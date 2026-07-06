@@ -1,0 +1,18 @@
+.DS_Store
+._*
+.build/
+DerivedData/
+*.xcodeproj
+*.xcworkspace
+*.xcuserstate
+*.xcuserdata/
+*.swp
+
+# Never commit local machine config or secrets.
+*.env
+secrets*.json
+auth.json
+
+# Generated app bundles.
+dist/
+*.app
