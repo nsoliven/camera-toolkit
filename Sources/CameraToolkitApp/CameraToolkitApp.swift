@@ -18,8 +18,8 @@ struct CameraToolkitApp: App {
         }
 
         Settings {
-            SettingsView(model: model)
-                .frame(width: 680, height: 520)
+            ConfigView(model: model)
+                .frame(width: 760, height: 620)
         }
     }
 }

@@ -44,8 +44,8 @@ struct AppShell: View {
             ImmichView(model: model)
         case .jobs:
             JobsView(model: model)
-        case .settings:
-            SettingsView(model: model)
+        case .config:
+            ConfigView(model: model)
         }
     }
 

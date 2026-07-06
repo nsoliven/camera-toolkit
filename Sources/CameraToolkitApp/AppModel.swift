@@ -11,46 +11,50 @@ final class DashboardModel {
     var activePlan: CopyPlan
     var jobs: [JobSnapshot]
     var activityLog: [ActivityLogEntry]
+    var configuration: AppConfiguration
+    var configMessage: String = "Config is saved automatically."
     var safetyChecks: [SafetyCheck]
-    var selectedDevice: String = "sony-a7v"
-    var eventName: String = "Lee Canyon"
-    var importDestination: TransferLocation = .nas
-    var importSourcePath: String
     var simulationSummary: SimulationSummary?
     var statusMessage: String = "Ready. Demo mode only uses fake local folders."
     var isBusy: Bool = false
-    @ObservationIgnored private let activityLogStore: ActivityLogStore
+    @ObservationIgnored private let configurationStore: ConfigurationStore
 
     init(
         locations: [LocationCard],
         activePlan: CopyPlan,
         jobs: [JobSnapshot],
         activityLog: [ActivityLogEntry] = [],
+        configuration: AppConfiguration = .defaults(applicationSupport: DashboardModel.defaultApplicationSupportURL),
         safetyChecks: [SafetyCheck],
-        importSourcePath: String = "",
-        activityLogStore: ActivityLogStore = ActivityLogStore(url: DashboardModel.defaultActivityLogURL),
+        configurationStore: ConfigurationStore = ConfigurationStore(url: DashboardModel.defaultConfigurationURL),
         loadActivityLog: Bool = false
     ) {
         self.locations = locations
         self.activePlan = activePlan
         self.jobs = jobs
         self.safetyChecks = safetyChecks
-        self.importSourcePath = importSourcePath
-        self.activityLogStore = activityLogStore
+        self.configuration = configuration
+        self.configurationStore = configurationStore
         if loadActivityLog {
-            self.activityLog = (try? activityLogStore.load()) ?? activityLog
+            self.activityLog = (try? ActivityLogStore(url: URL(fileURLWithPath: Self.expandedPath(configuration.activityLogPath))).load()) ?? activityLog
         } else {
             self.activityLog = activityLog
         }
     }
 
     static func live() -> DashboardModel {
-        DashboardModel(
+        let defaults = AppConfiguration.defaults(applicationSupport: defaultApplicationSupportURL)
+        let store = ConfigurationStore(url: defaultConfigurationURL)
+        let configuration = (try? store.load(defaults: defaults)) ?? defaults
+        try? store.save(configuration)
+
+        return DashboardModel(
             locations: preview.locations,
             activePlan: preview.activePlan,
             jobs: [],
+            configuration: configuration,
             safetyChecks: preview.safetyChecks,
-            importSourcePath: "~/Library/Application Support/CameraToolkit/Simulation/Fake Card",
+            configurationStore: store,
             loadActivityLog: true
         )
     }
@@ -93,6 +97,7 @@ final class DashboardModel {
                 detail: "No files were copied during preview."
             )
         ],
+        configuration: .defaults(applicationSupport: defaultApplicationSupportURL),
         safetyChecks: [
             SafetyCheck(
                 title: "Archive copy mode",
@@ -118,34 +123,73 @@ final class DashboardModel {
                 state: .attention,
                 helpText: "Real camera cards, drives, NAS folders, and Immich calls are intentionally locked out in this build."
             )
-        ],
-        importSourcePath: "~/Library/Application Support/CameraToolkit/Simulation/Fake Card"
+        ]
     )
 }
 
 extension DashboardModel {
     var simulationWorkspace: SimulationWorkspace {
-        SimulationWorkspace(root: Self.defaultSimulationRoot)
+        SimulationWorkspace(root: URL(fileURLWithPath: Self.expandedPath(configuration.demoRootPath)))
     }
 
     func chooseImportFolder() {
-        let panel = NSOpenPanel()
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        panel.allowsMultipleSelection = false
-        panel.prompt = "Use Folder"
-        panel.message = "Choose a folder to preview locally. Real archive writes are still disabled."
-        if panel.runModal() == .OK, let url = panel.url {
-            importSourcePath = url.path
-            statusMessage = "Selected \(url.lastPathComponent). Use Preview Copy before running the demo import."
+        if chooseFolder(title: "Choose Import Source", keyPath: \.importSourcePath) {
+            statusMessage = "Selected \(URL(fileURLWithPath: configuration.importSourcePath).lastPathComponent). Use Preview Copy before running the demo import."
             recordActivity(
                 action: .ingestCard,
                 state: .done,
                 title: "Selected source folder",
                 summary: statusMessage,
-                detail: "The selected folder will be scanned locally. Demo mode still writes only to the fake archive."
+                detail: "The selected folder will be scanned locally. Demo mode still writes only to the configured demo archive."
             )
         }
+    }
+
+    @discardableResult
+    func chooseFolder(title: String, keyPath: WritableKeyPath<AppConfiguration, String>) -> Bool {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.title = title
+        panel.prompt = "Use Folder"
+        panel.message = "Choose a folder for Camera Toolkit config."
+        if panel.runModal() == .OK, let url = panel.url {
+            setConfigPath(keyPath, to: url.path)
+            return true
+        }
+        return false
+    }
+
+    func chooseActivityLogFile() {
+        let panel = NSSavePanel()
+        panel.title = "Choose Activity Log File"
+        panel.prompt = "Use Log File"
+        panel.nameFieldStringValue = URL(fileURLWithPath: Self.expandedPath(configuration.activityLogPath)).lastPathComponent
+        panel.directoryURL = URL(fileURLWithPath: Self.expandedPath(configuration.activityLogPath)).deletingLastPathComponent()
+        panel.message = "Choose where Camera Toolkit saves the permanent activity log."
+        if panel.runModal() == .OK, let url = panel.url {
+            setConfigPath(\.activityLogPath, to: url.path)
+            activityLog = (try? ActivityLogStore(url: url).load()) ?? activityLog
+        }
+    }
+
+    func setConfigPath(_ keyPath: WritableKeyPath<AppConfiguration, String>, to value: String) {
+        updateConfiguration { configuration in
+            configuration[keyPath: keyPath] = value
+        }
+    }
+
+    func setDeviceID(_ value: String) {
+        updateConfiguration { $0.selectedDeviceID = value }
+    }
+
+    func setEventName(_ value: String) {
+        updateConfiguration { $0.eventName = value }
+    }
+
+    func setImportDestination(_ value: TransferLocation) {
+        updateConfiguration { $0.importDestination = value }
     }
 
     func seedSimulation() {
@@ -156,7 +200,7 @@ extension DashboardModel {
             logDetail: "Recreated the fake card, fake archive, and fake buffer under Application Support."
         ) {
             try simulationWorkspace.resetAndSeed()
-            importSourcePath = simulationWorkspace.sourceCard.path
+            setConfigPath(\.importSourcePath, to: simulationWorkspace.sourceCard.path)
             activePlan = try simulationWorkspace.previewImport()
             simulationSummary = nil
             statusMessage = "Demo files are ready at \(simulationWorkspace.root.path)."
@@ -234,7 +278,7 @@ extension DashboardModel {
         ) {
             let summary = try simulationWorkspace.runFullSimulation()
             simulationSummary = summary
-            importSourcePath = summary.sourcePath
+            setConfigPath(\.importSourcePath, to: summary.sourcePath)
             activePlan = try simulationWorkspace.previewImport()
             statusMessage = "Safe demo complete: \(summary.copiedCount) copied, \(summary.quarantinedCount) quarantined, \(summary.leftUnsafeCount) left alone."
             refreshSimulationLocations()
@@ -242,7 +286,7 @@ extension DashboardModel {
     }
 
     private var expandedImportSourcePath: String {
-        NSString(string: importSourcePath).expandingTildeInPath
+        Self.expandedPath(configuration.importSourcePath)
     }
 
     private func runJob(
@@ -291,9 +335,21 @@ extension DashboardModel {
         )
         activityLog.insert(entry, at: 0)
         do {
-            try activityLogStore.append(entry)
+            try ActivityLogStore(url: URL(fileURLWithPath: Self.expandedPath(configuration.activityLogPath))).append(entry)
         } catch {
             statusMessage = "Saved action on screen, but could not write permanent log: \(error.localizedDescription)"
+        }
+    }
+
+    private func updateConfiguration(_ mutate: (inout AppConfiguration) -> Void) {
+        var next = configuration
+        mutate(&next)
+        configuration = next
+        do {
+            try configurationStore.save(next)
+            configMessage = "Config saved at \(Self.defaultConfigurationURL.path)."
+        } catch {
+            configMessage = "Could not save config: \(error.localizedDescription)"
         }
     }
 
@@ -307,16 +363,17 @@ extension DashboardModel {
         ]
     }
 
-    private static var defaultSimulationRoot: URL {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+    private static var defaultApplicationSupportURL: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? FileManager.default.temporaryDirectory
-        return base.appendingPathComponent("CameraToolkit/Simulation", isDirectory: true)
     }
 
-    private static var defaultActivityLogURL: URL {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-            ?? FileManager.default.temporaryDirectory
-        return base.appendingPathComponent("CameraToolkit/activity-log.jsonl")
+    private static var defaultConfigurationURL: URL {
+        defaultApplicationSupportURL.appendingPathComponent("CameraToolkit/config.json")
+    }
+
+    private static func expandedPath(_ path: String) -> String {
+        NSString(string: path).expandingTildeInPath
     }
 }
 
@@ -327,7 +384,7 @@ enum AppSection: String, CaseIterable, Identifiable {
     case drive = "Drive"
     case immich = "Immich"
     case jobs = "Jobs"
-    case settings = "Settings"
+    case config = "Config"
 
     var id: String { rawValue }
 
@@ -339,7 +396,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .drive: "externaldrive"
         case .immich: "sparkles.rectangle.stack"
         case .jobs: "list.bullet.clipboard"
-        case .settings: "gearshape"
+        case .config: "slider.horizontal.3"
         }
     }
 }
