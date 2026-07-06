@@ -66,7 +66,12 @@ struct SafetyPanel: View {
     var checks: [SafetyCheck]
 
     var body: some View {
-        Panel(title: "Safety Gates", symbol: "lock.shield") {
+        Panel(
+            title: "Safety Gates",
+            symbol: "lock.shield",
+            helpTitle: "Safety Gates",
+            helpText: "These are the rules that protect real files later: no overwrite-style archive copies, no freeing space until checksums match, no permanent delete without confirmation, and real volumes locked during demo mode."
+        ) {
             ForEach(checks) { check in
                 HStack(alignment: .top, spacing: 12) {
                     Image(systemName: check.state.symbol)
@@ -74,8 +79,11 @@ struct SafetyPanel: View {
                         .foregroundStyle(color(for: check.state))
                         .frame(width: 28)
                     VStack(alignment: .leading, spacing: 4) {
-                        Text(check.title)
-                            .font(.headline)
+                        HStack(spacing: 5) {
+                            Text(check.title)
+                                .font(.headline)
+                            HelpButton(title: check.title, message: check.helpText)
+                        }
                         Text(check.detail)
                             .font(.callout)
                             .foregroundStyle(.secondary)

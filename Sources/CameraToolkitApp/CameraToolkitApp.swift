@@ -4,14 +4,14 @@ import SwiftUI
 @main
 struct CameraToolkitApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-    @State private var model = DashboardModel.preview
+    @State private var model = DashboardModel.live()
 
     var body: some Scene {
         WindowGroup {
             AppShell(model: model)
-                .frame(minWidth: 1180, minHeight: 760)
+                .frame(minWidth: 900, minHeight: 660)
         }
-        .defaultSize(width: 1280, height: 820)
+        .defaultSize(width: 1180, height: 760)
         .windowResizability(.contentMinSize)
         .commands {
             SidebarCommands()

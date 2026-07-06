@@ -10,27 +10,49 @@ final class DashboardModel {
     var locations: [LocationCard]
     var activePlan: CopyPlan
     var jobs: [JobSnapshot]
+    var activityLog: [ActivityLogEntry]
     var safetyChecks: [SafetyCheck]
     var selectedDevice: String = "sony-a7v"
     var eventName: String = "Lee Canyon"
     var importDestination: TransferLocation = .nas
     var importSourcePath: String
     var simulationSummary: SimulationSummary?
-    var statusMessage: String = "Ready. No real volumes are touched."
+    var statusMessage: String = "Ready. Demo mode only uses fake local folders."
     var isBusy: Bool = false
+    @ObservationIgnored private let activityLogStore: ActivityLogStore
 
     init(
         locations: [LocationCard],
         activePlan: CopyPlan,
         jobs: [JobSnapshot],
+        activityLog: [ActivityLogEntry] = [],
         safetyChecks: [SafetyCheck],
-        importSourcePath: String = ""
+        importSourcePath: String = "",
+        activityLogStore: ActivityLogStore = ActivityLogStore(url: DashboardModel.defaultActivityLogURL),
+        loadActivityLog: Bool = false
     ) {
         self.locations = locations
         self.activePlan = activePlan
         self.jobs = jobs
         self.safetyChecks = safetyChecks
         self.importSourcePath = importSourcePath
+        self.activityLogStore = activityLogStore
+        if loadActivityLog {
+            self.activityLog = (try? activityLogStore.load()) ?? activityLog
+        } else {
+            self.activityLog = activityLog
+        }
+    }
+
+    static func live() -> DashboardModel {
+        DashboardModel(
+            locations: preview.locations,
+            activePlan: preview.activePlan,
+            jobs: [],
+            safetyChecks: preview.safetyChecks,
+            importSourcePath: "~/Library/Application Support/CameraToolkit/Simulation/Fake Card",
+            loadActivityLog: true
+        )
     }
 
     static let preview = DashboardModel(
@@ -55,11 +77,47 @@ final class DashboardModel {
             JobSnapshot(action: .ingestCard, state: .running, progress: 0.42, note: "Hash verifying copied files"),
             JobSnapshot(action: .immichScan, state: .done, progress: 1, note: "Library scan queued")
         ],
+        activityLog: [
+            ActivityLogEntry(
+                action: .verifyManifest,
+                state: .done,
+                title: "Completed safe demo",
+                summary: "4 copied, 1 quarantined, 1 left alone.",
+                detail: "Created fake files, verified the demo archive manifest, and moved only verified buffer files to quarantine."
+            ),
+            ActivityLogEntry(
+                action: .ingestCard,
+                state: .done,
+                title: "Previewed copy plan",
+                summary: "3 new files, 1 already archived, 0 conflicts.",
+                detail: "No files were copied during preview."
+            )
+        ],
         safetyChecks: [
-            SafetyCheck(title: "Archive copy mode", detail: "rclone copy --checksum --immutable", state: .passed),
-            SafetyCheck(title: "Free-up gate", detail: "Fresh checksum compare required before quarantine", state: .passed),
-            SafetyCheck(title: "Permanent delete", detail: "Requires typed DELETE confirmation", state: .passed),
-            SafetyCheck(title: "Real volumes", detail: "Disabled until temp-dir suite is green", state: .attention)
+            SafetyCheck(
+                title: "Archive copy mode",
+                detail: "rclone copy --checksum --immutable",
+                state: .passed,
+                helpText: "Archive writes must copy by checksum and refuse overwrites. If a file already exists with different bytes, the app reports a conflict instead of replacing it."
+            ),
+            SafetyCheck(
+                title: "Free-up gate",
+                detail: "Fresh checksum compare required before quarantine",
+                state: .passed,
+                helpText: "Free-up means making space on temporary storage. The app only quarantines a buffer file after proving the archive has the same bytes."
+            ),
+            SafetyCheck(
+                title: "Permanent delete",
+                detail: "Requires typed DELETE confirmation",
+                state: .passed,
+                helpText: "The real delete path stays behind an explicit typed confirmation. The current demo moves files to quarantine only."
+            ),
+            SafetyCheck(
+                title: "Real volumes",
+                detail: "Disabled while the demo workflow is being hardened",
+                state: .attention,
+                helpText: "Real camera cards, drives, NAS folders, and Immich calls are intentionally locked out in this build."
+            )
         ],
         importSourcePath: "~/Library/Application Support/CameraToolkit/Simulation/Fake Card"
     )
@@ -79,32 +137,54 @@ extension DashboardModel {
         panel.message = "Choose a folder to preview locally. Real archive writes are still disabled."
         if panel.runModal() == .OK, let url = panel.url {
             importSourcePath = url.path
-            statusMessage = "Selected \(url.lastPathComponent). Preview before running anything."
+            statusMessage = "Selected \(url.lastPathComponent). Use Preview Copy before running the demo import."
+            recordActivity(
+                action: .ingestCard,
+                state: .done,
+                title: "Selected source folder",
+                summary: statusMessage,
+                detail: "The selected folder will be scanned locally. Demo mode still writes only to the fake archive."
+            )
         }
     }
 
     func seedSimulation() {
-        runJob(action: .ingestCard, runningNote: "Creating fake card, archive, and buffer") {
+        runJob(
+            action: .ingestCard,
+            runningNote: "Creating fake card, archive, and buffer",
+            logTitle: "Made demo files",
+            logDetail: "Recreated the fake card, fake archive, and fake buffer under Application Support."
+        ) {
             try simulationWorkspace.resetAndSeed()
             importSourcePath = simulationWorkspace.sourceCard.path
             activePlan = try simulationWorkspace.previewImport()
             simulationSummary = nil
-            statusMessage = "Simulation workspace is ready at \(simulationWorkspace.root.path)."
+            statusMessage = "Demo files are ready at \(simulationWorkspace.root.path)."
             refreshSimulationLocations()
         }
     }
 
     func previewImport() {
-        runJob(action: .ingestCard, runningNote: "Planning immutable copy") {
+        runJob(
+            action: .ingestCard,
+            runningNote: "Planning immutable copy",
+            logTitle: "Previewed copy plan",
+            logDetail: "Scanned the source and demo archive. No files were copied during preview."
+        ) {
             let source = URL(fileURLWithPath: expandedImportSourcePath)
             let destination = simulationWorkspace.archive
             activePlan = try ArchivePlanner().planCopy(source: source, destination: destination)
-            statusMessage = "Preview ready: \(activePlan.new.count) new, \(activePlan.existing.count) already there, \(activePlan.conflicts.count) conflicts."
+            statusMessage = "Preview ready: \(activePlan.new.count) new, \(activePlan.existing.count) already archived, \(activePlan.conflicts.count) conflicts."
         }
     }
 
     func runSimulationImport() {
-        runJob(action: .ingestCard, runningNote: "Copying into simulation archive") {
+        runJob(
+            action: .ingestCard,
+            runningNote: "Copying into demo archive",
+            logTitle: "Ran demo import",
+            logDetail: "Copied new files into the demo archive, refused overwrites, verified checksums, and wrote a manifest."
+        ) {
             let result = try simulationWorkspace.runImport()
             simulationSummary = SimulationSummary(
                 root: simulationWorkspace.root.path,
@@ -117,13 +197,18 @@ extension DashboardModel {
                 leftUnsafeCount: 0
             )
             activePlan = try simulationWorkspace.previewImport()
-            statusMessage = "Simulation import verified. Manifest OK: \(result.manifest.ok ? "yes" : "no")."
+            statusMessage = "Demo import verified. Manifest OK: \(result.manifest.ok ? "yes" : "no")."
             refreshSimulationLocations()
         }
     }
 
     func runSimulationFreeUp() {
-        runJob(action: .freeUp, runningNote: "Checksum comparing buffer before quarantine") {
+        runJob(
+            action: .freeUp,
+            runningNote: "Checksum comparing buffer before quarantine",
+            logTitle: "Ran free-up demo",
+            logDetail: "Moved only buffer files that matched the demo archive checksum into local quarantine."
+        ) {
             let report = try simulationWorkspace.runFreeUp()
             simulationSummary = SimulationSummary(
                 root: simulationWorkspace.root.path,
@@ -135,18 +220,23 @@ extension DashboardModel {
                 quarantinedCount: report.moved.count,
                 leftUnsafeCount: report.notOnArchive.count + report.differ.count + report.errors.count
             )
-            statusMessage = "Free-up simulation quarantined \(report.moved.count) verified files and left \(simulationSummary?.leftUnsafeCount ?? 0) unsafe file(s)."
+            statusMessage = "Free-up demo quarantined \(report.moved.count) verified files and left \(simulationSummary?.leftUnsafeCount ?? 0) unsafe file(s) alone."
             refreshSimulationLocations()
         }
     }
 
     func runFullSimulation() {
-        runJob(action: .verifyManifest, runningNote: "Running full safe workflow") {
+        runJob(
+            action: .verifyManifest,
+            runningNote: "Running safe demo",
+            logTitle: "Completed safe demo",
+            logDetail: "Created fake files, copied new files to the demo archive, verified the manifest, and quarantined only proven-safe buffer files."
+        ) {
             let summary = try simulationWorkspace.runFullSimulation()
             simulationSummary = summary
             importSourcePath = summary.sourcePath
             activePlan = try simulationWorkspace.previewImport()
-            statusMessage = "Full simulation complete: \(summary.copiedCount) copied, \(summary.quarantinedCount) quarantined, \(summary.leftUnsafeCount) left unsafe."
+            statusMessage = "Safe demo complete: \(summary.copiedCount) copied, \(summary.quarantinedCount) quarantined, \(summary.leftUnsafeCount) left alone."
             refreshSimulationLocations()
         }
     }
@@ -155,7 +245,13 @@ extension DashboardModel {
         NSString(string: importSourcePath).expandingTildeInPath
     }
 
-    private func runJob(action: JobAction, runningNote: String, operation: () throws -> Void) {
+    private func runJob(
+        action: JobAction,
+        runningNote: String,
+        logTitle: String,
+        logDetail: String,
+        operation: () throws -> Void
+    ) {
         isBusy = true
         var job = JobSnapshot(action: action, state: .running, progress: 0.35, note: runningNote)
         jobs.insert(job, at: 0)
@@ -172,17 +268,42 @@ extension DashboardModel {
             job.finishedAt = Date()
             statusMessage = job.note
         }
+        let summary = statusMessage
+        job.note = summary
         jobs[0] = job
+        recordActivity(
+            action: action,
+            state: job.state,
+            title: logTitle,
+            summary: summary,
+            detail: logDetail
+        )
         isBusy = false
+    }
+
+    private func recordActivity(action: JobAction, state: JobState, title: String, summary: String, detail: String) {
+        let entry = ActivityLogEntry(
+            action: action,
+            state: state,
+            title: title,
+            summary: summary,
+            detail: detail
+        )
+        activityLog.insert(entry, at: 0)
+        do {
+            try activityLogStore.append(entry)
+        } catch {
+            statusMessage = "Saved action on screen, but could not write permanent log: \(error.localizedDescription)"
+        }
     }
 
     private func refreshSimulationLocations() {
         let workspace = simulationWorkspace
         locations = [
             LocationCard(kind: .card, title: "Fake Card", subtitle: workspace.sourceCard.lastPathComponent, status: .ready, detail: workspace.sourceCard.path),
-            LocationCard(kind: .drive, title: "Simulation Buffer", subtitle: workspace.buffer.lastPathComponent, status: .warning, detail: "Local test folder"),
-            LocationCard(kind: .nas, title: "Simulation Archive", subtitle: workspace.archive.lastPathComponent, status: .ready, detail: "Local checksum target"),
-            LocationCard(kind: .immich, title: "Immich", subtitle: "Offline in simulation", status: .offline, detail: "No network calls")
+            LocationCard(kind: .drive, title: "Demo Buffer", subtitle: workspace.buffer.lastPathComponent, status: .warning, detail: "Local test folder"),
+            LocationCard(kind: .nas, title: "Demo Archive", subtitle: workspace.archive.lastPathComponent, status: .ready, detail: "Local checksum target"),
+            LocationCard(kind: .immich, title: "Immich", subtitle: "Offline in demo", status: .offline, detail: "No network calls")
         ]
     }
 
@@ -190,6 +311,12 @@ extension DashboardModel {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? FileManager.default.temporaryDirectory
         return base.appendingPathComponent("CameraToolkit/Simulation", isDirectory: true)
+    }
+
+    private static var defaultActivityLogURL: URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        return base.appendingPathComponent("CameraToolkit/activity-log.jsonl")
     }
 }
 
@@ -245,6 +372,7 @@ struct SafetyCheck: Identifiable, Hashable {
     var title: String
     var detail: String
     var state: SafetyState
+    var helpText: String
 }
 
 enum SafetyState {

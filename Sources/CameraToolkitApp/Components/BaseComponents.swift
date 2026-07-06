@@ -3,6 +3,8 @@ import SwiftUI
 struct Panel<Content: View>: View {
     var title: String?
     var symbol: String?
+    var helpTitle: String?
+    var helpText: String?
     @ViewBuilder var content: Content
 
     var body: some View {
@@ -15,6 +17,9 @@ struct Panel<Content: View>: View {
                     }
                     Text(title)
                         .font(.headline)
+                    if let helpText {
+                        HelpButton(title: helpTitle ?? title, message: helpText)
+                    }
                     Spacer()
                 }
             }
@@ -27,6 +32,39 @@ struct Panel<Content: View>: View {
                 .strokeBorder(Color.primary.opacity(0.08))
         )
         .shadow(color: .black.opacity(0.08), radius: 16, y: 8)
+    }
+}
+
+struct HelpButton: View {
+    var title: String
+    var message: String
+    @State private var isPresented = false
+
+    var body: some View {
+        Button {
+            isPresented.toggle()
+        } label: {
+            Image(systemName: "questionmark.circle")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 22, height: 22)
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .help("Explain \(title)")
+        .accessibilityLabel("Explain \(title)")
+        .popover(isPresented: $isPresented, arrowEdge: .top) {
+            VStack(alignment: .leading, spacing: 10) {
+                Text(title)
+                    .font(.headline)
+                Text(message)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(16)
+            .frame(width: 300, alignment: .leading)
+        }
     }
 }
 
@@ -62,8 +100,8 @@ struct HeaderView: View {
     var eyebrow: String
     var title: String
     var subtitle: String
-    var badgeTitle: String = "Simulation"
-    var badgeSubtitle: String = "No real volumes touched"
+    var badgeTitle: String = "Safe Demo"
+    var badgeSubtitle: String = "Fake local folders only"
 
     var body: some View {
         ViewThatFits(in: .horizontal) {
@@ -142,6 +180,7 @@ struct CommandButton: View {
     var symbol: String
     var prominence: Prominence = .secondary
     var isDisabled: Bool = false
+    var helpText: String?
     var action: () -> Void
 
     var body: some View {
@@ -163,9 +202,47 @@ struct CommandButton: View {
         .disabled(isDisabled)
         .fixedSize(horizontal: true, vertical: false)
         .accessibilityIdentifier(accessibilityID)
+        .help(helpText ?? title)
     }
 
     private var accessibilityID: String {
         "command-\(title.lowercased().filter { $0.isLetter || $0.isNumber }.prefix(32))"
+    }
+}
+
+struct HelpedCommandButton: View {
+    var title: String
+    var symbol: String
+    var prominence: CommandButton.Prominence = .secondary
+    var isDisabled: Bool = false
+    var helpTitle: String? = nil
+    var helpText: String
+    var action: () -> Void
+
+    var body: some View {
+        HStack(spacing: 4) {
+            CommandButton(
+                title: title,
+                symbol: symbol,
+                prominence: prominence,
+                isDisabled: isDisabled,
+                helpText: helpText,
+                action: action
+            )
+            HelpButton(title: helpTitle ?? title, message: helpText)
+        }
+        .fixedSize(horizontal: true, vertical: false)
+    }
+}
+
+struct FormFieldLabel: View {
+    var title: String
+    var helpText: String
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Text(title)
+            HelpButton(title: title, message: helpText)
+        }
     }
 }

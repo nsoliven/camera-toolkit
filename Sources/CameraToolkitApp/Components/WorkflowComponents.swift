@@ -5,7 +5,12 @@ struct TransferFlowPanel: View {
     var plan: CopyPlan
 
     var body: some View {
-        Panel(title: "Current Plan", symbol: "arrow.triangle.2.circlepath") {
+        Panel(
+            title: "Copy Plan",
+            symbol: "arrow.triangle.2.circlepath",
+            helpTitle: "Copy Plan",
+            helpText: "This is the dry-run view. New files can be copied, already archived files are skipped, and conflicts mean the same path exists with different bytes."
+        ) {
             HStack(spacing: 12) {
                 FlowNode(title: "Card", symbol: "sdcard", tint: AppTheme.accent)
                 FlowArrow(label: "copy")
@@ -86,7 +91,12 @@ struct SimulationSummaryPanel: View {
     var statusMessage: String
 
     var body: some View {
-        Panel(title: "Simulation Result", symbol: "checklist.checked") {
+        Panel(
+            title: "Demo Result",
+            symbol: "checklist.checked",
+            helpTitle: "Demo Result",
+            helpText: "This summarizes the last demo action. Copied files reached the demo archive, quarantined files were proven safe to move out of the demo buffer, and left-alone files were not safe to remove."
+        ) {
             Text(statusMessage)
                 .font(.callout)
                 .foregroundStyle(.secondary)
@@ -127,29 +137,134 @@ private struct PathRow: View {
     }
 }
 
+struct ActivityLogPanel: View {
+    var entries: [ActivityLogEntry]
+
+    var body: some View {
+        Panel(
+            title: "Permanent Activity Log",
+            symbol: "clock.arrow.circlepath",
+            helpTitle: "Permanent Activity Log",
+            helpText: "This is saved on disk and survives app restarts. It records the actions you took in normal language, so you can answer: what did I do, when did it happen, and did it pass?"
+        ) {
+            if entries.isEmpty {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("No saved actions yet.")
+                        .font(.headline)
+                    Text("Run a safe demo, preview a copy, or make demo files and the app will append an entry here.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(12)
+                .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 8))
+            } else {
+                VStack(spacing: 0) {
+                    ForEach(entries.prefix(30)) { entry in
+                        ActivityLogRow(entry: entry)
+                        if entry.id != entries.prefix(30).last?.id {
+                            Divider()
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+private struct ActivityLogRow: View {
+    var entry: ActivityLogEntry
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 14) {
+            Image(systemName: icon)
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(color)
+                .frame(width: 34, height: 34)
+                .background(color.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(entry.title)
+                        .font(.headline)
+                    Text(entry.createdAt.formatted(date: .abbreviated, time: .shortened))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Text(entry.summary)
+                    .font(.callout)
+                Text(entry.detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Spacer(minLength: 12)
+
+            Text(entry.state.activityLabel)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(color)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(color.opacity(0.12), in: RoundedRectangle(cornerRadius: 7))
+        }
+        .padding(.vertical, 12)
+    }
+
+    private var icon: String {
+        switch entry.state {
+        case .done: "checkmark.circle.fill"
+        case .failed: "xmark.circle.fill"
+        case .cancelled: "minus.circle.fill"
+        case .running: "clock.fill"
+        case .queued: "circle.dashed"
+        }
+    }
+
+    private var color: Color {
+        switch entry.state {
+        case .done: AppTheme.mint
+        case .failed: .red
+        case .cancelled: .secondary
+        case .running: AppTheme.amber
+        case .queued: .secondary
+        }
+    }
+}
+
 struct JobsStrip: View {
     var jobs: [JobSnapshot]
 
     var body: some View {
-        Panel(title: "Recent Jobs", symbol: "list.bullet.clipboard") {
-            ForEach(jobs.prefix(5)) { job in
-                HStack(spacing: 12) {
-                    Circle()
-                        .fill(color(for: job.state))
-                        .frame(width: 10, height: 10)
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(job.action.displayName)
-                            .font(.headline)
-                        Text(job.note)
+        Panel(
+            title: "Current Session",
+            symbol: "list.bullet.clipboard",
+            helpTitle: "Current Session",
+            helpText: "These rows are the live jobs from this app session. The permanent activity log above is the durable history that survives restarts."
+        ) {
+            if jobs.isEmpty {
+                Text("No actions in this app session yet.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(jobs.prefix(5)) { job in
+                    HStack(spacing: 12) {
+                        Circle()
+                            .fill(color(for: job.state))
+                            .frame(width: 10, height: 10)
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(job.action.displayName)
+                                .font(.headline)
+                            Text(job.note)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        ProgressView(value: job.progress)
+                            .frame(width: 180)
+                        Text("\(Int(job.progress * 100))%")
+                            .font(.callout.monospacedDigit())
                             .foregroundStyle(.secondary)
+                            .frame(width: 44, alignment: .trailing)
                     }
-                    Spacer()
-                    ProgressView(value: job.progress)
-                        .frame(width: 180)
-                    Text("\(Int(job.progress * 100))%")
-                        .font(.callout.monospacedDigit())
-                        .foregroundStyle(.secondary)
-                        .frame(width: 44, alignment: .trailing)
                 }
             }
         }
@@ -162,6 +277,18 @@ struct JobsStrip: View {
         case .done: AppTheme.mint
         case .failed: .red
         case .cancelled: .secondary
+        }
+    }
+}
+
+extension JobState {
+    var activityLabel: String {
+        switch self {
+        case .queued: "Queued"
+        case .running: "Running"
+        case .done: "Saved"
+        case .failed: "Failed"
+        case .cancelled: "Cancelled"
         }
     }
 }

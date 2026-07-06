@@ -8,19 +8,30 @@ struct ImportView: View {
         VStack(alignment: .leading, spacing: 22) {
             HeaderView(
                 eyebrow: "Import",
-                title: "Review the copy before bytes move",
-                subtitle: "Choose a local source or seed demo data, preview the immutable archive write, then run the simulation."
+                title: "Preview the copy before bytes move",
+                subtitle: "Pick a local source or make fake demo files, inspect the plan, then run the import against the demo archive."
             )
 
-            Panel(title: "Import Setup", symbol: "square.and.arrow.down") {
+            Panel(
+                title: "Import Setup",
+                symbol: "square.and.arrow.down",
+                helpTitle: "Import Setup",
+                helpText: "These controls describe what would be imported. In this build, the destination is still a fake local archive, so changing these values cannot write to your real NAS or camera card."
+            ) {
                 Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 16) {
                     GridRow {
-                        Text("Source")
+                        FormFieldLabel(
+                            title: "Source",
+                            helpText: "The folder being scanned as if it were a camera card. For safe demo runs, this points at the fake card folder under Application Support."
+                        )
                         TextField("Source folder", text: $model.importSourcePath)
                             .textFieldStyle(.roundedBorder)
                     }
                     GridRow {
-                        Text("Camera")
+                        FormFieldLabel(
+                            title: "Camera",
+                            helpText: "The device label that will be saved into manifests later. It helps batches stay searchable, but it does not change file bytes."
+                        )
                         Picker("Camera", selection: $model.selectedDevice) {
                             Text("Sony A7V").tag("sony-a7v")
                             Text("DJI Osmo 360").tag("osmo-360")
@@ -29,47 +40,61 @@ struct ImportView: View {
                         }
                     }
                     GridRow {
-                        Text("Trip")
+                        FormFieldLabel(
+                            title: "Trip",
+                            helpText: "A human name for the batch. Think shoot, day, client, vacation, or project."
+                        )
                         TextField("Trip name", text: $model.eventName)
                             .textFieldStyle(.roundedBorder)
                     }
                     GridRow {
-                        Text("Destination")
+                        FormFieldLabel(
+                            title: "Destination",
+                            helpText: "Where the demo import goes. Archive means the long-term verified copy. Buffer means temporary working storage."
+                        )
                         Picker("Destination", selection: $model.importDestination) {
-                            Text("Simulation Archive").tag(TransferLocation.nas)
-                            Text("Simulation Buffer").tag(TransferLocation.drive)
+                            Text("Demo Archive").tag(TransferLocation.nas)
+                            Text("Demo Buffer").tag(TransferLocation.drive)
                         }
                         .pickerStyle(.segmented)
                     }
                 }
 
                 CommandBar {
-                    CommandButton(
+                    HelpedCommandButton(
                         title: "Choose Folder",
                         symbol: "folder",
                         isDisabled: model.isBusy,
+                        helpTitle: "Choose Folder",
+                        helpText: "Pick a local folder to scan. This only previews and runs against the demo archive right now.",
                         action: model.chooseImportFolder
                     )
 
-                    CommandButton(
-                        title: "Seed Demo",
+                    HelpedCommandButton(
+                        title: "Make Demo Files",
                         symbol: "wand.and.stars",
                         isDisabled: model.isBusy,
+                        helpTitle: "Make Demo Files",
+                        helpText: "Creates fake camera files, a fake existing archive file, and a fake buffer file so you can test the workflow safely.",
                         action: model.seedSimulation
                     )
 
-                    CommandButton(
-                        title: "Preview",
+                    HelpedCommandButton(
+                        title: "Preview Copy",
                         symbol: "eye",
                         prominence: .primary,
                         isDisabled: model.isBusy,
+                        helpTitle: "Preview Copy",
+                        helpText: "Scans the source and archive, then shows which files are new, already present, or conflicting before anything copies.",
                         action: model.previewImport
                     )
 
-                    CommandButton(
-                        title: "Run Simulation Import",
+                    HelpedCommandButton(
+                        title: "Run Demo Import",
                         symbol: "checkmark.seal",
                         isDisabled: model.isBusy,
+                        helpTitle: "Run Demo Import",
+                        helpText: "Copies only new files into the demo archive, refuses overwrites, compares checksums, and writes a manifest if verification passes.",
                         action: model.runSimulationImport
                     )
                 }
