@@ -84,7 +84,7 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
 
     public static func defaults(applicationSupport: URL) -> AppConfiguration {
         let root = applicationSupport.appendingPathComponent("CameraToolkit", isDirectory: true)
-        let demoRoot = root.appendingPathComponent("Simulation", isDirectory: true)
+        let demoRoot = root.appendingPathComponent("Safety Test", isDirectory: true)
         let workingRoot = root.appendingPathComponent("Editor Working Copies", isDirectory: true)
 
         return AppConfiguration(

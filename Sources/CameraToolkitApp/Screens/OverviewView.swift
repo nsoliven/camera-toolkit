@@ -13,21 +13,21 @@ struct OverviewView: View {
 
             CommandBar {
                 HelpedCommandButton(
-                    title: "Run Local Simulation",
+                    title: "Run Safety Test",
                     symbol: "play.circle",
                     prominence: .primary,
                     isDisabled: model.isBusy,
-                    helpTitle: "Run Local Simulation",
-                    helpText: "This creates disposable camera-style files, copies new files into a local simulation archive, writes and verifies a manifest, then quarantines only files proven safe.",
+                    helpTitle: "Run Safety Test",
+                    helpText: "This creates disposable camera-style test files, copies new files into a test archive, writes and verifies a manifest, then quarantines only files proven safe.",
                     action: model.runFullSimulation
                 )
 
                 HelpedCommandButton(
-                    title: "Reset Simulation",
+                    title: "Reset Test Data",
                     symbol: "arrow.counterclockwise",
                     isDisabled: model.isBusy,
-                    helpTitle: "Reset Simulation",
-                    helpText: "This recreates the local simulation source, archive, and buffer folders so you can proof the workflow again from a clean state.",
+                    helpTitle: "Reset Test Data",
+                    helpText: "This recreates the disposable source, archive, and buffer folders so you can test the workflow again from a clean state.",
                     action: model.seedSimulation
                 )
             }

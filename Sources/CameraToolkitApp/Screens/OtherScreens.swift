@@ -100,21 +100,21 @@ struct DriveView: View {
             WorkflowPlanPanel(plan: model.workflowPlan(.freeUpBuffer))
             CommandBar {
                 HelpedCommandButton(
-                    title: "Run Free-Up Simulation",
+                    title: "Run Free-Up Safety Test",
                     symbol: "archivebox",
                     prominence: .primary,
                     isDisabled: model.isBusy,
-                    helpTitle: "Run Free-Up Simulation",
-                    helpText: "Looks at local simulation buffer files and moves only files that match the archive checksum into quarantine. Files missing from the archive stay put.",
+                    helpTitle: "Run Free-Up Safety Test",
+                    helpText: "Looks at disposable buffer files and moves only files that match the archive checksum into quarantine. Files missing from the archive stay put.",
                     action: model.runSimulationFreeUp
                 )
 
                 HelpedCommandButton(
-                    title: "Reset Simulation",
+                    title: "Reset Test Data",
                     symbol: "arrow.counterclockwise",
                     isDisabled: model.isBusy,
-                    helpTitle: "Reset Simulation",
-                    helpText: "Rebuilds the local simulation source, archive, and buffer folders so the free-up proof run starts from known test data.",
+                    helpTitle: "Reset Test Data",
+                    helpText: "Rebuilds the disposable source, archive, and buffer folders so the free-up safety test starts from known data.",
                     action: model.seedSimulation
                 )
             }
@@ -226,17 +226,17 @@ struct ConfigView: View {
                 title: "Folders",
                 symbol: "folder",
                 helpTitle: "Folders",
-                helpText: "These paths are saved in Camera Toolkit config. Source, archive, buffer, simulation, and log paths all live here so the workspace has one persistent source of truth."
+                helpText: "These paths are saved in Camera Toolkit config. Source, archive, buffer, test data, and log paths all live here so the workspace has one persistent source of truth."
             ) {
                 ConfigPathRow(
-                    title: "Simulation Root",
-                    detail: "Local proof-run source, archive, and buffer live under this folder.",
+                    title: "Test Data Root",
+                    detail: "Disposable source, archive, and buffer live under this folder.",
                     path: Binding(
                         get: { model.configuration.demoRootPath },
                         set: { model.setConfigPath(\.demoRootPath, to: $0) }
                     ),
-                    helpText: "Local simulations create disposable files under this root. Keep it somewhere local and safe to reset.",
-                    browse: { model.chooseFolder(title: "Choose Simulation Root", keyPath: \.demoRootPath) }
+                    helpText: "Safety tests create disposable files under this root. Keep it somewhere local and safe to reset.",
+                    browse: { model.chooseFolder(title: "Choose Test Data Root", keyPath: \.demoRootPath) }
                 )
 
                 ConfigPathRow(

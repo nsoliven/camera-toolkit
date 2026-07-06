@@ -136,7 +136,7 @@ struct SidebarView: View {
                             .foregroundStyle(AppTheme.mint)
                         HelpButton(
                             title: "Ready Workspace",
-                            message: "The app points at persistent config, real workflow plans, and live Immich connection checks. Local simulations are available for proof runs, while real writes remain locked."
+                            message: "The app points at persistent config, real workflow plans, and live Immich connection checks. Built-in safety tests are available, while real writes remain locked."
                         )
                     }
                     Text("Real plans are shown; execution stays locked.")
@@ -221,7 +221,7 @@ struct DetailContainer<Content: View>: View {
                         .labelStyle(.titleAndIcon)
                     HelpButton(
                         title: "Execution locked",
-                        message: "The workspace reads persistent config and shows the exact planned commands and endpoints. Buttons that move bytes still run only local simulations unless a real execution path is explicitly added later."
+                        message: "The workspace reads persistent config and shows the exact planned commands and endpoints. Buttons that move bytes still use disposable test data unless a real execution path is explicitly added later."
                     )
                 }
             }

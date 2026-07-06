@@ -17,7 +17,7 @@ final class DashboardModel {
     var configMessage: String = "Config is saved automatically."
     var safetyChecks: [SafetyCheck]
     var simulationSummary: SimulationSummary?
-    var statusMessage: String = "Ready. Configured workflows are pointed and locked; local simulation is available for safe proof runs."
+    var statusMessage: String = "Ready. Configured workflows are pointed and locked; safety tests are available for disposable checks."
     var isBusy: Bool = false
     var libraryFiles: [FileRecord] = []
     var lastOpenedWorkingCopyPath: String?
@@ -104,9 +104,9 @@ final class DashboardModel {
             ActivityLogEntry(
                 action: .verifyManifest,
                 state: .done,
-                title: "Completed local simulation",
+                title: "Completed safety test",
                 summary: "4 copied, 1 quarantined, 1 left alone.",
-                detail: "Created local simulation files, verified the archive manifest, and moved only verified buffer files to quarantine."
+                detail: "Created disposable test files, verified the archive manifest, and moved only verified buffer files to quarantine."
             ),
             ActivityLogEntry(
                 action: .ingestCard,
@@ -134,7 +134,7 @@ final class DashboardModel {
                 title: "Permanent delete",
                 detail: "Requires typed DELETE confirmation",
                 state: .passed,
-                helpText: "The real delete path stays behind an explicit typed confirmation. Local simulation moves files to quarantine only."
+                helpText: "The real delete path stays behind an explicit typed confirmation. Safety tests move files to quarantine only."
             ),
             SafetyCheck(
                 title: "Execution lock",
@@ -187,7 +187,7 @@ extension DashboardModel {
                 state: .done,
                 title: "Selected source folder",
                 summary: statusMessage,
-                detail: "The selected folder will be scanned locally. Real writes remain locked; simulation runs use disposable local folders."
+                detail: "The selected folder will be scanned locally. Real writes remain locked; safety tests use disposable local folders."
             )
         }
     }
@@ -342,15 +342,15 @@ extension DashboardModel {
     func seedSimulation() {
         runJob(
             action: .ingestCard,
-            runningNote: "Creating local simulation source, archive, and buffer",
-            logTitle: "Seeded simulation files",
-            logDetail: "Recreated the local simulation source, archive, and buffer under Application Support."
+            runningNote: "Creating disposable source, archive, and buffer",
+            logTitle: "Created test data",
+            logDetail: "Recreated the disposable source, archive, and buffer under Application Support."
         ) {
             try simulationWorkspace.resetAndSeed()
             setConfigPath(\.importSourcePath, to: simulationWorkspace.sourceCard.path)
             activePlan = try simulationWorkspace.previewImport()
             simulationSummary = nil
-            statusMessage = "Simulation files are ready at \(simulationWorkspace.root.path)."
+            statusMessage = "Test data is ready at \(simulationWorkspace.root.path)."
             refreshLocationCards()
         }
     }
@@ -372,9 +372,9 @@ extension DashboardModel {
     func runSimulationImport() {
         runJob(
             action: .ingestCard,
-            runningNote: "Copying into local simulation archive",
-            logTitle: "Ran local import simulation",
-            logDetail: "Copied new files into the local simulation archive, refused overwrites, verified checksums, and wrote a manifest."
+            runningNote: "Copying into test archive",
+            logTitle: "Ran import safety test",
+            logDetail: "Copied new files into the test archive, refused overwrites, verified checksums, and wrote a manifest."
         ) {
             let result = try simulationWorkspace.runImport()
             simulationSummary = SimulationSummary(
@@ -388,7 +388,7 @@ extension DashboardModel {
                 leftUnsafeCount: 0
             )
             activePlan = try simulationWorkspace.previewImport()
-            statusMessage = "Local import simulation verified. Manifest OK: \(result.manifest.ok ? "yes" : "no")."
+            statusMessage = "Import safety test verified. Manifest OK: \(result.manifest.ok ? "yes" : "no")."
             refreshLocationCards()
         }
     }
@@ -397,8 +397,8 @@ extension DashboardModel {
         runJob(
             action: .freeUp,
             runningNote: "Checksum comparing buffer before quarantine",
-            logTitle: "Ran free-up simulation",
-            logDetail: "Moved only simulation buffer files that matched the archive checksum into local quarantine."
+            logTitle: "Ran free-up safety test",
+            logDetail: "Moved only disposable buffer files that matched the archive checksum into quarantine."
         ) {
             let report = try simulationWorkspace.runFreeUp()
             simulationSummary = SimulationSummary(
@@ -411,7 +411,7 @@ extension DashboardModel {
                 quarantinedCount: report.moved.count,
                 leftUnsafeCount: report.notOnArchive.count + report.differ.count + report.errors.count
             )
-            statusMessage = "Free-up simulation quarantined \(report.moved.count) verified files and left \(simulationSummary?.leftUnsafeCount ?? 0) unsafe file(s) alone."
+            statusMessage = "Free-up safety test quarantined \(report.moved.count) verified files and left \(simulationSummary?.leftUnsafeCount ?? 0) unsafe file(s) alone."
             refreshLocationCards()
         }
     }
@@ -419,15 +419,15 @@ extension DashboardModel {
     func runFullSimulation() {
         runJob(
             action: .verifyManifest,
-            runningNote: "Running local simulation",
-            logTitle: "Completed local simulation",
-            logDetail: "Created local simulation files, copied new files to the archive, verified the manifest, and quarantined only proven-safe buffer files."
+            runningNote: "Running safety test",
+            logTitle: "Completed safety test",
+            logDetail: "Created disposable test files, copied new files to the archive, verified the manifest, and quarantined only proven-safe buffer files."
         ) {
             let summary = try simulationWorkspace.runFullSimulation()
             simulationSummary = summary
             setConfigPath(\.importSourcePath, to: summary.sourcePath)
             activePlan = try simulationWorkspace.previewImport()
-            statusMessage = "Local simulation complete: \(summary.copiedCount) copied, \(summary.quarantinedCount) quarantined, \(summary.leftUnsafeCount) left alone."
+            statusMessage = "Safety test complete: \(summary.copiedCount) copied, \(summary.quarantinedCount) quarantined, \(summary.leftUnsafeCount) left alone."
             refreshLocationCards()
         }
     }

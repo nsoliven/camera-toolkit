@@ -73,16 +73,16 @@ public struct SimulationWorkspace {
     public func runImport() throws -> (copy: LocalCopyResult, check: CheckReport, manifest: ManifestVerificationReport) {
         let copy = try LocalTransferService().copyImmutable(source: sourceCard, destination: archive)
         if !copy.conflicts.isEmpty {
-            throw ToolkitError.commandFailed("Local simulation import found immutable conflicts: \(copy.conflicts.joined(separator: ", "))")
+            throw ToolkitError.commandFailed("Safety test import found immutable conflicts: \(copy.conflicts.joined(separator: ", "))")
         }
 
         let check = try LocalCheckService().check(source: sourceCard, destination: archive)
         if !check.ok {
-            throw ToolkitError.commandFailed("Local simulation import failed verification")
+            throw ToolkitError.commandFailed("Safety test import failed verification")
         }
 
         let store = ManifestStore()
-        let manifest = try store.build(root: archive, batchID: "simulation-batch", deviceID: "sony-a7v", source: sourceCard.path)
+        let manifest = try store.build(root: archive, batchID: "safety-test-batch", deviceID: "sony-a7v", source: sourceCard.path)
         try store.write(manifest, to: manifestURL)
         let manifestReport = try store.verify(root: archive, manifest: manifest)
         return (copy, check, manifestReport)

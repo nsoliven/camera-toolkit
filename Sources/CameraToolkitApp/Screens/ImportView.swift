@@ -9,7 +9,7 @@ struct ImportView: View {
             HeaderView(
                 eyebrow: "Import",
                 title: "Plan imports against your archive",
-                subtitle: "Pick a source, preview the checksum-safe copy plan against the configured Archive Folder, then use local simulation for disposable proof runs."
+                subtitle: "Pick a source, preview the checksum-safe copy plan against the configured Archive Folder, then use safety tests for disposable checks."
             )
 
             Panel(
@@ -27,11 +27,11 @@ struct ImportView: View {
 
                 CommandBar {
                     HelpedCommandButton(
-                        title: "Seed Simulation",
+                        title: "Create Test Data",
                         symbol: "wand.and.stars",
                         isDisabled: model.isBusy,
-                        helpTitle: "Seed Simulation",
-                        helpText: "Creates camera-style local test files, an existing archive file, and a buffer file so you can proof the workflow safely.",
+                        helpTitle: "Create Test Data",
+                        helpText: "Creates camera-style test files, an existing archive file, and a buffer file so you can test the workflow safely.",
                         action: model.seedSimulation
                     )
 
@@ -46,11 +46,11 @@ struct ImportView: View {
                     )
 
                     HelpedCommandButton(
-                        title: "Run Local Simulation",
+                        title: "Run Import Safety Test",
                         symbol: "checkmark.seal",
                         isDisabled: model.isBusy,
-                        helpTitle: "Run Local Simulation",
-                        helpText: "Copies only new simulation files, refuses overwrites, compares checksums, and writes a manifest if verification passes.",
+                        helpTitle: "Run Import Safety Test",
+                        helpText: "Copies only new test files, refuses overwrites, compares checksums, and writes a manifest if verification passes.",
                         action: model.runSimulationImport
                     )
 
