@@ -29,18 +29,28 @@ cat > "$contents/Info.plist" <<'PLIST'
   <string>Camera Toolkit</string>
   <key>CFBundleDisplayName</key>
   <string>Camera Toolkit</string>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>en</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
   <string>0.1.0</string>
   <key>CFBundleVersion</key>
   <string>1</string>
+  <key>LSApplicationCategoryType</key>
+  <string>public.app-category.photography</string>
   <key>LSMinimumSystemVersion</key>
   <string>14.0</string>
+  <key>NSPrincipalClass</key>
+  <string>NSApplication</string>
   <key>NSHighResolutionCapable</key>
   <true/>
 </dict>
 </plist>
 PLIST
+
+printf 'APPL????' > "$contents/PkgInfo"
 
 echo "Built $app"

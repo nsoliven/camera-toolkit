@@ -5,27 +5,26 @@ struct OverviewView: View {
     @Bindable var model: DashboardModel
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 22) {
-                HeaderView(
-                    eyebrow: "Native archive console",
-                    title: "Photo ingest without scary buttons",
-                    subtitle: "Plan first, verify by checksum, quarantine before deletion, and keep the archive immutable."
-                )
+        VStack(alignment: .leading, spacing: 22) {
+            HeaderView(
+                eyebrow: "Native archive console",
+                title: "Photo ingest without scary buttons",
+                subtitle: "Plan first, verify by checksum, quarantine before deletion, and keep the archive immutable."
+            )
 
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 235), spacing: 14)], spacing: 14) {
-                    ForEach(model.locations) { location in
-                        LocationStatusCard(location: location)
-                    }
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 235), spacing: 14)], spacing: 14) {
+                ForEach(model.locations) { location in
+                    LocationStatusCard(location: location)
                 }
-
-                HStack(alignment: .top, spacing: 16) {
-                    TransferFlowPanel(model: model)
-                    SafetyPanel(checks: model.safetyChecks)
-                }
-
-                JobsStrip(jobs: model.jobs)
             }
+
+            HStack(alignment: .top, spacing: 16) {
+                TransferFlowPanel(model: model)
+                    .frame(minWidth: 0, maxWidth: .infinity)
+                SafetyPanel(checks: model.safetyChecks)
+            }
+
+            JobsStrip(jobs: model.jobs)
         }
     }
 }
@@ -315,7 +314,6 @@ struct ImportView: View {
                 }
             }
             TransferFlowPanel(model: model)
-            Spacer()
         }
     }
 }
@@ -329,7 +327,6 @@ struct LibraryView: View {
             Panel(title: "Batches", symbol: "photo.stack") {
                 ContentUnavailableView("Archive browser is next", systemImage: "photo.stack", description: Text("The safety core is in place first; real NAS browsing will be wired behind read-only checks."))
             }
-            Spacer()
         }
     }
 }
@@ -341,7 +338,6 @@ struct DriveView: View {
         VStack(alignment: .leading, spacing: 22) {
             HeaderView(eyebrow: "Drive", title: "Free space without losing originals", subtitle: "Free-up is quarantine-only after a live checksum comparison against the archive.")
             SafetyPanel(checks: model.safetyChecks)
-            Spacer()
         }
     }
 }
@@ -356,7 +352,6 @@ struct ImmichView: View {
                 MetricPill(title: "Server", value: "immich.solnas.net", symbol: "network", tint: AppTheme.accent)
                 MetricPill(title: "External library", value: "Camera Archive", symbol: "rectangle.stack.badge.play", tint: AppTheme.mint)
             }
-            Spacer()
         }
     }
 }
@@ -368,7 +363,6 @@ struct JobsView: View {
         VStack(alignment: .leading, spacing: 22) {
             HeaderView(eyebrow: "Jobs", title: "Every action leaves a trail", subtitle: "Long-running work is owned by a serialized job runner, not by view state.")
             JobsStrip(jobs: model.jobs)
-            Spacer()
         }
     }
 }
@@ -384,7 +378,6 @@ struct SettingsView: View {
                 MetricPill(title: "Metadata", value: "exiftool", symbol: "camera.metering.matrix", tint: AppTheme.mint)
                 MetricPill(title: "Uploads", value: "immich-go", symbol: "icloud.and.arrow.up", tint: .purple)
             }
-            Spacer()
         }
         .padding(28)
         .background(AppTheme.background)
