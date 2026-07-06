@@ -17,7 +17,7 @@ final class DashboardModel {
     var configMessage: String = "Config is saved automatically."
     var safetyChecks: [SafetyCheck]
     var simulationSummary: SimulationSummary?
-    var statusMessage: String = "Ready. Demo mode only uses fake local folders."
+    var statusMessage: String = "Ready. Configured workflows are pointed and locked; local simulation is available for safe proof runs."
     var isBusy: Bool = false
     var libraryFiles: [FileRecord] = []
     var lastOpenedWorkingCopyPath: String?
@@ -74,7 +74,7 @@ final class DashboardModel {
             configurationStore: store,
             loadActivityLog: true
         )
-        model.refreshSimulationLocations()
+        model.refreshLocationCards()
         return model
     }
 
@@ -104,9 +104,9 @@ final class DashboardModel {
             ActivityLogEntry(
                 action: .verifyManifest,
                 state: .done,
-                title: "Completed safe demo",
+                title: "Completed local simulation",
                 summary: "4 copied, 1 quarantined, 1 left alone.",
-                detail: "Created fake files, verified the demo archive manifest, and moved only verified buffer files to quarantine."
+                detail: "Created local simulation files, verified the archive manifest, and moved only verified buffer files to quarantine."
             ),
             ActivityLogEntry(
                 action: .ingestCard,
@@ -134,13 +134,13 @@ final class DashboardModel {
                 title: "Permanent delete",
                 detail: "Requires typed DELETE confirmation",
                 state: .passed,
-                helpText: "The real delete path stays behind an explicit typed confirmation. The current demo moves files to quarantine only."
+                helpText: "The real delete path stays behind an explicit typed confirmation. Local simulation moves files to quarantine only."
             ),
             SafetyCheck(
-                title: "Real volumes",
-                detail: "Disabled while the demo workflow is being hardened",
+                title: "Execution lock",
+                detail: "Real writes and uploads require deliberate unlock",
                 state: .attention,
-                helpText: "Real camera cards, drives, NAS folders, and Immich uploads are intentionally locked out in this build. Immich connection checks are allowed because they do not move files."
+                helpText: "Real camera cards, drives, NAS folders, and Immich uploads are represented by locked workflow plans. Immich connection checks are allowed because they do not move files."
             )
         ]
     )
@@ -181,13 +181,13 @@ extension DashboardModel {
 
     func chooseImportFolder() {
         if chooseFolder(title: "Choose Import Source", keyPath: \.importSourcePath) {
-            statusMessage = "Selected \(URL(fileURLWithPath: configuration.importSourcePath).lastPathComponent). Use Preview Copy before running the demo import."
+            statusMessage = "Selected \(URL(fileURLWithPath: configuration.importSourcePath).lastPathComponent). Use Preview Copy Plan to inspect the configured archive comparison."
             recordActivity(
                 action: .ingestCard,
                 state: .done,
                 title: "Selected source folder",
                 summary: statusMessage,
-                detail: "The selected folder will be scanned locally. Demo mode still writes only to the configured demo archive."
+                detail: "The selected folder will be scanned locally. Real writes remain locked; simulation runs use disposable local folders."
             )
         }
     }
@@ -342,16 +342,16 @@ extension DashboardModel {
     func seedSimulation() {
         runJob(
             action: .ingestCard,
-            runningNote: "Creating fake card, archive, and buffer",
-            logTitle: "Made demo files",
-            logDetail: "Recreated the fake card, fake archive, and fake buffer under Application Support."
+            runningNote: "Creating local simulation source, archive, and buffer",
+            logTitle: "Seeded simulation files",
+            logDetail: "Recreated the local simulation source, archive, and buffer under Application Support."
         ) {
             try simulationWorkspace.resetAndSeed()
             setConfigPath(\.importSourcePath, to: simulationWorkspace.sourceCard.path)
             activePlan = try simulationWorkspace.previewImport()
             simulationSummary = nil
-            statusMessage = "Demo files are ready at \(simulationWorkspace.root.path)."
-            refreshSimulationLocations()
+            statusMessage = "Simulation files are ready at \(simulationWorkspace.root.path)."
+            refreshLocationCards()
         }
     }
 
@@ -360,10 +360,10 @@ extension DashboardModel {
             action: .ingestCard,
             runningNote: "Planning immutable copy",
             logTitle: "Previewed copy plan",
-            logDetail: "Scanned the source and demo archive. No files were copied during preview."
+            logDetail: "Scanned the configured source and archive. No files were copied during preview."
         ) {
             let source = URL(fileURLWithPath: expandedImportSourcePath)
-            let destination = simulationWorkspace.archive
+            let destination = URL(fileURLWithPath: Self.expandedPath(configuration.archivePath), isDirectory: true)
             activePlan = try ArchivePlanner().planCopy(source: source, destination: destination)
             statusMessage = "Preview ready: \(activePlan.new.count) new, \(activePlan.existing.count) already archived, \(activePlan.conflicts.count) conflicts."
         }
@@ -372,9 +372,9 @@ extension DashboardModel {
     func runSimulationImport() {
         runJob(
             action: .ingestCard,
-            runningNote: "Copying into demo archive",
-            logTitle: "Ran demo import",
-            logDetail: "Copied new files into the demo archive, refused overwrites, verified checksums, and wrote a manifest."
+            runningNote: "Copying into local simulation archive",
+            logTitle: "Ran local import simulation",
+            logDetail: "Copied new files into the local simulation archive, refused overwrites, verified checksums, and wrote a manifest."
         ) {
             let result = try simulationWorkspace.runImport()
             simulationSummary = SimulationSummary(
@@ -388,8 +388,8 @@ extension DashboardModel {
                 leftUnsafeCount: 0
             )
             activePlan = try simulationWorkspace.previewImport()
-            statusMessage = "Demo import verified. Manifest OK: \(result.manifest.ok ? "yes" : "no")."
-            refreshSimulationLocations()
+            statusMessage = "Local import simulation verified. Manifest OK: \(result.manifest.ok ? "yes" : "no")."
+            refreshLocationCards()
         }
     }
 
@@ -397,8 +397,8 @@ extension DashboardModel {
         runJob(
             action: .freeUp,
             runningNote: "Checksum comparing buffer before quarantine",
-            logTitle: "Ran free-up demo",
-            logDetail: "Moved only buffer files that matched the demo archive checksum into local quarantine."
+            logTitle: "Ran free-up simulation",
+            logDetail: "Moved only simulation buffer files that matched the archive checksum into local quarantine."
         ) {
             let report = try simulationWorkspace.runFreeUp()
             simulationSummary = SimulationSummary(
@@ -411,24 +411,24 @@ extension DashboardModel {
                 quarantinedCount: report.moved.count,
                 leftUnsafeCount: report.notOnArchive.count + report.differ.count + report.errors.count
             )
-            statusMessage = "Free-up demo quarantined \(report.moved.count) verified files and left \(simulationSummary?.leftUnsafeCount ?? 0) unsafe file(s) alone."
-            refreshSimulationLocations()
+            statusMessage = "Free-up simulation quarantined \(report.moved.count) verified files and left \(simulationSummary?.leftUnsafeCount ?? 0) unsafe file(s) alone."
+            refreshLocationCards()
         }
     }
 
     func runFullSimulation() {
         runJob(
             action: .verifyManifest,
-            runningNote: "Running safe demo",
-            logTitle: "Completed safe demo",
-            logDetail: "Created fake files, copied new files to the demo archive, verified the manifest, and quarantined only proven-safe buffer files."
+            runningNote: "Running local simulation",
+            logTitle: "Completed local simulation",
+            logDetail: "Created local simulation files, copied new files to the archive, verified the manifest, and quarantined only proven-safe buffer files."
         ) {
             let summary = try simulationWorkspace.runFullSimulation()
             simulationSummary = summary
             setConfigPath(\.importSourcePath, to: summary.sourcePath)
             activePlan = try simulationWorkspace.previewImport()
-            statusMessage = "Safe demo complete: \(summary.copiedCount) copied, \(summary.quarantinedCount) quarantined, \(summary.leftUnsafeCount) left alone."
-            refreshSimulationLocations()
+            statusMessage = "Local simulation complete: \(summary.copiedCount) copied, \(summary.quarantinedCount) quarantined, \(summary.leftUnsafeCount) left alone."
+            refreshLocationCards()
         }
     }
 
@@ -440,7 +440,7 @@ extension DashboardModel {
         defer {
             isRefreshing = false
             lastRefreshedAt = Date()
-            refreshSimulationLocations()
+            refreshLocationCards()
         }
 
         var notes: [String] = []
@@ -507,7 +507,7 @@ extension DashboardModel {
     private func refreshCopyPlanIfPossible() -> String? {
         do {
             let source = URL(fileURLWithPath: expandedImportSourcePath)
-            let destination = simulationWorkspace.archive
+            let destination = URL(fileURLWithPath: Self.expandedPath(configuration.archivePath), isDirectory: true)
             activePlan = try ArchivePlanner().planCopy(source: source, destination: destination)
             return "\(activePlan.new.count) new in plan"
         } catch {
@@ -525,7 +525,7 @@ extension DashboardModel {
             let report = try await client.testConnection()
             immichConnectionReport = report
             immichConnectionStatus = "Connected to Immich \(report.version) as \(report.userName) <\(report.userEmail)>."
-            refreshSimulationLocations()
+            refreshLocationCards()
             if shouldRecordActivity {
                 recordActivity(
                     action: .immichScan,
@@ -538,7 +538,7 @@ extension DashboardModel {
         } catch {
             immichConnectionReport = nil
             immichConnectionStatus = "Immich connection failed: \(error.localizedDescription)"
-            refreshSimulationLocations()
+            refreshLocationCards()
             if shouldRecordActivity {
                 recordActivity(
                     action: .immichScan,
@@ -627,7 +627,7 @@ extension DashboardModel {
             configMessage = "Could not save config: \(error.localizedDescription)"
         }
         rebuildWorkflowPlans()
-        refreshSimulationLocations()
+        refreshLocationCards()
     }
 
     private func rebuildWorkflowPlans() {
@@ -637,14 +637,24 @@ extension DashboardModel {
         )
     }
 
-    private func refreshSimulationLocations() {
-        let workspace = simulationWorkspace
+    private func refreshLocationCards() {
+        let source = URL(fileURLWithPath: expandedImportSourcePath, isDirectory: true)
+        let archive = URL(fileURLWithPath: Self.expandedPath(configuration.archivePath), isDirectory: true)
+        let buffer = URL(fileURLWithPath: Self.expandedPath(configuration.bufferPath), isDirectory: true)
         locations = [
-            LocationCard(kind: .card, title: "Fake Card", subtitle: workspace.sourceCard.lastPathComponent, status: .ready, detail: workspace.sourceCard.path),
-            LocationCard(kind: .drive, title: "Demo Buffer", subtitle: workspace.buffer.lastPathComponent, status: .warning, detail: "Local test folder"),
-            LocationCard(kind: .nas, title: "Demo Archive", subtitle: workspace.archive.lastPathComponent, status: .ready, detail: "Local checksum target"),
+            LocationCard(kind: .card, title: "Import Source", subtitle: displayName(for: source), status: status(forFolder: source), detail: source.path),
+            LocationCard(kind: .drive, title: "Buffer", subtitle: displayName(for: buffer), status: .warning, detail: "Locked free-up plan: \(buffer.path)"),
+            LocationCard(kind: .nas, title: "Archive", subtitle: displayName(for: archive), status: status(forFolder: archive), detail: archive.path),
             immichLocationCard
         ]
+    }
+
+    private func status(forFolder url: URL) -> LocationStatus {
+        FileManager.default.fileExists(atPath: url.path) ? .ready : .warning
+    }
+
+    private func displayName(for url: URL) -> String {
+        url.lastPathComponent.isEmpty ? url.path : url.lastPathComponent
     }
 
     private var immichLocationCard: LocationCard {

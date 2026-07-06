@@ -119,27 +119,27 @@ struct SidebarView: View {
                         .font(.title3)
                         .foregroundStyle(AppTheme.mint)
                     HelpButton(
-                        title: "Safe Demo",
-                        message: "The app is currently locked to fake local folders under Application Support. It can show the workflow and run safety checks without touching a real camera card, drive, NAS, or Immich server."
+                        title: "Execution Locked",
+                        message: "Configured folders, tools, and Immich endpoints are live in the workspace. Real writes, deletes, and uploads stay locked until you deliberately add an execution path."
                     )
                 }
                 .padding(10)
                 .frame(maxWidth: .infinity)
                 .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 8))
                 .padding(8)
-                .help("Safe Demo: fake local folders only")
+                .help("Execution locked")
             } else {
                 VStack(alignment: .leading, spacing: 8) {
                     HStack(spacing: 6) {
-                        Label("Safe Demo", systemImage: "lock.shield")
+                        Label("Ready Workspace", systemImage: "lock.shield")
                             .font(.headline)
                             .foregroundStyle(AppTheme.mint)
                         HelpButton(
-                            title: "Safe Demo",
-                            message: "The app is currently locked to fake local folders under Application Support. It can show the workflow and run safety checks without touching a real camera card, drive, NAS, or Immich server."
+                            title: "Ready Workspace",
+                            message: "The app points at persistent config, real workflow plans, and live Immich connection checks. Local simulations are available for proof runs, while real writes remain locked."
                         )
                     }
-                    Text("Only fake local folders are touched.")
+                    Text("Real plans are shown; execution stays locked.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -215,13 +215,13 @@ struct DetailContainer<Content: View>: View {
                     refreshAll: refreshAll
                 )
                 HStack(spacing: 6) {
-                    Label("Demo only", systemImage: "testtube.2")
+                    Label("Execution locked", systemImage: "lock.shield")
                         .font(.callout.weight(.medium))
                         .foregroundStyle(AppTheme.amber)
                         .labelStyle(.titleAndIcon)
                     HelpButton(
-                        title: "Demo only",
-                        message: "Buttons run against fake folders unless a future real-device mode is deliberately unlocked. That keeps testing safe while the transfer and free-up rules are still being hardened."
+                        title: "Execution locked",
+                        message: "The workspace reads persistent config and shows the exact planned commands and endpoints. Buttons that move bytes still run only local simulations unless a real execution path is explicitly added later."
                     )
                 }
             }

@@ -34,7 +34,7 @@ public struct SimulationSummary: Codable, Equatable, Sendable {
 public struct SimulationWorkspace {
     public let root: URL
 
-    public var sourceCard: URL { root.appendingPathComponent("Fake Card", isDirectory: true) }
+    public var sourceCard: URL { root.appendingPathComponent("Source Card", isDirectory: true) }
     public var archive: URL { root.appendingPathComponent("Archive", isDirectory: true) }
     public var buffer: URL { root.appendingPathComponent("Buffer", isDirectory: true) }
     public var trash: URL { buffer.appendingPathComponent("_Trash", isDirectory: true) }
@@ -73,12 +73,12 @@ public struct SimulationWorkspace {
     public func runImport() throws -> (copy: LocalCopyResult, check: CheckReport, manifest: ManifestVerificationReport) {
         let copy = try LocalTransferService().copyImmutable(source: sourceCard, destination: archive)
         if !copy.conflicts.isEmpty {
-            throw ToolkitError.commandFailed("Simulation import found immutable conflicts: \(copy.conflicts.joined(separator: ", "))")
+            throw ToolkitError.commandFailed("Local simulation import found immutable conflicts: \(copy.conflicts.joined(separator: ", "))")
         }
 
         let check = try LocalCheckService().check(source: sourceCard, destination: archive)
         if !check.ok {
-            throw ToolkitError.commandFailed("Simulation import failed verification")
+            throw ToolkitError.commandFailed("Local simulation import failed verification")
         }
 
         let store = ManifestStore()

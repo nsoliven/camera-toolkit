@@ -100,21 +100,21 @@ struct DriveView: View {
             WorkflowPlanPanel(plan: model.workflowPlan(.freeUpBuffer))
             CommandBar {
                 HelpedCommandButton(
-                    title: "Try Free-Up Demo",
+                    title: "Run Free-Up Simulation",
                     symbol: "archivebox",
                     prominence: .primary,
                     isDisabled: model.isBusy,
-                    helpTitle: "Try Free-Up Demo",
-                    helpText: "Looks at fake buffer files and moves only files that match the archive checksum into a local quarantine folder. Files missing from the archive stay put.",
+                    helpTitle: "Run Free-Up Simulation",
+                    helpText: "Looks at local simulation buffer files and moves only files that match the archive checksum into quarantine. Files missing from the archive stay put.",
                     action: model.runSimulationFreeUp
                 )
 
                 HelpedCommandButton(
-                    title: "Reset Demo",
+                    title: "Reset Simulation",
                     symbol: "arrow.counterclockwise",
                     isDisabled: model.isBusy,
-                    helpTitle: "Reset Demo",
-                    helpText: "Rebuilds the fake card, archive, and buffer folders so the free-up demo starts from known local test data.",
+                    helpTitle: "Reset Simulation",
+                    helpText: "Rebuilds the local simulation source, archive, and buffer folders so the free-up proof run starts from known test data.",
                     action: model.seedSimulation
                 )
             }
@@ -204,7 +204,7 @@ struct JobsView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
-            HeaderView(eyebrow: "Jobs", title: "Every action leaves a trail", subtitle: "Each demo action records what ran, whether it passed, and what the latest status was.")
+            HeaderView(eyebrow: "Jobs", title: "Every action leaves a trail", subtitle: "Actions are saved in plain language with what ran, whether it passed, and what the latest status was.")
             ActivityLogPanel(entries: model.activityLog)
             JobsStrip(jobs: model.jobs)
         }
@@ -226,49 +226,49 @@ struct ConfigView: View {
                 title: "Folders",
                 symbol: "folder",
                 helpTitle: "Folders",
-                helpText: "These paths are saved in Camera Toolkit config. Demo Root is used by the safe demo today; the archive, buffer, and log paths are kept here so real integrations have one source of truth later."
+                helpText: "These paths are saved in Camera Toolkit config. Source, archive, buffer, simulation, and log paths all live here so the workspace has one persistent source of truth."
             ) {
                 ConfigPathRow(
-                    title: "Demo Root",
-                    detail: "Fake card, demo archive, and demo buffer live under this folder.",
+                    title: "Simulation Root",
+                    detail: "Local proof-run source, archive, and buffer live under this folder.",
                     path: Binding(
                         get: { model.configuration.demoRootPath },
                         set: { model.setConfigPath(\.demoRootPath, to: $0) }
                     ),
-                    helpText: "The safe demo creates fake files under this root. Keep it somewhere local and disposable.",
-                    browse: { model.chooseFolder(title: "Choose Demo Root", keyPath: \.demoRootPath) }
+                    helpText: "Local simulations create disposable files under this root. Keep it somewhere local and safe to reset.",
+                    browse: { model.chooseFolder(title: "Choose Simulation Root", keyPath: \.demoRootPath) }
                 )
 
                 ConfigPathRow(
                     title: "Import Source",
-                    detail: "The source folder used by Preview Copy and demo import.",
+                    detail: "The source folder used by Library and Preview Copy.",
                     path: Binding(
                         get: { model.configuration.importSourcePath },
                         set: { model.setConfigPath(\.importSourcePath, to: $0) }
                     ),
-                    helpText: "Use this for a local folder you want to scan. Demo mode still writes only to demo storage.",
+                    helpText: "Use this for the folder you want to scan. Preview Copy reads this path and compares it to the configured archive without copying.",
                     browse: { model.chooseFolder(title: "Choose Import Source", keyPath: \.importSourcePath) }
                 )
 
                 ConfigPathRow(
                     title: "Archive Folder",
-                    detail: "Long-term verified archive target for future real mode.",
+                    detail: "Long-term verified archive target for locked import plans.",
                     path: Binding(
                         get: { model.configuration.archivePath },
                         set: { model.setConfigPath(\.archivePath, to: $0) }
                     ),
-                    helpText: "This is saved now but not used for real writes until real storage mode is intentionally unlocked.",
+                    helpText: "Preview Copy compares against this folder now. Real archive writes stay locked until you intentionally add execution.",
                     browse: { model.chooseFolder(title: "Choose Archive Folder", keyPath: \.archivePath) }
                 )
 
                 ConfigPathRow(
                     title: "Buffer Folder",
-                    detail: "Temporary working storage for future free-up checks.",
+                    detail: "Temporary working storage for locked free-up plans.",
                     path: Binding(
                         get: { model.configuration.bufferPath },
                         set: { model.setConfigPath(\.bufferPath, to: $0) }
                     ),
-                    helpText: "This is the place the app will eventually free up after checksum verification. Demo mode keeps this local.",
+                    helpText: "This is the configured free-up source. Real quarantine/free-up execution stays locked until intentionally enabled.",
                     browse: { model.chooseFolder(title: "Choose Buffer Folder", keyPath: \.bufferPath) }
                 )
 
@@ -332,8 +332,8 @@ struct ConfigView: View {
                                 set: { value in model.setImportDestination(value) }
                             )
                         ) {
-                            Text("Demo Archive").tag(TransferLocation.nas)
-                            Text("Demo Buffer").tag(TransferLocation.drive)
+                            Text("Archive").tag(TransferLocation.nas)
+                            Text("Buffer").tag(TransferLocation.drive)
                         }
                         .pickerStyle(.segmented)
                     }

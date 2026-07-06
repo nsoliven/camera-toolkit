@@ -89,7 +89,7 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
 
         return AppConfiguration(
             demoRootPath: demoRoot.path,
-            importSourcePath: demoRoot.appendingPathComponent("Fake Card", isDirectory: true).path,
+            importSourcePath: demoRoot.appendingPathComponent("Source Card", isDirectory: true).path,
             archivePath: demoRoot.appendingPathComponent("Archive", isDirectory: true).path,
             bufferPath: demoRoot.appendingPathComponent("Buffer", isDirectory: true).path,
             activityLogPath: root.appendingPathComponent("activity-log.jsonl").path,

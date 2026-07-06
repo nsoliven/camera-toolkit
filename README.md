@@ -24,11 +24,11 @@ This is a new private repo. The original Python `camera-toolkit` repo is not mov
 
 ## Current App Surface
 
-- Overview and Import run the safe fake-folder demo.
+- Overview is a real workspace: configured paths, locked transfer plans, local simulation, editor handoff, and Immich connection status are visible together.
 - Library scans the configured import source for common photo and RAW formats; clicking a row opens a protected working copy in Preview by default.
 - Config is the single persistent settings screen for folders, batch defaults, Immich, external editors, and working-copy paths.
 - Immich can test the current API connection through ping, version, and current-user endpoints. Uploads remain locked until the transfer path is proven separately.
-- Locked workflow plans show the configured rclone copy/check commands, exiftool metadata read command, Immich `/api/assets` upload endpoint, quarantine target, and editor checkout path.
+- Locked workflow plans show the configured rclone copy/check commands, exiftool metadata read command, Immich `/api/assets` upload endpoint, quarantine target, and editor checkout path. Preview Copy compares the configured source against the configured archive without moving bytes.
 - `Command-B` toggles the sidebar. `Command-R` refreshes config, activity log, library scan, copy plan, and Immich connection status when credentials are configured.
 
 ## Build
@@ -45,4 +45,4 @@ scripts/package-app.sh
 open dist/CameraToolkit.app
 ```
 
-The current app uses fake local folders for transfer demos and locked plans for real workflows. Core tests use temporary directories only.
+The current app is not demo-only: it reads persistent config, previews real planned paths, and runs Immich connection checks. Byte-moving workflows remain locked, with local simulations available for safe proof runs. Core tests use temporary directories only.

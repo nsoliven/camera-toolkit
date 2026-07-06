@@ -8,8 +8,8 @@ struct ImportView: View {
         VStack(alignment: .leading, spacing: 22) {
             HeaderView(
                 eyebrow: "Import",
-                title: "Preview the copy before bytes move",
-                subtitle: "Pick a local source or make fake demo files, inspect the plan, then run the import against the demo archive."
+                title: "Plan imports against your archive",
+                subtitle: "Pick a source, preview the checksum-safe copy plan against the configured Archive Folder, then use local simulation for disposable proof runs."
             )
 
             Panel(
@@ -27,30 +27,30 @@ struct ImportView: View {
 
                 CommandBar {
                     HelpedCommandButton(
-                        title: "Make Demo Files",
+                        title: "Seed Simulation",
                         symbol: "wand.and.stars",
                         isDisabled: model.isBusy,
-                        helpTitle: "Make Demo Files",
-                        helpText: "Creates fake camera files, a fake existing archive file, and a fake buffer file so you can test the workflow safely.",
+                        helpTitle: "Seed Simulation",
+                        helpText: "Creates camera-style local test files, an existing archive file, and a buffer file so you can proof the workflow safely.",
                         action: model.seedSimulation
                     )
 
                     HelpedCommandButton(
-                        title: "Preview Copy",
+                        title: "Preview Copy Plan",
                         symbol: "eye",
                         prominence: .primary,
                         isDisabled: model.isBusy,
-                        helpTitle: "Preview Copy",
-                        helpText: "Scans the source and archive, then shows which files are new, already present, or conflicting before anything copies.",
+                        helpTitle: "Preview Copy Plan",
+                        helpText: "Scans the configured source and archive folders, then shows which files are new, already present, or conflicting before anything copies.",
                         action: model.previewImport
                     )
 
                     HelpedCommandButton(
-                        title: "Run Demo Import",
+                        title: "Run Local Simulation",
                         symbol: "checkmark.seal",
                         isDisabled: model.isBusy,
-                        helpTitle: "Run Demo Import",
-                        helpText: "Copies only new files into the demo archive, refuses overwrites, compares checksums, and writes a manifest if verification passes.",
+                        helpTitle: "Run Local Simulation",
+                        helpText: "Copies only new simulation files, refuses overwrites, compares checksums, and writes a manifest if verification passes.",
                         action: model.runSimulationImport
                     )
 

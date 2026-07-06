@@ -7,27 +7,27 @@ struct OverviewView: View {
         VStack(alignment: .leading, spacing: 22) {
             HeaderView(
                 eyebrow: "Native archive console",
-                title: "Try the photo workflow with fake files",
-                subtitle: "The demo builds a fake card, copies into a local archive, verifies checksums, and quarantines only files proven safe."
+                title: "Camera workflow control center",
+                subtitle: "Configured paths, transfer tools, editor handoff, and Immich checks live in one workspace. Execution stays locked until you deliberately add a real run path."
             )
 
             CommandBar {
                 HelpedCommandButton(
-                    title: "Try Safe Demo",
+                    title: "Run Local Simulation",
                     symbol: "play.circle",
                     prominence: .primary,
                     isDisabled: model.isBusy,
-                    helpTitle: "What happens in the safe demo?",
-                    helpText: "This creates a fake camera card, copies new files into a fake archive, writes and verifies a manifest, then moves one already-verified buffer file into a local quarantine folder. It does not touch real storage.",
+                    helpTitle: "Run Local Simulation",
+                    helpText: "This creates disposable camera-style files, copies new files into a local simulation archive, writes and verifies a manifest, then quarantines only files proven safe.",
                     action: model.runFullSimulation
                 )
 
                 HelpedCommandButton(
-                    title: "Reset Demo",
+                    title: "Reset Simulation",
                     symbol: "arrow.counterclockwise",
                     isDisabled: model.isBusy,
-                    helpTitle: "Reset Demo",
-                    helpText: "This recreates the fake card, fake archive, and fake buffer folders so you can run the workflow again from a clean local test state.",
+                    helpTitle: "Reset Simulation",
+                    helpText: "This recreates the local simulation source, archive, and buffer folders so you can proof the workflow again from a clean state.",
                     action: model.seedSimulation
                 )
             }

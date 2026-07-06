@@ -235,10 +235,10 @@ struct SimulationSummaryPanel: View {
 
     var body: some View {
         Panel(
-            title: "Demo Result",
+            title: "Simulation Result",
             symbol: "checklist.checked",
-            helpTitle: "Demo Result",
-            helpText: "This summarizes the last demo action. Copied files reached the demo archive, quarantined files were proven safe to move out of the demo buffer, and left-alone files were not safe to remove."
+            helpTitle: "Simulation Result",
+            helpText: "This summarizes the last local simulation action. Copied files reached the simulation archive, quarantined files were proven safe to move out of the buffer, and left-alone files were not safe to remove."
         ) {
             Text(statusMessage)
                 .font(.callout)
@@ -294,7 +294,7 @@ struct ActivityLogPanel: View {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("No saved actions yet.")
                         .font(.headline)
-                    Text("Run a safe demo, preview a copy, or make demo files and the app will append an entry here.")
+                    Text("Run a local simulation, preview a copy plan, or seed simulation files and the app will append an entry here.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                 }

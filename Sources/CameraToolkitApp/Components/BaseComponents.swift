@@ -100,8 +100,8 @@ struct HeaderView: View {
     var eyebrow: String
     var title: String
     var subtitle: String
-    var badgeTitle: String = "Safe Demo"
-    var badgeSubtitle: String = "Fake local folders only"
+    var badgeTitle: String = "Ready Workspace"
+    var badgeSubtitle: String = "Execution locked"
 
     var body: some View {
         ViewThatFits(in: .horizontal) {
@@ -140,9 +140,9 @@ private struct HeaderBadge: View {
 
     var body: some View {
         VStack(alignment: .trailing, spacing: 8) {
-            Label(title, systemImage: "testtube.2")
+            Label(title, systemImage: "lock.shield")
                 .font(.headline)
-                .foregroundStyle(AppTheme.amber)
+                .foregroundStyle(AppTheme.mint)
             Text(subtitle)
                 .font(.caption)
                 .foregroundStyle(.secondary)

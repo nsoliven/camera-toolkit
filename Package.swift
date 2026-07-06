@@ -20,6 +20,10 @@ let package = Package(
         .testTarget(
             name: "CameraToolkitCoreTests",
             dependencies: ["CameraToolkitCore"]
+        ),
+        .testTarget(
+            name: "CameraToolkitAppTests",
+            dependencies: ["CameraToolkitApp", "CameraToolkitCore"]
         )
     ]
 )

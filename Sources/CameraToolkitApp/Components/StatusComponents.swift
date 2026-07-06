@@ -70,7 +70,7 @@ struct SafetyPanel: View {
             title: "Safety Gates",
             symbol: "lock.shield",
             helpTitle: "Safety Gates",
-            helpText: "These are the rules that protect real files later: no overwrite-style archive copies, no freeing space until checksums match, no permanent delete without confirmation, and real volumes locked during demo mode."
+            helpText: "These are the rules that protect real files: no overwrite-style archive copies, no freeing space until checksums match, no permanent delete without confirmation, and real writes/uploads locked until deliberately enabled."
         ) {
             ForEach(checks) { check in
                 HStack(alignment: .top, spacing: 12) {
