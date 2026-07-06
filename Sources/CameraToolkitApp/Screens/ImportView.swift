@@ -65,6 +65,7 @@ struct ImportView: View {
                 }
             }
 
+            WorkflowPlanPanel(plan: model.workflowPlan(.importArchive))
             TransferFlowPanel(plan: model.activePlan)
             SimulationSummaryPanel(summary: model.simulationSummary, statusMessage: model.statusMessage)
         }

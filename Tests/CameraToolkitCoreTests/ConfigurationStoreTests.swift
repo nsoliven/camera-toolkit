@@ -24,6 +24,8 @@ final class ConfigurationStoreTests: XCTestCase {
                 immichServerURL: "http://photos.local:2283",
                 editorWorkingFolderPath: root.appendingPathComponent("Working Copies").path,
                 externalEditor: .photomator,
+                rcloneBinaryPath: "/opt/homebrew/bin/rclone",
+                exiftoolBinaryPath: "/opt/homebrew/bin/exiftool",
                 selectedDeviceID: "dji-mini-2",
                 eventName: "Test Trip",
                 importDestination: .drive
@@ -58,6 +60,8 @@ final class ConfigurationStoreTests: XCTestCase {
             XCTAssertEqual(loaded.immichServerURL, "")
             XCTAssertEqual(loaded.externalEditor, .preview)
             XCTAssertTrue(loaded.editorWorkingFolderPath.hasSuffix("Editor Working Copies"))
+            XCTAssertEqual(loaded.rcloneBinaryPath, "rclone")
+            XCTAssertEqual(loaded.exiftoolBinaryPath, "exiftool")
         }
     }
 }

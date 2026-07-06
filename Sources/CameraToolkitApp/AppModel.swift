@@ -10,6 +10,7 @@ final class DashboardModel {
     var isSidebarCollapsed: Bool = false
     var locations: [LocationCard]
     var activePlan: CopyPlan
+    var workflowPlans: [WorkflowPlan] = []
     var jobs: [JobSnapshot]
     var activityLog: [ActivityLogEntry]
     var configuration: AppConfiguration
@@ -55,6 +56,7 @@ final class DashboardModel {
         if !immichAPIKeyDraft.isEmpty {
             self.immichConnectionStatus = "API key is saved in Keychain. Test the connection when the server is reachable."
         }
+        rebuildWorkflowPlans()
     }
 
     static func live() -> DashboardModel {
@@ -153,6 +155,10 @@ extension DashboardModel {
         isSidebarCollapsed.toggle()
     }
 
+    func workflowPlan(_ kind: WorkflowPlanKind) -> WorkflowPlan? {
+        workflowPlans.first { $0.kind == kind }
+    }
+
     func refreshAllIfStale(maxAge: TimeInterval = 15) {
         guard let lastRefreshedAt else {
             refreshAll()
@@ -245,9 +251,18 @@ extension DashboardModel {
         updateConfiguration { $0.externalEditor = value }
     }
 
+    func setRcloneBinaryPath(_ value: String) {
+        updateConfiguration { $0.rcloneBinaryPath = value.trimmingCharacters(in: .whitespacesAndNewlines) }
+    }
+
+    func setExiftoolBinaryPath(_ value: String) {
+        updateConfiguration { $0.exiftoolBinaryPath = value.trimmingCharacters(in: .whitespacesAndNewlines) }
+    }
+
     func saveImmichAPIKey() {
         do {
             try secretStore.save(immichAPIKeyDraft, account: Self.immichAPIKeyAccount)
+            rebuildWorkflowPlans()
             immichConnectionStatus = immichAPIKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 ? "API key removed from Keychain."
                 : "API key saved in Keychain."
@@ -467,6 +482,7 @@ extension DashboardModel {
         if let planNote = refreshCopyPlanIfPossible() {
             notes.append(planNote)
         }
+        rebuildWorkflowPlans()
 
         let serverURL = configuration.immichServerURL.trimmingCharacters(in: .whitespacesAndNewlines)
         let apiKey = immichAPIKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -476,6 +492,7 @@ extension DashboardModel {
         }
 
         statusMessage = "Refreshed latest: \(notes.joined(separator: ", "))."
+        rebuildWorkflowPlans()
     }
 
     @discardableResult
@@ -532,6 +549,7 @@ extension DashboardModel {
                 )
             }
         }
+        rebuildWorkflowPlans()
     }
 
     private func librarySourceURL(for file: FileRecord) throws -> URL {
@@ -608,7 +626,15 @@ extension DashboardModel {
         } catch {
             configMessage = "Could not save config: \(error.localizedDescription)"
         }
+        rebuildWorkflowPlans()
         refreshSimulationLocations()
+    }
+
+    private func rebuildWorkflowPlans() {
+        workflowPlans = WorkflowPlanner().plans(
+            for: configuration,
+            hasImmichAPIKey: !immichAPIKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        )
     }
 
     private func refreshSimulationLocations() {

@@ -2,7 +2,7 @@
 
 The app is split into two targets:
 
-- `CameraToolkitCore`: transfer planning, checksum verification, manifests, quarantine, command construction, Immich API connection checks, editor working-copy creation, and job state.
+- `CameraToolkitCore`: transfer planning, checksum verification, manifests, quarantine, command construction, locked workflow planning, Immich API connection checks, editor working-copy creation, and job state.
 - `CameraToolkitApp`: native SwiftUI macOS interface, persistent config, Keychain secret storage, Finder-style folder picking, and AppKit editor launching.
 
 ## Core Ownership
@@ -14,6 +14,7 @@ The UI does not decide whether a file is safe to delete or quarantine. That live
 - `FreeUpService`: converts a fresh check report into quarantine actions.
 - `ManifestStore`: builds and verifies SHA-256 manifests.
 - `RcloneCommandBuilder`: constructs only allowlisted `rclone` commands.
+- `WorkflowPlanner`: builds non-executing plans for import, free-up, Immich upload, external editor checkout, and metadata reads.
 - `ImmichClient`: normalizes server URLs and tests current Immich API connectivity without uploading.
 - `EditorWorkingCopyService`: copies source photos into a working folder before external editors open them.
 - `JobRunner`: serialized actor for long-running job state.
@@ -23,6 +24,8 @@ The UI does not decide whether a file is safe to delete or quarantine. That live
 The Swift app intentionally does not reimplement `rclone` or photo editors. Reimplementing transfer engines, SMB edge behavior, retry semantics, and checksum comparison would make the rewrite less stable. Swift owns orchestration and safety gates; mature tools do the heavy I/O work.
 
 Preview is the default photo opener. Photomator and Topaz Photo are selectable external editors. The app opens a copied file under the configured working-copy folder, not the source original.
+
+Real archive import, buffer free-up, Immich upload, and metadata workflows are represented as locked plans. A plan can show exact paths, argv arrays, endpoints, and safety gates, but it is not an execution path.
 
 ## Testing Boundary
 

@@ -18,6 +18,7 @@ This is a new private repo. The original Python `camera-toolkit` repo is not mov
 - Verified files move into `_Trash/<batch>/`; permanent delete is separate and requires `DELETE`.
 - Archive copies use `rclone copy --checksum --immutable`.
 - Low-level command builder rejects destructive `rclone` subcommands such as `sync`, `move`, `delete`, and `purge`.
+- Real transfer, free-up, metadata, and Immich upload workflows are rendered as locked plans with exact commands/endpoints; the UI does not execute them.
 - Clicking a photo opens an editor working copy by default, so Preview, Photomator, or Topaz Photo do not mutate the source original.
 - Immich API keys are stored in macOS Keychain, not in `config.json` or the activity log.
 
@@ -27,6 +28,7 @@ This is a new private repo. The original Python `camera-toolkit` repo is not mov
 - Library scans the configured import source for common photo and RAW formats; clicking a row opens a protected working copy in Preview by default.
 - Config is the single persistent settings screen for folders, batch defaults, Immich, external editors, and working-copy paths.
 - Immich can test the current API connection through ping, version, and current-user endpoints. Uploads remain locked until the transfer path is proven separately.
+- Locked workflow plans show the configured rclone copy/check commands, exiftool metadata read command, Immich `/api/assets` upload endpoint, quarantine target, and editor checkout path.
 - `Command-B` toggles the sidebar. `Command-R` refreshes config, activity log, library scan, copy plan, and Immich connection status when credentials are configured.
 
 ## Build
@@ -43,4 +45,4 @@ scripts/package-app.sh
 open dist/CameraToolkit.app
 ```
 
-The current app uses fake local folders for transfer demos. Core tests use temporary directories only.
+The current app uses fake local folders for transfer demos and locked plans for real workflows. Core tests use temporary directories only.

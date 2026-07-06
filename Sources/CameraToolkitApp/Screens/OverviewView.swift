@@ -36,6 +36,20 @@ struct OverviewView: View {
 
             ViewThatFits(in: .horizontal) {
                 HStack(alignment: .top, spacing: 16) {
+                    WorkflowPlanPanel(plan: model.workflowPlan(.importArchive))
+                        .frame(minWidth: 0, maxWidth: .infinity)
+                    WorkflowPlanPanel(plan: model.workflowPlan(.freeUpBuffer))
+                        .frame(minWidth: 0, maxWidth: .infinity)
+                }
+
+                VStack(alignment: .leading, spacing: 16) {
+                    WorkflowPlanPanel(plan: model.workflowPlan(.importArchive))
+                    WorkflowPlanPanel(plan: model.workflowPlan(.freeUpBuffer))
+                }
+            }
+
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .top, spacing: 16) {
                     TransferFlowPanel(plan: model.activePlan)
                         .frame(minWidth: 0, maxWidth: .infinity)
                     SafetyPanel(checks: model.safetyChecks)

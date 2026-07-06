@@ -58,6 +58,8 @@ struct LibraryView: View {
                 }
             }
 
+            WorkflowPlanPanel(plan: model.workflowPlan(.editorCheckout))
+
             Panel(
                 title: "Photos",
                 symbol: "photo.on.rectangle.angled",
@@ -95,6 +97,7 @@ struct DriveView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
             HeaderView(eyebrow: "Drive", title: "Free space without losing originals", subtitle: "Free-up is quarantine-only after a live checksum comparison against the archive.")
+            WorkflowPlanPanel(plan: model.workflowPlan(.freeUpBuffer))
             CommandBar {
                 HelpedCommandButton(
                     title: "Try Free-Up Demo",
@@ -190,6 +193,8 @@ struct ImmichView: View {
                     MetricPill(title: "Uploads", value: "locked for now", symbol: "lock", tint: AppTheme.amber)
                 }
             }
+
+            WorkflowPlanPanel(plan: model.workflowPlan(.immichUpload))
         }
     }
 }
@@ -454,14 +459,42 @@ struct ConfigView: View {
                 title: "Transfer Tools",
                 symbol: "wrench.and.screwdriver",
                 helpTitle: "Transfer Tools",
-                helpText: "The app keeps stable transfer logic in tested Swift services while preserving rclone-style safety rules for copy, checksum, and immutable archive writes."
+                helpText: "The app keeps stable transfer logic in tested Swift services while preserving rclone-style safety rules for copy, checksum, and immutable archive writes. These paths are used for plan previews only in this locked build."
             ) {
+                Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 16) {
+                    GridRow {
+                        FormFieldLabel(title: "rclone", helpText: "Used to preview immutable copy and checksum commands. The app does not execute these commands in locked mode.")
+                        TextField(
+                            "rclone",
+                            text: Binding(
+                                get: { model.configuration.rcloneBinaryPath },
+                                set: { model.setRcloneBinaryPath($0) }
+                            )
+                        )
+                        .textFieldStyle(.roundedBorder)
+                    }
+
+                    GridRow {
+                        FormFieldLabel(title: "exiftool", helpText: "Used to preview read-only metadata commands for future batch naming and manifests.")
+                        TextField(
+                            "exiftool",
+                            text: Binding(
+                                get: { model.configuration.exiftoolBinaryPath },
+                                set: { model.setExiftoolBinaryPath($0) }
+                            )
+                        )
+                        .textFieldStyle(.roundedBorder)
+                    }
+                }
+
                 HStack(spacing: 12) {
-                    MetricPill(title: "Transfer engine", value: "safe Swift services", symbol: "arrow.left.arrow.right", tint: AppTheme.accent)
-                    MetricPill(title: "External editors", value: "Preview, Photomator, Topaz", symbol: "paintbrush", tint: AppTheme.mint)
-                    MetricPill(title: "Immich", value: "connection ready", symbol: "network", tint: AppTheme.amber)
+                    MetricPill(title: "Transfer engine", value: "rclone planned", symbol: "arrow.left.arrow.right", tint: AppTheme.accent)
+                    MetricPill(title: "Metadata", value: "exiftool read-only", symbol: "camera.metering.matrix", tint: AppTheme.mint)
+                    MetricPill(title: "Real execution", value: "locked", symbol: "lock", tint: AppTheme.amber)
                 }
             }
+
+            WorkflowPlanPanel(plan: model.workflowPlan(.metadataRead))
         }
     }
 }

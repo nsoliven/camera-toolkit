@@ -9,6 +9,8 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
     public var immichServerURL: String
     public var editorWorkingFolderPath: String
     public var externalEditor: ExternalEditor
+    public var rcloneBinaryPath: String
+    public var exiftoolBinaryPath: String
     public var selectedDeviceID: String
     public var eventName: String
     public var importDestination: TransferLocation
@@ -22,6 +24,8 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         immichServerURL: String = "",
         editorWorkingFolderPath: String = "",
         externalEditor: ExternalEditor = .preview,
+        rcloneBinaryPath: String = "rclone",
+        exiftoolBinaryPath: String = "exiftool",
         selectedDeviceID: String = "sony-a7v",
         eventName: String = "Lee Canyon",
         importDestination: TransferLocation = .nas
@@ -34,6 +38,8 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         self.immichServerURL = immichServerURL
         self.editorWorkingFolderPath = editorWorkingFolderPath
         self.externalEditor = externalEditor
+        self.rcloneBinaryPath = rcloneBinaryPath
+        self.exiftoolBinaryPath = exiftoolBinaryPath
         self.selectedDeviceID = selectedDeviceID
         self.eventName = eventName
         self.importDestination = importDestination
@@ -48,6 +54,8 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         case immichServerURL
         case editorWorkingFolderPath
         case externalEditor
+        case rcloneBinaryPath
+        case exiftoolBinaryPath
         case selectedDeviceID
         case eventName
         case importDestination
@@ -67,6 +75,8 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         immichServerURL = try values.decodeIfPresent(String.self, forKey: .immichServerURL) ?? defaults.immichServerURL
         editorWorkingFolderPath = try values.decodeIfPresent(String.self, forKey: .editorWorkingFolderPath) ?? defaults.editorWorkingFolderPath
         externalEditor = try values.decodeIfPresent(ExternalEditor.self, forKey: .externalEditor) ?? defaults.externalEditor
+        rcloneBinaryPath = try values.decodeIfPresent(String.self, forKey: .rcloneBinaryPath) ?? defaults.rcloneBinaryPath
+        exiftoolBinaryPath = try values.decodeIfPresent(String.self, forKey: .exiftoolBinaryPath) ?? defaults.exiftoolBinaryPath
         selectedDeviceID = try values.decodeIfPresent(String.self, forKey: .selectedDeviceID) ?? defaults.selectedDeviceID
         eventName = try values.decodeIfPresent(String.self, forKey: .eventName) ?? defaults.eventName
         importDestination = try values.decodeIfPresent(TransferLocation.self, forKey: .importDestination) ?? defaults.importDestination

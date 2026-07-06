@@ -52,6 +52,111 @@ struct TransferFlowPanel: View {
     }
 }
 
+struct WorkflowPlanPanel: View {
+    var plan: WorkflowPlan?
+
+    var body: some View {
+        Panel(
+            title: plan?.title ?? "Workflow Plan",
+            symbol: "point.topleft.down.curvedto.point.bottomright.up",
+            helpTitle: "Workflow Plan",
+            helpText: "This shows the exact planned paths, commands, endpoints, and safety gates. Locked plans are not executed by the app."
+        ) {
+            if let plan {
+                HStack(spacing: 12) {
+                    MetricPill(title: "Status", value: plan.status.displayName, symbol: plan.status.symbol, tint: plan.status.tint)
+                    MetricPill(title: "Steps", value: "\(plan.steps.count)", symbol: "list.bullet.rectangle", tint: AppTheme.accent)
+                    MetricPill(title: "Writes", value: "\(plan.steps.filter(\.writesFiles).count)", symbol: "pencil.and.outline", tint: AppTheme.amber)
+                }
+
+                Text(plan.summary)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                VStack(alignment: .leading, spacing: 10) {
+                    ForEach(plan.steps) { step in
+                        WorkflowPlanStepRow(step: step)
+                    }
+                }
+
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Safety Gates")
+                        .font(.headline)
+                    ForEach(plan.gates) { gate in
+                        HStack(alignment: .top, spacing: 10) {
+                            Image(systemName: gate.isSatisfied ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                                .foregroundStyle(gate.isSatisfied ? AppTheme.mint : AppTheme.amber)
+                                .frame(width: 20)
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(gate.title)
+                                    .font(.callout.weight(.semibold))
+                                Text(gate.detail)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(2)
+                                    .truncationMode(.middle)
+                            }
+                            Spacer()
+                        }
+                    }
+                }
+            } else {
+                Text("No plan available yet. Open Config and refresh.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+}
+
+private struct WorkflowPlanStepRow: View {
+    var step: WorkflowPlanStep
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                Label(step.title, systemImage: step.writesFiles ? "pencil.and.outline" : "eye")
+                    .font(.headline)
+                Text(step.isExecutableNow ? "available now" : "locked")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(step.isExecutableNow ? AppTheme.mint : AppTheme.amber)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background((step.isExecutableNow ? AppTheme.mint : AppTheme.amber).opacity(0.12), in: RoundedRectangle(cornerRadius: 7))
+                Spacer()
+            }
+
+            Text(step.detail)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+                .truncationMode(.middle)
+
+            if let endpoint = step.endpoint {
+                Text(endpoint)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(AppTheme.accent)
+                    .lineLimit(2)
+                    .truncationMode(.middle)
+            }
+
+            if let command = step.command, !command.isEmpty {
+                Text(command.shellPreview)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.primary)
+                    .lineLimit(4)
+                    .truncationMode(.middle)
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color.black.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
+            }
+        }
+        .padding(12)
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 8))
+    }
+}
+
 struct FlowNode: View {
     var title: String
     var symbol: String
@@ -68,6 +173,44 @@ struct FlowNode: View {
                 .font(.caption.weight(.medium))
         }
         .frame(maxWidth: .infinity)
+    }
+}
+
+private extension WorkflowPlanStatus {
+    var displayName: String {
+        switch self {
+        case .ready: "Ready"
+        case .needsConfig: "Needs Config"
+        case .locked: "Locked"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .ready: "checkmark.circle"
+        case .needsConfig: "slider.horizontal.3"
+        case .locked: "lock"
+        }
+    }
+
+    var tint: Color {
+        switch self {
+        case .ready: AppTheme.mint
+        case .needsConfig: AppTheme.amber
+        case .locked: AppTheme.amber
+        }
+    }
+}
+
+private extension Array where Element == String {
+    var shellPreview: String {
+        map { value in
+            if value.rangeOfCharacter(from: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: #""'\"#))) == nil {
+                return value
+            }
+            return "'\(value.replacingOccurrences(of: "'", with: "'\\''"))'"
+        }
+        .joined(separator: " ")
     }
 }
 
