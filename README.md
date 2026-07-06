@@ -27,6 +27,7 @@ This is a new private repo. The original Python `camera-toolkit` repo is not mov
 - Library scans the configured import source for common photo and RAW formats; clicking a row opens a protected working copy in Preview by default.
 - Config is the single persistent settings screen for folders, batch defaults, Immich, external editors, and working-copy paths.
 - Immich can test the current API connection through ping, version, and current-user endpoints. Uploads remain locked until the transfer path is proven separately.
+- `Command-B` toggles the sidebar. `Command-R` refreshes config, activity log, library scan, copy plan, and Immich connection status when credentials are configured.
 
 ## Build
 

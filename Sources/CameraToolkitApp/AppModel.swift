@@ -7,6 +7,7 @@ import Observation
 @Observable
 final class DashboardModel {
     var selectedSection: AppSection = .overview
+    var isSidebarCollapsed: Bool = false
     var locations: [LocationCard]
     var activePlan: CopyPlan
     var jobs: [JobSnapshot]
@@ -23,6 +24,8 @@ final class DashboardModel {
     var immichConnectionStatus: String = "Not connected. Add your server URL and API key in Config."
     var immichConnectionReport: ImmichConnectionReport?
     var immichIsTestingConnection: Bool = false
+    var isRefreshing: Bool = false
+    var lastRefreshedAt: Date?
     @ObservationIgnored private let configurationStore: ConfigurationStore
     @ObservationIgnored private let secretStore = KeychainSecretStore(service: "org.cameratoolkit.CameraToolkit")
     @ObservationIgnored private let editorLauncher = ExternalEditorLauncher()
@@ -135,7 +138,7 @@ final class DashboardModel {
                 title: "Real volumes",
                 detail: "Disabled while the demo workflow is being hardened",
                 state: .attention,
-                helpText: "Real camera cards, drives, NAS folders, and Immich calls are intentionally locked out in this build."
+                helpText: "Real camera cards, drives, NAS folders, and Immich uploads are intentionally locked out in this build. Immich connection checks are allowed because they do not move files."
             )
         ]
     )
@@ -144,6 +147,30 @@ final class DashboardModel {
 extension DashboardModel {
     var simulationWorkspace: SimulationWorkspace {
         SimulationWorkspace(root: URL(fileURLWithPath: Self.expandedPath(configuration.demoRootPath)))
+    }
+
+    func toggleSidebar() {
+        isSidebarCollapsed.toggle()
+    }
+
+    func refreshAllIfStale(maxAge: TimeInterval = 15) {
+        guard let lastRefreshedAt else {
+            refreshAll()
+            return
+        }
+        if Date().timeIntervalSince(lastRefreshedAt) >= maxAge {
+            refreshAll()
+        }
+    }
+
+    func refreshAll() {
+        guard !isRefreshing else { return }
+        isRefreshing = true
+        statusMessage = "Refreshing latest app state..."
+
+        Task { @MainActor in
+            await refreshAllNow()
+        }
     }
 
     func chooseImportFolder() {
@@ -244,34 +271,8 @@ extension DashboardModel {
 
         do {
             try secretStore.save(apiKey, account: Self.immichAPIKeyAccount)
-            let client = try ImmichClient(serverURL: serverURL, apiKey: apiKey)
-            immichIsTestingConnection = true
-            immichConnectionStatus = "Testing Immich connection..."
-
             Task { @MainActor in
-                defer { immichIsTestingConnection = false }
-                do {
-                    let report = try await client.testConnection()
-                    immichConnectionReport = report
-                    immichConnectionStatus = "Connected to Immich \(report.version) as \(report.userName) <\(report.userEmail)>."
-                    refreshSimulationLocations()
-                    recordActivity(
-                        action: .immichScan,
-                        state: .done,
-                        title: "Tested Immich connection",
-                        summary: immichConnectionStatus,
-                        detail: "Called stable Immich endpoints for ping, server version, and current user. The API key stays in macOS Keychain and is not written to the activity log."
-                    )
-                } catch {
-                    immichConnectionStatus = "Immich connection failed: \(error.localizedDescription)"
-                    recordActivity(
-                        action: .immichScan,
-                        state: .failed,
-                        title: "Immich connection failed",
-                        summary: immichConnectionStatus,
-                        detail: "No upload was attempted."
-                    )
-                }
+                await performImmichConnectionCheck(serverURL: serverURL, apiKey: apiKey, shouldRecordActivity: true)
             }
         } catch {
             immichConnectionStatus = "Could not prepare Immich connection: \(error.localizedDescription)"
@@ -280,13 +281,10 @@ extension DashboardModel {
 
     func refreshLibraryFiles() {
         do {
-            let root = URL(fileURLWithPath: expandedImportSourcePath, isDirectory: true)
-            let records = try FileScanner().scan(root: root)
-                .filter { MediaFileMatcher.isSupportedPhotoPath($0.path) }
-            libraryFiles = records
+            let records = try loadLibraryFiles()
             statusMessage = records.isEmpty
-                ? "No supported photo files found in \(root.path)."
-                : "Found \(records.count) supported photo file(s) in \(root.path)."
+                ? "No supported photo files found in \(expandedImportSourcePath)."
+                : "Found \(records.count) supported photo file(s) in \(expandedImportSourcePath)."
         } catch {
             libraryFiles = []
             statusMessage = "Could not scan library source: \(error.localizedDescription)"
@@ -421,6 +419,119 @@ extension DashboardModel {
 
     private var expandedImportSourcePath: String {
         Self.expandedPath(configuration.importSourcePath)
+    }
+
+    private func refreshAllNow() async {
+        defer {
+            isRefreshing = false
+            lastRefreshedAt = Date()
+            refreshSimulationLocations()
+        }
+
+        var notes: [String] = []
+
+        do {
+            let defaults = AppConfiguration.defaults(applicationSupport: Self.defaultApplicationSupportURL)
+            configuration = try configurationStore.load(defaults: defaults)
+            configMessage = "Config reloaded at \(Self.defaultConfigurationURL.path)."
+            notes.append("config")
+        } catch {
+            configMessage = "Could not reload config: \(error.localizedDescription)"
+            notes.append("config failed")
+        }
+
+        do {
+            immichAPIKeyDraft = try secretStore.read(account: Self.immichAPIKeyAccount) ?? ""
+            if !immichAPIKeyDraft.isEmpty, immichConnectionReport == nil {
+                immichConnectionStatus = "API key is saved in Keychain. Test the connection when the server is reachable."
+            }
+        } catch {
+            immichConnectionStatus = "Could not reload Immich API key from Keychain: \(error.localizedDescription)"
+        }
+
+        do {
+            activityLog = try ActivityLogStore(url: URL(fileURLWithPath: Self.expandedPath(configuration.activityLogPath))).load()
+            notes.append("\(activityLog.count) log entries")
+        } catch {
+            notes.append("log unavailable")
+        }
+
+        do {
+            let records = try loadLibraryFiles()
+            notes.append("\(records.count) photos")
+        } catch {
+            libraryFiles = []
+            notes.append("library unavailable")
+        }
+
+        if let planNote = refreshCopyPlanIfPossible() {
+            notes.append(planNote)
+        }
+
+        let serverURL = configuration.immichServerURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let apiKey = immichAPIKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !serverURL.isEmpty, !apiKey.isEmpty {
+            await performImmichConnectionCheck(serverURL: serverURL, apiKey: apiKey, shouldRecordActivity: false)
+            notes.append("Immich")
+        }
+
+        statusMessage = "Refreshed latest: \(notes.joined(separator: ", "))."
+    }
+
+    @discardableResult
+    private func loadLibraryFiles() throws -> [FileRecord] {
+        let root = URL(fileURLWithPath: expandedImportSourcePath, isDirectory: true)
+        let records = try FileScanner().scan(root: root)
+            .filter { MediaFileMatcher.isSupportedPhotoPath($0.path) }
+        libraryFiles = records
+        return records
+    }
+
+    private func refreshCopyPlanIfPossible() -> String? {
+        do {
+            let source = URL(fileURLWithPath: expandedImportSourcePath)
+            let destination = simulationWorkspace.archive
+            activePlan = try ArchivePlanner().planCopy(source: source, destination: destination)
+            return "\(activePlan.new.count) new in plan"
+        } catch {
+            return nil
+        }
+    }
+
+    private func performImmichConnectionCheck(serverURL: String, apiKey: String, shouldRecordActivity: Bool) async {
+        do {
+            let client = try ImmichClient(serverURL: serverURL, apiKey: apiKey)
+            immichIsTestingConnection = true
+            immichConnectionStatus = "Testing Immich connection..."
+            defer { immichIsTestingConnection = false }
+
+            let report = try await client.testConnection()
+            immichConnectionReport = report
+            immichConnectionStatus = "Connected to Immich \(report.version) as \(report.userName) <\(report.userEmail)>."
+            refreshSimulationLocations()
+            if shouldRecordActivity {
+                recordActivity(
+                    action: .immichScan,
+                    state: .done,
+                    title: "Tested Immich connection",
+                    summary: immichConnectionStatus,
+                    detail: "Called stable Immich endpoints for ping, server version, and current user. The API key stays in macOS Keychain and is not written to the activity log."
+                )
+            }
+        } catch {
+            immichConnectionReport = nil
+            immichConnectionStatus = "Immich connection failed: \(error.localizedDescription)"
+            refreshSimulationLocations()
+            if shouldRecordActivity {
+                recordActivity(
+                    action: .immichScan,
+                    state: .failed,
+                    title: "Immich connection failed",
+                    summary: immichConnectionStatus,
+                    detail: "No upload was attempted."
+                )
+            }
+        }
     }
 
     private func librarySourceURL(for file: FileRecord) throws -> URL {

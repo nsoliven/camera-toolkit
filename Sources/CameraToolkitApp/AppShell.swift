@@ -1,18 +1,24 @@
 import CameraToolkitCore
+import AppKit
 import SwiftUI
 
 struct AppShell: View {
     @Bindable var model: DashboardModel
-    @State private var isSidebarCollapsed = false
 
     var body: some View {
         ZStack {
             AppTheme.background.ignoresSafeArea()
 
             HStack(spacing: 0) {
-                SidebarView(model: model, isCollapsed: $isSidebarCollapsed)
-                    .frame(width: isSidebarCollapsed ? 74 : 252)
-                    .animation(.snappy(duration: 0.18), value: isSidebarCollapsed)
+                SidebarView(
+                    model: model,
+                    isCollapsed: Binding(
+                        get: { model.isSidebarCollapsed },
+                        set: { model.isSidebarCollapsed = $0 }
+                    )
+                )
+                .frame(width: model.isSidebarCollapsed ? 74 : 252)
+                .animation(.snappy(duration: 0.18), value: model.isSidebarCollapsed)
 
                 Rectangle()
                     .fill(Color.primary.opacity(0.08))
@@ -20,12 +26,21 @@ struct AppShell: View {
 
                 DetailContainer(
                     section: model.selectedSection,
-                    isSidebarCollapsed: isSidebarCollapsed,
-                    toggleSidebar: toggleSidebar
+                    isSidebarCollapsed: model.isSidebarCollapsed,
+                    isRefreshing: model.isRefreshing,
+                    lastRefreshedAt: model.lastRefreshedAt,
+                    toggleSidebar: toggleSidebar,
+                    refreshAll: model.refreshAll
                 ) {
                     detailView
                 }
             }
+        }
+        .onAppear {
+            model.refreshAllIfStale(maxAge: 0)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            model.refreshAllIfStale()
         }
     }
 
@@ -51,7 +66,7 @@ struct AppShell: View {
 
     private func toggleSidebar() {
         withAnimation(.snappy(duration: 0.18)) {
-            isSidebarCollapsed.toggle()
+            model.toggleSidebar()
         }
     }
 }
@@ -181,7 +196,10 @@ struct SidebarRow: View {
 struct DetailContainer<Content: View>: View {
     var section: AppSection
     var isSidebarCollapsed: Bool
+    var isRefreshing: Bool
+    var lastRefreshedAt: Date?
     var toggleSidebar: () -> Void
+    var refreshAll: () -> Void
     @ViewBuilder var content: Content
 
     var body: some View {
@@ -191,6 +209,11 @@ struct DetailContainer<Content: View>: View {
                 Label(section.rawValue, systemImage: section.symbol)
                     .font(.headline)
                 Spacer()
+                RefreshControl(
+                    isRefreshing: isRefreshing,
+                    lastRefreshedAt: lastRefreshedAt,
+                    refreshAll: refreshAll
+                )
                 HStack(spacing: 6) {
                     Label("Demo only", systemImage: "testtube.2")
                         .font(.callout.weight(.medium))
@@ -220,6 +243,39 @@ struct DetailContainer<Content: View>: View {
             .scrollIndicators(.visible)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+}
+
+private struct RefreshControl: View {
+    var isRefreshing: Bool
+    var lastRefreshedAt: Date?
+    var refreshAll: () -> Void
+
+    var body: some View {
+        HStack(spacing: 8) {
+            if isRefreshing {
+                ProgressView()
+                    .controlSize(.small)
+                    .accessibilityLabel("Refreshing")
+            }
+            if let lastRefreshedAt {
+                Text("Updated \(lastRefreshedAt.formatted(date: .omitted, time: .shortened))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Button(action: refreshAll) {
+                Image(systemName: "arrow.clockwise")
+                    .font(.system(size: 14, weight: .semibold))
+                    .frame(width: 28, height: 28)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .disabled(isRefreshing)
+            .help("Refresh all (Command-R)")
+            .accessibilityLabel("Refresh all")
+        }
     }
 }
 

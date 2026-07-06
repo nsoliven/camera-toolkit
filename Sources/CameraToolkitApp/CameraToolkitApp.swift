@@ -15,6 +15,18 @@ struct CameraToolkitApp: App {
         .windowResizability(.contentMinSize)
         .commands {
             SidebarCommands()
+            CommandGroup(after: .sidebar) {
+                Button("Toggle Camera Toolkit Sidebar") {
+                    model.toggleSidebar()
+                }
+                .keyboardShortcut("b", modifiers: .command)
+
+                Button(model.isRefreshing ? "Refreshing All" : "Refresh All") {
+                    model.refreshAll()
+                }
+                .keyboardShortcut("r", modifiers: .command)
+                .disabled(model.isRefreshing)
+            }
         }
 
         Settings {
