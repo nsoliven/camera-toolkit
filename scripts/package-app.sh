@@ -14,6 +14,7 @@ swift build -c release --product CameraToolkit
 rm -rf "$app"
 mkdir -p "$macos" "$resources"
 cp ".build/release/CameraToolkit" "$macos/CameraToolkit"
+"$repo_root/scripts/make-app-icon.swift" "$resources/AppIcon.icns"
 
 cat > "$contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -25,6 +26,8 @@ cat > "$contents/Info.plist" <<'PLIST'
   <string>CameraToolkit</string>
   <key>CFBundleIdentifier</key>
   <string>org.cameratoolkit.CameraToolkit</string>
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
   <key>CFBundleName</key>
   <string>Camera Toolkit</string>
   <key>CFBundleDisplayName</key>
