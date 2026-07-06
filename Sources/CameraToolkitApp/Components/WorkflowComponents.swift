@@ -12,16 +12,9 @@ struct TransferFlowPanel: View {
             title: "Copy Plan",
             symbol: "arrow.triangle.2.circlepath",
             helpTitle: "Copy Plan",
-            helpText: "This is the dry-run view. New files can be copied, already archived files are skipped, and conflicts mean the same path exists with different bytes."
+            helpText: "This is the dry-run view. Follow the numbered flow from source to archive verification. New files can be copied, already archived files are skipped, and conflicts mean the same path exists with different bytes."
         ) {
-            HStack(spacing: 12) {
-                FlowNode(title: "Card", symbol: "sdcard", tint: AppTheme.accent)
-                FlowArrow(label: "copy")
-                FlowNode(title: "Archive", symbol: "server.rack", tint: AppTheme.mint)
-                FlowArrow(label: "verify")
-                FlowNode(title: "Manifest", symbol: "checkmark.seal", tint: .purple)
-            }
-            .padding(.vertical, 4)
+            CopyFlowPath()
 
             HStack(spacing: 12) {
                 MetricPill(title: "New files", value: "\(plan.new.count)", symbol: "plus.circle", tint: AppTheme.mint)
@@ -47,6 +40,160 @@ struct TransferFlowPanel: View {
             .padding(12)
             .background(Color.black.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
         }
+    }
+}
+
+private struct CopyFlowPath: View {
+    private let stages = [
+        FlowStage(number: 1, title: "Source", subtitle: "Configured card folder", symbol: "sdcard", tint: AppTheme.accent),
+        FlowStage(number: 2, title: "Copy", subtitle: "Checksum + immutable", symbol: "arrow.right.doc.on.clipboard", tint: AppTheme.mint),
+        FlowStage(number: 3, title: "Verify", subtitle: "Compare archive bytes", symbol: "checkmark.shield", tint: AppTheme.amber),
+        FlowStage(number: 4, title: "Manifest", subtitle: "Record the result", symbol: "checklist.checked", tint: .purple)
+    ]
+
+    var body: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(alignment: .center, spacing: 10) {
+                ForEach(Array(stages.enumerated()), id: \.element.id) { index, stage in
+                    FlowStageCard(stage: stage)
+                        .frame(minWidth: 130, maxWidth: .infinity)
+                    if index < stages.count - 1 {
+                        FlowConnector()
+                    }
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 10) {
+                ForEach(Array(stages.enumerated()), id: \.element.id) { index, stage in
+                    FlowStageRow(stage: stage)
+                    if index < stages.count - 1 {
+                        VerticalFlowConnector()
+                    }
+                }
+            }
+        }
+        .padding(.vertical, 4)
+    }
+}
+
+private struct FlowStage: Identifiable {
+    var id: Int { number }
+    var number: Int
+    var title: String
+    var subtitle: String
+    var symbol: String
+    var tint: Color
+}
+
+private struct FlowStageCard: View {
+    var stage: FlowStage
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .top, spacing: 10) {
+                StepNumberBadge(number: stage.number, tint: stage.tint)
+                Spacer(minLength: 8)
+                Image(systemName: stage.symbol)
+                    .font(.title3)
+                    .frame(width: 40, height: 36)
+                    .foregroundStyle(stage.tint)
+                    .background(stage.tint.opacity(0.14), in: RoundedRectangle(cornerRadius: 8))
+            }
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(stage.title)
+                    .font(.headline)
+                Text(stage.subtitle)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(12)
+        .frame(minHeight: 116, alignment: .topLeading)
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 8))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(stage.tint.opacity(0.18))
+        )
+    }
+}
+
+private struct FlowStageRow: View {
+    var stage: FlowStage
+
+    var body: some View {
+        HStack(spacing: 12) {
+            StepNumberBadge(number: stage.number, tint: stage.tint)
+            Image(systemName: stage.symbol)
+                .font(.headline)
+                .foregroundStyle(stage.tint)
+                .frame(width: 30)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(stage.title)
+                    .font(.headline)
+                Text(stage.subtitle)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+        }
+        .padding(12)
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+private struct StepNumberBadge: View {
+    var number: Int
+    var tint: Color
+
+    var body: some View {
+        VStack(spacing: 1) {
+            Text("STEP")
+                .font(.system(size: 8, weight: .bold))
+                .foregroundStyle(tint)
+            Text("\(number)")
+                .font(.system(size: 16, weight: .bold, design: .rounded))
+                .foregroundStyle(.primary)
+        }
+        .frame(width: 42, height: 42)
+        .background(tint.opacity(0.14), in: RoundedRectangle(cornerRadius: 8))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(tint.opacity(0.22))
+        )
+    }
+}
+
+private struct FlowConnector: View {
+    var body: some View {
+        HStack(spacing: 5) {
+            Rectangle()
+                .fill(AppTheme.accent.opacity(0.34))
+                .frame(width: 28, height: 2)
+            Image(systemName: "arrow.right.circle.fill")
+                .font(.headline)
+                .foregroundStyle(AppTheme.accent)
+        }
+        .frame(width: 54)
+        .accessibilityHidden(true)
+    }
+}
+
+private struct VerticalFlowConnector: View {
+    var body: some View {
+        HStack(spacing: 10) {
+            Rectangle()
+                .fill(AppTheme.accent.opacity(0.34))
+                .frame(width: 2, height: 16)
+                .padding(.leading, 20)
+            Image(systemName: "arrow.down")
+                .font(.caption.weight(.bold))
+                .foregroundStyle(AppTheme.accent)
+            Spacer()
+        }
+        .accessibilityHidden(true)
     }
 }
 
@@ -159,11 +306,7 @@ struct WorkflowPlanPanel: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
 
-                VStack(alignment: .leading, spacing: 10) {
-                    ForEach(plan.steps) { step in
-                        WorkflowPlanStepRow(step: step)
-                    }
-                }
+                WorkflowStepTimeline(steps: plan.steps)
 
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Safety Gates")
@@ -197,67 +340,96 @@ struct WorkflowPlanPanel: View {
 
 private struct WorkflowPlanStepRow: View {
     var step: WorkflowPlanStep
+    var number: Int
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(alignment: .firstTextBaseline, spacing: 10) {
-                Label(step.title, systemImage: step.writesFiles ? "pencil.and.outline" : "eye")
-                    .font(.headline)
-                Text(step.isExecutableNow ? "available now" : "locked")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(step.isExecutableNow ? AppTheme.mint : AppTheme.amber)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 3)
-                    .background((step.isExecutableNow ? AppTheme.mint : AppTheme.amber).opacity(0.12), in: RoundedRectangle(cornerRadius: 7))
-                Spacer()
-            }
+        HStack(alignment: .top, spacing: 12) {
+            StepNumberBadge(number: number, tint: stepTint)
 
-            Text(step.detail)
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .lineLimit(2)
-                .truncationMode(.middle)
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(alignment: .firstTextBaseline, spacing: 10) {
+                    Label(step.title, systemImage: step.writesFiles ? "pencil.and.outline" : "eye")
+                        .font(.headline)
+                    Text(step.isExecutableNow ? "available now" : "locked")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(stepTint)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(stepTint.opacity(0.12), in: RoundedRectangle(cornerRadius: 7))
+                    Spacer()
+                }
 
-            if let endpoint = step.endpoint {
-                Text(endpoint)
-                    .font(.caption.monospaced())
-                    .foregroundStyle(AppTheme.accent)
+                Text(step.detail)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
                     .lineLimit(2)
                     .truncationMode(.middle)
-            }
 
-            if let command = step.command, !command.isEmpty {
-                Text(command.shellPreview)
-                    .font(.caption.monospaced())
-                    .foregroundStyle(.primary)
-                    .lineLimit(4)
-                    .truncationMode(.middle)
-                    .padding(10)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color.black.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
+                if let endpoint = step.endpoint {
+                    Text(endpoint)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(AppTheme.accent)
+                        .lineLimit(2)
+                        .truncationMode(.middle)
+                }
+
+                if let command = step.command, !command.isEmpty {
+                    Text(command.shellPreview)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.primary)
+                        .lineLimit(4)
+                        .truncationMode(.middle)
+                        .padding(10)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color.black.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
+                }
             }
         }
         .padding(12)
         .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 8))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(stepTint.opacity(0.14))
+        )
+    }
+
+    private var stepTint: Color {
+        step.isExecutableNow ? AppTheme.mint : AppTheme.amber
     }
 }
 
-struct FlowNode: View {
-    var title: String
-    var symbol: String
-    var tint: Color
+private struct WorkflowStepTimeline: View {
+    var steps: [WorkflowPlanStep]
 
     var body: some View {
-        VStack(spacing: 8) {
-            Image(systemName: symbol)
-                .font(.title2)
-                .frame(width: 52, height: 46)
-                .background(tint.opacity(0.14), in: RoundedRectangle(cornerRadius: 8))
-                .foregroundStyle(tint)
-            Text(title)
-                .font(.caption.weight(.medium))
+        VStack(alignment: .leading, spacing: 0) {
+            ForEach(Array(steps.enumerated()), id: \.element.id) { index, step in
+                WorkflowPlanStepRow(step: step, number: index + 1)
+                if index < steps.count - 1 {
+                    WorkflowStepConnector()
+                }
+            }
         }
-        .frame(maxWidth: .infinity)
+    }
+}
+
+private struct WorkflowStepConnector: View {
+    var body: some View {
+        HStack(spacing: 10) {
+            Rectangle()
+                .fill(AppTheme.amber.opacity(0.28))
+                .frame(width: 2, height: 18)
+                .padding(.leading, 33)
+            Image(systemName: "arrow.down")
+                .font(.caption.weight(.bold))
+                .foregroundStyle(AppTheme.amber)
+            Text("then")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+            Spacer()
+        }
+        .padding(.vertical, 3)
+        .accessibilityHidden(true)
     }
 }
 
@@ -296,21 +468,6 @@ private extension Array where Element == String {
             return "'\(value.replacingOccurrences(of: "'", with: "'\\''"))'"
         }
         .joined(separator: " ")
-    }
-}
-
-struct FlowArrow: View {
-    var label: String
-
-    var body: some View {
-        VStack(spacing: 4) {
-            Image(systemName: "arrow.right")
-                .foregroundStyle(.secondary)
-            Text(label)
-                .font(.caption2.weight(.semibold))
-                .foregroundStyle(.secondary)
-        }
-        .frame(width: 46)
     }
 }
 
