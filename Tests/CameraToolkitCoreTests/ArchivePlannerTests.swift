@@ -55,4 +55,19 @@ final class ArchivePlannerTests: XCTestCase {
             XCTAssertTrue(report.match.isEmpty)
         }
     }
+
+    func testPlanCopyTreatsSameSizeDifferentBytesAsConflict() throws {
+        try withTemporaryDirectory { root in
+            let source = root.appendingPathComponent("src", isDirectory: true)
+            let destination = root.appendingPathComponent("dst", isDirectory: true)
+            try writeFile(source.appendingPathComponent("DCIM/a.ARW"), Data(repeating: 0x41, count: 4096))
+            try writeFile(destination.appendingPathComponent("DCIM/a.ARW"), Data(repeating: 0x42, count: 4096))
+
+            let plan = try ArchivePlanner().planCopy(source: source, destination: destination)
+
+            XCTAssertTrue(plan.new.isEmpty)
+            XCTAssertTrue(plan.existing.isEmpty)
+            XCTAssertEqual(plan.conflicts.map(\.path), ["DCIM/a.ARW"])
+        }
+    }
 }

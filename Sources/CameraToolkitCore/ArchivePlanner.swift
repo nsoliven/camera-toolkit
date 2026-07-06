@@ -8,11 +8,11 @@ public struct ArchivePlanner {
     }
 
     public func planCopy(source: URL, destination: URL, excludes: [String] = DefaultExcludes.all) throws -> CopyPlan {
-        let sourceFiles = try scanner.scan(root: source, excludes: excludes, hashing: false)
+        let sourceFiles = try scanner.scan(root: source, excludes: excludes, hashing: true)
         let destinationFiles: [FileRecord]
 
         if FileManager.default.fileExists(atPath: destination.path) {
-            destinationFiles = try scanner.scan(root: destination, excludes: excludes, hashing: false)
+            destinationFiles = try scanner.scan(root: destination, excludes: excludes, hashing: true)
         } else {
             destinationFiles = []
         }
@@ -26,7 +26,7 @@ public struct ArchivePlanner {
                 continue
             }
 
-            if existing.size == file.size {
+            if existing.sha256 == file.sha256 {
                 plan.existing.append(file)
             } else {
                 plan.conflicts.append(file)

@@ -30,6 +30,22 @@ final class EditorWorkingCopyServiceTests: XCTestCase {
         }
     }
 
+    func testWorkingCopyRefusesDirectorySource() throws {
+        try withTemporaryDirectory { root in
+            let sourceDirectory = root.appendingPathComponent("Card/DCIM", isDirectory: true)
+            try FileManager.default.createDirectory(at: sourceDirectory, withIntermediateDirectories: true)
+
+            XCTAssertThrowsError(
+                try EditorWorkingCopyService().makeWorkingCopy(
+                    source: sourceDirectory,
+                    workingRoot: root.appendingPathComponent("Working", isDirectory: true)
+                )
+            ) { error in
+                XCTAssertEqual(error as? ToolkitError, .pathNotFound(sourceDirectory.path))
+            }
+        }
+    }
+
     func testPhotoMatcherIncludesCommonRawAndPreviewFormats() {
         XCTAssertTrue(MediaFileMatcher.isSupportedPhotoPath("DCIM/DSC0001.ARW"))
         XCTAssertTrue(MediaFileMatcher.isSupportedPhotoPath("DCIM/DSC0002.HEIC"))
