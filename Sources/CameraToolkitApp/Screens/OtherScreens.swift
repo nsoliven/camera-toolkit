@@ -6,8 +6,85 @@ struct LibraryView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
-            HeaderView(eyebrow: "Library", title: "Archive browser", subtitle: "A native view for batches, manifests, and checkout-ready folders.")
+            HeaderView(
+                eyebrow: "Library",
+                title: "Open photos like a Mac app",
+                subtitle: "Browse the configured source folder, then click a photo to open a protected working copy in Preview by default."
+            )
+
+            Panel(
+                title: "Photo Source",
+                symbol: "photo.stack",
+                helpTitle: "Photo Source",
+                helpText: "This scans the Import Source from Config. Clicking a photo copies it into the Editor Working Copies folder before opening it, so the original source file is not modified by an editor."
+            ) {
+                VStack(alignment: .leading, spacing: 10) {
+                    DetailLine(title: "Source", value: model.configuration.importSourcePath)
+                    DetailLine(title: "Opens With", value: model.configuration.externalEditor.displayName)
+                    DetailLine(title: "Working Copies", value: model.configuration.editorWorkingFolderPath)
+                    if let lastOpenedWorkingCopyPath = model.lastOpenedWorkingCopyPath {
+                        DetailLine(title: "Last Opened", value: lastOpenedWorkingCopyPath)
+                    }
+                }
+
+                CommandBar {
+                    HelpedCommandButton(
+                        title: "Choose Source",
+                        symbol: "folder",
+                        isDisabled: model.isBusy,
+                        helpTitle: "Choose Source",
+                        helpText: "Pick the folder the Library tab scans for supported photo files.",
+                        action: model.chooseImportFolder
+                    )
+
+                    HelpedCommandButton(
+                        title: "Refresh",
+                        symbol: "arrow.clockwise",
+                        prominence: .primary,
+                        isDisabled: model.isBusy,
+                        helpTitle: "Refresh",
+                        helpText: "Rescans the configured source folder and lists supported photo files.",
+                        action: model.refreshLibraryFiles
+                    )
+
+                    HelpedCommandButton(
+                        title: "Edit Config",
+                        symbol: "slider.horizontal.3",
+                        isDisabled: model.isBusy,
+                        helpTitle: "Edit Config",
+                        helpText: "Open Config to change the default editor, working-copy folder, or source path.",
+                        action: { model.selectedSection = .config }
+                    )
+                }
+            }
+
+            Panel(
+                title: "Photos",
+                symbol: "photo.on.rectangle.angled",
+                helpTitle: "Photos",
+                helpText: "Single-clicking a row opens a working copy in the configured editor. Preview is the default editor, and real archive/source originals stay untouched."
+            ) {
+                if model.libraryFiles.isEmpty {
+                    EmptyLibraryState(refresh: model.refreshLibraryFiles)
+                } else {
+                    VStack(spacing: 0) {
+                        ForEach(model.libraryFiles.prefix(80)) { file in
+                            PhotoFileRow(file: file, editorName: model.configuration.externalEditor.displayName) {
+                                model.openLibraryFile(file)
+                            }
+                            if file.id != model.libraryFiles.prefix(80).last?.id {
+                                Divider()
+                            }
+                        }
+                    }
+                }
+            }
             SimulationSummaryPanel(summary: model.simulationSummary, statusMessage: model.statusMessage)
+        }
+        .onAppear {
+            if model.libraryFiles.isEmpty {
+                model.refreshLibraryFiles()
+            }
         }
     }
 }
@@ -49,10 +126,69 @@ struct ImmichView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
-            HeaderView(eyebrow: "Immich", title: "Library scan and upload control", subtitle: "Keep Immich as the view layer while the archive remains the source of truth.")
-            Panel(title: "Connection", symbol: "sparkles.rectangle.stack") {
-                MetricPill(title: "Server", value: "offline in demo", symbol: "network", tint: AppTheme.amber)
-                MetricPill(title: "External library", value: "Camera Archive", symbol: "rectangle.stack.badge.play", tint: AppTheme.mint)
+            HeaderView(
+                eyebrow: "Immich",
+                title: "Connection before upload",
+                subtitle: "Use the current Immich API for health, version, and user checks before any real upload path is enabled."
+            )
+            Panel(
+                title: "Connection",
+                symbol: "sparkles.rectangle.stack",
+                helpTitle: "Immich Connection",
+                helpText: "Connection testing uses Immich ping, server version, and current-user endpoints. The API key is stored in macOS Keychain, and uploads remain locked until the transfer path is separately proven safe."
+            ) {
+                HStack(spacing: 12) {
+                    MetricPill(
+                        title: "Server",
+                        value: model.configuration.immichServerURL.isEmpty ? "not configured" : model.configuration.immichServerURL,
+                        symbol: "network",
+                        tint: model.immichConnectionReport == nil ? AppTheme.amber : AppTheme.mint
+                    )
+                    MetricPill(
+                        title: "User",
+                        value: model.immichConnectionReport?.userEmail ?? "not connected",
+                        symbol: "person.crop.circle",
+                        tint: AppTheme.accent
+                    )
+                }
+
+                Text(model.immichConnectionStatus)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                CommandBar {
+                    HelpedCommandButton(
+                        title: model.immichIsTestingConnection ? "Testing" : "Test Connection",
+                        symbol: "bolt.horizontal.circle",
+                        prominence: .primary,
+                        isDisabled: model.immichIsTestingConnection,
+                        helpTitle: "Test Connection",
+                        helpText: "Calls the Immich server with the configured URL and Keychain API key. No files are uploaded.",
+                        action: model.testImmichConnection
+                    )
+
+                    HelpedCommandButton(
+                        title: "Edit Config",
+                        symbol: "slider.horizontal.3",
+                        isDisabled: model.immichIsTestingConnection,
+                        helpTitle: "Edit Config",
+                        helpText: "Open Config to edit the Immich server URL and API key.",
+                        action: { model.selectedSection = .config }
+                    )
+                }
+            }
+
+            Panel(
+                title: "Upload Gate",
+                symbol: "lock.shield",
+                helpTitle: "Upload Gate",
+                helpText: "Immich upload requires asset bytes, created and modified timestamps, and API-key permission. This app connects first, then keeps real upload disabled until source-copy verification is finished."
+            ) {
+                HStack(spacing: 12) {
+                    MetricPill(title: "API", value: "latest OpenAPI checked", symbol: "checkmark.seal", tint: AppTheme.mint)
+                    MetricPill(title: "Uploads", value: "locked for now", symbol: "lock", tint: AppTheme.amber)
+                }
             }
         }
     }
@@ -199,10 +335,132 @@ struct ConfigView: View {
                 }
             }
 
-            Panel(title: "External Tools", symbol: "wrench.and.screwdriver") {
-                MetricPill(title: "Transfer engine", value: "rclone command builder ready", symbol: "arrow.left.arrow.right", tint: AppTheme.accent)
-                MetricPill(title: "Metadata", value: "exiftool planned", symbol: "camera.metering.matrix", tint: AppTheme.mint)
-                MetricPill(title: "Uploads", value: "immich-go planned", symbol: "icloud.and.arrow.up", tint: .purple)
+            Panel(
+                title: "Immich",
+                symbol: "sparkles.rectangle.stack",
+                helpTitle: "Immich",
+                helpText: "The server URL is stored in config. The API key is stored separately in macOS Keychain, not in the JSON config or activity log."
+            ) {
+                Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 16) {
+                    GridRow {
+                        FormFieldLabel(title: "Server URL", helpText: "Use the base Immich URL, such as http://photos.local:2283. The app normalizes it to the /api endpoint internally.")
+                        TextField(
+                            "http://photos.local:2283",
+                            text: Binding(
+                                get: { model.configuration.immichServerURL },
+                                set: { value in model.setImmichServerURL(value) }
+                            )
+                        )
+                        .textFieldStyle(.roundedBorder)
+                    }
+
+                    GridRow {
+                        FormFieldLabel(title: "API Key", helpText: "Saved in macOS Keychain under the Camera Toolkit service. It is not written to config.json.")
+                        SecureField(
+                            "Immich API key",
+                            text: Binding(
+                                get: { model.immichAPIKeyDraft },
+                                set: { model.immichAPIKeyDraft = $0 }
+                            )
+                        )
+                        .textFieldStyle(.roundedBorder)
+                    }
+                }
+
+                Text(model.immichConnectionStatus)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                CommandBar {
+                    HelpedCommandButton(
+                        title: "Save Key",
+                        symbol: "key",
+                        isDisabled: model.immichIsTestingConnection,
+                        helpTitle: "Save Key",
+                        helpText: "Stores the API key in macOS Keychain. Leave the field empty and save to remove it.",
+                        action: model.saveImmichAPIKey
+                    )
+
+                    HelpedCommandButton(
+                        title: model.immichIsTestingConnection ? "Testing" : "Test Connection",
+                        symbol: "bolt.horizontal.circle",
+                        prominence: .primary,
+                        isDisabled: model.immichIsTestingConnection,
+                        helpTitle: "Test Connection",
+                        helpText: "Calls Immich ping, server version, and current user endpoints. No files are uploaded.",
+                        action: model.testImmichConnection
+                    )
+                }
+            }
+
+            Panel(
+                title: "External Editors",
+                symbol: "paintbrush.pointed",
+                helpTitle: "External Editors",
+                helpText: "Preview is the default. The Library tab opens a working copy from this folder so editor apps do not mutate the original source photo."
+            ) {
+                Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 16) {
+                    GridRow {
+                        FormFieldLabel(title: "Default Editor", helpText: "Choose which app opens when you click a photo in Library. Preview is the safest default because it is built into macOS.")
+                        Picker(
+                            "Default Editor",
+                            selection: Binding(
+                                get: { model.configuration.externalEditor },
+                                set: { value in model.setExternalEditor(value) }
+                            )
+                        ) {
+                            ForEach(ExternalEditor.allCases, id: \.self) { editor in
+                                Text(editor.displayName).tag(editor)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                    }
+
+                    GridRow {
+                        FormFieldLabel(title: "Working Copies", helpText: "Camera Toolkit copies photos here before opening them in Preview, Photomator, or Topaz Photo.")
+                        PathAutocompleteField(
+                            path: Binding(
+                                get: { model.configuration.editorWorkingFolderPath },
+                                set: { model.setConfigPath(\.editorWorkingFolderPath, to: $0) }
+                            ),
+                            placeholder: "/Users/you/Pictures/Camera Toolkit Working Copies"
+                        )
+                        .frame(height: 28)
+                    }
+                }
+
+                CommandBar {
+                    HelpedCommandButton(
+                        title: "Choose Folder",
+                        symbol: "folder",
+                        helpTitle: "Choose Working Folder",
+                        helpText: "Pick where protected working copies are created before an external editor opens them.",
+                        action: model.chooseEditorWorkingFolder
+                    )
+
+                    HelpedCommandButton(
+                        title: "Open Library",
+                        symbol: "photo.stack",
+                        prominence: .primary,
+                        helpTitle: "Open Library",
+                        helpText: "Go to Library and click a photo to open a working copy in the configured editor.",
+                        action: { model.selectedSection = .library }
+                    )
+                }
+            }
+
+            Panel(
+                title: "Transfer Tools",
+                symbol: "wrench.and.screwdriver",
+                helpTitle: "Transfer Tools",
+                helpText: "The app keeps stable transfer logic in tested Swift services while preserving rclone-style safety rules for copy, checksum, and immutable archive writes."
+            ) {
+                HStack(spacing: 12) {
+                    MetricPill(title: "Transfer engine", value: "safe Swift services", symbol: "arrow.left.arrow.right", tint: AppTheme.accent)
+                    MetricPill(title: "External editors", value: "Preview, Photomator, Topaz", symbol: "paintbrush", tint: AppTheme.mint)
+                    MetricPill(title: "Immich", value: "connection ready", symbol: "network", tint: AppTheme.amber)
+                }
             }
         }
     }
@@ -238,6 +496,88 @@ private struct ConfigPathRow: View {
                 .fixedSize()
             }
         }
+    }
+}
+
+private struct DetailLine: View {
+    var title: String
+    var value: String
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 12) {
+            Text(title)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 108, alignment: .leading)
+            Text(value)
+                .font(.callout.monospaced())
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+    }
+}
+
+private struct EmptyLibraryState: View {
+    var refresh: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("No photo files listed yet.")
+                .font(.headline)
+            Text("Refresh scans the configured Import Source for JPG, HEIC, TIFF, and common RAW formats.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            CommandButton(
+                title: "Refresh",
+                symbol: "arrow.clockwise",
+                prominence: .primary,
+                action: refresh
+            )
+        }
+    }
+}
+
+private struct PhotoFileRow: View {
+    var file: FileRecord
+    var editorName: String
+    var open: () -> Void
+
+    var body: some View {
+        Button(action: open) {
+            HStack(alignment: .center, spacing: 14) {
+                Image(systemName: "photo")
+                    .font(.system(size: 17, weight: .semibold))
+                    .foregroundStyle(AppTheme.accent)
+                    .frame(width: 34, height: 34)
+                    .background(AppTheme.accent.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(file.path)
+                        .font(.callout.monospaced())
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Text(file.modifiedAt.formatted(date: .abbreviated, time: .shortened))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer(minLength: 12)
+
+                VStack(alignment: .trailing, spacing: 4) {
+                    Text(file.size.formattedBytes)
+                        .font(.callout.monospacedDigit())
+                    Label(editorName, systemImage: "arrow.up.right.square")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .labelStyle(.titleAndIcon)
+                }
+            }
+            .contentShape(Rectangle())
+            .padding(.vertical, 10)
+        }
+        .buttonStyle(.plain)
+        .help("Open a working copy in \(editorName)")
     }
 }
 

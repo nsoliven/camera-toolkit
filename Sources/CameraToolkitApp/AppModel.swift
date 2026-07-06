@@ -17,7 +17,15 @@ final class DashboardModel {
     var simulationSummary: SimulationSummary?
     var statusMessage: String = "Ready. Demo mode only uses fake local folders."
     var isBusy: Bool = false
+    var libraryFiles: [FileRecord] = []
+    var lastOpenedWorkingCopyPath: String?
+    var immichAPIKeyDraft: String = ""
+    var immichConnectionStatus: String = "Not connected. Add your server URL and API key in Config."
+    var immichConnectionReport: ImmichConnectionReport?
+    var immichIsTestingConnection: Bool = false
     @ObservationIgnored private let configurationStore: ConfigurationStore
+    @ObservationIgnored private let secretStore = KeychainSecretStore(service: "org.cameratoolkit.CameraToolkit")
+    @ObservationIgnored private let editorLauncher = ExternalEditorLauncher()
 
     init(
         locations: [LocationCard],
@@ -40,6 +48,10 @@ final class DashboardModel {
         } else {
             self.activityLog = activityLog
         }
+        self.immichAPIKeyDraft = (try? secretStore.read(account: Self.immichAPIKeyAccount)) ?? ""
+        if !immichAPIKeyDraft.isEmpty {
+            self.immichConnectionStatus = "API key is saved in Keychain. Test the connection when the server is reachable."
+        }
     }
 
     static func live() -> DashboardModel {
@@ -48,7 +60,7 @@ final class DashboardModel {
         let configuration = (try? store.load(defaults: defaults)) ?? defaults
         try? store.save(configuration)
 
-        return DashboardModel(
+        let model = DashboardModel(
             locations: preview.locations,
             activePlan: preview.activePlan,
             jobs: [],
@@ -57,6 +69,8 @@ final class DashboardModel {
             configurationStore: store,
             loadActivityLog: true
         )
+        model.refreshSimulationLocations()
+        return model
     }
 
     static let preview = DashboardModel(
@@ -174,6 +188,10 @@ extension DashboardModel {
         }
     }
 
+    func chooseEditorWorkingFolder() {
+        _ = chooseFolder(title: "Choose Editor Working Folder", keyPath: \.editorWorkingFolderPath)
+    }
+
     func setConfigPath(_ keyPath: WritableKeyPath<AppConfiguration, String>, to value: String) {
         updateConfiguration { configuration in
             configuration[keyPath: keyPath] = value
@@ -190,6 +208,122 @@ extension DashboardModel {
 
     func setImportDestination(_ value: TransferLocation) {
         updateConfiguration { $0.importDestination = value }
+    }
+
+    func setImmichServerURL(_ value: String) {
+        updateConfiguration { $0.immichServerURL = value.trimmingCharacters(in: .whitespacesAndNewlines) }
+    }
+
+    func setExternalEditor(_ value: ExternalEditor) {
+        updateConfiguration { $0.externalEditor = value }
+    }
+
+    func saveImmichAPIKey() {
+        do {
+            try secretStore.save(immichAPIKeyDraft, account: Self.immichAPIKeyAccount)
+            immichConnectionStatus = immichAPIKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? "API key removed from Keychain."
+                : "API key saved in Keychain."
+            configMessage = "Immich API key saved in macOS Keychain."
+        } catch {
+            immichConnectionStatus = "Could not save API key: \(error.localizedDescription)"
+        }
+    }
+
+    func testImmichConnection() {
+        let serverURL = configuration.immichServerURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let apiKey = immichAPIKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !serverURL.isEmpty else {
+            immichConnectionStatus = "Add an Immich server URL in Config first."
+            return
+        }
+        guard !apiKey.isEmpty else {
+            immichConnectionStatus = "Add an Immich API key first. It will be stored in Keychain."
+            return
+        }
+
+        do {
+            try secretStore.save(apiKey, account: Self.immichAPIKeyAccount)
+            let client = try ImmichClient(serverURL: serverURL, apiKey: apiKey)
+            immichIsTestingConnection = true
+            immichConnectionStatus = "Testing Immich connection..."
+
+            Task { @MainActor in
+                defer { immichIsTestingConnection = false }
+                do {
+                    let report = try await client.testConnection()
+                    immichConnectionReport = report
+                    immichConnectionStatus = "Connected to Immich \(report.version) as \(report.userName) <\(report.userEmail)>."
+                    refreshSimulationLocations()
+                    recordActivity(
+                        action: .immichScan,
+                        state: .done,
+                        title: "Tested Immich connection",
+                        summary: immichConnectionStatus,
+                        detail: "Called stable Immich endpoints for ping, server version, and current user. The API key stays in macOS Keychain and is not written to the activity log."
+                    )
+                } catch {
+                    immichConnectionStatus = "Immich connection failed: \(error.localizedDescription)"
+                    recordActivity(
+                        action: .immichScan,
+                        state: .failed,
+                        title: "Immich connection failed",
+                        summary: immichConnectionStatus,
+                        detail: "No upload was attempted."
+                    )
+                }
+            }
+        } catch {
+            immichConnectionStatus = "Could not prepare Immich connection: \(error.localizedDescription)"
+        }
+    }
+
+    func refreshLibraryFiles() {
+        do {
+            let root = URL(fileURLWithPath: expandedImportSourcePath, isDirectory: true)
+            let records = try FileScanner().scan(root: root)
+                .filter { MediaFileMatcher.isSupportedPhotoPath($0.path) }
+            libraryFiles = records
+            statusMessage = records.isEmpty
+                ? "No supported photo files found in \(root.path)."
+                : "Found \(records.count) supported photo file(s) in \(root.path)."
+        } catch {
+            libraryFiles = []
+            statusMessage = "Could not scan library source: \(error.localizedDescription)"
+        }
+    }
+
+    func openLibraryFile(_ file: FileRecord) {
+        do {
+            let source = try librarySourceURL(for: file)
+            let workingRoot = URL(
+                fileURLWithPath: Self.expandedPath(configuration.editorWorkingFolderPath),
+                isDirectory: true
+            )
+            let copyURL = try editorLauncher.openWorkingCopy(
+                source: source,
+                editor: configuration.externalEditor,
+                workingRoot: workingRoot
+            )
+            lastOpenedWorkingCopyPath = copyURL.path
+            statusMessage = "Opened \(file.path) in \(configuration.externalEditor.displayName) from a protected working copy."
+            recordActivity(
+                action: .checkout,
+                state: .done,
+                title: "Opened photo for editing",
+                summary: statusMessage,
+                detail: "Source stayed untouched. Working copy: \(copyURL.path)"
+            )
+        } catch {
+            statusMessage = "Could not open \(file.path): \(error.localizedDescription)"
+            recordActivity(
+                action: .checkout,
+                state: .failed,
+                title: "Photo open failed",
+                summary: statusMessage,
+                detail: "No source file was changed."
+            )
+        }
     }
 
     func seedSimulation() {
@@ -289,6 +423,18 @@ extension DashboardModel {
         Self.expandedPath(configuration.importSourcePath)
     }
 
+    private func librarySourceURL(for file: FileRecord) throws -> URL {
+        guard !file.path.hasPrefix("/") && !file.path.contains("..") else {
+            throw ToolkitError.unsafeRelativePath(file.path)
+        }
+        let root = URL(fileURLWithPath: expandedImportSourcePath, isDirectory: true).standardizedFileURL
+        let source = root.appendingPathComponent(file.path).standardizedFileURL
+        guard source.path.hasPrefix(root.path + "/") else {
+            throw ToolkitError.unsafeRelativePath(file.path)
+        }
+        return source
+    }
+
     private func runJob(
         action: JobAction,
         runningNote: String,
@@ -351,6 +497,7 @@ extension DashboardModel {
         } catch {
             configMessage = "Could not save config: \(error.localizedDescription)"
         }
+        refreshSimulationLocations()
     }
 
     private func refreshSimulationLocations() {
@@ -359,8 +506,27 @@ extension DashboardModel {
             LocationCard(kind: .card, title: "Fake Card", subtitle: workspace.sourceCard.lastPathComponent, status: .ready, detail: workspace.sourceCard.path),
             LocationCard(kind: .drive, title: "Demo Buffer", subtitle: workspace.buffer.lastPathComponent, status: .warning, detail: "Local test folder"),
             LocationCard(kind: .nas, title: "Demo Archive", subtitle: workspace.archive.lastPathComponent, status: .ready, detail: "Local checksum target"),
-            LocationCard(kind: .immich, title: "Immich", subtitle: "Offline in demo", status: .offline, detail: "No network calls")
+            immichLocationCard
         ]
+    }
+
+    private var immichLocationCard: LocationCard {
+        if let report = immichConnectionReport {
+            return LocationCard(
+                kind: .immich,
+                title: "Immich",
+                subtitle: report.userEmail,
+                status: .ready,
+                detail: "API \(report.version) at \(report.baseURL)"
+            )
+        }
+        return LocationCard(
+            kind: .immich,
+            title: "Immich",
+            subtitle: "Not connected",
+            status: .offline,
+            detail: configuration.immichServerURL.isEmpty ? "Configure in Config" : configuration.immichServerURL
+        )
     }
 
     private static var defaultApplicationSupportURL: URL {
@@ -371,6 +537,8 @@ extension DashboardModel {
     private static var defaultConfigurationURL: URL {
         defaultApplicationSupportURL.appendingPathComponent("CameraToolkit/config.json")
     }
+
+    private static let immichAPIKeyAccount = "immich-api-key"
 
     private static func expandedPath(_ path: String) -> String {
         NSString(string: path).expandingTildeInPath

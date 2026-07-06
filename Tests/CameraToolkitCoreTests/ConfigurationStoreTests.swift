@@ -21,6 +21,9 @@ final class ConfigurationStoreTests: XCTestCase {
                 archivePath: root.appendingPathComponent("Archive").path,
                 bufferPath: root.appendingPathComponent("Buffer").path,
                 activityLogPath: root.appendingPathComponent("activity-log.jsonl").path,
+                immichServerURL: "http://photos.local:2283",
+                editorWorkingFolderPath: root.appendingPathComponent("Working Copies").path,
+                externalEditor: .photomator,
                 selectedDeviceID: "dji-mini-2",
                 eventName: "Test Trip",
                 importDestination: .drive
@@ -29,6 +32,32 @@ final class ConfigurationStoreTests: XCTestCase {
             try store.save(configuration)
 
             XCTAssertEqual(try store.load(defaults: .defaults(applicationSupport: root)), configuration)
+        }
+    }
+
+    func testOldConfigurationJSONMigratesToNewDefaults() throws {
+        try withTemporaryDirectory { root in
+            let store = ConfigurationStore(url: root.appendingPathComponent("config/config.json"))
+            let oldJSON = """
+            {
+              "demoRootPath": "\(root.appendingPathComponent("Demo").path)",
+              "importSourcePath": "\(root.appendingPathComponent("Card").path)",
+              "archivePath": "\(root.appendingPathComponent("Archive").path)",
+              "bufferPath": "\(root.appendingPathComponent("Buffer").path)",
+              "activityLogPath": "\(root.appendingPathComponent("activity-log.jsonl").path)",
+              "selectedDeviceID": "sony-a7v",
+              "eventName": "Old Trip",
+              "importDestination": "nas"
+            }
+            """
+            try FileManager.default.createDirectory(at: store.url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try oldJSON.write(to: store.url, atomically: true, encoding: .utf8)
+
+            let loaded = try store.load(defaults: .defaults(applicationSupport: root))
+
+            XCTAssertEqual(loaded.immichServerURL, "")
+            XCTAssertEqual(loaded.externalEditor, .preview)
+            XCTAssertTrue(loaded.editorWorkingFolderPath.hasSuffix("Editor Working Copies"))
         }
     }
 }
