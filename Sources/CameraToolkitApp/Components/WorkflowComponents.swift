@@ -3,6 +3,9 @@ import SwiftUI
 
 struct TransferFlowPanel: View {
     var plan: CopyPlan
+    var sourceURL: (FileRecord) -> URL? = { _ in nil }
+    var openFile: ((FileRecord) -> Void)?
+    var revealFile: ((FileRecord) -> Void)?
 
     var body: some View {
         Panel(
@@ -28,17 +31,12 @@ struct TransferFlowPanel: View {
 
             VStack(alignment: .leading, spacing: 8) {
                 ForEach(plan.new.prefix(5)) { file in
-                    HStack {
-                        Image(systemName: file.path.hasSuffix(".MP4") ? "video" : "photo")
-                            .foregroundStyle(.secondary)
-                        Text(file.path)
-                            .font(.callout.monospaced())
-                            .lineLimit(1)
-                        Spacer()
-                        Text(file.size.formattedBytes)
-                            .font(.callout.monospacedDigit())
-                            .foregroundStyle(.secondary)
-                    }
+                    CopyPlanFileRow(
+                        file: file,
+                        url: sourceURL(file),
+                        openFile: openFile,
+                        revealFile: revealFile
+                    )
                 }
                 if plan.new.isEmpty {
                     Text("No new files in the current plan.")
@@ -49,6 +47,93 @@ struct TransferFlowPanel: View {
             .padding(12)
             .background(Color.black.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
         }
+    }
+}
+
+private struct CopyPlanFileRow: View {
+    var file: FileRecord
+    var url: URL?
+    var openFile: ((FileRecord) -> Void)?
+    var revealFile: ((FileRecord) -> Void)?
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: file.path.hasSuffix(".MP4") ? "video" : "photo")
+                .foregroundStyle(.secondary)
+                .frame(width: 20)
+
+            Text(file.path)
+                .font(.callout.monospaced())
+                .lineLimit(1)
+                .truncationMode(.middle)
+
+            Spacer(minLength: 12)
+
+            Text(file.size.formattedBytes)
+                .font(.callout.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .frame(minWidth: 72, alignment: .trailing)
+
+            HStack(spacing: 6) {
+                if let openFile {
+                    PlanFileActionButton(
+                        symbol: "eye",
+                        help: "Open a protected working copy"
+                    ) {
+                        openFile(file)
+                    }
+                }
+
+                if let revealFile {
+                    PlanFileActionButton(
+                        symbol: "folder",
+                        help: "Reveal source file in Finder"
+                    ) {
+                        revealFile(file)
+                    }
+                }
+
+                if let url {
+                    ShareLink(item: url) {
+                        Image(systemName: "square.and.arrow.up")
+                            .font(.system(size: 13, weight: .semibold))
+                            .frame(width: 28, height: 28)
+                            .contentShape(RoundedRectangle(cornerRadius: 7))
+                    }
+                    .buttonStyle(.plain)
+                    .help("Share source file")
+                    .accessibilityLabel("Share \(file.path)")
+                }
+            }
+            .frame(width: actionClusterWidth, alignment: .trailing)
+        }
+        .padding(.vertical, 2)
+    }
+
+    private var actionClusterWidth: CGFloat {
+        var count = 0
+        if openFile != nil { count += 1 }
+        if revealFile != nil { count += 1 }
+        if url != nil { count += 1 }
+        return CGFloat(max(count, 1)) * 34
+    }
+}
+
+private struct PlanFileActionButton: View {
+    var symbol: String
+    var help: String
+    var action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 13, weight: .semibold))
+                .frame(width: 28, height: 28)
+                .contentShape(RoundedRectangle(cornerRadius: 7))
+        }
+        .buttonStyle(.plain)
+        .help(help)
+        .accessibilityLabel(help)
     }
 }
 

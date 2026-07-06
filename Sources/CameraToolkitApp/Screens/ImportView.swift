@@ -66,7 +66,12 @@ struct ImportView: View {
             }
 
             WorkflowPlanPanel(plan: model.workflowPlan(.importArchive))
-            TransferFlowPanel(plan: model.activePlan)
+            TransferFlowPanel(
+                plan: model.activePlan,
+                sourceURL: model.planFileSourceURL,
+                openFile: model.openPlanFile,
+                revealFile: model.revealPlanFileInFinder
+            )
             SimulationSummaryPanel(summary: model.simulationSummary, statusMessage: model.statusMessage)
         }
     }

@@ -308,7 +308,7 @@ extension DashboardModel {
 
     func openLibraryFile(_ file: FileRecord) {
         do {
-            let source = try librarySourceURL(for: file)
+            let source = try sourceURL(for: file)
             let workingRoot = URL(
                 fileURLWithPath: Self.expandedPath(configuration.editorWorkingFolderPath),
                 isDirectory: true
@@ -333,6 +333,71 @@ extension DashboardModel {
                 action: .checkout,
                 state: .failed,
                 title: "Photo open failed",
+                summary: statusMessage,
+                detail: "No source file was changed."
+            )
+        }
+    }
+
+    func planFileSourceURL(_ file: FileRecord) -> URL? {
+        guard let source = try? sourceURL(for: file),
+              FileManager.default.fileExists(atPath: source.path) else {
+            return nil
+        }
+        return source
+    }
+
+    func openPlanFile(_ file: FileRecord) {
+        do {
+            let source = try existingSourceURL(for: file)
+            let workingRoot = URL(
+                fileURLWithPath: Self.expandedPath(configuration.editorWorkingFolderPath),
+                isDirectory: true
+            )
+            let copyURL = try editorLauncher.openWorkingCopy(
+                source: source,
+                editor: configuration.externalEditor,
+                workingRoot: workingRoot
+            )
+            lastOpenedWorkingCopyPath = copyURL.path
+            statusMessage = "Opened \(file.path) from Copy Plan in \(configuration.externalEditor.displayName)."
+            recordActivity(
+                action: .checkout,
+                state: .done,
+                title: "Opened copy-plan file",
+                summary: statusMessage,
+                detail: "Source stayed untouched. Working copy: \(copyURL.path)"
+            )
+        } catch {
+            statusMessage = "Could not open \(file.path): \(error.localizedDescription)"
+            recordActivity(
+                action: .checkout,
+                state: .failed,
+                title: "Copy-plan open failed",
+                summary: statusMessage,
+                detail: "No source file was changed."
+            )
+        }
+    }
+
+    func revealPlanFileInFinder(_ file: FileRecord) {
+        do {
+            let source = try existingSourceURL(for: file)
+            NSWorkspace.shared.activateFileViewerSelecting([source])
+            statusMessage = "Revealed \(file.path) in Finder."
+            recordActivity(
+                action: .checkout,
+                state: .done,
+                title: "Revealed copy-plan file",
+                summary: statusMessage,
+                detail: "No files were changed. Source: \(source.path)"
+            )
+        } catch {
+            statusMessage = "Could not reveal \(file.path): \(error.localizedDescription)"
+            recordActivity(
+                action: .checkout,
+                state: .failed,
+                title: "Copy-plan reveal failed",
                 summary: statusMessage,
                 detail: "No source file was changed."
             )
@@ -552,7 +617,15 @@ extension DashboardModel {
         rebuildWorkflowPlans()
     }
 
-    private func librarySourceURL(for file: FileRecord) throws -> URL {
+    private func existingSourceURL(for file: FileRecord) throws -> URL {
+        let source = try sourceURL(for: file)
+        guard FileManager.default.fileExists(atPath: source.path) else {
+            throw ToolkitError.pathNotFound(source.path)
+        }
+        return source
+    }
+
+    private func sourceURL(for file: FileRecord) throws -> URL {
         guard !file.path.hasPrefix("/") && !file.path.contains("..") else {
             throw ToolkitError.unsafeRelativePath(file.path)
         }

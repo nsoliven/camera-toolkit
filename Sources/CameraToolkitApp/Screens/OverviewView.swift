@@ -48,15 +48,22 @@ struct OverviewView: View {
                 }
             }
 
+            let fileActions = TransferFlowPanel(
+                plan: model.activePlan,
+                sourceURL: model.planFileSourceURL,
+                openFile: model.openPlanFile,
+                revealFile: model.revealPlanFileInFinder
+            )
+
             ViewThatFits(in: .horizontal) {
                 HStack(alignment: .top, spacing: 16) {
-                    TransferFlowPanel(plan: model.activePlan)
+                    fileActions
                         .frame(minWidth: 0, maxWidth: .infinity)
                     SafetyPanel(checks: model.safetyChecks)
                 }
 
                 VStack(alignment: .leading, spacing: 16) {
-                    TransferFlowPanel(plan: model.activePlan)
+                    fileActions
                     SafetyPanel(checks: model.safetyChecks)
                 }
             }
