@@ -53,12 +53,10 @@ public struct DiskSpeedTester {
         let writeRate = rate(bytes: written, since: writeStartedAt)
         let readStartedAt = Date()
         var read: Int64 = 0
-        let reader = try FileHandle(forReadingFrom: testURL)
-        do {
-            while true {
-                let data = try reader.read(upToCount: chunkSize) ?? Data()
-                if data.isEmpty { break }
-                read += Int64(data.count)
+        var progressLimiter = FileOperationProgressLimiter()
+        try StreamingFileIO.readChunks(from: testURL, chunkSize: chunkSize) { chunk in
+            read += Int64(chunk.count)
+            if progressLimiter.shouldEmit(force: read == bytes) {
                 progress?(
                     FileOperationProgress(
                         phase: "Reading test file",
@@ -71,10 +69,6 @@ public struct DiskSpeedTester {
                     )
                 )
             }
-            try reader.close()
-        } catch {
-            try? reader.close()
-            throw error
         }
 
         return DiskSpeedReport(

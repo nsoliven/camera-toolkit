@@ -47,6 +47,7 @@ public struct LocalTransferService {
         let startedAt = Date()
         var processedFiles = 0
         var processedBytes: Int64 = 0
+        var progressLimiter = FileOperationProgressLimiter()
 
         for sourceFile in sourceFiles {
             try PathSafety.validateRelativePath(sourceFile.path)
@@ -71,8 +72,9 @@ public struct LocalTransferService {
                 }
                 processedFiles += 1
                 processedBytes += sourceFile.size
-                progress?(
-                    FileOperationProgress(
+                if progressLimiter.shouldEmit(force: processedFiles == totalFiles) {
+                    progress?(
+                        FileOperationProgress(
                         phase: "Comparing existing file",
                         currentPath: sourceFile.path,
                         processedFiles: processedFiles,
@@ -80,16 +82,18 @@ public struct LocalTransferService {
                         processedBytes: processedBytes,
                         totalBytes: totalBytes,
                         bytesPerSecond: Self.rate(bytes: processedBytes, since: startedAt)
+                        )
                     )
-                )
+                }
                 continue
             }
 
             try fileManager.createDirectory(at: destinationURL.deletingLastPathComponent(), withIntermediateDirectories: true)
             try copyFile(from: sourceURL, to: destinationURL) { copiedChunk in
                 processedBytes += Int64(copiedChunk)
-                progress?(
-                    FileOperationProgress(
+                if progressLimiter.shouldEmit() {
+                    progress?(
+                        FileOperationProgress(
                         phase: "Copying",
                         currentPath: sourceFile.path,
                         processedFiles: processedFiles,
@@ -97,13 +101,15 @@ public struct LocalTransferService {
                         processedBytes: processedBytes,
                         totalBytes: totalBytes,
                         bytesPerSecond: Self.rate(bytes: processedBytes, since: startedAt)
+                        )
                     )
-                )
+                }
             }
             processedFiles += 1
             result.copied.append(sourceFile.path)
-            progress?(
-                FileOperationProgress(
+            if progressLimiter.shouldEmit(force: processedFiles == totalFiles) {
+                progress?(
+                    FileOperationProgress(
                     phase: "Copying",
                     currentPath: sourceFile.path,
                     processedFiles: processedFiles,
@@ -111,8 +117,9 @@ public struct LocalTransferService {
                     processedBytes: processedBytes,
                     totalBytes: totalBytes,
                     bytesPerSecond: Self.rate(bytes: processedBytes, since: startedAt)
+                    )
                 )
-            )
+            }
         }
 
         result.copied.sort()
@@ -127,24 +134,13 @@ public struct LocalTransferService {
             .appendingPathComponent(".\(destination.lastPathComponent).cttmp-\(UUID().uuidString)")
         try? fileManager.removeItem(at: temporaryURL)
 
-        let input = try FileHandle(forReadingFrom: source)
-        defer { try? input.close() }
-
         guard fileManager.createFile(atPath: temporaryURL.path, contents: nil) else {
             throw ToolkitError.commandFailed("Could not create temporary copy file at \(temporaryURL.path)")
         }
-        let output = try FileHandle(forWritingTo: temporaryURL)
         do {
-            while true {
-                let chunk = try input.read(upToCount: 4 * 1024 * 1024) ?? Data()
-                if chunk.isEmpty { break }
-                try output.write(contentsOf: chunk)
-                progress(chunk.count)
-            }
-            try output.close()
+            try StreamingFileIO.copyBytes(from: source, to: temporaryURL, progress: progress)
             try fileManager.moveItem(at: temporaryURL, to: destination)
         } catch {
-            try? output.close()
             try? fileManager.removeItem(at: temporaryURL)
             throw error
         }

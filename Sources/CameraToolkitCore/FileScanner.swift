@@ -1,5 +1,105 @@
 import CryptoKit
+import Darwin
 import Foundation
+
+struct FileOperationProgressLimiter {
+    private var lastEmission = 0.0
+    private let minimumInterval: TimeInterval
+
+    init(minimumInterval: TimeInterval = 0.1) {
+        self.minimumInterval = minimumInterval
+    }
+
+    mutating func shouldEmit(force: Bool = false) -> Bool {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard force || now - lastEmission >= minimumInterval else { return false }
+        lastEmission = now
+        return true
+    }
+}
+
+enum StreamingFileIO {
+    static func readChunks(
+        from url: URL,
+        chunkSize: Int = 1024 * 1024,
+        _ body: (UnsafeRawBufferPointer) throws -> Void
+    ) throws {
+        let descriptor = try openDescriptor(url, flags: O_RDONLY)
+        defer { Darwin.close(descriptor) }
+
+        var buffer = [UInt8](repeating: 0, count: chunkSize)
+        while true {
+            let count = buffer.withUnsafeMutableBytes { rawBuffer in
+                Darwin.read(descriptor, rawBuffer.baseAddress, rawBuffer.count)
+            }
+            guard count >= 0 else {
+                if errno == EINTR { continue }
+                throw posixError(operation: "read", url: url)
+            }
+            guard count > 0 else { return }
+            try buffer.withUnsafeBytes { rawBuffer in
+                try body(UnsafeRawBufferPointer(start: rawBuffer.baseAddress, count: count))
+            }
+        }
+    }
+
+    static func copyBytes(
+        from source: URL,
+        to destination: URL,
+        chunkSize: Int = 4 * 1024 * 1024,
+        progress: (Int) -> Void
+    ) throws {
+        let input = try openDescriptor(source, flags: O_RDONLY)
+        defer { Darwin.close(input) }
+        let output = try openDescriptor(destination, flags: O_WRONLY | O_TRUNC)
+        defer { Darwin.close(output) }
+
+        var buffer = [UInt8](repeating: 0, count: chunkSize)
+        while true {
+            let count = buffer.withUnsafeMutableBytes { rawBuffer in
+                Darwin.read(input, rawBuffer.baseAddress, rawBuffer.count)
+            }
+            guard count >= 0 else {
+                if errno == EINTR { continue }
+                throw posixError(operation: "read", url: source)
+            }
+            guard count > 0 else {
+                return
+            }
+
+            try buffer.withUnsafeBytes { rawBuffer in
+                guard let baseAddress = rawBuffer.baseAddress else { return }
+                var offset = 0
+                while offset < count {
+                    let written = Darwin.write(output, baseAddress.advanced(by: offset), count - offset)
+                    if written < 0, errno == EINTR { continue }
+                    guard written > 0 else {
+                        throw posixError(operation: "write", url: destination)
+                    }
+                    offset += written
+                }
+            }
+            progress(count)
+        }
+    }
+
+    private static func openDescriptor(_ url: URL, flags: Int32) throws -> Int32 {
+        let descriptor = url.withUnsafeFileSystemRepresentation { path -> Int32 in
+            guard let path else { return -1 }
+            return Darwin.open(path, flags)
+        }
+        guard descriptor >= 0 else {
+            throw posixError(operation: "open", url: url)
+        }
+        return descriptor
+    }
+
+    private static func posixError(operation: String, url: URL) -> ToolkitError {
+        let code = errno
+        let message = String(cString: strerror(code))
+        return .commandFailed("Could not \(operation) \(url.path): \(message) (errno \(code))")
+    }
+}
 
 public struct FileOperationProgress: Sendable {
     public var phase: String
@@ -147,11 +247,13 @@ public struct FileScanner {
         var records: [FileRecord] = []
         var processedFiles = 0
         var processedBytes: Int64 = 0
+        var progressLimiter = FileOperationProgressLimiter()
 
         for file in files {
             let digest = try Self.sha256(file.url) { chunkBytes in
                 processedBytes += Int64(chunkBytes)
-                progress?(
+                if progressLimiter.shouldEmit() {
+                    progress?(
                     FileOperationProgress(
                         phase: "Hashing",
                         currentPath: file.path,
@@ -161,11 +263,13 @@ public struct FileScanner {
                         totalBytes: totalBytes,
                         bytesPerSecond: Self.rate(bytes: processedBytes, since: startedAt)
                     )
-                )
+                    )
+                }
             }
             processedFiles += 1
             records.append(FileRecord(path: file.path, size: file.size, modifiedAt: file.modifiedAt, sha256: digest))
-            progress?(
+            if progressLimiter.shouldEmit(force: processedFiles == totalFiles) {
+                progress?(
                 FileOperationProgress(
                     phase: "Hashing",
                     currentPath: file.path,
@@ -175,7 +279,8 @@ public struct FileScanner {
                     totalBytes: totalBytes,
                     bytesPerSecond: Self.rate(bytes: processedBytes, since: startedAt)
                 )
-            )
+                )
+            }
         }
 
         return records.sorted { $0.path < $1.path }
@@ -192,17 +297,11 @@ public struct FileScanner {
     }
 
     public static func sha256(_ url: URL, progress: ((Int) -> Void)? = nil) throws -> String {
-        let handle = try FileHandle(forReadingFrom: url)
-        defer { try? handle.close() }
-
         var hasher = SHA256()
-        while true {
-            let chunk = try handle.read(upToCount: 1024 * 1024) ?? Data()
-            if chunk.isEmpty { break }
-            hasher.update(data: chunk)
+        try StreamingFileIO.readChunks(from: url) { chunk in
+            hasher.update(bufferPointer: chunk)
             progress?(chunk.count)
         }
-
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
