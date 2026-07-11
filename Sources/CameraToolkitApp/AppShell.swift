@@ -6,37 +6,41 @@ struct AppShell: View {
     @Bindable var model: DashboardModel
 
     var body: some View {
-        ZStack {
-            AppTheme.background.ignoresSafeArea()
+        NavigationSplitView(columnVisibility: sidebarVisibility) {
+            List(selection: Binding(
+                get: { model.selectedSection },
+                set: { model.selectedSection = $0 }
+            )) {
+                Section {
+                    ForEach(AppSection.allCases) { section in
+                        Label(section.rawValue, systemImage: section.symbol)
+                            .tag(section)
+                    }
+                }
 
-            HStack(spacing: 0) {
-                SidebarView(
-                    model: model,
-                    isCollapsed: Binding(
-                        get: { model.isSidebarCollapsed },
-                        set: { model.isSidebarCollapsed = $0 }
-                    )
-                )
-                .frame(width: model.isSidebarCollapsed ? 74 : 252)
-                .animation(.snappy(duration: 0.18), value: model.isSidebarCollapsed)
-
-                Rectangle()
-                    .fill(Color.primary.opacity(0.08))
-                    .frame(width: 1)
-
-                DetailContainer(
-                    section: model.selectedSection,
-                    isSidebarCollapsed: model.isSidebarCollapsed,
-                    isRefreshing: model.isRefreshing,
-                    lastRefreshedAt: model.lastRefreshedAt,
-                    activeJob: model.activeJob,
-                    toggleSidebar: toggleSidebar,
-                    refreshAll: model.refreshAll
-                ) {
-                    detailView
+                Section("Protection") {
+                    Label("Writes locked", systemImage: "lock.shield")
+                        .foregroundStyle(.secondary)
+                        .help("Camera cards are never modified. Archive and delete workflows remain locked.")
                 }
             }
+            .listStyle(.sidebar)
+            .navigationTitle("Camera Toolkit")
+            .navigationSplitViewColumnWidth(min: 190, ideal: 220, max: 260)
+        } detail: {
+            DetailContainer(
+                section: model.selectedSection,
+                isRefreshing: model.isRefreshing,
+                lastRefreshedAt: model.lastRefreshedAt,
+                activeJob: model.activeJob,
+                refreshAll: model.refreshAll
+            ) {
+                detailView
+            }
+            .background(AppTheme.background)
         }
+        .navigationSplitViewStyle(.balanced)
+        .tint(.accentColor)
         .onAppear {
             model.refreshAllIfStale(maxAge: 0)
         }
@@ -68,9 +72,14 @@ struct AppShell: View {
     }
 
     private func toggleSidebar() {
-        withAnimation(.snappy(duration: 0.18)) {
-            model.toggleSidebar()
-        }
+        model.toggleSidebar()
+    }
+
+    private var sidebarVisibility: Binding<NavigationSplitViewVisibility> {
+        Binding(
+            get: { model.isSidebarCollapsed ? .detailOnly : .all },
+            set: { model.isSidebarCollapsed = $0 == .detailOnly }
+        )
     }
 }
 
@@ -198,18 +207,15 @@ struct SidebarRow: View {
 
 struct DetailContainer<Content: View>: View {
     var section: AppSection
-    var isSidebarCollapsed: Bool
     var isRefreshing: Bool
     var lastRefreshedAt: Date?
     var activeJob: JobSnapshot?
-    var toggleSidebar: () -> Void
     var refreshAll: () -> Void
     @ViewBuilder var content: Content
 
     var body: some View {
         VStack(spacing: 0) {
             HStack {
-                SidebarToggleButton(isCollapsed: isSidebarCollapsed, action: toggleSidebar)
                 Label(section.rawValue, systemImage: section.symbol)
                     .font(.headline)
                 Spacer()
@@ -219,9 +225,9 @@ struct DetailContainer<Content: View>: View {
                     refreshAll: refreshAll
                 )
                 HStack(spacing: 6) {
-                    Label("Real writes locked", systemImage: "lock.shield")
-                        .font(.callout.weight(.medium))
-                        .foregroundStyle(AppTheme.amber)
+                    Label("Protected", systemImage: "lock.shield")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
                         .labelStyle(.titleAndIcon)
                     HelpButton(
                         title: "Real writes locked",
@@ -229,9 +235,9 @@ struct DetailContainer<Content: View>: View {
                     )
                 }
             }
-            .padding(.horizontal, 28)
-            .padding(.vertical, 16)
-            .background(.ultraThinMaterial)
+            .padding(.horizontal, 20)
+            .padding(.vertical, 11)
+            .background(.bar)
             .overlay(alignment: .bottom) {
                 Rectangle()
                     .fill(Color.primary.opacity(0.08))
@@ -240,16 +246,15 @@ struct DetailContainer<Content: View>: View {
 
             if let activeJob {
                 ActiveJobBanner(job: activeJob)
-                    .padding(.horizontal, 28)
+                    .padding(.horizontal, 20)
                     .padding(.vertical, 10)
-                    .background(.thinMaterial)
                     .transition(.move(edge: .top).combined(with: .opacity))
             }
 
             ScrollView {
                 content
-                    .padding(24)
-                    .frame(maxWidth: 1180, alignment: .topLeading)
+                    .padding(20)
+                    .frame(maxWidth: 1120, alignment: .topLeading)
                     .frame(maxWidth: .infinity, alignment: .top)
             }
             .scrollIndicators(.visible)

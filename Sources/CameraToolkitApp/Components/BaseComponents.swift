@@ -26,13 +26,12 @@ struct Panel<Content: View>: View {
             }
             content
         }
-        .padding(18)
-        .background(AppTheme.panel, in: RoundedRectangle(cornerRadius: 8))
+        .padding(16)
+        .background(AppTheme.panel, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: 8)
-                .strokeBorder(Color.primary.opacity(0.08))
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(Color(nsColor: .separatorColor).opacity(0.65))
         )
-        .shadow(color: .black.opacity(0.08), radius: 16, y: 8)
     }
 }
 
@@ -101,56 +100,20 @@ struct HeaderView: View {
     var eyebrow: String
     var title: String
     var subtitle: String
-    var badgeTitle: String = "Ready Workspace"
-    var badgeSubtitle: String = "Real writes locked"
 
     var body: some View {
-        ViewThatFits(in: .horizontal) {
-            HStack(alignment: .bottom, spacing: 20) {
-                headerCopy
-                Spacer(minLength: 16)
-                HeaderBadge(title: badgeTitle, subtitle: badgeSubtitle)
-            }
-
-            VStack(alignment: .leading, spacing: 14) {
-                headerCopy
-                HeaderBadge(title: badgeTitle, subtitle: badgeSubtitle)
-            }
-        }
-    }
-
-    private var headerCopy: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 5) {
             Text(eyebrow.uppercased())
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(AppTheme.accent)
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.secondary)
             Text(title)
-                .font(.system(size: 36, weight: .semibold, design: .rounded))
+                .font(.largeTitle.weight(.semibold))
                 .lineLimit(2)
             Text(subtitle)
-                .font(.title3)
+                .font(.callout)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
-    }
-}
-
-private struct HeaderBadge: View {
-    var title: String
-    var subtitle: String
-
-    var body: some View {
-        VStack(alignment: .trailing, spacing: 8) {
-            Label(title, systemImage: "lock.shield")
-                .font(.headline)
-                .foregroundStyle(AppTheme.mint)
-            Text(subtitle)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .lineLimit(2)
-        }
-        .padding(14)
-        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 8))
     }
 }
 

@@ -2,20 +2,11 @@ import CameraToolkitCore
 import SwiftUI
 
 enum AppTheme {
-    static let background = LinearGradient(
-        colors: [
-            Color(nsColor: .windowBackgroundColor),
-            Color(red: 0.06, green: 0.09, blue: 0.10).opacity(0.28),
-            Color(red: 0.12, green: 0.13, blue: 0.10).opacity(0.18)
-        ],
-        startPoint: .topLeading,
-        endPoint: .bottomTrailing
-    )
-
-    static let panel = Color(nsColor: .controlBackgroundColor).opacity(0.86)
-    static let accent = Color(red: 0.08, green: 0.47, blue: 0.62)
-    static let mint = Color(red: 0.12, green: 0.58, blue: 0.42)
-    static let amber = Color(red: 0.86, green: 0.55, blue: 0.16)
+    static let background = Color(nsColor: .windowBackgroundColor)
+    static let panel = Color(nsColor: .controlBackgroundColor)
+    static let accent = Color.accentColor
+    static let mint = Color(nsColor: .systemGreen)
+    static let amber = Color(nsColor: .systemOrange)
 }
 
 extension Int64 {

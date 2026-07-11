@@ -1696,7 +1696,7 @@ private extension AppConfiguration {
     }
 }
 
-enum AppSection: String, CaseIterable, Identifiable {
+enum AppSection: String, CaseIterable, Identifiable, Hashable {
     case setup = "Setup"
     case overview = "Overview"
     case `import` = "Import"
