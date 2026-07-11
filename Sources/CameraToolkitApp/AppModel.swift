@@ -131,7 +131,8 @@ final class DashboardModel {
     static func live() -> DashboardModel {
         let defaults = AppConfiguration.defaults(applicationSupport: defaultApplicationSupportURL)
         let store = ConfigurationStore(url: defaultConfigurationURL)
-        let configuration = (try? store.load(defaults: defaults)) ?? defaults
+        var configuration = (try? store.load(defaults: defaults)) ?? defaults
+        configuration.migrateKnownCameraToolkitPaths()
         try? store.save(configuration)
 
         let model = DashboardModel(
@@ -472,6 +473,7 @@ extension DashboardModel {
             if let destination = preset.importDestination {
                 configuration.importDestination = destination
             }
+            configuration.beginNewBatch()
         }
         activePlan = CopyPlan()
         queuedFilePaths.removeAll()
@@ -1622,6 +1624,34 @@ extension DashboardModel {
 }
 
 private extension AppConfiguration {
+    mutating func migrateKnownCameraToolkitPaths() {
+        let pathMigrations: [String: (name: String, path: String)] = [
+            "/Volumes/CAMERA_CARD/TEMP": ("Camera Card · Sony A7V", "/Volumes/CAMERA_CARD"),
+            "/Volumes/ACTION_CAMERA/DCIM/CAM_001": ("Action Camera · DJI Osmo 360", "/Volumes/ACTION_CAMERA"),
+            "/Volumes/PHOTO_WORKSPACE/Photos": ("Photo Workspace · Camera Buffer", "/Volumes/PHOTO_WORKSPACE/Camera Buffer")
+        ]
+
+        for index in configuredLocations.indices {
+            guard let migration = pathMigrations[configuredLocations[index].path] else { continue }
+            configuredLocations[index].name = migration.name
+            configuredLocations[index].path = migration.path
+        }
+
+        if let migration = pathMigrations[importSourcePath] {
+            importSourcePath = migration.path
+        }
+        if let migration = pathMigrations[bufferPath] {
+            bufferPath = migration.path
+        }
+
+        var seen: Set<String> = []
+        configuredLocations = configuredLocations.filter { location in
+            let key = "\(location.role.rawValue)|\(location.path)"
+            return seen.insert(key).inserted
+        }
+        normalizeLocationSelections()
+    }
+
     mutating func setCameraLibraryRoot(_ path: String) {
         let root = URL(fileURLWithPath: path, isDirectory: true)
         cameraLibraryRootPath = root.path
@@ -1727,52 +1757,31 @@ struct CameraSetupPreset: Identifiable, Hashable {
     static let defaults: [CameraSetupPreset] = [
         CameraSetupPreset(
             id: "lexar-sony-buffer",
-            title: "Camera Card · Sony A7V",
-            subtitle: "Sony photos on the Camera Card card",
-            effect: "Uses Camera Card/TEMP as the from folder, labels the batch Sony A7V, and copies selected files to Photo Workspace.",
+            title: "Import Sony A7V",
+            subtitle: "Camera Card card → Photo Workspace camera buffer",
+            effect: "Copies the complete card, including DCIM stills, M4ROOT video, sidecars, and camera folders. The card is never changed.",
             symbol: "sdcard",
-            sourceName: "Camera Card Photos",
-            sourcePath: "/Volumes/CAMERA_CARD/TEMP",
-            bufferName: "Photo Workspace Photos",
-            bufferPath: "/Volumes/PHOTO_WORKSPACE/Photos",
+            sourceName: "Camera Card · Sony A7V",
+            sourcePath: "/Volumes/CAMERA_CARD",
+            bufferName: "Photo Workspace · Camera Buffer",
+            bufferPath: "/Volumes/PHOTO_WORKSPACE/Camera Buffer",
             deviceID: "sony-a7v",
             importDestination: .drive,
-            requiredPaths: ["/Volumes/CAMERA_CARD/TEMP", "/Volumes/PHOTO_WORKSPACE/Photos"]
+            requiredPaths: ["/Volumes/CAMERA_CARD", "/Volumes/PHOTO_WORKSPACE"]
         ),
         CameraSetupPreset(
             id: "osmo-360-buffer",
-            title: "DJI Osmo 360",
-            subtitle: "360 camera card to working drive",
-            effect: "Uses Action Camera/DCIM/CAM_001 as the from folder, labels the batch DJI Osmo 360, and copies selected files to Photo Workspace.",
+            title: "Import DJI Osmo 360",
+            subtitle: "Action Camera card → Photo Workspace camera buffer",
+            effect: "Copies the complete card so full-resolution OSV/video files and MISC thumbnails or indexes remain together. The card is never changed.",
             symbol: "camera.aperture",
-            sourceName: "Osmo 360",
-            sourcePath: "/Volumes/ACTION_CAMERA/DCIM/CAM_001",
-            bufferName: "Photo Workspace Photos",
-            bufferPath: "/Volumes/PHOTO_WORKSPACE/Photos",
+            sourceName: "Action Camera · DJI Osmo 360",
+            sourcePath: "/Volumes/ACTION_CAMERA",
+            bufferName: "Photo Workspace · Camera Buffer",
+            bufferPath: "/Volumes/PHOTO_WORKSPACE/Camera Buffer",
             deviceID: "osmo-360",
             importDestination: .drive,
-            requiredPaths: ["/Volumes/ACTION_CAMERA/DCIM/CAM_001", "/Volumes/PHOTO_WORKSPACE/Photos"]
-        ),
-        CameraSetupPreset(
-            id: "crucial-buffer",
-            title: "Photo Workspace",
-            subtitle: "Portable photo working drive",
-            effect: "Makes /Volumes/PHOTO_WORKSPACE/Photos the buffer. It does not change the selected camera folder or copy files.",
-            symbol: "externaldrive",
-            bufferName: "Photo Workspace Photos",
-            bufferPath: "/Volumes/PHOTO_WORKSPACE/Photos",
-            importDestination: .drive,
-            requiredPaths: ["/Volumes/PHOTO_WORKSPACE/Photos"]
-        ),
-        CameraSetupPreset(
-            id: "home-photo-library",
-            title: "Home Photo Library",
-            subtitle: "Long-term NAS originals and edits",
-            effect: "Makes the mounted Camera folder the library root and derives Originals, Edited, Selects, Shared, and proof folders. It moves nothing.",
-            symbol: "building.columns",
-            libraryRootPath: "/Volumes/PHOTO_LIBRARY",
-            importDestination: .nas,
-            requiredPaths: ["/Volumes/PHOTO_LIBRARY"]
+            requiredPaths: ["/Volumes/ACTION_CAMERA", "/Volumes/PHOTO_WORKSPACE"]
         )
     ]
 
@@ -1815,9 +1824,9 @@ private struct RecommendedCameraSetup {
 
         return RecommendedCameraSetup(
             libraryRoot: existingDirectory("/Volumes/PHOTO_LIBRARY"),
-            osmoSource: existingDirectory("/Volumes/ACTION_CAMERA/DCIM/CAM_001"),
+            osmoSource: existingDirectory("/Volumes/ACTION_CAMERA"),
             lexarSource: existingDirectory("/Volumes/CAMERA_CARD"),
-            buffer: existingDirectory("/Volumes/PHOTO_WORKSPACE/Photos")
+            buffer: existingDirectory("/Volumes/PHOTO_WORKSPACE").map { $0.appendingPathComponent("Camera Buffer", isDirectory: true) }
         )
     }
 }

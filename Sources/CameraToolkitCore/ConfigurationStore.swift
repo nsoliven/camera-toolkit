@@ -20,6 +20,7 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
     public var exiftoolBinaryPath: String
     public var selectedDeviceID: String
     public var eventName: String
+    public var batchID: String
     public var importDestination: TransferLocation
 
     public init(
@@ -42,6 +43,7 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         exiftoolBinaryPath: String = "exiftool",
         selectedDeviceID: String = "sony-a7v",
         eventName: String = "Lee Canyon",
+        batchID: String = "",
         importDestination: TransferLocation = .nas
     ) {
         self.demoRootPath = demoRootPath
@@ -63,6 +65,7 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         self.exiftoolBinaryPath = exiftoolBinaryPath
         self.selectedDeviceID = selectedDeviceID
         self.eventName = eventName
+        self.batchID = batchID.isEmpty ? Self.makeBatchID(deviceID: selectedDeviceID) : batchID
         self.importDestination = importDestination
         self.normalizeLocationSelections()
     }
@@ -87,6 +90,7 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         case exiftoolBinaryPath
         case selectedDeviceID
         case eventName
+        case batchID
         case importDestination
     }
 
@@ -115,6 +119,7 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         exiftoolBinaryPath = try values.decodeIfPresent(String.self, forKey: .exiftoolBinaryPath) ?? defaults.exiftoolBinaryPath
         selectedDeviceID = try values.decodeIfPresent(String.self, forKey: .selectedDeviceID) ?? defaults.selectedDeviceID
         eventName = try values.decodeIfPresent(String.self, forKey: .eventName) ?? defaults.eventName
+        batchID = try values.decodeIfPresent(String.self, forKey: .batchID) ?? Self.makeBatchID(deviceID: selectedDeviceID)
         importDestination = try values.decodeIfPresent(TransferLocation.self, forKey: .importDestination) ?? defaults.importDestination
         normalizeLocationSelections()
     }
@@ -258,18 +263,13 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
     }
 
     public func bufferBatchFolderPath() -> String {
-        let sourceName = URL(fileURLWithPath: importSourcePath, isDirectory: true).lastPathComponent
         return URL(fileURLWithPath: bufferPath, isDirectory: true)
-            .appendingPathComponent(Self.pathComponent(eventName, fallback: "Unsorted"), isDirectory: true)
-            .appendingPathComponent(Self.pathComponent(selectedDeviceID, fallback: "Camera"), isDirectory: true)
-            .appendingPathComponent(Self.pathComponent(sourceName, fallback: "Camera"), isDirectory: true)
+            .appendingPathComponent(batchRelativePath(), isDirectory: true)
             .path
     }
 
     public func bufferIngestFolderPath() -> String {
-        URL(fileURLWithPath: bufferBatchFolderPath(), isDirectory: true)
-            .appendingPathComponent("Originals", isDirectory: true)
-            .path
+        bufferBatchFolderPath()
     }
 
     public func bufferExportsFolderPath() -> String {
@@ -285,12 +285,72 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
     }
 
     public func libraryBatchFolderPath(_ folder: CameraLibraryFolder) -> String {
-        let sourceName = URL(fileURLWithPath: importSourcePath, isDirectory: true).lastPathComponent
-        return libraryFolderPath(folder)
-            .appendingPathComponent(Self.pathComponent(eventName, fallback: "Unsorted"), isDirectory: true)
-            .appendingPathComponent(Self.pathComponent(selectedDeviceID, fallback: "Camera"), isDirectory: true)
-            .appendingPathComponent(Self.pathComponent(sourceName, fallback: "Camera"), isDirectory: true)
-            .path
+        switch folder {
+        case .originals, .manifests:
+            return libraryFolderPath(folder)
+                .appendingPathComponent(batchRelativePath(), isDirectory: true)
+                .path
+        case .edited:
+            return libraryFolderPath(folder)
+                .appendingPathComponent(eventFolderName(), isDirectory: true)
+                .path
+        case .inbox, .selects, .shared:
+            return libraryFolderPath(folder)
+                .appendingPathComponent(eventFolderName(), isDirectory: true)
+                .path
+        }
+    }
+
+    public mutating func beginNewBatch(now: Date = Date()) {
+        batchID = Self.makeBatchID(deviceID: selectedDeviceID, now: now)
+    }
+
+    public func batchRelativePath() -> String {
+        [
+            yearFolderName(),
+            eventFolderName(),
+            deviceArchiveFolder(),
+            Self.pathComponent(batchID, fallback: Self.makeBatchID(deviceID: selectedDeviceID))
+        ].joined(separator: "/")
+    }
+
+    public func deviceArchiveFolder() -> String {
+        switch selectedDeviceID {
+        case "sony-a7v": "Sony-A7V"
+        case "osmo-360": "Osmo-360"
+        case "dji-mini-2": "DJI-Mini-2"
+        case "action-6": "Action-6"
+        case "iphone": "iPhone"
+        default: Self.pathComponent(selectedDeviceID, fallback: "Camera")
+        }
+    }
+
+    private func yearFolderName() -> String {
+        String(batchID.prefix(4)).allSatisfy(\.isNumber) ? String(batchID.prefix(4)) : Self.yearFormatter.string(from: Date())
+    }
+
+    private func eventFolderName() -> String {
+        let yearMonth = batchID.count >= 7 ? String(batchID.prefix(7)) : Self.monthFormatter.string(from: Date())
+        let event = Self.pathComponent(eventName, fallback: "Import")
+            .replacingOccurrences(of: " ", with: "-")
+            .replacingOccurrences(of: "_", with: "-")
+        return "\(yearMonth)_\(event)"
+    }
+
+    private static func makeBatchID(deviceID: String, now: Date = Date()) -> String {
+        "\(batchFormatter.string(from: now))_\(pathComponent(deviceID, fallback: "camera"))_\(UUID().uuidString.prefix(4).lowercased())"
+    }
+
+    private static let yearFormatter: DateFormatter = formatter("yyyy")
+    private static let monthFormatter: DateFormatter = formatter("yyyy-MM")
+    private static let batchFormatter: DateFormatter = formatter("yyyy-MM-dd_HHmmss")
+
+    private static func formatter(_ format: String) -> DateFormatter {
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = format
+        return formatter
     }
 
     private static func pathComponent(_ value: String, fallback: String) -> String {

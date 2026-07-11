@@ -14,7 +14,7 @@ final class DashboardModelTests: XCTestCase {
             let relativePath = "DCIM/100MSDCF/DSC00001.ARW"
             let bytes = Data("same-photo-bytes".utf8)
             try writeFile(source.appendingPathComponent(relativePath), bytes)
-            try writeFile(buffer.appendingPathComponent("Test Batch/sony-a7v/Configured Source/Originals").appendingPathComponent(relativePath), bytes)
+            try writeFile(buffer.appendingPathComponent("2026/2026-07_Test-Batch/Sony-A7V/2026-07-10_120000_sony-a7v_test").appendingPathComponent(relativePath), bytes)
 
             let model = DashboardModel(
                 locations: [],
@@ -33,6 +33,7 @@ final class DashboardModelTests: XCTestCase {
                     exiftoolBinaryPath: "exiftool",
                     selectedDeviceID: "sony-a7v",
                     eventName: "Test Batch",
+                    batchID: "2026-07-10_120000_sony-a7v_test",
                     importDestination: .nas
                 ),
                 safetyChecks: [],
@@ -76,6 +77,7 @@ final class DashboardModelTests: XCTestCase {
                     exiftoolBinaryPath: "exiftool",
                     selectedDeviceID: "sony-a7v",
                     eventName: "Test Batch",
+                    batchID: "2026-07-10_120000_sony-a7v_test",
                     importDestination: .nas
                 ),
                 safetyChecks: [],
@@ -86,7 +88,7 @@ final class DashboardModelTests: XCTestCase {
             try await waitForIdle(model)
 
             let bufferedFile = buffer
-                .appendingPathComponent("Test Batch/sony-a7v/Card/Originals")
+                .appendingPathComponent("2026/2026-07_Test-Batch/Sony-A7V/2026-07-10_120000_sony-a7v_test")
                 .appendingPathComponent(relativePath)
             XCTAssertEqual(try Data(contentsOf: bufferedFile), bytes)
             XCTAssertFalse(FileManager.default.fileExists(atPath: archive.appendingPathComponent(relativePath).path))
@@ -122,6 +124,7 @@ final class DashboardModelTests: XCTestCase {
                     exiftoolBinaryPath: "exiftool",
                     selectedDeviceID: "sony-a7v",
                     eventName: "Test Batch",
+                    batchID: "2026-07-10_120000_sony-a7v_test",
                     importDestination: .nas
                 ),
                 safetyChecks: [],
@@ -138,7 +141,7 @@ final class DashboardModelTests: XCTestCase {
             model.copyQueuedFilesToBuffer()
             try await waitForIdle(model)
 
-            let bufferRoot = buffer.appendingPathComponent("Test Batch/sony-a7v/Card/Originals")
+            let bufferRoot = buffer.appendingPathComponent("2026/2026-07_Test-Batch/Sony-A7V/2026-07-10_120000_sony-a7v_test")
             XCTAssertTrue(FileManager.default.fileExists(atPath: bufferRoot.appendingPathComponent(queuedPath).path))
             XCTAssertFalse(FileManager.default.fileExists(atPath: bufferRoot.appendingPathComponent(unqueuedPath).path))
             XCTAssertTrue(model.queuedFiles.isEmpty)
@@ -239,8 +242,8 @@ final class DashboardModelTests: XCTestCase {
             let preset = try XCTUnwrap(CameraSetupPreset.defaults.first { $0.id == "lexar-sony-buffer" })
             model.applySetupPreset(preset)
 
-            XCTAssertEqual(model.configuration.importSourcePath, "/Volumes/CAMERA_CARD/TEMP")
-            XCTAssertEqual(model.configuration.bufferPath, "/Volumes/PHOTO_WORKSPACE/Photos")
+            XCTAssertEqual(model.configuration.importSourcePath, "/Volumes/CAMERA_CARD")
+            XCTAssertEqual(model.configuration.bufferPath, "/Volumes/PHOTO_WORKSPACE/Camera Buffer")
             XCTAssertEqual(model.configuration.selectedDeviceID, "sony-a7v")
             XCTAssertEqual(model.configuration.importDestination, .drive)
             XCTAssertTrue(model.activePlan.isEmpty)
@@ -248,28 +251,26 @@ final class DashboardModelTests: XCTestCase {
             XCTAssertTrue(model.statusMessage.contains("No files were moved"))
 
             let saved = try store.load(defaults: .defaults(applicationSupport: root))
-            XCTAssertEqual(saved.importSourcePath, "/Volumes/CAMERA_CARD/TEMP")
-            XCTAssertEqual(saved.bufferPath, "/Volumes/PHOTO_WORKSPACE/Photos")
+            XCTAssertEqual(saved.importSourcePath, "/Volumes/CAMERA_CARD")
+            XCTAssertEqual(saved.bufferPath, "/Volumes/PHOTO_WORKSPACE/Camera Buffer")
         }
     }
 
-    func testHardwarePresetsExplainEveryKnownStorageRole() throws {
+    func testIngestPresetsMatchTheEstablishedCardAndBufferContract() throws {
         let presets = CameraSetupPreset.defaults
 
         XCTAssertEqual(Set(presets.map(\.id)), [
             "lexar-sony-buffer",
-            "osmo-360-buffer",
-            "crucial-buffer",
-            "home-photo-library"
+            "osmo-360-buffer"
         ])
         XCTAssertTrue(presets.allSatisfy { !$0.effect.isEmpty && !$0.requiredPaths.isEmpty })
         XCTAssertEqual(
             presets.first { $0.id == "osmo-360-buffer" }?.sourcePath,
-            "/Volumes/ACTION_CAMERA/DCIM/CAM_001"
+            "/Volumes/ACTION_CAMERA"
         )
         XCTAssertEqual(
-            presets.first { $0.id == "home-photo-library" }?.libraryRootPath,
-            "/Volumes/PHOTO_LIBRARY"
+            presets.first { $0.id == "lexar-sony-buffer" }?.bufferPath,
+            "/Volumes/PHOTO_WORKSPACE/Camera Buffer"
         )
     }
 }
