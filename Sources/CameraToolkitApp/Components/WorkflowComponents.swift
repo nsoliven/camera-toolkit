@@ -333,14 +333,13 @@ private struct CameraMove: Identifiable {
 private struct CameraPlacesGrid: View {
     var places: [CameraPlace]
 
-    private let columns = [
-        GridItem(.adaptive(minimum: 210), spacing: 12, alignment: .top)
-    ]
-
     var body: some View {
-        LazyVGrid(columns: columns, alignment: .leading, spacing: 12) {
+        VStack(spacing: 0) {
             ForEach(places) { place in
                 CameraPlaceCard(place: place)
+                if place.id != places.last?.id {
+                    Divider()
+                }
             }
         }
     }
@@ -353,9 +352,8 @@ private struct CameraPlaceCard: View {
         HStack(alignment: .top, spacing: 12) {
             Image(systemName: place.symbol)
                 .font(.headline)
-                .frame(width: 34, height: 34)
+                .frame(width: 24)
                 .foregroundStyle(place.tint)
-                .background(place.tint.opacity(0.14), in: RoundedRectangle(cornerRadius: 8))
 
             VStack(alignment: .leading, spacing: 4) {
                 Text(place.title)
@@ -372,14 +370,8 @@ private struct CameraPlaceCard: View {
                     .truncationMode(.middle)
             }
         }
-        .padding(12)
-        .frame(minHeight: 92, alignment: .topLeading)
+        .padding(.vertical, 10)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 8))
-        .overlay(
-            RoundedRectangle(cornerRadius: 8)
-                .strokeBorder(place.tint.opacity(0.16))
-        )
     }
 }
 
@@ -390,6 +382,9 @@ private struct CameraMovesList: View {
         VStack(alignment: .leading, spacing: 8) {
             ForEach(moves) { move in
                 CameraMoveRow(move: move)
+                if move.id != moves.last?.id {
+                    Divider()
+                }
             }
         }
     }
@@ -403,8 +398,7 @@ private struct CameraMoveRow: View {
             Image(systemName: "arrow.right")
                 .font(.caption.weight(.bold))
                 .foregroundStyle(move.tint)
-                .frame(width: 28, height: 28)
-                .background(move.tint.opacity(0.12), in: RoundedRectangle(cornerRadius: 7))
+                .frame(width: 24)
 
             VStack(alignment: .leading, spacing: 4) {
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
@@ -425,8 +419,7 @@ private struct CameraMoveRow: View {
 
             Spacer(minLength: 8)
         }
-        .padding(10)
-        .background(Color.black.opacity(0.05), in: RoundedRectangle(cornerRadius: 8))
+        .padding(.vertical, 9)
     }
 }
 
