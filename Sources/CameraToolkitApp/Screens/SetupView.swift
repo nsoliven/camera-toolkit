@@ -9,7 +9,7 @@ struct SetupView: View {
             HeaderView(
                 eyebrow: "Setup",
                 title: "Camera Library setup",
-                subtitle: "Pick the photo library, from folders, buffer, and photo list once. Real copy/delete buttons stay locked until the app has enough proof."
+                subtitle: "Choose the camera workflow and confirm where originals will live."
             )
 
             Panel(
@@ -18,9 +18,12 @@ struct SetupView: View {
                 helpTitle: "Current Setup",
                 helpText: "This is the small set of choices the app needs before it should move real files: photo library, from folder, buffer drive, photo list file, and backup folder."
             ) {
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 220), spacing: 12)], alignment: .leading, spacing: 12) {
+                VStack(spacing: 0) {
                     ForEach(model.setupChecklist) { item in
                         SetupStatusTile(item: item)
+                        if item.id != model.setupChecklist.last?.id {
+                            Divider()
+                        }
                     }
                 }
 
@@ -56,59 +59,24 @@ struct SetupView: View {
             }
 
             Panel(
-                title: "My Presets",
-                symbol: "rectangle.3.group",
-                helpTitle: "My Presets",
-                helpText: "A preset only selects saved folders and the camera label. It never starts a copy, deletes a file, or unlocks NAS and Immich writes."
+                title: "Camera Import",
+                symbol: "camera",
+                helpTitle: "Camera Import",
+                helpText: "Choose the camera you plugged in. This selects the complete card as the source and the established Photo Workspace Camera Buffer as the destination. Nothing moves until you preview and copy."
             ) {
-                Text("Pick the setup that matches what you plugged in. The card shows every setting it changes before you apply it.")
+                Text("These are complete ingest workflows, not independent drive presets.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
 
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 300), spacing: 12)], alignment: .leading, spacing: 12) {
+                VStack(spacing: 0) {
                     ForEach(model.setupPresets) { preset in
-                        SetupPresetCard(preset: preset) {
+                        SetupPresetRow(preset: preset) {
                             model.applySetupPreset(preset)
                         }
+                        if preset.id != model.setupPresets.last?.id {
+                            Divider()
+                        }
                     }
-                }
-            }
-
-            Panel(
-                title: "Main Buttons",
-                symbol: "point.3.connected.trianglepath.dotted",
-                helpTitle: "Buttons",
-                helpText: "The real movement buttons remain locked until the app has enough photo-list and proof-file evidence to avoid losing files."
-            ) {
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 230), spacing: 12)], alignment: .leading, spacing: 12) {
-                    SetupActionTile(
-                        title: "Preview Copy",
-                        symbol: "eye",
-                        status: "Reads only",
-                        detail: "Reads the from folder and buffer. Moves nothing.",
-                        tint: AppTheme.mint
-                    )
-                    SetupActionTile(
-                        title: "Copy to Buffer",
-                        symbol: "square.and.arrow.down",
-                        status: "Copy only",
-                        detail: "Copies new files into the buffer. No delete, no overwrite.",
-                        tint: AppTheme.mint
-                    )
-                    SetupActionTile(
-                        title: "Check + Proof File",
-                        symbol: "checkmark.shield",
-                        status: "Prepare list first",
-                        detail: "Will save proof in the library.",
-                        tint: AppTheme.accent
-                    )
-                    SetupActionTile(
-                        title: "Clear Buffer Space",
-                        symbol: "externaldrive.badge.minus",
-                        status: "Locked",
-                        detail: "Will move aside only files already proven in the library.",
-                        tint: AppTheme.amber
-                    )
                 }
             }
 
@@ -145,7 +113,7 @@ struct SetupView: View {
     }
 }
 
-private struct SetupPresetCard: View {
+private struct SetupPresetRow: View {
     var preset: CameraSetupPreset
     var apply: () -> Void
 
@@ -160,84 +128,63 @@ private struct SetupPresetCard: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(alignment: .top, spacing: 12) {
-                Image(systemName: preset.symbol)
-                    .font(.headline)
-                    .foregroundStyle(statusColor)
-                    .frame(width: 36, height: 36)
-                    .background(statusColor.opacity(0.13), in: RoundedRectangle(cornerRadius: 8))
+        HStack(alignment: .top, spacing: 14) {
+            Image(systemName: preset.symbol)
+                .font(.title3)
+                .foregroundStyle(statusColor)
+                .frame(width: 28)
 
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(preset.title)
-                        .font(.headline)
-                    Text(preset.subtitle)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 7) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(preset.title)
+                            .font(.headline)
+                        Text(preset.subtitle)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer(minLength: 8)
+                    Text(statusText)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(statusColor)
                 }
-                Spacer(minLength: 8)
-                Text(statusText)
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(statusColor)
-            }
 
-            Text(preset.effect)
-                .font(.callout)
-                .fixedSize(horizontal: false, vertical: true)
+                Text(preset.effect)
+                    .font(.callout)
+                    .fixedSize(horizontal: false, vertical: true)
 
-            VStack(alignment: .leading, spacing: 6) {
-                if let sourcePath = preset.sourcePath {
-                    PresetSettingRow(label: "From", value: sourcePath)
+                if let sourcePath = preset.sourcePath, let bufferPath = preset.bufferPath {
+                    HStack(spacing: 8) {
+                        Text(sourcePath)
+                        Image(systemName: "arrow.right")
+                            .foregroundStyle(.tertiary)
+                        Text(bufferPath)
+                    }
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
                 }
-                if let bufferPath = preset.bufferPath {
-                    PresetSettingRow(label: "Buffer", value: bufferPath)
-                }
-                if let libraryRootPath = preset.libraryRootPath {
-                    PresetSettingRow(label: "Library", value: libraryRootPath)
-                }
-                if let deviceID = preset.deviceID {
-                    PresetSettingRow(label: "Camera", value: deviceID)
-                }
-            }
 
-            Button(action: apply) {
-                Label(preset.isApplied ? "Preset Selected" : "Use This Preset", systemImage: preset.isApplied ? "checkmark.circle.fill" : "slider.horizontal.3")
-            }
-            .buttonStyle(.borderedProminent)
-            .disabled(preset.isApplied)
-            .help(preset.isAvailable ? "Select these settings. No files will move." : "Save these settings now; connect the missing drive before previewing or copying.")
+                HStack {
+                    if preset.isApplied {
+                        Label("Selected for next import", systemImage: "checkmark.circle.fill")
+                            .font(.callout.weight(.medium))
+                            .foregroundStyle(AppTheme.mint)
+                    } else {
+                        Button("Use for Next Import", systemImage: "arrow.right.circle", action: apply)
+                            .buttonStyle(.borderedProminent)
+                    }
 
-            if !preset.isAvailable {
-                Label("You can save this preset now, but connect the missing drive before Preview Files.", systemImage: "exclamationmark.triangle")
-                    .font(.caption)
-                    .foregroundStyle(AppTheme.amber)
+                    if !preset.isAvailable {
+                        Label("Connect the missing drive before previewing", systemImage: "externaldrive.badge.exclamationmark")
+                            .font(.caption)
+                            .foregroundStyle(AppTheme.amber)
+                    }
+                }
             }
         }
-        .padding(14)
-        .frame(maxWidth: .infinity, minHeight: 270, alignment: .topLeading)
-        .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 9))
-        .overlay {
-            RoundedRectangle(cornerRadius: 9)
-                .strokeBorder(statusColor.opacity(preset.isApplied ? 0.5 : 0.18))
-        }
-    }
-}
-
-private struct PresetSettingRow: View {
-    var label: String
-    var value: String
-
-    var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Text(label)
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
-                .frame(width: 46, alignment: .leading)
-            Text(value)
-                .font(.caption.monospaced())
-                .lineLimit(1)
-                .truncationMode(.middle)
-        }
+        .padding(.vertical, 12)
     }
 }
 
@@ -261,41 +208,7 @@ private struct SetupStatusTile: View {
             }
             Spacer(minLength: 0)
         }
-        .padding(12)
-        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 8))
-    }
-}
-
-private struct SetupActionTile: View {
-    var title: String
-    var symbol: String
-    var status: String
-    var detail: String
-    var tint: Color
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 9) {
-            HStack(spacing: 10) {
-                Image(systemName: symbol)
-                    .font(.headline)
-                    .foregroundStyle(tint)
-                    .frame(width: 30, height: 30)
-                    .background(tint.opacity(0.12), in: RoundedRectangle(cornerRadius: 7))
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(title)
-                        .font(.headline)
-                    Text(status)
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(tint)
-                }
-            }
-            Text(detail)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        .padding(12)
-        .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 8))
+        .padding(.vertical, 10)
     }
 }
 
