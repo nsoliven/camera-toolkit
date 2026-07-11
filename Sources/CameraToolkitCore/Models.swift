@@ -21,7 +21,7 @@ public enum ToolkitError: Error, Equatable, LocalizedError {
         case .trashPathRequired(let path):
             "Trash root must contain a _Trash component: \(path)"
         case .crossVolumeQuarantine(let a, let b):
-            "Refusing to quarantine across volumes: \(a) and \(b)"
+            "Refusing to move files aside across volumes: \(a) and \(b)"
         case .confirmationRequired(let expected, let received):
             "Expected confirmation \(expected), received \(received)"
         case .rcloneSubcommandNotAllowed(let subcommand):
@@ -169,6 +169,8 @@ public enum JobState: String, Codable, Sendable {
 }
 
 public enum JobAction: String, Codable, CaseIterable, Sendable {
+    case previewFiles
+    case prepareTestData
     case ingestCard
     case syncBuffer
     case freeUp
@@ -176,6 +178,8 @@ public enum JobAction: String, Codable, CaseIterable, Sendable {
     case checkinExports
     case immichScan
     case verifyManifest
+    case diskSpeed
+    case networkSpeed
 }
 
 public struct JobSnapshot: Identifiable, Codable, Hashable, Sendable {
@@ -184,6 +188,16 @@ public struct JobSnapshot: Identifiable, Codable, Hashable, Sendable {
     public var state: JobState
     public var progress: Double
     public var note: String
+    public var detail: String
+    public var command: String
+    public var sourcePath: String?
+    public var destinationPath: String?
+    public var currentPath: String?
+    public var processedFiles: Int
+    public var totalFiles: Int
+    public var processedBytes: Int64
+    public var totalBytes: Int64
+    public var bytesPerSecond: Double
     public var createdAt: Date
     public var finishedAt: Date?
 
@@ -193,6 +207,16 @@ public struct JobSnapshot: Identifiable, Codable, Hashable, Sendable {
         state: JobState = .queued,
         progress: Double = 0,
         note: String = "",
+        detail: String = "",
+        command: String = "",
+        sourcePath: String? = nil,
+        destinationPath: String? = nil,
+        currentPath: String? = nil,
+        processedFiles: Int = 0,
+        totalFiles: Int = 0,
+        processedBytes: Int64 = 0,
+        totalBytes: Int64 = 0,
+        bytesPerSecond: Double = 0,
         createdAt: Date = Date(),
         finishedAt: Date? = nil
     ) {
@@ -201,7 +225,31 @@ public struct JobSnapshot: Identifiable, Codable, Hashable, Sendable {
         self.state = state
         self.progress = progress
         self.note = note
+        self.detail = detail
+        self.command = command
+        self.sourcePath = sourcePath
+        self.destinationPath = destinationPath
+        self.currentPath = currentPath
+        self.processedFiles = processedFiles
+        self.totalFiles = totalFiles
+        self.processedBytes = processedBytes
+        self.totalBytes = totalBytes
+        self.bytesPerSecond = bytesPerSecond
         self.createdAt = createdAt
         self.finishedAt = finishedAt
+    }
+}
+
+public struct DiskSpeedReport: Codable, Equatable, Sendable {
+    public var path: String
+    public var bytes: Int64
+    public var writeBytesPerSecond: Double
+    public var readBytesPerSecond: Double
+
+    public init(path: String, bytes: Int64, writeBytesPerSecond: Double, readBytesPerSecond: Double) {
+        self.path = path
+        self.bytes = bytes
+        self.writeBytesPerSecond = writeBytesPerSecond
+        self.readBytesPerSecond = readBytesPerSecond
     }
 }

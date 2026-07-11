@@ -6,10 +6,12 @@ struct OverviewView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
             HeaderView(
-                eyebrow: "Native archive console",
-                title: "Camera workflow control center",
-                subtitle: "Configured paths, transfer tools, editor handoff, and Immich checks live in one workspace. Execution stays locked until you deliberately add a real run path."
+                eyebrow: "Overview",
+                title: "Places and Moves",
+                subtitle: "Pick where photos come from, pick where they go, and let the app protect the copy."
             )
+
+            SimpleCameraFlowPanel(model: model, showsPaths: false)
 
             CommandBar {
                 HelpedCommandButton(
@@ -18,7 +20,7 @@ struct OverviewView: View {
                     prominence: .primary,
                     isDisabled: model.isBusy,
                     helpTitle: "Run Safety Test",
-                    helpText: "This creates disposable camera-style test files, copies new files into a test archive, writes and verifies a manifest, then quarantines only files proven safe.",
+                    helpText: "This creates disposable camera-style test files, copies new files into a test library, writes and checks a proof file, then moves aside only files proven safe.",
                     action: model.runFullSimulation
                 )
 
@@ -27,7 +29,7 @@ struct OverviewView: View {
                     symbol: "arrow.counterclockwise",
                     isDisabled: model.isBusy,
                     helpTitle: "Reset Test Data",
-                    helpText: "This recreates the disposable source, archive, and buffer folders so you can test the workflow again from a clean state.",
+                    helpText: "This recreates the disposable from folder, test library, and buffer folders so you can test the workflow again from a clean state.",
                     action: model.seedSimulation
                 )
             }
@@ -36,6 +38,8 @@ struct OverviewView: View {
 
             ViewThatFits(in: .horizontal) {
                 HStack(alignment: .top, spacing: 16) {
+                    WorkflowPlanPanel(plan: model.workflowPlan(.ingestBuffer))
+                        .frame(minWidth: 0, maxWidth: .infinity)
                     WorkflowPlanPanel(plan: model.workflowPlan(.importArchive))
                         .frame(minWidth: 0, maxWidth: .infinity)
                     WorkflowPlanPanel(plan: model.workflowPlan(.freeUpBuffer))
@@ -43,6 +47,7 @@ struct OverviewView: View {
                 }
 
                 VStack(alignment: .leading, spacing: 16) {
+                    WorkflowPlanPanel(plan: model.workflowPlan(.ingestBuffer))
                     WorkflowPlanPanel(plan: model.workflowPlan(.importArchive))
                     WorkflowPlanPanel(plan: model.workflowPlan(.freeUpBuffer))
                 }

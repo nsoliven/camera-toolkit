@@ -1,6 +1,575 @@
 import CameraToolkitCore
 import SwiftUI
 
+struct SimpleCameraFlowPanel: View {
+    @Bindable var model: DashboardModel
+    var showsActions: Bool = true
+    var showsFolderChoices: Bool = false
+    var showsMoves: Bool = true
+    var showsPaths: Bool = true
+
+    private var places: [CameraPlace] {
+        [
+            CameraPlace(
+                title: "Camera / Folder",
+                detail: "The folder you copy from",
+                path: model.configuration.importSourcePath,
+                symbol: "sdcard",
+                tint: AppTheme.accent
+            ),
+            CameraPlace(
+                title: "Buffer",
+                detail: "Working scratch space",
+                path: model.expandedBufferRootPath,
+                symbol: "externaldrive",
+                tint: AppTheme.mint
+            ),
+            CameraPlace(
+                title: "Photo Library / NAS",
+                detail: "Long-term home for originals",
+                path: model.expandedLibraryRootPath,
+                symbol: "building.columns",
+                tint: AppTheme.amber
+            ),
+            CameraPlace(
+                title: "PC Work",
+                detail: "Optional local edit space",
+                path: model.expandedEditorWorkingFolderPath,
+                symbol: "desktopcomputer",
+                tint: .secondary
+            )
+        ]
+    }
+
+    private var moves: [CameraMove] {
+        [
+            CameraMove(
+                title: "From Folder -> Buffer",
+                status: "Ready",
+                detail: "Best default when you want a fast working copy before saving to the photo library.",
+                tint: AppTheme.mint
+            ),
+            CameraMove(
+                title: "From Folder -> Photo Library",
+                status: "Direct",
+                detail: "Valid when you want to skip the buffer; still preview, check, and never delete the camera folder.",
+                tint: AppTheme.accent
+            ),
+            CameraMove(
+                title: "Buffer -> Photo Library",
+                status: "Save",
+                detail: "After edits, copy Originals to Originals and finished exports to Edited.",
+                tint: AppTheme.amber
+            ),
+            CameraMove(
+                title: "Photo Library -> Buffer or PC",
+                status: "Edit copy",
+                detail: "Use this when an older shoot needs another edit pass.",
+                tint: .secondary
+            ),
+            CameraMove(
+                title: "Edited Files -> Photo Library",
+                status: "Save",
+                detail: "Finished JPEG, TIFF, video, or delivery files belong with the library record.",
+                tint: AppTheme.mint
+            )
+        ]
+    }
+
+    var body: some View {
+        Panel(
+            title: showsFolderChoices ? "Pick Folders" : "Places and Moves",
+            symbol: "arrow.triangle.branch",
+            helpTitle: showsFolderChoices ? "Pick Folders" : "Places and Moves",
+            helpText: showsFolderChoices
+                ? "Choose the folders for this copy: where photos come from, where buffer copies go, where the library lives, and where edit copies open."
+                : "The app has four places: from folder, buffer, photo library, and optional PC work folder. The buttons choose a move between places."
+        ) {
+            VStack(alignment: .leading, spacing: 16) {
+                if showsFolderChoices {
+                    CameraFolderChoiceGrid(model: model)
+                } else {
+                    CameraPlacesGrid(places: places)
+                }
+
+                if showsActions {
+                    CommandBar {
+                        if showsFolderChoices {
+                            HelpedCommandButton(
+                                title: "Preview Files",
+                                symbol: "eye",
+                                prominence: .primary,
+                                isDisabled: model.isBusy,
+                                helpTitle: "Preview Files",
+                                helpText: "Scan the from folder, compare it to the buffer, and queue new files. Nothing is copied yet.",
+                                action: model.previewImport
+                            )
+
+                            HelpedCommandButton(
+                                title: "Add All New",
+                                symbol: "checklist.checked",
+                                isDisabled: model.isBusy || model.activePlan.new.isEmpty,
+                                helpTitle: "Add All New",
+                                helpText: "Put every new file from the preview into the queue.",
+                                action: model.queueAllNewFiles
+                            )
+
+                            HelpedCommandButton(
+                                title: "Copy Queue to Buffer",
+                                symbol: "externaldrive.badge.plus",
+                                isDisabled: model.isBusy || model.queuedFiles.isEmpty,
+                                helpTitle: "Copy Queue to Buffer",
+                                helpText: "Copy only queued files into the buffer. Nothing is deleted or overwritten.",
+                                action: model.copyQueuedFilesToBuffer
+                            )
+                        } else {
+                            HelpedCommandButton(
+                                title: "Preview Copy",
+                                symbol: "eye",
+                                prominence: .primary,
+                                isDisabled: model.isBusy,
+                                helpTitle: "Preview Copy",
+                                helpText: "Check what would copy from the selected folder into the buffer before writing anything.",
+                                action: model.previewImport
+                            )
+
+                            HelpedCommandButton(
+                                title: "Copy to Buffer",
+                                symbol: "externaldrive.badge.plus",
+                                isDisabled: model.isBusy,
+                                helpTitle: "Copy to Buffer",
+                                helpText: "Copy new files from the selected folder into the buffer. Nothing is deleted or overwritten.",
+                                action: model.copySourceToBuffer
+                            )
+
+                            HelpedCommandButton(
+                                title: "Setup",
+                                symbol: "checklist",
+                                isDisabled: model.isBusy,
+                                helpTitle: "Setup",
+                                helpText: "Choose the from folder, buffer folder, photo library, photo list, and backup folder.",
+                                action: { model.selectedSection = .setup }
+                            )
+                        }
+                    }
+                }
+
+                if showsMoves {
+                    CameraMovesList(moves: moves)
+                }
+
+                if showsPaths {
+                    VStack(alignment: .leading, spacing: 8) {
+                        SimpleCameraFlowPathRow(title: "Copy from", path: model.configuration.importSourcePath)
+                        SimpleCameraFlowPathRow(title: "Buffer copies", path: model.expandedBufferIngestPath)
+                        SimpleCameraFlowPathRow(title: "Export edits", path: model.expandedBufferExportsPath)
+                        SimpleCameraFlowPathRow(title: "PC work", path: model.expandedEditorWorkingFolderPath)
+                        SimpleCameraFlowPathRow(title: "Library originals", path: model.expandedLibraryOriginalsPath)
+                        SimpleCameraFlowPathRow(title: "Library edits", path: model.expandedLibraryEditedPath)
+                    }
+                    .padding(12)
+                    .background(Color.black.opacity(0.06), in: RoundedRectangle(cornerRadius: 8))
+                }
+            }
+        }
+    }
+}
+
+private struct CameraFolderChoiceGrid: View {
+    @Bindable var model: DashboardModel
+
+    private let columns = [
+        GridItem(.adaptive(minimum: 250), spacing: 12, alignment: .top)
+    ]
+
+    var body: some View {
+        LazyVGrid(columns: columns, alignment: .leading, spacing: 12) {
+            CameraFolderChoiceCard(
+                title: "From Folder",
+                detail: "Camera or card folder",
+                path: model.configuration.importSourcePath,
+                symbol: "sdcard",
+                tint: AppTheme.accent,
+                savedLocations: model.configuration.locations(role: .importSource),
+                selectedID: model.configuration.selectedLocationID(for: .importSource),
+                chooseTitle: "Choose From Folder",
+                chooseAction: model.chooseImportFolder,
+                useLocation: model.useConfiguredLocation
+            )
+
+            CameraFolderChoiceCard(
+                title: "Buffer",
+                detail: "Fast working copy",
+                path: model.expandedBufferRootPath,
+                symbol: "externaldrive",
+                tint: AppTheme.mint,
+                savedLocations: model.configuration.locations(role: .buffer),
+                selectedID: model.configuration.selectedLocationID(for: .buffer),
+                chooseTitle: "Choose Buffer",
+                chooseAction: model.chooseBufferFolder,
+                useLocation: model.useConfiguredLocation
+            )
+
+            CameraFolderChoiceCard(
+                title: "Photo Library",
+                detail: "Long-term home",
+                path: model.expandedLibraryRootPath,
+                symbol: "building.columns",
+                tint: AppTheme.amber,
+                savedLocations: model.configuration.locations(role: .archive),
+                selectedID: model.configuration.selectedLocationID(for: .archive),
+                chooseTitle: "Choose Library",
+                chooseAction: model.chooseCameraLibraryRoot,
+                useLocation: model.useConfiguredLocation
+            )
+
+            CameraFolderChoiceCard(
+                title: "Edit Copies",
+                detail: "Local editor folder",
+                path: model.expandedEditorWorkingFolderPath,
+                symbol: "desktopcomputer",
+                tint: .secondary,
+                savedLocations: [],
+                selectedID: nil,
+                chooseTitle: "Choose Edit Folder",
+                chooseAction: model.chooseEditorWorkingFolder,
+                useLocation: { _ in }
+            )
+        }
+    }
+}
+
+private struct CameraFolderChoiceCard: View {
+    var title: String
+    var detail: String
+    var path: String
+    var symbol: String
+    var tint: Color
+    var savedLocations: [ConfiguredLocation]
+    var selectedID: UUID?
+    var chooseTitle: String
+    var chooseAction: () -> Void
+    var useLocation: (ConfiguredLocation) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: symbol)
+                    .font(.headline)
+                    .frame(width: 34, height: 34)
+                    .foregroundStyle(tint)
+                    .background(tint.opacity(0.14), in: RoundedRectangle(cornerRadius: 8))
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(title)
+                        .font(.headline)
+                    Text(detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer(minLength: 8)
+            }
+
+            Text(path)
+                .font(.caption.monospaced())
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+                .truncationMode(.middle)
+                .frame(minHeight: 32, alignment: .topLeading)
+
+            HStack(spacing: 8) {
+                Button(action: chooseAction) {
+                    Label("Choose", systemImage: "folder")
+                }
+                .buttonStyle(.bordered)
+                .fixedSize()
+
+                Menu {
+                    ForEach(savedLocations) { location in
+                        Button {
+                            useLocation(location)
+                        } label: {
+                            Label(location.name, systemImage: location.id == selectedID ? "checkmark.circle.fill" : "folder")
+                        }
+                    }
+                } label: {
+                    Label("Saved", systemImage: "list.bullet")
+                }
+                .menuStyle(.button)
+                .buttonStyle(.bordered)
+                .disabled(savedLocations.isEmpty)
+                .fixedSize()
+            }
+        }
+        .padding(12)
+        .frame(minHeight: 156, alignment: .topLeading)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(tint.opacity(0.07), in: RoundedRectangle(cornerRadius: 8))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(tint.opacity(0.22))
+        )
+    }
+}
+
+private struct CameraPlace: Identifiable {
+    var id: String { title }
+    var title: String
+    var detail: String
+    var path: String
+    var symbol: String
+    var tint: Color
+}
+
+private struct CameraMove: Identifiable {
+    var id: String { title }
+    var title: String
+    var status: String
+    var detail: String
+    var tint: Color
+}
+
+private struct CameraPlacesGrid: View {
+    var places: [CameraPlace]
+
+    private let columns = [
+        GridItem(.adaptive(minimum: 210), spacing: 12, alignment: .top)
+    ]
+
+    var body: some View {
+        LazyVGrid(columns: columns, alignment: .leading, spacing: 12) {
+            ForEach(places) { place in
+                CameraPlaceCard(place: place)
+            }
+        }
+    }
+}
+
+private struct CameraPlaceCard: View {
+    var place: CameraPlace
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: place.symbol)
+                .font(.headline)
+                .frame(width: 34, height: 34)
+                .foregroundStyle(place.tint)
+                .background(place.tint.opacity(0.14), in: RoundedRectangle(cornerRadius: 8))
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(place.title)
+                    .font(.headline)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.82)
+                Text(place.detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text(place.path)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+        }
+        .padding(12)
+        .frame(minHeight: 92, alignment: .topLeading)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 8))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(place.tint.opacity(0.16))
+        )
+    }
+}
+
+private struct CameraMovesList: View {
+    var moves: [CameraMove]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(moves) { move in
+                CameraMoveRow(move: move)
+            }
+        }
+    }
+}
+
+private struct CameraMoveRow: View {
+    var move: CameraMove
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: "arrow.right")
+                .font(.caption.weight(.bold))
+                .foregroundStyle(move.tint)
+                .frame(width: 28, height: 28)
+                .background(move.tint.opacity(0.12), in: RoundedRectangle(cornerRadius: 7))
+
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(move.title)
+                        .font(.callout.weight(.semibold))
+                    Text(move.status)
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(move.tint)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(move.tint.opacity(0.12), in: RoundedRectangle(cornerRadius: 7))
+                }
+                Text(move.detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Spacer(minLength: 8)
+        }
+        .padding(10)
+        .background(Color.black.opacity(0.05), in: RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+private struct SimpleCameraFlowStep: Identifiable {
+    var id: Int { number }
+    var number: Int
+    var badge: String
+    var title: String
+    var detail: String
+    var symbol: String
+    var tint: Color
+}
+
+private struct SimpleCameraFlowPath: View {
+    var steps: [SimpleCameraFlowStep]
+
+    var body: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(alignment: .center, spacing: 10) {
+                ForEach(Array(steps.enumerated()), id: \.element.id) { index, step in
+                    SimpleCameraFlowStepCard(step: step)
+                        .frame(minWidth: 118, maxWidth: .infinity)
+                    if index < steps.count - 1 {
+                        SimpleCameraFlowConnector()
+                    }
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 10) {
+                ForEach(Array(steps.enumerated()), id: \.element.id) { index, step in
+                    SimpleCameraFlowStepRow(step: step)
+                    if index < steps.count - 1 {
+                        VerticalFlowConnector()
+                    }
+                }
+            }
+        }
+    }
+}
+
+private struct SimpleCameraFlowStepCard: View {
+    var step: SimpleCameraFlowStep
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top, spacing: 10) {
+                StepNumberBadge(number: step.number, tint: step.tint)
+                Spacer(minLength: 8)
+                Text(step.badge)
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(step.tint)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(step.tint.opacity(0.12), in: RoundedRectangle(cornerRadius: 7))
+            }
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(step.title)
+                    .font(.callout.weight(.semibold))
+                    .lineLimit(2)
+                    .minimumScaleFactor(0.8)
+                Text(step.detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(12)
+        .frame(minHeight: 118, alignment: .topLeading)
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 8))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(step.tint.opacity(0.18))
+        )
+    }
+}
+
+private struct SimpleCameraFlowConnector: View {
+    var body: some View {
+        HStack(spacing: 3) {
+            Rectangle()
+                .fill(AppTheme.accent.opacity(0.34))
+                .frame(width: 12, height: 2)
+            Image(systemName: "arrow.right")
+                .font(.caption.weight(.bold))
+                .foregroundStyle(AppTheme.accent)
+        }
+        .frame(width: 28)
+        .accessibilityHidden(true)
+    }
+}
+
+private struct SimpleCameraFlowStepRow: View {
+    var step: SimpleCameraFlowStep
+
+    var body: some View {
+        HStack(spacing: 12) {
+            StepNumberBadge(number: step.number, tint: step.tint)
+            Image(systemName: step.symbol)
+                .font(.headline)
+                .foregroundStyle(step.tint)
+                .frame(width: 30)
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 8) {
+                    Text(step.title)
+                        .font(.headline)
+                    Text(step.badge)
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(step.tint)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(step.tint.opacity(0.12), in: RoundedRectangle(cornerRadius: 7))
+                }
+                Text(step.detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+        }
+        .padding(12)
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+private struct SimpleCameraFlowPathRow: View {
+    var title: String
+    var path: String
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 12) {
+            Text(title)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 112, alignment: .leading)
+            Text(path)
+                .font(.caption.monospaced())
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+    }
+}
+
 struct TransferFlowPanel: View {
     var plan: CopyPlan
     var sourceURL: (FileRecord) -> URL? = { _ in nil }
@@ -12,7 +581,7 @@ struct TransferFlowPanel: View {
             title: "Copy Plan",
             symbol: "arrow.triangle.2.circlepath",
             helpTitle: "Copy Plan",
-            helpText: "This is the dry-run view. Follow the numbered flow from source to archive verification. New files can be copied, already archived files are skipped, and conflicts mean the same path exists with different bytes."
+            helpText: "This shows what would copy. New files can be copied, files already there are skipped, and conflicts need your review."
         ) {
             CopyFlowPath()
 
@@ -45,10 +614,10 @@ struct TransferFlowPanel: View {
 
 private struct CopyFlowPath: View {
     private let stages = [
-        FlowStage(number: 1, title: "Source", subtitle: "Configured card folder", symbol: "sdcard", tint: AppTheme.accent),
-        FlowStage(number: 2, title: "Copy", subtitle: "Checksum + immutable", symbol: "arrow.right.doc.on.clipboard", tint: AppTheme.mint),
-        FlowStage(number: 3, title: "Verify", subtitle: "Compare archive bytes", symbol: "checkmark.shield", tint: AppTheme.amber),
-        FlowStage(number: 4, title: "Manifest", subtitle: "Record the result", symbol: "checklist.checked", tint: .purple)
+        FlowStage(number: 1, title: "From", subtitle: "Selected folder", symbol: "sdcard", tint: AppTheme.accent),
+        FlowStage(number: 2, title: "Copy", subtitle: "No overwrite", symbol: "arrow.right.doc.on.clipboard", tint: AppTheme.mint),
+        FlowStage(number: 3, title: "Check", subtitle: "Compare copied bytes", symbol: "checkmark.shield", tint: AppTheme.amber),
+        FlowStage(number: 4, title: "Proof File", subtitle: "Save what happened", symbol: "checklist.checked", tint: .purple)
     ]
 
     var body: some View {
@@ -234,7 +803,7 @@ private struct CopyPlanFileRow: View {
                 if let revealFile {
                     PlanFileActionButton(
                         symbol: "folder",
-                        help: "Reveal source file in Finder"
+                        help: "Reveal original file in Finder"
                     ) {
                         revealFile(file)
                     }
@@ -248,7 +817,7 @@ private struct CopyPlanFileRow: View {
                             .contentShape(RoundedRectangle(cornerRadius: 7))
                     }
                     .buttonStyle(.plain)
-                    .help("Share source file")
+                    .help("Share original file")
                     .accessibilityLabel("Share \(file.path)")
                 }
             }
@@ -289,10 +858,10 @@ struct WorkflowPlanPanel: View {
 
     var body: some View {
         Panel(
-            title: plan?.title ?? "Workflow Plan",
+            title: plan?.title ?? "Move Plan",
             symbol: "point.topleft.down.curvedto.point.bottomright.up",
-            helpTitle: "Workflow Plan",
-            helpText: "This shows the exact planned paths, commands, endpoints, and safety gates. Locked plans are not executed by the app."
+            helpTitle: "Move Plan",
+            helpText: "This shows plain-language steps. Details still show exact commands when useful. Locked steps do not run."
         ) {
             if let plan {
                 HStack(spacing: 12) {
@@ -309,7 +878,7 @@ struct WorkflowPlanPanel: View {
                 WorkflowStepTimeline(steps: plan.steps)
 
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("Safety Gates")
+                    Text("Safety Checks")
                         .font(.headline)
                     ForEach(plan.gates) { gate in
                         HStack(alignment: .top, spacing: 10) {
@@ -350,7 +919,7 @@ private struct WorkflowPlanStepRow: View {
                 HStack(alignment: .firstTextBaseline, spacing: 10) {
                     Label(step.title, systemImage: step.writesFiles ? "pencil.and.outline" : "eye")
                         .font(.headline)
-                    Text(step.isExecutableNow ? "available now" : "locked")
+                    Text(step.isExecutableNow ? "ready" : "locked")
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(stepTint)
                         .padding(.horizontal, 8)
@@ -437,7 +1006,7 @@ private extension WorkflowPlanStatus {
     var displayName: String {
         switch self {
         case .ready: "Ready"
-        case .needsConfig: "Needs Config"
+        case .needsConfig: "Needs Setup"
         case .locked: "Locked"
         }
     }
@@ -480,7 +1049,7 @@ struct SimulationSummaryPanel: View {
             title: "Safety Test Result",
             symbol: "checklist.checked",
             helpTitle: "Safety Test Result",
-            helpText: "This summarizes the last safety test. Copied files reached the test archive, quarantined files were proven safe to move out of the buffer, and left-alone files were not safe to remove."
+            helpText: "This summarizes the last test. Files copied to the test library, proven matches moved aside, and unsafe files stayed put."
         ) {
             Text(statusMessage)
                 .font(.callout)
@@ -488,15 +1057,15 @@ struct SimulationSummaryPanel: View {
 
             HStack(spacing: 12) {
                 MetricPill(title: "Copied", value: "\(summary?.copiedCount ?? 0)", symbol: "doc.on.doc", tint: AppTheme.accent)
-                MetricPill(title: "Quarantined", value: "\(summary?.quarantinedCount ?? 0)", symbol: "archivebox", tint: AppTheme.mint)
-                MetricPill(title: "Left unsafe", value: "\(summary?.leftUnsafeCount ?? 0)", symbol: "exclamationmark.triangle", tint: AppTheme.amber)
+                MetricPill(title: "Moved aside", value: "\(summary?.quarantinedCount ?? 0)", symbol: "archivebox", tint: AppTheme.mint)
+                MetricPill(title: "Left alone", value: "\(summary?.leftUnsafeCount ?? 0)", symbol: "exclamationmark.triangle", tint: AppTheme.amber)
             }
 
             if let summary {
                 VStack(alignment: .leading, spacing: 6) {
                     PathRow(title: "Root", path: summary.root)
-                    PathRow(title: "Source", path: summary.sourcePath)
-                    PathRow(title: "Archive", path: summary.archivePath)
+                    PathRow(title: "From", path: summary.sourcePath)
+                    PathRow(title: "Library", path: summary.archivePath)
                     PathRow(title: "Buffer", path: summary.bufferPath)
                 }
             }
@@ -618,6 +1187,7 @@ private struct ActivityLogRow: View {
 
 struct JobsStrip: View {
     var jobs: [JobSnapshot]
+    @State private var selectedJob: JobSnapshot?
 
     var body: some View {
         Panel(
@@ -632,26 +1202,21 @@ struct JobsStrip: View {
                     .foregroundStyle(.secondary)
             } else {
                 ForEach(jobs.prefix(5)) { job in
-                    HStack(spacing: 12) {
-                        Circle()
-                            .fill(color(for: job.state))
-                            .frame(width: 10, height: 10)
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(job.action.displayName)
-                                .font(.headline)
-                            Text(job.note)
-                                .foregroundStyle(.secondary)
-                        }
-                        Spacer()
-                        ProgressView(value: job.progress)
-                            .frame(width: 180)
-                        Text("\(Int(job.progress * 100))%")
-                            .font(.callout.monospacedDigit())
-                            .foregroundStyle(.secondary)
-                            .frame(width: 44, alignment: .trailing)
+                    JobSessionRow(job: job, tint: color(for: job.state)) {
+                        selectedJob = job
                     }
                 }
             }
+        }
+        .sheet(item: $selectedJob) { selectedJob in
+            JobDetailSheet(job: jobs.first(where: { $0.id == selectedJob.id }) ?? selectedJob)
+        }
+        .onChange(of: jobs) { _, newJobs in
+            guard let selectedJob,
+                  let updatedJob = newJobs.first(where: { $0.id == selectedJob.id }) else {
+                return
+            }
+            self.selectedJob = updatedJob
         }
     }
 
@@ -662,6 +1227,177 @@ struct JobsStrip: View {
         case .done: AppTheme.mint
         case .failed: .red
         case .cancelled: .secondary
+        }
+    }
+}
+
+private struct JobSessionRow: View {
+    var job: JobSnapshot
+    var tint: Color
+    var openDetails: () -> Void
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Circle()
+                .fill(tint)
+                .frame(width: 10, height: 10)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(job.action.displayName)
+                    .font(.headline)
+                Text(job.note)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .truncationMode(.middle)
+                if let currentPath = job.currentPath, !currentPath.isEmpty {
+                    Text(currentPath)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+            }
+
+            Spacer()
+
+            if job.bytesPerSecond > 0 {
+                Text("\(Int64(job.bytesPerSecond).formattedBytes)/s")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .frame(width: 86, alignment: .trailing)
+            }
+
+            ProgressView(value: job.progress)
+                .frame(width: 180)
+
+            Text("\(Int(job.progress * 100))%")
+                .font(.callout.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .frame(width: 44, alignment: .trailing)
+
+            Button(action: openDetails) {
+                Image(systemName: "info.circle")
+                    .font(.system(size: 15, weight: .semibold))
+                    .frame(width: 28, height: 28)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Open job details")
+            .accessibilityLabel("Open details for \(job.action.displayName)")
+        }
+        .padding(.vertical, 4)
+        .contentShape(Rectangle())
+        .onTapGesture(perform: openDetails)
+    }
+}
+
+private struct JobDetailSheet: View {
+    var job: JobSnapshot
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(job.action.displayName)
+                        .font(.title2.weight(.semibold))
+                    Text(job.state.activityLabel)
+                        .font(.callout.weight(.semibold))
+                        .foregroundStyle(stateTint)
+                }
+                Spacer()
+                Text("\(Int(job.progress * 100))%")
+                    .font(.title3.monospacedDigit().weight(.semibold))
+                    .foregroundStyle(AppTheme.accent)
+            }
+
+            ProgressView(value: job.progress)
+
+            HStack(spacing: 12) {
+                MetricPill(title: "Files", value: filesText, symbol: "doc.on.doc", tint: AppTheme.accent)
+                MetricPill(title: "Bytes", value: bytesText, symbol: "externaldrive", tint: AppTheme.mint)
+                MetricPill(title: "Speed", value: speedText, symbol: "speedometer", tint: AppTheme.amber)
+            }
+
+            VStack(alignment: .leading, spacing: 10) {
+                JobDetailLine(title: "Now", value: job.note)
+                if !job.detail.isEmpty {
+                    JobDetailLine(title: "Progress", value: job.detail)
+                }
+                if let sourcePath = job.sourcePath {
+                    JobDetailLine(title: "From", value: sourcePath)
+                }
+                if let destinationPath = job.destinationPath {
+                    JobDetailLine(title: "To", value: destinationPath)
+                }
+                if let currentPath = job.currentPath {
+                    JobDetailLine(title: "Current File", value: currentPath)
+                }
+            }
+
+            if !job.command.isEmpty {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Technical command")
+                        .font(.headline)
+                    Text(job.command)
+                        .font(.caption.monospaced())
+                        .textSelection(.enabled)
+                        .padding(12)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color.black.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
+                }
+            }
+
+            Spacer(minLength: 0)
+        }
+        .padding(24)
+        .frame(width: 680)
+        .frame(minHeight: 420)
+    }
+
+    private var filesText: String {
+        guard job.totalFiles > 0 else {
+            return "\(job.processedFiles)"
+        }
+        return "\(job.processedFiles)/\(job.totalFiles)"
+    }
+
+    private var bytesText: String {
+        guard job.totalBytes > 0 else {
+            return job.processedBytes > 0 ? job.processedBytes.formattedBytes : "-"
+        }
+        return "\(job.processedBytes.formattedBytes) / \(job.totalBytes.formattedBytes)"
+    }
+
+    private var speedText: String {
+        job.bytesPerSecond > 0 ? "\(Int64(job.bytesPerSecond).formattedBytes)/s" : "-"
+    }
+
+    private var stateTint: Color {
+        switch job.state {
+        case .queued: .secondary
+        case .running: AppTheme.amber
+        case .done: AppTheme.mint
+        case .failed: .red
+        case .cancelled: .secondary
+        }
+    }
+}
+
+private struct JobDetailLine: View {
+    var title: String
+    var value: String
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 12) {
+            Text(title)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 92, alignment: .leading)
+            Text(value)
+                .font(.callout.monospaced())
+                .textSelection(.enabled)
+                .lineLimit(3)
+                .truncationMode(.middle)
         }
     }
 }

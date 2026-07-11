@@ -29,13 +29,17 @@ extension Int64 {
 extension JobAction {
     var displayName: String {
         switch self {
-        case .ingestCard: "Import"
-        case .syncBuffer: "Sync buffer"
-        case .freeUp: "Free up"
-        case .checkout: "Checkout"
-        case .checkinExports: "Upload edits"
-        case .immichScan: "Immich scan"
-        case .verifyManifest: "Verify manifest"
+        case .previewFiles: "Preview files"
+        case .prepareTestData: "Prepare test data"
+        case .ingestCard: "Copy to buffer"
+        case .syncBuffer: "Copy buffer"
+        case .freeUp: "Clear buffer space"
+        case .checkout: "Open for editing"
+        case .checkinExports: "Save edited files"
+        case .immichScan: "Check Immich"
+        case .verifyManifest: "Run safety test"
+        case .diskSpeed: "Test buffer speed"
+        case .networkSpeed: "Test library speed"
         }
     }
 }

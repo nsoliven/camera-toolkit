@@ -62,6 +62,12 @@ final class ConfigurationStoreTests: XCTestCase {
             XCTAssertTrue(loaded.editorWorkingFolderPath.hasSuffix("Editor Working Copies"))
             XCTAssertEqual(loaded.rcloneBinaryPath, "rclone")
             XCTAssertEqual(loaded.exiftoolBinaryPath, "exiftool")
+            XCTAssertEqual(loaded.selectedLocation(for: .importSource)?.path, root.appendingPathComponent("Card").path)
+            XCTAssertEqual(loaded.selectedLocation(for: .archive)?.path, root.appendingPathComponent("Archive").path)
+            XCTAssertEqual(loaded.selectedLocation(for: .buffer)?.path, root.appendingPathComponent("Buffer").path)
+            XCTAssertEqual(loaded.locations(role: .importSource).map(\.name), ["Card"])
+            XCTAssertEqual(loaded.locations(role: .archive).map(\.name), ["Archive"])
+            XCTAssertEqual(loaded.locations(role: .buffer).map(\.name), ["Buffer"])
         }
     }
 }

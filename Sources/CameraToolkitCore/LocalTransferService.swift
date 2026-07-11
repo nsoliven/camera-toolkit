@@ -21,34 +21,137 @@ public struct LocalTransferService {
         self.fileManager = fileManager
     }
 
-    public func copyImmutable(source: URL, destination: URL, excludes: [String] = DefaultExcludes.all) throws -> LocalCopyResult {
-        let sourceFiles = try scanner.scan(root: source, excludes: excludes, hashing: true)
+    public func copyImmutable(
+        source: URL,
+        destination: URL,
+        excludes: [String] = DefaultExcludes.all,
+        progress: FileOperationProgressHandler? = nil
+    ) throws -> LocalCopyResult {
+        let sourceFiles = try scanner.scan(root: source, excludes: excludes, hashing: true) { update in
+            progress?(update.withPhase("Hashing source"))
+        }
+        return try copyFiles(source: source, destination: destination, files: sourceFiles, progress: progress)
+    }
+
+    public func copyFiles(
+        source: URL,
+        destination: URL,
+        files: [FileRecord],
+        progress: FileOperationProgressHandler? = nil
+    ) throws -> LocalCopyResult {
         try fileManager.createDirectory(at: destination, withIntermediateDirectories: true)
         var result = LocalCopyResult()
+        let sourceFiles = files.sorted { $0.path < $1.path }
+        let totalFiles = sourceFiles.count
+        let totalBytes = sourceFiles.reduce(Int64(0)) { $0 + $1.size }
+        let startedAt = Date()
+        var processedFiles = 0
+        var processedBytes: Int64 = 0
 
         for sourceFile in sourceFiles {
             try PathSafety.validateRelativePath(sourceFile.path)
             let sourceURL = source.appendingPathComponent(sourceFile.path)
             let destinationURL = destination.appendingPathComponent(sourceFile.path)
+            guard fileManager.fileExists(atPath: sourceURL.path) else {
+                throw ToolkitError.pathNotFound(sourceURL.path)
+            }
+            let sourceHash: String
+            if let existingHash = sourceFile.sha256 {
+                sourceHash = existingHash
+            } else {
+                sourceHash = try FileScanner.sha256(sourceURL)
+            }
 
             if fileManager.fileExists(atPath: destinationURL.path) {
                 let destinationHash = try FileScanner.sha256(destinationURL)
-                if destinationHash == sourceFile.sha256 {
+                if destinationHash == sourceHash {
                     result.skippedIdentical.append(sourceFile.path)
                 } else {
                     result.conflicts.append(sourceFile.path)
                 }
+                processedFiles += 1
+                processedBytes += sourceFile.size
+                progress?(
+                    FileOperationProgress(
+                        phase: "Comparing existing file",
+                        currentPath: sourceFile.path,
+                        processedFiles: processedFiles,
+                        totalFiles: totalFiles,
+                        processedBytes: processedBytes,
+                        totalBytes: totalBytes,
+                        bytesPerSecond: Self.rate(bytes: processedBytes, since: startedAt)
+                    )
+                )
                 continue
             }
 
             try fileManager.createDirectory(at: destinationURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try fileManager.copyItem(at: sourceURL, to: destinationURL)
+            try copyFile(from: sourceURL, to: destinationURL) { copiedChunk in
+                processedBytes += Int64(copiedChunk)
+                progress?(
+                    FileOperationProgress(
+                        phase: "Copying",
+                        currentPath: sourceFile.path,
+                        processedFiles: processedFiles,
+                        totalFiles: totalFiles,
+                        processedBytes: processedBytes,
+                        totalBytes: totalBytes,
+                        bytesPerSecond: Self.rate(bytes: processedBytes, since: startedAt)
+                    )
+                )
+            }
+            processedFiles += 1
             result.copied.append(sourceFile.path)
+            progress?(
+                FileOperationProgress(
+                    phase: "Copying",
+                    currentPath: sourceFile.path,
+                    processedFiles: processedFiles,
+                    totalFiles: totalFiles,
+                    processedBytes: processedBytes,
+                    totalBytes: totalBytes,
+                    bytesPerSecond: Self.rate(bytes: processedBytes, since: startedAt)
+                )
+            )
         }
 
         result.copied.sort()
         result.skippedIdentical.sort()
         result.conflicts.sort()
         return result
+    }
+
+    private func copyFile(from source: URL, to destination: URL, progress: (Int) -> Void) throws {
+        let temporaryURL = destination
+            .deletingLastPathComponent()
+            .appendingPathComponent(".\(destination.lastPathComponent).cttmp-\(UUID().uuidString)")
+        try? fileManager.removeItem(at: temporaryURL)
+
+        let input = try FileHandle(forReadingFrom: source)
+        defer { try? input.close() }
+
+        guard fileManager.createFile(atPath: temporaryURL.path, contents: nil) else {
+            throw ToolkitError.commandFailed("Could not create temporary copy file at \(temporaryURL.path)")
+        }
+        let output = try FileHandle(forWritingTo: temporaryURL)
+        do {
+            while true {
+                let chunk = try input.read(upToCount: 4 * 1024 * 1024) ?? Data()
+                if chunk.isEmpty { break }
+                try output.write(contentsOf: chunk)
+                progress(chunk.count)
+            }
+            try output.close()
+            try fileManager.moveItem(at: temporaryURL, to: destination)
+        } catch {
+            try? output.close()
+            try? fileManager.removeItem(at: temporaryURL)
+            throw error
+        }
+    }
+
+    private static func rate(bytes: Int64, since date: Date) -> Double {
+        let elapsed = max(Date().timeIntervalSince(date), 0.001)
+        return Double(bytes) / elapsed
     }
 }

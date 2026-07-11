@@ -1,6 +1,7 @@
 import Foundation
 
 public enum WorkflowPlanKind: String, Codable, CaseIterable, Sendable {
+    case ingestBuffer
     case importArchive
     case freeUpBuffer
     case immichUpload
@@ -9,11 +10,12 @@ public enum WorkflowPlanKind: String, Codable, CaseIterable, Sendable {
 
     public var displayName: String {
         switch self {
-        case .importArchive: "Import to Archive"
-        case .freeUpBuffer: "Free Up Buffer"
-        case .immichUpload: "Immich Upload"
-        case .editorCheckout: "External Editor"
-        case .metadataRead: "Metadata Read"
+        case .ingestBuffer: "Copy to Buffer"
+        case .importArchive: "Save Buffer to Library"
+        case .freeUpBuffer: "Clear Buffer Space"
+        case .immichUpload: "Send to Immich"
+        case .editorCheckout: "Edit a Copy"
+        case .metadataRead: "Read Photo Info"
         }
     }
 }
@@ -97,6 +99,7 @@ public struct WorkflowPlanner {
 
     public func plans(for configuration: AppConfiguration, hasImmichAPIKey: Bool = false) -> [WorkflowPlan] {
         [
+            ingestBufferPlan(configuration),
             importPlan(configuration),
             freeUpPlan(configuration),
             immichPlan(configuration, hasAPIKey: hasImmichAPIKey),
@@ -105,75 +108,131 @@ public struct WorkflowPlanner {
         ]
     }
 
-    private func importPlan(_ configuration: AppConfiguration) -> WorkflowPlan {
+    private func ingestBufferPlan(_ configuration: AppConfiguration) -> WorkflowPlan {
         let source = URL(fileURLWithPath: expanded(configuration.importSourcePath), isDirectory: true)
-        let archive = URL(fileURLWithPath: expanded(configuration.archivePath), isDirectory: true)
+        let bufferBatch = URL(fileURLWithPath: expanded(configuration.bufferIngestFolderPath()), isDirectory: true)
         let builder = rcloneBuilder(configuration)
 
-        let copyCommand = (try? builder.copyCommand(source: source, destination: archive)) ?? []
-        let checkCommand = (try? builder.checkCommand(source: source, destination: archive)) ?? []
-        let manifest = archive.appendingPathComponent(Manifest.fileName)
-        let hasPaths = !configuration.importSourcePath.isEmpty && !configuration.archivePath.isEmpty
+        let copyCommand = (try? builder.copyCommand(source: source, destination: bufferBatch)) ?? []
+        let checkCommand = (try? builder.checkCommand(source: source, destination: bufferBatch)) ?? []
+        let hasPaths = !configuration.importSourcePath.isEmpty && !configuration.bufferPath.isEmpty
+
+        return WorkflowPlan(
+            kind: .ingestBuffer,
+            title: "Copy to Buffer",
+            summary: "Copy the selected camera folder into the buffer. This never deletes the original files and never overwrites conflicts.",
+            status: hasPaths ? .ready : .needsConfig,
+            steps: [
+                WorkflowPlanStep(
+                    title: "Scan From Folder",
+                    detail: source.path,
+                    writesFiles: false,
+                    isExecutableNow: hasPaths
+                ),
+                WorkflowPlanStep(
+                    title: "Copy to Buffer",
+                    detail: bufferBatch.path,
+                    command: copyCommand,
+                    writesFiles: true,
+                    isExecutableNow: hasPaths
+                ),
+                WorkflowPlanStep(
+                    title: "Check the Copy",
+                    detail: "Compare the from folder against the buffer before you clear the camera folder.",
+                    command: checkCommand,
+                    writesFiles: false,
+                    isExecutableNow: hasPaths
+                )
+            ],
+            gates: [
+                WorkflowSafetyGate(title: "From folder selected", detail: source.path, isSatisfied: !configuration.importSourcePath.isEmpty),
+                WorkflowSafetyGate(title: "Buffer configured", detail: bufferBatch.path, isSatisfied: !configuration.bufferPath.isEmpty),
+                WorkflowSafetyGate(title: "Copy only", detail: "No deletes, no overwrites, no one-way sync.", isSatisfied: true)
+            ]
+        )
+    }
+
+    private func importPlan(_ configuration: AppConfiguration) -> WorkflowPlan {
+        let bufferOriginals = URL(fileURLWithPath: expanded(configuration.bufferIngestFolderPath()), isDirectory: true)
+        let bufferExports = URL(fileURLWithPath: expanded(configuration.bufferExportsFolderPath()), isDirectory: true)
+        let archiveOriginals = URL(fileURLWithPath: expanded(configuration.libraryBatchFolderPath(.originals)), isDirectory: true)
+        let archiveEdited = URL(fileURLWithPath: expanded(configuration.libraryBatchFolderPath(.edited)), isDirectory: true)
+        let builder = rcloneBuilder(configuration)
+
+        let copyOriginalsCommand = (try? builder.copyCommand(source: bufferOriginals, destination: archiveOriginals)) ?? []
+        let copyExportsCommand = (try? builder.copyCommand(source: bufferExports, destination: archiveEdited)) ?? []
+        let checkOriginalsCommand = (try? builder.checkCommand(source: bufferOriginals, destination: archiveOriginals)) ?? []
+        let manifest = URL(fileURLWithPath: expanded(configuration.libraryBatchFolderPath(.manifests)), isDirectory: true)
+            .appendingPathComponent(Manifest.fileName)
+        let hasPaths = !configuration.bufferPath.isEmpty && !configuration.cameraLibraryRootPath.isEmpty
 
         return WorkflowPlan(
             kind: .importArchive,
-            title: "Archive Import",
-            summary: "Plan source files into the archive with immutable copy, checksum verification, and manifest write. UI stays locked until real mode is explicitly enabled.",
+            title: "Save Buffer to Photo Library",
+            summary: "Copy buffer originals into Library Originals and finished exports into Library Edited. The app still requires proof before it unlocks real library writes.",
             status: hasPaths ? .locked : .needsConfig,
             steps: [
                 WorkflowPlanStep(
-                    title: "Scan Source",
-                    detail: source.path,
+                    title: "Scan Buffer Folder",
+                    detail: URL(fileURLWithPath: expanded(configuration.bufferBatchFolderPath()), isDirectory: true).path,
                     writesFiles: false
                 ),
                 WorkflowPlanStep(
-                    title: "Immutable Copy",
-                    detail: "rclone copy with checksum and immutable flags.",
-                    command: copyCommand,
+                    title: "Copy Originals to Library",
+                    detail: archiveOriginals.path,
+                    command: copyOriginalsCommand,
                     writesFiles: true
                 ),
                 WorkflowPlanStep(
-                    title: "Verify Archive",
-                    detail: "Compare source and archive after copy.",
-                    command: checkCommand,
+                    title: "Copy Edited Files",
+                    detail: archiveEdited.path,
+                    command: copyExportsCommand,
+                    writesFiles: true
+                ),
+                WorkflowPlanStep(
+                    title: "Check Originals",
+                    detail: "Compare buffer originals and library originals after copy.",
+                    command: checkOriginalsCommand,
                     writesFiles: false
                 ),
                 WorkflowPlanStep(
-                    title: "Write Manifest",
-                    detail: manifest.path,
+                    title: "Save Photo List + Proof File",
+                    detail: "\(configuration.catalogDatabasePath) and \(manifest.path)",
                     writesFiles: true
                 )
             ],
             gates: [
-                WorkflowSafetyGate(title: "Source configured", detail: source.path, isSatisfied: !configuration.importSourcePath.isEmpty),
-                WorkflowSafetyGate(title: "Archive configured", detail: archive.path, isSatisfied: !configuration.archivePath.isEmpty),
-                WorkflowSafetyGate(title: "Real execution lock", detail: "Plan is displayed only; no bytes move from this UI.", isSatisfied: true)
+                WorkflowSafetyGate(title: "Buffer folder selected", detail: bufferOriginals.path, isSatisfied: !configuration.bufferPath.isEmpty),
+                WorkflowSafetyGate(title: "Photo library selected", detail: archiveOriginals.path, isSatisfied: !configuration.cameraLibraryRootPath.isEmpty),
+                WorkflowSafetyGate(title: "Photo list selected", detail: configuration.catalogDatabasePath.isEmpty ? "Missing" : configuration.catalogDatabasePath, isSatisfied: !configuration.catalogDatabasePath.isEmpty),
+                WorkflowSafetyGate(title: "Real copy is locked", detail: "This screen explains the move first; it will not copy files until that path is unlocked.", isSatisfied: true)
             ]
         )
     }
 
     private func freeUpPlan(_ configuration: AppConfiguration) -> WorkflowPlan {
-        let buffer = URL(fileURLWithPath: expanded(configuration.bufferPath), isDirectory: true)
-        let archive = URL(fileURLWithPath: expanded(configuration.archivePath), isDirectory: true)
-        let trash = buffer.appendingPathComponent("_Trash", isDirectory: true)
-        let checkCommand = (try? rcloneBuilder(configuration).checkCommand(source: buffer, destination: archive)) ?? []
-        let hasPaths = !configuration.bufferPath.isEmpty && !configuration.archivePath.isEmpty
+        let bufferBatch = URL(fileURLWithPath: expanded(configuration.bufferBatchFolderPath()), isDirectory: true)
+        let bufferOriginals = URL(fileURLWithPath: expanded(configuration.bufferIngestFolderPath()), isDirectory: true)
+        let archiveOriginals = URL(fileURLWithPath: expanded(configuration.libraryBatchFolderPath(.originals)), isDirectory: true)
+        let trash = bufferBatch.appendingPathComponent("_Trash", isDirectory: true)
+        let checkCommand = (try? rcloneBuilder(configuration).checkCommand(source: bufferOriginals, destination: archiveOriginals)) ?? []
+        let hasPaths = !configuration.bufferPath.isEmpty && !configuration.cameraLibraryRootPath.isEmpty
 
         return WorkflowPlan(
             kind: .freeUpBuffer,
-            title: "Free-Up Buffer",
-            summary: "Compare buffer against archive, quarantine only matched files into _Trash, then require a separate DELETE confirmation for permanent removal.",
+            title: "Clear Buffer Space",
+            summary: "Check buffer originals against library originals. Only files already proven in the photo library can be moved aside.",
             status: hasPaths ? .locked : .needsConfig,
             steps: [
-                WorkflowPlanStep(title: "Checksum Compare", detail: "Buffer must match archive before quarantine.", command: checkCommand),
-                WorkflowPlanStep(title: "Quarantine Matches", detail: trash.path, writesFiles: true),
-                WorkflowPlanStep(title: "Permanent Delete", detail: "Requires exact DELETE token and _Trash path.", writesFiles: true)
+                WorkflowPlanStep(title: "Compare Files", detail: "Buffer originals must match library originals first.", command: checkCommand),
+                WorkflowPlanStep(title: "Move Matched Files Aside", detail: trash.path, writesFiles: true),
+                WorkflowPlanStep(title: "Delete Later", detail: "Requires typing DELETE and uses only the buffer _Trash folder.", writesFiles: true)
             ],
             gates: [
-                WorkflowSafetyGate(title: "Buffer configured", detail: buffer.path, isSatisfied: !configuration.bufferPath.isEmpty),
-                WorkflowSafetyGate(title: "Archive configured", detail: archive.path, isSatisfied: !configuration.archivePath.isEmpty),
-                WorkflowSafetyGate(title: "Trash scoped", detail: trash.path, isSatisfied: trash.pathComponents.contains("_Trash")),
-                WorkflowSafetyGate(title: "Real execution lock", detail: "Plan is displayed only; no quarantine/delete runs from this UI.", isSatisfied: true)
+                WorkflowSafetyGate(title: "Buffer folder selected", detail: bufferBatch.path, isSatisfied: !configuration.bufferPath.isEmpty),
+                WorkflowSafetyGate(title: "Photo library selected", detail: archiveOriginals.path, isSatisfied: !configuration.cameraLibraryRootPath.isEmpty),
+                WorkflowSafetyGate(title: "Move-aside folder selected", detail: trash.path, isSatisfied: trash.pathComponents.contains("_Trash")),
+                WorkflowSafetyGate(title: "Real delete is locked", detail: "This screen explains the move first; it will not move/delete files until that path is unlocked.", isSatisfied: true)
             ]
         )
     }
@@ -188,18 +247,18 @@ public struct WorkflowPlanner {
 
         return WorkflowPlan(
             kind: .immichUpload,
-            title: "Immich Upload",
-            summary: "Use Immich as the view layer after archive verification. The upload endpoint and required multipart fields are planned, not executed.",
+            title: "Send to Immich",
+            summary: "Use Immich after the photo library copy is checked. This app plans the upload but does not upload files yet.",
             status: baseURL != nil && hasAPIKey ? .locked : .needsConfig,
             steps: [
-                WorkflowPlanStep(title: "Ping Server", detail: "GET /server/ping", endpoint: pingEndpoint),
-                WorkflowPlanStep(title: "Upload Asset", detail: "multipart fields: assetData, fileCreatedAt, fileModifiedAt", endpoint: assetEndpoint, writesFiles: true),
-                WorkflowPlanStep(title: "Keep Archive Source of Truth", detail: expanded(configuration.archivePath), writesFiles: false)
+                WorkflowPlanStep(title: "Check Server", detail: "GET /server/ping", endpoint: pingEndpoint),
+                WorkflowPlanStep(title: "Upload Photo", detail: "photo bytes, created time, modified time", endpoint: assetEndpoint, writesFiles: true),
+                WorkflowPlanStep(title: "Keep Photo Library as Truth", detail: expanded(configuration.archivePath), writesFiles: false)
             ],
             gates: [
                 WorkflowSafetyGate(title: "Server URL configured", detail: configuration.immichServerURL.isEmpty ? "Missing" : configuration.immichServerURL, isSatisfied: baseURL != nil),
                 WorkflowSafetyGate(title: "API key in Keychain", detail: hasAPIKey ? "Saved" : "Missing", isSatisfied: hasAPIKey),
-                WorkflowSafetyGate(title: "Upload lock", detail: "No asset upload is exposed until archive verification is wired into the upload flow.", isSatisfied: true)
+                WorkflowSafetyGate(title: "Upload is locked", detail: "No upload button is exposed until the library copy check is connected to this flow.", isSatisfied: true)
             ]
         )
     }
@@ -211,16 +270,16 @@ public struct WorkflowPlanner {
 
         return WorkflowPlan(
             kind: .editorCheckout,
-            title: "External Editor Checkout",
-            summary: "Copy a selected photo into the working-copy folder before opening it in the configured editor.",
+            title: "Edit a Copy",
+            summary: "Copy a selected photo into the edit folder before opening it.",
             status: hasWorkingRoot ? .ready : .needsConfig,
             steps: [
-                WorkflowPlanStep(title: "Make Working Copy", detail: workingRoot.path, writesFiles: true, isExecutableNow: true),
-                WorkflowPlanStep(title: "Open Editor", detail: "\(configuration.externalEditor.displayName) (\(bundle))", writesFiles: false, isExecutableNow: true)
+                WorkflowPlanStep(title: "Make Edit Copy", detail: workingRoot.path, writesFiles: true, isExecutableNow: true),
+                WorkflowPlanStep(title: "Open App", detail: "\(configuration.externalEditor.displayName) (\(bundle))", writesFiles: false, isExecutableNow: true)
             ],
             gates: [
                 WorkflowSafetyGate(title: "Working folder configured", detail: workingRoot.path, isSatisfied: hasWorkingRoot),
-                WorkflowSafetyGate(title: "Source original protected", detail: "Editors receive a copy, not the source path.", isSatisfied: true)
+                WorkflowSafetyGate(title: "Original protected", detail: "Editors receive a copy, not the original file.", isSatisfied: true)
             ]
         )
     }
@@ -236,15 +295,15 @@ public struct WorkflowPlanner {
 
         return WorkflowPlan(
             kind: .metadataRead,
-            title: "Metadata Read",
-            summary: "Read camera metadata for preview, manifests, and future batch naming. This is planned as read-only.",
+            title: "Read Photo Info",
+            summary: "Read photo info for previews, proof files, and future batch naming. This does not change files.",
             status: configuration.importSourcePath.isEmpty ? .needsConfig : .locked,
             steps: [
-                WorkflowPlanStep(title: "Read Metadata", detail: "Recursive JSON metadata scan.", command: command, writesFiles: false)
+                WorkflowPlanStep(title: "Read Photo Info", detail: "Read info from files and folders.", command: command, writesFiles: false)
             ],
             gates: [
-                WorkflowSafetyGate(title: "Read-only command", detail: "exiftool is planned without write flags.", isSatisfied: true),
-                WorkflowSafetyGate(title: "Source configured", detail: source.path, isSatisfied: !configuration.importSourcePath.isEmpty)
+                WorkflowSafetyGate(title: "Read only", detail: "exiftool is planned without write flags.", isSatisfied: true),
+                WorkflowSafetyGate(title: "From folder selected", detail: source.path, isSatisfied: !configuration.importSourcePath.isEmpty)
             ]
         )
     }

@@ -9,17 +9,17 @@ struct LibraryView: View {
             HeaderView(
                 eyebrow: "Library",
                 title: "Open photos like a Mac app",
-                subtitle: "Browse the configured source folder, then click a photo to open a protected working copy in Preview by default."
+                subtitle: "Browse the chosen from folder, then click a photo to open a protected edit copy in Preview by default."
             )
 
             Panel(
-                title: "Photo Source",
+                title: "Photos to Edit",
                 symbol: "photo.stack",
-                helpTitle: "Photo Source",
-                helpText: "This scans the Import Source from Config. Clicking a photo copies it into the Editor Working Copies folder before opening it, so the original source file is not modified by an editor."
+                helpTitle: "Photos to Edit",
+                helpText: "This scans the from folder from Config. Clicking a photo copies it into the edit folder before opening it, so the original file is not modified by an editor."
             ) {
                 VStack(alignment: .leading, spacing: 10) {
-                    DetailLine(title: "Source", value: model.configuration.importSourcePath)
+                    DetailLine(title: "From", value: model.configuration.importSourcePath)
                     DetailLine(title: "Opens With", value: model.configuration.externalEditor.displayName)
                     DetailLine(title: "Working Copies", value: model.configuration.editorWorkingFolderPath)
                     if let lastOpenedWorkingCopyPath = model.lastOpenedWorkingCopyPath {
@@ -29,10 +29,10 @@ struct LibraryView: View {
 
                 CommandBar {
                     HelpedCommandButton(
-                        title: "Choose Source",
+                        title: "Choose From Folder",
                         symbol: "folder",
                         isDisabled: model.isBusy,
-                        helpTitle: "Choose Source",
+                        helpTitle: "Choose From Folder",
                         helpText: "Pick the folder the Library tab scans for supported photo files.",
                         action: model.chooseImportFolder
                     )
@@ -43,7 +43,7 @@ struct LibraryView: View {
                         prominence: .primary,
                         isDisabled: model.isBusy,
                         helpTitle: "Refresh",
-                        helpText: "Rescans the configured source folder and lists supported photo files.",
+                        helpText: "Rescans the selected from folder and lists supported photo files.",
                         action: model.refreshLibraryFiles
                     )
 
@@ -52,7 +52,7 @@ struct LibraryView: View {
                         symbol: "slider.horizontal.3",
                         isDisabled: model.isBusy,
                         helpTitle: "Edit Config",
-                        helpText: "Open Config to change the default editor, working-copy folder, or source path.",
+                        helpText: "Open Config to change the default editor, edit-copy folder, or from folder.",
                         action: { model.selectedSection = .config }
                     )
                 }
@@ -64,7 +64,7 @@ struct LibraryView: View {
                 title: "Photos",
                 symbol: "photo.on.rectangle.angled",
                 helpTitle: "Photos",
-                helpText: "Single-clicking a row opens a working copy in the configured editor. Preview is the default editor, and real archive/source originals stay untouched."
+                helpText: "Single-clicking a row opens an edit copy in the configured editor. Preview is the default editor, and the real originals stay untouched."
             ) {
                 if model.libraryFiles.isEmpty {
                     EmptyLibraryState(refresh: model.refreshLibraryFiles)
@@ -96,16 +96,16 @@ struct DriveView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
-            HeaderView(eyebrow: "Drive", title: "Free space without losing originals", subtitle: "Free-up is quarantine-only after a live checksum comparison against the archive.")
+            HeaderView(eyebrow: "Drive", title: "Clear space without losing originals", subtitle: "Only clear buffer space after the app proves the same files are already in the photo library.")
             WorkflowPlanPanel(plan: model.workflowPlan(.freeUpBuffer))
             CommandBar {
                 HelpedCommandButton(
-                    title: "Run Free-Up Safety Test",
+                    title: "Test Clear Space",
                     symbol: "archivebox",
                     prominence: .primary,
                     isDisabled: model.isBusy,
-                    helpTitle: "Run Free-Up Safety Test",
-                    helpText: "Looks at disposable buffer files and moves only files that match the archive checksum into quarantine. Files missing from the archive stay put.",
+                    helpTitle: "Test Clear Space",
+                    helpText: "Looks at disposable buffer files and moves aside only files that already match the test library. Files missing from the library stay put.",
                     action: model.runSimulationFreeUp
                 )
 
@@ -114,9 +114,41 @@ struct DriveView: View {
                     symbol: "arrow.counterclockwise",
                     isDisabled: model.isBusy,
                     helpTitle: "Reset Test Data",
-                    helpText: "Rebuilds the disposable source, archive, and buffer folders so the free-up safety test starts from known data.",
+                    helpText: "Rebuilds the disposable from folder, test library, and buffer folders so the clear-space test starts from known data.",
                     action: model.seedSimulation
                 )
+            }
+            Panel(
+                title: "Speed Tests",
+                symbol: "speedometer",
+                helpTitle: "Speed Tests",
+                helpText: "These write and read one temporary test file in the configured folder, report live throughput, and remove the test file when finished."
+            ) {
+                HStack(spacing: 12) {
+                    MetricPill(title: "Buffer", value: model.expandedBufferRootPath, symbol: "externaldrive", tint: AppTheme.mint)
+                    MetricPill(title: "Photo Library", value: model.expandedLibraryRootPath, symbol: "network", tint: AppTheme.accent)
+                }
+
+                CommandBar {
+                    HelpedCommandButton(
+                        title: "Test Buffer Speed",
+                        symbol: "speedometer",
+                        prominence: .primary,
+                        isDisabled: model.isBusy,
+                        helpTitle: "Test Buffer Speed",
+                        helpText: "Measures write and read speed in the configured buffer folder using a temporary file.",
+                        action: model.runBufferSpeedTest
+                    )
+
+                    HelpedCommandButton(
+                        title: "Test Library Speed",
+                        symbol: "network",
+                        isDisabled: model.isBusy,
+                        helpTitle: "Test Library Speed",
+                        helpText: "Measures write and read speed in the configured photo library using a temporary file.",
+                        action: model.runLibraryNetworkSpeedTest
+                    )
+                }
             }
             SafetyPanel(checks: model.safetyChecks)
             SimulationSummaryPanel(summary: model.simulationSummary, statusMessage: model.statusMessage)
@@ -132,13 +164,13 @@ struct ImmichView: View {
             HeaderView(
                 eyebrow: "Immich",
                 title: "Connection before upload",
-                subtitle: "Use the current Immich API for health, version, and user checks before any real upload path is enabled."
+                subtitle: "Check Immich before any real upload path is enabled."
             )
             Panel(
                 title: "Connection",
                 symbol: "sparkles.rectangle.stack",
                 helpTitle: "Immich Connection",
-                helpText: "Connection testing uses Immich ping, server version, and current-user endpoints. The API key is stored in macOS Keychain, and uploads remain locked until the transfer path is separately proven safe."
+                helpText: "Connection testing checks Immich health, version, and current user. The API key is stored in macOS Keychain, and uploads remain locked until the copy path is separately proven safe."
             ) {
                 HStack(spacing: 12) {
                     MetricPill(
@@ -183,10 +215,10 @@ struct ImmichView: View {
             }
 
             Panel(
-                title: "Upload Gate",
+                title: "Upload Lock",
                 symbol: "lock.shield",
-                helpTitle: "Upload Gate",
-                helpText: "Immich upload requires asset bytes, created and modified timestamps, and API-key permission. This app connects first, then keeps real upload disabled until source-copy verification is finished."
+                helpTitle: "Upload Lock",
+                helpText: "Immich upload needs photo bytes, timestamps, and API-key permission. This app connects first, then keeps real upload disabled until the copy check is finished."
             ) {
                 HStack(spacing: 12) {
                     MetricPill(title: "API", value: "latest OpenAPI checked", symbol: "checkmark.seal", tint: AppTheme.mint)
@@ -218,58 +250,121 @@ struct ConfigView: View {
         VStack(alignment: .leading, spacing: 22) {
             HeaderView(
                 eyebrow: "Config",
-                title: "One place for paths and defaults",
-                subtitle: "Browse with Finder-style panels or type paths directly. Config saves automatically and survives app restarts."
+                title: "Advanced paths",
+                subtitle: "Setup keeps the main choices simple. This screen lets you inspect and edit the exact saved paths."
             )
 
             Panel(
-                title: "Folders",
-                symbol: "folder",
-                helpTitle: "Folders",
-                helpText: "These paths are saved in Camera Toolkit config. Source, archive, buffer, test data, and log paths all live here so the workspace has one persistent source of truth."
+                title: "Camera Library",
+                symbol: "folder.badge.gearshape",
+                helpTitle: "Camera Library",
+                helpText: "The library root is the folder that owns Inbox, Originals, Edited, Selects, Shared, and proof files."
+            ) {
+                ConfigPathRow(
+                    title: "Library Root",
+                    detail: "The main photo folder.",
+                    path: Binding(
+                        get: { model.configuration.cameraLibraryRootPath },
+                        set: { model.setCameraLibraryRoot($0) }
+                    ),
+                    helpText: "Choose the folder that owns Inbox, Originals, Edited, Selects, Shared, and proof files.",
+                    browse: model.chooseCameraLibraryRoot
+                )
+
+                ConfigPathRow(
+                    title: "Photo List DB",
+                    detail: "Local database for file relationships.",
+                    path: Binding(
+                        get: { model.configuration.catalogDatabasePath },
+                        set: { model.setConfigPath(\.catalogDatabasePath, to: $0) }
+                    ),
+                    helpText: "The local SQLite database tracks saved places, library folders, batches, assets, and file copies.",
+                    browse: model.chooseCatalogDatabaseFile
+                )
+
+                ConfigPathRow(
+                    title: "Photo List Backups",
+                    detail: "Timestamped SQLite copies.",
+                    path: Binding(
+                        get: { model.configuration.catalogBackupFolderPath },
+                        set: { model.setConfigPath(\.catalogBackupFolderPath, to: $0) }
+                    ),
+                    helpText: "Prepare Photo List writes timestamped backups here, usually inside the photo library proof folder.",
+                    browse: { model.chooseFolder(title: "Choose Photo List Backup Folder", keyPath: \.catalogBackupFolderPath) }
+                )
+
+                CommandBar {
+                    HelpedCommandButton(
+                        title: "Open Setup",
+                        symbol: "checklist",
+                        helpTitle: "Open Setup",
+                        helpText: "Return to the simpler setup screen.",
+                        action: { model.selectedSection = .setup }
+                    )
+                    HelpedCommandButton(
+                        title: "Prepare Photo List",
+                        symbol: "cylinder.split.1x2",
+                        prominence: .primary,
+                        helpTitle: "Prepare Photo List",
+                        helpText: "Creates missing library folders, creates or updates the local photo list, and writes a timestamped backup.",
+                        action: model.prepareLibraryCatalog
+                    )
+                }
+            }
+
+            Panel(
+                title: "Saved Places",
+                symbol: "externaldrive.connected.to.line.below",
+                helpTitle: "Saved Places",
+                helpText: "Add named folders you actually use: camera folders, homelab/NAS photo libraries, and portable buffer drives. The selected folder in each group drives Library, Preview Copy, and locked move plans."
+            ) {
+                ConfigLocationSection(
+                    title: "From Folders",
+                    subtitle: "Camera cards, mounted camera folders, or staging folders the app can copy from.",
+                    role: .importSource,
+                    emptyText: "Add a camera folder.",
+                    addTitle: "Add From Folder",
+                    model: model
+                )
+
+                Divider()
+
+                ConfigLocationSection(
+                    title: "Photo Library Targets",
+                    subtitle: "Long-term folders, usually your homelab/NAS photo library.",
+                    role: .archive,
+                    emptyText: "Add your photo library folder.",
+                    addTitle: "Add Library",
+                    model: model
+                )
+
+                Divider()
+
+                ConfigLocationSection(
+                    title: "Buffer Drives",
+                    subtitle: "Temporary travel or working storage that can later be checked against the photo library.",
+                    role: .buffer,
+                    emptyText: "Add a portable buffer folder.",
+                    addTitle: "Add Buffer",
+                    model: model
+                )
+            }
+
+            Panel(
+                title: "Test Data",
+                symbol: "testtube.2",
+                helpTitle: "Test Data",
+                helpText: "These local paths are only for disposable safety tests and app logs. They are not your real camera folder, photo library, or portable buffer unless you explicitly add those as saved places above."
             ) {
                 ConfigPathRow(
                     title: "Test Data Root",
-                    detail: "Disposable source, archive, and buffer live under this folder.",
+                    detail: "Disposable from folder, library, and buffer live under this folder.",
                     path: Binding(
                         get: { model.configuration.demoRootPath },
                         set: { model.setConfigPath(\.demoRootPath, to: $0) }
                     ),
                     helpText: "Safety tests create disposable files under this root. Keep it somewhere local and safe to reset.",
                     browse: { model.chooseFolder(title: "Choose Test Data Root", keyPath: \.demoRootPath) }
-                )
-
-                ConfigPathRow(
-                    title: "Import Source",
-                    detail: "The source folder used by Library and Preview Copy.",
-                    path: Binding(
-                        get: { model.configuration.importSourcePath },
-                        set: { model.setConfigPath(\.importSourcePath, to: $0) }
-                    ),
-                    helpText: "Use this for the folder you want to scan. Preview Copy reads this path and compares it to the configured archive without copying.",
-                    browse: { model.chooseFolder(title: "Choose Import Source", keyPath: \.importSourcePath) }
-                )
-
-                ConfigPathRow(
-                    title: "Archive Folder",
-                    detail: "Long-term verified archive target for locked import plans.",
-                    path: Binding(
-                        get: { model.configuration.archivePath },
-                        set: { model.setConfigPath(\.archivePath, to: $0) }
-                    ),
-                    helpText: "Preview Copy compares against this folder now. Real archive writes stay locked until you intentionally add execution.",
-                    browse: { model.chooseFolder(title: "Choose Archive Folder", keyPath: \.archivePath) }
-                )
-
-                ConfigPathRow(
-                    title: "Buffer Folder",
-                    detail: "Temporary working storage for locked free-up plans.",
-                    path: Binding(
-                        get: { model.configuration.bufferPath },
-                        set: { model.setConfigPath(\.bufferPath, to: $0) }
-                    ),
-                    helpText: "This is the configured free-up source. Real quarantine/free-up execution stays locked until intentionally enabled.",
-                    browse: { model.chooseFolder(title: "Choose Buffer Folder", keyPath: \.bufferPath) }
                 )
 
                 ConfigPathRow(
@@ -296,7 +391,7 @@ struct ConfigView: View {
             ) {
                 Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 16) {
                     GridRow {
-                        FormFieldLabel(title: "Camera", helpText: "The device label stored with future manifests.")
+                        FormFieldLabel(title: "Camera", helpText: "The device label stored with future proof files.")
                         Picker(
                             "Camera",
                             selection: Binding(
@@ -332,7 +427,7 @@ struct ConfigView: View {
                                 set: { value in model.setImportDestination(value) }
                             )
                         ) {
-                            Text("Archive").tag(TransferLocation.nas)
+                            Text("Photo Library").tag(TransferLocation.nas)
                             Text("Buffer").tag(TransferLocation.drive)
                         }
                         .pickerStyle(.segmented)
@@ -403,7 +498,7 @@ struct ConfigView: View {
                 title: "External Editors",
                 symbol: "paintbrush.pointed",
                 helpTitle: "External Editors",
-                helpText: "Preview is the default. The Library tab opens a working copy from this folder so editor apps do not mutate the original source photo."
+                helpText: "Preview is the default. The Library tab opens an edit copy from this folder so editor apps do not change the original photo."
             ) {
                 Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 16) {
                     GridRow {
@@ -423,7 +518,7 @@ struct ConfigView: View {
                     }
 
                     GridRow {
-                        FormFieldLabel(title: "Working Copies", helpText: "Camera Toolkit copies photos here before opening them in Preview, Photomator, or Topaz Photo.")
+                        FormFieldLabel(title: "Edit Copies", helpText: "Camera Toolkit copies photos here before opening them in Preview, Photomator, or Topaz Photo.")
                         PathAutocompleteField(
                             path: Binding(
                                 get: { model.configuration.editorWorkingFolderPath },
@@ -440,7 +535,7 @@ struct ConfigView: View {
                         title: "Choose Folder",
                         symbol: "folder",
                         helpTitle: "Choose Working Folder",
-                        helpText: "Pick where protected working copies are created before an external editor opens them.",
+                        helpText: "Pick where protected edit copies are created before an external editor opens them.",
                         action: model.chooseEditorWorkingFolder
                     )
 
@@ -456,14 +551,14 @@ struct ConfigView: View {
             }
 
             Panel(
-                title: "Transfer Tools",
+                title: "Technical Tools",
                 symbol: "wrench.and.screwdriver",
-                helpTitle: "Transfer Tools",
-                helpText: "The app keeps stable transfer logic in tested Swift services while preserving rclone-style safety rules for copy, checksum, and immutable archive writes. These paths are used for plan previews only in this locked build."
+                helpTitle: "Technical Tools",
+                helpText: "These are for advanced command previews. Normal app buttons use the tested Swift copy code."
             ) {
                 Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 16) {
                     GridRow {
-                        FormFieldLabel(title: "rclone", helpText: "Used to preview immutable copy and checksum commands. The app does not execute these commands in locked mode.")
+                        FormFieldLabel(title: "rclone", helpText: "Used to preview copy/check commands. The app does not execute these commands in locked mode.")
                         TextField(
                             "rclone",
                             text: Binding(
@@ -475,7 +570,7 @@ struct ConfigView: View {
                     }
 
                     GridRow {
-                        FormFieldLabel(title: "exiftool", helpText: "Used to preview read-only metadata commands for future batch naming and manifests.")
+                        FormFieldLabel(title: "exiftool", helpText: "Used to preview read-only photo-info commands for future batch naming and proof files.")
                         TextField(
                             "exiftool",
                             text: Binding(
@@ -488,9 +583,9 @@ struct ConfigView: View {
                 }
 
                 HStack(spacing: 12) {
-                    MetricPill(title: "Transfer engine", value: "rclone planned", symbol: "arrow.left.arrow.right", tint: AppTheme.accent)
-                    MetricPill(title: "Metadata", value: "exiftool read-only", symbol: "camera.metering.matrix", tint: AppTheme.mint)
-                    MetricPill(title: "Real execution", value: "locked", symbol: "lock", tint: AppTheme.amber)
+                    MetricPill(title: "Copy tool", value: "rclone preview", symbol: "arrow.left.arrow.right", tint: AppTheme.accent)
+                    MetricPill(title: "Photo info", value: "exiftool read-only", symbol: "camera.metering.matrix", tint: AppTheme.mint)
+                    MetricPill(title: "Real writes", value: "locked", symbol: "lock", tint: AppTheme.amber)
                 }
             }
 
@@ -532,6 +627,154 @@ private struct ConfigPathRow: View {
     }
 }
 
+private struct ConfigLocationSection: View {
+    var title: String
+    var subtitle: String
+    var role: ConfiguredLocationRole
+    var emptyText: String
+    var addTitle: String
+    @Bindable var model: DashboardModel
+
+    private var locations: [ConfiguredLocation] {
+        model.configuration.locations(role: role)
+    }
+
+    private var selectedID: UUID? {
+        model.configuration.selectedLocationID(for: role)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(title)
+                        .font(.headline)
+                    Text(subtitle)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer()
+                Button {
+                    model.addConfiguredLocation(role: role)
+                } label: {
+                    Label(addTitle, systemImage: "plus")
+                }
+                .buttonStyle(.bordered)
+                .fixedSize()
+            }
+
+            if locations.isEmpty {
+                Text(emptyText)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .padding(12)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 8))
+            } else {
+                VStack(spacing: 10) {
+                    ForEach(locations) { location in
+                        ConfigLocationRow(
+                            location: location,
+                            isSelected: selectedID == location.id,
+                            canRemove: locations.count > 1,
+                            model: model
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+private struct ConfigLocationRow: View {
+    var location: ConfiguredLocation
+    var isSelected: Bool
+    var canRemove: Bool
+    @Bindable var model: DashboardModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                Image(systemName: iconName)
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(isSelected ? AppTheme.mint : AppTheme.accent)
+                    .frame(width: 28, height: 28)
+                    .background((isSelected ? AppTheme.mint : AppTheme.accent).opacity(0.12), in: RoundedRectangle(cornerRadius: 7))
+
+                TextField(
+                    "Name",
+                    text: Binding(
+                        get: { currentLocation.name },
+                        set: { model.setConfiguredLocationName(location, to: $0) }
+                    )
+                )
+                .textFieldStyle(.roundedBorder)
+                .frame(minWidth: 160, maxWidth: 260)
+
+                if isSelected {
+                    Label("Selected", systemImage: "checkmark.circle.fill")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(AppTheme.mint)
+                        .labelStyle(.titleAndIcon)
+                } else {
+                    Button("Use") {
+                        model.useConfiguredLocation(currentLocation)
+                    }
+                    .buttonStyle(.bordered)
+                    .fixedSize()
+                }
+
+                Spacer()
+
+                Button {
+                    model.chooseConfiguredLocationFolder(currentLocation)
+                } label: {
+                    Label("Browse", systemImage: "folder")
+                }
+                .buttonStyle(.bordered)
+                .fixedSize()
+
+                Button(role: .destructive) {
+                    model.removeConfiguredLocation(currentLocation)
+                } label: {
+                    Image(systemName: "trash")
+                }
+                .buttonStyle(.borderless)
+                .disabled(!canRemove)
+                .help(canRemove ? "Remove \(currentLocation.name)" : "Keep at least one \(currentLocation.role.displayName.lowercased())")
+            }
+
+            PathAutocompleteField(
+                path: Binding(
+                    get: { currentLocation.path },
+                    set: { model.setConfiguredLocationPath(location, to: $0) }
+                ),
+                placeholder: "/Volumes/path"
+            )
+            .frame(height: 28)
+        }
+        .padding(12)
+        .background(isSelected ? AppTheme.mint.opacity(0.08) : Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 8))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(isSelected ? AppTheme.mint.opacity(0.32) : Color.primary.opacity(0.08))
+        )
+    }
+
+    private var currentLocation: ConfiguredLocation {
+        model.configuration.configuredLocations.first { $0.id == location.id } ?? location
+    }
+
+    private var iconName: String {
+        switch location.role {
+        case .importSource: "camera.viewfinder"
+        case .archive: "network"
+        case .buffer: "externaldrive"
+        }
+    }
+}
+
 private struct DetailLine: View {
     var title: String
     var value: String
@@ -557,7 +800,7 @@ private struct EmptyLibraryState: View {
         VStack(alignment: .leading, spacing: 10) {
             Text("No photo files listed yet.")
                 .font(.headline)
-            Text("Refresh scans the configured Import Source for JPG, HEIC, TIFF, and common RAW formats.")
+            Text("Refresh scans the selected from folder for JPG, HEIC, TIFF, and common RAW formats.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)

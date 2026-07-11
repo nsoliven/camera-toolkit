@@ -5,6 +5,13 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
     public var importSourcePath: String
     public var archivePath: String
     public var bufferPath: String
+    public var cameraLibraryRootPath: String
+    public var catalogDatabasePath: String
+    public var catalogBackupFolderPath: String
+    public var configuredLocations: [ConfiguredLocation]
+    public var selectedImportSourceID: UUID?
+    public var selectedArchiveID: UUID?
+    public var selectedBufferID: UUID?
     public var activityLogPath: String
     public var immichServerURL: String
     public var editorWorkingFolderPath: String
@@ -20,6 +27,13 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         importSourcePath: String,
         archivePath: String,
         bufferPath: String,
+        cameraLibraryRootPath: String = "",
+        catalogDatabasePath: String = "",
+        catalogBackupFolderPath: String = "",
+        configuredLocations: [ConfiguredLocation] = [],
+        selectedImportSourceID: UUID? = nil,
+        selectedArchiveID: UUID? = nil,
+        selectedBufferID: UUID? = nil,
         activityLogPath: String,
         immichServerURL: String = "",
         editorWorkingFolderPath: String = "",
@@ -34,6 +48,13 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         self.importSourcePath = importSourcePath
         self.archivePath = archivePath
         self.bufferPath = bufferPath
+        self.cameraLibraryRootPath = cameraLibraryRootPath
+        self.catalogDatabasePath = catalogDatabasePath
+        self.catalogBackupFolderPath = catalogBackupFolderPath
+        self.configuredLocations = configuredLocations
+        self.selectedImportSourceID = selectedImportSourceID
+        self.selectedArchiveID = selectedArchiveID
+        self.selectedBufferID = selectedBufferID
         self.activityLogPath = activityLogPath
         self.immichServerURL = immichServerURL
         self.editorWorkingFolderPath = editorWorkingFolderPath
@@ -43,6 +64,7 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         self.selectedDeviceID = selectedDeviceID
         self.eventName = eventName
         self.importDestination = importDestination
+        self.normalizeLocationSelections()
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -50,6 +72,13 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         case importSourcePath
         case archivePath
         case bufferPath
+        case cameraLibraryRootPath
+        case catalogDatabasePath
+        case catalogBackupFolderPath
+        case configuredLocations
+        case selectedImportSourceID
+        case selectedArchiveID
+        case selectedBufferID
         case activityLogPath
         case immichServerURL
         case editorWorkingFolderPath
@@ -71,6 +100,13 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         importSourcePath = try values.decodeIfPresent(String.self, forKey: .importSourcePath) ?? defaults.importSourcePath
         archivePath = try values.decodeIfPresent(String.self, forKey: .archivePath) ?? defaults.archivePath
         bufferPath = try values.decodeIfPresent(String.self, forKey: .bufferPath) ?? defaults.bufferPath
+        cameraLibraryRootPath = try values.decodeIfPresent(String.self, forKey: .cameraLibraryRootPath) ?? defaults.cameraLibraryRootPath
+        catalogDatabasePath = try values.decodeIfPresent(String.self, forKey: .catalogDatabasePath) ?? defaults.catalogDatabasePath
+        catalogBackupFolderPath = try values.decodeIfPresent(String.self, forKey: .catalogBackupFolderPath) ?? defaults.catalogBackupFolderPath
+        configuredLocations = try values.decodeIfPresent([ConfiguredLocation].self, forKey: .configuredLocations) ?? []
+        selectedImportSourceID = try values.decodeIfPresent(UUID.self, forKey: .selectedImportSourceID)
+        selectedArchiveID = try values.decodeIfPresent(UUID.self, forKey: .selectedArchiveID)
+        selectedBufferID = try values.decodeIfPresent(UUID.self, forKey: .selectedBufferID)
         activityLogPath = try values.decodeIfPresent(String.self, forKey: .activityLogPath) ?? defaults.activityLogPath
         immichServerURL = try values.decodeIfPresent(String.self, forKey: .immichServerURL) ?? defaults.immichServerURL
         editorWorkingFolderPath = try values.decodeIfPresent(String.self, forKey: .editorWorkingFolderPath) ?? defaults.editorWorkingFolderPath
@@ -80,21 +116,250 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         selectedDeviceID = try values.decodeIfPresent(String.self, forKey: .selectedDeviceID) ?? defaults.selectedDeviceID
         eventName = try values.decodeIfPresent(String.self, forKey: .eventName) ?? defaults.eventName
         importDestination = try values.decodeIfPresent(TransferLocation.self, forKey: .importDestination) ?? defaults.importDestination
+        normalizeLocationSelections()
     }
 
     public static func defaults(applicationSupport: URL) -> AppConfiguration {
         let root = applicationSupport.appendingPathComponent("CameraToolkit", isDirectory: true)
         let demoRoot = root.appendingPathComponent("Safety Test", isDirectory: true)
+        let libraryRoot = root.appendingPathComponent("Camera Library", isDirectory: true)
         let workingRoot = root.appendingPathComponent("Editor Working Copies", isDirectory: true)
 
-        return AppConfiguration(
+        var configuration = AppConfiguration(
             demoRootPath: demoRoot.path,
-            importSourcePath: demoRoot.appendingPathComponent("Source Card", isDirectory: true).path,
-            archivePath: demoRoot.appendingPathComponent("Archive", isDirectory: true).path,
+            importSourcePath: demoRoot.appendingPathComponent("From Folder", isDirectory: true).path,
+            archivePath: libraryRoot.appendingPathComponent(CameraLibraryFolder.originals.rawValue, isDirectory: true).path,
             bufferPath: demoRoot.appendingPathComponent("Buffer", isDirectory: true).path,
+            cameraLibraryRootPath: libraryRoot.path,
+            catalogDatabasePath: root.appendingPathComponent("catalog.sqlite").path,
+            catalogBackupFolderPath: libraryRoot
+                .appendingPathComponent(CameraLibraryFolder.manifests.rawValue, isDirectory: true)
+                .appendingPathComponent("CameraToolkit", isDirectory: true)
+                .appendingPathComponent("catalog-backups", isDirectory: true)
+                .path,
             activityLogPath: root.appendingPathComponent("activity-log.jsonl").path,
             editorWorkingFolderPath: workingRoot.path
         )
+        configuration.normalizeLocationSelections()
+        return configuration
+    }
+
+    public mutating func normalizeLocationSelections() {
+        if cameraLibraryRootPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            cameraLibraryRootPath = URL(fileURLWithPath: archivePath, isDirectory: true)
+                .deletingLastPathComponent()
+                .path
+        }
+        if catalogBackupFolderPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            catalogBackupFolderPath = libraryFolderPath(.manifests)
+                .appendingPathComponent("CameraToolkit", isDirectory: true)
+                .appendingPathComponent("catalog-backups", isDirectory: true)
+                .path
+        }
+
+        if configuredLocations.isEmpty {
+            configuredLocations = [
+                ConfiguredLocation(
+                    role: .importSource,
+                    name: defaultLocationName(path: importSourcePath, fallback: "From Folder"),
+                    path: importSourcePath
+                ),
+                ConfiguredLocation(
+                    role: .archive,
+                    name: defaultLocationName(path: archivePath, fallback: "Photo Library"),
+                    path: archivePath
+                ),
+                ConfiguredLocation(
+                    role: .buffer,
+                    name: defaultLocationName(path: bufferPath, fallback: "Buffer"),
+                    path: bufferPath
+                )
+            ]
+        }
+
+        let locations = configuredLocations
+        let importSourceSelection = Self.normalizedSelection(
+            selectedImportSourceID,
+            role: .importSource,
+            selectedPath: importSourcePath,
+            locations: locations
+        )
+        selectedImportSourceID = importSourceSelection.id
+        importSourcePath = importSourceSelection.path
+
+        let archiveSelection = Self.normalizedSelection(
+            selectedArchiveID,
+            role: .archive,
+            selectedPath: archivePath,
+            locations: locations
+        )
+        selectedArchiveID = archiveSelection.id
+        archivePath = archiveSelection.path
+
+        let bufferSelection = Self.normalizedSelection(
+            selectedBufferID,
+            role: .buffer,
+            selectedPath: bufferPath,
+            locations: locations
+        )
+        selectedBufferID = bufferSelection.id
+        bufferPath = bufferSelection.path
+    }
+
+    public func locations(role: ConfiguredLocationRole) -> [ConfiguredLocation] {
+        configuredLocations.filter { $0.role == role }
+    }
+
+    public func selectedLocationID(for role: ConfiguredLocationRole) -> UUID? {
+        switch role {
+        case .importSource: selectedImportSourceID
+        case .archive: selectedArchiveID
+        case .buffer: selectedBufferID
+        }
+    }
+
+    public func selectedLocation(for role: ConfiguredLocationRole) -> ConfiguredLocation? {
+        guard let id = selectedLocationID(for: role) else {
+            return nil
+        }
+        return configuredLocations.first { $0.id == id && $0.role == role }
+    }
+
+    private static func normalizedSelection(
+        _ selection: UUID?,
+        role: ConfiguredLocationRole,
+        selectedPath: String,
+        locations: [ConfiguredLocation]
+    ) -> (id: UUID?, path: String) {
+        let matching = locations.filter { $0.role == role }
+        guard !matching.isEmpty else {
+            return (nil, selectedPath)
+        }
+
+        if let selection, let location = matching.first(where: { $0.id == selection }) {
+            return (location.id, location.path)
+        }
+
+        if let location = matching.first(where: { $0.path == selectedPath }) ?? matching.first {
+            return (location.id, location.path)
+        }
+
+        return (nil, selectedPath)
+    }
+
+    private func defaultLocationName(path: String, fallback: String) -> String {
+        let last = URL(fileURLWithPath: path).lastPathComponent
+        return last.isEmpty ? fallback : last
+    }
+
+    public func libraryFolderPath(_ folder: CameraLibraryFolder) -> URL {
+        URL(fileURLWithPath: cameraLibraryRootPath, isDirectory: true)
+            .appendingPathComponent(folder.rawValue, isDirectory: true)
+    }
+
+    public func bufferBatchFolderPath() -> String {
+        let sourceName = URL(fileURLWithPath: importSourcePath, isDirectory: true).lastPathComponent
+        return URL(fileURLWithPath: bufferPath, isDirectory: true)
+            .appendingPathComponent(Self.pathComponent(eventName, fallback: "Unsorted"), isDirectory: true)
+            .appendingPathComponent(Self.pathComponent(selectedDeviceID, fallback: "Camera"), isDirectory: true)
+            .appendingPathComponent(Self.pathComponent(sourceName, fallback: "Camera"), isDirectory: true)
+            .path
+    }
+
+    public func bufferIngestFolderPath() -> String {
+        URL(fileURLWithPath: bufferBatchFolderPath(), isDirectory: true)
+            .appendingPathComponent("Originals", isDirectory: true)
+            .path
+    }
+
+    public func bufferExportsFolderPath() -> String {
+        URL(fileURLWithPath: bufferBatchFolderPath(), isDirectory: true)
+            .appendingPathComponent("Exports", isDirectory: true)
+            .path
+    }
+
+    public func bufferEditsFolderPath() -> String {
+        URL(fileURLWithPath: bufferBatchFolderPath(), isDirectory: true)
+            .appendingPathComponent("Edits", isDirectory: true)
+            .path
+    }
+
+    public func libraryBatchFolderPath(_ folder: CameraLibraryFolder) -> String {
+        let sourceName = URL(fileURLWithPath: importSourcePath, isDirectory: true).lastPathComponent
+        return libraryFolderPath(folder)
+            .appendingPathComponent(Self.pathComponent(eventName, fallback: "Unsorted"), isDirectory: true)
+            .appendingPathComponent(Self.pathComponent(selectedDeviceID, fallback: "Camera"), isDirectory: true)
+            .appendingPathComponent(Self.pathComponent(sourceName, fallback: "Camera"), isDirectory: true)
+            .path
+    }
+
+    private static func pathComponent(_ value: String, fallback: String) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        let source = trimmed.isEmpty ? fallback : trimmed
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: " ._-"))
+        let scalars = source.unicodeScalars.map { scalar -> Character in
+            allowed.contains(scalar) ? Character(scalar) : "-"
+        }
+        let sanitized = String(scalars)
+            .replacingOccurrences(of: "/", with: "-")
+            .replacingOccurrences(of: ":", with: "-")
+            .trimmingCharacters(in: CharacterSet(charactersIn: " ._-"))
+        return sanitized.isEmpty ? fallback : sanitized
+    }
+}
+
+public enum CameraLibraryFolder: String, Codable, CaseIterable, Identifiable, Sendable {
+    case inbox = "_Inbox"
+    case manifests = "_Manifests"
+    case originals = "Originals"
+    case edited = "Edited"
+    case selects = "Selects"
+    case shared = "Shared"
+
+    public var id: String { rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .inbox: "Inbox"
+        case .manifests: "Proof Files"
+        case .originals: "Originals"
+        case .edited: "Edited"
+        case .selects: "Selects"
+        case .shared: "Shared"
+        }
+    }
+}
+
+public enum ConfiguredLocationRole: String, Codable, CaseIterable, Sendable {
+    case importSource
+    case archive
+    case buffer
+
+    public var displayName: String {
+        switch self {
+        case .importSource: "From Folder"
+        case .archive: "Photo Library Target"
+        case .buffer: "Buffer Drive"
+        }
+    }
+}
+
+public struct ConfiguredLocation: Identifiable, Codable, Hashable, Sendable {
+    public var id: UUID
+    public var role: ConfiguredLocationRole
+    public var name: String
+    public var path: String
+
+    public init(
+        id: UUID = UUID(),
+        role: ConfiguredLocationRole,
+        name: String,
+        path: String
+    ) {
+        self.id = id
+        self.role = role
+        self.name = name
+        self.path = path
     }
 }
 

@@ -3,6 +3,69 @@ import AppKit
 import Foundation
 import Observation
 
+private struct SeedSimulationJobResult: Sendable {
+    var sourcePath: String
+    var plan: CopyPlan
+}
+
+private struct CopyToBufferJobResult: Sendable {
+    var copy: LocalCopyResult
+    var plan: CopyPlan
+}
+
+private struct QueueCopyJobResult: Sendable {
+    var copy: LocalCopyResult
+    var plan: CopyPlan
+}
+
+private struct SimulationJobResult: Sendable {
+    var summary: SimulationSummary
+    var plan: CopyPlan
+}
+
+private struct BackgroundJobUpdate: Sendable {
+    var progress: Double
+    var note: String
+    var detail: String
+    var command: String
+    var sourcePath: String?
+    var destinationPath: String?
+    var currentPath: String?
+    var processedFiles: Int
+    var totalFiles: Int
+    var processedBytes: Int64
+    var totalBytes: Int64
+    var bytesPerSecond: Double
+
+    init(
+        progress: Double,
+        note: String,
+        detail: String = "",
+        command: String = "",
+        sourcePath: String? = nil,
+        destinationPath: String? = nil,
+        currentPath: String? = nil,
+        processedFiles: Int = 0,
+        totalFiles: Int = 0,
+        processedBytes: Int64 = 0,
+        totalBytes: Int64 = 0,
+        bytesPerSecond: Double = 0
+    ) {
+        self.progress = progress
+        self.note = note
+        self.detail = detail
+        self.command = command
+        self.sourcePath = sourcePath
+        self.destinationPath = destinationPath
+        self.currentPath = currentPath
+        self.processedFiles = processedFiles
+        self.totalFiles = totalFiles
+        self.processedBytes = processedBytes
+        self.totalBytes = totalBytes
+        self.bytesPerSecond = bytesPerSecond
+    }
+}
+
 @MainActor
 @Observable
 final class DashboardModel {
@@ -10,6 +73,7 @@ final class DashboardModel {
     var isSidebarCollapsed: Bool = false
     var locations: [LocationCard]
     var activePlan: CopyPlan
+    var queuedFilePaths: Set<String> = []
     var workflowPlans: [WorkflowPlan] = []
     var jobs: [JobSnapshot]
     var activityLog: [ActivityLogEntry]
@@ -17,7 +81,7 @@ final class DashboardModel {
     var configMessage: String = "Config is saved automatically."
     var safetyChecks: [SafetyCheck]
     var simulationSummary: SimulationSummary?
-    var statusMessage: String = "Ready. Configured workflows are pointed and locked; safety tests are available for disposable checks."
+    var statusMessage: String = "Ready. Setup is loaded; real write/delete/upload buttons stay locked unless explicitly enabled."
     var isBusy: Bool = false
     var libraryFiles: [FileRecord] = []
     var lastOpenedWorkingCopyPath: String?
@@ -27,9 +91,15 @@ final class DashboardModel {
     var immichIsTestingConnection: Bool = false
     var isRefreshing: Bool = false
     var lastRefreshedAt: Date?
+    var catalogReport: CatalogBootstrapReport?
+    var catalogMessage: String = "Photo list has not been prepared yet."
+    var activeJob: JobSnapshot? {
+        jobs.first { $0.state == .running || $0.state == .queued }
+    }
     @ObservationIgnored private let configurationStore: ConfigurationStore
     @ObservationIgnored private let secretStore = KeychainSecretStore(service: "org.cameratoolkit.CameraToolkit")
     @ObservationIgnored private let editorLauncher = ExternalEditorLauncher()
+    @ObservationIgnored private var immichHasUsableAPIKey: Bool = false
 
     init(
         locations: [LocationCard],
@@ -52,9 +122,8 @@ final class DashboardModel {
         } else {
             self.activityLog = activityLog
         }
-        self.immichAPIKeyDraft = (try? secretStore.read(account: Self.immichAPIKeyAccount)) ?? ""
-        if !immichAPIKeyDraft.isEmpty {
-            self.immichConnectionStatus = "API key is saved in Keychain. Test the connection when the server is reachable."
+        if !configuration.immichServerURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            self.immichConnectionStatus = "Immich URL is saved. Keychain is checked only when you click Test Connection."
         }
         rebuildWorkflowPlans()
     }
@@ -80,10 +149,10 @@ final class DashboardModel {
 
     static let preview = DashboardModel(
         locations: [
-            LocationCard(kind: .card, title: "Camera Card", subtitle: "Sony A7V detected", status: .ready, detail: "5 new files · 48.2 GB"),
+            LocationCard(kind: .card, title: "Camera Folder", subtitle: "Sony A7V detected", status: .ready, detail: "5 new files · 48.2 GB"),
             LocationCard(kind: .drive, title: "Portable Drive", subtitle: "Photo Workspace", status: .warning, detail: "312 GB free"),
-            LocationCard(kind: .nas, title: "Home Server", subtitle: "Camera Archive", status: .ready, detail: "Mounted · checksum-ready"),
-            LocationCard(kind: .immich, title: "Immich", subtitle: "Camera Archive library", status: .ready, detail: "Connected")
+            LocationCard(kind: .nas, title: "Home Server", subtitle: "Photo Library", status: .ready, detail: "Mounted · ready to check"),
+            LocationCard(kind: .immich, title: "Immich", subtitle: "Photo library", status: .ready, detail: "Connected")
         ],
         activePlan: CopyPlan(
             new: [
@@ -97,7 +166,7 @@ final class DashboardModel {
             conflicts: []
         ),
         jobs: [
-            JobSnapshot(action: .ingestCard, state: .running, progress: 0.42, note: "Hash verifying copied files"),
+            JobSnapshot(action: .previewFiles, state: .running, progress: 0.42, note: "Checking what would copy"),
             JobSnapshot(action: .immichScan, state: .done, progress: 1, note: "Library scan queued")
         ],
         activityLog: [
@@ -105,48 +174,123 @@ final class DashboardModel {
                 action: .verifyManifest,
                 state: .done,
                 title: "Completed safety test",
-                summary: "4 copied, 1 quarantined, 1 left alone.",
-                detail: "Created disposable test files, verified the archive manifest, and moved only verified buffer files to quarantine."
+                summary: "4 copied, 1 moved aside, 1 left alone.",
+                detail: "Created disposable test files, checked the proof file, and moved aside only verified buffer files."
             ),
             ActivityLogEntry(
-                action: .ingestCard,
+                action: .previewFiles,
                 state: .done,
-                title: "Previewed copy plan",
-                summary: "3 new files, 1 already archived, 0 conflicts.",
+                title: "Previewed copy to buffer",
+                summary: "3 new files, 1 already in buffer, 0 conflicts.",
                 detail: "No files were copied during preview."
             )
         ],
         configuration: .defaults(applicationSupport: defaultApplicationSupportURL),
         safetyChecks: [
             SafetyCheck(
-                title: "Archive copy mode",
-                detail: "rclone copy --checksum --immutable",
+                title: "No-overwrite copy",
+                detail: "Copy checks bytes and refuses overwrites.",
                 state: .passed,
-                helpText: "Archive writes must copy by checksum and refuse overwrites. If a file already exists with different bytes, the app reports a conflict instead of replacing it."
+                helpText: "Photo library writes must check bytes and refuse overwrites. If a file already exists with different bytes, the app reports a conflict instead of replacing it."
             ),
             SafetyCheck(
-                title: "Free-up gate",
-                detail: "Fresh checksum compare required before quarantine",
+                title: "Clear-space check",
+                detail: "Compare files before moving anything aside",
                 state: .passed,
-                helpText: "Free-up means making space on temporary storage. The app only quarantines a buffer file after proving the archive has the same bytes."
+                helpText: "Clearing space means making room on temporary storage. The app only moves a buffer file aside after proving the photo library has the same bytes."
             ),
             SafetyCheck(
                 title: "Permanent delete",
                 detail: "Requires typed DELETE confirmation",
                 state: .passed,
-                helpText: "The real delete path stays behind an explicit typed confirmation. Safety tests move files to quarantine only."
+                helpText: "The real delete path stays behind an explicit typed confirmation. Safety tests move files aside only."
             ),
             SafetyCheck(
-                title: "Execution lock",
+                title: "Real writes lock",
                 detail: "Real writes and uploads require deliberate unlock",
                 state: .attention,
-                helpText: "Real camera cards, drives, NAS folders, and Immich uploads are represented by locked workflow plans. Immich connection checks are allowed because they do not move files."
+                helpText: "Real camera folders, drives, photo libraries, and Immich uploads are represented by locked move plans. Immich connection checks are allowed because they do not move files."
             )
         ]
     )
 }
 
 extension DashboardModel {
+    var setupPresets: [CameraSetupPreset] {
+        CameraSetupPreset.defaults.map { preset in
+            var preset = preset
+            preset.isAvailable = preset.requiredPaths.allSatisfy(folderExists)
+            preset.isApplied = preset.matches(configuration)
+            return preset
+        }
+    }
+
+    var setupChecklist: [SetupChecklistItem] {
+        let sourceCount = configuration.locations(role: .importSource).count
+        return [
+            SetupChecklistItem(
+                title: "Camera Library",
+                detail: configuration.cameraLibraryRootPath,
+                isReady: folderExists(configuration.cameraLibraryRootPath)
+            ),
+            SetupChecklistItem(
+                title: "From Folders",
+                detail: sourceCount == 1 ? "1 folder" : "\(sourceCount) folders",
+                isReady: sourceCount > 0 && folderExists(configuration.importSourcePath)
+            ),
+            SetupChecklistItem(
+                title: "Buffer",
+                detail: configuration.bufferPath,
+                isReady: folderExists(configuration.bufferPath)
+            ),
+            SetupChecklistItem(
+                title: "Photo List",
+                detail: configuration.catalogDatabasePath,
+                isReady: catalogDatabaseExists
+            ),
+            SetupChecklistItem(
+                title: "Photo List Backup",
+                detail: configuration.catalogBackupFolderPath,
+                isReady: catalogBackupFolderExists
+            )
+        ]
+    }
+
+    var queuedFiles: [FileRecord] {
+        activePlan.new.filter { queuedFilePaths.contains($0.path) }
+    }
+
+    var queuedBytes: Int64 {
+        queuedFiles.reduce(0) { $0 + $1.size }
+    }
+
+    var queueSummary: String {
+        if queuedFiles.isEmpty {
+            return "No files queued."
+        }
+        return "\(queuedFiles.count) file(s), \(queuedBytes.formattedBytes)"
+    }
+
+    var cameraLibraryFolderRows: [SetupPathStatus] {
+        CameraLibraryFolder.allCases.map { folder in
+            let path = configuration.libraryFolderPath(folder).path
+            return SetupPathStatus(
+                title: folder.displayName,
+                path: path,
+                exists: folderExists(path),
+                symbol: folder.symbolName
+            )
+        }
+    }
+
+    var catalogDatabaseExists: Bool {
+        FileManager.default.fileExists(atPath: Self.expandedPath(configuration.catalogDatabasePath))
+    }
+
+    var catalogBackupFolderExists: Bool {
+        folderExists(configuration.catalogBackupFolderPath)
+    }
+
     var simulationWorkspace: SimulationWorkspace {
         SimulationWorkspace(root: URL(fileURLWithPath: Self.expandedPath(configuration.demoRootPath)))
     }
@@ -179,13 +323,37 @@ extension DashboardModel {
         }
     }
 
+    func isQueued(_ file: FileRecord) -> Bool {
+        queuedFilePaths.contains(file.path)
+    }
+
+    func toggleQueuedFile(_ file: FileRecord) {
+        if queuedFilePaths.contains(file.path) {
+            queuedFilePaths.remove(file.path)
+        } else {
+            queuedFilePaths.insert(file.path)
+        }
+    }
+
+    func queueAllNewFiles() {
+        queuedFilePaths = Set(activePlan.new.map(\.path))
+        statusMessage = activePlan.new.isEmpty
+            ? "No new files to queue. Preview files first, or pick a different from folder."
+            : "Queued \(activePlan.new.count) new file(s) for the next copy."
+    }
+
+    func clearQueue() {
+        queuedFilePaths.removeAll()
+        statusMessage = "Queue cleared."
+    }
+
     func chooseImportFolder() {
-        if chooseFolder(title: "Choose Import Source", keyPath: \.importSourcePath) {
-            statusMessage = "Selected \(URL(fileURLWithPath: configuration.importSourcePath).lastPathComponent). Use Preview Copy Plan to inspect the configured archive comparison."
+        if chooseFolder(title: "Choose From Folder", keyPath: \.importSourcePath) {
+            statusMessage = "Selected \(URL(fileURLWithPath: configuration.importSourcePath).lastPathComponent). Use Preview Copy to check what would go into the buffer."
             recordActivity(
-                action: .ingestCard,
+                action: .previewFiles,
                 state: .done,
-                title: "Selected source folder",
+                title: "Selected from folder",
                 summary: statusMessage,
                 detail: "The selected folder will be scanned locally. Real writes remain locked; safety tests use disposable local folders."
             )
@@ -221,14 +389,219 @@ extension DashboardModel {
         }
     }
 
+    func chooseCatalogDatabaseFile() {
+        let panel = NSSavePanel()
+        panel.title = "Choose Photo List Database"
+        panel.prompt = "Use Photo List"
+        panel.nameFieldStringValue = URL(fileURLWithPath: Self.expandedPath(configuration.catalogDatabasePath)).lastPathComponent
+        panel.directoryURL = URL(fileURLWithPath: Self.expandedPath(configuration.catalogDatabasePath)).deletingLastPathComponent()
+        panel.message = "Choose where Camera Toolkit stores the local photo list database."
+        if panel.runModal() == .OK, let url = panel.url {
+            setConfigPath(\.catalogDatabasePath, to: url.path)
+        }
+    }
+
     func chooseEditorWorkingFolder() {
-        _ = chooseFolder(title: "Choose Editor Working Folder", keyPath: \.editorWorkingFolderPath)
+        if chooseFolder(title: "Choose Edit Folder", keyPath: \.editorWorkingFolderPath) {
+            statusMessage = "Edit copies will open from \(configuration.editorWorkingFolderPath)."
+        }
+    }
+
+    func chooseBufferFolder() {
+        if chooseFolder(title: "Choose Buffer Folder", keyPath: \.bufferPath) {
+            statusMessage = "Buffer set to \(configuration.bufferPath)."
+        }
+    }
+
+    func chooseCameraLibraryRoot() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.title = "Choose Camera Library"
+        panel.prompt = "Use Library"
+        panel.message = "Choose the folder that contains Inbox, Originals, Edited, Selects, Shared, and proof files."
+        if panel.runModal() == .OK, let url = panel.url {
+            setCameraLibraryRoot(url.path)
+        }
+    }
+
+    func applyRecommendedCameraSetup() {
+        let recommended = RecommendedCameraSetup.detect()
+        updateConfiguration { configuration in
+            if let libraryRoot = recommended.libraryRoot {
+                configuration.setCameraLibraryRoot(libraryRoot.path)
+            }
+            if let osmo = recommended.osmoSource {
+                configuration.upsertLocation(role: .importSource, name: "Osmo 360", path: osmo.path, select: true)
+            }
+            if let lexar = recommended.lexarSource {
+                configuration.upsertLocation(role: .importSource, name: "Camera Card", path: lexar.path, select: recommended.osmoSource == nil)
+            }
+            if let buffer = recommended.buffer {
+                configuration.upsertLocation(role: .buffer, name: "Photo Workspace Photos", path: buffer.path, select: true)
+            }
+        }
+        statusMessage = recommended.summary
+    }
+
+    func applySetupPreset(_ preset: CameraSetupPreset) {
+        updateConfiguration { configuration in
+            if let sourcePath = preset.sourcePath {
+                configuration.upsertLocation(
+                    role: .importSource,
+                    name: preset.sourceName ?? preset.title,
+                    path: sourcePath,
+                    select: true
+                )
+            }
+            if let bufferPath = preset.bufferPath {
+                configuration.upsertLocation(
+                    role: .buffer,
+                    name: preset.bufferName ?? "Buffer",
+                    path: bufferPath,
+                    select: true
+                )
+            }
+            if let libraryRootPath = preset.libraryRootPath {
+                configuration.setCameraLibraryRoot(libraryRootPath)
+            }
+            if let deviceID = preset.deviceID {
+                configuration.selectedDeviceID = deviceID
+            }
+            if let destination = preset.importDestination {
+                configuration.importDestination = destination
+            }
+        }
+        activePlan = CopyPlan()
+        queuedFilePaths.removeAll()
+        statusMessage = "Applied \(preset.title). No files were moved. Preview Files before copying anything."
+    }
+
+    func prepareLibraryCatalog() {
+        do {
+            let store = CatalogStore(url: URL(fileURLWithPath: Self.expandedPath(configuration.catalogDatabasePath)))
+            let report = try store.bootstrap(configuration: configuration)
+            catalogReport = report
+            catalogMessage = "Photo list ready with \(report.storageLocationCount) saved place(s)."
+            recordActivity(
+                action: .verifyManifest,
+                state: .done,
+                title: "Prepared photo list",
+                summary: catalogMessage,
+                detail: "Photo list: \(report.databasePath). Backup: \(report.backupPath ?? "not configured")."
+            )
+        } catch {
+            catalogMessage = "Could not prepare photo list: \(error.localizedDescription)"
+            statusMessage = catalogMessage
+            recordActivity(
+                action: .verifyManifest,
+                state: .failed,
+                title: "Photo list setup failed",
+                summary: catalogMessage,
+                detail: "No photo files were moved."
+            )
+        }
+        refreshLocationCards()
     }
 
     func setConfigPath(_ keyPath: WritableKeyPath<AppConfiguration, String>, to value: String) {
+        if keyPath == \.importSourcePath {
+            setSelectedLocationPath(role: .importSource, to: value)
+            return
+        }
+        if keyPath == \.archivePath {
+            setSelectedLocationPath(role: .archive, to: value)
+            return
+        }
+        if keyPath == \.bufferPath {
+            setSelectedLocationPath(role: .buffer, to: value)
+            return
+        }
         updateConfiguration { configuration in
             configuration[keyPath: keyPath] = value
         }
+    }
+
+    func setCameraLibraryRoot(_ path: String) {
+        updateConfiguration { configuration in
+            configuration.setCameraLibraryRoot(path)
+        }
+        statusMessage = "Camera library points at \(path)."
+    }
+
+    func addConfiguredLocation(role: ConfiguredLocationRole) {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.title = "Add \(role.displayName)"
+        panel.prompt = "Add"
+        panel.message = "Choose a folder for this \(role.displayName.lowercased())."
+        guard panel.runModal() == .OK, let url = panel.url else {
+            return
+        }
+
+        let location = ConfiguredLocation(
+            role: role,
+            name: defaultLocationName(for: url, role: role),
+            path: url.path
+        )
+        updateConfiguration { configuration in
+            configuration.configuredLocations.append(location)
+            configuration.selectLocation(location)
+        }
+        statusMessage = "Added \(location.name) as \(role.displayName)."
+    }
+
+    func useConfiguredLocation(_ location: ConfiguredLocation) {
+        updateConfiguration { configuration in
+            configuration.selectLocation(location)
+        }
+        statusMessage = "Using \(location.name) for \(location.role.displayName)."
+    }
+
+    func setConfiguredLocationName(_ location: ConfiguredLocation, to value: String) {
+        updateConfiguration { configuration in
+            guard let index = configuration.configuredLocations.firstIndex(where: { $0.id == location.id }) else {
+                return
+            }
+            configuration.configuredLocations[index].name = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+    }
+
+    func setConfiguredLocationPath(_ location: ConfiguredLocation, to value: String) {
+        updateConfiguration { configuration in
+            guard let index = configuration.configuredLocations.firstIndex(where: { $0.id == location.id }) else {
+                return
+            }
+            configuration.configuredLocations[index].path = value
+            if configuration.selectedLocationID(for: location.role) == location.id {
+                configuration.selectLocation(configuration.configuredLocations[index])
+            }
+        }
+    }
+
+    func chooseConfiguredLocationFolder(_ location: ConfiguredLocation) {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.title = "Choose \(location.role.displayName)"
+        panel.prompt = "Use Folder"
+        panel.message = "Choose the folder for \(location.name)."
+        panel.directoryURL = URL(fileURLWithPath: Self.expandedPath(location.path), isDirectory: true)
+        guard panel.runModal() == .OK, let url = panel.url else {
+            return
+        }
+        setConfiguredLocationPath(location, to: url.path)
+    }
+
+    func removeConfiguredLocation(_ location: ConfiguredLocation) {
+        updateConfiguration { configuration in
+            configuration.configuredLocations.removeAll { $0.id == location.id }
+        }
+        statusMessage = "Removed \(location.name) from \(location.role.displayName)."
     }
 
     func setDeviceID(_ value: String) {
@@ -262,48 +635,78 @@ extension DashboardModel {
     func saveImmichAPIKey() {
         do {
             try secretStore.save(immichAPIKeyDraft, account: Self.immichAPIKeyAccount)
+            immichHasUsableAPIKey = !immichAPIKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             rebuildWorkflowPlans()
             immichConnectionStatus = immichAPIKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 ? "API key removed from Keychain."
                 : "API key saved in Keychain."
             configMessage = "Immich API key saved in macOS Keychain."
         } catch {
+            immichHasUsableAPIKey = false
             immichConnectionStatus = "Could not save API key: \(error.localizedDescription)"
         }
     }
 
     func testImmichConnection() {
         let serverURL = configuration.immichServerURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        let apiKey = immichAPIKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !serverURL.isEmpty else {
             immichConnectionStatus = "Add an Immich server URL in Config first."
             return
         }
-        guard !apiKey.isEmpty else {
-            immichConnectionStatus = "Add an Immich API key first. It will be stored in Keychain."
+
+        var apiKey = immichAPIKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        do {
+            if apiKey.isEmpty {
+                apiKey = try secretStore.read(account: Self.immichAPIKeyAccount)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            } else {
+                try secretStore.save(apiKey, account: Self.immichAPIKeyAccount)
+            }
+        } catch {
+            immichHasUsableAPIKey = false
+            rebuildWorkflowPlans()
+            immichConnectionStatus = "Could not read Immich API key from Keychain: \(error.localizedDescription)"
             return
         }
 
-        do {
-            try secretStore.save(apiKey, account: Self.immichAPIKeyAccount)
-            Task { @MainActor in
-                await performImmichConnectionCheck(serverURL: serverURL, apiKey: apiKey, shouldRecordActivity: true)
-            }
-        } catch {
-            immichConnectionStatus = "Could not prepare Immich connection: \(error.localizedDescription)"
+        guard !apiKey.isEmpty else {
+            immichHasUsableAPIKey = false
+            rebuildWorkflowPlans()
+            immichConnectionStatus = "Paste an Immich API key, or save one first, then test again."
+            return
+        }
+
+        immichHasUsableAPIKey = true
+        rebuildWorkflowPlans()
+        Task { @MainActor in
+            await performImmichConnectionCheck(serverURL: serverURL, apiKey: apiKey, shouldRecordActivity: true)
         }
     }
 
     func refreshLibraryFiles() {
-        do {
-            let records = try loadLibraryFiles()
-            statusMessage = records.isEmpty
-                ? "No supported photo files found in \(expandedImportSourcePath)."
-                : "Found \(records.count) supported photo file(s) in \(expandedImportSourcePath)."
-        } catch {
-            libraryFiles = []
-            statusMessage = "Could not scan library source: \(error.localizedDescription)"
-        }
+        let sourcePath = expandedImportSourcePath
+        let root = URL(fileURLWithPath: sourcePath, isDirectory: true)
+        let command = Self.commandLine(["scan-photos", sourcePath])
+        runBackgroundJob(
+            action: .checkout,
+            runningNote: "Scanning photos in the background",
+            logTitle: "Scanned photos",
+            logDetail: "Read file info from \(sourcePath). No files were moved.",
+            command: command,
+            sourcePath: sourcePath,
+            operation: { progress in
+                try FileScanner().scan(root: root) { update in
+                    progress(Self.jobUpdate(from: update, notePrefix: "Scanning photos", command: command, sourcePath: sourcePath))
+                }
+                    .filter { MediaFileMatcher.isSupportedPhotoPath($0.path) }
+            },
+            completion: { records in
+                self.libraryFiles = records
+                return records.isEmpty
+                    ? "No supported photo files found in \(sourcePath)."
+                    : "Found \(records.count) supported photo file(s) in \(sourcePath)."
+            }
+        )
     }
 
     func openLibraryFile(_ file: FileRecord) {
@@ -319,13 +722,13 @@ extension DashboardModel {
                 workingRoot: workingRoot
             )
             lastOpenedWorkingCopyPath = copyURL.path
-            statusMessage = "Opened \(file.path) in \(configuration.externalEditor.displayName) from a protected working copy."
+            statusMessage = "Opened \(file.path) in \(configuration.externalEditor.displayName) from a protected edit copy."
             recordActivity(
                 action: .checkout,
                 state: .done,
                 title: "Opened photo for editing",
                 summary: statusMessage,
-                detail: "Source stayed untouched. Working copy: \(copyURL.path)"
+                detail: "Original stayed untouched. Edit copy: \(copyURL.path)"
             )
         } catch {
             statusMessage = "Could not open \(file.path): \(error.localizedDescription)"
@@ -334,7 +737,7 @@ extension DashboardModel {
                 state: .failed,
                 title: "Photo open failed",
                 summary: statusMessage,
-                detail: "No source file was changed."
+                detail: "No original file was changed."
             )
         }
     }
@@ -360,22 +763,22 @@ extension DashboardModel {
                 workingRoot: workingRoot
             )
             lastOpenedWorkingCopyPath = copyURL.path
-            statusMessage = "Opened \(file.path) from Copy Plan in \(configuration.externalEditor.displayName)."
+            statusMessage = "Opened \(file.path) from Preview Copy in \(configuration.externalEditor.displayName)."
             recordActivity(
                 action: .checkout,
                 state: .done,
-                title: "Opened copy-plan file",
+                title: "Opened previewed file",
                 summary: statusMessage,
-                detail: "Source stayed untouched. Working copy: \(copyURL.path)"
+                detail: "Original stayed untouched. Edit copy: \(copyURL.path)"
             )
         } catch {
             statusMessage = "Could not open \(file.path): \(error.localizedDescription)"
             recordActivity(
                 action: .checkout,
                 state: .failed,
-                title: "Copy-plan open failed",
+                title: "Previewed file open failed",
                 summary: statusMessage,
-                detail: "No source file was changed."
+                detail: "No original file was changed."
             )
         }
     }
@@ -388,117 +791,360 @@ extension DashboardModel {
             recordActivity(
                 action: .checkout,
                 state: .done,
-                title: "Revealed copy-plan file",
+                title: "Revealed previewed file",
                 summary: statusMessage,
-                detail: "No files were changed. Source: \(source.path)"
+                detail: "No files were changed. Original: \(source.path)"
             )
         } catch {
             statusMessage = "Could not reveal \(file.path): \(error.localizedDescription)"
             recordActivity(
                 action: .checkout,
                 state: .failed,
-                title: "Copy-plan reveal failed",
+                title: "Previewed file reveal failed",
                 summary: statusMessage,
-                detail: "No source file was changed."
+                detail: "No original file was changed."
             )
         }
     }
 
     func seedSimulation() {
-        runJob(
-            action: .ingestCard,
-            runningNote: "Creating disposable source, archive, and buffer",
+        let rootPath = Self.expandedPath(configuration.demoRootPath)
+        let command = Self.commandLine(["seed-test-data", rootPath])
+        runBackgroundJob(
+            action: .prepareTestData,
+            runningNote: "Creating disposable from folder, test library, and buffer",
             logTitle: "Created test data",
-            logDetail: "Recreated the disposable source, archive, and buffer under Application Support."
-        ) {
-            try simulationWorkspace.resetAndSeed()
-            setConfigPath(\.importSourcePath, to: simulationWorkspace.sourceCard.path)
-            activePlan = try simulationWorkspace.previewImport()
-            simulationSummary = nil
-            statusMessage = "Test data is ready at \(simulationWorkspace.root.path)."
-            refreshLocationCards()
-        }
+            logDetail: "Recreated the disposable from folder, test library, and buffer under Application Support.",
+            command: command,
+            destinationPath: rootPath,
+            operation: { progress in
+                progress(BackgroundJobUpdate(progress: 0.15, note: "Resetting disposable folders", command: command, destinationPath: rootPath))
+                let workspace = SimulationWorkspace(root: URL(fileURLWithPath: rootPath, isDirectory: true))
+                try workspace.resetAndSeed()
+                let source = workspace.sourceCard
+                let archive = workspace.archive
+                let sourcePath = source.path
+                let archivePath = archive.path
+                progress(BackgroundJobUpdate(progress: 0.7, note: "Building initial copy preview", command: command, sourcePath: sourcePath, destinationPath: archivePath))
+                return SeedSimulationJobResult(
+                    sourcePath: sourcePath,
+                    plan: try ArchivePlanner().planCopy(source: source, destination: archive) { update in
+                        progress(Self.jobUpdate(from: update, lowerBound: 0.7, upperBound: 0.95, notePrefix: "Checking test files", command: command, sourcePath: sourcePath, destinationPath: archivePath))
+                    }
+                )
+            },
+            completion: { result in
+                self.setConfigPath(\.importSourcePath, to: result.sourcePath)
+                self.activePlan = result.plan
+                self.simulationSummary = nil
+                self.refreshLocationCards()
+                return "Test data is ready at \(rootPath)."
+            }
+        )
     }
 
     func previewImport() {
-        runJob(
+        let sourcePath = expandedImportSourcePath
+        let destinationPath = expandedBufferIngestPath
+        let source = URL(fileURLWithPath: sourcePath, isDirectory: true)
+        let destination = URL(fileURLWithPath: destinationPath, isDirectory: true)
+        let command = Self.commandLine(["plan-copy", "--checksum", sourcePath, destinationPath])
+        runBackgroundJob(
+            action: .previewFiles,
+            runningNote: "Checking what would copy to buffer",
+            logTitle: "Previewed copy to buffer",
+            logDetail: "Checked the selected from folder and buffer. No files were copied.",
+            command: command,
+            sourcePath: sourcePath,
+            destinationPath: destinationPath,
+            operation: { progress in
+                try ArchivePlanner().planCopy(source: source, destination: destination) { update in
+                    let bounds = Self.planProgressBounds(for: update)
+                    progress(Self.jobUpdate(from: update, lowerBound: bounds.lower, upperBound: bounds.upper, notePrefix: "Checking copy", command: command, sourcePath: sourcePath, destinationPath: destinationPath))
+                }
+            },
+            completion: { plan in
+                self.activePlan = plan
+                self.queuedFilePaths = Set(plan.new.map(\.path))
+                return "Preview ready: \(plan.new.count) new, \(plan.existing.count) already in buffer, \(plan.conflicts.count) conflicts. To: \(destinationPath)"
+            }
+        )
+    }
+
+    func copySourceToBuffer() {
+        let sourcePath = expandedImportSourcePath
+        let destinationPath = expandedBufferIngestPath
+        let source = URL(fileURLWithPath: sourcePath, isDirectory: true)
+        let destination = URL(fileURLWithPath: destinationPath, isDirectory: true)
+        let command = Self.commandLine(["copy-immutable", "--checksum", sourcePath, destinationPath])
+        runBackgroundJob(
             action: .ingestCard,
-            runningNote: "Planning immutable copy",
-            logTitle: "Previewed copy plan",
-            logDetail: "Scanned the configured source and archive. No files were copied during preview."
-        ) {
-            let source = URL(fileURLWithPath: expandedImportSourcePath)
-            let destination = URL(fileURLWithPath: Self.expandedPath(configuration.archivePath), isDirectory: true)
-            activePlan = try ArchivePlanner().planCopy(source: source, destination: destination)
-            statusMessage = "Preview ready: \(activePlan.new.count) new, \(activePlan.existing.count) already archived, \(activePlan.conflicts.count) conflicts."
+            runningNote: "Copying files to buffer",
+            logTitle: "Copied files to buffer",
+            logDetail: "Copied only new files into the selected buffer batch. Existing conflicts were not overwritten.",
+            command: command,
+            sourcePath: sourcePath,
+            destinationPath: destinationPath,
+            operation: { progress in
+                let result = try LocalTransferService().copyImmutable(source: source, destination: destination) { update in
+                    let isHashing = update.phase.localizedCaseInsensitiveContains("hashing")
+                    progress(Self.jobUpdate(from: update, lowerBound: isHashing ? 0.02 : 0.32, upperBound: isHashing ? 0.32 : 0.82, notePrefix: "Copying to buffer", command: command, sourcePath: sourcePath, destinationPath: destinationPath))
+                }
+                let plan = try ArchivePlanner().planCopy(source: source, destination: destination) { update in
+                    let bounds = Self.planProgressBounds(for: update, lowerBound: 0.82, upperBound: 0.97)
+                    progress(Self.jobUpdate(from: update, lowerBound: bounds.lower, upperBound: bounds.upper, notePrefix: "Checking buffer copy", command: command, sourcePath: sourcePath, destinationPath: destinationPath))
+                }
+                return CopyToBufferJobResult(copy: result, plan: plan)
+            },
+            completion: { result in
+                self.activePlan = result.plan
+                self.refreshLocationCards()
+                return "Copied \(result.copy.copied.count) file(s) to buffer, skipped \(result.copy.skippedIdentical.count) already there, left \(result.copy.conflicts.count) conflict(s) untouched. Buffer batch: \(destinationPath)"
+            }
+        )
+    }
+
+    func copyQueuedFilesToBuffer() {
+        let selectedFiles = queuedFiles
+        guard !selectedFiles.isEmpty else {
+            statusMessage = "Queue is empty. Preview files, then add files to the queue."
+            return
         }
+
+        let sourcePath = expandedImportSourcePath
+        let destinationPath = expandedBufferIngestPath
+        let source = URL(fileURLWithPath: sourcePath, isDirectory: true)
+        let destination = URL(fileURLWithPath: destinationPath, isDirectory: true)
+        let command = Self.commandLine(["copy-queue", sourcePath, destinationPath, "\(selectedFiles.count) files"])
+        runBackgroundJob(
+            action: .ingestCard,
+            runningNote: "Copying queued files to buffer",
+            logTitle: "Copied queue to buffer",
+            logDetail: "Copied only the files selected in the queue. Nothing was deleted or overwritten.",
+            command: command,
+            sourcePath: sourcePath,
+            destinationPath: destinationPath,
+            operation: { progress in
+                let result = try LocalTransferService().copyFiles(source: source, destination: destination, files: selectedFiles) { update in
+                    progress(Self.jobUpdate(from: update, lowerBound: 0.04, upperBound: 0.78, notePrefix: "Copying queue", command: command, sourcePath: sourcePath, destinationPath: destinationPath))
+                }
+                let plan = try ArchivePlanner().planCopy(source: source, destination: destination) { update in
+                    let bounds = Self.planProgressBounds(for: update, lowerBound: 0.78, upperBound: 0.97)
+                    progress(Self.jobUpdate(from: update, lowerBound: bounds.lower, upperBound: bounds.upper, notePrefix: "Checking buffer copy", command: command, sourcePath: sourcePath, destinationPath: destinationPath))
+                }
+                return QueueCopyJobResult(copy: result, plan: plan)
+            },
+            completion: { result in
+                self.activePlan = result.plan
+                self.queuedFilePaths.removeAll()
+                self.refreshLocationCards()
+                return "Copied \(result.copy.copied.count) queued file(s) to buffer, skipped \(result.copy.skippedIdentical.count) already there, left \(result.copy.conflicts.count) conflict(s) untouched."
+            }
+        )
+    }
+
+    func runBufferSpeedTest() {
+        let folderPath = expandedBufferRootPath
+        let folder = URL(fileURLWithPath: folderPath, isDirectory: true)
+        let command = Self.commandLine(["disk-speed-test", "--write-read", folderPath])
+        runBackgroundJob(
+            action: .diskSpeed,
+            runningNote: "Measuring buffer write and read speed",
+            logTitle: "Measured buffer speed",
+            logDetail: "Wrote and read a temporary test file in the configured buffer folder, then removed it.",
+            command: command,
+            sourcePath: folderPath,
+            operation: { progress in
+                try DiskSpeedTester().run(folder: folder) { update in
+                    progress(Self.jobUpdate(from: update, notePrefix: "Testing buffer speed", command: command, sourcePath: folderPath))
+                }
+            },
+            completion: { report in
+                let write = Int64(report.writeBytesPerSecond).formattedBytes
+                let read = Int64(report.readBytesPerSecond).formattedBytes
+                return "Buffer speed: write \(write)/s, read \(read)/s at \(report.path)."
+            }
+        )
+    }
+
+    func runLibraryNetworkSpeedTest() {
+        let folderPath = expandedLibraryRootPath
+        let folder = URL(fileURLWithPath: folderPath, isDirectory: true)
+        let command = Self.commandLine(["network-speed-test", "--write-read", folderPath])
+        runBackgroundJob(
+            action: .networkSpeed,
+            runningNote: "Measuring photo library write and read speed",
+            logTitle: "Measured photo library speed",
+            logDetail: "Wrote and read a temporary test file in the configured library folder, then removed it.",
+            command: command,
+            sourcePath: folderPath,
+            operation: { progress in
+                try DiskSpeedTester().run(folder: folder) { update in
+                    progress(Self.jobUpdate(from: update, notePrefix: "Testing photo library speed", command: command, sourcePath: folderPath))
+                }
+            },
+            completion: { report in
+                let write = Int64(report.writeBytesPerSecond).formattedBytes
+                let read = Int64(report.readBytesPerSecond).formattedBytes
+                return "Photo library speed: write \(write)/s, read \(read)/s at \(report.path)."
+            }
+        )
     }
 
     func runSimulationImport() {
-        runJob(
+        let rootPath = Self.expandedPath(configuration.demoRootPath)
+        let existingQuarantinedCount = simulationSummary?.quarantinedCount ?? 0
+        let command = Self.commandLine(["run-safety-import", rootPath])
+        runBackgroundJob(
             action: .ingestCard,
-            runningNote: "Copying into test archive",
-            logTitle: "Ran import safety test",
-            logDetail: "Copied new files into the test archive, refused overwrites, verified checksums, and wrote a manifest."
-        ) {
-            let result = try simulationWorkspace.runImport()
-            simulationSummary = SimulationSummary(
-                root: simulationWorkspace.root.path,
-                sourcePath: simulationWorkspace.sourceCard.path,
-                archivePath: simulationWorkspace.archive.path,
-                bufferPath: simulationWorkspace.buffer.path,
-                manifestOK: result.manifest.ok,
-                copiedCount: result.copy.copied.count,
-                quarantinedCount: simulationSummary?.quarantinedCount ?? 0,
-                leftUnsafeCount: 0
-            )
-            activePlan = try simulationWorkspace.previewImport()
-            statusMessage = "Import safety test verified. Manifest OK: \(result.manifest.ok ? "yes" : "no")."
-            refreshLocationCards()
-        }
+            runningNote: "Copying into the test library",
+            logTitle: "Ran copy test",
+            logDetail: "Copied new files into the test library, refused overwrites, checked bytes, and wrote a proof file.",
+            command: command,
+            destinationPath: rootPath,
+            operation: { progress in
+                let workspace = SimulationWorkspace(root: URL(fileURLWithPath: rootPath, isDirectory: true))
+                let source = workspace.sourceCard
+                let archive = workspace.archive
+                let sourcePath = source.path
+                let archivePath = archive.path
+                progress(BackgroundJobUpdate(progress: 0.12, note: "Preparing disposable import test", command: command, sourcePath: sourcePath, destinationPath: archivePath))
+                let result = try workspace.runImport()
+                progress(BackgroundJobUpdate(progress: 0.8, note: "Refreshing import test plan", command: command, sourcePath: sourcePath, destinationPath: archivePath))
+                let summary = SimulationSummary(
+                    root: workspace.root.path,
+                    sourcePath: sourcePath,
+                    archivePath: archivePath,
+                    bufferPath: workspace.buffer.path,
+                    manifestOK: result.manifest.ok,
+                    copiedCount: result.copy.copied.count,
+                    quarantinedCount: existingQuarantinedCount,
+                    leftUnsafeCount: 0
+                )
+                return SimulationJobResult(
+                    summary: summary,
+                    plan: try ArchivePlanner().planCopy(source: source, destination: archive) { update in
+                        progress(Self.jobUpdate(from: update, lowerBound: 0.8, upperBound: 0.95, notePrefix: "Checking test library", command: command, sourcePath: sourcePath, destinationPath: archivePath))
+                    }
+                )
+            },
+            completion: { result in
+                self.simulationSummary = result.summary
+                self.activePlan = result.plan
+                self.refreshLocationCards()
+                return "Copy test passed. Proof file: \(result.summary.manifestOK ? "yes" : "no")."
+            }
+        )
     }
 
     func runSimulationFreeUp() {
-        runJob(
+        let rootPath = Self.expandedPath(configuration.demoRootPath)
+        let manifestOK = simulationSummary?.manifestOK ?? false
+        let copiedCount = simulationSummary?.copiedCount ?? 0
+        let command = Self.commandLine(["run-free-up-test", rootPath])
+        runBackgroundJob(
             action: .freeUp,
-            runningNote: "Checksum comparing buffer before quarantine",
-            logTitle: "Ran free-up safety test",
-            logDetail: "Moved only disposable buffer files that matched the archive checksum into quarantine."
-        ) {
-            let report = try simulationWorkspace.runFreeUp()
-            simulationSummary = SimulationSummary(
-                root: simulationWorkspace.root.path,
-                sourcePath: simulationWorkspace.sourceCard.path,
-                archivePath: simulationWorkspace.archive.path,
-                bufferPath: simulationWorkspace.buffer.path,
-                manifestOK: simulationSummary?.manifestOK ?? false,
-                copiedCount: simulationSummary?.copiedCount ?? 0,
-                quarantinedCount: report.moved.count,
-                leftUnsafeCount: report.notOnArchive.count + report.differ.count + report.errors.count
-            )
-            statusMessage = "Free-up safety test quarantined \(report.moved.count) verified files and left \(simulationSummary?.leftUnsafeCount ?? 0) unsafe file(s) alone."
-            refreshLocationCards()
-        }
+            runningNote: "Checking buffer files before moving them aside",
+            logTitle: "Ran clear-space test",
+            logDetail: "Moved only disposable buffer files that matched the test library into the move-aside folder.",
+            command: command,
+            destinationPath: rootPath,
+            operation: { progress in
+                let workspace = SimulationWorkspace(root: URL(fileURLWithPath: rootPath, isDirectory: true))
+                let bufferPath = workspace.buffer.path
+                let archivePath = workspace.archive.path
+                progress(BackgroundJobUpdate(progress: 0.18, note: "Comparing buffer against library", command: command, sourcePath: bufferPath, destinationPath: archivePath))
+                let report = try workspace.runFreeUp()
+                progress(BackgroundJobUpdate(progress: 0.92, note: "Finishing move-aside report", command: command, sourcePath: bufferPath, destinationPath: archivePath))
+                return SimulationSummary(
+                    root: workspace.root.path,
+                    sourcePath: workspace.sourceCard.path,
+                    archivePath: workspace.archive.path,
+                    bufferPath: workspace.buffer.path,
+                    manifestOK: manifestOK,
+                    copiedCount: copiedCount,
+                    quarantinedCount: report.moved.count,
+                    leftUnsafeCount: report.notOnArchive.count + report.differ.count + report.errors.count
+                )
+            },
+            completion: { summary in
+                self.simulationSummary = summary
+                self.refreshLocationCards()
+                return "Clear-space test moved aside \(summary.quarantinedCount) verified files and left \(summary.leftUnsafeCount) file(s) alone."
+            }
+        )
     }
 
     func runFullSimulation() {
-        runJob(
+        let rootPath = Self.expandedPath(configuration.demoRootPath)
+        let command = Self.commandLine(["run-full-safety-test", rootPath])
+        runBackgroundJob(
             action: .verifyManifest,
-            runningNote: "Running safety test",
+            runningNote: "Running the full safety test in the background",
             logTitle: "Completed safety test",
-            logDetail: "Created disposable test files, copied new files to the archive, verified the manifest, and quarantined only proven-safe buffer files."
-        ) {
-            let summary = try simulationWorkspace.runFullSimulation()
-            simulationSummary = summary
-            setConfigPath(\.importSourcePath, to: summary.sourcePath)
-            activePlan = try simulationWorkspace.previewImport()
-            statusMessage = "Safety test complete: \(summary.copiedCount) copied, \(summary.quarantinedCount) quarantined, \(summary.leftUnsafeCount) left alone."
-            refreshLocationCards()
-        }
+            logDetail: "Created disposable test files, copied new files to the test library, checked the proof file, and moved aside only proven-safe buffer files.",
+            command: command,
+            destinationPath: rootPath,
+            operation: { progress in
+                let workspace = SimulationWorkspace(root: URL(fileURLWithPath: rootPath, isDirectory: true))
+                progress(BackgroundJobUpdate(progress: 0.08, note: "Creating disposable safety test data", command: command, destinationPath: workspace.root.path))
+                let summary = try workspace.runFullSimulation()
+                let source = workspace.sourceCard
+                let archive = workspace.archive
+                let sourcePath = source.path
+                let archivePath = archive.path
+                progress(BackgroundJobUpdate(progress: 0.84, note: "Refreshing final safety plan", command: command, sourcePath: sourcePath, destinationPath: archivePath))
+                return SimulationJobResult(
+                    summary: summary,
+                    plan: try ArchivePlanner().planCopy(source: source, destination: archive) { update in
+                        progress(Self.jobUpdate(from: update, lowerBound: 0.84, upperBound: 0.96, notePrefix: "Checking final test state", command: command, sourcePath: sourcePath, destinationPath: archivePath))
+                    }
+                )
+            },
+            completion: { result in
+                self.simulationSummary = result.summary
+                self.setConfigPath(\.importSourcePath, to: result.summary.sourcePath)
+                self.activePlan = result.plan
+                self.refreshLocationCards()
+                return "Safety test complete: \(result.summary.copiedCount) copied, \(result.summary.quarantinedCount) moved aside, \(result.summary.leftUnsafeCount) left alone."
+            }
+        )
     }
 
     private var expandedImportSourcePath: String {
         Self.expandedPath(configuration.importSourcePath)
+    }
+
+    var expandedBufferIngestPath: String {
+        Self.expandedPath(configuration.bufferIngestFolderPath())
+    }
+
+    var expandedBufferRootPath: String {
+        Self.expandedPath(configuration.bufferPath)
+    }
+
+    var expandedBufferExportsPath: String {
+        Self.expandedPath(configuration.bufferExportsFolderPath())
+    }
+
+    var expandedBufferEditsPath: String {
+        Self.expandedPath(configuration.bufferEditsFolderPath())
+    }
+
+    var expandedLibraryOriginalsPath: String {
+        Self.expandedPath(configuration.libraryBatchFolderPath(.originals))
+    }
+
+    var expandedLibraryRootPath: String {
+        Self.expandedPath(configuration.cameraLibraryRootPath)
+    }
+
+    var expandedLibraryEditedPath: String {
+        Self.expandedPath(configuration.libraryBatchFolderPath(.edited))
+    }
+
+    var expandedEditorWorkingFolderPath: String {
+        Self.expandedPath(configuration.editorWorkingFolderPath)
     }
 
     private func refreshAllNow() async {
@@ -521,40 +1167,20 @@ extension DashboardModel {
         }
 
         do {
-            immichAPIKeyDraft = try secretStore.read(account: Self.immichAPIKeyAccount) ?? ""
-            if !immichAPIKeyDraft.isEmpty, immichConnectionReport == nil {
-                immichConnectionStatus = "API key is saved in Keychain. Test the connection when the server is reachable."
-            }
-        } catch {
-            immichConnectionStatus = "Could not reload Immich API key from Keychain: \(error.localizedDescription)"
-        }
-
-        do {
             activityLog = try ActivityLogStore(url: URL(fileURLWithPath: Self.expandedPath(configuration.activityLogPath))).load()
             notes.append("\(activityLog.count) log entries")
         } catch {
             notes.append("log unavailable")
         }
 
-        do {
-            let records = try loadLibraryFiles()
-            notes.append("\(records.count) photos")
-        } catch {
-            libraryFiles = []
-            notes.append("library unavailable")
-        }
-
-        if let planNote = refreshCopyPlanIfPossible() {
-            notes.append(planNote)
+        notes.append("paths")
+        if !configuration.immichServerURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            notes.append("Immich configured")
+            if immichConnectionReport == nil {
+                immichConnectionStatus = "Immich URL is saved. Keychain is checked only when you click Test Connection."
+            }
         }
         rebuildWorkflowPlans()
-
-        let serverURL = configuration.immichServerURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        let apiKey = immichAPIKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !serverURL.isEmpty, !apiKey.isEmpty {
-            await performImmichConnectionCheck(serverURL: serverURL, apiKey: apiKey, shouldRecordActivity: false)
-            notes.append("Immich")
-        }
 
         statusMessage = "Refreshed latest: \(notes.joined(separator: ", "))."
         rebuildWorkflowPlans()
@@ -567,17 +1193,6 @@ extension DashboardModel {
             .filter { MediaFileMatcher.isSupportedPhotoPath($0.path) }
         libraryFiles = records
         return records
-    }
-
-    private func refreshCopyPlanIfPossible() -> String? {
-        do {
-            let source = URL(fileURLWithPath: expandedImportSourcePath)
-            let destination = URL(fileURLWithPath: Self.expandedPath(configuration.archivePath), isDirectory: true)
-            activePlan = try ArchivePlanner().planCopy(source: source, destination: destination)
-            return "\(activePlan.new.count) new in plan"
-        } catch {
-            return nil
-        }
     }
 
     private func performImmichConnectionCheck(serverURL: String, apiKey: String, shouldRecordActivity: Bool) async {
@@ -637,37 +1252,237 @@ extension DashboardModel {
         return source
     }
 
-    private func runJob(
+    nonisolated private static func jobUpdate(
+        from update: FileOperationProgress,
+        lowerBound: Double = 0.02,
+        upperBound: Double = 0.95,
+        notePrefix: String,
+        command: String,
+        sourcePath: String? = nil,
+        destinationPath: String? = nil
+    ) -> BackgroundJobUpdate {
+        let span = max(upperBound - lowerBound, 0)
+        let rawFraction: Double
+        if update.totalBytes > 0 || update.totalFiles > 0 {
+            rawFraction = update.fractionComplete
+        } else {
+            rawFraction = min(Double(update.processedFiles) / 1_000, 0.85)
+        }
+        let progress = lowerBound + min(max(rawFraction, 0), 1) * span
+
+        var details: [String] = []
+        if update.totalFiles > 0 {
+            details.append("\(update.processedFiles)/\(update.totalFiles) files")
+        } else if update.processedFiles > 0 {
+            details.append("\(update.processedFiles) files")
+        }
+        if update.totalBytes > 0 {
+            details.append("\(update.processedBytes.formattedBytes) / \(update.totalBytes.formattedBytes)")
+        } else if update.processedBytes > 0 {
+            details.append(update.processedBytes.formattedBytes)
+        }
+        if update.bytesPerSecond > 0 {
+            details.append("\(Int64(update.bytesPerSecond).formattedBytes)/s")
+        }
+
+        let phase = displayPhase(update.phase)
+        let note: String
+        if let currentPath = update.currentPath {
+            note = "\(notePrefix): \(phase) \(currentPath)"
+        } else {
+            note = "\(notePrefix): \(phase)"
+        }
+
+        return BackgroundJobUpdate(
+            progress: progress,
+            note: note,
+            detail: details.joined(separator: " · "),
+            command: command,
+            sourcePath: sourcePath,
+            destinationPath: destinationPath,
+            currentPath: update.currentPath,
+            processedFiles: update.processedFiles,
+            totalFiles: update.totalFiles,
+            processedBytes: update.processedBytes,
+            totalBytes: update.totalBytes,
+            bytesPerSecond: update.bytesPerSecond
+        )
+    }
+
+    nonisolated private static func displayPhase(_ phase: String) -> String {
+        switch phase.lowercased() {
+        case "hashing source":
+            "Reading from folder"
+        case "hashing destination":
+            "Checking to folder"
+        case "checking source":
+            "Checking from folder"
+        case "checking destination":
+            "Checking to folder"
+        case "destination missing":
+            "To folder will be created"
+        case "hashing":
+            "Checking file bytes"
+        case "scanned metadata":
+            "Read file info"
+        case "comparing existing file":
+            "Checking existing file"
+        default:
+            phase
+        }
+    }
+
+    nonisolated private static func planProgressBounds(
+        for update: FileOperationProgress,
+        lowerBound: Double = 0.02,
+        upperBound: Double = 0.95
+    ) -> (lower: Double, upper: Double) {
+        let span = upperBound - lowerBound
+        let phase = update.phase.lowercased()
+        if phase.contains("destination") {
+            return (lowerBound + span * 0.58, upperBound)
+        }
+        if phase.contains("missing") {
+            return (upperBound, upperBound)
+        }
+        return (lowerBound, lowerBound + span * 0.58)
+    }
+
+    nonisolated private static func commandLine(_ arguments: [String]) -> String {
+        arguments.map(quoteForCommand).joined(separator: " ")
+    }
+
+    nonisolated private static func quoteForCommand(_ value: String) -> String {
+        if value.rangeOfCharacter(from: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "\"'"))) == nil {
+            return value
+        }
+        return "'\(value.replacingOccurrences(of: "'", with: "'\\''"))'"
+    }
+
+    private func runBackgroundJob<Result: Sendable>(
         action: JobAction,
         runningNote: String,
         logTitle: String,
         logDetail: String,
-        operation: () throws -> Void
+        command: String = "",
+        sourcePath: String? = nil,
+        destinationPath: String? = nil,
+        operation: @escaping @Sendable (@escaping @Sendable (BackgroundJobUpdate) -> Void) throws -> Result,
+        completion: @escaping (Result) throws -> String
     ) {
-        isBusy = true
-        var job = JobSnapshot(action: action, state: .running, progress: 0.35, note: runningNote)
-        jobs.insert(job, at: 0)
-        do {
-            try operation()
-            job.state = .done
-            job.progress = 1
-            job.note = "Done"
-            job.finishedAt = Date()
-        } catch {
-            job.state = .failed
-            job.progress = 1
-            job.note = String(describing: error)
-            job.finishedAt = Date()
-            statusMessage = job.note
+        guard !isBusy else {
+            statusMessage = "Another file job is already running. Wait for it to finish, then try again."
+            return
         }
-        let summary = statusMessage
-        job.note = summary
-        jobs[0] = job
+
+        isBusy = true
+        statusMessage = runningNote
+
+        let jobID = UUID()
+        let startedJob = JobSnapshot(
+            id: jobID,
+            action: action,
+            state: .running,
+            progress: 0.02,
+            note: runningNote,
+            detail: logDetail,
+            command: command,
+            sourcePath: sourcePath,
+            destinationPath: destinationPath
+        )
+        jobs.insert(startedJob, at: 0)
+
+        let progressHandler: @Sendable (BackgroundJobUpdate) -> Void = { [weak self] update in
+            Task { @MainActor in
+                self?.updateJob(id: jobID, update: update)
+            }
+        }
+
+        let worker = Task.detached(priority: .userInitiated) {
+            try operation(progressHandler)
+        }
+
+        Task { @MainActor [weak self] in
+            guard let self else {
+                return
+            }
+
+            do {
+                let result = try await worker.value
+                let summary = try completion(result)
+                statusMessage = summary
+                finishJob(
+                    id: jobID,
+                    action: action,
+                    state: .done,
+                    note: summary,
+                    logTitle: logTitle,
+                    logDetail: logDetail
+                )
+            } catch is CancellationError {
+                let summary = "Cancelled."
+                statusMessage = summary
+                finishJob(
+                    id: jobID,
+                    action: action,
+                    state: .cancelled,
+                    note: summary,
+                    logTitle: logTitle,
+                    logDetail: logDetail
+                )
+            } catch {
+                let summary = error.localizedDescription
+                statusMessage = summary
+                finishJob(
+                    id: jobID,
+                    action: action,
+                    state: .failed,
+                    note: summary,
+                    logTitle: logTitle,
+                    logDetail: logDetail
+                )
+            }
+        }
+    }
+
+    private func updateJob(id: UUID, update: BackgroundJobUpdate) {
+        guard let index = jobs.firstIndex(where: { $0.id == id }) else {
+            return
+        }
+        jobs[index].progress = min(max(update.progress, 0), 1)
+        jobs[index].note = update.note
+        jobs[index].detail = update.detail.isEmpty ? jobs[index].detail : update.detail
+        jobs[index].command = update.command.isEmpty ? jobs[index].command : update.command
+        jobs[index].sourcePath = update.sourcePath ?? jobs[index].sourcePath
+        jobs[index].destinationPath = update.destinationPath ?? jobs[index].destinationPath
+        jobs[index].currentPath = update.currentPath
+        jobs[index].processedFiles = update.processedFiles
+        jobs[index].totalFiles = update.totalFiles
+        jobs[index].processedBytes = update.processedBytes
+        jobs[index].totalBytes = update.totalBytes
+        jobs[index].bytesPerSecond = update.bytesPerSecond
+    }
+
+    private func finishJob(
+        id: UUID,
+        action: JobAction,
+        state: JobState,
+        note: String,
+        logTitle: String,
+        logDetail: String
+    ) {
+        if let index = jobs.firstIndex(where: { $0.id == id }) {
+            jobs[index].state = state
+            jobs[index].progress = 1
+            jobs[index].note = note
+            jobs[index].finishedAt = Date()
+        }
+
         recordActivity(
             action: action,
-            state: job.state,
+            state: state,
             title: logTitle,
-            summary: summary,
+            summary: note,
             detail: logDetail
         )
         isBusy = false
@@ -692,6 +1507,7 @@ extension DashboardModel {
     private func updateConfiguration(_ mutate: (inout AppConfiguration) -> Void) {
         var next = configuration
         mutate(&next)
+        next.normalizeLocationSelections()
         configuration = next
         do {
             try configurationStore.save(next)
@@ -706,7 +1522,7 @@ extension DashboardModel {
     private func rebuildWorkflowPlans() {
         workflowPlans = WorkflowPlanner().plans(
             for: configuration,
-            hasImmichAPIKey: !immichAPIKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            hasImmichAPIKey: immichHasUsableAPIKey || !immichAPIKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         )
     }
 
@@ -714,10 +1530,13 @@ extension DashboardModel {
         let source = URL(fileURLWithPath: expandedImportSourcePath, isDirectory: true)
         let archive = URL(fileURLWithPath: Self.expandedPath(configuration.archivePath), isDirectory: true)
         let buffer = URL(fileURLWithPath: Self.expandedPath(configuration.bufferPath), isDirectory: true)
+        let library = URL(fileURLWithPath: Self.expandedPath(configuration.cameraLibraryRootPath), isDirectory: true)
+        let catalog = URL(fileURLWithPath: Self.expandedPath(configuration.catalogDatabasePath))
         locations = [
-            LocationCard(kind: .card, title: "Import Source", subtitle: displayName(for: source), status: status(forFolder: source), detail: source.path),
-            LocationCard(kind: .drive, title: "Buffer", subtitle: displayName(for: buffer), status: .warning, detail: "Locked free-up plan: \(buffer.path)"),
-            LocationCard(kind: .nas, title: "Archive", subtitle: displayName(for: archive), status: status(forFolder: archive), detail: archive.path),
+            LocationCard(kind: .card, title: "From Folder", subtitle: displayName(for: source), status: status(forFolder: source), detail: source.path),
+            LocationCard(kind: .drive, title: "Buffer", subtitle: displayName(for: buffer), status: status(forFolder: buffer), detail: "Batch: \(Self.expandedPath(configuration.bufferBatchFolderPath()))"),
+            LocationCard(kind: .nas, title: "Photo Library", subtitle: displayName(for: library), status: status(forFolder: library), detail: archive.path),
+            LocationCard(kind: .mac, title: "Photo List", subtitle: displayName(for: catalog), status: fileExists(catalog) ? .ready : .warning, detail: catalog.path),
             immichLocationCard
         ]
     }
@@ -726,8 +1545,17 @@ extension DashboardModel {
         FileManager.default.fileExists(atPath: url.path) ? .ready : .warning
     }
 
+    private func fileExists(_ url: URL) -> Bool {
+        FileManager.default.fileExists(atPath: url.path)
+    }
+
     private func displayName(for url: URL) -> String {
         url.lastPathComponent.isEmpty ? url.path : url.lastPathComponent
+    }
+
+    private func folderExists(_ path: String) -> Bool {
+        var isDirectory: ObjCBool = false
+        return FileManager.default.fileExists(atPath: Self.expandedPath(path), isDirectory: &isDirectory) && isDirectory.boolValue
     }
 
     private var immichLocationCard: LocationCard {
@@ -763,9 +1591,83 @@ extension DashboardModel {
     private static func expandedPath(_ path: String) -> String {
         NSString(string: path).expandingTildeInPath
     }
+
+    private func setSelectedLocationPath(role: ConfiguredLocationRole, to value: String) {
+        updateConfiguration { configuration in
+            let selectedID = configuration.selectedLocationID(for: role)
+            if let selectedID,
+               let index = configuration.configuredLocations.firstIndex(where: { $0.id == selectedID }) {
+                configuration.configuredLocations[index].path = value
+                configuration.selectLocation(configuration.configuredLocations[index])
+                return
+            }
+
+            let location = ConfiguredLocation(
+                role: role,
+                name: defaultLocationName(for: URL(fileURLWithPath: value), role: role),
+                path: value
+            )
+            configuration.configuredLocations.append(location)
+            configuration.selectLocation(location)
+        }
+    }
+
+    private func defaultLocationName(for url: URL, role: ConfiguredLocationRole) -> String {
+        let lastPathComponent = url.lastPathComponent
+        if !lastPathComponent.isEmpty {
+            return lastPathComponent
+        }
+        return role.displayName
+    }
+}
+
+private extension AppConfiguration {
+    mutating func setCameraLibraryRoot(_ path: String) {
+        let root = URL(fileURLWithPath: path, isDirectory: true)
+        cameraLibraryRootPath = root.path
+        archivePath = root.appendingPathComponent(CameraLibraryFolder.originals.rawValue, isDirectory: true).path
+        catalogBackupFolderPath = root
+            .appendingPathComponent(CameraLibraryFolder.manifests.rawValue, isDirectory: true)
+            .appendingPathComponent("CameraToolkit", isDirectory: true)
+            .appendingPathComponent("catalog-backups", isDirectory: true)
+            .path
+        upsertLocation(role: .archive, name: "Library Originals", path: archivePath, select: true)
+    }
+
+    mutating func upsertLocation(role: ConfiguredLocationRole, name: String, path: String, select: Bool) {
+        if let index = configuredLocations.firstIndex(where: { $0.role == role && ($0.path == path || $0.name == name) }) {
+            configuredLocations[index].name = name
+            configuredLocations[index].path = path
+            if select {
+                selectLocation(configuredLocations[index])
+            }
+            return
+        }
+
+        let location = ConfiguredLocation(role: role, name: name, path: path)
+        configuredLocations.append(location)
+        if select {
+            selectLocation(location)
+        }
+    }
+
+    mutating func selectLocation(_ location: ConfiguredLocation) {
+        switch location.role {
+        case .importSource:
+            selectedImportSourceID = location.id
+            importSourcePath = location.path
+        case .archive:
+            selectedArchiveID = location.id
+            archivePath = location.path
+        case .buffer:
+            selectedBufferID = location.id
+            bufferPath = location.path
+        }
+    }
 }
 
 enum AppSection: String, CaseIterable, Identifiable {
+    case setup = "Setup"
     case overview = "Overview"
     case `import` = "Import"
     case library = "Library"
@@ -778,6 +1680,7 @@ enum AppSection: String, CaseIterable, Identifiable {
 
     var symbol: String {
         switch self {
+        case .setup: "checklist"
         case .overview: "rectangle.grid.2x2"
         case .import: "square.and.arrow.down"
         case .library: "photo.stack"
@@ -785,6 +1688,149 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .immich: "sparkles.rectangle.stack"
         case .jobs: "list.bullet.clipboard"
         case .config: "slider.horizontal.3"
+        }
+    }
+}
+
+struct SetupChecklistItem: Identifiable, Hashable {
+    var id: String { title }
+    var title: String
+    var detail: String
+    var isReady: Bool
+}
+
+struct SetupPathStatus: Identifiable, Hashable {
+    var id: String { title }
+    var title: String
+    var path: String
+    var exists: Bool
+    var symbol: String
+}
+
+struct CameraSetupPreset: Identifiable, Hashable {
+    var id: String
+    var title: String
+    var subtitle: String
+    var effect: String
+    var symbol: String
+    var sourceName: String?
+    var sourcePath: String?
+    var bufferName: String?
+    var bufferPath: String?
+    var libraryRootPath: String?
+    var deviceID: String?
+    var importDestination: TransferLocation?
+    var requiredPaths: [String]
+    var isAvailable: Bool = false
+    var isApplied: Bool = false
+
+    static let defaults: [CameraSetupPreset] = [
+        CameraSetupPreset(
+            id: "lexar-sony-buffer",
+            title: "Camera Card · Sony A7V",
+            subtitle: "Sony photos on the Camera Card card",
+            effect: "Uses Camera Card/TEMP as the from folder, labels the batch Sony A7V, and copies selected files to Photo Workspace.",
+            symbol: "sdcard",
+            sourceName: "Camera Card Photos",
+            sourcePath: "/Volumes/CAMERA_CARD/TEMP",
+            bufferName: "Photo Workspace Photos",
+            bufferPath: "/Volumes/PHOTO_WORKSPACE/Photos",
+            deviceID: "sony-a7v",
+            importDestination: .drive,
+            requiredPaths: ["/Volumes/CAMERA_CARD/TEMP", "/Volumes/PHOTO_WORKSPACE/Photos"]
+        ),
+        CameraSetupPreset(
+            id: "osmo-360-buffer",
+            title: "DJI Osmo 360",
+            subtitle: "360 camera card to working drive",
+            effect: "Uses Action Camera/DCIM/CAM_001 as the from folder, labels the batch DJI Osmo 360, and copies selected files to Photo Workspace.",
+            symbol: "camera.aperture",
+            sourceName: "Osmo 360",
+            sourcePath: "/Volumes/ACTION_CAMERA/DCIM/CAM_001",
+            bufferName: "Photo Workspace Photos",
+            bufferPath: "/Volumes/PHOTO_WORKSPACE/Photos",
+            deviceID: "osmo-360",
+            importDestination: .drive,
+            requiredPaths: ["/Volumes/ACTION_CAMERA/DCIM/CAM_001", "/Volumes/PHOTO_WORKSPACE/Photos"]
+        ),
+        CameraSetupPreset(
+            id: "crucial-buffer",
+            title: "Photo Workspace",
+            subtitle: "Portable photo working drive",
+            effect: "Makes /Volumes/PHOTO_WORKSPACE/Photos the buffer. It does not change the selected camera folder or copy files.",
+            symbol: "externaldrive",
+            bufferName: "Photo Workspace Photos",
+            bufferPath: "/Volumes/PHOTO_WORKSPACE/Photos",
+            importDestination: .drive,
+            requiredPaths: ["/Volumes/PHOTO_WORKSPACE/Photos"]
+        ),
+        CameraSetupPreset(
+            id: "home-photo-library",
+            title: "Home Photo Library",
+            subtitle: "Long-term NAS originals and edits",
+            effect: "Makes the mounted Camera folder the library root and derives Originals, Edited, Selects, Shared, and proof folders. It moves nothing.",
+            symbol: "building.columns",
+            libraryRootPath: "/Volumes/PHOTO_LIBRARY",
+            importDestination: .nas,
+            requiredPaths: ["/Volumes/PHOTO_LIBRARY"]
+        )
+    ]
+
+    func matches(_ configuration: AppConfiguration) -> Bool {
+        if let sourcePath, configuration.importSourcePath != sourcePath { return false }
+        if let bufferPath, configuration.bufferPath != bufferPath { return false }
+        if let libraryRootPath, configuration.cameraLibraryRootPath != libraryRootPath { return false }
+        if let deviceID, configuration.selectedDeviceID != deviceID { return false }
+        if let importDestination, configuration.importDestination != importDestination { return false }
+        return true
+    }
+}
+
+private struct RecommendedCameraSetup {
+    var libraryRoot: URL?
+    var osmoSource: URL?
+    var lexarSource: URL?
+    var buffer: URL?
+
+    var summary: String {
+        var pieces: [String] = []
+        if libraryRoot != nil { pieces.append("photo library") }
+        if osmoSource != nil { pieces.append("Action Camera") }
+        if lexarSource != nil { pieces.append("Camera Card") }
+        if buffer != nil { pieces.append("Photo Workspace") }
+        if pieces.isEmpty {
+            return "No recommended mounted camera folders were found."
+        }
+        return "Configured \(pieces.joined(separator: ", ")). No files were moved."
+    }
+
+    static func detect(fileManager: FileManager = .default) -> RecommendedCameraSetup {
+        func existingDirectory(_ path: String) -> URL? {
+            var isDirectory: ObjCBool = false
+            guard fileManager.fileExists(atPath: path, isDirectory: &isDirectory), isDirectory.boolValue else {
+                return nil
+            }
+            return URL(fileURLWithPath: path, isDirectory: true)
+        }
+
+        return RecommendedCameraSetup(
+            libraryRoot: existingDirectory("/Volumes/PHOTO_LIBRARY"),
+            osmoSource: existingDirectory("/Volumes/ACTION_CAMERA/DCIM/CAM_001"),
+            lexarSource: existingDirectory("/Volumes/CAMERA_CARD"),
+            buffer: existingDirectory("/Volumes/PHOTO_WORKSPACE/Photos")
+        )
+    }
+}
+
+private extension CameraLibraryFolder {
+    var symbolName: String {
+        switch self {
+        case .inbox: "tray.and.arrow.down"
+        case .manifests: "checklist.checked"
+        case .originals: "archivebox"
+        case .edited: "paintbrush.pointed"
+        case .selects: "star"
+        case .shared: "person.2"
         }
     }
 }

@@ -29,6 +29,7 @@ struct AppShell: View {
                     isSidebarCollapsed: model.isSidebarCollapsed,
                     isRefreshing: model.isRefreshing,
                     lastRefreshedAt: model.lastRefreshedAt,
+                    activeJob: model.activeJob,
                     toggleSidebar: toggleSidebar,
                     refreshAll: model.refreshAll
                 ) {
@@ -47,6 +48,8 @@ struct AppShell: View {
     @ViewBuilder
     private var detailView: some View {
         switch model.selectedSection {
+        case .setup:
+            SetupView(model: model)
         case .overview:
             OverviewView(model: model)
         case .import:
@@ -90,7 +93,7 @@ struct SidebarView: View {
                     SidebarToggleButton(isCollapsed: isCollapsed, action: toggleSidebar)
                 }
                 if !isCollapsed {
-                    Text("Native archive console")
+                    Text("Photo library setup")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -119,15 +122,15 @@ struct SidebarView: View {
                         .font(.title3)
                         .foregroundStyle(AppTheme.mint)
                     HelpButton(
-                        title: "Execution Locked",
-                        message: "Configured folders, tools, and Immich endpoints are live in the workspace. Real writes, deletes, and uploads stay locked until you deliberately add an execution path."
+                        title: "Real Writes Locked",
+                        message: "Configured folders, tools, and Immich endpoints are live in the workspace. Real writes, deletes, and uploads stay locked until you deliberately turn them on."
                     )
                 }
                 .padding(10)
                 .frame(maxWidth: .infinity)
                 .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 8))
                 .padding(8)
-                .help("Execution locked")
+                .help("Real writes locked")
             } else {
                 VStack(alignment: .leading, spacing: 8) {
                     HStack(spacing: 6) {
@@ -136,10 +139,10 @@ struct SidebarView: View {
                             .foregroundStyle(AppTheme.mint)
                         HelpButton(
                             title: "Ready Workspace",
-                            message: "The app points at persistent config, real workflow plans, and live Immich connection checks. Built-in safety tests are available, while real writes remain locked."
+                            message: "The app points at saved setup, real move plans, and live Immich connection checks. Built-in safety tests are available, while real writes remain locked."
                         )
                     }
-                    Text("Real plans are shown; execution stays locked.")
+                    Text("Real plans are shown; real writes stay locked.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -198,6 +201,7 @@ struct DetailContainer<Content: View>: View {
     var isSidebarCollapsed: Bool
     var isRefreshing: Bool
     var lastRefreshedAt: Date?
+    var activeJob: JobSnapshot?
     var toggleSidebar: () -> Void
     var refreshAll: () -> Void
     @ViewBuilder var content: Content
@@ -215,13 +219,13 @@ struct DetailContainer<Content: View>: View {
                     refreshAll: refreshAll
                 )
                 HStack(spacing: 6) {
-                    Label("Execution locked", systemImage: "lock.shield")
+                    Label("Real writes locked", systemImage: "lock.shield")
                         .font(.callout.weight(.medium))
                         .foregroundStyle(AppTheme.amber)
                         .labelStyle(.titleAndIcon)
                     HelpButton(
-                        title: "Execution locked",
-                        message: "The workspace reads persistent config and shows the exact planned commands and endpoints. Buttons that move bytes still use disposable test data unless a real execution path is explicitly added later."
+                        title: "Real writes locked",
+                        message: "The workspace reads saved setup and shows the exact planned commands and endpoints. Buttons that move real files stay locked unless that path is explicitly added later."
                     )
                 }
             }
@@ -232,6 +236,14 @@ struct DetailContainer<Content: View>: View {
                 Rectangle()
                     .fill(Color.primary.opacity(0.08))
                     .frame(height: 1)
+            }
+
+            if let activeJob {
+                ActiveJobBanner(job: activeJob)
+                    .padding(.horizontal, 28)
+                    .padding(.vertical, 10)
+                    .background(.thinMaterial)
+                    .transition(.move(edge: .top).combined(with: .opacity))
             }
 
             ScrollView {

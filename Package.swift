@@ -12,14 +12,22 @@ let package = Package(
         .executable(name: "CameraToolkit", targets: ["CameraToolkitApp"])
     ],
     targets: [
-        .target(name: "CameraToolkitCore"),
+        .target(
+            name: "CameraToolkitCore",
+            linkerSettings: [
+                .linkedLibrary("sqlite3")
+            ]
+        ),
         .executableTarget(
             name: "CameraToolkitApp",
             dependencies: ["CameraToolkitCore"]
         ),
         .testTarget(
             name: "CameraToolkitCoreTests",
-            dependencies: ["CameraToolkitCore"]
+            dependencies: ["CameraToolkitCore"],
+            linkerSettings: [
+                .linkedLibrary("sqlite3")
+            ]
         ),
         .testTarget(
             name: "CameraToolkitAppTests",

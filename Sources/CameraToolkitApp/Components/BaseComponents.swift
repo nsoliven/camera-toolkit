@@ -1,3 +1,4 @@
+import CameraToolkitCore
 import SwiftUI
 
 struct Panel<Content: View>: View {
@@ -101,7 +102,7 @@ struct HeaderView: View {
     var title: String
     var subtitle: String
     var badgeTitle: String = "Ready Workspace"
-    var badgeSubtitle: String = "Execution locked"
+    var badgeSubtitle: String = "Real writes locked"
 
     var body: some View {
         ViewThatFits(in: .horizontal) {
@@ -244,5 +245,47 @@ struct FormFieldLabel: View {
             Text(title)
             HelpButton(title: title, message: helpText)
         }
+    }
+}
+
+struct ActiveJobBanner: View {
+    var job: JobSnapshot
+
+    var body: some View {
+        HStack(spacing: 12) {
+            ProgressView()
+                .controlSize(.small)
+                .accessibilityLabel("Working")
+
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 8) {
+                    Text(job.action.displayName)
+                        .font(.callout.weight(.semibold))
+                    Text("\(Int(job.progress * 100))%")
+                        .font(.caption.monospacedDigit().weight(.semibold))
+                        .foregroundStyle(AppTheme.accent)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(AppTheme.accent.opacity(0.12), in: RoundedRectangle(cornerRadius: 7))
+                }
+                Text(job.note)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+
+            Spacer(minLength: 12)
+
+            ProgressView(value: job.progress)
+                .frame(width: 180)
+                .accessibilityLabel("Job progress")
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(AppTheme.panel, in: RoundedRectangle(cornerRadius: 8))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(AppTheme.accent.opacity(0.18))
+        )
     }
 }

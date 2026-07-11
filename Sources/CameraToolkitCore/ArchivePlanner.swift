@@ -7,14 +7,32 @@ public struct ArchivePlanner {
         self.scanner = scanner
     }
 
-    public func planCopy(source: URL, destination: URL, excludes: [String] = DefaultExcludes.all) throws -> CopyPlan {
-        let sourceFiles = try scanner.scan(root: source, excludes: excludes, hashing: true)
+    public func planCopy(
+        source: URL,
+        destination: URL,
+        excludes: [String] = DefaultExcludes.all,
+        progress: FileOperationProgressHandler? = nil
+    ) throws -> CopyPlan {
+        let sourceFiles = try scanner.scan(root: source, excludes: excludes, hashing: true) { update in
+            progress?(update.withPhase("Hashing source"))
+        }
         let destinationFiles: [FileRecord]
 
         if FileManager.default.fileExists(atPath: destination.path) {
-            destinationFiles = try scanner.scan(root: destination, excludes: excludes, hashing: true)
+            destinationFiles = try scanner.scan(root: destination, excludes: excludes, hashing: true) { update in
+                progress?(update.withPhase("Hashing destination"))
+            }
         } else {
             destinationFiles = []
+            progress?(
+                FileOperationProgress(
+                    phase: "Destination missing",
+                    processedFiles: sourceFiles.count,
+                    totalFiles: sourceFiles.count,
+                    processedBytes: sourceFiles.reduce(0) { $0 + $1.size },
+                    totalBytes: sourceFiles.reduce(0) { $0 + $1.size }
+                )
+            )
         }
 
         let destinationByPath = Dictionary(uniqueKeysWithValues: destinationFiles.map { ($0.path, $0) })
@@ -44,11 +62,23 @@ public struct LocalCheckService {
         self.scanner = scanner
     }
 
-    public func check(source: URL, destination: URL, excludes: [String] = DefaultExcludes.all) throws -> CheckReport {
-        let sourceFiles = try scanner.scan(root: source, excludes: excludes, hashing: true)
-        let destinationFiles = FileManager.default.fileExists(atPath: destination.path)
-            ? try scanner.scan(root: destination, excludes: excludes, hashing: true)
-            : []
+    public func check(
+        source: URL,
+        destination: URL,
+        excludes: [String] = DefaultExcludes.all,
+        progress: FileOperationProgressHandler? = nil
+    ) throws -> CheckReport {
+        let sourceFiles = try scanner.scan(root: source, excludes: excludes, hashing: true) { update in
+            progress?(update.withPhase("Checking source"))
+        }
+        let destinationFiles: [FileRecord]
+        if FileManager.default.fileExists(atPath: destination.path) {
+            destinationFiles = try scanner.scan(root: destination, excludes: excludes, hashing: true) { update in
+                progress?(update.withPhase("Checking destination"))
+            }
+        } else {
+            destinationFiles = []
+        }
 
         let sourceByPath = Dictionary(uniqueKeysWithValues: sourceFiles.map { ($0.path, $0) })
         let destinationByPath = Dictionary(uniqueKeysWithValues: destinationFiles.map { ($0.path, $0) })

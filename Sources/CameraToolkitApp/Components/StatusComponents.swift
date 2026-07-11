@@ -67,10 +67,10 @@ struct SafetyPanel: View {
 
     var body: some View {
         Panel(
-            title: "Safety Gates",
+            title: "Safety Checks",
             symbol: "lock.shield",
-            helpTitle: "Safety Gates",
-            helpText: "These are the rules that protect real files: no overwrite-style archive copies, no freeing space until checksums match, no permanent delete without confirmation, and real writes/uploads locked until deliberately enabled."
+            helpTitle: "Safety Checks",
+            helpText: "These rules protect real files: do not overwrite, do not clear buffer space until files match the library, do not permanently delete without confirmation, and keep real writes/uploads locked until you turn them on."
         ) {
             ForEach(checks) { check in
                 HStack(alignment: .top, spacing: 12) {
