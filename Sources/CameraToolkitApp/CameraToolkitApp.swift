@@ -135,10 +135,10 @@ private final class CameraToolkitMainWindow: NSObject, NSWindowDelegate {
 
         let hostingController = NSHostingController(
             rootView: AppShell(model: model)
-                .frame(minWidth: 900, minHeight: 660)
+                .frame(minWidth: 1040, minHeight: 720)
         )
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 1180, height: 760),
+            contentRect: NSRect(x: 0, y: 0, width: 1320, height: 840),
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
@@ -147,6 +147,8 @@ private final class CameraToolkitMainWindow: NSObject, NSWindowDelegate {
         window.identifier = NSUserInterfaceItemIdentifier("CameraToolkitMainWindow")
         window.isRestorable = false
         window.contentViewController = hostingController
+        window.minSize = NSSize(width: 1040, height: 720)
+        window.setContentSize(NSSize(width: 1320, height: 840))
         window.isReleasedWhenClosed = false
         window.delegate = self
         window.center()

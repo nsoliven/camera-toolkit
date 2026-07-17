@@ -263,8 +263,12 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
     }
 
     public func bufferBatchFolderPath() -> String {
+        let layout = OrganizedArchiveLayout(configuration: self)
         return URL(fileURLWithPath: bufferPath, isDirectory: true)
-            .appendingPathComponent(batchRelativePath(), isDirectory: true)
+            .appendingPathComponent(layout.year, isDirectory: true)
+            .appendingPathComponent(layout.eventFolder, isDirectory: true)
+            .appendingPathComponent(layout.deviceFolder, isDirectory: true)
+            .appendingPathComponent("Card Copy", isDirectory: true)
             .path
     }
 
@@ -274,14 +278,25 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
 
     public func bufferExportsFolderPath() -> String {
         URL(fileURLWithPath: bufferBatchFolderPath(), isDirectory: true)
+            .deletingLastPathComponent()
             .appendingPathComponent("Exports", isDirectory: true)
             .path
     }
 
     public func bufferEditsFolderPath() -> String {
         URL(fileURLWithPath: bufferBatchFolderPath(), isDirectory: true)
+            .deletingLastPathComponent()
             .appendingPathComponent("Edits", isDirectory: true)
             .path
+    }
+
+    public var archiveEventDate: String {
+        let candidate = String(batchID.prefix(10))
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter.date(from: candidate) == nil ? Self.dayFormatter.string(from: Date()) : candidate
     }
 
     public func libraryBatchFolderPath(_ folder: CameraLibraryFolder) -> String {
@@ -344,6 +359,7 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
     private static let yearFormatter: DateFormatter = formatter("yyyy")
     private static let monthFormatter: DateFormatter = formatter("yyyy-MM")
     private static let batchFormatter: DateFormatter = formatter("yyyy-MM-dd_HHmmss")
+    private static let dayFormatter: DateFormatter = formatter("yyyy-MM-dd")
 
     private static func formatter(_ format: String) -> DateFormatter {
         let formatter = DateFormatter()

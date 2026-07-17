@@ -18,6 +18,16 @@ private struct QueueCopyJobResult: Sendable {
     var plan: CopyPlan
 }
 
+private struct SafeImportPreviewResult: Sendable {
+    var buffer: CopyPlan
+    var archive: OrganizedArchivePlan
+}
+
+private struct OrganizedArchiveJobResult: Sendable {
+    var copy: OrganizedArchiveResult
+    var plan: OrganizedArchivePlan
+}
+
 private struct SimulationJobResult: Sendable {
     var summary: SimulationSummary
     var plan: CopyPlan
@@ -73,6 +83,7 @@ final class DashboardModel {
     var isSidebarCollapsed: Bool = false
     var locations: [LocationCard]
     var activePlan: CopyPlan
+    var organizedArchivePlan = OrganizedArchivePlan()
     var queuedFilePaths: Set<String> = []
     var workflowPlans: [WorkflowPlan] = []
     var jobs: [JobSnapshot]
@@ -560,7 +571,22 @@ extension DashboardModel {
         updateConfiguration { configuration in
             configuration.selectLocation(location)
         }
+        activePlan = CopyPlan()
+        organizedArchivePlan = OrganizedArchivePlan()
+        queuedFilePaths.removeAll()
         statusMessage = "Using \(location.name) for \(location.role.displayName)."
+    }
+
+    func useFolderAsImportSource(_ url: URL) {
+        let name = url.lastPathComponent.isEmpty ? "Camera Source" : url.lastPathComponent
+        updateConfiguration { configuration in
+            configuration.upsertLocation(role: .importSource, name: name, path: url.path, select: true)
+            configuration.beginNewBatch()
+        }
+        activePlan = CopyPlan()
+        organizedArchivePlan = OrganizedArchivePlan()
+        queuedFilePaths.removeAll()
+        statusMessage = "Using \(name) as the camera source. Nothing has been copied yet."
     }
 
     func setConfiguredLocationName(_ location: ConfiguredLocation, to value: String) {
@@ -608,10 +634,18 @@ extension DashboardModel {
 
     func setDeviceID(_ value: String) {
         updateConfiguration { $0.selectedDeviceID = value }
+        activePlan = CopyPlan()
+        organizedArchivePlan = OrganizedArchivePlan()
+        queuedFilePaths.removeAll()
+        statusMessage = "Camera changed. Preview or copy again before archiving."
     }
 
     func setEventName(_ value: String) {
         updateConfiguration { $0.eventName = value }
+        activePlan = CopyPlan()
+        organizedArchivePlan = OrganizedArchivePlan()
+        queuedFilePaths.removeAll()
+        statusMessage = "Event folder changed. Preview or copy again before archiving."
     }
 
     func setImportDestination(_ value: TransferLocation) {
@@ -873,6 +907,48 @@ extension DashboardModel {
         )
     }
 
+    func previewSafeImport() {
+        let sourcePath = expandedImportSourcePath
+        let bufferPath = expandedBufferIngestPath
+        let libraryPath = expandedLibraryRootPath
+        let source = URL(fileURLWithPath: sourcePath, isDirectory: true)
+        let buffer = URL(fileURLWithPath: bufferPath, isDirectory: true)
+        let library = URL(fileURLWithPath: libraryPath, isDirectory: true)
+        let layout = OrganizedArchiveLayout(configuration: configuration)
+        let command = Self.commandLine(["preview-safe-import", sourcePath, bufferPath, libraryPath])
+        runBackgroundJob(
+            action: .previewFiles,
+            runningNote: "Checking the card, workspace, and NAS folders",
+            logTitle: "Previewed safe import",
+            logDetail: "Checked both destinations by checksum. No files were copied.",
+            command: command,
+            sourcePath: sourcePath,
+            destinationPath: libraryPath,
+            operation: { progress in
+                let bufferPlan = try ArchivePlanner().planCopy(source: source, destination: buffer) { update in
+                    let bounds = Self.planProgressBounds(for: update, lowerBound: 0.02, upperBound: 0.58)
+                    progress(Self.jobUpdate(from: update, lowerBound: bounds.lower, upperBound: bounds.upper, notePrefix: "Checking workspace", command: command, sourcePath: sourcePath, destinationPath: bufferPath))
+                }
+                let sourceFiles = bufferPlan.new + bufferPlan.existing + bufferPlan.conflicts
+                let archivePlan = try OrganizedArchivePlanner().plan(
+                    source: source,
+                    sourceFiles: sourceFiles,
+                    libraryRoot: library,
+                    layout: layout
+                ) { update in
+                    progress(Self.jobUpdate(from: update, lowerBound: 0.60, upperBound: 0.97, notePrefix: "Checking NAS folders", command: command, sourcePath: sourcePath, destinationPath: libraryPath))
+                }
+                return SafeImportPreviewResult(buffer: bufferPlan, archive: archivePlan)
+            },
+            completion: { result in
+                self.activePlan = result.buffer
+                self.organizedArchivePlan = result.archive
+                self.queuedFilePaths = Set(result.buffer.new.map(\.path))
+                return "Preview ready: \(result.buffer.new.count) need copying to Crucial; \(result.archive.new.count) need archiving to NAS; \(result.buffer.conflicts.count + result.archive.conflicts.count) conflict(s)."
+            }
+        )
+    }
+
     func copySourceToBuffer() {
         let sourcePath = expandedImportSourcePath
         let destinationPath = expandedBufferIngestPath
@@ -941,6 +1017,52 @@ extension DashboardModel {
                 self.queuedFilePaths.removeAll()
                 self.refreshLocationCards()
                 return "Copied \(result.copy.copied.count) queued file(s) to buffer, skipped \(result.copy.skippedIdentical.count) already there, left \(result.copy.conflicts.count) conflict(s) untouched."
+            }
+        )
+    }
+
+    var isBufferVerifiedForArchive: Bool {
+        !activePlan.existing.isEmpty && activePlan.new.isEmpty && activePlan.conflicts.isEmpty
+    }
+
+    func archiveBufferToLibrary() {
+        guard isBufferVerifiedForArchive else {
+            statusMessage = "Copy and verify the full card on Crucial before archiving to the NAS."
+            return
+        }
+
+        let sourcePath = expandedBufferIngestPath
+        let libraryPath = expandedLibraryRootPath
+        let source = URL(fileURLWithPath: sourcePath, isDirectory: true)
+        let library = URL(fileURLWithPath: libraryPath, isDirectory: true)
+        let layout = OrganizedArchiveLayout(configuration: configuration)
+        let command = Self.commandLine(["archive-organized", "--verify", sourcePath, libraryPath])
+        runBackgroundJob(
+            action: .syncBuffer,
+            runningNote: "Organizing and verifying permanent originals on the NAS",
+            logTitle: "Archived verified originals to NAS",
+            logDetail: "Copied from the verified Crucial workspace into event folders. Existing conflicts were never overwritten, and a checksum manifest was written.",
+            command: command,
+            sourcePath: sourcePath,
+            destinationPath: libraryPath,
+            operation: { progress in
+                let planner = OrganizedArchivePlanner()
+                let plan = try planner.plan(source: source, libraryRoot: library, layout: layout) { update in
+                    progress(Self.jobUpdate(from: update, lowerBound: 0.02, upperBound: 0.34, notePrefix: "Planning NAS archive", command: command, sourcePath: sourcePath, destinationPath: libraryPath))
+                }
+                let result = try OrganizedArchiveService().archive(source: source, libraryRoot: library, plan: plan) { update in
+                    progress(Self.jobUpdate(from: update, lowerBound: 0.34, upperBound: 0.88, notePrefix: "Archiving to NAS", command: command, sourcePath: sourcePath, destinationPath: libraryPath))
+                }
+                let verifiedPlan = try planner.plan(source: source, libraryRoot: library, layout: layout) { update in
+                    progress(Self.jobUpdate(from: update, lowerBound: 0.88, upperBound: 0.98, notePrefix: "Final NAS verification", command: command, sourcePath: sourcePath, destinationPath: libraryPath))
+                }
+                return OrganizedArchiveJobResult(copy: result, plan: verifiedPlan)
+            },
+            completion: { result in
+                self.organizedArchivePlan = result.plan
+                self.refreshLocationCards()
+                let proof = result.copy.manifestPath.map { " Proof: \($0)" } ?? ""
+                return "NAS archive verified: \(result.copy.copied.count) copied, \(result.copy.skippedIdentical.count) already safe, \(result.copy.conflicts.count) conflict(s) left untouched.\(proof)"
             }
         )
     }
@@ -1590,7 +1712,7 @@ extension DashboardModel {
 
     private static let immichAPIKeyAccount = "immich-api-key"
 
-    private static func expandedPath(_ path: String) -> String {
+    static func expandedPath(_ path: String) -> String {
         NSString(string: path).expandingTildeInPath
     }
 

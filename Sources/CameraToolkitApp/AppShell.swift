@@ -6,41 +6,7 @@ struct AppShell: View {
     @Bindable var model: DashboardModel
 
     var body: some View {
-        NavigationSplitView(columnVisibility: sidebarVisibility) {
-            List(selection: Binding(
-                get: { model.selectedSection },
-                set: { model.selectedSection = $0 }
-            )) {
-                Section {
-                    ForEach(AppSection.allCases) { section in
-                        Label(section.rawValue, systemImage: section.symbol)
-                            .tag(section)
-                    }
-                }
-
-                Section("Protection") {
-                    Label("Writes locked", systemImage: "lock.shield")
-                        .foregroundStyle(.secondary)
-                        .help("Camera cards are never modified. Archive and delete workflows remain locked.")
-                }
-            }
-            .listStyle(.sidebar)
-            .navigationTitle("Camera Toolkit")
-            .navigationSplitViewColumnWidth(min: 190, ideal: 220, max: 260)
-        } detail: {
-            DetailContainer(
-                section: model.selectedSection,
-                isRefreshing: model.isRefreshing,
-                lastRefreshedAt: model.lastRefreshedAt,
-                activeJob: model.activeJob,
-                refreshAll: model.refreshAll
-            ) {
-                detailView
-            }
-            .background(AppTheme.background)
-        }
-        .navigationSplitViewStyle(.balanced)
-        .tint(.accentColor)
+        PhotoBrowserView(model: model)
         .onAppear {
             model.refreshAllIfStale(maxAge: 0)
         }
@@ -49,38 +15,6 @@ struct AppShell: View {
         }
     }
 
-    @ViewBuilder
-    private var detailView: some View {
-        switch model.selectedSection {
-        case .setup:
-            SetupView(model: model)
-        case .overview:
-            OverviewView(model: model)
-        case .import:
-            ImportView(model: model)
-        case .library:
-            LibraryView(model: model)
-        case .drive:
-            DriveView(model: model)
-        case .immich:
-            ImmichView(model: model)
-        case .jobs:
-            JobsView(model: model)
-        case .config:
-            ConfigView(model: model)
-        }
-    }
-
-    private func toggleSidebar() {
-        model.toggleSidebar()
-    }
-
-    private var sidebarVisibility: Binding<NavigationSplitViewVisibility> {
-        Binding(
-            get: { model.isSidebarCollapsed ? .detailOnly : .all },
-            set: { model.isSidebarCollapsed = $0 == .detailOnly }
-        )
-    }
 }
 
 struct SidebarView: View {

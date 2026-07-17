@@ -14,7 +14,7 @@ final class DashboardModelTests: XCTestCase {
             let relativePath = "DCIM/100MSDCF/DSC00001.ARW"
             let bytes = Data("same-photo-bytes".utf8)
             try writeFile(source.appendingPathComponent(relativePath), bytes)
-            try writeFile(buffer.appendingPathComponent("2026/2026-07_Test-Batch/Sony-A7V/2026-07-10_120000_sony-a7v_test").appendingPathComponent(relativePath), bytes)
+            try writeFile(buffer.appendingPathComponent("2026/2026-07-10 Test Batch/Sony A7V/Card Copy").appendingPathComponent(relativePath), bytes)
 
             let model = DashboardModel(
                 locations: [],
@@ -88,7 +88,7 @@ final class DashboardModelTests: XCTestCase {
             try await waitForIdle(model)
 
             let bufferedFile = buffer
-                .appendingPathComponent("2026/2026-07_Test-Batch/Sony-A7V/2026-07-10_120000_sony-a7v_test")
+                .appendingPathComponent("2026/2026-07-10 Test Batch/Sony A7V/Card Copy")
                 .appendingPathComponent(relativePath)
             XCTAssertEqual(try Data(contentsOf: bufferedFile), bytes)
             XCTAssertFalse(FileManager.default.fileExists(atPath: archive.appendingPathComponent(relativePath).path))
@@ -141,7 +141,7 @@ final class DashboardModelTests: XCTestCase {
             model.copyQueuedFilesToBuffer()
             try await waitForIdle(model)
 
-            let bufferRoot = buffer.appendingPathComponent("2026/2026-07_Test-Batch/Sony-A7V/2026-07-10_120000_sony-a7v_test")
+            let bufferRoot = buffer.appendingPathComponent("2026/2026-07-10 Test Batch/Sony A7V/Card Copy")
             XCTAssertTrue(FileManager.default.fileExists(atPath: bufferRoot.appendingPathComponent(queuedPath).path))
             XCTAssertFalse(FileManager.default.fileExists(atPath: bufferRoot.appendingPathComponent(unqueuedPath).path))
             XCTAssertTrue(model.queuedFiles.isEmpty)
@@ -272,6 +272,51 @@ final class DashboardModelTests: XCTestCase {
             presets.first { $0.id == "lexar-sony-buffer" }?.bufferPath,
             "/Volumes/PHOTO_WORKSPACE/Camera Buffer"
         )
+    }
+
+    func testTwoButtonImportCopiesToCrucialThenOrganizesVerifiedNASOriginals() async throws {
+        try await withTemporaryDirectoryAsync { root in
+            let card = root.appendingPathComponent("Camera Card", isDirectory: true)
+            let crucial = root.appendingPathComponent("Photo Workspace", isDirectory: true)
+            let library = root.appendingPathComponent("NAS/Camera", isDirectory: true)
+            try writeFile(card.appendingPathComponent("DCIM/100MSDCF/PHOTO.ARW"), Data("raw-photo".utf8))
+            try writeFile(card.appendingPathComponent("M4ROOT/CLIP/VIDEO.MP4"), Data("video".utf8))
+            try FileManager.default.createDirectory(at: library, withIntermediateDirectories: true)
+
+            let configuration = AppConfiguration(
+                demoRootPath: root.appendingPathComponent("Safety Test").path,
+                importSourcePath: card.path,
+                archivePath: library.appendingPathComponent("Originals").path,
+                bufferPath: crucial.path,
+                cameraLibraryRootPath: library.path,
+                activityLogPath: root.appendingPathComponent("activity.jsonl").path,
+                selectedDeviceID: "sony-a7v",
+                eventName: "Lee Canyon",
+                batchID: "2026-07-11_120000_sony-a7v_test"
+            )
+            let model = DashboardModel(
+                locations: [],
+                activePlan: CopyPlan(),
+                jobs: [],
+                configuration: configuration,
+                safetyChecks: [],
+                configurationStore: ConfigurationStore(url: root.appendingPathComponent("config.json"))
+            )
+
+            model.copySourceToBuffer()
+            try await waitForIdle(model)
+            XCTAssertTrue(model.isBufferVerifiedForArchive)
+
+            model.archiveBufferToLibrary()
+            try await waitForIdle(model)
+
+            let raw = library.appendingPathComponent("Originals/2026/2026-07-11 Lee Canyon/Sony A7V/RAW/PHOTO.ARW")
+            let video = library.appendingPathComponent("Originals/2026/2026-07-11 Lee Canyon/Sony A7V/Video/VIDEO.MP4")
+            XCTAssertEqual(try Data(contentsOf: raw), Data("raw-photo".utf8))
+            XCTAssertEqual(try Data(contentsOf: video), Data("video".utf8))
+            XCTAssertTrue(model.organizedArchivePlan.isVerified)
+            XCTAssertTrue(model.statusMessage.contains("NAS archive verified"))
+        }
     }
 }
 

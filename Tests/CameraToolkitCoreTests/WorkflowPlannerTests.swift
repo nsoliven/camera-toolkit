@@ -16,7 +16,7 @@ final class WorkflowPlannerTests: XCTestCase {
                 "/opt/homebrew/bin/rclone",
                 "copy",
                 root.appendingPathComponent("Card").path,
-                root.appendingPathComponent("Buffer/2026/2026-07_Test-Trip/Sony-A7V/2026-07-10_120000_sony-a7v_test").path
+                root.appendingPathComponent("Buffer/2026/2026-07-10 Test Trip/Sony A7V/Card Copy").path
             ])
             XCTAssertTrue(copyCommand.contains("--checksum"))
             XCTAssertTrue(copyCommand.contains("--immutable"))
@@ -36,7 +36,7 @@ final class WorkflowPlannerTests: XCTestCase {
             XCTAssertEqual(Array(copyCommand.prefix(4)), [
                 "/opt/homebrew/bin/rclone",
                 "copy",
-                root.appendingPathComponent("Buffer/2026/2026-07_Test-Trip/Sony-A7V/2026-07-10_120000_sony-a7v_test").path,
+                root.appendingPathComponent("Buffer/2026/2026-07-10 Test Trip/Sony A7V/Card Copy").path,
                 root.appendingPathComponent("Camera Library/Originals/2026/2026-07_Test-Trip/Sony-A7V/2026-07-10_120000_sony-a7v_test").path
             ])
             XCTAssertTrue(copyCommand.contains("--checksum"))
