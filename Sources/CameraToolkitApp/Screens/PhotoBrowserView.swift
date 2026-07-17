@@ -84,6 +84,16 @@ private struct ImportFolderMapping: Identifiable {
     var fileCount: Int
 }
 
+private struct ImportPreviewIndex {
+    var folderMappings: [ImportFolderMapping]
+    var destinationFoldersBySourceFile: [String: Set<String>]
+
+    static let empty = ImportPreviewIndex(
+        folderMappings: [],
+        destinationFoldersBySourceFile: [:]
+    )
+}
+
 struct PhotoBrowserView: View {
     @Bindable var model: DashboardModel
     @State private var currentURL: URL
@@ -94,7 +104,7 @@ struct PhotoBrowserView: View {
     @State private var forwardHistory: [URL] = []
     @State private var isLoading = false
     @State private var browserError: String?
-    @State private var showFolderPlan = true
+    @State private var hasRequestedImportPreview = false
 
     init(model: DashboardModel) {
         self.model = model
@@ -111,12 +121,10 @@ struct PhotoBrowserView: View {
             VStack(spacing: 0) {
                 browserToolbar
                 Divider()
-                VSplitView {
-                    fileTable
-                        .frame(minHeight: 220)
-                    safeImportArea
-                        .frame(minHeight: 210, idealHeight: 270, maxHeight: 340)
-                }
+                fileTable
+                    .frame(minHeight: 320, maxHeight: .infinity)
+                Divider()
+                safeImportArea
             }
             .background(Color(nsColor: .controlBackgroundColor))
         }
@@ -127,6 +135,7 @@ struct PhotoBrowserView: View {
         }
         .onChange(of: selectedLocationID) { _, newValue in
             guard let location = locations.first(where: { $0.id == newValue }) else { return }
+            hasRequestedImportPreview = false
             if case .source(let id) = location.kind,
                let configured = model.configuration.configuredLocations.first(where: { $0.id == id }) {
                 model.useConfiguredLocation(configured)
@@ -290,7 +299,10 @@ struct PhotoBrowserView: View {
     }
 
     private var fileTable: some View {
-        Group {
+        let previewIndex = hasRequestedImportPreview && !model.isBusy
+            ? importPreviewIndex
+            : .empty
+        return Group {
             if isLoading && items.isEmpty {
                 ProgressView("Loading \(currentURL.lastPathComponent)…")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -327,27 +339,42 @@ struct PhotoBrowserView: View {
                             Button("Reveal in Finder") { NSWorkspace.shared.activateFileViewerSelecting([item.url]) }
                         }
                     }
-                    .width(min: 220, ideal: 440)
+                    .width(min: 180, ideal: 250, max: 300)
 
                     TableColumn("Date Modified") { item in
                         Text(item.modifiedAt.formatted(date: .abbreviated, time: .shortened))
                             .foregroundStyle(.secondary)
                     }
-                    .width(min: 130, ideal: 175, max: 210)
+                    .width(min: 130, ideal: 160, max: 180)
 
                     TableColumn("Size") { item in
                         Text(item.isDirectory ? "—" : item.size.formattedBytes)
                             .foregroundStyle(.secondary)
                             .frame(maxWidth: .infinity, alignment: .trailing)
                     }
-                    .width(min: 70, ideal: 90, max: 110)
+                    .width(min: 70, ideal: 80, max: 90)
 
                     TableColumn("Kind") { item in
                         Text(item.kind)
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
                     }
-                    .width(min: 90, ideal: 130, max: 190)
+                    .width(min: 80, ideal: 90, max: 105)
+
+                    TableColumn("Import To") { item in
+                        if !hasRequestedImportPreview {
+                            Text("Preview Import to see destination")
+                                .font(.caption)
+                                .foregroundStyle(.tertiary)
+                        } else if model.isBusy {
+                            Label("Calculating…", systemImage: "arrow.triangle.branch")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        } else {
+                            inlineImportDestination(for: item, index: previewIndex)
+                        }
+                    }
+                    .width(min: 330, ideal: 430)
                 }
                 .alternatingRowBackgrounds(.enabled)
             }
@@ -409,7 +436,8 @@ struct PhotoBrowserView: View {
 
                 Spacer()
 
-                Button("Preview Import") {
+                Button(hasRequestedImportPreview ? "Refresh Preview" : "Preview Import") {
+                    hasRequestedImportPreview = true
                     model.previewSafeImport()
                 }
                 .disabled(model.isBusy || !folderExists(model.configuration.importSourcePath))
@@ -430,201 +458,83 @@ struct PhotoBrowserView: View {
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 10)
-
-            Divider()
-
-            DisclosureGroup(isExpanded: $showFolderPlan) {
-                folderPlan
-            } label: {
-                HStack {
-                    Text("Folders for this import")
-                        .font(.callout.weight(.medium))
-                    if !importFolderMappings.isEmpty {
-                        Text("\(mappedFileCount) files mapped")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    if model.organizedArchivePlan.isVerified {
-                        Label("NAS verified", systemImage: "checkmark.seal.fill")
-                            .font(.caption.weight(.medium))
-                            .foregroundStyle(.green)
-                    }
-                }
-            }
-            .padding(.horizontal, 12)
-            .padding(.bottom, showFolderPlan ? 10 : 7)
         }
         .background(.bar)
     }
 
-    private var folderPlan: some View {
-        VStack(alignment: .leading, spacing: 7) {
-            HStack(alignment: .top, spacing: 10) {
-                importStageHeader(
-                    title: "1  CAMERA CARD",
-                    root: DashboardModel.expandedPath(model.configuration.importSourcePath),
-                    detail: "Read only",
-                    symbol: "sdcard.fill",
-                    color: .blue
-                )
-                transferArrow
-                importStageHeader(
-                    title: "2  CRUCIAL WORKSPACE",
-                    root: model.expandedBufferIngestPath,
-                    detail: "Same folder structure",
-                    symbol: "externaldrive.fill",
-                    color: .mint
-                )
-                transferArrow
-                importStageHeader(
-                    title: "3  NAS LIBRARY",
-                    root: archiveOriginalsBasePath,
-                    detail: "RAW / JPEG / Video folders",
-                    symbol: "network",
-                    color: .orange
-                )
-            }
-
-            ScrollView(.vertical) {
-                LazyVStack(spacing: 3) {
-                    if importFolderMappings.isEmpty {
-                        HStack(spacing: 10) {
-                            mappingCell(
-                                path: currentSourcePreviewName,
-                                state: .source,
-                                detail: "Camera folders"
-                            )
-                            transferArrow
-                            mappingCell(
-                                path: currentSourcePreviewName,
-                                state: workspaceFolder.state,
-                                detail: "Keeps DCIM and camera structure"
-                            )
-                            transferArrow
-                            mappingCell(
-                                path: "Preview to classify RAW, JPEG, and Video",
-                                state: .preview,
-                                detail: "No files have been copied"
-                            )
-                        }
-                        .padding(.vertical, 3)
-                    } else {
-                        ForEach(importFolderMappings) { mapping in
-                            HStack(spacing: 10) {
-                                mappingCell(
-                                    path: mapping.sourceFolder,
-                                    state: .source,
-                                    detail: fileCountLabel(mapping.fileCount)
-                                )
-                                transferArrow
-                                mappingCell(
-                                    path: mapping.workspaceFolder,
-                                    state: mapping.workspaceState,
-                                    detail: "Same camera folders"
-                                )
-                                transferArrow
-                                mappingCell(
-                                    path: mapping.archiveFolder,
-                                    state: mapping.archiveState,
-                                    detail: "Organized by media type"
-                                )
-                            }
-                            .padding(.vertical, 3)
-                        }
-                    }
+    @ViewBuilder
+    private func inlineImportDestination(
+        for item: BrowserItem,
+        index: ImportPreviewIndex
+    ) -> some View {
+        let mappings = importMappings(for: item, index: index)
+        if mappings.isEmpty {
+            Text("Not included in this import")
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+        } else {
+            let state = destinationState(for: mappings)
+            let workspaceFolders = shortFolderList(mappings.map(\.workspaceFolder))
+            let archiveFolders = shortFolderList(mappings.map(\.archiveFolder))
+            HStack(spacing: 8) {
+                Image(systemName: "folder.fill")
+                    .foregroundStyle(state.color)
+                    .font(.title3)
+                    .frame(width: 20)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Crucial / \(workspaceFolders)")
+                        .font(.caption.monospaced())
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Text("NAS / \(archiveFolders)")
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
                 }
+                Spacer(minLength: 4)
+                Text(state.label)
+                    .font(.system(size: 8, weight: .bold))
+                    .foregroundStyle(state.color)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 3)
+                    .background(state.color.opacity(0.12), in: Capsule())
             }
-            .frame(maxHeight: 126)
+            .help("Temporary: \(model.expandedBufferIngestPath)/\(workspaceFolders)\nPermanent: \(archiveOriginalsBasePath)/\(archiveFolders)")
+        }
+    }
 
-            HStack(spacing: 6) {
-                Image(systemName: "folder.fill.badge.plus")
-                    .foregroundStyle(.orange)
-                Text("Also creates Edited/\(archiveEventRelativePath)/{Masters, Web, Social} and System/{Manifests, Import History}.")
-                    .lineLimit(1)
-                Spacer()
-                Text("Immich indexes the stable NAS folders; no duplicate upload.")
-                    .lineLimit(1)
+    private func importMappings(
+        for item: BrowserItem,
+        index: ImportPreviewIndex
+    ) -> [ImportFolderMapping] {
+        let sourceRoot = DashboardModel.expandedPath(model.configuration.importSourcePath)
+        let relativeItemPath = relativePath(item.url.path, under: sourceRoot)
+        guard relativeItemPath != item.url.path else { return [] }
+
+        if item.isDirectory {
+            let prefix = relativeItemPath + "/"
+            return index.folderMappings.filter {
+                $0.sourceFolder == relativeItemPath || $0.sourceFolder.hasPrefix(prefix)
             }
-            .font(.caption2)
-            .foregroundStyle(.secondary)
         }
-        .padding(.top, 8)
-    }
 
-    private func importStageHeader(
-        title: String,
-        root: String,
-        detail: String,
-        symbol: String,
-        color: Color
-    ) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Label(title, systemImage: symbol)
-                .font(.system(size: 10, weight: .bold))
-                .foregroundStyle(color)
-            Text(root)
-                .font(.caption2.monospaced())
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .help(root)
-            Text(detail)
-                .font(.caption2)
-                .foregroundStyle(.secondary)
+        let destinationFolders = index.destinationFoldersBySourceFile[relativeItemPath] ?? []
+        return index.folderMappings.filter {
+            $0.sourceFolder == parentFolder(relativeItemPath)
+                && destinationFolders.contains($0.archiveFolder)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    private var transferArrow: some View {
-        Image(systemName: "arrow.right")
-            .font(.caption.weight(.semibold))
-            .foregroundStyle(.tertiary)
-            .frame(width: 18)
+    private func destinationState(for mappings: [ImportFolderMapping]) -> PlannedFolder.State {
+        let states = mappings.flatMap { [$0.workspaceState, $0.archiveState] }
+        return states.max { $0.priority < $1.priority } ?? .preview
     }
 
-    private func mappingCell(
-        path: String,
-        state: PlannedFolder.State,
-        detail: String
-    ) -> some View {
-        HStack(alignment: .top, spacing: 7) {
-            Image(systemName: "folder.fill")
-                .foregroundStyle(state.color)
-                .frame(width: 15)
-            VStack(alignment: .leading, spacing: 1) {
-                Text(path)
-                    .font(.caption.monospaced())
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .help(path)
-                Text(detail)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-            Spacer(minLength: 4)
-            Text(state.label)
-                .font(.system(size: 8, weight: .bold))
-                .foregroundStyle(state.color)
-        }
-        .padding(.horizontal, 7)
-        .padding(.vertical, 5)
-        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 5))
-        .frame(maxWidth: .infinity)
-    }
-
-    private var workspaceFolder: PlannedFolder {
-        let path = model.expandedBufferIngestPath
-        let state: PlannedFolder.State = model.isBufferVerifiedForArchive
-            ? .verified
-            : (folderExists(path) ? .exists : .willCreate)
-        return PlannedFolder(path: path, state: state)
-    }
-
-    private var archiveEventRelativePath: String {
-        let layout = OrganizedArchiveLayout(configuration: model.configuration)
-        return "\(layout.year)/\(layout.eventFolder)"
+    private func shortFolderList(_ folders: [String]) -> String {
+        let unique = Array(Set(folders)).sorted()
+        guard unique.count > 2 else { return unique.joined(separator: ", ") }
+        return "\(unique[0]), \(unique[1]) +\(unique.count - 2)"
     }
 
     private var archiveOriginalsRelativePath: String {
@@ -638,14 +548,23 @@ struct PhotoBrowserView: View {
             .path
     }
 
-    private var currentSourcePreviewName: String {
-        let source = URL(fileURLWithPath: DashboardModel.expandedPath(model.configuration.importSourcePath))
-        let folders = items.filter(\.isDirectory).prefix(3).map(\.name)
-        return folders.isEmpty ? source.lastPathComponent : folders.joined(separator: ", ")
-    }
-
-    private var mappedFileCount: Int {
-        importFolderMappings.reduce(0) { $0 + $1.fileCount }
+    private var importPreviewIndex: ImportPreviewIndex {
+        let archiveFiles = model.organizedArchivePlan.new
+            + model.organizedArchivePlan.existing
+            + model.organizedArchivePlan.conflicts
+        var destinationFoldersBySourceFile: [String: Set<String>] = [:]
+        destinationFoldersBySourceFile.reserveCapacity(archiveFiles.count)
+        for mapping in archiveFiles {
+            let folder = relativePath(
+                parentFolder(mapping.destinationPath),
+                under: archiveOriginalsRelativePath
+            )
+            destinationFoldersBySourceFile[mapping.sourcePath, default: []].insert(folder)
+        }
+        return ImportPreviewIndex(
+            folderMappings: importFolderMappings,
+            destinationFoldersBySourceFile: destinationFoldersBySourceFile
+        )
     }
 
     private var importFolderMappings: [ImportFolderMapping] {
@@ -735,10 +654,6 @@ struct PhotoBrowserView: View {
     private func relativePath(_ path: String, under root: String) -> String {
         let prefix = root.hasSuffix("/") ? root : root + "/"
         return path.hasPrefix(prefix) ? String(path.dropFirst(prefix.count)) : path
-    }
-
-    private func fileCountLabel(_ count: Int) -> String {
-        count == 1 ? "1 file" : "\(count) files"
     }
 
     private var locations: [BrowserLocation] {
