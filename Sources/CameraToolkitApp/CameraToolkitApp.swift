@@ -159,7 +159,7 @@ private final class CameraToolkitMainWindow: NSObject, NSWindowDelegate {
 }
 
 @MainActor
-private final class CameraToolkitConfigWindow: NSObject, NSWindowDelegate {
+final class CameraToolkitConfigWindow: NSObject, NSWindowDelegate {
     static let shared = CameraToolkitConfigWindow()
 
     private var window: NSWindow?

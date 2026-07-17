@@ -190,11 +190,23 @@ struct PhotoBrowserView: View {
             .listStyle(.sidebar)
 
             Divider()
-            Button {
-                chooseAnyFolder()
-            } label: {
-                Label("Choose Folder…", systemImage: "folder.badge.plus")
-                    .frame(maxWidth: .infinity, alignment: .leading)
+            VStack(spacing: 2) {
+                Button {
+                    chooseAnyFolder()
+                } label: {
+                    Label("Choose Folder…", systemImage: "folder.badge.plus")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
+                }
+
+                Button {
+                    CameraToolkitConfigWindow.shared.show(model: model)
+                } label: {
+                    Label("Settings…", systemImage: "gearshape")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
+                }
+                .help("Open Camera Toolkit settings (Command-,)")
             }
             .buttonStyle(.plain)
             .padding(12)
