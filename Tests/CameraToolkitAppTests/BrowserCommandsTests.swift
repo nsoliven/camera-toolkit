@@ -65,4 +65,10 @@ final class BrowserCommandsTests: XCTestCase {
         XCTAssertEqual(copiedURLs.map(\.standardizedFileURL), [first.standardizedFileURL, second.standardizedFileURL])
         pasteboard.clearContents()
     }
+
+    func testEventMediaSupportIncludesDJIOsmo360Files() {
+        XCTAssertTrue(EventMediaSupport.canAssign(URL(fileURLWithPath: "/camera/CAM_0001.OSV")))
+        XCTAssertTrue(EventMediaSupport.canAssign(URL(fileURLWithPath: "/camera/CAM_0001.LRF")))
+        XCTAssertFalse(EventMediaSupport.canAssign(URL(fileURLWithPath: "/camera/README.TXT")))
+    }
 }

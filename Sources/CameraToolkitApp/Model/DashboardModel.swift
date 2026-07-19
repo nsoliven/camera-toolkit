@@ -315,6 +315,16 @@ extension DashboardModel {
             : "Queued \(selectedEventFiles.count) file(s) assigned to \(selectedEvent?.name ?? "the event")."
     }
 
+    func copySelectedEventFilesToBuffer() {
+        let files = selectedEventFiles
+        guard !files.isEmpty else {
+            statusMessage = "Assign files to the selected event before copying to the Buffer."
+            return
+        }
+        queuedFilePaths = Set(files.map(\.path))
+        copyQueuedFilesToBuffer()
+    }
+
     func setEventImmichUploadEnabled(_ eventID: UUID, enabled: Bool) {
         updateConfiguration { configuration in
             guard let index = configuration.savedEvents.firstIndex(where: { $0.id == eventID }) else { return }
@@ -555,11 +565,60 @@ extension DashboardModel {
     func useConfiguredLocation(_ location: ConfiguredLocation) {
         updateConfiguration { configuration in
             configuration.selectLocation(location)
+            if location.role == .importSource,
+               let inferredDeviceID = Self.inferredDeviceID(for: location) {
+                configuration.selectedDeviceID = inferredDeviceID
+            }
         }
         activePlan = CopyPlan()
         organizedArchivePlan = OrganizedArchivePlan()
         queuedFilePaths.removeAll()
         statusMessage = "Using \(location.name) for \(location.role.displayName)."
+    }
+
+    func matchCameraToSelectedImportSource() {
+        guard let selectedID = configuration.selectedImportSourceID,
+              let location = configuration.configuredLocations.first(where: { $0.id == selectedID }),
+              let inferredDeviceID = Self.inferredDeviceID(for: location),
+              inferredDeviceID != configuration.selectedDeviceID else {
+            return
+        }
+
+        updateConfiguration { configuration in
+            configuration.selectedDeviceID = inferredDeviceID
+        }
+        activePlan = CopyPlan()
+        organizedArchivePlan = OrganizedArchivePlan()
+        queuedFilePaths.removeAll()
+        statusMessage = "Matched \(location.name) to \(Self.cameraDisplayName(for: inferredDeviceID))."
+    }
+
+    static func inferredDeviceID(for location: ConfiguredLocation) -> String? {
+        let fingerprint = "\(location.name) \(location.path)"
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            .lowercased()
+
+        if fingerprint.contains("osmo") { return "osmo-360" }
+        if fingerprint.contains("sony") || fingerprint.contains("a7v") { return "sony-a7v" }
+        if fingerprint.contains("mini 2") || fingerprint.contains("mini-2") || fingerprint.contains("mini_2") {
+            return "dji-mini-2"
+        }
+        if fingerprint.contains("action 6") || fingerprint.contains("action-6") || fingerprint.contains("action_6") {
+            return "action-6"
+        }
+        if fingerprint.contains("iphone") { return "iphone" }
+        return nil
+    }
+
+    private static func cameraDisplayName(for deviceID: String) -> String {
+        switch deviceID {
+        case "sony-a7v": "Sony A7V"
+        case "osmo-360": "DJI Osmo 360"
+        case "dji-mini-2": "DJI Mini 2"
+        case "action-6": "DJI Action 6"
+        case "iphone": "iPhone"
+        default: "the selected camera"
+        }
     }
 
     func useFolderAsImportSource(_ url: URL) {

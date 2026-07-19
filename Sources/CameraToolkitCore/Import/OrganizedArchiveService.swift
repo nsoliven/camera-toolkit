@@ -123,7 +123,7 @@ public struct OrganizedArchiveLayout: Sendable {
         let ext = URL(fileURLWithPath: path).pathExtension.lowercased()
         let sonyRAW = Set(["arw", "cr2", "cr3", "nef", "nrw", "orf", "raf", "rw2", "pef", "srw"])
         let photos = Set(["jpg", "jpeg", "heic", "heif", "png", "tif", "tiff", "webp"])
-        let video = Set(["mp4", "mov", "m4v", "mts", "m2ts", "mxf", "avi", "insv", "lrv", "osv"])
+        let video = Set(["mp4", "mov", "m4v", "mts", "m2ts", "mxf", "avi", "insv", "lrf", "lrv", "osv"])
         let audio = Set(["wav", "mp3", "m4a", "aac"])
 
         if ext == "xmp" { return deviceID == "osmo-360" ? .photos : .raw }

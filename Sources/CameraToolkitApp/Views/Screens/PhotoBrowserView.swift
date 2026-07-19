@@ -19,11 +19,17 @@ private struct BrowserFileIdentity: Hashable {
     var modifiedSecond: Int64
 }
 
-private let eventMediaExtensions: Set<String> = [
-    "arw", "dng", "cr2", "cr3", "nef",
-    "jpg", "jpeg", "heic", "heif", "png", "tif", "tiff", "webp",
-    "mp4", "mov", "m4v", "insv", "lrv",
-]
+enum EventMediaSupport {
+    static let extensions: Set<String> = [
+        "arw", "dng", "cr2", "cr3", "nef",
+        "jpg", "jpeg", "heic", "heif", "png", "tif", "tiff", "webp",
+        "mp4", "mov", "m4v", "insv", "lrf", "lrv", "osv",
+    ]
+
+    static func canAssign(_ url: URL) -> Bool {
+        extensions.contains(url.pathExtension.lowercased())
+    }
+}
 
 private enum BrowserLocationKind: Hashable {
     case source(UUID)
@@ -166,6 +172,9 @@ struct PhotoBrowserView: View {
         }
         .navigationSplitViewStyle(.balanced)
         .tint(.accentColor)
+        .onAppear {
+            model.matchCameraToSelectedImportSource()
+        }
         .onChange(of: model.isSidebarCollapsed) { _, isCollapsed in
             let requestedVisibility: NavigationSplitViewVisibility = isCollapsed ? .detailOnly : .all
             if columnVisibility != requestedVisibility {
@@ -358,8 +367,11 @@ struct PhotoBrowserView: View {
                     collectItems(withIDs: selectedItemIDs)
                 }
             } label: {
-                Image(systemName: isCollectingEventFiles ? "checkmark.circle.fill" : "plus.circle")
-                    .foregroundStyle(isCollectingEventFiles ? Color.accentColor : Color.primary)
+                Label(
+                    isCollectingEventFiles ? "Selecting Across Folders" : "Select Across Folders",
+                    systemImage: isCollectingEventFiles ? "checkmark.circle.fill" : "plus.circle"
+                )
+                .foregroundStyle(isCollectingEventFiles ? Color.accentColor : Color.primary)
             }
             .accessibilityLabel(isCollectingEventFiles ? "Stop Collecting Event Photos" : "Select Across Folders")
             .help(isCollectingEventFiles
@@ -691,7 +703,7 @@ struct PhotoBrowserView: View {
             eventControls
             if model.selectedEvent != nil {
                 Divider()
-                eventWorkspaceRow
+                bufferDestinationRow
             }
             Divider()
             importActionRow
@@ -702,7 +714,7 @@ struct PhotoBrowserView: View {
     private var eventControls: some View {
         HStack(spacing: 10) {
             VStack(alignment: .leading, spacing: 2) {
-                Text("Event Selection")
+                Text("1. Assign to Event")
                     .font(.headline)
                 Text(eventSelectionGuidance)
                     .font(.caption)
@@ -731,12 +743,15 @@ struct PhotoBrowserView: View {
                 Label("New Event", systemImage: "plus")
             }
 
-            Button(assignmentButtonTitle) {
+            Button {
                 model.assignFilesToSelectedEvent(filesReadyForAssignment)
                 if !collectedEventFiles.isEmpty {
                     clearCollectedSelections()
                 }
+            } label: {
+                Label(assignmentButtonTitle, systemImage: "calendar.badge.plus")
             }
+            .buttonStyle(.borderedProminent)
             .disabled(model.selectedEvent == nil || filesReadyForAssignment.isEmpty)
 
             if !collectedEventFiles.isEmpty {
@@ -745,11 +760,6 @@ struct PhotoBrowserView: View {
                 }
                 .help("Clear the cross-folder event selection")
             }
-
-            Button("Queue Saved (\(model.selectedEventFiles.count))") {
-                model.queueSelectedEventFiles()
-            }
-            .disabled(model.selectedEventFiles.isEmpty)
 
             Spacer()
 
@@ -764,38 +774,38 @@ struct PhotoBrowserView: View {
                 Text("DJI Action 6").tag("action-6")
                 Text("iPhone").tag("iphone")
             }
-            .labelsHidden()
-            .frame(width: 145)
+            .frame(width: 190)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 9)
     }
 
-    private var eventWorkspaceRow: some View {
+    private var bufferDestinationRow: some View {
         HStack(spacing: 10) {
-            Image(systemName: "folder.badge.gearshape")
+            Image(systemName: "externaldrive.fill")
                 .foregroundStyle(.mint)
                 .font(.title3)
             VStack(alignment: .leading, spacing: 2) {
-                Text("Card Copy · \(model.expandedBufferIngestPath)")
-                Text("Photomator · \(model.expandedBufferEditsPath)")
-                Text("Exports · \(model.expandedBufferExportsPath)/{Masters, Web, Social}")
+                Text("Buffer Destination")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.primary)
+                Text(model.expandedBufferIngestPath)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
             }
-            .font(.caption.monospaced())
-            .foregroundStyle(.secondary)
-            .lineLimit(1)
-            .truncationMode(.middle)
 
             Spacer()
 
-            Button("Create Folders") {
-                model.createSelectedEventFolders()
+            if model.isBufferVerifiedForArchive {
+                Label("Verified", systemImage: "checkmark.seal.fill")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.green)
             }
-            Button("Open Photomator Folder") {
-                model.openEventFolder(model.expandedBufferEditsPath)
-            }
-            Button("Open Exports") {
-                model.openEventFolder(model.expandedBufferExportsPath)
+
+            Button("Open Buffer") {
+                model.openEventFolder(model.expandedBufferIngestPath)
             }
         }
         .padding(.horizontal, 12)
@@ -805,47 +815,67 @@ struct PhotoBrowserView: View {
     private var importActionRow: some View {
         HStack(spacing: 12) {
             VStack(alignment: .leading, spacing: 3) {
-                Text("Safe Event Import")
+                Text("2. Copy to Buffer")
                     .font(.headline)
-                Text("Camera stays untouched · only assigned files copy · the buffer is temporary · library originals are permanent")
+                Text(bufferCopyGuidance)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
 
             Spacer()
 
-            Button(hasRequestedImportPreview ? "Refresh Event Preview" : "Preview Event") {
+            Button(hasRequestedImportPreview ? "Refresh Copy Preview" : "Preview Copy") {
                 hasRequestedImportPreview = true
                 model.previewSelectedEventImport()
             }
             .disabled(model.isBusy || model.selectedEventFiles.isEmpty)
             .help("Quickly compare assigned file paths and sizes; checksums run during Copy + Verify")
 
-            Button("Copy Event (\(model.queuedFiles.count)) + Verify") {
-                model.copyQueuedFilesToBuffer()
-            }
-            .disabled(model.isBusy || model.queuedFiles.isEmpty)
-            .help("Copy only queued event files to the buffer, then verify those files")
-
-            Button("Archive + Verify") {
-                model.archiveBufferToLibrary()
+            Button("Copy \(model.selectedEventFiles.count) to Buffer + Verify") {
+                model.copySelectedEventFilesToBuffer()
             }
             .buttonStyle(.borderedProminent)
-            .disabled(model.isBusy || !model.isBufferVerifiedForArchive || !folderExists(model.configuration.cameraLibraryRootPath))
-            .help("Organize the verified event copy into permanent library folders and write a checksum manifest")
+            .disabled(model.isBusy || model.selectedEventFiles.isEmpty)
+            .help("Copy only the files assigned to this event into the Buffer, then checksum-verify them")
+
+            if model.isBufferVerifiedForArchive {
+                Button("Archive to Library + Verify") {
+                    model.archiveBufferToLibrary()
+                }
+                .disabled(model.isBusy || !folderExists(model.configuration.cameraLibraryRootPath))
+                .help("Optional: move the verified event copy from the Buffer into the permanent library")
+            }
 
             Menu {
-                Button("Preview Full Card") {
-                    hasRequestedImportPreview = true
-                    model.previewSafeImport()
+                if model.selectedEvent != nil {
+                    Section("Optional Editing Folders") {
+                        Button("Prepare Photomator and Export Folders") {
+                            model.createSelectedEventFolders()
+                        }
+                        Button("Open Photomator Folder") {
+                            model.openEventFolder(model.expandedBufferEditsPath)
+                        }
+                        Button("Open Exports") {
+                            model.openEventFolder(model.expandedBufferExportsPath)
+                        }
+                    }
+
+                    Divider()
                 }
-                Button("Copy Full Card + Verify") {
-                    model.copySourceToBuffer()
+
+                Section("Full Card") {
+                    Button("Preview Full Card") {
+                        hasRequestedImportPreview = true
+                        model.previewSafeImport()
+                    }
+                    Button("Copy Full Card + Verify") {
+                        model.copySourceToBuffer()
+                    }
                 }
             } label: {
                 Image(systemName: "ellipsis.circle")
             }
-            .help("Full-card tools")
+            .help("Optional editing-folder and full-card tools")
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 9)
@@ -1142,9 +1172,9 @@ struct PhotoBrowserView: View {
 
     private var assignmentButtonTitle: String {
         if collectedEventFiles.isEmpty {
-            return "Assign Selected (\(selectedEventFileSelections.count))"
+            return "Assign \(selectedEventFileSelections.count) to Event"
         }
-        return "Assign Collected (\(collectedEventFiles.count))"
+        return "Assign \(collectedEventFiles.count) Collected to Event"
     }
 
     private var eventSelectionGuidance: String {
@@ -1155,9 +1185,34 @@ struct PhotoBrowserView: View {
             let folderCount = Set(collectedSelections.map { selection in
                 selection.sourceRootPath + "\u{0}" + URL(fileURLWithPath: selection.file.path).deletingLastPathComponent().path
             }).count
-            return "\(collectedEventFiles.count) photo(s) collected across \(folderCount) folder(s)"
+            return "\(collectedEventFiles.count) file(s) collected across \(folderCount) folder(s)"
         }
-        return "Choose an event, select photos above, then assign the selection"
+        if model.selectedEvent == nil {
+            return "Choose an existing event or create a new one"
+        }
+        if !filesReadyForAssignment.isEmpty {
+            return "\(filesReadyForAssignment.count) selected · ready to assign"
+        }
+        if !selectedItemIDs.isEmpty {
+            return "The selected rows are folders or unsupported file types"
+        }
+        if !model.selectedEventFiles.isEmpty {
+            return "\(model.selectedEventFiles.count) assigned · ready to copy to Buffer"
+        }
+        return "Select files in the list above, then assign them"
+    }
+
+    private var bufferCopyGuidance: String {
+        if model.selectedEvent == nil {
+            return "Choose an event and assign files first"
+        }
+        if model.selectedEventFiles.isEmpty {
+            return "Nothing will move until files are assigned above"
+        }
+        if model.isBufferVerifiedForArchive {
+            return "Verified in Buffer · the camera files remain untouched"
+        }
+        return "\(model.selectedEventFiles.count) assigned file(s) · camera stays untouched"
     }
 
     private var previewableURLs: [URL] {
@@ -1210,7 +1265,7 @@ struct PhotoBrowserView: View {
     }
 
     private func eventSelection(for item: BrowserItem) -> EventFileSelection? {
-        guard eventMediaExtensions.contains(item.url.pathExtension.lowercased()) else { return nil }
+        guard EventMediaSupport.canAssign(item.url) else { return nil }
         guard let file = fileRecord(for: item) else { return nil }
         return EventFileSelection(
             sourceRootPath: URL(
@@ -1489,7 +1544,7 @@ struct PhotoBrowserView: View {
         if ["jpg", "jpeg", "heic", "png", "tif", "tiff", "arw", "dng", "cr2", "cr3", "nef"].contains(ext) {
             return "photo"
         }
-        if ["mp4", "mov", "m4v", "insv", "lrv"].contains(ext) {
+        if ["mp4", "mov", "m4v", "insv", "lrf", "lrv", "osv"].contains(ext) {
             return "film"
         }
         return "doc"

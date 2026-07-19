@@ -5,6 +5,56 @@ import XCTest
 
 @MainActor
 final class DashboardModelTests: XCTestCase {
+    func testConfiguredCameraSourceInfersItsDevice() {
+        XCTAssertEqual(
+            DashboardModel.inferredDeviceID(for: ConfiguredLocation(
+                role: .importSource,
+                name: "Osmo360 · DJI Osmo 360",
+                path: "/Volumes/Osmo360"
+            )),
+            "osmo-360"
+        )
+        XCTAssertEqual(
+            DashboardModel.inferredDeviceID(for: ConfiguredLocation(
+                role: .importSource,
+                name: "LEXAR · Sony A7V",
+                path: "/Volumes/LEXAR"
+            )),
+            "sony-a7v"
+        )
+    }
+
+    func testStartupMatchesCameraToAlreadySelectedSource() throws {
+        try withTemporaryDirectory { root in
+            let source = ConfiguredLocation(
+                role: .importSource,
+                name: "Osmo360 · DJI Osmo 360",
+                path: root.appendingPathComponent("Osmo360").path
+            )
+            let configuration = AppConfiguration(
+                demoRootPath: root.appendingPathComponent("Safety Test").path,
+                importSourcePath: source.path,
+                archivePath: root.appendingPathComponent("Library/Originals").path,
+                bufferPath: root.appendingPathComponent("Buffer").path,
+                configuredLocations: [source],
+                selectedImportSourceID: source.id,
+                activityLogPath: root.appendingPathComponent("activity.jsonl").path,
+                selectedDeviceID: "sony-a7v"
+            )
+            let model = DashboardModel(
+                activePlan: CopyPlan(),
+                jobs: [],
+                configuration: configuration,
+                configurationStore: ConfigurationStore(url: root.appendingPathComponent("config.json"))
+            )
+
+            model.matchCameraToSelectedImportSource()
+
+            XCTAssertEqual(model.configuration.selectedDeviceID, "osmo-360")
+            XCTAssertTrue(model.statusMessage.contains("DJI Osmo 360"))
+        }
+    }
+
     func testPreviewImportUsesBufferBatchInsteadOfArchiveOrTestData() async throws {
         try await withTemporaryDirectoryAsync { root in
             let source = root.appendingPathComponent("Configured Source", isDirectory: true)

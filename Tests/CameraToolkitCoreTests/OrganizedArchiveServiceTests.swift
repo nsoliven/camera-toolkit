@@ -28,6 +28,8 @@ final class OrganizedArchiveServiceTests: XCTestCase {
         XCTAssertEqual(layout.mediaFolder(for: "DCIM/IMG_001.DNG"), .photos)
         XCTAssertEqual(layout.mediaFolder(for: "DCIM/IMG_001.JPG"), .photos)
         XCTAssertEqual(layout.mediaFolder(for: "DCIM/VID_001.INSV"), .video)
+        XCTAssertEqual(layout.mediaFolder(for: "DCIM/CAM_0001.OSV"), .video)
+        XCTAssertEqual(layout.mediaFolder(for: "DCIM/CAM_0001.LRF"), .video)
     }
 
     func testArchiveCopiesVerifiesWritesManifestAndNeverOverwritesConflict() throws {
