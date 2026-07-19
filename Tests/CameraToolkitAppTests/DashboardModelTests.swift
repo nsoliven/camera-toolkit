@@ -276,7 +276,9 @@ private func withTemporaryDirectory<T>(_ body: (URL) throws -> T) throws -> T {
 }
 
 @MainActor
-private func withTemporaryDirectoryAsync<T>(_ body: (URL) async throws -> T) async throws -> T {
+private func withTemporaryDirectoryAsync<T: Sendable>(
+    _ body: @MainActor (URL) async throws -> T
+) async throws -> T {
     let root = FileManager.default.temporaryDirectory
         .appendingPathComponent("CameraToolkitAppTests-\(UUID().uuidString)", isDirectory: true)
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
