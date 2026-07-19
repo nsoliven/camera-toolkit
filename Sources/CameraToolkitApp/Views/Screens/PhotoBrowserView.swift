@@ -122,6 +122,8 @@ struct PhotoBrowserView: View {
     @State private var backHistory: [URL] = []
     @State private var forwardHistory: [URL] = []
     @State private var isLoading = false
+    @State private var loadingDirectoryURL: URL?
+    @State private var loadedDirectoryURL: URL?
     @State private var browserError: String?
     @State private var hasRequestedImportPreview = false
     @State private var isCreatingEvent = false
@@ -129,6 +131,7 @@ struct PhotoBrowserView: View {
     @State private var collectedEventFiles: [String: EventFileSelection] = [:]
     @State private var isShowingCollectedFiles = false
     @State private var previewPaneWidth: CGFloat = 390
+    @State private var browserOperationLabel: String?
     @AppStorage("CameraToolkit.browserThumbnailHeight") private var thumbnailHeight = BrowserThumbnailSizing.defaultHeight
     @FocusState private var isFileTableFocused: Bool
 
@@ -518,18 +521,21 @@ struct PhotoBrowserView: View {
             if isLoading && items.isEmpty {
                 ProgressView("Loading \(currentURL.lastPathComponent)…")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .contextMenu { browserBackgroundContextMenu }
             } else if let browserError {
                 ContentUnavailableView(
                     "Folder Unavailable",
                     systemImage: "externaldrive.badge.exclamationmark",
                     description: Text(browserError)
                 )
+                .contextMenu { browserBackgroundContextMenu }
             } else if items.isEmpty {
                 ContentUnavailableView(
                     "Empty Folder",
                     systemImage: "folder",
                     description: Text(currentURL.path)
                 )
+                .contextMenu { browserBackgroundContextMenu }
             } else {
                 Table(items, selection: $selectedItemIDs) {
                     TableColumn("Name") { item in
@@ -565,14 +571,6 @@ struct PhotoBrowserView: View {
                             Spacer(minLength: 0)
                         }
                         .contentShape(Rectangle())
-                        .onTapGesture(count: 2) {
-                            open(item)
-                        }
-                        .contextMenu {
-                            Button(item.isDirectory ? "Open" : "Open File") { open(item) }
-                            Button("Preview") { CameraPreviewController.shared.preview([item.url]) }
-                            Button("Reveal in Finder") { NSWorkspace.shared.activateFileViewerSelecting([item.url]) }
-                        }
                     }
                     .width(min: 180, ideal: 250, max: 300)
 
@@ -634,6 +632,16 @@ struct PhotoBrowserView: View {
                     .width(min: 330, ideal: 430)
                 }
                 .alternatingRowBackgrounds(.enabled)
+                .contextMenu(forSelectionType: String.self) { selection in
+                    browserContextMenu(for: selection)
+                } primaryAction: { selection in
+                    guard selection.count == 1,
+                          let id = selection.first,
+                          let item = items.first(where: { $0.id == id }) else {
+                        return
+                    }
+                    open(item)
+                }
                 .focused($isFileTableFocused)
                 .onAppear {
                     Task { @MainActor in
@@ -662,11 +670,11 @@ struct PhotoBrowserView: View {
                     return .handled
                 }
                 .overlay(alignment: .topTrailing) {
-                    if isLoading {
+                    if isLoading || browserOperationLabel != nil {
                         HStack(spacing: 6) {
                             ProgressView()
                                 .controlSize(.small)
-                            Text("Loading folder…")
+                            Text(browserOperationLabel ?? "Loading folder…")
                                 .font(.caption)
                         }
                         .padding(.horizontal, 9)
@@ -678,6 +686,110 @@ struct PhotoBrowserView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    @ViewBuilder
+    private var browserBackgroundContextMenu: some View {
+        Button {
+            createFolder()
+        } label: {
+            Label("New Folder…", systemImage: "folder.badge.plus")
+        }
+        .disabled(browserOperationLabel != nil)
+
+        Divider()
+
+        Button {
+            selectedItemIDs = Set(items.map(\.id))
+        } label: {
+            Label("Select All", systemImage: "checkmark.circle")
+        }
+        .disabled(items.isEmpty)
+
+        Button {
+            NSWorkspace.shared.open(currentURL)
+        } label: {
+            Label("Open Current Folder in Finder", systemImage: "finder")
+        }
+
+        Divider()
+
+        Button {
+            Task { await loadCurrentDirectory() }
+        } label: {
+            Label("Reload", systemImage: "arrow.clockwise")
+        }
+        .disabled(isLoading)
+    }
+
+    @ViewBuilder
+    private func browserContextMenu(for selection: Set<String>) -> some View {
+        let selectedItems = items.filter { selection.contains($0.id) }
+
+        if selectedItems.isEmpty {
+            browserBackgroundContextMenu
+        } else {
+            if selectedItems.count == 1, let item = selectedItems.first {
+                Button {
+                    open(item)
+                } label: {
+                    Label(item.isDirectory ? "Open" : "Open File", systemImage: item.isDirectory ? "folder" : "arrow.up.forward.app")
+                }
+
+                if !item.isDirectory, CameraPreviewSupport.canDecode(item.url) {
+                    Button {
+                        CameraPreviewController.shared.preview(previewableURLs, startingAt: item.url)
+                    } label: {
+                        Label("Preview in Camera Toolkit", systemImage: "eye")
+                    }
+
+                    Button {
+                        PhotomatorLauncher.open(item.url)
+                    } label: {
+                        Label("Open in Photomator", systemImage: "arrow.up.left.and.arrow.down.right")
+                    }
+                }
+
+                Divider()
+
+                Button {
+                    rename(item)
+                } label: {
+                    Label("Rename…", systemImage: "pencil")
+                }
+                .disabled(browserOperationLabel != nil)
+            }
+
+            Button {
+                FileClipboardWriter.copy(selectedItems.map(\.url))
+            } label: {
+                Label(copyMenuTitle(for: selectedItems.count), systemImage: "doc.on.doc")
+            }
+
+            let assignableSelections = selectedItems.compactMap(eventSelection(for:))
+            if let event = model.selectedEvent, !assignableSelections.isEmpty {
+                Button {
+                    model.assignFilesToSelectedEvent(assignableSelections)
+                } label: {
+                    Label(
+                        "Assign \(assignableSelections.count) to \(event.name)",
+                        systemImage: "calendar.badge.plus"
+                    )
+                }
+            }
+
+            Divider()
+
+            Button {
+                NSWorkspace.shared.activateFileViewerSelecting(selectedItems.map(\.url))
+            } label: {
+                Label("Reveal in Finder", systemImage: "finder")
+            }
+        }
+    }
+
+    private func copyMenuTitle(for count: Int) -> String {
+        count == 1 ? "Copy" : "Copy \(count) Items"
     }
 
     private var safeImportArea: some View {
@@ -1315,10 +1427,18 @@ struct PhotoBrowserView: View {
 
     @MainActor
     private func loadCurrentDirectory() async {
+        let url = currentURL.standardizedFileURL
+        guard loadingDirectoryURL?.standardizedFileURL != url else { return }
+
+        let isRefreshingCurrentDirectory = loadedDirectoryURL?.standardizedFileURL == url
+        loadingDirectoryURL = url
         isLoading = true
         browserError = nil
-        selectedItemIDs.removeAll()
-        let url = currentURL
+        if !isRefreshingCurrentDirectory {
+            items = []
+            selectedItemIDs.removeAll()
+        }
+
         do {
             let loaded = try await Task.detached(priority: .userInitiated) {
                 let keys: Set<URLResourceKey> = [.isDirectoryKey, .isRegularFileKey, .fileSizeKey, .contentModificationDateKey, .localizedTypeDescriptionKey, .isHiddenKey]
@@ -1344,14 +1464,22 @@ struct PhotoBrowserView: View {
                     return $0.name.localizedStandardCompare($1.name) == .orderedAscending
                 }
             }.value
-            guard currentURL == url else { return }
+            guard currentURL.standardizedFileURL == url else { return }
             items = loaded
+            loadedDirectoryURL = url
+            if isRefreshingCurrentDirectory {
+                let availableIDs = Set(loaded.map(\.id))
+                selectedItemIDs.formIntersection(availableIDs)
+            }
         } catch {
-            guard currentURL == url else { return }
+            guard currentURL.standardizedFileURL == url else { return }
             items = []
             browserError = error.localizedDescription
         }
-        isLoading = false
+        if loadingDirectoryURL?.standardizedFileURL == url {
+            loadingDirectoryURL = nil
+            isLoading = false
+        }
     }
 
     private func navigate(to url: URL, recordingHistory: Bool = true) {
@@ -1497,14 +1625,88 @@ struct PhotoBrowserView: View {
         field.frame = NSRect(x: 0, y: 0, width: 320, height: 24)
         alert.accessoryView = field
         guard alert.runModal() == .alertFirstButtonReturn else { return }
-        let name = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !name.isEmpty, !name.contains("/"), name != ".", name != ".." else { return }
-        do {
-            try FileManager.default.createDirectory(at: currentURL.appendingPathComponent(name, isDirectory: true), withIntermediateDirectories: false)
-            Task { await loadCurrentDirectory() }
-        } catch {
-            browserError = error.localizedDescription
+        guard let name = BrowserItemNamePolicy.normalizedName(field.stringValue) else {
+            showBrowserOperationError(
+                title: "That Folder Name Can’t Be Used",
+                message: "Use a name without / or : and do not use only dots."
+            )
+            return
         }
+        let destination = currentURL.appendingPathComponent(name, isDirectory: true)
+        runBrowserMutation(label: "Creating folder…", selecting: destination) {
+            try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: false)
+        }
+    }
+
+    private func rename(_ item: BrowserItem) {
+        let alert = NSAlert()
+        alert.messageText = "Rename \(item.name)"
+        alert.informativeText = "Renaming changes only the item’s name. Camera Toolkit will not read or rewrite its contents."
+        alert.addButton(withTitle: "Rename")
+        alert.addButton(withTitle: "Cancel")
+        let field = NSTextField(string: item.name)
+        field.frame = NSRect(x: 0, y: 0, width: 360, height: 24)
+        alert.accessoryView = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        guard let name = BrowserItemNamePolicy.normalizedName(field.stringValue) else {
+            showBrowserOperationError(
+                title: "That Name Can’t Be Used",
+                message: "Use a name without / or : and do not use only dots."
+            )
+            return
+        }
+        guard name != item.name else { return }
+
+        let destination = item.url.deletingLastPathComponent().appendingPathComponent(
+            name,
+            isDirectory: item.isDirectory
+        )
+        runBrowserMutation(label: "Renaming…", selecting: destination) {
+            if FileManager.default.fileExists(atPath: destination.path) {
+                throw CocoaError(.fileWriteFileExists)
+            }
+            try FileManager.default.moveItem(at: item.url, to: destination)
+        }
+    }
+
+    private func runBrowserMutation(
+        label: String,
+        selecting destination: URL?,
+        operation: @escaping @Sendable () throws -> Void
+    ) {
+        guard browserOperationLabel == nil else { return }
+        browserOperationLabel = label
+
+        Task { @MainActor in
+            let errorMessage = await Task.detached(priority: .userInitiated) {
+                do {
+                    try operation()
+                    return String?.none
+                } catch {
+                    return error.localizedDescription
+                }
+            }.value
+
+            browserOperationLabel = nil
+            if let errorMessage {
+                showBrowserOperationError(title: "The File Operation Failed", message: errorMessage)
+                return
+            }
+
+            await loadCurrentDirectory()
+            if let destination {
+                selectedItemIDs = [destination.path]
+            }
+        }
+    }
+
+    private func showBrowserOperationError(title: String, message: String) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = title
+        alert.informativeText = message
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
     }
 
     private func folderExists(_ path: String) -> Bool {

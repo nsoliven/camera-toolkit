@@ -64,6 +64,21 @@ enum BrowserThumbnailShortcut {
     }
 }
 
+enum BrowserItemNamePolicy {
+    static func normalizedName(_ rawValue: String) -> String? {
+        let name = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty,
+              name != ".",
+              name != "..",
+              !name.contains("/"),
+              !name.contains(":"),
+              !name.contains("\0") else {
+            return nil
+        }
+        return name
+    }
+}
+
 struct KeyboardShortcutReference: Identifiable, Equatable, Sendable {
     var id: String { action }
     var action: String
@@ -88,6 +103,7 @@ enum CameraToolkitShortcutCatalog {
                 .init(action: "Open selected item", keys: "Return  /  ⌘O  /  ⌘↓", detail: "Opens a folder or the selected file in its default app."),
                 .init(action: "Preview selected photos", keys: "Space  /  ⌘Y", detail: "Opens Camera Toolkit's large preview without decoding the full RAW."),
                 .init(action: "Copy selected files", keys: "⌘C", detail: "Copies Finder-compatible file references to the clipboard."),
+                .init(action: "Rename selected item", keys: "Right-click", detail: "Renames one item without reading or rewriting its file contents."),
                 .init(action: "Select all", keys: "⌘A", detail: "Selects every item in the current folder."),
                 .init(action: "Larger or smaller thumbnails", keys: "⌘+  ⌘−", detail: "Resizes browser thumbnails and remembers the chosen size."),
                 .init(action: "Select across folders", keys: "+ button", detail: "Starts an event-selection basket that stays with you while browsing folders or camera sources."),

@@ -611,7 +611,7 @@ private struct EmbeddedPreviewView: View {
     }
 }
 
-private enum PhotomatorLauncher {
+enum PhotomatorLauncher {
     static func open(_ url: URL) {
         guard let app = NSWorkspace.shared.urlForApplication(
             withBundleIdentifier: "com.pixelmatorteam.pixelmator.touch.x.photo"
