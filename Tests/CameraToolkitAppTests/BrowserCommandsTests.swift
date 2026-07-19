@@ -10,6 +10,7 @@ final class BrowserCommandsTests: XCTestCase {
 
         XCTAssertTrue(actions.contains("Previous or next item"))
         XCTAssertTrue(actions.contains("Copy selected files"))
+        XCTAssertTrue(actions.contains("Rename selected item"))
         XCTAssertTrue(actions.contains("Select across folders"))
         XCTAssertTrue(actions.contains("Larger or smaller thumbnails"))
         XCTAssertTrue(actions.contains("Previous or next camera"))
@@ -70,5 +71,19 @@ final class BrowserCommandsTests: XCTestCase {
         XCTAssertTrue(EventMediaSupport.canAssign(URL(fileURLWithPath: "/camera/CAM_0001.OSV")))
         XCTAssertTrue(EventMediaSupport.canAssign(URL(fileURLWithPath: "/camera/CAM_0001.LRF")))
         XCTAssertFalse(EventMediaSupport.canAssign(URL(fileURLWithPath: "/camera/README.TXT")))
+    }
+
+    func testDJIVideoFilesNeverEnterAutomaticImagePreviewPipeline() {
+        XCTAssertFalse(CameraPreviewSupport.canDecode(URL(fileURLWithPath: "/camera/17-gigabyte.OSV")))
+        XCTAssertFalse(CameraPreviewSupport.canDecode(URL(fileURLWithPath: "/camera/proxy.LRF")))
+    }
+
+    func testBrowserItemNamesAcceptFinderStyleNamesAndRejectUnsafeComponents() {
+        XCTAssertEqual(BrowserItemNamePolicy.normalizedName("  Event Photos  "), "Event Photos")
+        XCTAssertEqual(BrowserItemNamePolicy.normalizedName("UCSC Library w Eileen"), "UCSC Library w Eileen")
+        XCTAssertNil(BrowserItemNamePolicy.normalizedName(""))
+        XCTAssertNil(BrowserItemNamePolicy.normalizedName(".."))
+        XCTAssertNil(BrowserItemNamePolicy.normalizedName("folder/name"))
+        XCTAssertNil(BrowserItemNamePolicy.normalizedName("folder:name"))
     }
 }
