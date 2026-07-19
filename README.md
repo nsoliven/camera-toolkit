@@ -1,10 +1,21 @@
 # Camera Toolkit
 
-Camera Toolkit is a native macOS app for reviewing camera cards, grouping photos into reusable events, and copying verified originals through a temporary buffer into a long-term photo library.
+Camera Toolkit is the native macOS app I use to move photos and video off my cameras, split a card into the events I actually shot, and get each event into a predictable editing and archive layout.
 
-The app is designed around one rule: the camera source is read-only. Previewing never copies bytes, copy operations never overwrite conflicts, and archive operations verify checksums before reporting success.
+I built it because a camera card is not always one event. A single card can cover several shoots, and one event can span multiple cards or folders. I wanted to select those files quickly, save the event once, preview Sony RAW files without depending on Finder, and hand the resulting folders to Photomator or another editor without reorganizing everything by hand.
 
-## What it does
+The safety rule is simple: the camera source stays read-only. Previewing never copies bytes, copy operations never overwrite conflicts, and archive operations verify checksums before reporting success.
+
+## What I use it for
+
+1. Plug in a camera card and browse it immediately.
+2. Create or reopen an event, then select its photos across as many folders or cards as needed.
+3. Preview the camera's embedded JPEGs, including supported Sony lossless-compressed `.ARW` files.
+4. Copy only that event into a temporary workspace and verify every copied file.
+5. Open the RAW files in Photomator and keep exports beside the event in a consistent layout.
+6. Archive the verified originals into my long-term photo library without overwriting conflicts.
+
+## What the app does
 
 - Browses camera sources, buffer drives, photo-library folders, and ordinary local folders in one Finder-style window.
 - Builds thumbnails and large previews from the JPEG embedded in supported Sony `.ARW` files, including lossless-compressed RAW variants that Finder may not preview.
