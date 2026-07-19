@@ -7,6 +7,7 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate {
     private static var retainedDelegate: CameraToolkitApplication?
 
     private let model = CameraToolkitRuntime.model
+    private var thumbnailShortcutMonitor: Any?
 
     static func main() {
         UserDefaults.standard.set(false, forKey: "NSQuitAlwaysKeepsWindows")
@@ -20,7 +21,14 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        installThumbnailShortcutMonitor()
         CameraToolkitMainWindow.shared.show(model: model)
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        if let thumbnailShortcutMonitor {
+            NSEvent.removeMonitor(thumbnailShortcutMonitor)
+        }
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -38,6 +46,21 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate {
 
     func applicationShouldRestoreApplicationState(_ app: NSApplication) -> Bool {
         false
+    }
+
+    private func installThumbnailShortcutMonitor() {
+        guard thumbnailShortcutMonitor == nil else { return }
+        thumbnailShortcutMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            guard let command = BrowserThumbnailShortcut.command(
+                for: event.charactersIgnoringModifiers,
+                modifierFlags: event.modifierFlags
+            ) else {
+                return event
+            }
+
+            BrowserCommand.post(command)
+            return nil
+        }
     }
 
     private func installMenu() {
@@ -76,6 +99,99 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate {
         quitItem.target = NSApp
         appMenu.addItem(quitItem)
 
+        let fileMenuItem = NSMenuItem()
+        mainMenu.addItem(fileMenuItem)
+        let fileMenu = NSMenu(title: "File")
+        fileMenuItem.submenu = fileMenu
+        addBrowserCommand(
+            to: fileMenu,
+            title: "Open Selected Item",
+            command: .openSelection,
+            keyEquivalent: "o"
+        )
+        addBrowserCommand(
+            to: fileMenu,
+            title: "Preview Selected Photos",
+            command: .previewSelection,
+            keyEquivalent: "y"
+        )
+        fileMenu.addItem(.separator())
+        addBrowserCommand(
+            to: fileMenu,
+            title: "New Folder…",
+            command: .createFolder,
+            keyEquivalent: "n",
+            modifiers: [.command, .shift]
+        )
+        addBrowserCommand(
+            to: fileMenu,
+            title: "Reveal in Finder",
+            command: .revealSelection,
+            keyEquivalent: "r",
+            modifiers: [.command, .shift]
+        )
+
+        let editMenuItem = NSMenuItem()
+        mainMenu.addItem(editMenuItem)
+        let editMenu = NSMenu(title: "Edit")
+        editMenuItem.submenu = editMenu
+        addBrowserCommand(
+            to: editMenu,
+            title: "Copy",
+            command: .copySelection,
+            keyEquivalent: "c"
+        )
+        addBrowserCommand(
+            to: editMenu,
+            title: "Select All",
+            command: .selectAll,
+            keyEquivalent: "a"
+        )
+
+        let goMenuItem = NSMenuItem()
+        mainMenu.addItem(goMenuItem)
+        let goMenu = NSMenu(title: "Go")
+        goMenuItem.submenu = goMenu
+        addBrowserCommand(
+            to: goMenu,
+            title: "Back",
+            command: .goBack,
+            keyEquivalent: "["
+        )
+        addBrowserCommand(
+            to: goMenu,
+            title: "Forward",
+            command: .goForward,
+            keyEquivalent: "]"
+        )
+        addBrowserCommand(
+            to: goMenu,
+            title: "Enclosing Folder",
+            command: .goUp,
+            keyEquivalent: "\u{F700}"
+        )
+        addBrowserCommand(
+            to: goMenu,
+            title: "Open Selected Item",
+            command: .openSelection,
+            keyEquivalent: "\u{F701}"
+        )
+        goMenu.addItem(.separator())
+        addBrowserCommand(
+            to: goMenu,
+            title: "Previous Camera Source",
+            command: .previousSource,
+            keyEquivalent: "\t",
+            modifiers: [.control, .shift]
+        )
+        addBrowserCommand(
+            to: goMenu,
+            title: "Next Camera Source",
+            command: .nextSource,
+            keyEquivalent: "\t",
+            modifiers: [.control]
+        )
+
         let viewMenuItem = NSMenuItem()
         mainMenu.addItem(viewMenuItem)
         let viewMenu = NSMenu(title: "View")
@@ -90,6 +206,42 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate {
         sidebarItem.target = self
         viewMenu.addItem(sidebarItem)
 
+        viewMenu.addItem(.separator())
+        addBrowserCommand(
+            to: viewMenu,
+            title: "Larger Thumbnails",
+            command: .increaseThumbnailSize,
+            keyEquivalent: "+"
+        )
+        addBrowserCommand(
+            to: viewMenu,
+            title: "Smaller Thumbnails",
+            command: .decreaseThumbnailSize,
+            keyEquivalent: "-"
+        )
+
+        viewMenu.addItem(.separator())
+
+        let eventLibraryItem = NSMenuItem(
+            title: "Event Library…",
+            action: #selector(openEventLibrary),
+            keyEquivalent: "e"
+        )
+        eventLibraryItem.keyEquivalentModifierMask = [.command, .option]
+        eventLibraryItem.target = self
+        viewMenu.addItem(eventLibraryItem)
+
+        let catalogInspectorItem = NSMenuItem(
+            title: "Photo List SQL Inspector…",
+            action: #selector(openCatalogInspector),
+            keyEquivalent: "i"
+        )
+        catalogInspectorItem.keyEquivalentModifierMask = [.command, .shift]
+        catalogInspectorItem.target = self
+        viewMenu.addItem(catalogInspectorItem)
+
+        viewMenu.addItem(.separator())
+
         let refreshItem = NSMenuItem(
             title: "Refresh All",
             action: #selector(refreshAll),
@@ -99,7 +251,40 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate {
         refreshItem.target = self
         viewMenu.addItem(refreshItem)
 
+        let helpMenuItem = NSMenuItem()
+        mainMenu.addItem(helpMenuItem)
+        let helpMenu = NSMenu(title: "Help")
+        helpMenuItem.submenu = helpMenu
+
+        let shortcutsItem = NSMenuItem(
+            title: "Keyboard Shortcuts…",
+            action: #selector(openKeyboardShortcuts),
+            keyEquivalent: "k"
+        )
+        shortcutsItem.keyEquivalentModifierMask = [.command, .shift]
+        shortcutsItem.target = self
+        helpMenu.addItem(shortcutsItem)
+        NSApp.helpMenu = helpMenu
+
         NSApp.mainMenu = mainMenu
+    }
+
+    private func addBrowserCommand(
+        to menu: NSMenu,
+        title: String,
+        command: BrowserCommand,
+        keyEquivalent: String,
+        modifiers: NSEvent.ModifierFlags = [.command]
+    ) {
+        let item = NSMenuItem(
+            title: title,
+            action: #selector(performBrowserCommand(_:)),
+            keyEquivalent: keyEquivalent
+        )
+        item.keyEquivalentModifierMask = modifiers
+        item.representedObject = command.rawValue
+        item.target = self
+        menu.addItem(item)
     }
 
     @objc private func openSettings() {
@@ -108,6 +293,26 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate {
 
     @objc private func toggleSidebar() {
         model.toggleSidebar()
+    }
+
+    @objc private func performBrowserCommand(_ sender: NSMenuItem) {
+        guard let rawValue = sender.representedObject as? String,
+              let command = BrowserCommand(rawValue: rawValue) else {
+            return
+        }
+        BrowserCommand.post(command)
+    }
+
+    @objc private func openKeyboardShortcuts() {
+        KeyboardShortcutsWindowController.shared.show()
+    }
+
+    @objc private func openEventLibrary() {
+        EventLibraryWindowController.shared.show(model: model)
+    }
+
+    @objc private func openCatalogInspector() {
+        CatalogInspectorWindowController.shared.show(model: model)
     }
 
     @objc private func refreshAll() {

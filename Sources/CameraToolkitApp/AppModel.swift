@@ -111,6 +111,8 @@ final class DashboardModel {
     @ObservationIgnored private let secretStore = KeychainSecretStore(service: "org.cameratoolkit.CameraToolkit")
     @ObservationIgnored private let editorLauncher = ExternalEditorLauncher()
     @ObservationIgnored private var immichHasUsableAPIKey: Bool = false
+    @ObservationIgnored private var catalogSyncTask: Task<Void, Never>?
+    @ObservationIgnored private var locationRefreshTask: Task<Void, Never>?
 
     init(
         locations: [LocationCard],
@@ -156,6 +158,7 @@ final class DashboardModel {
             loadActivityLog: true
         )
         model.refreshLocationCards()
+        model.scheduleCatalogSync(configuration: configuration)
         return model
     }
 
@@ -269,7 +272,11 @@ extension DashboardModel {
     }
 
     var queuedFiles: [FileRecord] {
-        activePlan.new.filter { queuedFilePaths.contains($0.path) }
+        var candidates: [String: FileRecord] = [:]
+        for file in activePlan.new + selectedEventFiles {
+            candidates[file.path] = file
+        }
+        return queuedFilePaths.compactMap { candidates[$0] }.sorted { $0.path < $1.path }
     }
 
     var queuedBytes: Int64 {
@@ -281,6 +288,43 @@ extension DashboardModel {
             return "No files queued."
         }
         return "\(queuedFiles.count) file(s), \(queuedBytes.formattedBytes)"
+    }
+
+    var savedEvents: [SavedCameraEvent] {
+        configuration.savedEvents.sorted {
+            if $0.eventDate == $1.eventDate { return $0.name < $1.name }
+            return $0.eventDate > $1.eventDate
+        }
+    }
+
+    var selectedEvent: SavedCameraEvent? {
+        guard let id = configuration.selectedEventID else { return nil }
+        return configuration.savedEvents.first { $0.id == id }
+    }
+
+    var selectedEventFiles: [FileRecord] {
+        guard let eventID = configuration.selectedEventID else { return [] }
+        let root = URL(fileURLWithPath: expandedImportSourcePath, isDirectory: true).standardizedFileURL.path
+        return configuration.photoEventAssignments.compactMap { assignment in
+            guard assignment.eventID == eventID,
+                  URL(fileURLWithPath: assignment.sourceRootPath, isDirectory: true).standardizedFileURL.path == root,
+                  (try? PathSafety.validateRelativePath(assignment.relativePath)) != nil else {
+                return nil
+            }
+            return FileRecord(
+                path: assignment.relativePath,
+                size: assignment.fileSize,
+                modifiedAt: assignment.modifiedAt
+            )
+        }.sorted { $0.path < $1.path }
+    }
+
+    func assignedEvent(for file: FileRecord) -> SavedCameraEvent? {
+        let root = URL(fileURLWithPath: expandedImportSourcePath, isDirectory: true).standardizedFileURL.path
+        guard let assignment = configuration.photoEventAssignments.last(where: {
+            $0.matches(sourceRootPath: root, file: file)
+        }) else { return nil }
+        return configuration.savedEvents.first { $0.id == assignment.eventID }
     }
 
     var cameraLibraryFolderRows: [SetupPathStatus] {
@@ -357,6 +401,210 @@ extension DashboardModel {
     func clearQueue() {
         queuedFilePaths.removeAll()
         statusMessage = "Queue cleared."
+    }
+
+    @discardableResult
+    func createEvent(named rawName: String, on eventDate: Date) -> Bool {
+        let validation = EventNamePolicy.validate(rawName)
+        guard validation.isValid else {
+            statusMessage = validation.errorMessage ?? "Choose a different event name."
+            return false
+        }
+        let name = validation.normalizedName
+
+        var selectedID: UUID?
+        updateConfiguration { configuration in
+            if let index = configuration.savedEvents.firstIndex(where: {
+                $0.name.localizedCaseInsensitiveCompare(name) == .orderedSame
+                    && Calendar.current.isDate($0.eventDate, inSameDayAs: eventDate)
+            }) {
+                configuration.savedEvents[index].lastUsedAt = Date()
+                selectedID = configuration.savedEvents[index].id
+            } else {
+                let event = SavedCameraEvent(name: name, eventDate: eventDate)
+                configuration.savedEvents.append(event)
+                selectedID = event.id
+            }
+            configuration.selectedEventID = selectedID
+            configuration.eventName = name
+            configuration.beginNewBatch(now: eventDate)
+        }
+        activePlan = CopyPlan()
+        organizedArchivePlan = OrganizedArchivePlan()
+        queuedFilePaths = Set(selectedEventFiles.map(\.path))
+        createSelectedEventFolders()
+        return true
+    }
+
+    func selectEvent(_ id: UUID) {
+        guard let event = configuration.savedEvents.first(where: { $0.id == id }) else { return }
+        updateConfiguration { configuration in
+            configuration.selectedEventID = event.id
+            configuration.eventName = event.name
+            configuration.beginNewBatch(now: event.eventDate)
+            if let index = configuration.savedEvents.firstIndex(where: { $0.id == event.id }) {
+                configuration.savedEvents[index].lastUsedAt = Date()
+            }
+        }
+        activePlan = CopyPlan()
+        organizedArchivePlan = OrganizedArchivePlan()
+        queuedFilePaths = Set(selectedEventFiles.map(\.path))
+        statusMessage = selectedEventFiles.isEmpty
+            ? "Selected \(event.name). Select photos and assign them to this event."
+            : "Selected \(event.name) with \(selectedEventFiles.count) assigned file(s)."
+    }
+
+    func assignFilesToSelectedEvent(_ files: [FileRecord]) {
+        let root = URL(fileURLWithPath: expandedImportSourcePath, isDirectory: true).standardizedFileURL.path
+        assignFilesToSelectedEvent(files.map {
+            EventFileSelection(sourceRootPath: root, file: $0)
+        })
+    }
+
+    func assignFilesToSelectedEvent(_ selections: [EventFileSelection]) {
+        guard let event = selectedEvent, !selections.isEmpty else {
+            statusMessage = selectedEvent == nil
+                ? "Create or choose an event before assigning photos."
+                : "Select one or more files first."
+            return
+        }
+
+        let validSelections = selections.compactMap { selection -> EventFileSelection? in
+            let root = URL(
+                fileURLWithPath: Self.expandedPath(selection.sourceRootPath),
+                isDirectory: true
+            ).standardizedFileURL.path
+            guard (try? PathSafety.validateRelativePath(selection.file.path)) != nil else { return nil }
+            return EventFileSelection(sourceRootPath: root, file: selection.file)
+        }
+        guard !validSelections.isEmpty else {
+            statusMessage = "None of the selected files had a safe path."
+            return
+        }
+
+        updateConfiguration { configuration in
+            for selection in validSelections {
+                let root = selection.sourceRootPath
+                let file = selection.file
+                configuration.photoEventAssignments.removeAll {
+                    $0.sourceRootPath == root
+                        && $0.relativePath == file.path
+                        && $0.fileSize == file.size
+                        && abs($0.modifiedAt.timeIntervalSince(file.modifiedAt)) < 1
+                }
+                configuration.photoEventAssignments.append(
+                    PhotoEventAssignment(
+                        sourceRootPath: root,
+                        relativePath: file.path,
+                        fileSize: file.size,
+                        modifiedAt: file.modifiedAt,
+                        eventID: event.id,
+                        deviceID: configuration.selectedDeviceID
+                    )
+                )
+            }
+        }
+        let currentRoot = URL(fileURLWithPath: expandedImportSourcePath, isDirectory: true).standardizedFileURL.path
+        queuedFilePaths.formUnion(
+            validSelections
+                .filter { $0.sourceRootPath == currentRoot }
+                .map(\.file.path)
+        )
+        let sourceCount = Set(validSelections.map(\.sourceRootPath)).count
+        let sourceNote = sourceCount == 1 ? "" : " across \(sourceCount) camera sources"
+        statusMessage = "Assigned \(validSelections.count) file(s)\(sourceNote) to \(event.name)."
+    }
+
+    func queueSelectedEventFiles() {
+        queuedFilePaths = Set(selectedEventFiles.map(\.path))
+        statusMessage = selectedEventFiles.isEmpty
+            ? "This event has no assigned files on the selected camera source."
+            : "Queued \(selectedEventFiles.count) file(s) assigned to \(selectedEvent?.name ?? "the event")."
+    }
+
+    func setEventImmichUploadEnabled(_ eventID: UUID, enabled: Bool) {
+        updateConfiguration { configuration in
+            guard let index = configuration.savedEvents.firstIndex(where: { $0.id == eventID }) else { return }
+            configuration.savedEvents[index].immichUploadEnabled = enabled
+            configuration.savedEvents[index].lastUsedAt = Date()
+        }
+        statusMessage = enabled
+            ? "This event is marked for Immich. Nothing was uploaded."
+            : "This event is storage-only. Nothing will be sent to Immich."
+    }
+
+    func setEventImmichAlbumPolicy(_ eventID: UUID, policy: ImmichAlbumPolicy) {
+        updateConfiguration { configuration in
+            guard let index = configuration.savedEvents.firstIndex(where: { $0.id == eventID }) else { return }
+            configuration.savedEvents[index].immichAlbumPolicy = policy
+        }
+        statusMessage = policy == .none
+            ? "Immich uploads for this event will not create an album."
+            : "Saved the Immich album preference. Nothing was uploaded."
+    }
+
+    func setEventImmichAlbumName(_ eventID: UUID, name: String) {
+        updateConfiguration { configuration in
+            guard let index = configuration.savedEvents.firstIndex(where: { $0.id == eventID }) else { return }
+            configuration.savedEvents[index].immichAlbumName = name
+        }
+    }
+
+    func setAssignmentImmichOverride(_ assignment: PhotoEventAssignment, value: Bool?) {
+        updateConfiguration { configuration in
+            guard let index = configuration.photoEventAssignments.firstIndex(where: {
+                CatalogStore.eventAssetID($0) == CatalogStore.eventAssetID(assignment)
+            }) else { return }
+            configuration.photoEventAssignments[index].immichUploadOverride = value
+        }
+    }
+
+    func checkImmichPresence(_ assets: [ImmichChecksumQuery]) async throws -> [ImmichChecksumResult] {
+        let serverURL = configuration.immichServerURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !serverURL.isEmpty else {
+            throw ToolkitError.commandFailed("Add the Immich server URL in Settings first.")
+        }
+        var apiKey = immichAPIKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        if apiKey.isEmpty {
+            apiKey = try secretStore.read(account: Self.immichAPIKeyAccount)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        }
+        guard !apiKey.isEmpty else {
+            throw ToolkitError.commandFailed("Save an Immich API key in Settings first.")
+        }
+        let client = try ImmichClient(serverURL: serverURL, apiKey: apiKey)
+        var results: [ImmichChecksumResult] = []
+        for start in stride(from: 0, to: assets.count, by: 100) {
+            let end = min(start + 100, assets.count)
+            results += try await client.checkBulkUpload(Array(assets[start..<end]))
+        }
+        return results
+    }
+
+    func createSelectedEventFolders() {
+        guard let event = selectedEvent else {
+            statusMessage = "Create or choose an event first."
+            return
+        }
+        do {
+            for path in configuration.eventWorkspaceFolderPaths() {
+                try FileManager.default.createDirectory(
+                    at: URL(fileURLWithPath: Self.expandedPath(path), isDirectory: true),
+                    withIntermediateDirectories: true
+                )
+            }
+            statusMessage = "Created the \(event.name) card-copy, Photomator, Masters, Web, and Social folders."
+            refreshLocationCards()
+        } catch {
+            statusMessage = "Could not create folders for \(event.name): \(error.localizedDescription)"
+        }
+    }
+
+    func openEventFolder(_ path: String) {
+        createSelectedEventFolders()
+        let url = URL(fileURLWithPath: Self.expandedPath(path), isDirectory: true)
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        NSWorkspace.shared.open(url)
     }
 
     func chooseImportFolder() {
@@ -492,30 +740,54 @@ extension DashboardModel {
     }
 
     func prepareLibraryCatalog() {
-        do {
-            let store = CatalogStore(url: URL(fileURLWithPath: Self.expandedPath(configuration.catalogDatabasePath)))
-            let report = try store.bootstrap(configuration: configuration)
-            catalogReport = report
-            catalogMessage = "Photo list ready with \(report.storageLocationCount) saved place(s)."
-            recordActivity(
-                action: .verifyManifest,
-                state: .done,
-                title: "Prepared photo list",
-                summary: catalogMessage,
-                detail: "Photo list: \(report.databasePath). Backup: \(report.backupPath ?? "not configured")."
-            )
-        } catch {
-            catalogMessage = "Could not prepare photo list: \(error.localizedDescription)"
-            statusMessage = catalogMessage
-            recordActivity(
-                action: .verifyManifest,
-                state: .failed,
-                title: "Photo list setup failed",
-                summary: catalogMessage,
-                detail: "No photo files were moved."
-            )
+        prepareLibraryCatalog(createBackup: true)
+    }
+
+    func syncCatalogCache() {
+        scheduleCatalogSync(configuration: configuration)
+    }
+
+    func prepareLibraryCatalog(createBackup: Bool) {
+        catalogSyncTask?.cancel()
+        let snapshot = configuration
+        let catalogURL = URL(fileURLWithPath: Self.expandedPath(snapshot.catalogDatabasePath))
+        catalogMessage = "Preparing the local photo list in the background…"
+        catalogSyncTask = Task { @MainActor in
+            let outcome = await Task.detached(priority: .utility) {
+                do {
+                    let report = try CatalogStore(url: catalogURL).bootstrap(
+                        configuration: snapshot,
+                        createBackup: createBackup
+                    )
+                    return (report: Optional(report), error: String?.none)
+                } catch {
+                    return (report: CatalogBootstrapReport?.none, error: Optional(error.localizedDescription))
+                }
+            }.value
+            guard !Task.isCancelled else { return }
+            if let report = outcome.report {
+                catalogReport = report
+                catalogMessage = "Photo list ready with \(report.storageLocationCount) saved place(s)."
+                recordActivity(
+                    action: .verifyManifest,
+                    state: .done,
+                    title: "Prepared photo list",
+                    summary: catalogMessage,
+                    detail: "Photo list: \(report.databasePath). Backup: \(report.backupPath ?? "not configured")."
+                )
+            } else {
+                catalogMessage = "Could not prepare photo list: \(outcome.error ?? "Unknown catalog error")"
+                statusMessage = catalogMessage
+                recordActivity(
+                    action: .verifyManifest,
+                    state: .failed,
+                    title: "Photo list setup failed",
+                    summary: catalogMessage,
+                    detail: "No photo files were moved."
+                )
+            }
+            refreshLocationCards()
         }
-        refreshLocationCards()
     }
 
     func setConfigPath(_ keyPath: WritableKeyPath<AppConfiguration, String>, to value: String) {
@@ -641,7 +913,14 @@ extension DashboardModel {
     }
 
     func setEventName(_ value: String) {
-        updateConfiguration { $0.eventName = value }
+        updateConfiguration { configuration in
+            configuration.eventName = value
+            if let id = configuration.selectedEventID,
+               let index = configuration.savedEvents.firstIndex(where: { $0.id == id }) {
+                configuration.savedEvents[index].name = value
+                configuration.savedEvents[index].lastUsedAt = Date()
+            }
+        }
         activePlan = CopyPlan()
         organizedArchivePlan = OrganizedArchivePlan()
         queuedFilePaths.removeAll()
@@ -949,6 +1228,56 @@ extension DashboardModel {
         )
     }
 
+    func previewSelectedEventImport() {
+        let selectedFiles = selectedEventFiles
+        guard !selectedFiles.isEmpty else {
+            statusMessage = "Assign photos to the selected event before previewing it."
+            return
+        }
+
+        let sourcePath = expandedImportSourcePath
+        let bufferPath = expandedBufferIngestPath
+        let libraryPath = expandedLibraryRootPath
+        let source = URL(fileURLWithPath: sourcePath, isDirectory: true)
+        let buffer = URL(fileURLWithPath: bufferPath, isDirectory: true)
+        let library = URL(fileURLWithPath: libraryPath, isDirectory: true)
+        let layout = OrganizedArchiveLayout(configuration: configuration)
+        let command = Self.commandLine(["preview-event-import", sourcePath, bufferPath, "\(selectedFiles.count) files"])
+        runBackgroundJob(
+            action: .previewFiles,
+            runningNote: "Checking selected event files",
+            logTitle: "Previewed event import",
+            logDetail: "Checked only the photos assigned to the selected event. No files were copied.",
+            command: command,
+            sourcePath: sourcePath,
+            destinationPath: libraryPath,
+            operation: { progress in
+                let bufferPlan = try ArchivePlanner().planCopyMetadata(
+                    source: source,
+                    destination: buffer,
+                    files: selectedFiles
+                ) { update in
+                    progress(Self.jobUpdate(from: update, lowerBound: 0.03, upperBound: 0.62, notePrefix: "Reading event workspace", command: command, sourcePath: sourcePath, destinationPath: bufferPath))
+                }
+                let sourceFiles = bufferPlan.new + bufferPlan.existing + bufferPlan.conflicts
+                let archivePlan = try OrganizedArchivePlanner().planMetadata(
+                    sourceFiles: sourceFiles,
+                    libraryRoot: library,
+                    layout: layout
+                ) { update in
+                    progress(Self.jobUpdate(from: update, lowerBound: 0.64, upperBound: 0.97, notePrefix: "Reading event archive", command: command, sourcePath: sourcePath, destinationPath: libraryPath))
+                }
+                return SafeImportPreviewResult(buffer: bufferPlan, archive: archivePlan)
+            },
+            completion: { result in
+                self.activePlan = result.buffer
+                self.organizedArchivePlan = result.archive
+                self.queuedFilePaths = Set(selectedFiles.map(\.path))
+                return "Fast event preview ready: \(result.buffer.new.count) need copying to Crucial; \(result.archive.new.count) need archiving to NAS; \(result.buffer.conflicts.count + result.archive.conflicts.count) size conflict(s). Copy + Verify performs the checksum check."
+            }
+        )
+    }
+
     func copySourceToBuffer() {
         let sourcePath = expandedImportSourcePath
         let destinationPath = expandedBufferIngestPath
@@ -1006,7 +1335,7 @@ extension DashboardModel {
                 let result = try LocalTransferService().copyFiles(source: source, destination: destination, files: selectedFiles) { update in
                     progress(Self.jobUpdate(from: update, lowerBound: 0.04, upperBound: 0.78, notePrefix: "Copying queue", command: command, sourcePath: sourcePath, destinationPath: destinationPath))
                 }
-                let plan = try ArchivePlanner().planCopy(source: source, destination: destination) { update in
+                let plan = try ArchivePlanner().planCopy(source: source, destination: destination, files: selectedFiles) { update in
                     let bounds = Self.planProgressBounds(for: update, lowerBound: 0.78, upperBound: 0.97)
                     progress(Self.jobUpdate(from: update, lowerBound: bounds.lower, upperBound: bounds.upper, notePrefix: "Checking buffer copy", command: command, sourcePath: sourcePath, destinationPath: destinationPath))
                 }
@@ -1022,12 +1351,15 @@ extension DashboardModel {
     }
 
     var isBufferVerifiedForArchive: Bool {
-        !activePlan.existing.isEmpty && activePlan.new.isEmpty && activePlan.conflicts.isEmpty
+        !activePlan.existing.isEmpty
+            && activePlan.new.isEmpty
+            && activePlan.conflicts.isEmpty
+            && activePlan.existing.allSatisfy { $0.sha256 != nil }
     }
 
     func archiveBufferToLibrary() {
         guard isBufferVerifiedForArchive else {
-            statusMessage = "Copy and verify the full card on Crucial before archiving to the NAS."
+            statusMessage = "Copy and checksum-verify the event files on Crucial before archiving to the NAS."
             return
         }
 
@@ -1632,6 +1964,7 @@ extension DashboardModel {
         var next = configuration
         mutate(&next)
         next.normalizeLocationSelections()
+        next.normalizeEventSelection()
         configuration = next
         do {
             try configurationStore.save(next)
@@ -1639,8 +1972,38 @@ extension DashboardModel {
         } catch {
             configMessage = "Could not save config: \(error.localizedDescription)"
         }
+        scheduleCatalogSync(configuration: next)
         rebuildWorkflowPlans()
         refreshLocationCards()
+    }
+
+    private func scheduleCatalogSync(configuration: AppConfiguration) {
+        let catalogURL = URL(fileURLWithPath: Self.expandedPath(configuration.catalogDatabasePath))
+        catalogSyncTask?.cancel()
+        catalogSyncTask = Task { @MainActor in
+            do {
+                try await Task.sleep(for: .milliseconds(150))
+            } catch {
+                return
+            }
+            guard !Task.isCancelled else { return }
+            let snapshot = configuration
+            let errorMessage = await Task.detached(priority: .utility) {
+                do {
+                    _ = try CatalogStore(url: catalogURL).bootstrap(
+                        configuration: snapshot,
+                        createBackup: false,
+                        createLibraryFolders: false
+                    )
+                    return String?.none
+                } catch {
+                    return error.localizedDescription
+                }
+            }.value
+            if let errorMessage {
+                catalogMessage = "Config saved, but the photo list could not sync: \(errorMessage)"
+            }
+        }
     }
 
     private func rebuildWorkflowPlans() {
@@ -1656,21 +2019,28 @@ extension DashboardModel {
         let buffer = URL(fileURLWithPath: Self.expandedPath(configuration.bufferPath), isDirectory: true)
         let library = URL(fileURLWithPath: Self.expandedPath(configuration.cameraLibraryRootPath), isDirectory: true)
         let catalog = URL(fileURLWithPath: Self.expandedPath(configuration.catalogDatabasePath))
-        locations = [
-            LocationCard(kind: .card, title: "From Folder", subtitle: displayName(for: source), status: status(forFolder: source), detail: source.path),
-            LocationCard(kind: .drive, title: "Buffer", subtitle: displayName(for: buffer), status: status(forFolder: buffer), detail: "Batch: \(Self.expandedPath(configuration.bufferBatchFolderPath()))"),
-            LocationCard(kind: .nas, title: "Photo Library", subtitle: displayName(for: library), status: status(forFolder: library), detail: archive.path),
-            LocationCard(kind: .mac, title: "Photo List", subtitle: displayName(for: catalog), status: fileExists(catalog) ? .ready : .warning, detail: catalog.path),
-            immichLocationCard
-        ]
-    }
-
-    private func status(forFolder url: URL) -> LocationStatus {
-        FileManager.default.fileExists(atPath: url.path) ? .ready : .warning
-    }
-
-    private func fileExists(_ url: URL) -> Bool {
-        FileManager.default.fileExists(atPath: url.path)
+        let batchPath = Self.expandedPath(configuration.bufferBatchFolderPath())
+        let immichCard = immichLocationCard
+        locationRefreshTask?.cancel()
+        locationRefreshTask = Task { @MainActor in
+            let availability = await Task.detached(priority: .utility) {
+                let fileManager = FileManager.default
+                return (
+                    source: fileManager.fileExists(atPath: source.path),
+                    buffer: fileManager.fileExists(atPath: buffer.path),
+                    library: fileManager.fileExists(atPath: library.path),
+                    catalog: fileManager.fileExists(atPath: catalog.path)
+                )
+            }.value
+            guard !Task.isCancelled else { return }
+            locations = [
+                LocationCard(kind: .card, title: "From Folder", subtitle: displayName(for: source), status: availability.source ? .ready : .warning, detail: source.path),
+                LocationCard(kind: .drive, title: "Buffer", subtitle: displayName(for: buffer), status: availability.buffer ? .ready : .warning, detail: "Batch: \(batchPath)"),
+                LocationCard(kind: .nas, title: "Photo Library", subtitle: displayName(for: library), status: availability.library ? .ready : .warning, detail: archive.path),
+                LocationCard(kind: .mac, title: "Photo List", subtitle: displayName(for: catalog), status: availability.catalog ? .ready : .warning, detail: catalog.path),
+                immichCard
+            ]
+        }
     }
 
     private func displayName(for url: URL) -> String {

@@ -51,7 +51,12 @@ public struct OrganizedArchivePlan: Codable, Equatable, Sendable {
     }
 
     public var totalFiles: Int { new.count + existing.count + conflicts.count }
-    public var isVerified: Bool { totalFiles > 0 && new.isEmpty && conflicts.isEmpty }
+    public var isVerified: Bool {
+        totalFiles > 0
+            && new.isEmpty
+            && conflicts.isEmpty
+            && existing.allSatisfy { !$0.sha256.isEmpty }
+    }
 }
 
 public struct OrganizedArchiveResult: Codable, Equatable, Sendable {
@@ -80,7 +85,7 @@ public struct OrganizedArchiveLayout: Sendable {
 
     public init(eventDate: String, eventName: String, deviceID: String) {
         self.eventDate = Self.safeDate(eventDate)
-        self.eventName = Self.pathComponent(eventName, fallback: "Import")
+        self.eventName = EventNamePolicy.folderName(for: eventName, fallback: "Import")
         self.deviceID = deviceID
     }
 
@@ -220,6 +225,50 @@ public struct OrganizedArchivePlanner {
             progress?(
                 FileOperationProgress(
                     phase: "Comparing NAS destination",
+                    currentPath: relativeDestination,
+                    processedFiles: index + 1,
+                    totalFiles: totalFiles
+                )
+            )
+        }
+        return plan
+    }
+
+    /// Builds a destination preview without reading the contents of each RAW.
+    /// Empty hashes intentionally mark same-size destination files as present,
+    /// not verified. Copy and archive operations still perform SHA-256 checks.
+    public func planMetadata(
+        sourceFiles files: [FileRecord],
+        libraryRoot: URL,
+        layout: OrganizedArchiveLayout,
+        progress: FileOperationProgressHandler? = nil
+    ) throws -> OrganizedArchivePlan {
+        var plan = OrganizedArchivePlan(folders: layout.requiredFolders(for: files.map(\.path)))
+        let totalFiles = files.count
+
+        for (index, file) in files.enumerated() {
+            let relativeDestination = try layout.destinationRelativePath(for: file.path)
+            let mapping = OrganizedArchiveMapping(
+                sourcePath: file.path,
+                destinationPath: relativeDestination,
+                size: file.size,
+                modifiedAt: file.modifiedAt,
+                sha256: ""
+            )
+            let destination = libraryRoot.appendingPathComponent(relativeDestination)
+            if fileManager.fileExists(atPath: destination.path) {
+                let values = try destination.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+                if values.isRegularFile == true, Int64(values.fileSize ?? -1) == file.size {
+                    plan.existing.append(mapping)
+                } else {
+                    plan.conflicts.append(mapping)
+                }
+            } else {
+                plan.new.append(mapping)
+            }
+            progress?(
+                FileOperationProgress(
+                    phase: "Reading destination metadata",
                     currentPath: relativeDestination,
                     processedFiles: index + 1,
                     totalFiles: totalFiles

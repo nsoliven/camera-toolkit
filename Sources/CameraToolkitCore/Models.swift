@@ -77,6 +77,22 @@ public struct FileRecord: Identifiable, Codable, Hashable, Sendable {
     }
 }
 
+/// A file selected while browsing a specific camera/source root.
+///
+/// Keeping the root beside the relative file record lets the UI collect an
+/// event across multiple folders—and even across mounted cards—without
+/// accidentally attributing every file to whichever source is selected last.
+public struct EventFileSelection: Identifiable, Hashable, Sendable {
+    public var id: String { sourceRootPath + "\u{0}" + file.id }
+    public var sourceRootPath: String
+    public var file: FileRecord
+
+    public init(sourceRootPath: String, file: FileRecord) {
+        self.sourceRootPath = sourceRootPath
+        self.file = file
+    }
+}
+
 public struct CopyPlan: Codable, Equatable, Sendable {
     public var new: [FileRecord]
     public var existing: [FileRecord]

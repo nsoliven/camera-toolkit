@@ -24,8 +24,12 @@ public struct CatalogStore {
         self.fileManager = fileManager
     }
 
-    public func bootstrap(configuration: AppConfiguration) throws -> CatalogBootstrapReport {
-        let folders = try ensureLibraryFolders(configuration: configuration)
+    public func bootstrap(
+        configuration: AppConfiguration,
+        createBackup: Bool = true,
+        createLibraryFolders: Bool = true
+    ) throws -> CatalogBootstrapReport {
+        let folders = createLibraryFolders ? try ensureLibraryFolders(configuration: configuration) : []
         try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
 
         var database: OpaquePointer?
@@ -34,6 +38,10 @@ public struct CatalogStore {
             throw ToolkitError.commandFailed("Could not open catalog database: \(message)")
         }
         defer { sqlite3_close(database) }
+        // Catalog work always runs away from the main actor. A short wait is
+        // preferable to dropping a cache update when a read-only inspector has
+        // the local database open for a moment.
+        sqlite3_busy_timeout(database, 5_000)
 
         try execute("""
         PRAGMA foreign_keys = ON;
@@ -82,23 +90,73 @@ public struct CatalogStore {
             FOREIGN KEY(asset_id) REFERENCES assets(id),
             FOREIGN KEY(storage_location_id) REFERENCES storage_locations(id)
         );
+        CREATE TABLE IF NOT EXISTS events (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            event_date TEXT NOT NULL,
+            immich_upload_enabled INTEGER NOT NULL DEFAULT 0,
+            immich_album_policy TEXT NOT NULL DEFAULT 'none',
+            immich_album_name TEXT,
+            created_at TEXT NOT NULL,
+            last_used_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS event_assets (
+            id TEXT PRIMARY KEY,
+            event_id TEXT NOT NULL,
+            source_root_path TEXT NOT NULL,
+            relative_path TEXT NOT NULL,
+            byte_count INTEGER NOT NULL,
+            modified_at TEXT NOT NULL,
+            device_id TEXT,
+            immich_upload_override INTEGER,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(event_id) REFERENCES events(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS event_assets_event_id ON event_assets(event_id);
+        CREATE TABLE IF NOT EXISTS event_asset_locations (
+            event_asset_id TEXT NOT NULL,
+            location TEXT NOT NULL CHECK(location IN ('source', 'buffer', 'archive')),
+            state INTEGER NOT NULL,
+            checked_at TEXT NOT NULL,
+            PRIMARY KEY(event_asset_id, location),
+            FOREIGN KEY(event_asset_id) REFERENCES event_assets(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS immich_assets (
+            event_asset_id TEXT PRIMARY KEY,
+            status TEXT NOT NULL,
+            immich_asset_id TEXT,
+            checksum_sha1 TEXT,
+            is_trashed INTEGER NOT NULL DEFAULT 0,
+            checked_at TEXT NOT NULL,
+            FOREIGN KEY(event_asset_id) REFERENCES event_assets(id) ON DELETE CASCADE
+        );
         """, database: database)
 
-        try upsertAppState("cameraLibraryRootPath", value: configuration.cameraLibraryRootPath, database: database)
-        try upsertAppState("archivePath", value: configuration.archivePath, database: database)
-        try upsertAppState("bufferPath", value: configuration.bufferPath, database: database)
-        try upsertAppState("catalogBackupFolderPath", value: configuration.catalogBackupFolderPath, database: database)
+        try execute("BEGIN IMMEDIATE;", database: database)
+        do {
+            try upsertAppState("cameraLibraryRootPath", value: configuration.cameraLibraryRootPath, database: database)
+            try upsertAppState("archivePath", value: configuration.archivePath, database: database)
+            try upsertAppState("bufferPath", value: configuration.bufferPath, database: database)
+            try upsertAppState("catalogBackupFolderPath", value: configuration.catalogBackupFolderPath, database: database)
 
-        for folder in CameraLibraryFolder.allCases {
-            try upsertLibraryFolder(folder, path: configuration.libraryFolderPath(folder).path, database: database)
+            for folder in CameraLibraryFolder.allCases {
+                try upsertLibraryFolder(folder, path: configuration.libraryFolderPath(folder).path, database: database)
+            }
+
+            for location in configuration.configuredLocations {
+                let selected = configuration.selectedLocationID(for: location.role) == location.id
+                try upsertStorageLocation(location, selected: selected, database: database)
+            }
+
+            try synchronizeEvents(configuration: configuration, database: database)
+            try execute("COMMIT;", database: database)
+        } catch {
+            try? execute("ROLLBACK;", database: database)
+            throw error
         }
 
-        for location in configuration.configuredLocations {
-            let selected = configuration.selectedLocationID(for: location.role) == location.id
-            try upsertStorageLocation(location, selected: selected, database: database)
-        }
-
-        let backupURL = try backupIfConfigured(configuration: configuration)
+        let backupURL = createBackup ? try backupIfConfigured(configuration: configuration) : nil
         return CatalogBootstrapReport(
             databasePath: url.path,
             backupPath: backupURL?.path,
@@ -114,6 +172,11 @@ public struct CatalogStore {
 
         var folders: [URL] = []
         let root = URL(fileURLWithPath: configuration.cameraLibraryRootPath, isDirectory: true)
+        // Never manufacture a fake /Volumes mount point when a NAS or removable
+        // drive is offline. The local SQLite catalog must remain usable anyway.
+        guard Self.configuredVolumeIsAvailable(for: root, fileManager: fileManager) else {
+            return []
+        }
         try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
         folders.append(root)
 
@@ -132,6 +195,9 @@ public struct CatalogStore {
         }
 
         let backupRoot = URL(fileURLWithPath: backupPath, isDirectory: true)
+        guard Self.configuredVolumeIsAvailable(for: backupRoot, fileManager: fileManager) else {
+            return nil
+        }
         try fileManager.createDirectory(at: backupRoot, withIntermediateDirectories: true)
         let stamp = Self.backupTimestamp()
         let destination = backupRoot.appendingPathComponent("catalog-\(stamp).sqlite")
@@ -199,6 +265,111 @@ public struct CatalogStore {
         )
     }
 
+    private func synchronizeEvents(configuration: AppConfiguration, database: OpaquePointer) throws {
+        let now = Self.isoTimestamp()
+        let eventsByID = Dictionary(uniqueKeysWithValues: configuration.savedEvents.map { ($0.id, $0) })
+
+        for event in configuration.savedEvents {
+            try runUpsert(
+                """
+                INSERT INTO events(
+                    id, name, event_date, immich_upload_enabled, immich_album_policy,
+                    immich_album_name, created_at, last_used_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    name = excluded.name,
+                    event_date = excluded.event_date,
+                    immich_upload_enabled = excluded.immich_upload_enabled,
+                    immich_album_policy = excluded.immich_album_policy,
+                    immich_album_name = excluded.immich_album_name,
+                    last_used_at = excluded.last_used_at,
+                    updated_at = excluded.updated_at;
+                """,
+                values: [
+                    event.id.uuidString,
+                    event.name,
+                    Self.isoTimestamp(event.eventDate),
+                    event.sendsToImmich ? "1" : "0",
+                    event.resolvedImmichAlbumPolicy.rawValue,
+                    event.immichAlbumName ?? "",
+                    Self.isoTimestamp(event.createdAt),
+                    Self.isoTimestamp(event.lastUsedAt),
+                    now
+                ],
+                database: database
+            )
+        }
+
+        for assignment in configuration.photoEventAssignments where eventsByID[assignment.eventID] != nil {
+            try runUpsert(
+                """
+                INSERT INTO event_assets(
+                    id, event_id, source_root_path, relative_path, byte_count,
+                    modified_at, device_id, immich_upload_override, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    event_id = excluded.event_id,
+                    source_root_path = excluded.source_root_path,
+                    relative_path = excluded.relative_path,
+                    byte_count = excluded.byte_count,
+                    modified_at = excluded.modified_at,
+                    device_id = excluded.device_id,
+                    immich_upload_override = excluded.immich_upload_override,
+                    updated_at = excluded.updated_at;
+                """,
+                values: [
+                    Self.eventAssetID(assignment),
+                    assignment.eventID.uuidString,
+                    assignment.sourceRootPath,
+                    assignment.relativePath,
+                    String(assignment.fileSize),
+                    Self.isoTimestamp(assignment.modifiedAt),
+                    assignment.deviceID ?? "",
+                    assignment.immichUploadOverride.map { $0 ? "1" : "0" } ?? "",
+                    now
+                ],
+                database: database
+            )
+        }
+
+        try deleteRowsNotIn(
+            table: "event_assets",
+            ids: configuration.photoEventAssignments.map(Self.eventAssetID),
+            database: database
+        )
+        try deleteRowsNotIn(
+            table: "events",
+            ids: configuration.savedEvents.map { $0.id.uuidString },
+            database: database
+        )
+    }
+
+    private func deleteRowsNotIn(table: String, ids: [String], database: OpaquePointer) throws {
+        guard table == "events" || table == "event_assets" else { return }
+        if ids.isEmpty {
+            try execute("DELETE FROM \(table);", database: database)
+            return
+        }
+        // A temporary key table avoids SQLite's bound-variable limit for large
+        // events with thousands of photos.
+        let temporaryTable = table == "events" ? "active_event_ids" : "active_event_asset_ids"
+        try execute(
+            "CREATE TEMP TABLE IF NOT EXISTS \(temporaryTable) (id TEXT PRIMARY KEY); DELETE FROM \(temporaryTable);",
+            database: database
+        )
+        for id in ids {
+            try runUpsert(
+                "INSERT OR IGNORE INTO \(temporaryTable)(id) VALUES (?);",
+                values: [id],
+                database: database
+            )
+        }
+        try execute(
+            "DELETE FROM \(table) WHERE id NOT IN (SELECT id FROM \(temporaryTable)); DROP TABLE \(temporaryTable);",
+            database: database
+        )
+    }
+
     private func runUpsert(_ sql: String, values: [String], database: OpaquePointer) throws {
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK, let statement else {
@@ -218,9 +389,23 @@ public struct CatalogStore {
     private static let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
     private static func isoTimestamp() -> String {
+        isoTimestamp(Date())
+    }
+
+    private static func isoTimestamp(_ date: Date) -> String {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter.string(from: Date())
+        return formatter.string(from: date)
+    }
+
+    public static func eventAssetID(_ assignment: PhotoEventAssignment) -> String {
+        [
+            assignment.eventID.uuidString,
+            assignment.sourceRootPath,
+            assignment.relativePath,
+            String(assignment.fileSize),
+            String(Int64(assignment.modifiedAt.timeIntervalSince1970.rounded()))
+        ].joined(separator: "|")
     }
 
     private static func backupTimestamp() -> String {
@@ -229,5 +414,13 @@ public struct CatalogStore {
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.dateFormat = "yyyyMMdd-HHmmss"
         return formatter.string(from: Date())
+    }
+
+    private static func configuredVolumeIsAvailable(for url: URL, fileManager: FileManager) -> Bool {
+        let components = url.standardizedFileURL.pathComponents
+        guard components.count >= 3, components[1] == "Volumes" else { return true }
+        let mountURL = URL(fileURLWithPath: "/Volumes", isDirectory: true)
+            .appendingPathComponent(components[2], isDirectory: true)
+        return fileManager.fileExists(atPath: mountURL.path)
     }
 }

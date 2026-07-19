@@ -16,20 +16,45 @@ This is a new private repo. The original Python `camera-toolkit` repo is not mov
 - No real camera cards, NAS paths, or external drives are used by tests.
 - Free-up uses live checksum comparison before quarantine.
 - Verified files move into `_Trash/<batch>/`; permanent delete is separate and requires `DELETE`.
-- Archive copies use `rclone copy --checksum --immutable`.
+- Event preview reads paths and file sizes only, so it can show what will move without reading every RAW byte.
+- `Copy + Verify` performs SHA-256 checks and never treats a metadata-only preview as verification.
+- Archive copies are immutable and checksum-verified before Camera Toolkit marks them safe.
 - Low-level command builder rejects destructive `rclone` subcommands such as `sync`, `move`, `delete`, and `purge`.
-- Real transfer, free-up, metadata, and Immich upload workflows are rendered as locked plans with exact commands/endpoints; the UI does not execute them.
-- Clicking a photo opens an editor working copy by default, so Preview, Photomator, or Topaz Photo do not mutate the source original.
+- Camera cards are never modified by preview, copy, or archive actions.
+- Opening a Library photo creates an editor working copy so Photomator does not mutate the source original.
 - Immich API keys are stored in macOS Keychain, not in `config.json` or the activity log.
 
 ## Current App Surface
 
-- Overview is a real workspace: configured paths, locked transfer plans, safety tests, editor handoff, and Immich connection status are visible together.
-- Library scans the configured import source for common photo and RAW formats; clicking a row opens a protected working copy in Preview by default.
+- Files is the camera workspace. It browses mounted cards, Crucial, NAS locations, and ordinary folders without sending the user through Finder.
+- Sony ARW thumbnails and the larger selection/Space-bar previews come from JPEGs embedded by the camera. This works for A7 V Compressed RAW 2 even when macOS Quick Look cannot decode that RAW variant.
+- Selecting one photo opens a larger preview pane with a draggable divider. Space opens the resizable preview window; arrow keys move through a multi-file selection.
+- Double-clicking a file uses its macOS default application. Photomator is the app's default protected editor.
+- Saved events can be reused across camera cards. Select files, choose or create an event, and click **Assign Selected**; only those files are included in that event's copy.
+- **Event Library** (`Option-Command-E`) shows every assignment across its source card/folder, Crucial buffer, and NAS original, with direct file links plus storage-only/per-photo Immich routing.
+- **Photo List SQL Inspector** (`Shift-Command-I`) uses the GRDB Swift package to browse SQLite tables, schema SQL, and bounded read-only queries inside the app.
+- **Preview Event** is metadata-only and fast. **Copy Event + Verify** is deliberately slower because it reads the selected bytes and performs the safety checksum.
 - Config is the single persistent settings screen for folders, batch defaults, Immich, external editors, and working-copy paths.
 - Immich can test the current API connection through ping, version, and current-user endpoints. Uploads remain locked until the transfer path is proven separately.
+- Immich presence checks stream SHA-1 hashes in bounded chunks and call the stable bulk-upload-check endpoint; the event policy can use no album, an event album, or a custom album without implying that an upload has happened.
 - Locked workflow plans show the configured rclone copy/check commands, exiftool metadata read command, Immich `/api/assets` upload endpoint, quarantine target, and editor checkout path. Preview Copy compares the configured source against the configured archive without moving bytes.
 - `Command-B` toggles the sidebar. `Command-R` refreshes config, activity log, library scan, copy plan, and Immich connection status when credentials are configured.
+
+## Event Folder Layout
+
+Creating an event makes a stable workspace on Crucial. The same saved event remains available when a different camera or card is selected:
+
+```text
+Camera Buffer/<year>/<event>/
+├── Sony A7V/Card Copy/     # verified copy of assigned camera files
+├── Photomator/             # Photomator project/working files
+└── Exports/
+    ├── Masters/            # full-resolution final files
+    ├── Web/                # web-sized exports
+    └── Social/             # social-sized exports
+```
+
+Permanent NAS originals are organized separately by event, camera, and media type. Camera Toolkit provides **Open Photomator Folder** and **Open Exports** buttons so these destinations do not have to be remembered.
 
 ## Build
 

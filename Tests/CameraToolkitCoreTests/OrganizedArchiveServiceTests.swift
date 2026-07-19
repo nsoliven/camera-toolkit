@@ -58,4 +58,26 @@ final class OrganizedArchiveServiceTests: XCTestCase {
             XCTAssertEqual(try Data(contentsOf: raw), Data("different-existing-file".utf8))
         }
     }
+
+    func testMetadataArchivePreviewCannotBeMistakenForVerifiedArchive() throws {
+        try withTemporaryDirectory { root in
+            let library = root.appendingPathComponent("NAS/Camera", isDirectory: true)
+            let layout = OrganizedArchiveLayout(eventDate: "2026-07-11", eventName: "Event", deviceID: "sony-a7v")
+            let destination = library.appendingPathComponent(
+                "Originals/2026/2026-07-11 Event/Sony A7V/RAW/PHOTO.ARW"
+            )
+            try writeFile(destination, Data(repeating: 0x42, count: 1_024))
+            let files = [FileRecord(path: "DCIM/PHOTO.ARW", size: 1_024, modifiedAt: .now)]
+
+            let preview = try OrganizedArchivePlanner().planMetadata(
+                sourceFiles: files,
+                libraryRoot: library,
+                layout: layout
+            )
+
+            XCTAssertEqual(preview.existing.map(\.sourcePath), ["DCIM/PHOTO.ARW"])
+            XCTAssertEqual(preview.existing.first?.sha256, "")
+            XCTAssertFalse(preview.isVerified)
+        }
+    }
 }

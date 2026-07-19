@@ -70,4 +70,57 @@ final class ArchivePlannerTests: XCTestCase {
             XCTAssertEqual(plan.conflicts.map(\.path), ["DCIM/a.ARW"])
         }
     }
+
+    func testSelectedFilePlanIgnoresUnassignedCardFiles() throws {
+        try withTemporaryDirectory { root in
+            let source = root.appendingPathComponent("src", isDirectory: true)
+            let destination = root.appendingPathComponent("dst", isDirectory: true)
+            let includedData = Data(repeating: 0x41, count: 256)
+            try writeFile(source.appendingPathComponent("DCIM/included.ARW"), includedData)
+            try writeFile(source.appendingPathComponent("DCIM/other-event.ARW"), Data(repeating: 0x42, count: 2_048))
+            try writeFile(destination.appendingPathComponent("DCIM/included.ARW"), includedData)
+
+            let selected = [
+                FileRecord(path: "DCIM/included.ARW", size: Int64(includedData.count), modifiedAt: .now)
+            ]
+            let plan = try ArchivePlanner().planCopy(
+                source: source,
+                destination: destination,
+                files: selected
+            )
+
+            XCTAssertEqual(plan.existing.map(\.path), ["DCIM/included.ARW"])
+            XCTAssertTrue(plan.new.isEmpty)
+            XCTAssertTrue(plan.conflicts.isEmpty)
+            XCTAssertFalse((plan.new + plan.existing + plan.conflicts).contains { $0.path.contains("other-event") })
+        }
+    }
+
+    func testMetadataPreviewIsFastButDoesNotClaimChecksumVerification() throws {
+        try withTemporaryDirectory { root in
+            let source = root.appendingPathComponent("src", isDirectory: true)
+            let destination = root.appendingPathComponent("dst", isDirectory: true)
+            try writeFile(source.appendingPathComponent("DCIM/a.ARW"), Data(repeating: 0x41, count: 4_096))
+            try writeFile(destination.appendingPathComponent("DCIM/a.ARW"), Data(repeating: 0x42, count: 4_096))
+            let selected = [
+                FileRecord(path: "DCIM/a.ARW", size: 4_096, modifiedAt: .now)
+            ]
+
+            let preview = try ArchivePlanner().planCopyMetadata(
+                source: source,
+                destination: destination,
+                files: selected
+            )
+            XCTAssertEqual(preview.existing.map(\.path), ["DCIM/a.ARW"])
+            XCTAssertNil(preview.existing.first?.sha256)
+
+            let verified = try ArchivePlanner().planCopy(
+                source: source,
+                destination: destination,
+                files: selected
+            )
+            XCTAssertTrue(verified.existing.isEmpty)
+            XCTAssertEqual(verified.conflicts.map(\.path), ["DCIM/a.ARW"])
+        }
+    }
 }

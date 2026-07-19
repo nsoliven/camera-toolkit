@@ -22,6 +22,32 @@ public struct ImmichConnectionReport: Equatable, Sendable {
     }
 }
 
+public struct ImmichChecksumQuery: Codable, Equatable, Sendable {
+    public var id: String
+    public var checksum: String
+
+    public init(id: String, checksum: String) {
+        self.id = id
+        self.checksum = checksum
+    }
+}
+
+public struct ImmichChecksumResult: Equatable, Sendable {
+    public var id: String
+    public var isPresent: Bool
+    public var assetID: String?
+    public var isTrashed: Bool
+    public var reason: String?
+
+    public init(id: String, isPresent: Bool, assetID: String?, isTrashed: Bool, reason: String?) {
+        self.id = id
+        self.isPresent = isPresent
+        self.assetID = assetID
+        self.isTrashed = isTrashed
+        self.reason = reason
+    }
+}
+
 public struct ImmichClient: Sendable {
     private let apiBaseURL: URL
     private let apiKey: String
@@ -54,6 +80,25 @@ public struct ImmichClient: Sendable {
             userName: user.name,
             userEmail: user.email
         )
+    }
+
+    /// Uses Immich's stable pre-upload checksum endpoint. This only asks whether
+    /// content already exists; it never uploads or changes an asset or album.
+    public func checkBulkUpload(_ assets: [ImmichChecksumQuery]) async throws -> [ImmichChecksumResult] {
+        guard !assets.isEmpty else { return [] }
+        let response: AssetBulkUploadCheckResponse = try await post(
+            "/assets/bulk-upload-check",
+            body: AssetBulkUploadCheckRequest(assets: assets)
+        )
+        return response.results.map {
+            ImmichChecksumResult(
+                id: $0.id,
+                isPresent: $0.action == "reject" && $0.reason == "duplicate" && $0.assetId != nil,
+                assetID: $0.assetId,
+                isTrashed: $0.isTrashed ?? false,
+                reason: $0.reason
+            )
+        }
     }
 
     public static func normalizedAPIBaseURL(_ serverURL: String) -> URL? {
@@ -103,6 +148,27 @@ public struct ImmichClient: Sendable {
         }
         return try decoder.decode(T.self, from: data)
     }
+
+    private func post<Body: Encodable, Response: Decodable>(_ path: String, body: Body) async throws -> Response {
+        guard let url = URL(string: "\(apiBaseURL.absoluteString)/\(path.trimmingCharacters(in: CharacterSet(charactersIn: "/")))") else {
+            throw ToolkitError.commandFailed("Immich endpoint URL is not valid")
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+        request.httpBody = try JSONEncoder().encode(body)
+
+        let (data, response) = try await transport.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw ToolkitError.commandFailed("Immich response was not HTTP")
+        }
+        guard (200..<300).contains(httpResponse.statusCode) else {
+            throw ToolkitError.commandFailed("Immich \(path) failed with HTTP \(httpResponse.statusCode)")
+        }
+        return try decoder.decode(Response.self, from: data)
+    }
 }
 
 private struct ServerPingResponse: Decodable {
@@ -128,4 +194,20 @@ private struct ImmichUserResponse: Decodable {
     var email: String
     var name: String
     var isAdmin: Bool
+}
+
+private struct AssetBulkUploadCheckRequest: Encodable {
+    var assets: [ImmichChecksumQuery]
+}
+
+private struct AssetBulkUploadCheckResponse: Decodable {
+    var results: [AssetBulkUploadCheckResult]
+}
+
+private struct AssetBulkUploadCheckResult: Decodable {
+    var action: String
+    var assetId: String?
+    var id: String
+    var isTrashed: Bool?
+    var reason: String?
 }

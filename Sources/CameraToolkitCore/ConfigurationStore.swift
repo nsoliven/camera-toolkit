@@ -22,6 +22,9 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
     public var eventName: String
     public var batchID: String
     public var importDestination: TransferLocation
+    public var savedEvents: [SavedCameraEvent]
+    public var selectedEventID: UUID?
+    public var photoEventAssignments: [PhotoEventAssignment]
 
     public init(
         demoRootPath: String,
@@ -38,13 +41,16 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         activityLogPath: String,
         immichServerURL: String = "",
         editorWorkingFolderPath: String = "",
-        externalEditor: ExternalEditor = .preview,
+        externalEditor: ExternalEditor = .photomator,
         rcloneBinaryPath: String = "rclone",
         exiftoolBinaryPath: String = "exiftool",
         selectedDeviceID: String = "sony-a7v",
-        eventName: String = "Lee Canyon",
+        eventName: String = "",
         batchID: String = "",
-        importDestination: TransferLocation = .nas
+        importDestination: TransferLocation = .nas,
+        savedEvents: [SavedCameraEvent] = [],
+        selectedEventID: UUID? = nil,
+        photoEventAssignments: [PhotoEventAssignment] = []
     ) {
         self.demoRootPath = demoRootPath
         self.importSourcePath = importSourcePath
@@ -67,7 +73,11 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         self.eventName = eventName
         self.batchID = batchID.isEmpty ? Self.makeBatchID(deviceID: selectedDeviceID) : batchID
         self.importDestination = importDestination
+        self.savedEvents = savedEvents
+        self.selectedEventID = selectedEventID
+        self.photoEventAssignments = photoEventAssignments
         self.normalizeLocationSelections()
+        self.normalizeEventSelection()
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -92,6 +102,9 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         case eventName
         case batchID
         case importDestination
+        case savedEvents
+        case selectedEventID
+        case photoEventAssignments
     }
 
     public init(from decoder: Decoder) throws {
@@ -121,7 +134,11 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         eventName = try values.decodeIfPresent(String.self, forKey: .eventName) ?? defaults.eventName
         batchID = try values.decodeIfPresent(String.self, forKey: .batchID) ?? Self.makeBatchID(deviceID: selectedDeviceID)
         importDestination = try values.decodeIfPresent(TransferLocation.self, forKey: .importDestination) ?? defaults.importDestination
+        savedEvents = try values.decodeIfPresent([SavedCameraEvent].self, forKey: .savedEvents) ?? []
+        selectedEventID = try values.decodeIfPresent(UUID.self, forKey: .selectedEventID)
+        photoEventAssignments = try values.decodeIfPresent([PhotoEventAssignment].self, forKey: .photoEventAssignments) ?? []
         normalizeLocationSelections()
+        normalizeEventSelection()
     }
 
     public static func defaults(applicationSupport: URL) -> AppConfiguration {
@@ -211,6 +228,29 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         bufferPath = bufferSelection.path
     }
 
+    public mutating func normalizeEventSelection() {
+        let trimmedName = eventName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if savedEvents.isEmpty, !trimmedName.isEmpty {
+            let eventDate = Self.dayFormatter.date(from: archiveEventDate) ?? Date()
+            let event = SavedCameraEvent(name: trimmedName, eventDate: eventDate)
+            savedEvents = [event]
+            selectedEventID = event.id
+        }
+
+        if let selectedEventID,
+           let selected = savedEvents.first(where: { $0.id == selectedEventID }) {
+            eventName = selected.name
+        } else if let matching = savedEvents.first(where: {
+            $0.name.localizedCaseInsensitiveCompare(trimmedName) == .orderedSame
+        }) ?? savedEvents.sorted(by: { $0.lastUsedAt > $1.lastUsedAt }).first {
+            selectedEventID = matching.id
+            eventName = matching.name
+        } else {
+            selectedEventID = nil
+            eventName = ""
+        }
+    }
+
     public func locations(role: ConfiguredLocationRole) -> [ConfiguredLocation] {
         configuredLocations.filter { $0.role == role }
     }
@@ -264,11 +304,17 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
 
     public func bufferBatchFolderPath() -> String {
         let layout = OrganizedArchiveLayout(configuration: self)
+        return URL(fileURLWithPath: bufferEventFolderPath(), isDirectory: true)
+            .appendingPathComponent(layout.deviceFolder, isDirectory: true)
+            .appendingPathComponent("Card Copy", isDirectory: true)
+            .path
+    }
+
+    public func bufferEventFolderPath() -> String {
+        let layout = OrganizedArchiveLayout(configuration: self)
         return URL(fileURLWithPath: bufferPath, isDirectory: true)
             .appendingPathComponent(layout.year, isDirectory: true)
             .appendingPathComponent(layout.eventFolder, isDirectory: true)
-            .appendingPathComponent(layout.deviceFolder, isDirectory: true)
-            .appendingPathComponent("Card Copy", isDirectory: true)
             .path
     }
 
@@ -277,17 +323,31 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
     }
 
     public func bufferExportsFolderPath() -> String {
-        URL(fileURLWithPath: bufferBatchFolderPath(), isDirectory: true)
-            .deletingLastPathComponent()
+        URL(fileURLWithPath: bufferEventFolderPath(), isDirectory: true)
             .appendingPathComponent("Exports", isDirectory: true)
             .path
     }
 
     public func bufferEditsFolderPath() -> String {
-        URL(fileURLWithPath: bufferBatchFolderPath(), isDirectory: true)
-            .deletingLastPathComponent()
-            .appendingPathComponent("Edits", isDirectory: true)
+        URL(fileURLWithPath: bufferEventFolderPath(), isDirectory: true)
+            .appendingPathComponent("Photomator", isDirectory: true)
             .path
+    }
+
+    public func bufferExportFolderPath(_ folderName: String) -> String {
+        URL(fileURLWithPath: bufferExportsFolderPath(), isDirectory: true)
+            .appendingPathComponent(Self.pathComponent(folderName, fallback: "Masters"), isDirectory: true)
+            .path
+    }
+
+    public func eventWorkspaceFolderPaths() -> [String] {
+        [
+            bufferBatchFolderPath(),
+            bufferEditsFolderPath(),
+            bufferExportFolderPath("Masters"),
+            bufferExportFolderPath("Web"),
+            bufferExportFolderPath("Social")
+        ]
     }
 
     public var archiveEventDate: String {
@@ -346,7 +406,7 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
 
     private func eventFolderName() -> String {
         let yearMonth = batchID.count >= 7 ? String(batchID.prefix(7)) : Self.monthFormatter.string(from: Date())
-        let event = Self.pathComponent(eventName, fallback: "Import")
+        let event = EventNamePolicy.folderName(for: eventName, fallback: "Import")
             .replacingOccurrences(of: " ", with: "-")
             .replacingOccurrences(of: "_", with: "-")
         return "\(yearMonth)_\(event)"
@@ -381,6 +441,94 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
             .replacingOccurrences(of: ":", with: "-")
             .trimmingCharacters(in: CharacterSet(charactersIn: " ._-"))
         return sanitized.isEmpty ? fallback : sanitized
+    }
+}
+
+public struct SavedCameraEvent: Identifiable, Codable, Equatable, Hashable, Sendable {
+    public var id: UUID
+    public var name: String
+    public var eventDate: Date
+    public var createdAt: Date
+    public var lastUsedAt: Date
+    /// `nil` is the migration-safe default for events created before Immich routing existed.
+    /// It intentionally behaves like `false`: storage-only until the user opts in.
+    public var immichUploadEnabled: Bool?
+    public var immichAlbumPolicy: ImmichAlbumPolicy?
+    public var immichAlbumName: String?
+
+    public init(
+        id: UUID = UUID(),
+        name: String,
+        eventDate: Date,
+        createdAt: Date = Date(),
+        lastUsedAt: Date = Date(),
+        immichUploadEnabled: Bool? = nil,
+        immichAlbumPolicy: ImmichAlbumPolicy? = nil,
+        immichAlbumName: String? = nil
+    ) {
+        self.id = id
+        self.name = name
+        self.eventDate = eventDate
+        self.createdAt = createdAt
+        self.lastUsedAt = lastUsedAt
+        self.immichUploadEnabled = immichUploadEnabled
+        self.immichAlbumPolicy = immichAlbumPolicy
+        self.immichAlbumName = immichAlbumName
+    }
+
+    public var sendsToImmich: Bool { immichUploadEnabled ?? false }
+    public var resolvedImmichAlbumPolicy: ImmichAlbumPolicy { immichAlbumPolicy ?? .none }
+}
+
+public enum ImmichAlbumPolicy: String, Codable, CaseIterable, Identifiable, Sendable {
+    case none
+    case event
+    case custom
+
+    public var id: String { rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .none: "No album"
+        case .event: "Event album"
+        case .custom: "Custom album"
+        }
+    }
+}
+
+public struct PhotoEventAssignment: Codable, Equatable, Hashable, Sendable {
+    public var sourceRootPath: String
+    public var relativePath: String
+    public var fileSize: Int64
+    public var modifiedAt: Date
+    public var eventID: UUID
+    public var deviceID: String?
+    /// `nil` follows the event setting; `false` is explicitly storage-only.
+    public var immichUploadOverride: Bool?
+
+    public init(
+        sourceRootPath: String,
+        relativePath: String,
+        fileSize: Int64,
+        modifiedAt: Date,
+        eventID: UUID,
+        deviceID: String? = nil,
+        immichUploadOverride: Bool? = nil
+    ) {
+        self.sourceRootPath = sourceRootPath
+        self.relativePath = relativePath
+        self.fileSize = fileSize
+        self.modifiedAt = modifiedAt
+        self.eventID = eventID
+        self.deviceID = deviceID
+        self.immichUploadOverride = immichUploadOverride
+    }
+
+    public func matches(sourceRootPath: String, file: FileRecord) -> Bool {
+        self.sourceRootPath == sourceRootPath
+            && relativePath == file.path
+            && fileSize == file.size
+            && abs(modifiedAt.timeIntervalSince(file.modifiedAt)) < 1
     }
 }
 

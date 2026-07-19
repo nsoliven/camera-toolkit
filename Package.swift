@@ -11,9 +11,15 @@ let package = Package(
         .library(name: "CameraToolkitCore", targets: ["CameraToolkitCore"]),
         .executable(name: "CameraToolkit", targets: ["CameraToolkitApp"])
     ],
+    dependencies: [
+        .package(url: "https://github.com/groue/GRDB.swift.git", from: "7.10.0")
+    ],
     targets: [
         .target(
             name: "CameraToolkitCore",
+            dependencies: [
+                .product(name: "GRDB", package: "GRDB.swift")
+            ],
             linkerSettings: [
                 .linkedLibrary("sqlite3")
             ]

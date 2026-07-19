@@ -4,6 +4,94 @@ import SQLite3
 import XCTest
 
 final class CatalogStoreTests: XCTestCase {
+    func testLocalCatalogSyncDoesNotTouchConfiguredLibraryFolders() throws {
+        try withTemporaryDirectory { root in
+            let catalog = root.appendingPathComponent("Catalog/catalog.sqlite")
+            let library = root.appendingPathComponent("Slow Library", isDirectory: true)
+            let configuration = AppConfiguration(
+                demoRootPath: root.appendingPathComponent("Demo").path,
+                importSourcePath: root.appendingPathComponent("Card").path,
+                archivePath: library.appendingPathComponent("Originals").path,
+                bufferPath: root.appendingPathComponent("Buffer").path,
+                cameraLibraryRootPath: library.path,
+                catalogDatabasePath: catalog.path,
+                activityLogPath: root.appendingPathComponent("activity.jsonl").path
+            )
+
+            _ = try CatalogStore(url: catalog).bootstrap(
+                configuration: configuration,
+                createBackup: false,
+                createLibraryFolders: false
+            )
+
+            XCTAssertTrue(FileManager.default.fileExists(atPath: catalog.path))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: library.path))
+            XCTAssertEqual(
+                try integerValue("SELECT COUNT(*) FROM sqlite_schema WHERE name = 'event_asset_locations'", database: catalog),
+                1
+            )
+        }
+    }
+
+    func testOfflineConfiguredVolumeDoesNotBlockLocalCatalogSchema() throws {
+        try withTemporaryDirectory { root in
+            let catalog = root.appendingPathComponent("catalog.sqlite")
+            let missingVolume = "/Volumes/CameraToolkit-Definitely-Not-Mounted/Camera"
+            let configuration = AppConfiguration(
+                demoRootPath: root.appendingPathComponent("Demo").path,
+                importSourcePath: root.appendingPathComponent("Card").path,
+                archivePath: missingVolume + "/Originals",
+                bufferPath: root.appendingPathComponent("Buffer").path,
+                cameraLibraryRootPath: missingVolume,
+                catalogDatabasePath: catalog.path,
+                catalogBackupFolderPath: missingVolume + "/_Manifests/backups",
+                activityLogPath: root.appendingPathComponent("activity.jsonl").path
+            )
+
+            let report = try CatalogStore(url: catalog).bootstrap(configuration: configuration)
+
+            XCTAssertTrue(FileManager.default.fileExists(atPath: catalog.path))
+            XCTAssertNil(report.backupPath)
+            XCTAssertEqual(try integerValue("SELECT COUNT(*) FROM sqlite_schema WHERE name = 'events'", database: catalog), 1)
+        }
+    }
+
+    func testLargeEventSyncDoesNotHitSQLiteVariableLimitAndPrunesStaleAssignments() throws {
+        try withTemporaryDirectory { root in
+            let catalog = root.appendingPathComponent("catalog.sqlite")
+            let event = SavedCameraEvent(name: "Large Event", eventDate: Date(timeIntervalSince1970: 1_752_124_800))
+            let assignments = (0..<1_050).map { index in
+                PhotoEventAssignment(
+                    sourceRootPath: root.appendingPathComponent("Card").path,
+                    relativePath: String(format: "DCIM/DSC%05d.ARW", index),
+                    fileSize: Int64(index + 1),
+                    modifiedAt: Date(timeIntervalSince1970: Double(1_752_124_800 + index)),
+                    eventID: event.id,
+                    deviceID: "sony-a7v"
+                )
+            }
+            var configuration = AppConfiguration(
+                demoRootPath: root.appendingPathComponent("Demo").path,
+                importSourcePath: root.appendingPathComponent("Card").path,
+                archivePath: root.appendingPathComponent("Library/Originals").path,
+                bufferPath: root.appendingPathComponent("Buffer").path,
+                cameraLibraryRootPath: root.appendingPathComponent("Library").path,
+                catalogDatabasePath: catalog.path,
+                activityLogPath: root.appendingPathComponent("activity.jsonl").path,
+                savedEvents: [event],
+                selectedEventID: event.id,
+                photoEventAssignments: assignments
+            )
+
+            _ = try CatalogStore(url: catalog).bootstrap(configuration: configuration, createBackup: false)
+            XCTAssertEqual(try integerValue("SELECT COUNT(*) FROM event_assets", database: catalog), 1_050)
+
+            configuration.photoEventAssignments = Array(assignments.prefix(10))
+            _ = try CatalogStore(url: catalog).bootstrap(configuration: configuration, createBackup: false)
+            XCTAssertEqual(try integerValue("SELECT COUNT(*) FROM event_assets", database: catalog), 10)
+        }
+    }
+
     func testBootstrapCreatesLibraryFoldersDatabaseRowsAndBackup() throws {
         try withTemporaryDirectory { root in
             let libraryRoot = root.appendingPathComponent("Camera", isDirectory: true)

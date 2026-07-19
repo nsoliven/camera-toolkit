@@ -13,6 +13,18 @@ private struct BrowserItem: Identifiable, Hashable, Sendable {
     var kind: String
 }
 
+private struct BrowserFileIdentity: Hashable {
+    var relativePath: String
+    var size: Int64
+    var modifiedSecond: Int64
+}
+
+private let eventMediaExtensions: Set<String> = [
+    "arw", "dng", "cr2", "cr3", "nef",
+    "jpg", "jpeg", "heic", "heif", "png", "tif", "tiff", "webp",
+    "mp4", "mov", "m4v", "insv", "lrv",
+]
+
 private enum BrowserLocationKind: Hashable {
     case source(UUID)
     case workspace
@@ -96,6 +108,7 @@ private struct ImportPreviewIndex {
 
 struct PhotoBrowserView: View {
     @Bindable var model: DashboardModel
+    @State private var columnVisibility: NavigationSplitViewVisibility
     @State private var currentURL: URL
     @State private var items: [BrowserItem] = []
     @State private var selectedItemIDs: Set<String> = []
@@ -105,24 +118,47 @@ struct PhotoBrowserView: View {
     @State private var isLoading = false
     @State private var browserError: String?
     @State private var hasRequestedImportPreview = false
+    @State private var isCreatingEvent = false
+    @State private var isCollectingEventFiles = false
+    @State private var collectedEventFiles: [String: EventFileSelection] = [:]
+    @State private var isShowingCollectedFiles = false
+    @State private var previewPaneWidth: CGFloat = 390
+    @AppStorage("CameraToolkit.browserThumbnailHeight") private var thumbnailHeight = BrowserThumbnailSizing.defaultHeight
+    @FocusState private var isFileTableFocused: Bool
 
     init(model: DashboardModel) {
         self.model = model
         let initial = URL(fileURLWithPath: DashboardModel.expandedPath(model.configuration.importSourcePath), isDirectory: true)
+        _columnVisibility = State(initialValue: model.isSidebarCollapsed ? .detailOnly : .all)
         _currentURL = State(initialValue: initial)
         _selectedLocationID = State(initialValue: "source-\(model.configuration.selectedImportSourceID?.uuidString ?? "selected")")
     }
 
     var body: some View {
-        NavigationSplitView {
+        NavigationSplitView(columnVisibility: $columnVisibility) {
             sidebar
                 .navigationSplitViewColumnWidth(min: 185, ideal: 215, max: 270)
         } detail: {
             VStack(spacing: 0) {
                 browserToolbar
                 Divider()
-                fileTable
-                    .frame(minHeight: 320, maxHeight: .infinity)
+                GeometryReader { geometry in
+                    HStack(spacing: 0) {
+                        fileTable
+                            .frame(minWidth: 420, maxWidth: .infinity, minHeight: 320, maxHeight: .infinity)
+                        if let selectedPreviewURL {
+                        let maximumPreviewWidth = max(260, geometry.size.width - 420 - PreviewPaneResizeHandle.width)
+                        let renderedPreviewWidth = min(max(previewPaneWidth, 260), maximumPreviewWidth)
+                            PreviewPaneResizeHandle(
+                                previewWidth: $previewPaneWidth,
+                                renderedPreviewWidth: renderedPreviewWidth,
+                                maximumPreviewWidth: maximumPreviewWidth
+                            )
+                            CameraSelectionPreview(url: selectedPreviewURL)
+                                .frame(width: renderedPreviewWidth)
+                        }
+                    }
+                }
                 Divider()
                 safeImportArea
             }
@@ -130,6 +166,29 @@ struct PhotoBrowserView: View {
         }
         .navigationSplitViewStyle(.balanced)
         .tint(.accentColor)
+        .onChange(of: model.isSidebarCollapsed) { _, isCollapsed in
+            let requestedVisibility: NavigationSplitViewVisibility = isCollapsed ? .detailOnly : .all
+            if columnVisibility != requestedVisibility {
+                columnVisibility = requestedVisibility
+            }
+        }
+        .onChange(of: columnVisibility) { _, visibility in
+            let isCollapsed = visibility == .detailOnly
+            if model.isSidebarCollapsed != isCollapsed {
+                model.isSidebarCollapsed = isCollapsed
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: BrowserCommand.notification)) { notification in
+            guard let rawValue = notification.object as? String,
+                  let command = BrowserCommand(rawValue: rawValue) else {
+                return
+            }
+            perform(command)
+        }
+        .onChange(of: selectedItemIDs) { _, selection in
+            guard isCollectingEventFiles else { return }
+            collectItems(withIDs: selection)
+        }
         .task(id: currentURL.path) {
             await loadCurrentDirectory()
         }
@@ -147,6 +206,22 @@ struct PhotoBrowserView: View {
                 Task { await loadCurrentDirectory() }
             }
         }
+        .onChange(of: model.isRefreshing) { wasRefreshing, isRefreshing in
+            if wasRefreshing && !isRefreshing {
+                Task { await loadCurrentDirectory() }
+            }
+        }
+        .onChange(of: isCreatingEvent) { _, isPresented in
+            if isPresented {
+                isFileTableFocused = false
+            }
+        }
+        .sheet(isPresented: $isCreatingEvent) {
+            NewCameraEventSheet { name, date in
+                model.createEvent(named: name, on: date)
+                isCreatingEvent = false
+            }
+        }
     }
 
     private var sidebar: some View {
@@ -157,7 +232,18 @@ struct PhotoBrowserView: View {
                 Text("Locations")
                     .font(.headline)
                 Spacer()
+                Button(action: selectPreviousSource) {
+                    Image(systemName: "chevron.left")
+                }
+                .accessibilityLabel("Previous Camera Source")
+                .help("Previous camera source (Shift-Control-Tab)")
+                Button(action: selectNextSource) {
+                    Image(systemName: "chevron.right")
+                }
+                .accessibilityLabel("Next Camera Source")
+                .help("Next camera source (Control-Tab)")
             }
+            .buttonStyle(.borderless)
             .padding(.horizontal, 12)
             .padding(.vertical, 10)
             Divider()
@@ -266,6 +352,63 @@ struct PhotoBrowserView: View {
 
             Spacer()
 
+            Button {
+                isCollectingEventFiles.toggle()
+                if isCollectingEventFiles {
+                    collectItems(withIDs: selectedItemIDs)
+                }
+            } label: {
+                Image(systemName: isCollectingEventFiles ? "checkmark.circle.fill" : "plus.circle")
+                    .foregroundStyle(isCollectingEventFiles ? Color.accentColor : Color.primary)
+            }
+            .accessibilityLabel(isCollectingEventFiles ? "Stop Collecting Event Photos" : "Select Across Folders")
+            .help(isCollectingEventFiles
+                ? "Selection mode is on — click photos, then browse to another folder"
+                : "Start selecting photos across multiple folders")
+
+            if !collectedEventFiles.isEmpty {
+                Button {
+                    isShowingCollectedFiles = true
+                } label: {
+                    Text("\(collectedEventFiles.count)")
+                        .font(.caption.bold().monospacedDigit())
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 3)
+                        .background(Color.accentColor.opacity(0.18), in: Capsule())
+                }
+                .accessibilityLabel("Show \(collectedEventFiles.count) Collected Photos")
+                .help("Review photos collected across folders")
+                .popover(isPresented: $isShowingCollectedFiles, arrowEdge: .bottom) {
+                    CollectedEventFilesView(
+                        selections: collectedSelections,
+                        onRemove: removeCollectedSelection,
+                        onClear: clearCollectedSelections,
+                        onDone: {
+                            isCollectingEventFiles = false
+                            isShowingCollectedFiles = false
+                        }
+                    )
+                }
+            }
+
+            Button {
+                EventLibraryWindowController.shared.show(model: model)
+            } label: {
+                Image(systemName: "calendar.badge.clock")
+            }
+            .accessibilityLabel("Open Event Library")
+            .help("Browse every event across the card, buffer, NAS, and Immich (Option-Command-E)")
+
+            Button {
+                CatalogInspectorWindowController.shared.show(model: model)
+            } label: {
+                Image(systemName: "cylinder.split.1x2")
+            }
+            .accessibilityLabel("Open Photo List SQL Inspector")
+            .help("Browse SQLite tables, schema, and read-only SQL (Shift-Command-I)")
+
+            Divider().frame(height: 18)
+
             if !isCurrentImportSource {
                 Button("Import This Folder") {
                     model.useFolderAsImportSource(currentURL)
@@ -286,7 +429,7 @@ struct PhotoBrowserView: View {
                 Image(systemName: "eye")
             }
             .disabled(selectedURLs.isEmpty)
-            .help("Quick Look")
+            .help("Preview in Camera Toolkit (Space)")
 
             Button {
                 revealSelection()
@@ -303,6 +446,50 @@ struct PhotoBrowserView: View {
             }
             .disabled(isLoading)
             .help("Reload")
+
+            Menu {
+                Button("Larger Thumbnails") {
+                    increaseThumbnailSize()
+                }
+                .disabled(thumbnailHeight >= BrowserThumbnailSizing.presets.last ?? thumbnailHeight)
+
+                Button("Smaller Thumbnails") {
+                    decreaseThumbnailSize()
+                }
+                .disabled(thumbnailHeight <= BrowserThumbnailSizing.presets.first ?? thumbnailHeight)
+
+                Divider()
+
+                ForEach(BrowserThumbnailSizing.presets, id: \.self) { height in
+                    Button {
+                        thumbnailHeight = height
+                    } label: {
+                        if abs(thumbnailHeight - height) < 0.5 {
+                            Label("\(Int(height)) pt", systemImage: "checkmark")
+                        } else {
+                            Text("\(Int(height)) pt")
+                        }
+                    }
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "photo.on.rectangle")
+                    Text("\(Int(thumbnailHeight))")
+                        .font(.caption.monospacedDigit())
+                }
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .accessibilityLabel("Thumbnail Size, \(Int(thumbnailHeight)) Points")
+            .help("Thumbnail size: \(Int(thumbnailHeight)) pt (Command-Plus / Command-Minus)")
+
+            Button {
+                KeyboardShortcutsWindowController.shared.show()
+            } label: {
+                Image(systemName: "keyboard")
+            }
+            .accessibilityLabel("Keyboard Shortcuts")
+            .help("Keyboard Shortcuts (Shift-Command-K)")
         }
         .buttonStyle(.borderless)
         .padding(.horizontal, 12)
@@ -314,6 +501,7 @@ struct PhotoBrowserView: View {
         let previewIndex = hasRequestedImportPreview && !model.isBusy
             ? importPreviewIndex
             : .empty
+        let eventIndex = currentEventAssignmentIndex
         return Group {
             if isLoading && items.isEmpty {
                 ProgressView("Loading \(currentURL.lastPathComponent)…")
@@ -334,9 +522,32 @@ struct PhotoBrowserView: View {
                 Table(items, selection: $selectedItemIDs) {
                     TableColumn("Name") { item in
                         HStack(spacing: 7) {
-                            Image(systemName: item.isDirectory ? "folder.fill" : fileSymbol(item.url))
-                                .foregroundStyle(item.isDirectory ? .blue : .secondary)
-                                .frame(width: 18)
+                            if isCollectingEventFiles,
+                               eventSelection(for: item) != nil {
+                                Button {
+                                    toggleCollectedItem(item)
+                                } label: {
+                                    Image(systemName: isCollected(item) ? "checkmark.circle.fill" : "circle")
+                                        .foregroundStyle(isCollected(item) ? Color.accentColor : Color.secondary)
+                                }
+                                .buttonStyle(.plain)
+                                .accessibilityLabel(isCollected(item) ? "Remove from Event Selection" : "Add to Event Selection")
+                                .help(isCollected(item) ? "Remove from event selection" : "Add to event selection")
+                            }
+                            if item.isDirectory {
+                                Image(systemName: "folder.fill")
+                                    .foregroundStyle(.blue)
+                                    .frame(
+                                        width: BrowserThumbnailSizing.width(for: thumbnailHeight),
+                                        height: thumbnailHeight
+                                    )
+                            } else {
+                                CameraFileThumbnail(
+                                    url: item.url,
+                                    fallbackSymbol: fileSymbol(item.url),
+                                    height: thumbnailHeight
+                                )
+                            }
                             Text(item.name)
                                 .lineLimit(1)
                             Spacer(minLength: 0)
@@ -347,7 +558,7 @@ struct PhotoBrowserView: View {
                         }
                         .contextMenu {
                             Button(item.isDirectory ? "Open" : "Open File") { open(item) }
-                            Button("Quick Look") { QuickLookPreviewController.shared.preview([item.url]) }
+                            Button("Preview") { CameraPreviewController.shared.preview([item.url]) }
                             Button("Reveal in Finder") { NSWorkspace.shared.activateFileViewerSelecting([item.url]) }
                         }
                     }
@@ -373,6 +584,28 @@ struct PhotoBrowserView: View {
                     }
                     .width(min: 80, ideal: 90, max: 105)
 
+                    TableColumn("Event") { item in
+                        if item.isDirectory {
+                            Text("—")
+                                .foregroundStyle(.tertiary)
+                        } else if isCollected(item) {
+                            Label("Selected", systemImage: "checkmark.circle.fill")
+                                .font(.caption)
+                                .foregroundStyle(.blue)
+                        } else if let identity = fileIdentity(for: item),
+                                  let event = eventIndex[identity] {
+                            Label(event.name, systemImage: "calendar.badge.checkmark")
+                                .font(.caption)
+                                .foregroundStyle(.blue)
+                                .lineLimit(1)
+                        } else {
+                            Text("Unassigned")
+                                .font(.caption)
+                                .foregroundStyle(.tertiary)
+                        }
+                    }
+                    .width(min: 100, ideal: 135, max: 180)
+
                     TableColumn("Import To") { item in
                         if !hasRequestedImportPreview {
                             Text("Preview Import to see destination")
@@ -389,6 +622,47 @@ struct PhotoBrowserView: View {
                     .width(min: 330, ideal: 430)
                 }
                 .alternatingRowBackgrounds(.enabled)
+                .focused($isFileTableFocused)
+                .onAppear {
+                    Task { @MainActor in
+                        await Task.yield()
+                        isFileTableFocused = true
+                    }
+                }
+                .onKeyPress(.space) {
+                    guard isFileTableFocused else { return .ignored }
+                    previewSelection()
+                    return .handled
+                }
+                .onKeyPress(.upArrow) {
+                    guard isFileTableFocused else { return .ignored }
+                    selectAdjacentItem(offset: -1)
+                    return .handled
+                }
+                .onKeyPress(.downArrow) {
+                    guard isFileTableFocused else { return .ignored }
+                    selectAdjacentItem(offset: 1)
+                    return .handled
+                }
+                .onKeyPress(.return) {
+                    guard isFileTableFocused else { return .ignored }
+                    openSelection()
+                    return .handled
+                }
+                .overlay(alignment: .topTrailing) {
+                    if isLoading {
+                        HStack(spacing: 6) {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text("Loading folder…")
+                                .font(.caption)
+                        }
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 6)
+                        .background(.regularMaterial, in: Capsule())
+                        .padding(10)
+                    }
+                }
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -414,64 +688,166 @@ struct PhotoBrowserView: View {
                 .padding(.vertical, 7)
                 Divider()
             }
+            eventControls
+            if model.selectedEvent != nil {
+                Divider()
+                eventWorkspaceRow
+            }
+            Divider()
+            importActionRow
+        }
+        .background(.bar)
+    }
 
-            HStack(alignment: .center, spacing: 12) {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("Safe Import")
-                        .font(.headline)
-                    Text("Camera stays untouched · Crucial is temporary · NAS originals are permanent")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+    private var eventControls: some View {
+        HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Event Selection")
+                    .font(.headline)
+                Text(eventSelectionGuidance)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Divider().frame(height: 34)
+
+            Picker("Event", selection: Binding<UUID?>(
+                get: { model.configuration.selectedEventID },
+                set: { id in
+                    if let id { model.selectEvent(id) }
                 }
-
-                Divider().frame(height: 34)
-
-                TextField("Event name", text: Binding(
-                    get: { model.configuration.eventName },
-                    set: { value in model.setEventName(value) }
-                ))
-                .textFieldStyle(.roundedBorder)
-                .frame(width: 170)
-
-                Picker("Camera", selection: Binding(
-                    get: { model.configuration.selectedDeviceID },
-                    set: { value in model.setDeviceID(value) }
-                )) {
-                    Text("Sony A7V").tag("sony-a7v")
-                    Text("DJI Osmo 360").tag("osmo-360")
-                    Text("DJI Mini 2").tag("dji-mini-2")
-                    Text("DJI Action 6").tag("action-6")
-                    Text("iPhone").tag("iphone")
+            )) {
+                Text("Choose an event").tag(UUID?.none)
+                ForEach(model.savedEvents) { event in
+                    Text("\(event.name) · \(event.eventDate.formatted(date: .abbreviated, time: .omitted))")
+                        .tag(Optional(event.id))
                 }
-                .labelsHidden()
-                .frame(width: 145)
+            }
+            .frame(width: 250)
 
-                Spacer()
+            Button {
+                isCreatingEvent = true
+            } label: {
+                Label("New Event", systemImage: "plus")
+            }
 
-                Button(hasRequestedImportPreview ? "Refresh Preview" : "Preview Import") {
+            Button(assignmentButtonTitle) {
+                model.assignFilesToSelectedEvent(filesReadyForAssignment)
+                if !collectedEventFiles.isEmpty {
+                    clearCollectedSelections()
+                }
+            }
+            .disabled(model.selectedEvent == nil || filesReadyForAssignment.isEmpty)
+
+            if !collectedEventFiles.isEmpty {
+                Button("Clear") {
+                    clearCollectedSelections()
+                }
+                .help("Clear the cross-folder event selection")
+            }
+
+            Button("Queue Saved (\(model.selectedEventFiles.count))") {
+                model.queueSelectedEventFiles()
+            }
+            .disabled(model.selectedEventFiles.isEmpty)
+
+            Spacer()
+
+            Picker("Camera", selection: Binding(
+                get: { model.configuration.selectedDeviceID },
+                set: { value in model.setDeviceID(value) }
+            )) {
+                Text("Sony A7V").tag("sony-a7v")
+                Text("DJI Osmo 360").tag("osmo-360")
+                Text("DJI Mini 2").tag("dji-mini-2")
+                Text("DJI Action 6").tag("action-6")
+                Text("iPhone").tag("iphone")
+            }
+            .labelsHidden()
+            .frame(width: 145)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+    }
+
+    private var eventWorkspaceRow: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "folder.badge.gearshape")
+                .foregroundStyle(.mint)
+                .font(.title3)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Card Copy · \(model.expandedBufferIngestPath)")
+                Text("Photomator · \(model.expandedBufferEditsPath)")
+                Text("Exports · \(model.expandedBufferExportsPath)/{Masters, Web, Social}")
+            }
+            .font(.caption.monospaced())
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+            .truncationMode(.middle)
+
+            Spacer()
+
+            Button("Create Folders") {
+                model.createSelectedEventFolders()
+            }
+            Button("Open Photomator Folder") {
+                model.openEventFolder(model.expandedBufferEditsPath)
+            }
+            Button("Open Exports") {
+                model.openEventFolder(model.expandedBufferExportsPath)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+    }
+
+    private var importActionRow: some View {
+        HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Safe Event Import")
+                    .font(.headline)
+                Text("Camera stays untouched · only assigned files copy · Crucial is temporary · NAS originals are permanent")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer()
+
+            Button(hasRequestedImportPreview ? "Refresh Event Preview" : "Preview Event") {
+                hasRequestedImportPreview = true
+                model.previewSelectedEventImport()
+            }
+            .disabled(model.isBusy || model.selectedEventFiles.isEmpty)
+            .help("Quickly compare assigned file paths and sizes; checksums run during Copy + Verify")
+
+            Button("Copy Event (\(model.queuedFiles.count)) + Verify") {
+                model.copyQueuedFilesToBuffer()
+            }
+            .disabled(model.isBusy || model.queuedFiles.isEmpty)
+            .help("Copy only queued event files to Crucial, then verify those files")
+
+            Button("Archive + Verify") {
+                model.archiveBufferToLibrary()
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(model.isBusy || !model.isBufferVerifiedForArchive || !folderExists(model.configuration.cameraLibraryRootPath))
+            .help("Organize the verified event copy into permanent NAS event folders and write a checksum manifest")
+
+            Menu {
+                Button("Preview Full Card") {
                     hasRequestedImportPreview = true
                     model.previewSafeImport()
                 }
-                .disabled(model.isBusy || !folderExists(model.configuration.importSourcePath))
-                .help("Checksum the source and compare both destinations without copying")
-
-                Button("Copy + Verify") {
+                Button("Copy Full Card + Verify") {
                     model.copySourceToBuffer()
                 }
-                .disabled(model.isBusy || !folderExists(model.configuration.importSourcePath))
-                .help("Copy the full card to the temporary workspace, then verify every file")
-
-                Button("Archive + Verify") {
-                    model.archiveBufferToLibrary()
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(model.isBusy || !model.isBufferVerifiedForArchive || !folderExists(model.configuration.cameraLibraryRootPath))
-                .help("Organize the verified Crucial copy into permanent NAS event folders and write a checksum manifest")
+            } label: {
+                Image(systemName: "ellipsis.circle")
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 10)
+            .help("Full-card tools")
         }
-        .background(.bar)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
     }
 
     @ViewBuilder
@@ -591,9 +967,11 @@ struct PhotoBrowserView: View {
 
         let workspaceNew = Set(model.activePlan.new.map(\.path))
         let workspaceExisting = Set(model.activePlan.existing.map(\.path))
+        let workspaceVerified = Set(model.activePlan.existing.filter { $0.sha256 != nil }.map(\.path))
         let workspaceConflicts = Set(model.activePlan.conflicts.map(\.path))
         let archiveNew = Set(model.organizedArchivePlan.new.map(\.sourcePath))
         let archiveExisting = Set(model.organizedArchivePlan.existing.map(\.sourcePath))
+        let archiveVerified = Set(model.organizedArchivePlan.existing.filter { !$0.sha256.isEmpty }.map(\.sourcePath))
         let archiveConflicts = Set(model.organizedArchivePlan.conflicts.map(\.sourcePath))
         let archiveMappings = model.organizedArchivePlan.new
             + model.organizedArchivePlan.existing
@@ -610,8 +988,10 @@ struct PhotoBrowserView: View {
                 workspaceState = .conflict
             } else if workspaceNew.contains(mapping.sourcePath) {
                 workspaceState = .willCreate
-            } else if workspaceExisting.contains(mapping.sourcePath) {
+            } else if workspaceVerified.contains(mapping.sourcePath) {
                 workspaceState = .verified
+            } else if workspaceExisting.contains(mapping.sourcePath) {
+                workspaceState = .exists
             } else {
                 workspaceState = .exists
             }
@@ -620,8 +1000,10 @@ struct PhotoBrowserView: View {
                 archiveState = .conflict
             } else if archiveNew.contains(mapping.sourcePath) {
                 archiveState = .willCreate
-            } else if archiveExisting.contains(mapping.sourcePath) {
+            } else if archiveVerified.contains(mapping.sourcePath) {
                 archiveState = .verified
+            } else if archiveExisting.contains(mapping.sourcePath) {
+                archiveState = .exists
             } else {
                 archiveState = .exists
             }
@@ -728,6 +1110,146 @@ struct PhotoBrowserView: View {
         items.filter { selectedItemIDs.contains($0.id) }.map(\.url)
     }
 
+    private var selectedPreviewURL: URL? {
+        guard selectedItemIDs.count == 1,
+              let item = items.first(where: { selectedItemIDs.contains($0.id) }),
+              !item.isDirectory,
+              CameraPreviewSupport.canDecode(item.url) else {
+            return nil
+        }
+        return item.url
+    }
+
+    private var selectedEventFileSelections: [EventFileSelection] {
+        items
+            .filter { selectedItemIDs.contains($0.id) }
+            .compactMap(eventSelection(for:))
+    }
+
+    private var collectedSelections: [EventFileSelection] {
+        collectedEventFiles.values.sorted {
+            if $0.sourceRootPath == $1.sourceRootPath {
+                return $0.file.path.localizedStandardCompare($1.file.path) == .orderedAscending
+            }
+            return $0.sourceRootPath.localizedStandardCompare($1.sourceRootPath) == .orderedAscending
+        }
+    }
+
+    private var filesReadyForAssignment: [EventFileSelection] {
+        collectedEventFiles.isEmpty ? selectedEventFileSelections : collectedSelections
+    }
+
+    private var assignmentButtonTitle: String {
+        if collectedEventFiles.isEmpty {
+            return "Assign Selected (\(selectedEventFileSelections.count))"
+        }
+        return "Assign Collected (\(collectedEventFiles.count))"
+    }
+
+    private var eventSelectionGuidance: String {
+        if isCollectingEventFiles {
+            return "Selection mode on · click photos, browse folders, and keep collecting"
+        }
+        if !collectedEventFiles.isEmpty {
+            let folderCount = Set(collectedSelections.map { selection in
+                selection.sourceRootPath + "\u{0}" + URL(fileURLWithPath: selection.file.path).deletingLastPathComponent().path
+            }).count
+            return "\(collectedEventFiles.count) photo(s) collected across \(folderCount) folder(s)"
+        }
+        return "Choose an event, select photos above, then assign the selection"
+    }
+
+    private var previewableURLs: [URL] {
+        items.compactMap { item in
+            guard !item.isDirectory, CameraPreviewSupport.canDecode(item.url) else { return nil }
+            return item.url
+        }
+    }
+
+    private func fileRecord(for item: BrowserItem) -> FileRecord? {
+        guard !item.isDirectory else { return nil }
+        let sourceRoot = URL(
+            fileURLWithPath: DashboardModel.expandedPath(model.configuration.importSourcePath),
+            isDirectory: true
+        ).standardizedFileURL.path
+        let relative = relativePath(item.url.standardizedFileURL.path, under: sourceRoot)
+        guard relative != item.url.standardizedFileURL.path,
+              (try? PathSafety.validateRelativePath(relative)) != nil else {
+            return nil
+        }
+        return FileRecord(path: relative, size: item.size, modifiedAt: item.modifiedAt)
+    }
+
+    private func fileIdentity(for item: BrowserItem) -> BrowserFileIdentity? {
+        guard let file = fileRecord(for: item) else { return nil }
+        return BrowserFileIdentity(
+            relativePath: file.path,
+            size: file.size,
+            modifiedSecond: Int64(file.modifiedAt.timeIntervalSinceReferenceDate.rounded())
+        )
+    }
+
+    private var currentEventAssignmentIndex: [BrowserFileIdentity: SavedCameraEvent] {
+        let root = URL(
+            fileURLWithPath: DashboardModel.expandedPath(model.configuration.importSourcePath),
+            isDirectory: true
+        ).standardizedFileURL.path
+        let eventsByID = Dictionary(uniqueKeysWithValues: model.savedEvents.map { ($0.id, $0) })
+        var result: [BrowserFileIdentity: SavedCameraEvent] = [:]
+        for assignment in model.configuration.photoEventAssignments where
+            URL(fileURLWithPath: assignment.sourceRootPath, isDirectory: true).standardizedFileURL.path == root {
+            guard let event = eventsByID[assignment.eventID] else { continue }
+            result[BrowserFileIdentity(
+                relativePath: assignment.relativePath,
+                size: assignment.fileSize,
+                modifiedSecond: Int64(assignment.modifiedAt.timeIntervalSinceReferenceDate.rounded())
+            )] = event
+        }
+        return result
+    }
+
+    private func eventSelection(for item: BrowserItem) -> EventFileSelection? {
+        guard eventMediaExtensions.contains(item.url.pathExtension.lowercased()) else { return nil }
+        guard let file = fileRecord(for: item) else { return nil }
+        return EventFileSelection(
+            sourceRootPath: URL(
+                fileURLWithPath: DashboardModel.expandedPath(model.configuration.importSourcePath),
+                isDirectory: true
+            ).standardizedFileURL.path,
+            file: file
+        )
+    }
+
+    private func isCollected(_ item: BrowserItem) -> Bool {
+        guard let selection = eventSelection(for: item) else { return false }
+        return collectedEventFiles[selection.id] != nil
+    }
+
+    private func collectItems(withIDs ids: Set<String>) {
+        for item in items where ids.contains(item.id) {
+            guard let selection = eventSelection(for: item) else { continue }
+            collectedEventFiles[selection.id] = selection
+        }
+    }
+
+    private func toggleCollectedItem(_ item: BrowserItem) {
+        guard let selection = eventSelection(for: item) else { return }
+        if collectedEventFiles.removeValue(forKey: selection.id) == nil {
+            collectedEventFiles[selection.id] = selection
+        }
+        isFileTableFocused = true
+    }
+
+    private func removeCollectedSelection(_ selection: EventFileSelection) {
+        collectedEventFiles.removeValue(forKey: selection.id)
+    }
+
+    private func clearCollectedSelections() {
+        collectedEventFiles.removeAll()
+        isCollectingEventFiles = false
+        isShowingCollectedFiles = false
+    }
+
     private var isCurrentImportSource: Bool {
         currentURL.standardizedFileURL.path == URL(
             fileURLWithPath: DashboardModel.expandedPath(model.configuration.importSourcePath),
@@ -802,6 +1324,71 @@ struct PhotoBrowserView: View {
         navigate(to: currentURL.deletingLastPathComponent())
     }
 
+    private func selectAdjacentItem(offset: Int) {
+        guard !items.isEmpty else { return }
+        let selectedIndex = items.firstIndex { selectedItemIDs.contains($0.id) }
+        let startingIndex = selectedIndex ?? (offset > 0 ? -1 : items.count)
+        let destinationIndex = min(max(startingIndex + offset, 0), items.count - 1)
+        selectedItemIDs = [items[destinationIndex].id]
+        isFileTableFocused = true
+    }
+
+    private func selectPreviousSource() {
+        selectAdjacentSource(offset: -1)
+    }
+
+    private func selectNextSource() {
+        selectAdjacentSource(offset: 1)
+    }
+
+    private func selectAdjacentSource(offset: Int) {
+        let connectedSources = sourceLocations.filter { folderExists($0.path) }
+        guard !connectedSources.isEmpty else { return }
+        let currentIndex = connectedSources.firstIndex { $0.id == selectedLocationID }
+        let startingIndex = currentIndex ?? (offset > 0 ? -1 : 0)
+        let destinationIndex = (startingIndex + offset + connectedSources.count) % connectedSources.count
+        selectedLocationID = connectedSources[destinationIndex].id
+    }
+
+    private func perform(_ command: BrowserCommand) {
+        switch command {
+        case .copySelection:
+            FileClipboardWriter.copy(selectedURLs)
+        case .selectAll:
+            selectedItemIDs = Set(items.map(\.id))
+        case .openSelection:
+            openSelection()
+        case .previewSelection:
+            previewSelection()
+        case .revealSelection:
+            revealSelection()
+        case .createFolder:
+            createFolder()
+        case .goBack:
+            goBack()
+        case .goForward:
+            goForward()
+        case .goUp:
+            goUp()
+        case .previousSource:
+            selectPreviousSource()
+        case .nextSource:
+            selectNextSource()
+        case .increaseThumbnailSize:
+            increaseThumbnailSize()
+        case .decreaseThumbnailSize:
+            decreaseThumbnailSize()
+        }
+    }
+
+    private func increaseThumbnailSize() {
+        thumbnailHeight = BrowserThumbnailSizing.larger(than: thumbnailHeight)
+    }
+
+    private func decreaseThumbnailSize() {
+        thumbnailHeight = BrowserThumbnailSizing.smaller(than: thumbnailHeight)
+    }
+
     private func open(_ item: BrowserItem) {
         if item.isDirectory {
             navigate(to: item.url)
@@ -811,7 +1398,19 @@ struct PhotoBrowserView: View {
     }
 
     private func previewSelection() {
-        QuickLookPreviewController.shared.preview(selectedURLs)
+        let selectedPreviewURL = selectedURLs.first { CameraPreviewSupport.canDecode($0) }
+        CameraPreviewController.shared.preview(
+            previewableURLs,
+            startingAt: selectedPreviewURL
+        )
+    }
+
+    private func openSelection() {
+        guard selectedItemIDs.count == 1,
+              let item = items.first(where: { selectedItemIDs.contains($0.id) }) else {
+            return
+        }
+        open(item)
     }
 
     private func revealSelection() {
@@ -898,17 +1497,231 @@ struct PhotoBrowserView: View {
     }
 }
 
+private struct PreviewPaneResizeHandle: View {
+    static let width: CGFloat = 10
+
+    @Binding var previewWidth: CGFloat
+    let renderedPreviewWidth: CGFloat
+    let maximumPreviewWidth: CGFloat
+
+    @State private var dragOriginWidth: CGFloat?
+    @State private var isHovering = false
+
+    var body: some View {
+        ZStack {
+            Color.clear
+            RoundedRectangle(cornerRadius: 1)
+                .fill(isHovering ? Color.accentColor : Color.primary.opacity(0.2))
+                .frame(width: isHovering ? 3 : 1)
+        }
+        .frame(width: Self.width)
+        .contentShape(Rectangle())
+        .gesture(
+            DragGesture(minimumDistance: 0)
+                .onChanged { value in
+                    if dragOriginWidth == nil {
+                        dragOriginWidth = renderedPreviewWidth
+                    }
+                    let requestedWidth = (dragOriginWidth ?? renderedPreviewWidth) - value.translation.width
+                    previewWidth = min(max(requestedWidth, 260), maximumPreviewWidth)
+                }
+                .onEnded { _ in
+                    dragOriginWidth = nil
+                }
+        )
+        .onHover { hovering in
+            isHovering = hovering
+            (hovering ? NSCursor.resizeLeftRight : NSCursor.arrow).set()
+        }
+        .help("Drag to resize the preview")
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Resize Preview")
+        .accessibilityValue("\(Int(renderedPreviewWidth)) points wide")
+    }
+}
+
+private struct CollectedEventFilesView: View {
+    let selections: [EventFileSelection]
+    let onRemove: (EventFileSelection) -> Void
+    let onClear: () -> Void
+    let onDone: () -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 10) {
+                Image(systemName: "photo.stack.fill")
+                    .foregroundStyle(.blue)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Event Selection")
+                        .font(.headline)
+                    Text("\(selections.count) photo(s) kept while you browse folders")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Clear", role: .destructive, action: onClear)
+                    .disabled(selections.isEmpty)
+            }
+            .padding(14)
+
+            Divider()
+
+            if selections.isEmpty {
+                ContentUnavailableView(
+                    "No Photos Selected",
+                    systemImage: "plus.circle",
+                    description: Text("Turn on selection mode, then click photos in any folder.")
+                )
+            } else {
+                List(selections) { selection in
+                    HStack(spacing: 10) {
+                        Image(systemName: "photo")
+                            .foregroundStyle(.blue)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(URL(fileURLWithPath: selection.file.path).lastPathComponent)
+                                .lineLimit(1)
+                            Text("\(URL(fileURLWithPath: selection.sourceRootPath).lastPathComponent) · \(selection.file.path)")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        }
+                        Spacer()
+                        Text(selection.file.size.formattedBytes)
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                        Button {
+                            onRemove(selection)
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Remove \(URL(fileURLWithPath: selection.file.path).lastPathComponent)")
+                    }
+                    .padding(.vertical, 3)
+                }
+            }
+
+            Divider()
+
+            HStack {
+                Text("You can close this and continue in another folder.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("Done Selecting", action: onDone)
+                    .keyboardShortcut(.defaultAction)
+            }
+            .padding(12)
+        }
+        .frame(width: 520, height: 390)
+    }
+}
+
+private struct NewCameraEventSheet: View {
+    var onCreate: (String, Date) -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var name = ""
+    @State private var date = Date()
+    @State private var hasAttemptedCreate = false
+    @FocusState private var isNameFocused: Bool
+
+    private var validation: EventNameValidation {
+        EventNamePolicy.validate(name)
+    }
+
+    private var shouldShowError: Bool {
+        hasAttemptedCreate || !name.isEmpty
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("New Event")
+                    .font(.title2.bold())
+                Text("This saves the event for reuse across camera cards and creates its Crucial workspace folders.")
+                    .foregroundStyle(.secondary)
+            }
+
+            Form {
+                VStack(alignment: .leading, spacing: 7) {
+                    TextField("Event name", text: $name, prompt: Text("21st Birthday, Utah, YouTube…"))
+                        .focused($isNameFocused)
+                        .onSubmit(createEvent)
+
+                    if shouldShowError, let errorMessage = validation.errorMessage {
+                        Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.red)
+
+                        if let suggestion = validation.suggestion {
+                            Button("Use “\(suggestion)”") {
+                                name = suggestion
+                                isNameFocused = true
+                            }
+                            .buttonStyle(.link)
+                            .font(.caption)
+                            .accessibilityLabel("Use suggested event name \(suggestion)")
+                        }
+                    } else if !name.isEmpty {
+                        Label("Spaces and normal punctuation are supported.", systemImage: "checkmark.circle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.green)
+                    }
+                }
+                DatePicker("Event date", selection: $date, displayedComponents: .date)
+            }
+            .formStyle(.grouped)
+
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                Button("Create Event") {
+                    createEvent()
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20)
+        .frame(width: 460)
+        .onAppear {
+            isNameFocused = true
+        }
+    }
+
+    private func createEvent() {
+        hasAttemptedCreate = true
+        guard validation.isValid else {
+            NSSound.beep()
+            isNameFocused = true
+            return
+        }
+        onCreate(validation.normalizedName, date)
+    }
+}
+
 @MainActor
-private final class QuickLookPreviewController: NSObject, QLPreviewPanelDataSource {
-    static let shared = QuickLookPreviewController()
+private final class CameraPreviewController: NSObject, QLPreviewPanelDataSource {
+    static let shared = CameraPreviewController()
     private var urls: [URL] = []
 
-    func preview(_ urls: [URL]) {
-        guard !urls.isEmpty, let panel = QLPreviewPanel.shared() else { return }
-        self.urls = urls
+    func preview(_ urls: [URL], startingAt selectedURL: URL? = nil) {
+        let files = urls.filter { !$0.hasDirectoryPath }
+        guard !files.isEmpty else { return }
+        if files.contains(where: { $0.pathExtension.lowercased() == "arw" }) {
+            EmbeddedPreviewWindowController.shared.show(urls: files, startingAt: selectedURL)
+            return
+        }
+        guard let panel = QLPreviewPanel.shared() else { return }
+        self.urls = files
         panel.dataSource = self
         panel.reloadData()
-        panel.currentPreviewItemIndex = 0
+        panel.currentPreviewItemIndex = selectedURL.flatMap { selected in
+            files.firstIndex { $0.standardizedFileURL == selected.standardizedFileURL }
+        } ?? 0
         panel.makeKeyAndOrderFront(nil)
     }
 

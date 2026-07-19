@@ -9,7 +9,7 @@ struct LibraryView: View {
             HeaderView(
                 eyebrow: "Library",
                 title: "Open photos like a Mac app",
-                subtitle: "Browse the chosen from folder, then click a photo to open a protected edit copy in Preview by default."
+                subtitle: "Browse the chosen source, preview RAWs inside Camera Toolkit, or open a protected edit copy in Photomator."
             )
 
             Panel(
@@ -64,7 +64,7 @@ struct LibraryView: View {
                 title: "Photos",
                 symbol: "photo.on.rectangle.angled",
                 helpTitle: "Photos",
-                helpText: "Single-clicking a row opens an edit copy in the configured editor. Preview is the default editor, and the real originals stay untouched."
+                helpText: "Opening a row creates a protected working copy in the configured editor. Photomator is the default, and the real originals stay untouched."
             ) {
                 if model.libraryFiles.isEmpty {
                     EmptyLibraryState(refresh: model.refreshLibraryFiles)
@@ -498,11 +498,11 @@ struct ConfigView: View {
                 title: "External Editors",
                 symbol: "paintbrush.pointed",
                 helpTitle: "External Editors",
-                helpText: "Preview is the default. The Library tab opens an edit copy from this folder so editor apps do not change the original photo."
+                helpText: "Photomator is the default. The Library tab opens an edit copy from this folder so editor apps do not change the original photo."
             ) {
                 Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 16) {
                     GridRow {
-                        FormFieldLabel(title: "Default Editor", helpText: "Choose which app opens when you click a photo in Library. Preview is the safest default because it is built into macOS.")
+                        FormFieldLabel(title: "Default Editor", helpText: "Choose which app opens a protected working copy from Library. Photomator is the default.")
                         Picker(
                             "Default Editor",
                             selection: Binding(

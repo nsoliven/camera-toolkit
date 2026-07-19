@@ -68,6 +68,27 @@ final class ImmichClientTests: XCTestCase {
         ])
         XCTAssertEqual(transport.requests[2].value(forHTTPHeaderField: "x-api-key"), "secret-key")
     }
+
+    func testBulkChecksumCheckIsAuthenticatedReadOnlyAndMapsDuplicates() async throws {
+        let transport = MockImmichTransport()
+        transport.bodyByPath["/api/assets/bulk-upload-check"] = #"{"results":[{"id":"first","action":"reject","reason":"duplicate","assetId":"asset-1","isTrashed":false},{"id":"second","action":"accept"}]}"#
+        let client = try ImmichClient(serverURL: "https://photos.example.com", apiKey: "secret-key", transport: transport)
+
+        let results = try await client.checkBulkUpload([
+            ImmichChecksumQuery(id: "first", checksum: "abc123"),
+            ImmichChecksumQuery(id: "second", checksum: "def456")
+        ])
+
+        XCTAssertEqual(results.map(\.isPresent), [true, false])
+        XCTAssertEqual(results.first?.assetID, "asset-1")
+        let request = try XCTUnwrap(transport.requests.first)
+        XCTAssertEqual(request.httpMethod, "POST")
+        XCTAssertEqual(request.url?.path, "/api/assets/bulk-upload-check")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "x-api-key"), "secret-key")
+        let body = try XCTUnwrap(request.httpBody)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        XCTAssertEqual((json["assets"] as? [[String: String]])?.count, 2)
+    }
 }
 
 private final class MockImmichTransport: HTTPTransport, @unchecked Sendable {
