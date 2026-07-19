@@ -1,0 +1,220 @@
+import CameraToolkitCore
+import SwiftUI
+
+struct ConfigView: View {
+    @Bindable var model: DashboardModel
+
+    var body: some View {
+        Form {
+            Section("Photo Library") {
+                PathSettingRow(
+                    title: "Library root",
+                    path: Binding(
+                        get: { model.configuration.cameraLibraryRootPath },
+                        set: { model.setCameraLibraryRoot($0) }
+                    ),
+                    choose: { model.chooseCameraLibraryRoot() }
+                )
+                PathSettingRow(
+                    title: "Photo list database",
+                    path: Binding(
+                        get: { model.configuration.catalogDatabasePath },
+                        set: { model.setConfigPath(\.catalogDatabasePath, to: $0) }
+                    ),
+                    choose: { model.chooseCatalogDatabaseFile() }
+                )
+                PathSettingRow(
+                    title: "Photo list backups",
+                    path: Binding(
+                        get: { model.configuration.catalogBackupFolderPath },
+                        set: { model.setConfigPath(\.catalogBackupFolderPath, to: $0) }
+                    ),
+                    choose: {
+                        _ = model.chooseFolder(
+                            title: "Choose Photo List Backup Folder",
+                            keyPath: \.catalogBackupFolderPath
+                        )
+                    }
+                )
+                Button("Prepare Photo List") { model.prepareLibraryCatalog() }
+            }
+
+            LocationSettingsSection(
+                title: "Camera Sources",
+                role: .importSource,
+                addTitle: "Add Camera Source",
+                model: model
+            )
+            LocationSettingsSection(
+                title: "Library Targets",
+                role: .archive,
+                addTitle: "Add Library Target",
+                model: model
+            )
+            LocationSettingsSection(
+                title: "Buffer Drives",
+                role: .buffer,
+                addTitle: "Add Buffer Drive",
+                model: model
+            )
+
+            Section("Import Defaults") {
+                Picker(
+                    "Camera",
+                    selection: Binding(
+                        get: { model.configuration.selectedDeviceID },
+                        set: { model.setDeviceID($0) }
+                    )
+                ) {
+                    Text("Generic Camera").tag("generic-camera")
+                    Text("Sony A7V").tag("sony-a7v")
+                    Text("DJI Osmo 360").tag("osmo-360")
+                    Text("DJI Mini 2").tag("dji-mini-2")
+                    Text("DJI Action 6").tag("action-6")
+                    Text("iPhone").tag("iphone")
+                }
+                TextField(
+                    "Default event name",
+                    text: Binding(
+                        get: { model.configuration.eventName },
+                        set: { model.setEventName($0) }
+                    )
+                )
+            }
+
+            Section("Immich") {
+                TextField(
+                    "Server URL",
+                    text: Binding(
+                        get: { model.configuration.immichServerURL },
+                        set: { model.setImmichServerURL($0) }
+                    )
+                )
+                SecureField("API key", text: $model.immichAPIKeyDraft)
+                Text(model.immichConnectionStatus)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                HStack {
+                    Button("Save Key") { model.saveImmichAPIKey() }
+                    Button(model.immichIsTestingConnection ? "Testing…" : "Test Connection") {
+                        model.testImmichConnection()
+                    }
+                    .disabled(model.immichIsTestingConnection)
+                }
+            }
+
+            Section("Local App Data") {
+                PathSettingRow(
+                    title: "Test data",
+                    path: Binding(
+                        get: { model.configuration.demoRootPath },
+                        set: { model.setConfigPath(\.demoRootPath, to: $0) }
+                    ),
+                    choose: {
+                        _ = model.chooseFolder(title: "Choose Test Data Folder", keyPath: \.demoRootPath)
+                    }
+                )
+                PathSettingRow(
+                    title: "Activity log",
+                    path: Binding(
+                        get: { model.configuration.activityLogPath },
+                        set: { model.setConfigPath(\.activityLogPath, to: $0) }
+                    ),
+                    choose: { model.chooseActivityLogFile() }
+                )
+                Text("API keys are stored in macOS Keychain. Paths and preferences are stored locally.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+        .padding()
+    }
+}
+
+private struct PathSettingRow: View {
+    var title: String
+    @Binding var path: String
+    var choose: () -> Void
+
+    var body: some View {
+        LabeledContent(title) {
+            HStack {
+                PathAutocompleteField(path: $path, placeholder: "Choose a path")
+                    .frame(minWidth: 320, minHeight: 28)
+                Button("Choose…", action: choose)
+            }
+        }
+    }
+}
+
+private struct LocationSettingsSection: View {
+    var title: String
+    var role: ConfiguredLocationRole
+    var addTitle: String
+    @Bindable var model: DashboardModel
+
+    private var locations: [ConfiguredLocation] {
+        model.configuration.locations(role: role)
+    }
+
+    var body: some View {
+        Section(title) {
+            ForEach(locations) { location in
+                LocationSettingRow(
+                    location: location,
+                    isSelected: model.configuration.selectedLocationID(for: role) == location.id,
+                    canRemove: locations.count > 1,
+                    model: model
+                )
+            }
+            Button(addTitle) { model.addConfiguredLocation(role: role) }
+        }
+    }
+}
+
+private struct LocationSettingRow: View {
+    var location: ConfiguredLocation
+    var isSelected: Bool
+    var canRemove: Bool
+    @Bindable var model: DashboardModel
+
+    private var currentLocation: ConfiguredLocation {
+        model.configuration.configuredLocations.first { $0.id == location.id } ?? location
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                TextField(
+                    "Name",
+                    text: Binding(
+                        get: { currentLocation.name },
+                        set: { model.setConfiguredLocationName(location, to: $0) }
+                    )
+                )
+                if isSelected {
+                    Label("Selected", systemImage: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                } else {
+                    Button("Use") { model.useConfiguredLocation(currentLocation) }
+                }
+                Button("Choose…") { model.chooseConfiguredLocationFolder(currentLocation) }
+                Button(role: .destructive) {
+                    model.removeConfiguredLocation(currentLocation)
+                } label: {
+                    Image(systemName: "trash")
+                }
+                .disabled(!canRemove)
+            }
+            PathAutocompleteField(
+                path: Binding(
+                    get: { currentLocation.path },
+                    set: { model.setConfiguredLocationPath(location, to: $0) }
+                ),
+                placeholder: "Choose a folder"
+            )
+            .frame(minHeight: 28)
+        }
+    }
+}

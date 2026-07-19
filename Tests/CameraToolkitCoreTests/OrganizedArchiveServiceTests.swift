@@ -32,8 +32,8 @@ final class OrganizedArchiveServiceTests: XCTestCase {
 
     func testArchiveCopiesVerifiesWritesManifestAndNeverOverwritesConflict() throws {
         try withTemporaryDirectory { root in
-            let workspace = root.appendingPathComponent("Crucial/Card Copy", isDirectory: true)
-            let library = root.appendingPathComponent("NAS/Camera", isDirectory: true)
+            let workspace = root.appendingPathComponent("Buffer/Card Copy", isDirectory: true)
+            let library = root.appendingPathComponent("Library", isDirectory: true)
             let layout = OrganizedArchiveLayout(eventDate: "2026-07-11", eventName: "Lee Canyon", deviceID: "sony-a7v")
             try writeFile(workspace.appendingPathComponent("DCIM/PHOTO.ARW"), Data("raw-original".utf8))
             try writeFile(workspace.appendingPathComponent("PRIVATE/NOTE.DAT"), Data("camera-support".utf8))
@@ -61,7 +61,7 @@ final class OrganizedArchiveServiceTests: XCTestCase {
 
     func testMetadataArchivePreviewCannotBeMistakenForVerifiedArchive() throws {
         try withTemporaryDirectory { root in
-            let library = root.appendingPathComponent("NAS/Camera", isDirectory: true)
+            let library = root.appendingPathComponent("Library", isDirectory: true)
             let layout = OrganizedArchiveLayout(eventDate: "2026-07-11", eventName: "Event", deviceID: "sony-a7v")
             let destination = library.appendingPathComponent(
                 "Originals/2026/2026-07-11 Event/Sony A7V/RAW/PHOTO.ARW"

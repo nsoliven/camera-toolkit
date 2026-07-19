@@ -22,13 +22,8 @@ final class ConfigurationStoreTests: XCTestCase {
                 bufferPath: root.appendingPathComponent("Buffer").path,
                 activityLogPath: root.appendingPathComponent("activity-log.jsonl").path,
                 immichServerURL: "http://photos.local:2283",
-                editorWorkingFolderPath: root.appendingPathComponent("Working Copies").path,
-                externalEditor: .photomator,
-                rcloneBinaryPath: "/opt/homebrew/bin/rclone",
-                exiftoolBinaryPath: "/opt/homebrew/bin/exiftool",
                 selectedDeviceID: "dji-mini-2",
-                eventName: "Test Trip",
-                importDestination: .drive
+                eventName: "Test Trip"
             )
 
             try store.save(configuration)
@@ -48,8 +43,7 @@ final class ConfigurationStoreTests: XCTestCase {
               "bufferPath": "\(root.appendingPathComponent("Buffer").path)",
               "activityLogPath": "\(root.appendingPathComponent("activity-log.jsonl").path)",
               "selectedDeviceID": "sony-a7v",
-              "eventName": "Old Trip",
-              "importDestination": "nas"
+              "eventName": "Old Trip"
             }
             """
             try FileManager.default.createDirectory(at: store.url.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -58,10 +52,6 @@ final class ConfigurationStoreTests: XCTestCase {
             let loaded = try store.load(defaults: .defaults(applicationSupport: root))
 
             XCTAssertEqual(loaded.immichServerURL, "")
-            XCTAssertEqual(loaded.externalEditor, .photomator)
-            XCTAssertTrue(loaded.editorWorkingFolderPath.hasSuffix("Editor Working Copies"))
-            XCTAssertEqual(loaded.rcloneBinaryPath, "rclone")
-            XCTAssertEqual(loaded.exiftoolBinaryPath, "exiftool")
             XCTAssertEqual(loaded.selectedLocation(for: .importSource)?.path, root.appendingPathComponent("Card").path)
             XCTAssertEqual(loaded.selectedLocation(for: .archive)?.path, root.appendingPathComponent("Archive").path)
             XCTAssertEqual(loaded.selectedLocation(for: .buffer)?.path, root.appendingPathComponent("Buffer").path)

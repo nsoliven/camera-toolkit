@@ -17,7 +17,7 @@ final class EventNamePolicyTests: XCTestCase {
         XCTAssertEqual(validation.normalizedName, "Summer Beach Portraits")
     }
 
-    func testNASReservedCharactersReturnClearDashSuggestion() {
+    func testPortableFilesystemReservedCharactersReturnClearDashSuggestion() {
         let validation = EventNamePolicy.validate("Summer/Beach:Portraits")
 
         XCTAssertFalse(validation.isValid)
@@ -33,8 +33,8 @@ final class EventNamePolicyTests: XCTestCase {
 
     func testFolderNameSafelyRepairsLegacyInvalidNames() {
         XCTAssertEqual(
-            EventNamePolicy.folderName(for: "YouTube/Studio:Test", fallback: "Import"),
-            "YouTube-Studio-Test"
+            EventNamePolicy.folderName(for: "Example/Studio:Test", fallback: "Import"),
+            "Example-Studio-Test"
         )
     }
 }

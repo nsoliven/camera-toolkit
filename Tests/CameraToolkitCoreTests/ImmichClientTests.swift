@@ -22,7 +22,7 @@ final class ImmichClientTests: XCTestCase {
 
         XCTAssertEqual(report.ping, "pong")
         XCTAssertEqual(report.version, "2.5.1")
-        XCTAssertEqual(report.userName, "Nev")
+        XCTAssertEqual(report.userName, "Example User")
         XCTAssertEqual(report.userEmail, "user@example.com")
         XCTAssertEqual(transport.requests.map(\.url?.path), [
             "/api/server/ping",

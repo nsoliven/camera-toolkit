@@ -1,0 +1,5 @@
+retain_public: true
+retain_objc_accessible: true
+retain_swift_ui_previews: true
+relative_results: true
+disable_update_check: true

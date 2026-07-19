@@ -1,0 +1,26 @@
+name: Feature request
+description: Suggest a focused improvement to the camera workflow.
+title: "[Feature]: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: workflow
+    attributes:
+      label: Workflow problem
+      description: What is difficult or impossible today?
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome
+      description: Describe the behavior you want without relying on private paths or media.
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety boundary
+      options:
+        - label: This request preserves read-only camera sources and no-overwrite copies.
+          required: true

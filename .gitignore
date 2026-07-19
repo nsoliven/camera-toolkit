@@ -1,6 +1,7 @@
 .DS_Store
 ._*
 .build/
+.swiftpm/
 DerivedData/
 *.xcodeproj
 *.xcworkspace
@@ -12,6 +13,33 @@ DerivedData/
 *.env
 secrets*.json
 auth.json
+config.json
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.jsonl
+
+# Camera media and local previews must never be committed accidentally.
+*.ARW
+*.DNG
+*.CR2
+*.CR3
+*.NEF
+*.RAF
+*.ORF
+*.RW2
+*.MP4
+*.MOV
+*.arw
+*.dng
+*.cr2
+*.cr3
+*.nef
+*.raf
+*.orf
+*.rw2
+*.mp4
+*.mov
 
 # Generated app bundles.
 dist/

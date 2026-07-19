@@ -1,32 +1,23 @@
 #!/bin/zsh
-set -eu
+set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
-dist="$repo_root/dist"
-app="$dist/CameraToolkit.app"
-install_root="${CAMERA_TOOLKIT_INSTALL_DIR:-/Applications}"
-installed_app="$install_root/CameraToolkit.app"
-saved_state="$HOME/Library/Saved Application State/org.cameratoolkit.CameraToolkit.savedState"
-old_window_key="NSWindow Frame SwiftUI.ModifiedContent<CameraToolkitApp.AppShell, SwiftUI._FlexFrameLayout>-1-AppWindow-1"
-old_split_key="NSSplitView Subview Frames SwiftUI.ModifiedContent<CameraToolkitApp.AppShell, SwiftUI._FlexFrameLayout>-1-AppWindow-1, SidebarNavigationSplitView"
+dist_dir="$repo_root/dist"
+app="$dist_dir/CameraToolkit.app"
 contents="$app/Contents"
 macos="$contents/MacOS"
 resources="$contents/Resources"
 
+install=false
+if [[ "${1:-}" == "--install" ]]; then
+  install=true
+elif [[ $# -gt 0 ]]; then
+  echo "usage: scripts/package-app.sh [--install]" >&2
+  exit 2
+fi
+
 cd "$repo_root"
 swift build -c release --product CameraToolkit
-
-if pgrep -x CameraToolkit >/dev/null 2>&1; then
-  /usr/bin/osascript -e 'tell application id "org.cameratoolkit.CameraToolkit" to quit' >/dev/null 2>&1 || true
-  for _ in {1..20}; do
-    pgrep -x CameraToolkit >/dev/null 2>&1 || break
-    sleep 0.1
-  done
-  if pgrep -x CameraToolkit >/dev/null 2>&1; then
-    pkill -x CameraToolkit || true
-    sleep 0.5
-  fi
-fi
 
 rm -rf "$app"
 mkdir -p "$macos" "$resources"
@@ -67,30 +58,19 @@ cat > "$contents/Info.plist" <<'PLIST'
   <string>NSApplication</string>
   <key>NSHighResolutionCapable</key>
   <true/>
-  <key>NSQuitAlwaysKeepsWindows</key>
-  <false/>
 </dict>
 </plist>
 PLIST
 
 printf 'APPL????' > "$contents/PkgInfo"
-
+codesign --force --deep --sign - "$app"
 echo "Built $app"
 
-mkdir -p "$install_root"
-rm -rf "$installed_app"
-ditto "$app" "$installed_app"
-echo "Installed $installed_app"
-
-if [[ -d "$saved_state" ]]; then
-  rm -rf "$saved_state"
-  echo "Cleared saved window state $saved_state"
-fi
-
-if /usr/bin/defaults delete org.cameratoolkit.CameraToolkit "$old_window_key" 2>/dev/null; then
-  echo "Cleared old CameraToolkit window frame preference"
-fi
-
-if /usr/bin/defaults delete org.cameratoolkit.CameraToolkit "$old_split_key" 2>/dev/null; then
-  echo "Cleared old CameraToolkit split-view preference"
+if $install; then
+  install_dir="${CAMERA_TOOLKIT_INSTALL_DIR:-/Applications}"
+  installed_app="$install_dir/CameraToolkit.app"
+  mkdir -p "$install_dir"
+  rm -rf "$installed_app"
+  ditto "$app" "$installed_app"
+  echo "Installed $installed_app"
 fi

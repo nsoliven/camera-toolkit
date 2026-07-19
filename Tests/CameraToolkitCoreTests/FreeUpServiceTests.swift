@@ -139,7 +139,7 @@ final class FreeUpServiceTests: XCTestCase {
 
     private func makeBufferAndArchive(_ root: URL) throws -> (buffer: URL, archive: URL, trash: URL, rel: String, files: [String: Data]) {
         let buffer = root.appendingPathComponent("drive/Camera Buffer", isDirectory: true)
-        let archive = root.appendingPathComponent("nas/Originals", isDirectory: true)
+        let archive = root.appendingPathComponent("Library/Originals", isDirectory: true)
         let trash = buffer.appendingPathComponent("_Trash", isDirectory: true)
         let rel = "Sony-A7V/2026/2026-06_Test/batch-1"
         let files = [
