@@ -1,5 +1,9 @@
 # Camera Toolkit
 
+<p align="center">
+  <img src="Assets/AppIcon.png" width="180" alt="Camera Toolkit app icon">
+</p>
+
 Camera Toolkit is the native macOS app I use to move photos and video off my cameras, split a card into the events I actually shot, and get each event into a predictable editing and archive layout.
 
 I built it because a camera card is not always one event. A single card can cover several shoots, and one event can span multiple cards or folders. I wanted to select those files quickly, save the event once, preview Sony RAW files without depending on Finder, and hand the resulting folders to Photomator or another editor without reorganizing everything by hand.
@@ -42,7 +46,7 @@ swift test --jobs 1
 swift run CameraToolkit
 ```
 
-Package an unsigned local app bundle:
+Package a locally ad-hoc-signed app bundle:
 
 ```sh
 scripts/package-app.sh

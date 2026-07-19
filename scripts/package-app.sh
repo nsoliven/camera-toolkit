@@ -22,7 +22,7 @@ swift build -c release --product CameraToolkit
 rm -rf "$app"
 mkdir -p "$macos" "$resources"
 cp ".build/release/CameraToolkit" "$macos/CameraToolkit"
-"$repo_root/scripts/make-app-icon.swift" "$resources/AppIcon.icns"
+"$repo_root/scripts/make-app-icon.swift" "$repo_root/Assets/AppIcon.png" "$resources/AppIcon.icns"
 
 cat > "$contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>

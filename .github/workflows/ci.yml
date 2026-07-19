@@ -25,3 +25,9 @@ jobs:
 
       - name: Build and test
         run: swift test --jobs 1
+
+      - name: Package app
+        run: |
+          scripts/package-app.sh
+          plutil -lint dist/CameraToolkit.app/Contents/Info.plist
+          codesign --verify --deep --strict dist/CameraToolkit.app
