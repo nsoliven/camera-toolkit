@@ -9,6 +9,7 @@ final class BrowserCommandsTests: XCTestCase {
         let actions = Set(shortcuts.map(\.action))
 
         XCTAssertTrue(actions.contains("Previous or next item"))
+        XCTAssertTrue(actions.contains("Expand or collapse a folder"))
         XCTAssertTrue(actions.contains("Copy selected files"))
         XCTAssertTrue(actions.contains("Rename selected item"))
         XCTAssertTrue(actions.contains("Delete an empty folder"))
@@ -22,9 +23,27 @@ final class BrowserCommandsTests: XCTestCase {
 
     func testThumbnailSizingStepsThroughPresetsAndClampsAtEnds() {
         XCTAssertEqual(BrowserThumbnailSizing.larger(than: 32), 44)
-        XCTAssertEqual(BrowserThumbnailSizing.smaller(than: 32), 24)
+        XCTAssertEqual(BrowserThumbnailSizing.smaller(than: 24), 16)
         XCTAssertEqual(BrowserThumbnailSizing.larger(than: 104), 104)
-        XCTAssertEqual(BrowserThumbnailSizing.smaller(than: 24), 24)
+        XCTAssertEqual(BrowserThumbnailSizing.smaller(than: 16), 16)
+    }
+
+    func testBrowserTreeProjectionExpandsOnlyRequestedFoldersInOrder() {
+        let children = [
+            "DCIM": ["DCIM/100MEDIA", "DCIM/README.txt"],
+            "DCIM/100MEDIA": ["DCIM/100MEDIA/PHOTO.ARW"],
+            "M4ROOT": ["M4ROOT/CLIP"]
+        ]
+
+        XCTAssertEqual(
+            BrowserTreeProjection.flattened(
+                roots: ["DCIM", "M4ROOT"],
+                childrenByParentID: children,
+                expandedParentIDs: ["DCIM", "DCIM/100MEDIA"],
+                id: { $0 }
+            ),
+            ["DCIM", "DCIM/100MEDIA", "DCIM/100MEDIA/PHOTO.ARW", "DCIM/README.txt", "M4ROOT"]
+        )
     }
 
     func testThumbnailSizingUsesDisplayScaleForDecodeBudget() {

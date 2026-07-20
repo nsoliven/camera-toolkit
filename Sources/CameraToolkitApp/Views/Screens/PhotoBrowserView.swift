@@ -8,9 +8,52 @@ private struct BrowserItem: Identifiable, Hashable, Sendable {
     var url: URL
     var name: String
     var isDirectory: Bool
+    var isSymbolicLink: Bool
     var size: Int64
     var modifiedAt: Date
     var kind: String
+    var depth: Int
+
+    var canExpand: Bool {
+        isDirectory && !isSymbolicLink
+    }
+}
+
+private enum BrowserDirectoryReader {
+    static func load(_ url: URL, depth: Int) throws -> [BrowserItem] {
+        let keys: Set<URLResourceKey> = [
+            .isDirectoryKey,
+            .isRegularFileKey,
+            .isSymbolicLinkKey,
+            .fileSizeKey,
+            .contentModificationDateKey,
+            .localizedTypeDescriptionKey,
+            .isHiddenKey,
+        ]
+        let urls = try FileManager.default.contentsOfDirectory(
+            at: url,
+            includingPropertiesForKeys: Array(keys),
+            options: [.skipsHiddenFiles]
+        )
+        return try urls.compactMap { child -> BrowserItem? in
+            let values = try child.resourceValues(forKeys: keys)
+            guard values.isDirectory == true || values.isRegularFile == true else { return nil }
+            return BrowserItem(
+                url: child,
+                name: child.lastPathComponent,
+                isDirectory: values.isDirectory == true,
+                isSymbolicLink: values.isSymbolicLink == true,
+                size: Int64(values.fileSize ?? 0),
+                modifiedAt: values.contentModificationDate ?? .distantPast,
+                kind: values.isDirectory == true ? "Folder" : (values.localizedTypeDescription ?? child.pathExtension.uppercased()),
+                depth: depth
+            )
+        }
+        .sorted {
+            if $0.isDirectory != $1.isDirectory { return $0.isDirectory }
+            return $0.name.localizedStandardCompare($1.name) == .orderedAscending
+        }
+    }
 }
 
 private struct BrowserFileIdentity: Hashable {
@@ -117,6 +160,10 @@ struct PhotoBrowserView: View {
     @State private var columnVisibility: NavigationSplitViewVisibility
     @State private var currentURL: URL
     @State private var items: [BrowserItem] = []
+    @State private var expandedFolderIDs: Set<String> = []
+    @State private var childrenByFolderID: [String: [BrowserItem]] = [:]
+    @State private var loadingFolderIDs: Set<String> = []
+    @State private var folderExpansionErrors: [String: String] = [:]
     @State private var selectedItemIDs: Set<String> = []
     @State private var selectedLocationID: String?
     @State private var backHistory: [URL] = []
@@ -629,7 +676,7 @@ struct PhotoBrowserView: View {
             .help("Reveal in Finder")
 
             Button {
-                Task { await loadCurrentDirectory() }
+                reloadBrowserTree()
             } label: {
                 Image(systemName: "arrow.clockwise")
             }
@@ -704,9 +751,10 @@ struct PhotoBrowserView: View {
                 )
                 .contextMenu { browserBackgroundContextMenu }
             } else {
-                Table(items, selection: $selectedItemIDs) {
+                Table(visibleBrowserItems, selection: $selectedItemIDs) {
                     TableColumn("Name") { item in
                         HStack(spacing: 7) {
+                            folderDisclosure(for: item)
                             if isCollectingEventFiles,
                                eventSelection(for: item) != nil {
                                 Button {
@@ -804,7 +852,7 @@ struct PhotoBrowserView: View {
                 } primaryAction: { selection in
                     guard selection.count == 1,
                           let id = selection.first,
-                          let item = items.first(where: { $0.id == id }) else {
+                          let item = visibleBrowserItems.first(where: { $0.id == id }) else {
                         return
                     }
                     open(item)
@@ -831,6 +879,14 @@ struct PhotoBrowserView: View {
                     selectAdjacentItem(offset: 1)
                     return .handled
                 }
+                .onKeyPress(.leftArrow) {
+                    guard isFileTableFocused else { return .ignored }
+                    return collapseSelectionOrSelectParent()
+                }
+                .onKeyPress(.rightArrow) {
+                    guard isFileTableFocused else { return .ignored }
+                    return expandSelectionOrSelectFirstChild()
+                }
                 .onKeyPress(.return) {
                     guard isFileTableFocused else { return .ignored }
                     openSelection()
@@ -856,6 +912,39 @@ struct PhotoBrowserView: View {
     }
 
     @ViewBuilder
+    private func folderDisclosure(for item: BrowserItem) -> some View {
+        Color.clear
+            .frame(width: CGFloat(item.depth) * 14, height: 1)
+
+        if item.canExpand {
+            if loadingFolderIDs.contains(item.id) {
+                ProgressView()
+                    .controlSize(.mini)
+                    .frame(width: 13, height: 16)
+                    .accessibilityLabel("Loading \(item.name)")
+            } else {
+                Button {
+                    toggleFolderExpansion(item)
+                } label: {
+                    Image(systemName: folderExpansionErrors[item.id] == nil
+                        ? (expandedFolderIDs.contains(item.id) ? "chevron.down" : "chevron.right")
+                        : "exclamationmark.triangle.fill")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(folderExpansionErrors[item.id] == nil ? Color.secondary : Color.orange)
+                        .frame(width: 13, height: 16)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(disclosureAccessibilityLabel(for: item))
+                .help(disclosureHelp(for: item))
+            }
+        } else {
+            Color.clear
+                .frame(width: 13, height: 16)
+        }
+    }
+
+    @ViewBuilder
     private var browserBackgroundContextMenu: some View {
         Button {
             createFolder()
@@ -867,7 +956,7 @@ struct PhotoBrowserView: View {
         Divider()
 
         Button {
-            selectedItemIDs = Set(items.map(\.id))
+            selectedItemIDs = Set(visibleBrowserItems.map(\.id))
         } label: {
             Label("Select All", systemImage: "checkmark.circle")
         }
@@ -882,7 +971,7 @@ struct PhotoBrowserView: View {
         Divider()
 
         Button {
-            Task { await loadCurrentDirectory() }
+            reloadBrowserTree()
         } label: {
             Label("Reload", systemImage: "arrow.clockwise")
         }
@@ -891,7 +980,7 @@ struct PhotoBrowserView: View {
 
     @ViewBuilder
     private func browserContextMenu(for selection: Set<String>) -> some View {
-        let selectedItems = items.filter { selection.contains($0.id) }
+        let selectedItems = visibleBrowserItems.filter { selection.contains($0.id) }
 
         if selectedItems.isEmpty {
             browserBackgroundContextMenu
@@ -1434,13 +1523,22 @@ struct PhotoBrowserView: View {
         ]
     }
 
+    private var visibleBrowserItems: [BrowserItem] {
+        BrowserTreeProjection.flattened(
+            roots: items,
+            childrenByParentID: childrenByFolderID,
+            expandedParentIDs: expandedFolderIDs,
+            id: \.id
+        )
+    }
+
     private var selectedURLs: [URL] {
-        items.filter { selectedItemIDs.contains($0.id) }.map(\.url)
+        visibleBrowserItems.filter { selectedItemIDs.contains($0.id) }.map(\.url)
     }
 
     private var selectedPreviewURL: URL? {
         guard selectedItemIDs.count == 1,
-              let item = items.first(where: { selectedItemIDs.contains($0.id) }),
+              let item = visibleBrowserItems.first(where: { selectedItemIDs.contains($0.id) }),
               !item.isDirectory,
               CameraPreviewSupport.canDecode(item.url) else {
             return nil
@@ -1449,7 +1547,7 @@ struct PhotoBrowserView: View {
     }
 
     private var selectedEventFileSelections: [EventFileSelection] {
-        items
+        visibleBrowserItems
             .filter { selectedItemIDs.contains($0.id) }
             .compactMap(eventSelection(for:))
     }
@@ -1513,7 +1611,7 @@ struct PhotoBrowserView: View {
     }
 
     private var previewableURLs: [URL] {
-        items.compactMap { item in
+        visibleBrowserItems.compactMap { item in
             guard !item.isDirectory, CameraPreviewSupport.canDecode(item.url) else { return nil }
             return item.url
         }
@@ -1579,7 +1677,7 @@ struct PhotoBrowserView: View {
     }
 
     private func collectItems(withIDs ids: Set<String>) {
-        for item in items where ids.contains(item.id) {
+        for item in visibleBrowserItems where ids.contains(item.id) {
             guard let selection = eventSelection(for: item) else { continue }
             collectedEventFiles[selection.id] = selection
         }
@@ -1610,6 +1708,104 @@ struct PhotoBrowserView: View {
         ).standardizedFileURL.path
     }
 
+    private func disclosureAccessibilityLabel(for item: BrowserItem) -> String {
+        if folderExpansionErrors[item.id] != nil {
+            return "Retry Loading \(item.name)"
+        }
+        return expandedFolderIDs.contains(item.id) ? "Collapse \(item.name)" : "Expand \(item.name)"
+    }
+
+    private func disclosureHelp(for item: BrowserItem) -> String {
+        if let error = folderExpansionErrors[item.id] {
+            return "Could not show this folder: \(error)\nClick to try again."
+        }
+        return expandedFolderIDs.contains(item.id)
+            ? "Hide this folder’s contents (Left Arrow)"
+            : "Show this folder’s contents inline (Right Arrow)"
+    }
+
+    private func toggleFolderExpansion(_ item: BrowserItem) {
+        guard item.canExpand else { return }
+        if folderExpansionErrors[item.id] != nil {
+            requestFolderExpansion(item, forceReload: true)
+        } else if expandedFolderIDs.contains(item.id) {
+            collapseFolder(item)
+        } else {
+            requestFolderExpansion(item)
+        }
+        isFileTableFocused = true
+    }
+
+    private func requestFolderExpansion(_ item: BrowserItem, forceReload: Bool = false) {
+        guard item.canExpand else { return }
+        expandedFolderIDs.insert(item.id)
+        folderExpansionErrors[item.id] = nil
+        if forceReload {
+            childrenByFolderID[item.id] = nil
+        }
+        guard childrenByFolderID[item.id] == nil,
+              !loadingFolderIDs.contains(item.id) else {
+            return
+        }
+
+        loadingFolderIDs.insert(item.id)
+        Task { await loadFolderChildren(for: item) }
+    }
+
+    @MainActor
+    private func loadFolderChildren(for item: BrowserItem) async {
+        let directoryID = item.id
+        let expectedRoot = currentURL.standardizedFileURL
+        do {
+            let loaded = try await Task.detached(priority: .userInitiated) {
+                try BrowserDirectoryReader.load(item.url, depth: item.depth + 1)
+            }.value
+            guard currentURL.standardizedFileURL == expectedRoot else { return }
+            childrenByFolderID[directoryID] = loaded
+            folderExpansionErrors[directoryID] = nil
+        } catch {
+            guard currentURL.standardizedFileURL == expectedRoot else { return }
+            childrenByFolderID[directoryID] = nil
+            folderExpansionErrors[directoryID] = error.localizedDescription
+        }
+        loadingFolderIDs.remove(directoryID)
+    }
+
+    private func collapseFolder(_ item: BrowserItem) {
+        expandedFolderIDs.remove(item.id)
+        let descendantPrefix = item.id.hasSuffix("/") ? item.id : item.id + "/"
+        let hiddenSelection = selectedItemIDs.filter { $0.hasPrefix(descendantPrefix) }
+        if !hiddenSelection.isEmpty {
+            selectedItemIDs.subtract(hiddenSelection)
+            selectedItemIDs.insert(item.id)
+        }
+    }
+
+    private func resetBrowserTree() {
+        expandedFolderIDs.removeAll()
+        childrenByFolderID.removeAll()
+        loadingFolderIDs.removeAll()
+        folderExpansionErrors.removeAll()
+    }
+
+    private func reloadBrowserTree() {
+        guard !isLoading else { return }
+        resetBrowserTree()
+        Task { await loadCurrentDirectory() }
+    }
+
+    private func pruneBrowserTree(to roots: [BrowserItem]) {
+        let rootIDs = roots.filter(\.canExpand).map(\.id)
+        func belongsToVisibleRoot(_ id: String) -> Bool {
+            rootIDs.contains { id == $0 || id.hasPrefix($0 + "/") }
+        }
+
+        expandedFolderIDs = expandedFolderIDs.filter(belongsToVisibleRoot)
+        childrenByFolderID = childrenByFolderID.filter { belongsToVisibleRoot($0.key) }
+        loadingFolderIDs = loadingFolderIDs.filter(belongsToVisibleRoot)
+        folderExpansionErrors = folderExpansionErrors.filter { belongsToVisibleRoot($0.key) }
+    }
+
     @MainActor
     private func loadCurrentDirectory() async {
         let url = currentURL.standardizedFileURL
@@ -1626,39 +1822,20 @@ struct PhotoBrowserView: View {
 
         do {
             let loaded = try await Task.detached(priority: .userInitiated) {
-                let keys: Set<URLResourceKey> = [.isDirectoryKey, .isRegularFileKey, .fileSizeKey, .contentModificationDateKey, .localizedTypeDescriptionKey, .isHiddenKey]
-                let urls = try FileManager.default.contentsOfDirectory(
-                    at: url,
-                    includingPropertiesForKeys: Array(keys),
-                    options: [.skipsHiddenFiles]
-                )
-                return try urls.compactMap { child -> BrowserItem? in
-                    let values = try child.resourceValues(forKeys: keys)
-                    guard values.isDirectory == true || values.isRegularFile == true else { return nil }
-                    return BrowserItem(
-                        url: child,
-                        name: child.lastPathComponent,
-                        isDirectory: values.isDirectory == true,
-                        size: Int64(values.fileSize ?? 0),
-                        modifiedAt: values.contentModificationDate ?? .distantPast,
-                        kind: values.isDirectory == true ? "Folder" : (values.localizedTypeDescription ?? child.pathExtension.uppercased())
-                    )
-                }
-                .sorted {
-                    if $0.isDirectory != $1.isDirectory { return $0.isDirectory }
-                    return $0.name.localizedStandardCompare($1.name) == .orderedAscending
-                }
+                try BrowserDirectoryReader.load(url, depth: 0)
             }.value
             guard currentURL.standardizedFileURL == url else { return }
             items = loaded
+            pruneBrowserTree(to: loaded)
             loadedDirectoryURL = url
             if isRefreshingCurrentDirectory {
-                let availableIDs = Set(loaded.map(\.id))
+                let availableIDs = Set(visibleBrowserItems.map(\.id))
                 selectedItemIDs.formIntersection(availableIDs)
             }
         } catch {
             guard currentURL.standardizedFileURL == url else { return }
             items = []
+            resetBrowserTree()
             browserError = error.localizedDescription
         }
         if loadingDirectoryURL?.standardizedFileURL == url {
@@ -1674,6 +1851,7 @@ struct PhotoBrowserView: View {
             backHistory.append(currentURL)
             forwardHistory.removeAll()
         }
+        resetBrowserTree()
         currentURL = normalized
     }
 
@@ -1694,12 +1872,47 @@ struct PhotoBrowserView: View {
     }
 
     private func selectAdjacentItem(offset: Int) {
-        guard !items.isEmpty else { return }
-        let selectedIndex = items.firstIndex { selectedItemIDs.contains($0.id) }
-        let startingIndex = selectedIndex ?? (offset > 0 ? -1 : items.count)
-        let destinationIndex = min(max(startingIndex + offset, 0), items.count - 1)
-        selectedItemIDs = [items[destinationIndex].id]
+        let visibleItems = visibleBrowserItems
+        guard !visibleItems.isEmpty else { return }
+        let selectedIndex = visibleItems.firstIndex { selectedItemIDs.contains($0.id) }
+        let startingIndex = selectedIndex ?? (offset > 0 ? -1 : visibleItems.count)
+        let destinationIndex = min(max(startingIndex + offset, 0), visibleItems.count - 1)
+        selectedItemIDs = [visibleItems[destinationIndex].id]
         isFileTableFocused = true
+    }
+
+    private func collapseSelectionOrSelectParent() -> KeyPress.Result {
+        guard selectedItemIDs.count == 1,
+              let selectedID = selectedItemIDs.first,
+              let item = visibleBrowserItems.first(where: { $0.id == selectedID }) else {
+            return .ignored
+        }
+        if item.canExpand, expandedFolderIDs.contains(item.id) {
+            collapseFolder(item)
+            return .handled
+        }
+        guard item.depth > 0 else { return .ignored }
+        let parentID = item.url.deletingLastPathComponent().standardizedFileURL.path
+        guard visibleBrowserItems.contains(where: { $0.id == parentID }) else { return .ignored }
+        selectedItemIDs = [parentID]
+        return .handled
+    }
+
+    private func expandSelectionOrSelectFirstChild() -> KeyPress.Result {
+        guard selectedItemIDs.count == 1,
+              let selectedID = selectedItemIDs.first,
+              let item = visibleBrowserItems.first(where: { $0.id == selectedID }),
+              item.canExpand else {
+            return .ignored
+        }
+        if expandedFolderIDs.contains(item.id) {
+            if let firstChild = childrenByFolderID[item.id]?.first {
+                selectedItemIDs = [firstChild.id]
+            }
+        } else {
+            requestFolderExpansion(item)
+        }
+        return .handled
     }
 
     private func selectPreviousSource() {
@@ -1724,7 +1937,7 @@ struct PhotoBrowserView: View {
         case .copySelection:
             FileClipboardWriter.copy(selectedURLs)
         case .selectAll:
-            selectedItemIDs = Set(items.map(\.id))
+            selectedItemIDs = Set(visibleBrowserItems.map(\.id))
         case .openSelection:
             openSelection()
         case .previewSelection:
@@ -1748,7 +1961,7 @@ struct PhotoBrowserView: View {
         case .decreaseThumbnailSize:
             decreaseThumbnailSize()
         case .reload:
-            Task { await loadCurrentDirectory() }
+            reloadBrowserTree()
         }
     }
 
@@ -1778,7 +1991,7 @@ struct PhotoBrowserView: View {
 
     private func openSelection() {
         guard selectedItemIDs.count == 1,
-              let item = items.first(where: { selectedItemIDs.contains($0.id) }) else {
+              let item = visibleBrowserItems.first(where: { selectedItemIDs.contains($0.id) }) else {
             return
         }
         open(item)
@@ -1922,6 +2135,7 @@ struct PhotoBrowserView: View {
             }
 
             model.storageCapacityRevision &+= 1
+            resetBrowserTree()
             await loadCurrentDirectory()
             if let destination {
                 selectedItemIDs = [destination.path]
