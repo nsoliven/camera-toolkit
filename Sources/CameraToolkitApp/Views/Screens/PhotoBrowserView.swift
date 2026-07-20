@@ -925,6 +925,15 @@ struct PhotoBrowserView: View {
                     Label("Rename…", systemImage: "pencil")
                 }
                 .disabled(browserOperationLabel != nil)
+
+                if item.isDirectory {
+                    Button(role: .destructive) {
+                        confirmDeleteEmptyFolder(item)
+                    } label: {
+                        Label("Delete Empty Folder…", systemImage: "trash")
+                    }
+                    .disabled(browserOperationLabel != nil)
+                }
             }
 
             Button {
@@ -1847,9 +1856,50 @@ struct PhotoBrowserView: View {
         }
     }
 
+    private func confirmDeleteEmptyFolder(_ item: BrowserItem) {
+        guard item.isDirectory else { return }
+
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Delete Empty Folder?"
+        alert.informativeText = "\(item.url.path)\n\nOnly this folder will be removed. If it contains anything, including a hidden file, Camera Toolkit will refuse to delete it."
+        let deleteButton = alert.addButton(withTitle: "Delete Empty Folder")
+        deleteButton.hasDestructiveAction = true
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        let protectedURLs = protectedBrowserFolderURLs
+        runBrowserMutation(
+            label: "Deleting empty folder…",
+            selecting: nil,
+            errorTitle: "Folder Was Not Deleted"
+        ) {
+            try EmptyFolderDeletionService.delete(item.url, protectedURLs: protectedURLs)
+        }
+    }
+
+    private var protectedBrowserFolderURLs: [URL] {
+        var paths = model.configuration.configuredLocations.map(\.path)
+        paths.append(contentsOf: [
+            model.configuration.importSourcePath,
+            model.configuration.bufferPath,
+            model.configuration.archivePath,
+            model.configuration.cameraLibraryRootPath,
+            FileManager.default.homeDirectoryForCurrentUser.path,
+            FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Pictures", isDirectory: true).path,
+            currentURL.path,
+        ])
+
+        return Set(paths.lazy
+            .map(DashboardModel.expandedPath)
+            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty })
+            .map { URL(fileURLWithPath: $0, isDirectory: true).standardizedFileURL }
+    }
+
     private func runBrowserMutation(
         label: String,
         selecting destination: URL?,
+        errorTitle: String = "The File Operation Failed",
         operation: @escaping @Sendable () throws -> Void
     ) {
         guard browserOperationLabel == nil else { return }
@@ -1867,10 +1917,11 @@ struct PhotoBrowserView: View {
 
             browserOperationLabel = nil
             if let errorMessage {
-                showBrowserOperationError(title: "The File Operation Failed", message: errorMessage)
+                showBrowserOperationError(title: errorTitle, message: errorMessage)
                 return
             }
 
+            model.storageCapacityRevision &+= 1
             await loadCurrentDirectory()
             if let destination {
                 selectedItemIDs = [destination.path]
