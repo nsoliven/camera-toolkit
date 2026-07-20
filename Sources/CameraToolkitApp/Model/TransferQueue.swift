@@ -1,5 +1,9 @@
 import Foundation
 
+extension Notification.Name {
+    static let cameraToolkitShowTransferQueue = Notification.Name("CameraToolkitShowTransferQueue")
+}
+
 enum TransferQueueState: String, Codable, Sendable {
     case running
     case completed

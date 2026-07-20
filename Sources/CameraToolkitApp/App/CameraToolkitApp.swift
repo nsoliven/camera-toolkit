@@ -22,10 +22,20 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         installThumbnailShortcutMonitor()
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleTransferQueueRequest(_:)),
+            name: .cameraToolkitShowTransferQueue,
+            object: nil
+        )
         CameraToolkitMainWindow.shared.show(model: model)
+        if model.transferQueue != nil {
+            TransferQueueWindowController.shared.show(model: model)
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        NotificationCenter.default.removeObserver(self)
         if let thumbnailShortcutMonitor {
             NSEvent.removeMonitor(thumbnailShortcutMonitor)
         }
@@ -247,6 +257,43 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate {
         refreshItem.target = self
         viewMenu.addItem(refreshItem)
 
+        let windowMenuItem = NSMenuItem()
+        mainMenu.addItem(windowMenuItem)
+        let windowMenu = NSMenu(title: "Window")
+        windowMenuItem.submenu = windowMenu
+
+        let minimizeItem = NSMenuItem(
+            title: "Minimize",
+            action: #selector(NSWindow.performMiniaturize(_:)),
+            keyEquivalent: "m"
+        )
+        windowMenu.addItem(minimizeItem)
+
+        let zoomItem = NSMenuItem(
+            title: "Zoom",
+            action: #selector(NSWindow.performZoom(_:)),
+            keyEquivalent: ""
+        )
+        windowMenu.addItem(zoomItem)
+        windowMenu.addItem(.separator())
+
+        let mainWindowItem = NSMenuItem(
+            title: "Camera Toolkit",
+            action: #selector(openMainWindow),
+            keyEquivalent: "0"
+        )
+        mainWindowItem.target = self
+        windowMenu.addItem(mainWindowItem)
+
+        let transferQueueItem = NSMenuItem(
+            title: "Transfer Queue…",
+            action: #selector(openTransferQueue),
+            keyEquivalent: ""
+        )
+        transferQueueItem.target = self
+        windowMenu.addItem(transferQueueItem)
+        NSApp.windowsMenu = windowMenu
+
         let helpMenuItem = NSMenuItem()
         mainMenu.addItem(helpMenuItem)
         let helpMenu = NSMenu(title: "Help")
@@ -309,6 +356,18 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate {
 
     @objc private func openCatalogInspector() {
         CatalogInspectorWindowController.shared.show(model: model)
+    }
+
+    @objc private func openMainWindow() {
+        CameraToolkitMainWindow.shared.show(model: model)
+    }
+
+    @objc private func openTransferQueue() {
+        TransferQueueWindowController.shared.show(model: model)
+    }
+
+    @objc private func handleTransferQueueRequest(_ notification: Notification) {
+        openTransferQueue()
     }
 
     @objc private func refreshAll() {
