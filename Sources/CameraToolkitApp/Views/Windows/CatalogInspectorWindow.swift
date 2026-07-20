@@ -26,9 +26,9 @@ final class CatalogInspectorWindowController: NSObject, NSWindowDelegate {
         )
         window.title = "Photo List SQL Inspector"
         window.identifier = NSUserInterfaceItemIdentifier("CameraToolkitCatalogInspectorWindow")
-        window.minSize = NSSize(width: 820, height: 540)
         window.isReleasedWhenClosed = false
         window.contentViewController = controller
+        CameraToolkitWindowSizing.configure(window, as: .photoDatabase)
         window.setContentSize(NSSize(width: 1_120, height: 720))
         window.delegate = self
         window.center()

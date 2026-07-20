@@ -31,8 +31,8 @@ final class StorageBenchmarkWindowController: NSObject, NSWindowDelegate {
         window.isRestorable = false
         window.isReleasedWhenClosed = false
         window.tabbingMode = .disallowed
-        window.minSize = NSSize(width: 720, height: 520)
         window.contentViewController = controller
+        CameraToolkitWindowSizing.configure(window, as: .storageSpeedTests)
         window.setContentSize(NSSize(width: 820, height: 640))
         window.delegate = self
         window.center()

@@ -220,9 +220,9 @@ final class KeyboardShortcutsWindowController: NSObject, NSWindowDelegate {
         )
         window.title = "Camera Toolkit Keyboard Shortcuts"
         window.identifier = NSUserInterfaceItemIdentifier("CameraToolkitKeyboardShortcutsWindow")
-        window.minSize = NSSize(width: 620, height: 480)
         window.isReleasedWhenClosed = false
         window.contentViewController = NSHostingController(rootView: KeyboardShortcutsReferenceView())
+        CameraToolkitWindowSizing.configure(window, as: .keyboardShortcuts)
         window.delegate = self
         window.center()
         window.makeKeyAndOrderFront(nil)
