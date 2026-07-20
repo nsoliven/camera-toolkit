@@ -199,6 +199,38 @@ enum FileClipboardWriter {
     }
 }
 
+enum FinderItemActions {
+    static let informationWindowScript = """
+    on run itemPaths
+        tell application "Finder"
+            activate
+            repeat with itemPath in itemPaths
+                try
+                    open information window of ((POSIX file itemPath) as alias)
+                end try
+            end repeat
+        end tell
+    end run
+    """
+
+    static func informationArguments(for urls: [URL]) -> [String] {
+        ["-e", informationWindowScript, "--"] + urls.filter(\.isFileURL).map(\.path)
+    }
+
+    @MainActor
+    static func showInfo(for urls: [URL]) {
+        let arguments = informationArguments(for: urls)
+        guard arguments.count > 3 else { return }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        process.arguments = arguments
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try? process.run()
+    }
+}
+
 @MainActor
 final class KeyboardShortcutsWindowController: NSObject, NSWindowDelegate {
     static let shared = KeyboardShortcutsWindowController()

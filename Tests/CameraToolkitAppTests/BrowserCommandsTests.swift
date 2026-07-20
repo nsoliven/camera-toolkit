@@ -101,6 +101,18 @@ final class BrowserCommandsTests: XCTestCase {
         pasteboard.clearContents()
     }
 
+    func testFinderInfoPassesPathsAsArgumentsInsteadOfEmbeddingThemInScript() {
+        let first = URL(fileURLWithPath: "/tmp/Camera Toolkit/ONE.ARW")
+        let second = URL(fileURLWithPath: "/Volumes/Source \"Card\"/DCIM")
+
+        let arguments = FinderItemActions.informationArguments(for: [first, second])
+
+        XCTAssertEqual(Array(arguments.prefix(3)), ["-e", FinderItemActions.informationWindowScript, "--"])
+        XCTAssertEqual(Array(arguments.suffix(2)), [first.path, second.path])
+        XCTAssertFalse(FinderItemActions.informationWindowScript.contains(first.path))
+        XCTAssertFalse(FinderItemActions.informationWindowScript.contains(second.path))
+    }
+
     func testEventMediaSupportIncludesDJIOsmo360Files() {
         XCTAssertTrue(EventMediaSupport.canAssign(URL(fileURLWithPath: "/camera/CAM_0001.OSV")))
         XCTAssertTrue(EventMediaSupport.canAssign(URL(fileURLWithPath: "/camera/CAM_0001.LRF")))
