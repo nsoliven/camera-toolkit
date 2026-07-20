@@ -40,6 +40,11 @@ struct TransferQueueItemStatusText: Equatable, Sendable {
     var detail: String?
 }
 
+struct TransferQueueSidebarSummary: Equatable, Sendable {
+    var detail: String
+    var badge: String?
+}
+
 struct TransferQueueItem: Identifiable, Codable, Sendable {
     var id: UUID
     var relativePath: String
@@ -121,6 +126,37 @@ struct TransferQueueSnapshot: Codable, Sendable {
 
     var verifiedCount: Int {
         items.count { $0.state == .verified || $0.state == .alreadyPresent }
+    }
+
+    var sidebarSummary: TransferQueueSidebarSummary {
+        switch state {
+        case .running:
+            let percent = Int((min(max(progress, 0), 1) * 100).rounded())
+            guard !items.isEmpty else {
+                return TransferQueueSidebarSummary(detail: "Preparing transfer", badge: "\(percent)%")
+            }
+            let activeIndex = items.firstIndex {
+                $0.state == .copying || $0.state == .verifying
+            } ?? items.firstIndex { $0.state == .waiting } ?? 0
+            let action = switch items[activeIndex].state {
+            case .verifying: "Verifying"
+            case .copying: "Copying"
+            default: "Starting"
+            }
+            return TransferQueueSidebarSummary(
+                detail: "\(action) file \(activeIndex + 1) of \(items.count)",
+                badge: "\(percent)%"
+            )
+        case .completed:
+            return TransferQueueSidebarSummary(
+                detail: "Complete · \(verifiedCount) checksum verified",
+                badge: "Done"
+            )
+        case .failed:
+            return TransferQueueSidebarSummary(detail: "Stopped · open for details", badge: "!")
+        case .cancelled:
+            return TransferQueueSidebarSummary(detail: "Cancelled · open for details", badge: nil)
+        }
     }
 
     func statusText(for item: TransferQueueItem) -> TransferQueueItemStatusText {

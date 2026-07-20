@@ -18,6 +18,40 @@ final class TransferQueueTests: XCTestCase {
         XCTAssertEqual(queue.statusText(for: third), TransferQueueItemStatusText(label: "Waiting", detail: "for file 2"))
     }
 
+    func testSidebarSummaryShowsActiveFileAndProgress() {
+        let first = TransferQueueItem(relativePath: "DCIM/first.OSV", size: 100, copiedBytes: 100, state: .verified)
+        let second = TransferQueueItem(relativePath: "DCIM/second.OSV", size: 200, copiedBytes: 50, state: .copying)
+        let queue = TransferQueueSnapshot(
+            sourcePath: "/Volumes/Camera",
+            destinationPath: "/Volumes/Buffer",
+            items: [first, second],
+            progress: 0.25,
+            totalBytes: 300
+        )
+
+        XCTAssertEqual(
+            queue.sidebarSummary,
+            TransferQueueSidebarSummary(detail: "Copying file 2 of 2", badge: "25%")
+        )
+    }
+
+    func testSidebarSummaryKeepsCompletedTransferVisible() {
+        let item = TransferQueueItem(relativePath: "DCIM/first.OSV", size: 100, copiedBytes: 100, state: .verified)
+        let queue = TransferQueueSnapshot(
+            state: .completed,
+            sourcePath: "/Volumes/Camera",
+            destinationPath: "/Volumes/Buffer",
+            items: [item],
+            progress: 1,
+            totalBytes: 100
+        )
+
+        XCTAssertEqual(
+            queue.sidebarSummary,
+            TransferQueueSidebarSummary(detail: "Complete · 1 checksum verified", badge: "Done")
+        )
+    }
+
     func testStoppedQueueDoesNotClaimUntouchedFilesAreStillWaiting() {
         let untouched = TransferQueueItem(relativePath: "DCIM/later.ARW", size: 300)
         let queue = TransferQueueSnapshot(

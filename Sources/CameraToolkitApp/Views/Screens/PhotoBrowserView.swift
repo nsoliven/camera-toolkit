@@ -146,7 +146,7 @@ struct PhotoBrowserView: View {
     var body: some View {
         NavigationSplitView(columnVisibility: $columnVisibility) {
             sidebar
-                .navigationSplitViewColumnWidth(min: 185, ideal: 215, max: 270)
+                .navigationSplitViewColumnWidth(min: 220, ideal: 250, max: 320)
         } detail: {
             VStack(spacing: 0) {
                 browserToolbar
@@ -284,6 +284,51 @@ struct PhotoBrowserView: View {
                         locationRow(location)
                     }
                 }
+
+                Section("Activity") {
+                    sidebarActionButton(
+                        title: "Transfers",
+                        detail: transferSidebarDetail,
+                        symbol: transferSidebarSymbol,
+                        color: transferSidebarColor,
+                        badge: transferSidebarBadge,
+                        help: "Open the separate Transfer Queue window and see copy or checksum progress"
+                    ) {
+                        TransferQueueWindowController.shared.show(model: model)
+                    }
+                }
+
+                Section("Tools") {
+                    sidebarActionButton(
+                        title: "Events",
+                        detail: "Browse \(model.savedEvents.count) saved event\(model.savedEvents.count == 1 ? "" : "s")",
+                        symbol: "calendar.badge.clock",
+                        color: .blue,
+                        help: "Open the Event Library in a separate window"
+                    ) {
+                        EventLibraryWindowController.shared.show(model: model)
+                    }
+
+                    sidebarActionButton(
+                        title: "Photo Database",
+                        detail: "Files, locations, and read-only SQL",
+                        symbol: "cylinder.split.1x2",
+                        color: .secondary,
+                        help: "Open the photo database and read-only SQL inspector in a separate window"
+                    ) {
+                        CatalogInspectorWindowController.shared.show(model: model)
+                    }
+
+                    sidebarActionButton(
+                        title: "Keyboard Shortcuts",
+                        detail: "See every app shortcut",
+                        symbol: "keyboard",
+                        color: .secondary,
+                        help: "Open the keyboard shortcut reference in a separate window"
+                    ) {
+                        KeyboardShortcutsWindowController.shared.show()
+                    }
+                }
             }
             .listStyle(.sidebar)
 
@@ -326,6 +371,72 @@ struct PhotoBrowserView: View {
                 .help(folderExists(location.path) ? "Connected" : "Not mounted")
         }
         .tag(location.id)
+    }
+
+    private func sidebarActionButton(
+        title: String,
+        detail: String,
+        symbol: String,
+        color: Color,
+        badge: String? = nil,
+        help: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            HStack(spacing: 9) {
+                Image(systemName: symbol)
+                    .foregroundStyle(color)
+                    .frame(width: 18)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(title)
+                        .foregroundStyle(.primary)
+                    Text(detail)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 4)
+                if let badge {
+                    Text(badge)
+                        .font(.caption2.weight(.semibold).monospacedDigit())
+                        .foregroundStyle(color)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(color.opacity(0.12), in: Capsule())
+                }
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(help)
+        .accessibilityLabel("\(title), \(detail)")
+    }
+
+    private var transferSidebarDetail: String {
+        model.transferQueue?.sidebarSummary.detail ?? "Nothing running"
+    }
+
+    private var transferSidebarBadge: String? {
+        model.transferQueue?.sidebarSummary.badge
+    }
+
+    private var transferSidebarSymbol: String {
+        switch model.transferQueue?.state {
+        case .running: "arrow.down.circle.fill"
+        case .completed: "checkmark.circle.fill"
+        case .failed: "exclamationmark.circle.fill"
+        case .cancelled: "xmark.circle.fill"
+        case nil: "arrow.down.circle"
+        }
+    }
+
+    private var transferSidebarColor: Color {
+        switch model.transferQueue?.state {
+        case .running: .blue
+        case .completed: .green
+        case .failed: .red
+        case .cancelled, nil: .secondary
+        }
     }
 
     private var browserToolbar: some View {
@@ -406,22 +517,6 @@ struct PhotoBrowserView: View {
                 }
             }
 
-            Button {
-                EventLibraryWindowController.shared.show(model: model)
-            } label: {
-                Image(systemName: "calendar.badge.clock")
-            }
-            .accessibilityLabel("Open Event Library")
-            .help("Browse every event across its source, buffer, library, and Immich locations (Option-Command-E)")
-
-            Button {
-                CatalogInspectorWindowController.shared.show(model: model)
-            } label: {
-                Image(systemName: "cylinder.split.1x2")
-            }
-            .accessibilityLabel("Open Photo List SQL Inspector")
-            .help("Browse SQLite tables, schema, and read-only SQL (Shift-Command-I)")
-
             Divider().frame(height: 18)
 
             if !isCurrentImportSource {
@@ -434,14 +529,14 @@ struct PhotoBrowserView: View {
             Button {
                 createFolder()
             } label: {
-                Image(systemName: "folder.badge.plus")
+                Label("New Folder", systemImage: "folder.badge.plus")
             }
             .help("New Folder")
 
             Button {
                 previewSelection()
             } label: {
-                Image(systemName: "eye")
+                Label("Preview", systemImage: "eye")
             }
             .disabled(selectedURLs.isEmpty)
             .help("Preview in Camera Toolkit (Space)")
@@ -449,7 +544,7 @@ struct PhotoBrowserView: View {
             Button {
                 revealSelection()
             } label: {
-                Image(systemName: "arrow.right.circle")
+                Label("Show in Finder", systemImage: "arrow.right.circle")
             }
             .disabled(selectedURLs.isEmpty)
             .help("Reveal in Finder")
@@ -489,7 +584,7 @@ struct PhotoBrowserView: View {
             } label: {
                 HStack(spacing: 4) {
                     Image(systemName: "photo.on.rectangle")
-                    Text("\(Int(thumbnailHeight))")
+                    Text("Thumbnails \(Int(thumbnailHeight))")
                         .font(.caption.monospacedDigit())
                 }
             }
@@ -498,13 +593,6 @@ struct PhotoBrowserView: View {
             .accessibilityLabel("Thumbnail Size, \(Int(thumbnailHeight)) Points")
             .help("Thumbnail size: \(Int(thumbnailHeight)) pt (Command-Plus / Command-Minus)")
 
-            Button {
-                KeyboardShortcutsWindowController.shared.show()
-            } label: {
-                Image(systemName: "keyboard")
-            }
-            .accessibilityLabel("Keyboard Shortcuts")
-            .help("Keyboard Shortcuts (Shift-Command-K)")
         }
         .buttonStyle(.borderless)
         .padding(.horizontal, 12)
