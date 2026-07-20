@@ -3,6 +3,18 @@ import Foundation
 import XCTest
 
 final class StorageCapacityTests: XCTestCase {
+    func testMountedVolumeNameIdentifiesOnlyTheSpecificMountedVolume() {
+        XCTAssertEqual(
+            StorageCapacityReader.mountedVolumeName(for: "/Volumes/Photo NAS/library/originals"),
+            "Photo NAS"
+        )
+        XCTAssertEqual(
+            StorageCapacityReader.mountedVolumeName(for: "/Volumes/Other Disk/library"),
+            "Other Disk"
+        )
+        XCTAssertNil(StorageCapacityReader.mountedVolumeName(for: "/tmp/example/Pictures"))
+    }
+
     func testCapacityFractionsAreBoundedAndDescribeAvailableSpace() {
         let capacity = StorageCapacitySnapshot(availableBytes: 25, totalBytes: 100)
 
@@ -10,6 +22,29 @@ final class StorageCapacityTests: XCTestCase {
         XCTAssertEqual(capacity.availableFraction, 0.25, accuracy: 0.001)
         XCTAssertEqual(StorageCapacitySnapshot(availableBytes: 200, totalBytes: 100).usedFraction, 0)
         XCTAssertEqual(StorageCapacitySnapshot(availableBytes: -1, totalBytes: 100).usedFraction, 1)
+    }
+
+    func testNetworkEstimateAndAuthoritativeNASCapacityStayDistinct() {
+        let estimate = StorageCapacitySnapshot(
+            availableBytes: 1_500,
+            totalBytes: 1_500,
+            source: .networkShareEstimate
+        )
+        let authoritative = StorageCapacitySnapshot(
+            availableBytes: 600,
+            totalBytes: 1_000,
+            source: .trueNAS(
+                dataset: "vault/photos",
+                pool: "vault",
+                poolAvailableBytes: 2_500,
+                poolTotalBytes: 4_000,
+                poolHealthy: true
+            )
+        )
+
+        XCTAssertNotEqual(estimate, authoritative)
+        XCTAssertEqual(estimate.usedFraction, 0)
+        XCTAssertEqual(authoritative.usedFraction, 0.4, accuracy: 0.001)
     }
 
     func testSidebarCapacityUsesWholeAdaptiveUnits() {

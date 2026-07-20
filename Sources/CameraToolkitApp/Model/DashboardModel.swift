@@ -87,6 +87,11 @@ final class DashboardModel {
     var immichConnectionStatus: String = "Not connected. Add your server URL and API key in Config."
     var immichConnectionReport: ImmichConnectionReport?
     var immichIsTestingConnection: Bool = false
+    var trueNASAPIKeyDraft: String = ""
+    var trueNASConnectionStatus: String = "Not configured. Add the TrueNAS server in Settings."
+    var trueNASConnectionReport: TrueNASCapacityReport?
+    var trueNASIsTestingConnection: Bool = false
+    var trueNASIsInspectingCertificate: Bool = false
     var isRefreshing: Bool = false
     var lastRefreshedAt: Date?
     var catalogReport: CatalogBootstrapReport?
@@ -171,6 +176,9 @@ final class DashboardModel {
         }
         if !configuration.immichServerURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             self.immichConnectionStatus = "Immich URL is saved. Keychain is checked only when you click Test Connection."
+        }
+        if !configuration.trueNASServerURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            self.trueNASConnectionStatus = "TrueNAS settings are saved. The sidebar will verify the mounted SMB dataset with the Keychain API key."
         }
     }
 
@@ -779,6 +787,142 @@ extension DashboardModel {
 
     func setImmichServerURL(_ value: String) {
         updateConfiguration { $0.immichServerURL = value.trimmingCharacters(in: .whitespacesAndNewlines) }
+    }
+
+    func setTrueNASServerURL(_ value: String) {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        updateConfiguration { configuration in
+            if configuration.trueNASServerURL != trimmed {
+                configuration.trueNASTLSPinnedCertificateSHA256 = ""
+            }
+            configuration.trueNASServerURL = trimmed
+        }
+        trueNASConnectionReport = nil
+        trueNASConnectionStatus = trimmed.isEmpty
+            ? "Not configured. Add the TrueNAS server in Settings."
+            : "Server saved. Trust its certificate, save the API key, then test the NAS."
+        storageCapacityRevision &+= 1
+    }
+
+    func setTrueNASUsername(_ value: String) {
+        updateConfiguration { $0.trueNASUsername = value.trimmingCharacters(in: .whitespacesAndNewlines) }
+        trueNASConnectionReport = nil
+        storageCapacityRevision &+= 1
+    }
+
+    func setTrueNASDataset(_ value: String) {
+        updateConfiguration { $0.trueNASDataset = value.trimmingCharacters(in: .whitespacesAndNewlines) }
+        trueNASConnectionReport = nil
+        storageCapacityRevision &+= 1
+    }
+
+    func trustCurrentTrueNASCertificate() {
+        let serverURL = configuration.trueNASServerURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !serverURL.isEmpty else {
+            trueNASConnectionStatus = "Add the TrueNAS server URL first."
+            return
+        }
+        trueNASIsInspectingCertificate = true
+        trueNASConnectionStatus = "Reading the TrueNAS TLS certificate…"
+        Task { @MainActor in
+            defer { trueNASIsInspectingCertificate = false }
+            do {
+                let fingerprint = try await TrueNASClient.certificateFingerprint(serverURL: serverURL)
+                updateConfiguration { $0.trueNASTLSPinnedCertificateSHA256 = fingerprint }
+                trueNASConnectionStatus = "Trusted this server certificate: \(Self.shortFingerprint(fingerprint))."
+            } catch {
+                trueNASConnectionStatus = "Could not trust the TrueNAS certificate: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    func saveTrueNASAPIKey() {
+        do {
+            try secretStore.save(trueNASAPIKeyDraft, account: Self.trueNASAPIKeyAccount)
+            trueNASConnectionStatus = trueNASAPIKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? "TrueNAS API key removed from Keychain."
+                : "TrueNAS API key saved in Keychain."
+            configMessage = "TrueNAS API key saved in macOS Keychain."
+        } catch {
+            trueNASConnectionStatus = "Could not save the TrueNAS API key: \(error.localizedDescription)"
+        }
+    }
+
+    func testTrueNASConnection() {
+        Task { @MainActor in
+            trueNASIsTestingConnection = true
+            trueNASConnectionStatus = "Testing exact TrueNAS capacity…"
+            defer { trueNASIsTestingConnection = false }
+            if let snapshot = await readAuthoritativeTrueNASCapacity() {
+                trueNASConnectionStatus = trueNASConnectionSummary(snapshot: snapshot)
+                storageCapacityRevision &+= 1
+            }
+        }
+    }
+
+    func readAuthoritativeTrueNASCapacity() async -> StorageCapacitySnapshot? {
+        let serverURL = configuration.trueNASServerURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let dataset = configuration.trueNASDataset.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !serverURL.isEmpty else {
+            trueNASConnectionReport = nil
+            return nil
+        }
+
+        var apiKey = trueNASAPIKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        do {
+            if apiKey.isEmpty {
+                apiKey = try secretStore.read(account: Self.trueNASAPIKeyAccount)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            } else {
+                try secretStore.save(apiKey, account: Self.trueNASAPIKeyAccount)
+            }
+            guard !apiKey.isEmpty else {
+                trueNASConnectionReport = nil
+                trueNASConnectionStatus = "The SMB folder is mounted, but no TrueNAS API key is saved. Capacity is only an SMB estimate."
+                return nil
+            }
+
+            let client = try TrueNASClient(
+                serverURL: serverURL,
+                username: configuration.trueNASUsername,
+                apiKey: apiKey,
+                pinnedCertificateSHA256: configuration.trueNASTLSPinnedCertificateSHA256
+            )
+            let report = try await client.readCapacity(
+                dataset: dataset,
+                smbShareName: StorageCapacityReader.mountedVolumeName(for: configuration.cameraLibraryRootPath)
+            )
+            if dataset.isEmpty {
+                updateConfiguration { $0.trueNASDataset = report.dataset }
+            }
+            trueNASConnectionReport = report
+            let snapshot = StorageCapacitySnapshot(
+                availableBytes: report.datasetAvailableBytes,
+                totalBytes: report.datasetTotalBytes,
+                source: .trueNAS(
+                    dataset: report.dataset,
+                    pool: report.poolName,
+                    poolAvailableBytes: report.poolFreeBytes,
+                    poolTotalBytes: report.poolTotalBytes,
+                    poolHealthy: report.poolHealthy
+                )
+            )
+            trueNASConnectionStatus = trueNASConnectionSummary(snapshot: snapshot)
+            return snapshot
+        } catch {
+            trueNASConnectionReport = nil
+            let certificateHint = configuration.trueNASTLSPinnedCertificateSHA256.isEmpty
+                ? " If this NAS uses its default self-signed certificate, click Trust Current Certificate first."
+                : ""
+            trueNASConnectionStatus = "TrueNAS capacity check failed: \(error.localizedDescription)\(certificateHint)"
+            return nil
+        }
+    }
+
+    private func trueNASConnectionSummary(snapshot: StorageCapacitySnapshot) -> String {
+        guard let report = trueNASConnectionReport else { return "TrueNAS dataset connected." }
+        let health = report.poolHealthy ? report.poolStatus : "\(report.poolStatus), needs attention"
+        return "Connected to \(report.dataset) on pool \(report.poolName) (\(health)): \(snapshot.availableBytes.formattedWholeStorage) free."
     }
 
     func saveImmichAPIKey() {
@@ -1895,6 +2039,17 @@ extension DashboardModel {
     }
 
     private static let immichAPIKeyAccount = "immich-api-key"
+    private static let trueNASAPIKeyAccount = "truenas-api-key"
+
+    private static func shortFingerprint(_ fingerprint: String) -> String {
+        let compact = fingerprint.uppercased().filter(\.isHexDigit)
+        let groups = stride(from: 0, to: min(compact.count, 16), by: 2).map { offset -> String in
+            let start = compact.index(compact.startIndex, offsetBy: offset)
+            let end = compact.index(start, offsetBy: min(2, compact.distance(from: start, to: compact.endIndex)))
+            return String(compact[start..<end])
+        }
+        return groups.joined(separator: ":") + (compact.count > 16 ? "…" : "")
+    }
 
     static func expandedPath(_ path: String) -> String {
         NSString(string: path).expandingTildeInPath

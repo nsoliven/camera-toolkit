@@ -33,6 +33,7 @@ The safety rule is simple: the camera source stays read-only while browsing, pre
 - Offers **Free Up Camera** only for a completed, fully verified transfer. It shows the exact file count and size, requires typing `REMOVE`, rechecks every source/Buffer checksum, and permanently removes the source set only when all files still match.
 - Stores event/file relationships in SQLite through [GRDB](https://github.com/groue/GRDB.swift) and includes a bounded, read-only SQL inspector.
 - Checks whether known files already exist in Immich and stores per-event album/upload preferences. Photo upload is not enabled yet.
+- Labels macOS network-share capacity as an SMB estimate and can securely query the matching TrueNAS dataset and pool for authoritative free space and health.
 
 ## Requirements
 
@@ -40,6 +41,7 @@ The safety rule is simple: the camera source stays read-only while browsing, pre
 - Swift 6 and Xcode 16 or newer for source builds
 - Photomator is optional, but required for the preview window's **Open in Photomator** action
 - An Immich server and API key are optional
+- A TrueNAS server and read-only API key are optional when exact NAS capacity is needed
 
 ## Build and run
 
@@ -67,6 +69,7 @@ Open **Camera Toolkit → Settings** and choose:
 2. A temporary buffer folder.
 3. A long-term photo-library root.
 4. Optionally, an Immich server URL and API key.
+5. Optionally, a TrueNAS server URL and read-only API key. Leave the dataset blank to match it from the mounted SMB library share.
 
 No removable-drive, network-share, username, or home-directory path is compiled into the app. API keys are stored in macOS Keychain; paths and event preferences stay in the app's local configuration.
 

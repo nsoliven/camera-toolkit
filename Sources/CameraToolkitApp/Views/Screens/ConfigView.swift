@@ -132,6 +132,63 @@ struct ConfigView: View {
                 }
             }
 
+            Section("TrueNAS Capacity") {
+                TextField(
+                    "Server URL",
+                    text: Binding(
+                        get: { model.configuration.trueNASServerURL },
+                        set: { model.setTrueNASServerURL($0) }
+                    ),
+                    prompt: Text("https://nas.example.com")
+                )
+                TextField(
+                    "API username",
+                    text: Binding(
+                        get: { model.configuration.trueNASUsername },
+                        set: { model.setTrueNASUsername($0) }
+                    )
+                )
+                TextField(
+                    "Dataset",
+                    text: Binding(
+                        get: { model.configuration.trueNASDataset },
+                        set: { model.setTrueNASDataset($0) }
+                    ),
+                    prompt: Text("Optional — detect from mounted SMB share")
+                )
+                Text("Leave Dataset blank to match the mounted Library root to its TrueNAS SMB share automatically.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                SecureField("API key", text: $model.trueNASAPIKeyDraft)
+
+                LabeledContent("TLS certificate") {
+                    Text(model.configuration.trueNASTLSPinnedCertificateSHA256.isEmpty ? "System trust only" : "Pinned to this NAS")
+                        .foregroundStyle(
+                            model.configuration.trueNASTLSPinnedCertificateSHA256.isEmpty
+                                ? Color.secondary
+                                : Color.green
+                        )
+                }
+                Text(model.trueNASConnectionStatus)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                HStack {
+                    Button(model.trueNASIsInspectingCertificate ? "Reading…" : "Trust Current Certificate") {
+                        model.trustCurrentTrueNASCertificate()
+                    }
+                    .disabled(model.trueNASIsInspectingCertificate || model.trueNASIsTestingConnection)
+                    Button("Save Key") { model.saveTrueNASAPIKey() }
+                    Button(model.trueNASIsTestingConnection ? "Testing…" : "Test NAS") {
+                        model.testTrueNASConnection()
+                    }
+                    .disabled(model.trueNASIsTestingConnection || model.trueNASIsInspectingCertificate)
+                }
+                Text("The mounted SMB folder provides files. This read-only TrueNAS connection provides exact ZFS dataset and pool capacity. The API key stays in macOS Keychain; only the server, dataset, username, and pinned certificate fingerprint are saved locally.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             Section("Local App Data") {
                 PathSettingRow(
                     title: "Test data",
