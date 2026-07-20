@@ -180,11 +180,21 @@ public struct SourceCleanupService {
             }
         }
 
-        for file in validated {
+        let removalTotalBytes = validated.reduce(Int64(0)) { $0 + $1.size }
+        for (index, file) in validated.enumerated() {
             do {
                 try fileManager.removeItem(at: file.sourceURL)
                 report.removed.append(file.relativePath)
                 report.removedBytes += file.size
+                progress?(FileOperationProgress(
+                    phase: "Removing from camera",
+                    currentPath: file.relativePath,
+                    processedFiles: index + 1,
+                    totalFiles: validated.count,
+                    processedBytes: report.removedBytes,
+                    totalBytes: removalTotalBytes,
+                    bytesPerSecond: 0
+                ))
             } catch {
                 report.errors[file.relativePath] = error.localizedDescription
                 break

@@ -92,6 +92,8 @@ final class DashboardModel {
     var catalogReport: CatalogBootstrapReport?
     var catalogMessage: String = "Photo list has not been prepared yet."
     var transferQueue: TransferQueueSnapshot?
+    var pendingTransferBatches: [PendingTransferBatch]
+    var storageCapacityRevision: Int = 0
     var sourceCleanupMessage: String?
     var sourceCleanupError: String?
     var activeJob: JobSnapshot? {
@@ -105,9 +107,11 @@ final class DashboardModel {
     }
     @ObservationIgnored private let configurationStore: ConfigurationStore
     @ObservationIgnored private let transferQueueStore: TransferQueueStore
+    @ObservationIgnored private let pendingTransferQueueStore: PendingTransferQueueStore
     @ObservationIgnored private let secretStore = KeychainSecretStore(service: "org.cameratoolkit.CameraToolkit")
     @ObservationIgnored private var catalogSyncTask: Task<Void, Never>?
     @ObservationIgnored private var lastTransferQueuePersistence = Date.distantPast
+    @ObservationIgnored private var lastStorageCapacityRefreshRequest = Date.distantPast
 
     init(
         activePlan: CopyPlan,
@@ -116,6 +120,7 @@ final class DashboardModel {
         configuration: AppConfiguration = .defaults(applicationSupport: DashboardModel.defaultApplicationSupportURL),
         configurationStore: ConfigurationStore = ConfigurationStore(url: DashboardModel.defaultConfigurationURL),
         transferQueueStore: TransferQueueStore? = nil,
+        pendingTransferQueueStore: PendingTransferQueueStore? = nil,
         loadActivityLog: Bool = false
     ) {
         self.activePlan = activePlan
@@ -126,6 +131,11 @@ final class DashboardModel {
             url: configurationStore.url.deletingLastPathComponent().appendingPathComponent("transfer-queue.json")
         )
         self.transferQueueStore = resolvedTransferQueueStore
+        let resolvedPendingTransferQueueStore = pendingTransferQueueStore ?? PendingTransferQueueStore(
+            url: configurationStore.url.deletingLastPathComponent().appendingPathComponent("pending-transfers.json")
+        )
+        self.pendingTransferQueueStore = resolvedPendingTransferQueueStore
+        self.pendingTransferBatches = (try? resolvedPendingTransferQueueStore.load()) ?? []
         var restoredTransferQueue = try? resolvedTransferQueueStore.load()
         if var legacyQueue = restoredTransferQueue,
            legacyQueue.phaseProcessedBytes == nil || legacyQueue.phaseTotalBytes == nil {
@@ -194,6 +204,14 @@ extension DashboardModel {
             candidates[file.path] = file
         }
         return queuedFilePaths.compactMap { candidates[$0] }.sorted { $0.path < $1.path }
+    }
+
+    var pendingTransferFileCount: Int {
+        pendingTransferBatches.reduce(0) { $0 + $1.files.count }
+    }
+
+    var pendingTransferByteCount: Int64 {
+        pendingTransferBatches.reduce(Int64(0)) { $0 + $1.totalBytes }
     }
 
     var savedEvents: [SavedCameraEvent] {
@@ -375,7 +393,14 @@ extension DashboardModel {
             return
         }
         queuedFilePaths = Set(files.map(\.path))
-        copyQueuedFilesToBuffer()
+        enqueueTransfer(
+            files: files,
+            sourcePath: expandedImportSourcePath,
+            destinationPath: expandedBufferIngestPath,
+            eventID: selectedEvent?.id,
+            eventName: selectedEvent?.name ?? configuration.eventName,
+            deviceID: configuration.selectedDeviceID
+        )
     }
 
     func setEventImmichUploadEnabled(_ eventID: UUID, enabled: Bool) {
@@ -956,13 +981,120 @@ extension DashboardModel {
             statusMessage = "Queue is empty. Preview files, then add files to the queue."
             return
         }
+        enqueueTransfer(
+            files: selectedFiles,
+            sourcePath: expandedImportSourcePath,
+            destinationPath: expandedBufferIngestPath,
+            eventID: selectedEvent?.id,
+            eventName: selectedEvent?.name ?? configuration.eventName,
+            deviceID: configuration.selectedDeviceID
+        )
+    }
+
+    func resumePendingTransfers() {
+        guard !pendingTransferBatches.isEmpty else {
+            statusMessage = "There are no waiting transfers."
+            return
+        }
         guard !isBusy, !isStorageBenchmarkRunning else {
-            statusMessage = "Another file job is already running. Wait for it to finish, then try again."
+            statusMessage = "The queued transfers will start when the current job finishes."
+            return
+        }
+        startNextPendingTransferIfPossible()
+    }
+
+    func removePendingTransferBatch(_ id: UUID) {
+        guard let batch = pendingTransferBatches.first(where: { $0.id == id }) else { return }
+        pendingTransferBatches.removeAll { $0.id == id }
+        persistPendingTransfers()
+        statusMessage = "Removed \(batch.files.count) waiting file(s) from the transfer queue. No files were changed."
+    }
+
+    func enqueueTransferBatch(_ batch: PendingTransferBatch) {
+        enqueueTransfer(
+            files: batch.files,
+            sourcePath: batch.sourcePath,
+            destinationPath: batch.destinationPath,
+            eventID: batch.eventID,
+            eventName: batch.eventName,
+            deviceID: batch.deviceID
+        )
+    }
+
+    private func enqueueTransfer(
+        files: [FileRecord],
+        sourcePath: String,
+        destinationPath: String,
+        eventID: UUID?,
+        eventName: String,
+        deviceID: String
+    ) {
+        let standardizedSource = URL(fileURLWithPath: sourcePath, isDirectory: true).standardizedFileURL.path
+        let standardizedDestination = URL(fileURLWithPath: destinationPath, isDirectory: true).standardizedFileURL.path
+        var alreadyScheduled = Set<String>()
+
+        if let active = transferQueue,
+           active.state == .running,
+           URL(fileURLWithPath: active.sourcePath, isDirectory: true).standardizedFileURL.path == standardizedSource,
+           URL(fileURLWithPath: active.destinationPath, isDirectory: true).standardizedFileURL.path == standardizedDestination {
+            alreadyScheduled.formUnion(active.items.map(\.relativePath))
+        }
+        for batch in pendingTransferBatches
+        where batch.sourcePath == standardizedSource && batch.destinationPath == standardizedDestination {
+            alreadyScheduled.formUnion(batch.files.map(\.path))
+        }
+
+        var uniqueFiles: [String: FileRecord] = [:]
+        for file in files where (try? PathSafety.validateRelativePath(file.path)) != nil {
+            guard !alreadyScheduled.contains(file.path) else { continue }
+            uniqueFiles[file.path] = file
+        }
+        let unscheduledFiles = uniqueFiles.values.sorted { $0.path < $1.path }
+        guard !unscheduledFiles.isEmpty else {
+            statusMessage = "Those files are already transferring or waiting in the transfer queue."
+            NotificationCenter.default.post(name: .cameraToolkitShowTransferQueue, object: nil)
             return
         }
 
-        let sourcePath = expandedImportSourcePath
-        let destinationPath = expandedBufferIngestPath
+        if let existingIndex = pendingTransferBatches.firstIndex(where: {
+            $0.eventID == eventID
+                && $0.sourcePath == standardizedSource
+                && $0.destinationPath == standardizedDestination
+        }) {
+            pendingTransferBatches[existingIndex].files.append(contentsOf: unscheduledFiles)
+            pendingTransferBatches[existingIndex].files.sort { $0.path < $1.path }
+        } else {
+            pendingTransferBatches.append(PendingTransferBatch(
+                eventID: eventID,
+                eventName: eventName,
+                deviceID: deviceID,
+                sourcePath: standardizedSource,
+                destinationPath: standardizedDestination,
+                files: unscheduledFiles
+            ))
+        }
+        persistPendingTransfers()
+        queuedFilePaths.formUnion(unscheduledFiles.map(\.path))
+        NotificationCenter.default.post(name: .cameraToolkitShowTransferQueue, object: nil)
+
+        if isBusy || isStorageBenchmarkRunning {
+            statusMessage = "Added \(unscheduledFiles.count) file(s) to the transfer queue. Keep browsing and assigning more while the current job runs."
+        } else {
+            startNextPendingTransferIfPossible()
+        }
+    }
+
+    func startNextPendingTransferIfPossible() {
+        guard !isBusy, !isStorageBenchmarkRunning, let batch = pendingTransferBatches.first else { return }
+        pendingTransferBatches.removeFirst()
+        persistPendingTransfers()
+        runTransfer(batch)
+    }
+
+    private func runTransfer(_ batch: PendingTransferBatch) {
+        let selectedFiles = batch.files
+        let sourcePath = batch.sourcePath
+        let destinationPath = batch.destinationPath
         let source = URL(fileURLWithPath: sourcePath, isDirectory: true)
         let destination = URL(fileURLWithPath: destinationPath, isDirectory: true)
         let command = Self.commandLine(["copy-queue", sourcePath, destinationPath, "\(selectedFiles.count) files"])
@@ -988,11 +1120,19 @@ extension DashboardModel {
             },
             completion: { result in
                 self.activePlan = result.plan
-                self.queuedFilePaths.removeAll()
+                self.queuedFilePaths.subtract(selectedFiles.map(\.path))
                 self.completeTransferQueue(copy: result.copy, plan: result.plan)
                 return "Copied \(result.copy.copied.count) queued file(s) to buffer, skipped \(result.copy.skippedIdentical.count) already there, left \(result.copy.conflicts.count) conflict(s) untouched."
             }
         )
+    }
+
+    private func persistPendingTransfers() {
+        do {
+            try pendingTransferQueueStore.save(pendingTransferBatches)
+        } catch {
+            statusMessage = "The transfer was queued in this session, but its waiting list could not be saved: \(error.localizedDescription)"
+        }
     }
 
     func dismissTransferQueue() {
@@ -1596,6 +1736,9 @@ extension DashboardModel {
                     logTitle: logTitle,
                     logDetail: logDetail
                 )
+                if !tracksTransferQueue || transferQueue?.state == .completed {
+                    startNextPendingTransferIfPossible()
+                }
             } catch is CancellationError {
                 let summary = "Cancelled."
                 statusMessage = summary
@@ -1644,6 +1787,14 @@ extension DashboardModel {
         jobs[index].processedBytes = update.processedBytes
         jobs[index].totalBytes = update.totalBytes
         jobs[index].bytesPerSecond = update.bytesPerSecond
+
+        let phase = update.phase.lowercased()
+        let changesStoredBytes = phase.contains("copying") || phase.contains("removing from camera")
+        let now = Date()
+        if changesStoredBytes, now.timeIntervalSince(lastStorageCapacityRefreshRequest) >= 1 {
+            storageCapacityRevision &+= 1
+            lastStorageCapacityRefreshRequest = now
+        }
     }
 
     private func finishJob(
@@ -1671,6 +1822,7 @@ extension DashboardModel {
             detail: logDetail
         )
         isBusy = false
+        storageCapacityRevision &+= 1
     }
 
     private func recordActivity(action: JobAction, state: JobState, title: String, summary: String, detail: String) {

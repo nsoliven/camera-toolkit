@@ -1,4 +1,5 @@
 import Foundation
+import CameraToolkitCore
 
 extension Notification.Name {
     static let cameraToolkitShowTransferQueue = Notification.Name("CameraToolkitShowTransferQueue")
@@ -200,6 +201,41 @@ struct TransferQueueSnapshot: Codable, Sendable {
     }
 }
 
+struct PendingTransferBatch: Identifiable, Codable, Equatable, Sendable {
+    var id: UUID
+    var eventID: UUID?
+    var eventName: String
+    var deviceID: String
+    var sourcePath: String
+    var destinationPath: String
+    var files: [FileRecord]
+    var createdAt: Date
+
+    init(
+        id: UUID = UUID(),
+        eventID: UUID? = nil,
+        eventName: String,
+        deviceID: String,
+        sourcePath: String,
+        destinationPath: String,
+        files: [FileRecord],
+        createdAt: Date = Date()
+    ) {
+        self.id = id
+        self.eventID = eventID
+        self.eventName = eventName
+        self.deviceID = deviceID
+        self.sourcePath = sourcePath
+        self.destinationPath = destinationPath
+        self.files = files
+        self.createdAt = createdAt
+    }
+
+    var totalBytes: Int64 {
+        files.reduce(Int64(0)) { $0 + $1.size }
+    }
+}
+
 struct TransferQueueStore {
     let url: URL
     private let fileManager: FileManager
@@ -222,6 +258,40 @@ struct TransferQueueStore {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         encoder.dateEncodingStrategy = .iso8601
         try encoder.encode(snapshot).write(to: url, options: .atomic)
+    }
+
+    func remove() throws {
+        guard fileManager.fileExists(atPath: url.path) else { return }
+        try fileManager.removeItem(at: url)
+    }
+}
+
+struct PendingTransferQueueStore {
+    let url: URL
+    private let fileManager: FileManager
+
+    init(url: URL, fileManager: FileManager = .default) {
+        self.url = url
+        self.fileManager = fileManager
+    }
+
+    func load() throws -> [PendingTransferBatch] {
+        guard fileManager.fileExists(atPath: url.path) else { return [] }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return try decoder.decode([PendingTransferBatch].self, from: Data(contentsOf: url))
+    }
+
+    func save(_ batches: [PendingTransferBatch]) throws {
+        if batches.isEmpty {
+            try remove()
+            return
+        }
+        try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(batches).write(to: url, options: .atomic)
     }
 
     func remove() throws {

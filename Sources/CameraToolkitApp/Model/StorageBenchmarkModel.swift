@@ -274,6 +274,7 @@ final class StorageBenchmarkViewModel {
                 progress = 0
                 liveBytesPerSecond = 0
                 dashboardModel.isStorageBenchmarkRunning = false
+                dashboardModel.startNextPendingTransferIfPossible()
             }
 
             for target in selectedTargets {

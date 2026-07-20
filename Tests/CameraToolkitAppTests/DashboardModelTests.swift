@@ -267,6 +267,118 @@ final class DashboardModelTests: XCTestCase {
         }
     }
 
+    func testEventTransfersCanQueueWhileBusyAndRunInSavedFIFOOrder() async throws {
+        try await withTemporaryDirectoryAsync { root in
+            let card = root.appendingPathComponent("Camera Card", isDirectory: true)
+            let buffer = root.appendingPathComponent("Buffer", isDirectory: true)
+            let firstPath = "DCIM/FIRST.ARW"
+            let secondPath = "DCIM/SECOND.ARW"
+            let firstBytes = Data("first-event-photo".utf8)
+            let secondBytes = Data("second-event-photo".utf8)
+            let firstURL = try writeFile(card.appendingPathComponent(firstPath), firstBytes)
+            let secondURL = try writeFile(card.appendingPathComponent(secondPath), secondBytes)
+            let pendingStore = PendingTransferQueueStore(url: root.appendingPathComponent("pending-transfers.json"))
+            let model = DashboardModel(
+                activePlan: CopyPlan(),
+                jobs: [],
+                configuration: AppConfiguration(
+                    demoRootPath: root.appendingPathComponent("Safety Test").path,
+                    importSourcePath: card.path,
+                    archivePath: root.appendingPathComponent("Library/Originals").path,
+                    bufferPath: buffer.path,
+                    activityLogPath: root.appendingPathComponent("activity.jsonl").path,
+                    selectedDeviceID: "sony-a7v"
+                ),
+                configurationStore: ConfigurationStore(url: root.appendingPathComponent("config.json")),
+                transferQueueStore: TransferQueueStore(url: root.appendingPathComponent("transfer-queue.json")),
+                pendingTransferQueueStore: pendingStore
+            )
+
+            model.isBusy = true
+            XCTAssertTrue(model.createEvent(named: "Morning Event", on: Date(timeIntervalSince1970: 100)))
+            model.assignFilesToSelectedEvent([
+                FileRecord(
+                    path: firstPath,
+                    size: Int64(firstBytes.count),
+                    modifiedAt: try XCTUnwrap(firstURL.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)
+                )
+            ])
+            let firstDestination = model.expandedBufferIngestPath
+            model.copySelectedEventFilesToBuffer()
+
+            XCTAssertTrue(model.createEvent(named: "Evening Event", on: Date(timeIntervalSince1970: 200)))
+            model.assignFilesToSelectedEvent([
+                FileRecord(
+                    path: secondPath,
+                    size: Int64(secondBytes.count),
+                    modifiedAt: try XCTUnwrap(secondURL.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)
+                )
+            ])
+            let secondDestination = model.expandedBufferIngestPath
+            model.copySelectedEventFilesToBuffer()
+
+            XCTAssertEqual(model.pendingTransferBatches.map(\.eventName), ["Morning Event", "Evening Event"])
+            XCTAssertEqual(model.pendingTransferFileCount, 2)
+            XCTAssertEqual(try pendingStore.load().map(\.eventName), ["Morning Event", "Evening Event"])
+
+            model.isBusy = false
+            model.resumePendingTransfers()
+            try await waitForIdle(model)
+
+            XCTAssertTrue(model.pendingTransferBatches.isEmpty)
+            XCTAssertTrue(try pendingStore.load().isEmpty)
+            XCTAssertEqual(
+                try Data(contentsOf: URL(fileURLWithPath: firstDestination).appendingPathComponent(firstPath)),
+                firstBytes
+            )
+            XCTAssertEqual(
+                try Data(contentsOf: URL(fileURLWithPath: secondDestination).appendingPathComponent(secondPath)),
+                secondBytes
+            )
+            XCTAssertEqual(model.transferQueue?.items.map(\.relativePath), [secondPath])
+            XCTAssertEqual(model.transferQueue?.state, .completed)
+        }
+    }
+
+    func testQueueingDuringActiveTransferAddsOnlyNewlyAssignedFiles() throws {
+        try withTemporaryDirectory { root in
+            let card = root.appendingPathComponent("Camera", isDirectory: true)
+            let buffer = root.appendingPathComponent("Buffer", isDirectory: true)
+            let first = FileRecord(path: "DCIM/FIRST.ARW", size: 10, modifiedAt: Date(timeIntervalSince1970: 10))
+            let second = FileRecord(path: "DCIM/SECOND.ARW", size: 20, modifiedAt: Date(timeIntervalSince1970: 20))
+            let model = DashboardModel(
+                activePlan: CopyPlan(),
+                jobs: [],
+                configuration: AppConfiguration(
+                    demoRootPath: root.appendingPathComponent("Safety Test").path,
+                    importSourcePath: card.path,
+                    archivePath: root.appendingPathComponent("Library").path,
+                    bufferPath: buffer.path,
+                    activityLogPath: root.appendingPathComponent("activity.jsonl").path
+                ),
+                configurationStore: ConfigurationStore(url: root.appendingPathComponent("config.json")),
+                transferQueueStore: TransferQueueStore(url: root.appendingPathComponent("transfer-queue.json")),
+                pendingTransferQueueStore: PendingTransferQueueStore(url: root.appendingPathComponent("pending-transfers.json"))
+            )
+
+            XCTAssertTrue(model.createEvent(named: "Long Event", on: Date()))
+            model.assignFilesToSelectedEvent([first, second])
+            model.transferQueue = TransferQueueSnapshot(
+                sourcePath: card.standardizedFileURL.path,
+                destinationPath: model.expandedBufferIngestPath,
+                items: [TransferQueueItem(relativePath: first.path, size: first.size, state: .copying)],
+                totalBytes: first.size
+            )
+            model.isBusy = true
+
+            model.copySelectedEventFilesToBuffer()
+
+            XCTAssertEqual(model.pendingTransferBatches.count, 1)
+            XCTAssertEqual(model.pendingTransferBatches[0].files, [second])
+            XCTAssertEqual(model.queuedFilePaths, [first.path, second.path])
+        }
+    }
+
     func testRelaunchMarksAnUnfinishedPersistentTransferAsInterrupted() throws {
         try withTemporaryDirectory { root in
             let queueStore = TransferQueueStore(url: root.appendingPathComponent("transfer-queue.json"))
