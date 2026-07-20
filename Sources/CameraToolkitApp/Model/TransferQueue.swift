@@ -149,7 +149,7 @@ struct TransferQueueSnapshot: Codable, Sendable {
             )
         case .completed:
             return TransferQueueSidebarSummary(
-                detail: "Complete · \(verifiedCount) checksum verified",
+                detail: "\(verifiedCount) file\(verifiedCount == 1 ? "" : "s") verified",
                 badge: "Done"
             )
         case .failed:

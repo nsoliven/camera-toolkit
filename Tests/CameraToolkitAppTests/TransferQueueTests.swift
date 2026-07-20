@@ -48,7 +48,7 @@ final class TransferQueueTests: XCTestCase {
 
         XCTAssertEqual(
             queue.sidebarSummary,
-            TransferQueueSidebarSummary(detail: "Complete · 1 checksum verified", badge: "Done")
+            TransferQueueSidebarSummary(detail: "1 file verified", badge: "Done")
         )
     }
 
