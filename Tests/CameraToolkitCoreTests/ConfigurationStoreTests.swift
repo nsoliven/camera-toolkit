@@ -22,6 +22,10 @@ final class ConfigurationStoreTests: XCTestCase {
                 bufferPath: root.appendingPathComponent("Buffer").path,
                 activityLogPath: root.appendingPathComponent("activity-log.jsonl").path,
                 immichServerURL: "http://photos.local:2283",
+                trueNASServerURL: "https://nas.example.com",
+                trueNASUsername: "camera-reader",
+                trueNASDataset: "vault/photos",
+                trueNASTLSPinnedCertificateSHA256: "AABBCCDD",
                 selectedDeviceID: "dji-mini-2",
                 eventName: "Test Trip"
             )
@@ -52,6 +56,10 @@ final class ConfigurationStoreTests: XCTestCase {
             let loaded = try store.load(defaults: .defaults(applicationSupport: root))
 
             XCTAssertEqual(loaded.immichServerURL, "")
+            XCTAssertEqual(loaded.trueNASServerURL, "")
+            XCTAssertEqual(loaded.trueNASUsername, "")
+            XCTAssertEqual(loaded.trueNASDataset, "")
+            XCTAssertEqual(loaded.trueNASTLSPinnedCertificateSHA256, "")
             XCTAssertEqual(loaded.selectedLocation(for: .importSource)?.path, root.appendingPathComponent("Card").path)
             XCTAssertEqual(loaded.selectedLocation(for: .archive)?.path, root.appendingPathComponent("Archive").path)
             XCTAssertEqual(loaded.selectedLocation(for: .buffer)?.path, root.appendingPathComponent("Buffer").path)

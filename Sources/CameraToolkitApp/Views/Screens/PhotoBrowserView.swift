@@ -418,6 +418,8 @@ struct PhotoBrowserView: View {
 
     @ViewBuilder
     private func locationRow(_ location: BrowserLocation) -> some View {
+        let isMounted = folderExists(location.path)
+        let capacity = storageCapacities[location.id]
         HStack(spacing: 8) {
             Image(systemName: location.symbol)
                 .foregroundStyle(locationColor(location))
@@ -425,13 +427,13 @@ struct PhotoBrowserView: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text(location.name)
                     .lineLimit(1)
-                if let capacity = storageCapacities[location.id] {
+                if let capacity {
                     HStack(spacing: 6) {
                         ProgressView(value: capacity.usedFraction)
                             .progressViewStyle(.linear)
                             .tint(storageCapacityColor(capacity))
                             .frame(width: 54)
-                        Text("\(capacity.availableBytes.formattedWholeStorage) free")
+                        Text(storageCapacityLabel(capacity))
                             .font(.caption2.monospacedDigit())
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
@@ -441,9 +443,9 @@ struct PhotoBrowserView: View {
             }
             Spacer(minLength: 4)
             Circle()
-                .fill(folderExists(location.path) ? Color.green : Color.secondary.opacity(0.35))
+                .fill(locationConnectionColor(isMounted: isMounted, capacity: capacity))
                 .frame(width: 7, height: 7)
-                .help(folderExists(location.path) ? "Connected" : "Not mounted")
+                .help(locationConnectionHelp(isMounted: isMounted, capacity: capacity))
         }
         .tag(location.id)
     }
@@ -480,9 +482,22 @@ struct PhotoBrowserView: View {
                 }
             }
         }
+
+        if let authoritative = await model.readAuthoritativeTrueNASCapacity() {
+            let configuredNASVolume = StorageCapacityReader.mountedVolumeName(
+                for: model.configuration.cameraLibraryRootPath
+            )
+            for location in libraryLocations where
+                configuredNASVolume != nil
+                && StorageCapacityReader.mountedVolumeName(for: location.path) == configuredNASVolume {
+                storageCapacities[location.id] = authoritative
+            }
+        }
     }
 
     private func storageCapacityColor(_ capacity: StorageCapacitySnapshot) -> Color {
+        if case .networkShareEstimate = capacity.source { return .orange }
+        if case .trueNAS(_, _, _, _, false) = capacity.source { return .red }
         if capacity.availableFraction < 0.10 { return .red }
         if capacity.availableFraction < 0.20 { return .orange }
         return .blue
@@ -490,7 +505,59 @@ struct PhotoBrowserView: View {
 
     private func storageCapacityHelp(_ capacity: StorageCapacitySnapshot) -> String {
         let usedPercent = capacity.usedFraction.formatted(.percent.precision(.fractionLength(0)))
-        return "\(capacity.availableBytes.formattedWholeStorage) available out of \(capacity.totalBytes.formattedWholeStorage) · \(usedPercent) used"
+        let basic = "\(capacity.availableBytes.formattedWholeStorage) available out of \(capacity.totalBytes.formattedWholeStorage) · \(usedPercent) used"
+        switch capacity.source {
+        case .localVolume:
+            return basic
+        case .networkShareEstimate:
+            return "\(basic) · SMB estimate only; TrueNAS dataset usage has not been verified"
+        case .trueNAS(let dataset, let pool, let poolAvailable, let poolTotal, let poolHealthy):
+            let health = poolHealthy ? "healthy" : "needs attention"
+            return "\(basic) for TrueNAS dataset \(dataset) · pool \(pool): \(poolAvailable.formattedWholeStorage) free of \(poolTotal.formattedWholeStorage), \(health)"
+        }
+    }
+
+    private func storageCapacityLabel(_ capacity: StorageCapacitySnapshot) -> String {
+        switch capacity.source {
+        case .localVolume:
+            "\(capacity.availableBytes.formattedWholeStorage) free"
+        case .networkShareEstimate:
+            "\(capacity.availableBytes.formattedWholeStorage) · SMB estimate"
+        case .trueNAS(_, _, _, let poolTotal, _):
+            "\(capacity.availableBytes.formattedWholeStorage) free · \(poolTotal.formattedWholeStorage) pool"
+        }
+    }
+
+    private func locationConnectionColor(
+        isMounted: Bool,
+        capacity: StorageCapacitySnapshot?
+    ) -> Color {
+        guard isMounted else { return Color.secondary.opacity(0.35) }
+        guard let capacity else { return .green }
+        switch capacity.source {
+        case .networkShareEstimate:
+            return .orange
+        case .trueNAS(_, _, _, _, let poolHealthy):
+            return poolHealthy ? .green : .red
+        case .localVolume:
+            return .green
+        }
+    }
+
+    private func locationConnectionHelp(
+        isMounted: Bool,
+        capacity: StorageCapacitySnapshot?
+    ) -> String {
+        guard isMounted else { return "Not mounted" }
+        guard let capacity else { return "Connected" }
+        switch capacity.source {
+        case .networkShareEstimate:
+            return "SMB mounted, but authoritative NAS capacity is not connected"
+        case .trueNAS(_, _, _, _, let poolHealthy):
+            return poolHealthy ? "Mounted and verified with TrueNAS" : "Mounted, but TrueNAS reports a pool problem"
+        case .localVolume:
+            return "Connected"
+        }
     }
 
     private func sidebarActionButton(

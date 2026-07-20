@@ -14,6 +14,10 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
     public var selectedBufferID: UUID?
     public var activityLogPath: String
     public var immichServerURL: String
+    public var trueNASServerURL: String
+    public var trueNASUsername: String
+    public var trueNASDataset: String
+    public var trueNASTLSPinnedCertificateSHA256: String
     public var selectedDeviceID: String
     public var eventName: String
     public var batchID: String
@@ -35,6 +39,10 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         selectedBufferID: UUID? = nil,
         activityLogPath: String,
         immichServerURL: String = "",
+        trueNASServerURL: String = "",
+        trueNASUsername: String = "",
+        trueNASDataset: String = "",
+        trueNASTLSPinnedCertificateSHA256: String = "",
         selectedDeviceID: String = "generic-camera",
         eventName: String = "",
         batchID: String = "",
@@ -55,6 +63,10 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         self.selectedBufferID = selectedBufferID
         self.activityLogPath = activityLogPath
         self.immichServerURL = immichServerURL
+        self.trueNASServerURL = trueNASServerURL
+        self.trueNASUsername = trueNASUsername
+        self.trueNASDataset = trueNASDataset
+        self.trueNASTLSPinnedCertificateSHA256 = trueNASTLSPinnedCertificateSHA256
         self.selectedDeviceID = selectedDeviceID
         self.eventName = eventName
         self.batchID = batchID.isEmpty ? Self.makeBatchID(deviceID: selectedDeviceID) : batchID
@@ -79,6 +91,10 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         case selectedBufferID
         case activityLogPath
         case immichServerURL
+        case trueNASServerURL
+        case trueNASUsername
+        case trueNASDataset
+        case trueNASTLSPinnedCertificateSHA256
         case selectedDeviceID
         case eventName
         case batchID
@@ -106,6 +122,13 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         selectedBufferID = try values.decodeIfPresent(UUID.self, forKey: .selectedBufferID)
         activityLogPath = try values.decodeIfPresent(String.self, forKey: .activityLogPath) ?? defaults.activityLogPath
         immichServerURL = try values.decodeIfPresent(String.self, forKey: .immichServerURL) ?? defaults.immichServerURL
+        trueNASServerURL = try values.decodeIfPresent(String.self, forKey: .trueNASServerURL) ?? defaults.trueNASServerURL
+        trueNASUsername = try values.decodeIfPresent(String.self, forKey: .trueNASUsername) ?? defaults.trueNASUsername
+        trueNASDataset = try values.decodeIfPresent(String.self, forKey: .trueNASDataset) ?? defaults.trueNASDataset
+        trueNASTLSPinnedCertificateSHA256 = try values.decodeIfPresent(
+            String.self,
+            forKey: .trueNASTLSPinnedCertificateSHA256
+        ) ?? defaults.trueNASTLSPinnedCertificateSHA256
         selectedDeviceID = try values.decodeIfPresent(String.self, forKey: .selectedDeviceID) ?? defaults.selectedDeviceID
         eventName = try values.decodeIfPresent(String.self, forKey: .eventName) ?? defaults.eventName
         batchID = try values.decodeIfPresent(String.self, forKey: .batchID) ?? Self.makeBatchID(deviceID: selectedDeviceID)
