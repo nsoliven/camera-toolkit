@@ -288,8 +288,9 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate {
         let transferQueueItem = NSMenuItem(
             title: "Transfer Queue…",
             action: #selector(openTransferQueue),
-            keyEquivalent: ""
+            keyEquivalent: "t"
         )
+        transferQueueItem.keyEquivalentModifierMask = [.command, .option]
         transferQueueItem.target = self
         windowMenu.addItem(transferQueueItem)
         NSApp.windowsMenu = windowMenu

@@ -14,7 +14,7 @@ struct TransferSpeedGuideView: View {
     @State private var isLoadingLinks = true
 
     private let connectionRows = [
-        SpeedReferenceRow(title: "USB 2.0", detail: "480 Mb/s link", result: "30–45 MB/s typical"),
+        SpeedReferenceRow(title: "USB 2.0", detail: "480 Mb/s · 60 MB/s wire ceiling", result: "30–45 MB/s typical"),
         SpeedReferenceRow(title: "USB 3.2 Gen 1", detail: "5 Gb/s · formerly USB 3.0", result: "350–500 MB/s"),
         SpeedReferenceRow(title: "USB 3.2 Gen 2", detail: "10 Gb/s · USB NVMe enclosure", result: "700–1,050 MB/s"),
         SpeedReferenceRow(title: "USB 3.2 Gen 2x2", detail: "20 Gb/s · host must support 2x2", result: "1,500–2,100 MB/s"),
@@ -151,7 +151,7 @@ struct TransferSpeedGuideView: View {
     private var bottleneckTitle: String {
         if isLoadingLinks { return "Checking the connection chain" }
         if isOsmoSource, let osmoLink, osmoLink.bitsPerSecond <= 500_000_000 {
-            return "Bottleneck: Osmo USB connection"
+            return "Current connection is USB 2.0 — not the camera limit"
         }
         if queue.bytesPerSecond > 0, queue.bytesPerSecond < 55_000_000 {
             return "Result resembles USB 2.0 or slower media"
@@ -167,7 +167,7 @@ struct TransferSpeedGuideView: View {
             let measuredNote = queue.bytesPerSecond > 0
                 ? "Your current rate is normal for that link."
                 : "A transfer through this link will usually land around 30–45 MB/s."
-            return "The camera negotiated \(osmoLink.formattedLinkRate), whose wire ceiling is \(osmoLink.theoreticalMegabytesPerSecond) MB/s. \(measuredNote) DJI rates Osmo 360 internal-memory copies up to 600 MB/s over USB 3.1, so try a USB 3 data-rated cable connected directly to the Mac."
+            return "This Osmo-to-Mac path negotiated \(osmoLink.formattedLinkRate), whose wire ceiling is \(osmoLink.theoreticalMegabytesPerSecond) MB/s. That does not make the camera a 60 MB/s device. \(measuredNote) DJI rates Osmo 360 internal-memory copies up to 600 MB/s over USB 3.1, so try DJI's USB 3.1 cable or another verified USB 3 data cable connected directly to the Mac."
         }
         return "A fast enclosure cannot outrun a slower camera, card, cable, or reader. Compare the measured rate with every link below; the lowest matching result is usually the bottleneck."
     }
