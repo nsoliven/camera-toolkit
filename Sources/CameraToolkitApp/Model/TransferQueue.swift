@@ -35,6 +35,11 @@ enum TransferQueueItemState: String, Codable, Sendable {
     }
 }
 
+struct TransferQueueItemStatusText: Equatable, Sendable {
+    var label: String
+    var detail: String?
+}
+
 struct TransferQueueItem: Identifiable, Codable, Sendable {
     var id: UUID
     var relativePath: String
@@ -90,7 +95,7 @@ struct TransferQueueSnapshot: Codable, Sendable {
         phaseProcessedBytes: Int64? = nil,
         phaseTotalBytes: Int64? = nil,
         bytesPerSecond: Double = 0,
-        phase: String = "Waiting to copy",
+        phase: String = "Preparing transfer",
         message: String? = nil,
         technicalDetail: String? = nil,
         createdAt: Date = Date(),
@@ -116,6 +121,32 @@ struct TransferQueueSnapshot: Codable, Sendable {
 
     var verifiedCount: Int {
         items.count { $0.state == .verified || $0.state == .alreadyPresent }
+    }
+
+    func statusText(for item: TransferQueueItem) -> TransferQueueItemStatusText {
+        guard item.state == .waiting else {
+            return TransferQueueItemStatusText(label: item.state.label, detail: nil)
+        }
+
+        switch state {
+        case .failed:
+            return TransferQueueItemStatusText(label: "Not started", detail: "transfer stopped")
+        case .cancelled:
+            return TransferQueueItemStatusText(label: "Not started", detail: "transfer cancelled")
+        case .completed:
+            return TransferQueueItemStatusText(label: "Not started", detail: "needs attention")
+        case .running:
+            guard let index = items.firstIndex(where: { $0.id == item.id }) else {
+                return TransferQueueItemStatusText(label: "Waiting", detail: "for its turn")
+            }
+            let hasActiveItem = items.contains { $0.state == .copying || $0.state == .verifying }
+            let firstWaitingIndex = items.firstIndex { $0.state == .waiting }
+            if !hasActiveItem, firstWaitingIndex == index {
+                let detail = index == 0 ? "opening drives" : "opening next file"
+                return TransferQueueItemStatusText(label: "Starting", detail: detail)
+            }
+            return TransferQueueItemStatusText(label: "Waiting", detail: "for file \(index)")
+        }
     }
 }
 

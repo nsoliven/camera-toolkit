@@ -159,7 +159,7 @@ private struct TransferQueueView: View {
         ScrollView {
             LazyVStack(spacing: 0) {
                 ForEach(queue.items) { item in
-                    queueRow(item)
+                    queueRow(item, queue: queue)
                     if item.id != queue.items.last?.id {
                         Divider().padding(.leading, 54)
                     }
@@ -169,7 +169,7 @@ private struct TransferQueueView: View {
         .background(Color(nsColor: .textBackgroundColor))
     }
 
-    private func queueRow(_ item: TransferQueueItem) -> some View {
+    private func queueRow(_ item: TransferQueueItem, queue: TransferQueueSnapshot) -> some View {
         HStack(spacing: 12) {
             Image(systemName: itemSymbol(item.state))
                 .font(.system(size: 16, weight: .medium))
@@ -205,22 +205,39 @@ private struct TransferQueueView: View {
             }
             .frame(width: 168, alignment: .trailing)
 
-            statusPill(item.state)
-                .frame(width: 104, alignment: .trailing)
+            statusColumn(item, queue: queue)
+                .frame(width: 112, alignment: .trailing)
         }
         .padding(.horizontal, 16)
         .frame(height: 62)
         .help(item.detail ?? item.state.label)
     }
 
-    private func statusPill(_ state: TransferQueueItemState) -> some View {
-        Text(state.label)
-            .font(.caption.weight(.semibold))
-            .foregroundStyle(itemColor(state))
-            .lineLimit(1)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(itemColor(state).opacity(0.10), in: Capsule())
+    private func statusColumn(_ item: TransferQueueItem, queue: TransferQueueSnapshot) -> some View {
+        let status = queue.statusText(for: item)
+        return VStack(alignment: .trailing, spacing: 2) {
+            Text(status.label)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(statusColor(item, queue: queue))
+                .lineLimit(1)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(statusColor(item, queue: queue).opacity(0.10), in: Capsule())
+
+            if let detail = status.detail {
+                Text(detail)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+        }
+    }
+
+    private func statusColor(_ item: TransferQueueItem, queue: TransferQueueSnapshot) -> Color {
+        if queue.statusText(for: item).label == "Starting" {
+            return .blue
+        }
+        return itemColor(item.state)
     }
 
     private func locationFooter(_ queue: TransferQueueSnapshot) -> some View {
@@ -275,6 +292,11 @@ private struct TransferQueueView: View {
     }
 
     private func queueSummary(_ queue: TransferQueueSnapshot) -> String {
+        if queue.state == .running,
+           !queue.items.isEmpty,
+           queue.items.allSatisfy({ $0.state == .waiting }) {
+            return "Opening Camera and Buffer · file 1 starts next"
+        }
         let completed = queue.items.count {
             $0.state == .copied || $0.state == .verified || $0.state == .alreadyPresent
         }
