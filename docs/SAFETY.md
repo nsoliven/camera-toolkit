@@ -11,6 +11,7 @@ Camera Toolkit treats source media as read-only during normal browsing and trans
 - **Free Up Camera** is available only for an explicit transfer set whose Buffer copies are all verified. It requires typing `REMOVE`, hashes every source file and Buffer copy again, verifies the files did not change during that pass, and validates the entire set before removing the first source file.
 - A missing, changed, differently sized, or checksum-mismatched file blocks source removal for the whole set.
 - Source removal is permanent because putting files in an external volume's Trash would not free camera space. The verified Buffer copies are never modified by this action.
+- Storage speed tests never write to configured camera/card sources. Writable Buffer and library tests use one unique hidden temporary file, require free-space headroom, flush it before measuring read speed, and remove it after success, cancellation, or failure.
 - Buffer-to-archive cleanup quarantines matching Buffer files under `_Trash/<batch>` on the same volume. It does not immediately delete them.
 - Emptying quarantine requires an explicit confirmation token and rejects paths outside an `_Trash` hierarchy.
 

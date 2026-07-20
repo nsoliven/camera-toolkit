@@ -82,6 +82,7 @@ final class DashboardModel {
     var configMessage: String = "Config is saved automatically."
     var statusMessage: String = "Ready. Choose folders in Settings to begin."
     var isBusy: Bool = false
+    var isStorageBenchmarkRunning: Bool = false
     var immichAPIKeyDraft: String = ""
     var immichConnectionStatus: String = "Not connected. Add your server URL and API key in Config."
     var immichConnectionReport: ImmichConnectionReport?
@@ -955,7 +956,7 @@ extension DashboardModel {
             statusMessage = "Queue is empty. Preview files, then add files to the queue."
             return
         }
-        guard !isBusy else {
+        guard !isBusy, !isStorageBenchmarkRunning else {
             statusMessage = "Another file job is already running. Wait for it to finish, then try again."
             return
         }
@@ -1007,7 +1008,7 @@ extension DashboardModel {
     }
 
     func removeVerifiedSourceFiles(queueID: UUID, confirmation: String) {
-        guard !isBusy, !isSourceCleanupRunning else {
+        guard !isBusy, !isSourceCleanupRunning, !isStorageBenchmarkRunning else {
             sourceCleanupError = "Another file job is already running. Wait for it to finish, then try again."
             return
         }
@@ -1542,7 +1543,7 @@ extension DashboardModel {
         operation: @escaping @Sendable (@escaping @Sendable (BackgroundJobUpdate) -> Void) throws -> Result,
         completion: @escaping (Result) throws -> String
     ) {
-        guard !isBusy else {
+        guard !isBusy, !isStorageBenchmarkRunning else {
             statusMessage = "Another file job is already running. Wait for it to finish, then try again."
             return
         }

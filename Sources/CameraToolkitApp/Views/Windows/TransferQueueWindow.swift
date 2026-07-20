@@ -122,7 +122,7 @@ private struct TransferQueueView: View {
                         .buttonStyle(.plain)
                         .help("Compare this transfer with USB, Thunderbolt, camera, and SD card speeds")
                         .popover(isPresented: $showingSpeedGuide, arrowEdge: .bottom) {
-                            TransferSpeedGuideView(queue: queue)
+                            TransferSpeedGuideView(queue: queue, model: model)
                         }
                     }
                     .font(.caption)
