@@ -1,4 +1,5 @@
 import AppKit
+import CameraToolkitCore
 import SwiftUI
 
 @MainActor
@@ -41,6 +42,7 @@ final class TransferQueueWindowController: NSObject, NSWindowDelegate {
 private struct TransferQueueView: View {
     @Bindable var model: DashboardModel
     @State private var showingSpeedGuide = false
+    @State private var showingSourceCleanup = false
 
     var body: some View {
         Group {
@@ -71,6 +73,9 @@ private struct TransferQueueView: View {
             queueList(queue)
             Divider()
             locationFooter(queue)
+        }
+        .sheet(isPresented: $showingSourceCleanup) {
+            SourceCleanupSheet(model: model, queue: queue)
         }
     }
 
@@ -272,6 +277,15 @@ private struct TransferQueueView: View {
 
             Spacer(minLength: 12)
 
+            if canFreeUpCamera(queue) {
+                Button("Free Up Camera…", role: .destructive) {
+                    model.prepareSourceCleanup()
+                    showingSourceCleanup = true
+                }
+                .tint(.red)
+                .help("Permanently remove only these checksum-matched files from the camera after one fresh recheck")
+            }
+
             Button("Show Camera") {
                 model.openEventFolder(queue.sourcePath)
             }
@@ -282,6 +296,12 @@ private struct TransferQueueView: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
         .background(.bar)
+    }
+
+    private func canFreeUpCamera(_ queue: TransferQueueSnapshot) -> Bool {
+        queue.state == .completed
+            && queue.verifiedCount == queue.items.count
+            && queue.items.contains { $0.state == .verified || $0.state == .alreadyPresent }
     }
 
     private func locationLabel(title: String, value: String, symbol: String) -> some View {
@@ -311,7 +331,10 @@ private struct TransferQueueView: View {
             return "Opening Camera and Buffer · file 1 starts next"
         }
         let completed = queue.items.count {
-            $0.state == .copied || $0.state == .verified || $0.state == .alreadyPresent
+            $0.state == .copied
+                || $0.state == .verified
+                || $0.state == .alreadyPresent
+                || $0.state == .sourceRemoved
         }
         if let activeIndex = queue.items.firstIndex(where: {
             $0.state == .copying || $0.state == .verifying || $0.state == .failed
@@ -386,6 +409,7 @@ private struct TransferQueueView: View {
         case .copied: "doc.badge.clock"
         case .verifying: "checkmark.circle.badge.questionmark"
         case .verified, .alreadyPresent: "checkmark.circle.fill"
+        case .sourceRemoved: "externaldrive.badge.minus"
         case .conflict: "exclamationmark.triangle.fill"
         case .failed: "xmark.circle.fill"
         }
@@ -396,7 +420,139 @@ private struct TransferQueueView: View {
         case .waiting: .secondary
         case .copying, .copied, .verifying: .blue
         case .verified, .alreadyPresent: .green
+        case .sourceRemoved: .teal
         case .conflict, .failed: .orange
         }
+    }
+}
+
+private struct SourceCleanupSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @Bindable var model: DashboardModel
+    let queue: TransferQueueSnapshot
+
+    @State private var confirmation = ""
+    @State private var attemptedRemoval = false
+
+    private var removableItems: [TransferQueueItem] {
+        queue.items.filter { $0.state == .verified || $0.state == .alreadyPresent }
+    }
+
+    private var removableBytes: Int64 {
+        removableItems.reduce(Int64(0)) { $0 + $1.size }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: "externaldrive.badge.minus")
+                    .font(.system(size: 30, weight: .medium))
+                    .foregroundStyle(.red)
+                    .frame(width: 40)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Free Up Camera")
+                        .font(.title2.weight(.semibold))
+                    Text("\(removableItems.count) file\(removableItems.count == 1 ? "" : "s") · \(removableBytes.formattedBytes)")
+                        .font(.subheadline.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                Label("Buffer copies are checksum verified", systemImage: "checkmark.shield.fill")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.green)
+                Text("Camera Toolkit will hash every source file and its Buffer copy again. It removes nothing unless the entire selected set still matches.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(12)
+            .background(Color.green.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
+
+            VStack(alignment: .leading, spacing: 6) {
+                Label("Permanent removal", systemImage: "exclamationmark.triangle.fill")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.red)
+                Text("This frees space on \(URL(fileURLWithPath: queue.sourcePath).lastPathComponent). The camera files cannot be restored from Trash; the verified Buffer copies stay untouched.")
+                    .font(.callout)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text("Type REMOVE to continue")
+                    .font(.caption.weight(.semibold))
+                    .padding(.top, 4)
+                TextField("REMOVE", text: $confirmation)
+                    .textFieldStyle(.roundedBorder)
+                    .disabled(model.isSourceCleanupRunning || model.sourceCleanupMessage != nil)
+            }
+            .padding(12)
+            .background(Color.red.opacity(0.07), in: RoundedRectangle(cornerRadius: 10))
+
+            if model.isSourceCleanupRunning {
+                VStack(alignment: .leading, spacing: 7) {
+                    HStack {
+                        Text(model.sourceCleanupJob?.note ?? "Rechecking files")
+                        Spacer()
+                        Text((model.sourceCleanupJob?.progress ?? 0).formatted(.percent.precision(.fractionLength(0))))
+                            .monospacedDigit()
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    ProgressView(value: model.sourceCleanupJob?.progress ?? 0)
+                        .progressViewStyle(.linear)
+                }
+            }
+
+            if let message = model.sourceCleanupMessage {
+                Label(message, systemImage: "checkmark.circle.fill")
+                    .font(.callout)
+                    .foregroundStyle(.green)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if let error = cleanupError {
+                Label(error, systemImage: "exclamationmark.triangle.fill")
+                    .font(.callout)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            HStack {
+                Spacer()
+                Button(model.sourceCleanupMessage == nil ? "Cancel" : "Done") {
+                    dismiss()
+                }
+                .disabled(model.isSourceCleanupRunning)
+
+                if model.sourceCleanupMessage == nil {
+                    Button("Recheck & Remove", role: .destructive) {
+                        attemptedRemoval = true
+                        model.removeVerifiedSourceFiles(
+                            queueID: queue.id,
+                            confirmation: confirmation
+                        )
+                    }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(
+                        confirmation != SourceCleanupService.confirmationToken
+                            || model.isSourceCleanupRunning
+                    )
+                }
+            }
+        }
+        .padding(20)
+        .frame(width: 520)
+        .background(Color(nsColor: .windowBackgroundColor))
+        .interactiveDismissDisabled(model.isSourceCleanupRunning)
+    }
+
+    private var cleanupError: String? {
+        if let error = model.sourceCleanupError {
+            return error
+        }
+        guard attemptedRemoval,
+              model.sourceCleanupJob?.state == .failed else {
+            return nil
+        }
+        return model.sourceCleanupJob?.note
     }
 }

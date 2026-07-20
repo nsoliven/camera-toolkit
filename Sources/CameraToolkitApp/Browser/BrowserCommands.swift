@@ -15,6 +15,7 @@ enum BrowserCommand: String, Sendable {
     case nextSource
     case increaseThumbnailSize
     case decreaseThumbnailSize
+    case reload
 
     static let notification = Notification.Name("CameraToolkit.BrowserCommand")
 

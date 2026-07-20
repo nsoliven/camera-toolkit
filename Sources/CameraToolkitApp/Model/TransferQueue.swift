@@ -18,6 +18,7 @@ enum TransferQueueItemState: String, Codable, Sendable {
     case verifying
     case verified
     case alreadyPresent
+    case sourceRemoved
     case conflict
     case failed
 
@@ -29,6 +30,7 @@ enum TransferQueueItemState: String, Codable, Sendable {
         case .verifying: "Verifying"
         case .verified: "Verified"
         case .alreadyPresent: "Already verified"
+        case .sourceRemoved: "Removed from camera"
         case .conflict: "Conflict"
         case .failed: "Stopped"
         }
@@ -125,7 +127,13 @@ struct TransferQueueSnapshot: Codable, Sendable {
     }
 
     var verifiedCount: Int {
-        items.count { $0.state == .verified || $0.state == .alreadyPresent }
+        items.count {
+            $0.state == .verified || $0.state == .alreadyPresent || $0.state == .sourceRemoved
+        }
+    }
+
+    var sourceRemovedCount: Int {
+        items.count { $0.state == .sourceRemoved }
     }
 
     var sidebarSummary: TransferQueueSidebarSummary {
@@ -148,6 +156,12 @@ struct TransferQueueSnapshot: Codable, Sendable {
                 badge: "\(percent)%"
             )
         case .completed:
+            if sourceRemovedCount > 0 {
+                return TransferQueueSidebarSummary(
+                    detail: "\(sourceRemovedCount) file\(sourceRemovedCount == 1 ? "" : "s") removed from camera",
+                    badge: "Freed"
+                )
+            }
             return TransferQueueSidebarSummary(
                 detail: "\(verifiedCount) file\(verifiedCount == 1 ? "" : "s") verified",
                 badge: "Done"

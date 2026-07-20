@@ -1650,6 +1650,8 @@ struct PhotoBrowserView: View {
             increaseThumbnailSize()
         case .decreaseThumbnailSize:
             decreaseThumbnailSize()
+        case .reload:
+            Task { await loadCurrentDirectory() }
         }
     }
 
