@@ -40,6 +40,7 @@ final class TransferQueueWindowController: NSObject, NSWindowDelegate {
 
 private struct TransferQueueView: View {
     @Bindable var model: DashboardModel
+    @State private var showingSpeedGuide = false
 
     var body: some View {
         Group {
@@ -100,15 +101,26 @@ private struct TransferQueueView: View {
                     Text(phaseByteSummary(queue))
                         .font(.subheadline.weight(.semibold).monospacedDigit())
                         .lineLimit(1)
-                    if queue.state == .running, queue.bytesPerSecond > 0 {
-                        Text("\(Int64(queue.bytesPerSecond).formattedBytes)/s")
-                            .font(.caption.monospacedDigit())
-                            .foregroundStyle(.secondary)
-                    } else {
-                        Text(queueStateNote(queue.state))
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                    HStack(spacing: 5) {
+                        if queue.state == .running, queue.bytesPerSecond > 0 {
+                            Text("\(Int64(queue.bytesPerSecond).formattedBytes)/s")
+                                .monospacedDigit()
+                        } else {
+                            Text(queueStateNote(queue.state))
+                        }
+                        Button {
+                            showingSpeedGuide.toggle()
+                        } label: {
+                            Image(systemName: "info.circle")
+                        }
+                        .buttonStyle(.plain)
+                        .help("Compare this transfer with USB, Thunderbolt, camera, and SD card speeds")
+                        .popover(isPresented: $showingSpeedGuide, arrowEdge: .bottom) {
+                            TransferSpeedGuideView(queue: queue)
+                        }
                     }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 }
 
                 if queue.state != .running {
