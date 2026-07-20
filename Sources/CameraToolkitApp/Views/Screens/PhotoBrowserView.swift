@@ -430,7 +430,7 @@ struct PhotoBrowserView: View {
                             .progressViewStyle(.linear)
                             .tint(storageCapacityColor(capacity))
                             .frame(width: 54)
-                        Text("\(capacity.availableBytes.formattedBytes) free")
+                        Text("\(capacity.availableBytes.formattedWholeStorage) free")
                             .font(.caption2.monospacedDigit())
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
@@ -489,7 +489,7 @@ struct PhotoBrowserView: View {
 
     private func storageCapacityHelp(_ capacity: StorageCapacitySnapshot) -> String {
         let usedPercent = capacity.usedFraction.formatted(.percent.precision(.fractionLength(0)))
-        return "\(capacity.availableBytes.formattedBytes) available out of \(capacity.totalBytes.formattedBytes) · \(usedPercent) used"
+        return "\(capacity.availableBytes.formattedWholeStorage) available out of \(capacity.totalBytes.formattedWholeStorage) · \(usedPercent) used"
     }
 
     private func sidebarActionButton(

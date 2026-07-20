@@ -12,6 +12,12 @@ final class StorageCapacityTests: XCTestCase {
         XCTAssertEqual(StorageCapacitySnapshot(availableBytes: -1, totalBytes: 100).usedFraction, 1)
     }
 
+    func testSidebarCapacityUsesWholeAdaptiveUnits() {
+        XCTAssertEqual(Int64(110_450_000_000).formattedWholeStorage, "110 GB")
+        XCTAssertEqual(Int64(1_650_000_000_000).formattedWholeStorage, "2 TB")
+        XCTAssertEqual(Int64(999_000_000).formattedWholeStorage, "999 MB")
+    }
+
     func testReaderFindsCapacityForMountedTemporaryFolder() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("CameraToolkitCapacityTests-\(UUID().uuidString)", isDirectory: true)
