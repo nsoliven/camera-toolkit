@@ -56,14 +56,13 @@ public struct LocalTransferService {
             guard fileManager.fileExists(atPath: sourceURL.path) else {
                 throw ToolkitError.pathNotFound(sourceURL.path)
             }
-            let sourceHash: String
-            if let existingHash = sourceFile.sha256 {
-                sourceHash = existingHash
-            } else {
-                sourceHash = try FileScanner.sha256(sourceURL)
-            }
-
             if fileManager.fileExists(atPath: destinationURL.path) {
+                let sourceHash: String
+                if let existingHash = sourceFile.sha256 {
+                    sourceHash = existingHash
+                } else {
+                    sourceHash = try FileScanner.sha256(sourceURL)
+                }
                 let destinationHash = try FileScanner.sha256(destinationURL)
                 if destinationHash == sourceHash {
                     result.skippedIdentical.append(sourceFile.path)
@@ -89,7 +88,7 @@ public struct LocalTransferService {
             }
 
             try fileManager.createDirectory(at: destinationURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try copyFile(from: sourceURL, to: destinationURL) { copiedChunk in
+            try copyFile(from: sourceURL, to: destinationURL, expectedByteCount: sourceFile.size) { copiedChunk in
                 processedBytes += Int64(copiedChunk)
                 if progressLimiter.shouldEmit() {
                     progress?(
@@ -128,7 +127,13 @@ public struct LocalTransferService {
         return result
     }
 
-    private func copyFile(from source: URL, to destination: URL, progress: (Int) -> Void) throws {
+    private func copyFile(
+        from source: URL,
+        to destination: URL,
+        expectedByteCount: Int64,
+        progress: (Int) -> Void
+    ) throws {
+        try removeStaleTemporaryCopies(for: destination)
         let temporaryURL = destination
             .deletingLastPathComponent()
             .appendingPathComponent(".\(destination.lastPathComponent).cttmp-\(UUID().uuidString)")
@@ -138,11 +143,28 @@ public struct LocalTransferService {
             throw ToolkitError.commandFailed("Could not create temporary copy file at \(temporaryURL.path)")
         }
         do {
-            try StreamingFileIO.copyBytes(from: source, to: temporaryURL, progress: progress)
+            try StreamingFileIO.copyBytes(
+                from: source,
+                to: temporaryURL,
+                expectedByteCount: expectedByteCount,
+                progress: progress
+            )
             try fileManager.moveItem(at: temporaryURL, to: destination)
         } catch {
             try? fileManager.removeItem(at: temporaryURL)
-            throw error
+            throw ToolkitError.commandFailed(
+                "Could not safely finish \(source.lastPathComponent). The source or Buffer may have disconnected. Reconnect both drives and try again. No camera file was deleted. Technical detail: \(error.localizedDescription)"
+            )
+        }
+    }
+
+    private func removeStaleTemporaryCopies(for destination: URL) throws {
+        let parent = destination.deletingLastPathComponent()
+        guard fileManager.fileExists(atPath: parent.path) else { return }
+        let prefix = ".\(destination.lastPathComponent).cttmp-"
+        for candidate in try fileManager.contentsOfDirectory(at: parent, includingPropertiesForKeys: nil)
+            where candidate.lastPathComponent.hasPrefix(prefix) {
+            try fileManager.removeItem(at: candidate)
         }
     }
 

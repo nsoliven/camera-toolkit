@@ -26,6 +26,7 @@ private struct OrganizedArchiveJobResult: Sendable {
 private struct BackgroundJobUpdate: Sendable {
     var progress: Double
     var note: String
+    var phase: String
     var detail: String
     var command: String
     var sourcePath: String?
@@ -40,6 +41,7 @@ private struct BackgroundJobUpdate: Sendable {
     init(
         progress: Double,
         note: String,
+        phase: String = "",
         detail: String = "",
         command: String = "",
         sourcePath: String? = nil,
@@ -53,6 +55,7 @@ private struct BackgroundJobUpdate: Sendable {
     ) {
         self.progress = progress
         self.note = note
+        self.phase = phase
         self.detail = detail
         self.command = command
         self.sourcePath = sourcePath
@@ -87,12 +90,15 @@ final class DashboardModel {
     var lastRefreshedAt: Date?
     var catalogReport: CatalogBootstrapReport?
     var catalogMessage: String = "Photo list has not been prepared yet."
+    var transferQueue: TransferQueueSnapshot?
     var activeJob: JobSnapshot? {
         jobs.first { $0.state == .running || $0.state == .queued }
     }
     @ObservationIgnored private let configurationStore: ConfigurationStore
+    @ObservationIgnored private let transferQueueStore: TransferQueueStore
     @ObservationIgnored private let secretStore = KeychainSecretStore(service: "org.cameratoolkit.CameraToolkit")
     @ObservationIgnored private var catalogSyncTask: Task<Void, Never>?
+    @ObservationIgnored private var lastTransferQueuePersistence = Date.distantPast
 
     init(
         activePlan: CopyPlan,
@@ -100,12 +106,34 @@ final class DashboardModel {
         activityLog: [ActivityLogEntry] = [],
         configuration: AppConfiguration = .defaults(applicationSupport: DashboardModel.defaultApplicationSupportURL),
         configurationStore: ConfigurationStore = ConfigurationStore(url: DashboardModel.defaultConfigurationURL),
+        transferQueueStore: TransferQueueStore? = nil,
         loadActivityLog: Bool = false
     ) {
         self.activePlan = activePlan
         self.jobs = jobs
         self.configuration = configuration
         self.configurationStore = configurationStore
+        let resolvedTransferQueueStore = transferQueueStore ?? TransferQueueStore(
+            url: configurationStore.url.deletingLastPathComponent().appendingPathComponent("transfer-queue.json")
+        )
+        self.transferQueueStore = resolvedTransferQueueStore
+        var restoredTransferQueue = try? resolvedTransferQueueStore.load()
+        if var interruptedQueue = restoredTransferQueue, interruptedQueue.state == .running {
+            interruptedQueue.state = .failed
+            interruptedQueue.phase = "Transfer interrupted"
+            interruptedQueue.message = "Camera Toolkit closed before this transfer finished. Reconnect both drives, then retry. Camera originals were untouched."
+            interruptedQueue.bytesPerSecond = 0
+            interruptedQueue.updatedAt = Date()
+            if let activeIndex = interruptedQueue.items.firstIndex(where: {
+                $0.state == .copying || $0.state == .verifying
+            }) {
+                interruptedQueue.items[activeIndex].state = .failed
+                interruptedQueue.items[activeIndex].detail = interruptedQueue.message
+            }
+            restoredTransferQueue = interruptedQueue
+            try? resolvedTransferQueueStore.save(interruptedQueue)
+        }
+        self.transferQueue = restoredTransferQueue
         if loadActivityLog {
             self.activityLog = (try? ActivityLogStore(url: URL(fileURLWithPath: Self.expandedPath(configuration.activityLogPath))).load()) ?? activityLog
         } else {
@@ -903,12 +931,17 @@ extension DashboardModel {
             statusMessage = "Queue is empty. Preview files, then add files to the queue."
             return
         }
+        guard !isBusy else {
+            statusMessage = "Another file job is already running. Wait for it to finish, then try again."
+            return
+        }
 
         let sourcePath = expandedImportSourcePath
         let destinationPath = expandedBufferIngestPath
         let source = URL(fileURLWithPath: sourcePath, isDirectory: true)
         let destination = URL(fileURLWithPath: destinationPath, isDirectory: true)
         let command = Self.commandLine(["copy-queue", sourcePath, destinationPath, "\(selectedFiles.count) files"])
+        startTransferQueue(files: selectedFiles, sourcePath: sourcePath, destinationPath: destinationPath)
         runBackgroundJob(
             action: .ingestCard,
             runningNote: "Copying queued files to buffer",
@@ -917,6 +950,7 @@ extension DashboardModel {
             command: command,
             sourcePath: sourcePath,
             destinationPath: destinationPath,
+            tracksTransferQueue: true,
             operation: { progress in
                 let result = try LocalTransferService().copyFiles(source: source, destination: destination, files: selectedFiles) { update in
                     progress(Self.jobUpdate(from: update, lowerBound: 0.04, upperBound: 0.78, notePrefix: "Copying queue", command: command, sourcePath: sourcePath, destinationPath: destinationPath))
@@ -930,9 +964,16 @@ extension DashboardModel {
             completion: { result in
                 self.activePlan = result.plan
                 self.queuedFilePaths.removeAll()
+                self.completeTransferQueue(copy: result.copy, plan: result.plan)
                 return "Copied \(result.copy.copied.count) queued file(s) to buffer, skipped \(result.copy.skippedIdentical.count) already there, left \(result.copy.conflicts.count) conflict(s) untouched."
             }
         )
+    }
+
+    func dismissTransferQueue() {
+        guard transferQueue?.state != .running else { return }
+        transferQueue = nil
+        try? transferQueueStore.remove()
     }
 
     var isBufferVerifiedForArchive: Bool {
@@ -1116,6 +1157,7 @@ extension DashboardModel {
         return BackgroundJobUpdate(
             progress: progress,
             note: note,
+            phase: update.phase,
             detail: details.joined(separator: " · "),
             command: command,
             sourcePath: sourcePath,
@@ -1179,6 +1221,144 @@ extension DashboardModel {
         return "'\(value.replacingOccurrences(of: "'", with: "'\\''"))'"
     }
 
+    private func startTransferQueue(files: [FileRecord], sourcePath: String, destinationPath: String) {
+        let sorted = files.sorted { $0.path < $1.path }
+        transferQueue = TransferQueueSnapshot(
+            sourcePath: sourcePath,
+            destinationPath: destinationPath,
+            items: sorted.map { TransferQueueItem(relativePath: $0.path, size: $0.size) },
+            totalBytes: sorted.reduce(Int64(0)) { $0 + $1.size }
+        )
+        persistTransferQueue(force: true)
+    }
+
+    private func updateTransferQueue(_ update: BackgroundJobUpdate) {
+        guard var queue = transferQueue, queue.state == .running else { return }
+        queue.progress = min(max(update.progress, 0), 1)
+        queue.bytesPerSecond = update.bytesPerSecond
+        queue.phase = Self.displayPhase(update.phase)
+        queue.updatedAt = Date()
+
+        let phase = update.phase.lowercased()
+        if phase.contains("copy") {
+            queue.processedBytes = min(max(update.processedBytes, 0), queue.totalBytes)
+            for index in queue.items.indices where index < update.processedFiles {
+                queue.items[index].state = .copied
+                queue.items[index].copiedBytes = queue.items[index].size
+            }
+            if let currentPath = update.currentPath,
+               let currentIndex = queue.items.firstIndex(where: { $0.relativePath == currentPath }) {
+                if update.processedFiles > currentIndex {
+                    queue.items[currentIndex].state = .copied
+                    queue.items[currentIndex].copiedBytes = queue.items[currentIndex].size
+                } else {
+                    let earlierBytes = queue.items[..<currentIndex].reduce(Int64(0)) { $0 + $1.size }
+                    queue.items[currentIndex].state = .copying
+                    queue.items[currentIndex].copiedBytes = min(
+                        max(update.processedBytes - earlierBytes, 0),
+                        queue.items[currentIndex].size
+                    )
+                }
+            }
+        } else if phase.contains("verif") || phase.contains("check") {
+            for index in queue.items.indices where index < update.processedFiles {
+                queue.items[index].state = .verified
+                queue.items[index].copiedBytes = queue.items[index].size
+            }
+            if let currentPath = update.currentPath,
+               let currentIndex = queue.items.firstIndex(where: { $0.relativePath == currentPath }),
+               update.processedFiles <= currentIndex {
+                queue.items[currentIndex].state = .verifying
+                queue.items[currentIndex].copiedBytes = queue.items[currentIndex].size
+            }
+        }
+
+        transferQueue = queue
+        persistTransferQueue()
+    }
+
+    private func completeTransferQueue(copy: LocalCopyResult, plan: CopyPlan) {
+        guard var queue = transferQueue else { return }
+        let skipped = Set(copy.skippedIdentical)
+        let verified = Set(plan.existing.map(\.path))
+        let conflicts = Set(plan.conflicts.map(\.path))
+
+        for index in queue.items.indices {
+            let path = queue.items[index].relativePath
+            queue.items[index].copiedBytes = queue.items[index].size
+            if conflicts.contains(path) {
+                queue.items[index].state = .conflict
+                queue.items[index].detail = "A different file already exists at the Buffer destination."
+            } else if verified.contains(path) {
+                queue.items[index].state = skipped.contains(path) ? .alreadyPresent : .verified
+            } else {
+                queue.items[index].state = .failed
+                queue.items[index].detail = "The file was not present in the verified Buffer result."
+            }
+        }
+
+        let issueCount = queue.items.count { $0.state == .conflict || $0.state == .failed }
+        queue.state = issueCount == 0 ? .completed : .failed
+        queue.progress = 1
+        queue.processedBytes = queue.totalBytes
+        queue.bytesPerSecond = 0
+        queue.phase = issueCount == 0 ? "Transfer complete" : "Completed with issues"
+        queue.message = issueCount == 0
+            ? "All \(queue.items.count) files are checksum-verified in the Buffer. Camera originals were untouched."
+            : "\(issueCount) file(s) need attention. Existing files were not overwritten."
+        queue.updatedAt = Date()
+        transferQueue = queue
+        persistTransferQueue(force: true)
+    }
+
+    private func failTransferQueue(error: Error, message: String) {
+        guard var queue = transferQueue else { return }
+        if let activeIndex = queue.items.firstIndex(where: { $0.state == .copying || $0.state == .verifying })
+            ?? queue.items.firstIndex(where: { $0.state == .waiting }) {
+            queue.items[activeIndex].state = .failed
+            queue.items[activeIndex].detail = message
+        }
+        queue.state = .failed
+        queue.phase = "Transfer stopped"
+        queue.message = message
+        queue.technicalDetail = error.localizedDescription
+        queue.bytesPerSecond = 0
+        queue.updatedAt = Date()
+        transferQueue = queue
+        persistTransferQueue(force: true)
+    }
+
+    private func cancelTransferQueue() {
+        guard var queue = transferQueue else { return }
+        queue.state = .cancelled
+        queue.phase = "Cancelled"
+        queue.message = "Transfer cancelled. Camera originals were untouched."
+        queue.bytesPerSecond = 0
+        queue.updatedAt = Date()
+        transferQueue = queue
+        persistTransferQueue(force: true)
+    }
+
+    private func persistTransferQueue(force: Bool = false) {
+        guard let queue = transferQueue else { return }
+        let now = Date()
+        guard force || now.timeIntervalSince(lastTransferQueuePersistence) >= 1 else { return }
+        try? transferQueueStore.save(queue)
+        lastTransferQueuePersistence = now
+    }
+
+    nonisolated private static func transferFailureSummary(_ error: Error) -> String {
+        let detail = error.localizedDescription
+        let normalized = detail.lowercased()
+        let looksLikeDisconnect = [
+            "disconnect", "not attached", "no such file", "input/output", "couldn’t be moved", "couldn't be moved"
+        ].contains { normalized.contains($0) }
+        if looksLikeDisconnect {
+            return "A camera or Buffer drive disconnected while copying. Reconnect both drives, then retry. Camera originals were untouched."
+        }
+        return "The transfer stopped safely: \(detail) Camera originals were untouched."
+    }
+
     private func runBackgroundJob<Result: Sendable>(
         action: JobAction,
         runningNote: String,
@@ -1187,6 +1367,7 @@ extension DashboardModel {
         command: String = "",
         sourcePath: String? = nil,
         destinationPath: String? = nil,
+        tracksTransferQueue: Bool = false,
         operation: @escaping @Sendable (@escaping @Sendable (BackgroundJobUpdate) -> Void) throws -> Result,
         completion: @escaping (Result) throws -> String
     ) {
@@ -1214,7 +1395,11 @@ extension DashboardModel {
 
         let progressHandler: @Sendable (BackgroundJobUpdate) -> Void = { [weak self] update in
             Task { @MainActor in
-                self?.updateJob(id: jobID, update: update)
+                guard let self else { return }
+                self.updateJob(id: jobID, update: update)
+                if tracksTransferQueue {
+                    self.updateTransferQueue(update)
+                }
             }
         }
 
@@ -1242,6 +1427,9 @@ extension DashboardModel {
             } catch is CancellationError {
                 let summary = "Cancelled."
                 statusMessage = summary
+                if tracksTransferQueue {
+                    cancelTransferQueue()
+                }
                 finishJob(
                     id: jobID,
                     action: action,
@@ -1251,8 +1439,11 @@ extension DashboardModel {
                     logDetail: logDetail
                 )
             } catch {
-                let summary = error.localizedDescription
+                let summary = tracksTransferQueue ? Self.transferFailureSummary(error) : error.localizedDescription
                 statusMessage = summary
+                if tracksTransferQueue {
+                    failTransferQueue(error: error, message: summary)
+                }
                 finishJob(
                     id: jobID,
                     action: action,
@@ -1293,7 +1484,9 @@ extension DashboardModel {
     ) {
         if let index = jobs.firstIndex(where: { $0.id == id }) {
             jobs[index].state = state
-            jobs[index].progress = 1
+            if state == .done {
+                jobs[index].progress = 1
+            }
             jobs[index].note = note
             jobs[index].finishedAt = Date()
         }

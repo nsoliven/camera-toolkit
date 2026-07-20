@@ -68,8 +68,10 @@ public struct ArchivePlanner {
     ) throws -> CopyPlan {
         var plan = CopyPlan()
         let selected = files.sorted { $0.path < $1.path }
-        let totalBytes = selected.reduce(Int64(0)) { $0 + $1.size }
+        let totalBytes = selected.reduce(Int64(0)) { $0 + ($1.size * 2) }
         var processedBytes: Int64 = 0
+        let startedAt = Date()
+        var progressLimiter = FileOperationProgressLimiter()
 
         for (index, file) in selected.enumerated() {
             try PathSafety.validateRelativePath(file.path)
@@ -78,7 +80,26 @@ public struct ArchivePlanner {
                 throw ToolkitError.pathNotFound(sourceURL.path)
             }
 
-            let sourceHash = try file.sha256 ?? FileScanner.sha256(sourceURL)
+            let sourceHash: String
+            if let existingHash = file.sha256 {
+                sourceHash = existingHash
+                processedBytes += file.size
+            } else {
+                sourceHash = try FileScanner.sha256(sourceURL) { chunkBytes in
+                    processedBytes += Int64(chunkBytes)
+                    if progressLimiter.shouldEmit() {
+                        progress?(FileOperationProgress(
+                            phase: "Verifying camera file",
+                            currentPath: file.path,
+                            processedFiles: index,
+                            totalFiles: selected.count,
+                            processedBytes: processedBytes,
+                            totalBytes: totalBytes,
+                            bytesPerSecond: Self.rate(bytes: processedBytes, since: startedAt)
+                        ))
+                    }
+                }
+            }
             let record = FileRecord(
                 path: file.path,
                 size: file.size,
@@ -87,29 +108,49 @@ public struct ArchivePlanner {
             )
             let destinationURL = destination.appendingPathComponent(file.path)
             if FileManager.default.fileExists(atPath: destinationURL.path) {
-                if try FileScanner.sha256(destinationURL) == sourceHash {
+                let destinationHash = try FileScanner.sha256(destinationURL) { chunkBytes in
+                    processedBytes += Int64(chunkBytes)
+                    if progressLimiter.shouldEmit() {
+                        progress?(FileOperationProgress(
+                            phase: "Verifying buffer file",
+                            currentPath: file.path,
+                            processedFiles: index,
+                            totalFiles: selected.count,
+                            processedBytes: processedBytes,
+                            totalBytes: totalBytes,
+                            bytesPerSecond: Self.rate(bytes: processedBytes, since: startedAt)
+                        ))
+                    }
+                }
+                if destinationHash == sourceHash {
                     plan.existing.append(record)
                 } else {
                     plan.conflicts.append(record)
                 }
             } else {
+                processedBytes += file.size
                 plan.new.append(record)
             }
 
-            processedBytes += file.size
             progress?(
                 FileOperationProgress(
-                    phase: "Checking selected files",
+                    phase: "Verifying selected files",
                     currentPath: file.path,
                     processedFiles: index + 1,
                     totalFiles: selected.count,
                     processedBytes: processedBytes,
-                    totalBytes: totalBytes
+                    totalBytes: totalBytes,
+                    bytesPerSecond: Self.rate(bytes: processedBytes, since: startedAt)
                 )
             )
         }
 
         return plan
+    }
+
+    private static func rate(bytes: Int64, since date: Date) -> Double {
+        let elapsed = max(Date().timeIntervalSince(date), 0.001)
+        return Double(bytes) / elapsed
     }
 
     /// Quickly previews an explicitly selected import using file metadata only.
