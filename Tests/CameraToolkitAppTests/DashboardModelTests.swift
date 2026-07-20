@@ -305,6 +305,9 @@ final class DashboardModelTests: XCTestCase {
             XCTAssertEqual(model.transferQueue?.state, .failed)
             XCTAssertEqual(model.transferQueue?.items.first?.state, .failed)
             XCTAssertEqual(model.transferQueue?.processedBytes, 400)
+            XCTAssertEqual(model.transferQueue?.phaseProcessedBytes, 400)
+            XCTAssertEqual(model.transferQueue?.phaseTotalBytes, 1_000)
+            XCTAssertEqual(model.transferQueue?.progress ?? -1, 0.4, accuracy: 0.001)
             XCTAssertTrue(try XCTUnwrap(model.transferQueue?.message).contains("closed before this transfer finished"))
             XCTAssertEqual(try queueStore.load()?.state, .failed)
         }

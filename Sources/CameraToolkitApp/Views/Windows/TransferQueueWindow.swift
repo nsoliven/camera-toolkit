@@ -16,7 +16,7 @@ final class TransferQueueWindowController: NSObject, NSWindowDelegate {
 
         let controller = NSHostingController(rootView: TransferQueueView(model: model))
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 900, height: 460),
+            contentRect: NSRect(x: 0, y: 0, width: 840, height: 500),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
@@ -25,9 +25,11 @@ final class TransferQueueWindowController: NSObject, NSWindowDelegate {
         window.identifier = NSUserInterfaceItemIdentifier("CameraToolkitTransferQueueWindow")
         window.isRestorable = false
         window.isReleasedWhenClosed = false
-        window.minSize = NSSize(width: 680, height: 400)
+        window.tabbingMode = .disallowed
+        window.minSize = NSSize(width: 720, height: 440)
+        window.maxSize = NSSize(width: 1_080, height: 720)
         window.contentViewController = controller
-        window.setContentSize(NSSize(width: 900, height: 460))
+        window.setContentSize(NSSize(width: 840, height: 500))
         window.delegate = self
         window.center()
         self.window = window
@@ -47,187 +49,289 @@ private struct TransferQueueView: View {
                 ContentUnavailableView(
                     "No Transfers Yet",
                     systemImage: "arrow.down.circle",
-                    description: Text("Start Copy to Buffer from the camera browser. This window will show every file and open automatically.")
+                    description: Text("Start Copy to Buffer from the camera browser. This window opens automatically when a transfer starts.")
                 )
             }
         }
-        .frame(minWidth: 680, minHeight: 400)
+        .frame(minWidth: 720, minHeight: 440)
         .background(Color(nsColor: .controlBackgroundColor))
     }
 
     private func queueContent(_ queue: TransferQueueSnapshot) -> some View {
         VStack(spacing: 0) {
             summary(queue)
-            Divider()
 
             if let message = queue.message {
-                messageBanner(message, queue: queue)
                 Divider()
+                messageBanner(message, queue: queue)
             }
 
-            ScrollView {
-                LazyVStack(spacing: 0) {
-                    ForEach(queue.items) { item in
-                        queueRow(item)
-                        if item.id != queue.items.last?.id {
-                            Divider().padding(.leading, 52)
-                        }
-                    }
-                }
-            }
-            .background(Color(nsColor: .textBackgroundColor))
-
+            Divider()
+            queueList(queue)
             Divider()
             locationFooter(queue)
         }
     }
 
     private func summary(_ queue: TransferQueueSnapshot) -> some View {
-        HStack(spacing: 14) {
-            Image(systemName: queueSymbol(queue.state))
-                .font(.system(size: 30, weight: .semibold))
-                .foregroundStyle(queueColor(queue.state))
-                .frame(width: 38)
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .center, spacing: 12) {
+                ZStack {
+                    Circle()
+                        .fill(queueColor(queue.state).opacity(0.12))
+                    Image(systemName: queueSymbol(queue.state))
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundStyle(queueColor(queue.state))
+                }
+                .frame(width: 36, height: 36)
 
-            VStack(alignment: .leading, spacing: 3) {
-                Text(queue.phase)
-                    .font(.title2.bold())
-                Text("\(queue.verifiedCount) of \(queue.items.count) files verified")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-            }
-
-            Spacer()
-
-            VStack(alignment: .trailing, spacing: 4) {
-                Text("\(queue.processedBytes.formattedBytes) of \(queue.totalBytes.formattedBytes)")
-                    .font(.headline.monospacedDigit())
-                if queue.state == .running, queue.bytesPerSecond > 0 {
-                    Text("\(Int64(queue.bytesPerSecond).formattedBytes)/s")
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(.secondary)
-                } else {
-                    Text(queue.state == .completed ? "Checksum verified" : queue.state == .failed ? "Stopped safely" : "")
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(queue.phase)
+                        .font(.headline)
+                    Text(queueSummary(queue))
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+
+                Spacer(minLength: 16)
+
+                VStack(alignment: .trailing, spacing: 2) {
+                    Text(phaseByteSummary(queue))
+                        .font(.subheadline.weight(.semibold).monospacedDigit())
+                        .lineLimit(1)
+                    if queue.state == .running, queue.bytesPerSecond > 0 {
+                        Text("\(Int64(queue.bytesPerSecond).formattedBytes)/s")
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text(queueStateNote(queue.state))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                if queue.state != .running {
+                    Button("Clear") {
+                        model.dismissTransferQueue()
+                    }
+                    .help("Clear this finished transfer from the queue")
                 }
             }
 
-            if queue.state != .running {
-                Button("Clear Queue") {
-                    model.dismissTransferQueue()
+            VStack(alignment: .leading, spacing: 5) {
+                HStack {
+                    Text(phaseProgressLabel(queue))
+                    Spacer()
+                    Text(queue.progress.formatted(.percent.precision(.fractionLength(0))))
+                        .monospacedDigit()
                 }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+                ProgressView(value: queue.progress)
+                    .tint(queueColor(queue.state))
+                    .progressViewStyle(.linear)
             }
         }
-        .padding(.horizontal, 18)
-        .padding(.top, 16)
-        .padding(.bottom, 12)
-        .overlay(alignment: .bottom) {
-            ProgressView(value: queue.progress)
-                .tint(queueColor(queue.state))
-                .progressViewStyle(.linear)
-        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 14)
+        .background(.bar)
     }
 
     private func messageBanner(_ message: String, queue: TransferQueueSnapshot) -> some View {
-        HStack(alignment: .top, spacing: 10) {
+        HStack(alignment: .firstTextBaseline, spacing: 9) {
             Image(systemName: queue.state == .failed ? "exclamationmark.triangle.fill" : "checkmark.shield.fill")
                 .foregroundStyle(queueColor(queue.state))
             Text(message)
-                .font(.subheadline)
+                .font(.caption)
+                .fixedSize(horizontal: false, vertical: true)
                 .textSelection(.enabled)
-            Spacer()
+            Spacer(minLength: 0)
         }
-        .padding(.horizontal, 18)
-        .padding(.vertical, 11)
-        .background(queueColor(queue.state).opacity(0.10))
+        .padding(.horizontal, 16)
+        .padding(.vertical, 9)
+        .background(queueColor(queue.state).opacity(0.08))
         .help(queue.technicalDetail ?? message)
+    }
+
+    private func queueList(_ queue: TransferQueueSnapshot) -> some View {
+        ScrollView {
+            LazyVStack(spacing: 0) {
+                ForEach(queue.items) { item in
+                    queueRow(item)
+                    if item.id != queue.items.last?.id {
+                        Divider().padding(.leading, 54)
+                    }
+                }
+            }
+        }
+        .background(Color(nsColor: .textBackgroundColor))
     }
 
     private func queueRow(_ item: TransferQueueItem) -> some View {
         HStack(spacing: 12) {
             Image(systemName: itemSymbol(item.state))
-                .font(.title3)
+                .font(.system(size: 16, weight: .medium))
                 .foregroundStyle(itemColor(item.state))
-                .frame(width: 24)
+                .frame(width: 24, height: 24)
 
             VStack(alignment: .leading, spacing: 3) {
                 Text(URL(fileURLWithPath: item.relativePath).lastPathComponent)
-                    .font(.body.weight(.medium))
+                    .font(.subheadline.weight(.medium))
                     .lineLimit(1)
-                let parent = URL(fileURLWithPath: item.relativePath).deletingLastPathComponent().path
-                if parent != "." && parent != "/" {
-                    Text(parent)
-                        .font(.caption.monospaced())
+                    .truncationMode(.middle)
+                Text(shortParentPath(item.relativePath))
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.head)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            VStack(alignment: .trailing, spacing: 5) {
+                if showsItemProgress(item) {
+                    ProgressView(value: Double(item.copiedBytes), total: Double(max(item.size, 1)))
+                        .tint(itemColor(item.state))
+                        .frame(width: 150)
+                    Text("\(item.copiedBytes.formattedBytes) / \(item.size.formattedBytes)")
+                        .font(.caption2.monospacedDigit())
                         .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
+                } else {
+                    Text(item.size.formattedBytes)
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
                 }
+            }
+            .frame(width: 168, alignment: .trailing)
+
+            statusPill(item.state)
+                .frame(width: 104, alignment: .trailing)
+        }
+        .padding(.horizontal, 16)
+        .frame(height: 62)
+        .help(item.detail ?? item.state.label)
+    }
+
+    private func statusPill(_ state: TransferQueueItemState) -> some View {
+        Text(state.label)
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(itemColor(state))
+            .lineLimit(1)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(itemColor(state).opacity(0.10), in: Capsule())
+    }
+
+    private func locationFooter(_ queue: TransferQueueSnapshot) -> some View {
+        HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 5) {
+                locationLabel(
+                    title: "Camera",
+                    value: URL(fileURLWithPath: queue.sourcePath).lastPathComponent,
+                    symbol: "camera"
+                )
+                .help(queue.sourcePath)
+                locationLabel(
+                    title: "Buffer",
+                    value: shortDestination(queue.destinationPath),
+                    symbol: "externaldrive"
+                )
+                .help(queue.destinationPath)
             }
 
             Spacer(minLength: 12)
 
-            if item.size > 0,
-               item.state == .copying || (item.state == .failed && item.copiedBytes > 0) {
-                VStack(alignment: .trailing, spacing: 4) {
-                    ProgressView(value: Double(item.copiedBytes), total: Double(item.size))
-                        .tint(itemColor(item.state))
-                        .frame(width: 160)
-                    Text("\(item.copiedBytes.formattedBytes) / \(item.size.formattedBytes)")
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(.secondary)
-                }
-            } else {
-                Text(item.size.formattedBytes)
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
+            Button("Show Camera") {
+                model.openEventFolder(queue.sourcePath)
             }
-
-            Text(item.state.label)
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(itemColor(item.state))
-                .frame(width: 110, alignment: .trailing)
+            Button("Show Buffer") {
+                model.openEventFolder(queue.destinationPath)
+            }
         }
-        .padding(.horizontal, 18)
-        .frame(minHeight: 58)
-        .help(item.detail ?? item.state.label)
-    }
-
-    private func locationFooter(_ queue: TransferQueueSnapshot) -> some View {
-        VStack(spacing: 8) {
-            locationRow(label: "Camera", path: queue.sourcePath)
-            locationRow(label: "Buffer", path: queue.destinationPath)
-        }
-        .padding(.horizontal, 18)
-        .padding(.vertical, 12)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
         .background(.bar)
     }
 
-    private func locationRow(label: String, path: String) -> some View {
-        HStack(spacing: 10) {
-            Text(label)
+    private func locationLabel(title: String, value: String, symbol: String) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: symbol)
+                .foregroundStyle(.secondary)
+                .frame(width: 16)
+            Text(title)
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(.secondary)
-                .frame(width: 48, alignment: .leading)
-            Text(path)
+                .frame(width: 46, alignment: .leading)
+            Text(value)
                 .font(.caption.monospaced())
-                .foregroundStyle(.secondary)
                 .lineLimit(1)
                 .truncationMode(.middle)
-                .textSelection(.enabled)
-            Spacer()
-            Button("Open") {
-                model.openEventFolder(path)
-            }
         }
+    }
+
+    private func showsItemProgress(_ item: TransferQueueItem) -> Bool {
+        item.size > 0 && (item.state == .copying || (item.state == .failed && item.copiedBytes > 0))
+    }
+
+    private func queueSummary(_ queue: TransferQueueSnapshot) -> String {
+        let completed = queue.items.count {
+            $0.state == .copied || $0.state == .verified || $0.state == .alreadyPresent
+        }
+        if let activeIndex = queue.items.firstIndex(where: {
+            $0.state == .copying || $0.state == .verifying || $0.state == .failed
+        }) {
+            let verb = queue.state == .failed ? "Stopped on" : "Working on"
+            return "\(verb) file \(activeIndex + 1) of \(queue.items.count) · \(completed) copied · \(queue.verifiedCount) verified"
+        }
+        return "\(completed) copied · \(queue.verifiedCount) of \(queue.items.count) verified"
+    }
+
+    private func phaseByteSummary(_ queue: TransferQueueSnapshot) -> String {
+        let processed = queue.phaseProcessedBytes ?? queue.processedBytes
+        let total = queue.phaseTotalBytes ?? queue.totalBytes
+        return "\(processed.formattedBytes) / \(total.formattedBytes)"
+    }
+
+    private func phaseProgressLabel(_ queue: TransferQueueSnapshot) -> String {
+        let phase = queue.phase.lowercased()
+        if phase.contains("verif") || phase.contains("check") { return "Verification progress" }
+        if queue.state == .failed { return "Progress when stopped" }
+        if queue.state == .completed { return "Transfer complete" }
+        return "Copy progress"
+    }
+
+    private func queueStateNote(_ state: TransferQueueState) -> String {
+        switch state {
+        case .running: ""
+        case .completed: "Checksum verified"
+        case .failed: "Stopped safely"
+        case .cancelled: "Cancelled"
+        }
+    }
+
+    private func shortParentPath(_ path: String) -> String {
+        let components = URL(fileURLWithPath: path)
+            .deletingLastPathComponent()
+            .pathComponents
+            .filter { $0 != "/" }
+        return components.suffix(2).joined(separator: " / ")
+    }
+
+    private func shortDestination(_ path: String) -> String {
+        URL(fileURLWithPath: path)
+            .pathComponents
+            .filter { $0 != "/" }
+            .suffix(2)
+            .joined(separator: " / ")
     }
 
     private func queueSymbol(_ state: TransferQueueState) -> String {
         switch state {
-        case .running: "arrow.down.circle.fill"
-        case .completed: "checkmark.seal.fill"
-        case .failed: "exclamationmark.triangle.fill"
-        case .cancelled: "xmark.circle.fill"
+        case .running: "arrow.down"
+        case .completed: "checkmark"
+        case .failed: "exclamationmark"
+        case .cancelled: "xmark"
         }
     }
 

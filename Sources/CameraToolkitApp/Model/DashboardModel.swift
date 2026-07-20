@@ -118,6 +118,17 @@ final class DashboardModel {
         )
         self.transferQueueStore = resolvedTransferQueueStore
         var restoredTransferQueue = try? resolvedTransferQueueStore.load()
+        if var legacyQueue = restoredTransferQueue,
+           legacyQueue.phaseProcessedBytes == nil || legacyQueue.phaseTotalBytes == nil {
+            legacyQueue.phaseProcessedBytes = legacyQueue.processedBytes
+            legacyQueue.phaseTotalBytes = legacyQueue.totalBytes
+            legacyQueue.progress = Self.transferProgress(
+                processedBytes: legacyQueue.processedBytes,
+                totalBytes: legacyQueue.totalBytes
+            )
+            restoredTransferQueue = legacyQueue
+            try? resolvedTransferQueueStore.save(legacyQueue)
+        }
         if var interruptedQueue = restoredTransferQueue, interruptedQueue.state == .running {
             interruptedQueue.state = .failed
             interruptedQueue.phase = "Transfer interrupted"
@@ -159,6 +170,11 @@ final class DashboardModel {
         )
         model.scheduleCatalogSync(configuration: configuration)
         return model
+    }
+
+    private static func transferProgress(processedBytes: Int64, totalBytes: Int64) -> Double {
+        guard totalBytes > 0 else { return 0 }
+        return min(max(Double(processedBytes) / Double(totalBytes), 0), 1)
     }
 }
 
@@ -1227,7 +1243,9 @@ extension DashboardModel {
             sourcePath: sourcePath,
             destinationPath: destinationPath,
             items: sorted.map { TransferQueueItem(relativePath: $0.path, size: $0.size) },
-            totalBytes: sorted.reduce(Int64(0)) { $0 + $1.size }
+            totalBytes: sorted.reduce(Int64(0)) { $0 + $1.size },
+            phaseProcessedBytes: 0,
+            phaseTotalBytes: sorted.reduce(Int64(0)) { $0 + $1.size }
         )
         persistTransferQueue(force: true)
         NotificationCenter.default.post(name: .cameraToolkitShowTransferQueue, object: nil)
@@ -1235,7 +1253,13 @@ extension DashboardModel {
 
     private func updateTransferQueue(_ update: BackgroundJobUpdate) {
         guard var queue = transferQueue, queue.state == .running else { return }
-        queue.progress = min(max(update.progress, 0), 1)
+        if update.totalBytes > 0 {
+            queue.progress = min(max(Double(update.processedBytes) / Double(update.totalBytes), 0), 1)
+        } else {
+            queue.progress = min(max(update.progress, 0), 1)
+        }
+        queue.phaseProcessedBytes = update.processedBytes
+        queue.phaseTotalBytes = update.totalBytes
         queue.bytesPerSecond = update.bytesPerSecond
         queue.phase = Self.displayPhase(update.phase)
         queue.updatedAt = Date()
@@ -1302,6 +1326,8 @@ extension DashboardModel {
         queue.state = issueCount == 0 ? .completed : .failed
         queue.progress = 1
         queue.processedBytes = queue.totalBytes
+        queue.phaseProcessedBytes = queue.totalBytes
+        queue.phaseTotalBytes = queue.totalBytes
         queue.bytesPerSecond = 0
         queue.phase = issueCount == 0 ? "Transfer complete" : "Completed with issues"
         queue.message = issueCount == 0

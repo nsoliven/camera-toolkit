@@ -69,6 +69,8 @@ struct TransferQueueSnapshot: Codable, Sendable {
     var progress: Double
     var processedBytes: Int64
     var totalBytes: Int64
+    var phaseProcessedBytes: Int64?
+    var phaseTotalBytes: Int64?
     var bytesPerSecond: Double
     var phase: String
     var message: String?
@@ -85,6 +87,8 @@ struct TransferQueueSnapshot: Codable, Sendable {
         progress: Double = 0,
         processedBytes: Int64 = 0,
         totalBytes: Int64,
+        phaseProcessedBytes: Int64? = nil,
+        phaseTotalBytes: Int64? = nil,
         bytesPerSecond: Double = 0,
         phase: String = "Waiting to copy",
         message: String? = nil,
@@ -100,6 +104,8 @@ struct TransferQueueSnapshot: Codable, Sendable {
         self.progress = progress
         self.processedBytes = processedBytes
         self.totalBytes = totalBytes
+        self.phaseProcessedBytes = phaseProcessedBytes
+        self.phaseTotalBytes = phaseTotalBytes
         self.bytesPerSecond = bytesPerSecond
         self.phase = phase
         self.message = message
