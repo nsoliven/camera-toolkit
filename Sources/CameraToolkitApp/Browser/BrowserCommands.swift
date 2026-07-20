@@ -105,6 +105,7 @@ enum CameraToolkitShortcutCatalog {
                 .init(action: "Preview selected photos", keys: "Space  /  ⌘Y", detail: "Opens Camera Toolkit's large preview without decoding the full RAW."),
                 .init(action: "Copy selected files", keys: "⌘C", detail: "Copies Finder-compatible file references to the clipboard."),
                 .init(action: "Rename selected item", keys: "Right-click", detail: "Renames one item without reading or rewriting its file contents."),
+                .init(action: "Delete an empty folder", keys: "Right-click", detail: "Confirms, then removes only a truly empty folder. Hidden files make the operation fail safely."),
                 .init(action: "Select all", keys: "⌘A", detail: "Selects every item in the current folder."),
                 .init(action: "Larger or smaller thumbnails", keys: "⌘+  ⌘−", detail: "Resizes browser thumbnails and remembers the chosen size."),
                 .init(action: "Select across folders", keys: "+ button", detail: "Starts an event-selection basket that stays with you while browsing folders or camera sources."),
@@ -144,7 +145,7 @@ enum CameraToolkitShortcutCatalog {
             title: "Safety",
             symbol: "lock.shield",
             shortcuts: [
-                .init(action: "Move, paste, or delete", keys: "Disabled", detail: "Camera Toolkit never binds destructive Finder shortcuts while browsing a camera card."),
+                .init(action: "Move, paste, or delete files", keys: "Disabled", detail: "Camera Toolkit never binds destructive Finder shortcuts while browsing a camera card. Empty folders can be removed only from their confirmed right-click action."),
             ]
         ),
     ]
