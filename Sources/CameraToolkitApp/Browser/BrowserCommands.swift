@@ -27,7 +27,7 @@ enum BrowserCommand: String, Sendable {
 
 enum BrowserThumbnailSizing {
     static let defaultHeight = 32.0
-    static let presets = [24.0, 32.0, 44.0, 60.0, 80.0, 104.0]
+    static let presets = [16.0, 24.0, 32.0, 44.0, 60.0, 80.0, 104.0]
 
     static func larger(than current: Double) -> Double {
         presets.first(where: { $0 > current + 0.5 }) ?? presets.last ?? defaultHeight
@@ -43,6 +43,33 @@ enum BrowserThumbnailSizing {
 
     static func maximumPixelSize(for height: Double) -> Int {
         max(128, Int((height * 2).rounded(.up)))
+    }
+}
+
+enum BrowserTreeProjection {
+    static func flattened<Item>(
+        roots: [Item],
+        childrenByParentID: [String: [Item]],
+        expandedParentIDs: Set<String>,
+        id: (Item) -> String
+    ) -> [Item] {
+        var result: [Item] = []
+        var visited: Set<String> = []
+
+        func append(_ items: [Item]) {
+            for item in items {
+                let itemID = id(item)
+                guard visited.insert(itemID).inserted else { continue }
+                result.append(item)
+                if expandedParentIDs.contains(itemID),
+                   let children = childrenByParentID[itemID] {
+                    append(children)
+                }
+            }
+        }
+
+        append(roots)
+        return result
     }
 }
 
@@ -101,12 +128,13 @@ enum CameraToolkitShortcutCatalog {
             symbol: "folder",
             shortcuts: [
                 .init(action: "Previous or next item", keys: "↑  ↓", detail: "Moves the file selection and updates the side preview."),
+                .init(action: "Expand or collapse a folder", keys: "→  ←", detail: "Shows or hides a folder’s contents inline without navigating away."),
                 .init(action: "Open selected item", keys: "Return  /  ⌘O  /  ⌘↓", detail: "Opens a folder or the selected file in its default app."),
                 .init(action: "Preview selected photos", keys: "Space  /  ⌘Y", detail: "Opens Camera Toolkit's large preview without decoding the full RAW."),
                 .init(action: "Copy selected files", keys: "⌘C", detail: "Copies Finder-compatible file references to the clipboard."),
                 .init(action: "Rename selected item", keys: "Right-click", detail: "Renames one item without reading or rewriting its file contents."),
                 .init(action: "Delete an empty folder", keys: "Right-click", detail: "Confirms, then removes only a truly empty folder. Hidden files make the operation fail safely."),
-                .init(action: "Select all", keys: "⌘A", detail: "Selects every item in the current folder."),
+                .init(action: "Select all", keys: "⌘A", detail: "Selects every visible row, including contents from expanded folders."),
                 .init(action: "Larger or smaller thumbnails", keys: "⌘+  ⌘−", detail: "Resizes browser thumbnails and remembers the chosen size."),
                 .init(action: "Select across folders", keys: "+ button", detail: "Starts an event-selection basket that stays with you while browsing folders or camera sources."),
                 .init(action: "Open Event Library", keys: "⌥⌘E", detail: "Shows event photos across their camera, buffer, library, and Immich locations."),
