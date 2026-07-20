@@ -1,6 +1,35 @@
 import CameraToolkitCore
 import SwiftUI
 
+extension ConfiguredLocationRole {
+    var settingsCurrentLabel: String {
+        switch self {
+        case .importSource: "Import Default"
+        case .archive: "Originals Destination"
+        case .buffer: "Buffer Destination"
+        }
+    }
+
+    var settingsSelectionButtonTitle: String {
+        switch self {
+        case .importSource: "Set as Default"
+        case .archive: "Use for Originals"
+        case .buffer: "Use as Buffer"
+        }
+    }
+
+    var settingsSelectionExplanation: String {
+        switch self {
+        case .importSource:
+            "Import Default is the camera or card Camera Toolkit starts with. You can still browse any connected source from the sidebar."
+        case .archive:
+            "Originals Destination receives the permanent, checksum-verified archive after files are copied to the buffer."
+        case .buffer:
+            "Buffer Destination receives the first temporary, checksum-verified copy from a camera or card."
+        }
+    }
+}
+
 struct ConfigView: View {
     @Bindable var model: DashboardModel
 
@@ -159,7 +188,7 @@ private struct LocationSettingsSection: View {
     }
 
     var body: some View {
-        Section(title) {
+        Section {
             ForEach(locations) { location in
                 LocationSettingRow(
                     location: location,
@@ -169,6 +198,10 @@ private struct LocationSettingsSection: View {
                 )
             }
             Button(addTitle) { model.addConfiguredLocation(role: role) }
+        } header: {
+            Text(title)
+        } footer: {
+            Text(role.settingsSelectionExplanation)
         }
     }
 }
@@ -194,10 +227,14 @@ private struct LocationSettingRow: View {
                     )
                 )
                 if isSelected {
-                    Label("Selected", systemImage: "checkmark.circle.fill")
+                    Label(currentLocation.role.settingsCurrentLabel, systemImage: "checkmark.circle.fill")
                         .foregroundStyle(.green)
+                        .help(currentLocation.role.settingsSelectionExplanation)
                 } else {
-                    Button("Use") { model.useConfiguredLocation(currentLocation) }
+                    Button(currentLocation.role.settingsSelectionButtonTitle) {
+                        model.useConfiguredLocation(currentLocation)
+                    }
+                    .help(currentLocation.role.settingsSelectionExplanation)
                 }
                 Button("Choose…") { model.chooseConfiguredLocationFolder(currentLocation) }
                 Button(role: .destructive) {
