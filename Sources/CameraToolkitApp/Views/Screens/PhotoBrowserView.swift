@@ -132,6 +132,7 @@ struct PhotoBrowserView: View {
     @State private var isShowingCollectedFiles = false
     @State private var previewPaneWidth: CGFloat = 390
     @State private var browserOperationLabel: String?
+    @State private var storageCapacities: [String: StorageCapacitySnapshot] = [:]
     @AppStorage("CameraToolkit.browserThumbnailHeight") private var thumbnailHeight = BrowserThumbnailSizing.defaultHeight
     @FocusState private var isFileTableFocused: Bool
 
@@ -204,6 +205,12 @@ struct PhotoBrowserView: View {
         .task(id: currentURL.path) {
             await loadCurrentDirectory()
         }
+        .task(id: storageCapacityRefreshID) {
+            while !Task.isCancelled {
+                await refreshStorageCapacities()
+                try? await Task.sleep(for: .seconds(10))
+            }
+        }
         .onChange(of: selectedLocationID) { _, newValue in
             guard let location = locations.first(where: { $0.id == newValue }) else { return }
             hasRequestedImportPreview = false
@@ -212,11 +219,6 @@ struct PhotoBrowserView: View {
                 model.useConfiguredLocation(configured)
             }
             navigate(to: URL(fileURLWithPath: DashboardModel.expandedPath(location.path), isDirectory: true))
-        }
-        .onChange(of: model.isBusy) { wasBusy, isBusy in
-            if wasBusy && !isBusy {
-                Task { await loadCurrentDirectory() }
-            }
         }
         .onChange(of: model.isRefreshing) { wasRefreshing, isRefreshing in
             if wasRefreshing && !isRefreshing {
@@ -372,8 +374,23 @@ struct PhotoBrowserView: View {
             Image(systemName: location.symbol)
                 .foregroundStyle(locationColor(location))
                 .frame(width: 18)
-            Text(location.name)
-                .lineLimit(1)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(location.name)
+                    .lineLimit(1)
+                if let capacity = storageCapacities[location.id] {
+                    HStack(spacing: 6) {
+                        ProgressView(value: capacity.usedFraction)
+                            .progressViewStyle(.linear)
+                            .tint(storageCapacityColor(capacity))
+                            .frame(width: 54)
+                        Text("\(capacity.availableBytes.formattedBytes) free")
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                    .help(storageCapacityHelp(capacity))
+                }
+            }
             Spacer(minLength: 4)
             Circle()
                 .fill(folderExists(location.path) ? Color.green : Color.secondary.opacity(0.35))
@@ -381,6 +398,51 @@ struct PhotoBrowserView: View {
                 .help(folderExists(location.path) ? "Connected" : "Not mounted")
         }
         .tag(location.id)
+    }
+
+    private var storageCapacityRefreshID: String {
+        let paths = capacityLocations.map { "\($0.id)=\($0.path)" }.joined(separator: "|")
+        return "\(model.storageCapacityRevision)|\(paths)"
+    }
+
+    private var capacityLocations: [BrowserLocation] {
+        (sourceLocations + workspaceLocations + libraryLocations).filter {
+            !$0.path.lowercased().contains("/cameratoolkit/simulation/")
+        }
+    }
+
+    @MainActor
+    private func refreshStorageCapacities() async {
+        let targets = capacityLocations.map { ($0.id, $0.path) }
+        let targetIDs = Set(targets.map(\.0))
+        storageCapacities = storageCapacities.filter { targetIDs.contains($0.key) }
+
+        await withTaskGroup(of: (String, StorageCapacitySnapshot?).self) { group in
+            for (id, path) in targets {
+                group.addTask(priority: .utility) {
+                    (id, StorageCapacityReader.read(path: path))
+                }
+            }
+            for await (id, capacity) in group {
+                guard !Task.isCancelled else { return }
+                if let capacity {
+                    storageCapacities[id] = capacity
+                } else {
+                    storageCapacities[id] = nil
+                }
+            }
+        }
+    }
+
+    private func storageCapacityColor(_ capacity: StorageCapacitySnapshot) -> Color {
+        if capacity.availableFraction < 0.10 { return .red }
+        if capacity.availableFraction < 0.20 { return .orange }
+        return .blue
+    }
+
+    private func storageCapacityHelp(_ capacity: StorageCapacitySnapshot) -> String {
+        let usedPercent = capacity.usedFraction.formatted(.percent.precision(.fractionLength(0)))
+        return "\(capacity.availableBytes.formattedBytes) available out of \(capacity.totalBytes.formattedBytes) · \(usedPercent) used"
     }
 
     private func sidebarActionButton(
@@ -423,11 +485,17 @@ struct PhotoBrowserView: View {
     }
 
     private var transferSidebarDetail: String {
-        model.transferQueue?.sidebarSummary.detail ?? "Nothing running"
+        if model.pendingTransferFileCount > 0 {
+            if let active = model.transferQueue, active.state == .running {
+                return "\(active.sidebarSummary.detail) · \(model.pendingTransferFileCount) next"
+            }
+            return "\(model.pendingTransferFileCount) file\(model.pendingTransferFileCount == 1 ? "" : "s") waiting"
+        }
+        return model.transferQueue?.sidebarSummary.detail ?? "Nothing running"
     }
 
     private var transferSidebarBadge: String? {
-        model.transferQueue?.sidebarSummary.badge
+        model.transferQueue?.sidebarSummary.badge ?? (model.pendingTransferFileCount > 0 ? "\(model.pendingTransferFileCount)" : nil)
     }
 
     private var transferSidebarSymbol: String {
@@ -436,7 +504,7 @@ struct PhotoBrowserView: View {
         case .completed: "checkmark.circle.fill"
         case .failed: "exclamationmark.circle.fill"
         case .cancelled: "xmark.circle.fill"
-        case nil: "arrow.down.circle"
+        case nil: model.pendingTransferFileCount > 0 ? "clock.arrow.circlepath" : "arrow.down.circle"
         }
     }
 
@@ -445,7 +513,8 @@ struct PhotoBrowserView: View {
         case .running: .blue
         case .completed: .green
         case .failed: .red
-        case .cancelled, nil: .secondary
+        case .cancelled: .secondary
+        case nil: model.pendingTransferFileCount > 0 ? .blue : .secondary
         }
     }
 
@@ -1041,12 +1110,14 @@ struct PhotoBrowserView: View {
             .disabled(model.isBusy || model.selectedEventFiles.isEmpty)
             .help("Quickly compare assigned file paths and sizes; checksums run during Copy + Verify")
 
-            Button("Copy \(model.selectedEventFiles.count) to Buffer + Verify") {
+            Button(copyButtonTitle) {
                 model.copySelectedEventFilesToBuffer()
             }
             .buttonStyle(.borderedProminent)
-            .disabled(model.isBusy || model.selectedEventFiles.isEmpty)
-            .help("Copy only the files assigned to this event into the Buffer, then checksum-verify them")
+            .disabled(model.selectedEventFiles.isEmpty)
+            .help(model.isBusy
+                ? "Add these assigned files to the transfer queue while the current job continues"
+                : "Copy only the files assigned to this event into the Buffer, then checksum-verify them")
 
             if model.isBufferVerifiedForArchive {
                 Button("Archive to Library + Verify") {
@@ -1089,6 +1160,13 @@ struct PhotoBrowserView: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 9)
+    }
+
+    private var copyButtonTitle: String {
+        if model.isBusy || model.isStorageBenchmarkRunning {
+            return "Queue \(model.selectedEventFiles.count) for Transfer"
+        }
+        return "Copy \(model.selectedEventFiles.count) to Buffer + Verify"
     }
 
     @ViewBuilder

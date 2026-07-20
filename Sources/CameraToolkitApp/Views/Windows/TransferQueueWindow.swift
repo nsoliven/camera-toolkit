@@ -48,6 +48,8 @@ private struct TransferQueueView: View {
         Group {
             if let queue = model.transferQueue {
                 queueContent(queue)
+            } else if !model.pendingTransferBatches.isEmpty {
+                pendingOnlyContent
             } else {
                 ContentUnavailableView(
                     "No Transfers Yet",
@@ -69,6 +71,11 @@ private struct TransferQueueView: View {
                 messageBanner(message, queue: queue)
             }
 
+            if !model.pendingTransferBatches.isEmpty {
+                Divider()
+                pendingBatchesSection
+            }
+
             Divider()
             queueList(queue)
             Divider()
@@ -77,6 +84,110 @@ private struct TransferQueueView: View {
         .sheet(isPresented: $showingSourceCleanup) {
             SourceCleanupSheet(model: model, queue: queue)
         }
+    }
+
+    private var pendingOnlyContent: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 12) {
+                Image(systemName: "clock.arrow.circlepath")
+                    .font(.system(size: 22, weight: .medium))
+                    .foregroundStyle(.blue)
+                    .frame(width: 36, height: 36)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Transfers Waiting")
+                        .font(.headline)
+                    Text("The list is saved. Start it when the camera and Buffer are connected.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Start Next Transfer") {
+                    model.resumePendingTransfers()
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(model.isBusy || model.isStorageBenchmarkRunning)
+            }
+            .padding(16)
+            .background(.bar)
+
+            Divider()
+            pendingBatchesSection
+            Spacer(minLength: 0)
+        }
+    }
+
+    private var pendingBatchesSection: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 8) {
+                Text("UP NEXT")
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(.secondary)
+                Text("\(model.pendingTransferFileCount) file\(model.pendingTransferFileCount == 1 ? "" : "s") · \(model.pendingTransferByteCount.formattedBytes)")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if model.isBusy {
+                    Text("Starts automatically after the current job")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Button("Start Next") {
+                        model.resumePendingTransfers()
+                    }
+                    .buttonStyle(.borderless)
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
+
+            ScrollView {
+                LazyVStack(spacing: 0) {
+                    ForEach(Array(model.pendingTransferBatches.enumerated()), id: \.element.id) { index, batch in
+                        pendingBatchRow(batch, position: index + 1)
+                        if batch.id != model.pendingTransferBatches.last?.id {
+                            Divider().padding(.leading, 48)
+                        }
+                    }
+                }
+            }
+            .frame(maxHeight: model.transferQueue == nil ? .infinity : 116)
+        }
+        .background(Color(nsColor: .textBackgroundColor))
+    }
+
+    private func pendingBatchRow(_ batch: PendingTransferBatch, position: Int) -> some View {
+        HStack(spacing: 12) {
+            Text("\(position)")
+                .font(.caption.weight(.semibold).monospacedDigit())
+                .foregroundStyle(.blue)
+                .frame(width: 24, height: 24)
+                .background(Color.blue.opacity(0.10), in: Circle())
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(batch.eventName.isEmpty ? "Queued Transfer" : batch.eventName)
+                    .font(.subheadline.weight(.medium))
+                    .lineLimit(1)
+                Text(URL(fileURLWithPath: batch.sourcePath).lastPathComponent)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            Text("\(batch.files.count) file\(batch.files.count == 1 ? "" : "s") · \(batch.totalBytes.formattedBytes)")
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+
+            Button {
+                model.removePendingTransferBatch(batch.id)
+            } label: {
+                Image(systemName: "xmark.circle")
+            }
+            .buttonStyle(.borderless)
+            .help("Remove this waiting batch. No files will be changed.")
+        }
+        .padding(.horizontal, 16)
+        .frame(height: 50)
     }
 
     private func summary(_ queue: TransferQueueSnapshot) -> some View {

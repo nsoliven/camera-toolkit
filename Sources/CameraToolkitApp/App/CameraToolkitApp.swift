@@ -29,7 +29,7 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate {
             object: nil
         )
         CameraToolkitMainWindow.shared.show(model: model)
-        if model.transferQueue != nil {
+        if model.transferQueue != nil || !model.pendingTransferBatches.isEmpty {
             TransferQueueWindowController.shared.show(model: model)
         }
     }

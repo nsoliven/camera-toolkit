@@ -24,6 +24,7 @@ final class SourceCleanupServiceTests: XCTestCase {
             XCTAssertEqual(try Data(contentsOf: fixture.buffer.appendingPathComponent("DCIM/two.LRF")), Data("preview-two".utf8))
             XCTAssertTrue(phases.contains("Rechecking camera file"))
             XCTAssertTrue(phases.contains("Rechecking Buffer copy"))
+            XCTAssertTrue(phases.contains("Removing from camera"))
         }
     }
 
