@@ -1230,6 +1230,7 @@ extension DashboardModel {
             totalBytes: sorted.reduce(Int64(0)) { $0 + $1.size }
         )
         persistTransferQueue(force: true)
+        NotificationCenter.default.post(name: .cameraToolkitShowTransferQueue, object: nil)
     }
 
     private func updateTransferQueue(_ update: BackgroundJobUpdate) {
@@ -1309,6 +1310,7 @@ extension DashboardModel {
         queue.updatedAt = Date()
         transferQueue = queue
         persistTransferQueue(force: true)
+        NotificationCenter.default.post(name: .cameraToolkitShowTransferQueue, object: nil)
     }
 
     private func failTransferQueue(error: Error, message: String) {
@@ -1326,6 +1328,7 @@ extension DashboardModel {
         queue.updatedAt = Date()
         transferQueue = queue
         persistTransferQueue(force: true)
+        NotificationCenter.default.post(name: .cameraToolkitShowTransferQueue, object: nil)
     }
 
     private func cancelTransferQueue() {

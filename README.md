@@ -26,7 +26,7 @@ The safety rule is simple: the camera source stays read-only. Previewing never c
 - Opens the selected image with Space, moves through selections with the arrow keys, and opens a RAW in Photomator from the preview window.
 - Saves events and assigns photos from multiple folders or camera cards to the same event.
 - Shows a fast metadata-only import preview before any copy starts.
-- Keeps a persistent per-file transfer queue with bytes copied, speed, verification state, and clear disconnect failures.
+- Opens a separate persistent Transfer Queue window with per-file bytes copied, speed, verification state, and clear disconnect failures.
 - Copies selected files to a buffer, verifies their checksums, then organizes verified originals into the photo library without overwriting conflicts.
 - Stores event/file relationships in SQLite through [GRDB](https://github.com/groue/GRDB.swift) and includes a bounded, read-only SQL inspector.
 - Checks whether known files already exist in Immich and stores per-event album/upload preferences. Photo upload is not enabled yet.
