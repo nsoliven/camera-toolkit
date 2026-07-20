@@ -27,9 +27,8 @@ final class TransferQueueWindowController: NSObject, NSWindowDelegate {
         window.isRestorable = false
         window.isReleasedWhenClosed = false
         window.tabbingMode = .disallowed
-        window.minSize = NSSize(width: 720, height: 440)
-        window.maxSize = NSSize(width: 1_080, height: 720)
         window.contentViewController = controller
+        CameraToolkitWindowSizing.configure(window, as: .transferQueue)
         window.setContentSize(NSSize(width: 840, height: 500))
         window.delegate = self
         window.center()
@@ -58,7 +57,12 @@ private struct TransferQueueView: View {
                 )
             }
         }
-        .frame(minWidth: 720, minHeight: 440)
+        .frame(
+            minWidth: CameraToolkitPopOutWindow.transferQueue.minimumContentSize.width,
+            maxWidth: .infinity,
+            minHeight: CameraToolkitPopOutWindow.transferQueue.minimumContentSize.height,
+            maxHeight: .infinity
+        )
         .background(Color(nsColor: .controlBackgroundColor))
     }
 

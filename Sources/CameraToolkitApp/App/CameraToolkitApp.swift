@@ -446,7 +446,12 @@ final class CameraToolkitConfigWindow: NSObject, NSWindowDelegate {
 
         let hostingController = NSHostingController(
             rootView: ConfigView(model: model)
-                .frame(width: 760, height: 620)
+                .frame(
+                    minWidth: CameraToolkitPopOutWindow.settings.minimumContentSize.width,
+                    maxWidth: .infinity,
+                    minHeight: CameraToolkitPopOutWindow.settings.minimumContentSize.height,
+                    maxHeight: .infinity
+                )
         )
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 760, height: 620),
@@ -458,6 +463,7 @@ final class CameraToolkitConfigWindow: NSObject, NSWindowDelegate {
         window.identifier = NSUserInterfaceItemIdentifier("CameraToolkitConfigWindow")
         window.isRestorable = false
         window.contentViewController = hostingController
+        CameraToolkitWindowSizing.configure(window, as: .settings)
         window.isReleasedWhenClosed = false
         window.delegate = self
         window.center()

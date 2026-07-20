@@ -24,9 +24,9 @@ final class EventLibraryWindowController: NSObject, NSWindowDelegate {
         )
         window.title = "Event Library"
         window.identifier = NSUserInterfaceItemIdentifier("CameraToolkitEventLibraryWindow")
-        window.minSize = NSSize(width: 940, height: 600)
         window.isReleasedWhenClosed = false
         window.contentViewController = controller
+        CameraToolkitWindowSizing.configure(window, as: .eventLibrary)
         window.setContentSize(NSSize(width: 1_260, height: 760))
         window.delegate = self
         window.center()
