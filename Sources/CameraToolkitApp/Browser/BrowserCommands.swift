@@ -3,6 +3,7 @@ import SwiftUI
 
 enum BrowserCommand: String, Sendable {
     case copySelection
+    case moveSelectionToTrash
     case selectAll
     case openSelection
     case previewSelection
@@ -134,6 +135,7 @@ enum CameraToolkitShortcutCatalog {
                 .init(action: "Copy selected files", keys: "⌘C", detail: "Copies Finder-compatible file references to the clipboard."),
                 .init(action: "Copy file paths", keys: "Right-click", detail: "Copies each selected file or folder path as plain text, one path per line."),
                 .init(action: "Rename selected item", keys: "Right-click", detail: "Renames one item without reading or rewriting its file contents."),
+                .init(action: "Move selected items to Trash", keys: "⌘Delete / Right-click", detail: "Confirms, then uses macOS Trash for files, non-empty folders, or a multi-selection. Configured locations and drive roots stay protected."),
                 .init(action: "Delete an empty folder", keys: "Right-click", detail: "Confirms, then removes only a truly empty folder. Hidden files make the operation fail safely."),
                 .init(action: "Select all", keys: "⌘A", detail: "Selects every visible row, including contents from expanded folders."),
                 .init(action: "Larger or smaller thumbnails", keys: "⌘+  ⌘−", detail: "Resizes browser thumbnails and remembers the chosen size."),
@@ -174,7 +176,8 @@ enum CameraToolkitShortcutCatalog {
             title: "Safety",
             symbol: "lock.shield",
             shortcuts: [
-                .init(action: "Move, paste, or delete files", keys: "Disabled", detail: "Camera Toolkit never binds destructive Finder shortcuts while browsing a camera card. Empty folders can be removed only from their confirmed right-click action."),
+                .init(action: "Move files to Trash", keys: "Always confirms", detail: "Camera Toolkit uses macOS Trash, refuses configured locations and drive roots, and reports partial failures honestly."),
+                .init(action: "Paste or permanently delete files", keys: "Disabled", detail: "Permanent source cleanup remains a separate verified workflow and never runs from a normal browser shortcut."),
             ]
         ),
     ]
