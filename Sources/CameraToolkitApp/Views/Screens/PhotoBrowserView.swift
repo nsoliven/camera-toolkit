@@ -1116,6 +1116,16 @@ struct PhotoBrowserView: View {
                 .disabled(browserOperationLabel != nil)
             }
 
+            Button(role: .destructive) {
+                confirmMoveToTrash(selectedItems)
+            } label: {
+                Label(
+                    selectedItems.count == 1 ? "Move to Trash…" : "Move \(selectedItems.count) Items to Trash…",
+                    systemImage: "trash"
+                )
+            }
+            .disabled(browserOperationLabel != nil)
+
             Button {
                 FileClipboardWriter.copy(contextURLs)
             } label: {
@@ -2092,6 +2102,10 @@ struct PhotoBrowserView: View {
         switch command {
         case .copySelection:
             FileClipboardWriter.copy(selectedURLs)
+        case .moveSelectionToTrash:
+            guard isFileTableFocused else { return }
+            let selectedItems = visibleBrowserItems.filter { selectedItemIDs.contains($0.id) }
+            confirmMoveToTrash(selectedItems)
         case .selectAll:
             selectedItemIDs = Set(visibleBrowserItems.map(\.id))
         case .openSelection:
@@ -2272,6 +2286,38 @@ struct PhotoBrowserView: View {
         }
     }
 
+    private func confirmMoveToTrash(_ selectedItems: [BrowserItem]) {
+        guard !selectedItems.isEmpty else { return }
+
+        let urls = selectedItems.map(\.url)
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        if selectedItems.count == 1, let item = selectedItems.first {
+            alert.messageText = "Move “\(item.name)” to Trash?"
+            alert.informativeText = "\(item.url.path)\n\nCamera Toolkit will use macOS Trash. You can restore this item until Trash is emptied."
+        } else {
+            let names = selectedItems.prefix(5).map { "• \($0.name)" }.joined(separator: "\n")
+            let remainingCount = max(0, selectedItems.count - 5)
+            let remainder = remainingCount == 0 ? "" : "\n…and \(remainingCount) more"
+            alert.messageText = "Move \(selectedItems.count) Items to Trash?"
+            alert.informativeText = "\(names)\(remainder)\n\nCamera Toolkit will use macOS Trash. You can restore these items until Trash is emptied."
+        }
+        let trashButton = alert.addButton(withTitle: "Move to Trash")
+        trashButton.hasDestructiveAction = true
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        let protectedURLs = protectedBrowserFolderURLs
+        runBrowserMutation(
+            label: selectedItems.count == 1 ? "Moving item to Trash…" : "Moving \(selectedItems.count) items to Trash…",
+            selecting: nil,
+            errorTitle: "Items Were Not Moved to Trash",
+            refreshAfterFailure: true
+        ) {
+            _ = try FileTrashService.moveToTrash(urls, protectedURLs: protectedURLs)
+        }
+    }
+
     private var protectedBrowserFolderURLs: [URL] {
         var paths = model.configuration.configuredLocations.map(\.path)
         paths.append(contentsOf: [
@@ -2294,6 +2340,7 @@ struct PhotoBrowserView: View {
         label: String,
         selecting destination: URL?,
         errorTitle: String = "The File Operation Failed",
+        refreshAfterFailure: Bool = false,
         operation: @escaping @Sendable () throws -> Void
     ) {
         guard browserOperationLabel == nil else { return }
@@ -2311,6 +2358,11 @@ struct PhotoBrowserView: View {
 
             browserOperationLabel = nil
             if let errorMessage {
+                if refreshAfterFailure {
+                    model.storageCapacityRevision &+= 1
+                    resetBrowserTree()
+                    await loadCurrentDirectory()
+                }
                 showBrowserOperationError(title: errorTitle, message: errorMessage)
                 return
             }

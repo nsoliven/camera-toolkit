@@ -136,6 +136,13 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate {
             keyEquivalent: "r",
             modifiers: [.command, .shift]
         )
+        fileMenu.addItem(.separator())
+        addBrowserCommand(
+            to: fileMenu,
+            title: "Move to Trash…",
+            command: .moveSelectionToTrash,
+            keyEquivalent: "\u{8}"
+        )
 
         let editMenuItem = NSMenuItem()
         mainMenu.addItem(editMenuItem)

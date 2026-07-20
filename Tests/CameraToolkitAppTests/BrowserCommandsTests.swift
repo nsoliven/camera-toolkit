@@ -13,13 +13,15 @@ final class BrowserCommandsTests: XCTestCase {
         XCTAssertTrue(actions.contains("Copy selected files"))
         XCTAssertTrue(actions.contains("Copy file paths"))
         XCTAssertTrue(actions.contains("Rename selected item"))
+        XCTAssertTrue(actions.contains("Move selected items to Trash"))
         XCTAssertTrue(actions.contains("Delete an empty folder"))
         XCTAssertTrue(actions.contains("Select across folders"))
         XCTAssertTrue(actions.contains("Larger or smaller thumbnails"))
         XCTAssertTrue(actions.contains("Previous or next camera"))
         XCTAssertTrue(actions.contains("Zoom to fit"))
         XCTAssertTrue(actions.contains("Open in Photomator"))
-        XCTAssertTrue(actions.contains("Move, paste, or delete files"))
+        XCTAssertTrue(actions.contains("Move files to Trash"))
+        XCTAssertTrue(actions.contains("Paste or permanently delete files"))
     }
 
     func testThumbnailSizingStepsThroughPresetsAndClampsAtEnds() {
