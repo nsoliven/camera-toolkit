@@ -46,7 +46,7 @@ struct TransferSpeedGuideView: View {
                 VStack(alignment: .trailing, spacing: 2) {
                     Text(liveSpeed)
                         .font(.headline.monospacedDigit())
-                    Text("measured now")
+                    Text("job average")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
@@ -96,7 +96,7 @@ struct TransferSpeedGuideView: View {
                     VStack(alignment: .leading, spacing: 5) {
                         Text("How to read these numbers")
                             .font(.caption.weight(.semibold))
-                        Text("USB labels use bits per second; file copies use bytes per second. Eight bits equal one byte, and protocol overhead lowers real transfers. The slowest source, cable, reader, enclosure, or destination sets the final speed.")
+                        Text("USB labels use bits per second; file copies use bytes per second. Eight bits equal one byte, and protocol overhead lowers real transfers. The speed above is a whole-job average; verification alternates between the camera and Buffer, so the negotiated USB links are the better bottleneck evidence. The slowest source, cable, reader, enclosure, or destination sets the final speed.")
                         Text("U3 and V30 guarantee at least 30 MB/s sustained write. A2 is an app-performance rating—there is no A3 SD class.")
                         Text("Published ceilings: USB-IF, Intel, SD Association, DJI, and Samsung. Typical large-file ranges are approximate.")
                             .foregroundStyle(.tertiary)

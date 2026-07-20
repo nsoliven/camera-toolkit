@@ -103,8 +103,9 @@ private struct TransferQueueView: View {
                         .lineLimit(1)
                     HStack(spacing: 5) {
                         if queue.state == .running, queue.bytesPerSecond > 0 {
-                            Text("\(Int64(queue.bytesPerSecond).formattedBytes)/s")
+                            Text("\(Int64(queue.bytesPerSecond).formattedBytes)/s avg")
                                 .monospacedDigit()
+                                .help("Average for this copy or verification job. Verification alternates between camera and Buffer reads, so this is not an instantaneous camera-link measurement.")
                         } else {
                             Text(queueStateNote(queue.state))
                         }
