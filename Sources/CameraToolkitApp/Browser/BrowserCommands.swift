@@ -132,6 +132,7 @@ enum CameraToolkitShortcutCatalog {
                 .init(action: "Open selected item", keys: "Return  /  ⌘O  /  ⌘↓", detail: "Opens a folder or the selected file in its default app."),
                 .init(action: "Preview selected photos", keys: "Space  /  ⌘Y", detail: "Opens Camera Toolkit's large preview without decoding the full RAW."),
                 .init(action: "Copy selected files", keys: "⌘C", detail: "Copies Finder-compatible file references to the clipboard."),
+                .init(action: "Copy file paths", keys: "Right-click", detail: "Copies each selected file or folder path as plain text, one path per line."),
                 .init(action: "Rename selected item", keys: "Right-click", detail: "Renames one item without reading or rewriting its file contents."),
                 .init(action: "Delete an empty folder", keys: "Right-click", detail: "Confirms, then removes only a truly empty folder. Hidden files make the operation fail safely."),
                 .init(action: "Select all", keys: "⌘A", detail: "Selects every visible row, including contents from expanded folders."),
@@ -187,6 +188,14 @@ enum FileClipboardWriter {
         guard !fileURLs.isEmpty else { return false }
         pasteboard.clearContents()
         return pasteboard.writeObjects(fileURLs as [NSURL])
+    }
+
+    @discardableResult
+    static func copyPaths(_ urls: [URL], to pasteboard: NSPasteboard = .general) -> Bool {
+        let paths = urls.filter(\.isFileURL).map(\.path)
+        guard !paths.isEmpty else { return false }
+        pasteboard.clearContents()
+        return pasteboard.setString(paths.joined(separator: "\n"), forType: .string)
     }
 }
 
