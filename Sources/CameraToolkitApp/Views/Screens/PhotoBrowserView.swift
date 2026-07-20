@@ -1031,6 +1031,12 @@ struct PhotoBrowserView: View {
                 Label(copyMenuTitle(for: selectedItems.count), systemImage: "doc.on.doc")
             }
 
+            Button {
+                FileClipboardWriter.copyPaths(selectedItems.map(\.url))
+            } label: {
+                Label(copyPathMenuTitle(for: selectedItems.count), systemImage: "doc.on.clipboard")
+            }
+
             let assignableSelections = selectedItems.compactMap(eventSelection(for:))
             if let event = model.selectedEvent, !assignableSelections.isEmpty {
                 Button {
@@ -1055,6 +1061,10 @@ struct PhotoBrowserView: View {
 
     private func copyMenuTitle(for count: Int) -> String {
         count == 1 ? "Copy" : "Copy \(count) Items"
+    }
+
+    private func copyPathMenuTitle(for count: Int) -> String {
+        count == 1 ? "Copy Path" : "Copy \(count) Paths"
     }
 
     private var safeImportArea: some View {

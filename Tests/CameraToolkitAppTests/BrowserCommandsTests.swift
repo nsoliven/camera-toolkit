@@ -11,6 +11,7 @@ final class BrowserCommandsTests: XCTestCase {
         XCTAssertTrue(actions.contains("Previous or next item"))
         XCTAssertTrue(actions.contains("Expand or collapse a folder"))
         XCTAssertTrue(actions.contains("Copy selected files"))
+        XCTAssertTrue(actions.contains("Copy file paths"))
         XCTAssertTrue(actions.contains("Rename selected item"))
         XCTAssertTrue(actions.contains("Delete an empty folder"))
         XCTAssertTrue(actions.contains("Select across folders"))
@@ -84,6 +85,19 @@ final class BrowserCommandsTests: XCTestCase {
             pasteboard.readObjects(forClasses: [NSURL.self]) as? [URL]
         )
         XCTAssertEqual(copiedURLs.map(\.standardizedFileURL), [first.standardizedFileURL, second.standardizedFileURL])
+        pasteboard.clearContents()
+    }
+
+    func testFileClipboardWriterCopiesPathsAsPlainText() {
+        let pasteboard = NSPasteboard(name: NSPasteboard.Name("CameraToolkitPathTests-\(UUID().uuidString)"))
+        let first = URL(fileURLWithPath: "/tmp/Camera Toolkit/ONE.ARW")
+        let second = URL(fileURLWithPath: "/Volumes/Source Card/DCIM")
+
+        XCTAssertTrue(FileClipboardWriter.copyPaths([first, second], to: pasteboard))
+        XCTAssertEqual(
+            pasteboard.string(forType: .string),
+            "/tmp/Camera Toolkit/ONE.ARW\n/Volumes/Source Card/DCIM"
+        )
         pasteboard.clearContents()
     }
 
