@@ -293,6 +293,14 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate {
         transferQueueItem.keyEquivalentModifierMask = [.command, .option]
         transferQueueItem.target = self
         windowMenu.addItem(transferQueueItem)
+
+        let storageSpeedItem = NSMenuItem(
+            title: "Storage Speed Tests…",
+            action: #selector(openStorageSpeedTests),
+            keyEquivalent: ""
+        )
+        storageSpeedItem.target = self
+        windowMenu.addItem(storageSpeedItem)
         NSApp.windowsMenu = windowMenu
 
         let helpMenuItem = NSMenuItem()
@@ -365,6 +373,10 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate {
 
     @objc private func openTransferQueue() {
         TransferQueueWindowController.shared.show(model: model)
+    }
+
+    @objc private func openStorageSpeedTests() {
+        StorageBenchmarkWindowController.shared.show(model: model)
     }
 
     @objc private func handleTransferQueueRequest(_ notification: Notification) {

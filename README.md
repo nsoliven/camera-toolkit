@@ -28,6 +28,7 @@ The safety rule is simple: the camera source stays read-only while browsing, pre
 - Saves events and assigns photos from multiple folders or camera cards to the same event.
 - Shows a fast metadata-only import preview before any copy starts.
 - Opens a separate persistent Transfer Queue window with per-file bytes copied, speed, verification state, and clear disconnect failures.
+- Runs sequential storage speed tests inside the app: camera/card sources are read-only, while Buffer/library targets use a flushed, uncached, automatically removed temporary file. Live USB negotiation is shown beside measured read/write results to identify the actual bottleneck.
 - Copies selected files to a buffer, verifies their checksums, then organizes verified originals into the photo library without overwriting conflicts.
 - Offers **Free Up Camera** only for a completed, fully verified transfer. It shows the exact file count and size, requires typing `REMOVE`, rechecks every source/Buffer checksum, and permanently removes the source set only when all files still match.
 - Stores event/file relationships in SQLite through [GRDB](https://github.com/groue/GRDB.swift) and includes a bounded, read-only SQL inspector.

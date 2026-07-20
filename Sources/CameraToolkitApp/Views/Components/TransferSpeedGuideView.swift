@@ -9,6 +9,7 @@ private struct SpeedReferenceRow: Identifiable {
 
 struct TransferSpeedGuideView: View {
     let queue: TransferQueueSnapshot
+    @Bindable var model: DashboardModel
 
     @State private var connectedLinks: [USBLinkSnapshot] = []
     @State private var isLoadingLinks = true
@@ -103,6 +104,14 @@ struct TransferSpeedGuideView: View {
                     }
                     .font(.caption2)
                     .foregroundStyle(.secondary)
+
+                    Button {
+                        StorageBenchmarkWindowController.shared.show(model: model)
+                    } label: {
+                        Label("Run Storage Speed Tests", systemImage: "gauge.with.dots.needle.50percent")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
                 }
                 .padding(16)
             }

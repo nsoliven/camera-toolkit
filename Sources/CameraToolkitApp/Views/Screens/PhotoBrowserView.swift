@@ -300,6 +300,16 @@ struct PhotoBrowserView: View {
 
                 Section("Tools") {
                     sidebarActionButton(
+                        title: "Speed Tests",
+                        detail: model.isStorageBenchmarkRunning ? "Measuring connected storage" : "Find the slowest drive or USB link",
+                        symbol: "gauge.with.dots.needle.50percent",
+                        color: model.isStorageBenchmarkRunning ? .blue : .secondary,
+                        help: "Measure camera read speed and Buffer or library read/write speed in a separate window"
+                    ) {
+                        StorageBenchmarkWindowController.shared.show(model: model)
+                    }
+
+                    sidebarActionButton(
                         title: "Events",
                         detail: "Browse \(model.savedEvents.count) saved event\(model.savedEvents.count == 1 ? "" : "s")",
                         symbol: "calendar.badge.clock",
