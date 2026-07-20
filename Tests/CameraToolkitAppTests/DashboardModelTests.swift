@@ -222,6 +222,94 @@ final class DashboardModelTests: XCTestCase {
         }
     }
 
+    func testFailedEventCopyKeepsAPersistentActionableTransferQueue() async throws {
+        try await withTemporaryDirectoryAsync { root in
+            let card = root.appendingPathComponent("Camera Card", isDirectory: true)
+            let buffer = root.appendingPathComponent("Buffer", isDirectory: true)
+            let relativePath = "DCIM/100MSDCF/TRUNCATED.ARW"
+            try writeFile(card.appendingPathComponent(relativePath), Data("short".utf8))
+            let configStore = ConfigurationStore(url: root.appendingPathComponent("config.json"))
+            let queueStore = TransferQueueStore(url: root.appendingPathComponent("transfer-queue.json"))
+            let model = DashboardModel(
+                activePlan: CopyPlan(),
+                jobs: [],
+                configuration: AppConfiguration(
+                    demoRootPath: root.appendingPathComponent("Safety Test").path,
+                    importSourcePath: card.path,
+                    archivePath: root.appendingPathComponent("Library/Originals").path,
+                    bufferPath: buffer.path,
+                    activityLogPath: root.appendingPathComponent("activity.jsonl").path,
+                    selectedDeviceID: "sony-a7v"
+                ),
+                configurationStore: configStore,
+                transferQueueStore: queueStore
+            )
+
+            model.createEvent(named: "Transfer Failure Test", on: Date())
+            model.assignFilesToSelectedEvent([
+                FileRecord(path: relativePath, size: 500, modifiedAt: Date())
+            ])
+            model.copySelectedEventFilesToBuffer()
+            try await waitForIdle(model)
+
+            let queue = try XCTUnwrap(model.transferQueue)
+            XCTAssertEqual(queue.state, .failed)
+            XCTAssertEqual(queue.items.first?.state, .failed)
+            XCTAssertTrue(try XCTUnwrap(queue.message).contains("Camera originals were untouched"))
+            XCTAssertFalse(FileManager.default.fileExists(
+                atPath: URL(fileURLWithPath: model.expandedBufferIngestPath)
+                    .appendingPathComponent(relativePath).path
+            ))
+
+            let restored = try XCTUnwrap(try queueStore.load())
+            XCTAssertEqual(restored.state, .failed)
+            XCTAssertEqual(restored.items.map(\.relativePath), [relativePath])
+        }
+    }
+
+    func testRelaunchMarksAnUnfinishedPersistentTransferAsInterrupted() throws {
+        try withTemporaryDirectory { root in
+            let queueStore = TransferQueueStore(url: root.appendingPathComponent("transfer-queue.json"))
+            try queueStore.save(TransferQueueSnapshot(
+                sourcePath: root.appendingPathComponent("Card").path,
+                destinationPath: root.appendingPathComponent("Buffer").path,
+                items: [
+                    TransferQueueItem(
+                        relativePath: "DCIM/large.OSV",
+                        size: 1_000,
+                        copiedBytes: 400,
+                        state: .copying
+                    )
+                ],
+                progress: 0.4,
+                processedBytes: 400,
+                totalBytes: 1_000,
+                bytesPerSecond: 100,
+                phase: "Copying"
+            ))
+
+            let model = DashboardModel(
+                activePlan: CopyPlan(),
+                jobs: [],
+                configuration: AppConfiguration(
+                    demoRootPath: root.appendingPathComponent("Safety Test").path,
+                    importSourcePath: root.appendingPathComponent("Card").path,
+                    archivePath: root.appendingPathComponent("Library").path,
+                    bufferPath: root.appendingPathComponent("Buffer").path,
+                    activityLogPath: root.appendingPathComponent("activity.jsonl").path
+                ),
+                configurationStore: ConfigurationStore(url: root.appendingPathComponent("config.json")),
+                transferQueueStore: queueStore
+            )
+
+            XCTAssertEqual(model.transferQueue?.state, .failed)
+            XCTAssertEqual(model.transferQueue?.items.first?.state, .failed)
+            XCTAssertEqual(model.transferQueue?.processedBytes, 400)
+            XCTAssertTrue(try XCTUnwrap(model.transferQueue?.message).contains("closed before this transfer finished"))
+            XCTAssertEqual(try queueStore.load()?.state, .failed)
+        }
+    }
+
     func testEventSelectionCanSpanMultipleSourceRootsWithoutMisattribution() throws {
         try withTemporaryDirectory { root in
             let firstCard = root.appendingPathComponent("Camera Card A", isDirectory: true)

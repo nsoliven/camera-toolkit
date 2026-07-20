@@ -40,6 +40,59 @@ final class LocalTransferServiceTests: XCTestCase {
         }
     }
 
+    func testSelectedCopyRejectsAnEarlyEndOfFileAndLeavesNoFinalOrTemporaryFile() throws {
+        try withTemporaryDirectory { root in
+            let source = root.appendingPathComponent("source", isDirectory: true)
+            let destination = root.appendingPathComponent("destination", isDirectory: true)
+            let relativePath = "DCIM/clip.MP4"
+            try writeFile(source.appendingPathComponent(relativePath), "short")
+
+            XCTAssertThrowsError(
+                try LocalTransferService().copyFiles(
+                    source: source,
+                    destination: destination,
+                    files: [FileRecord(path: relativePath, size: 10, modifiedAt: Date())]
+                )
+            ) { error in
+                XCTAssertTrue(error.localizedDescription.contains("stopped early"))
+                XCTAssertTrue(error.localizedDescription.contains("No camera file was deleted"))
+            }
+
+            let finalURL = destination.appendingPathComponent(relativePath)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: finalURL.path))
+            let parent = finalURL.deletingLastPathComponent()
+            let leftovers = (try? FileManager.default.contentsOfDirectory(atPath: parent.path)) ?? []
+            XCTAssertFalse(leftovers.contains { $0.contains(".cttmp-") })
+        }
+    }
+
+    func testSelectedCopyRemovesOnlyItsOwnStaleTemporaryCopiesBeforeRetry() throws {
+        try withTemporaryDirectory { root in
+            let source = root.appendingPathComponent("source", isDirectory: true)
+            let destination = root.appendingPathComponent("destination", isDirectory: true)
+            let relativePath = "DCIM/photo.ARW"
+            let bytes = Data("camera-photo".utf8)
+            try writeFile(source.appendingPathComponent(relativePath), bytes)
+            let destinationParent = destination.appendingPathComponent("DCIM", isDirectory: true)
+            try FileManager.default.createDirectory(at: destinationParent, withIntermediateDirectories: true)
+            let stale = destinationParent.appendingPathComponent(".photo.ARW.cttmp-old-run")
+            let unrelated = destinationParent.appendingPathComponent(".different.ARW.cttmp-keep")
+            try writeFile(stale, "partial")
+            try writeFile(unrelated, "other")
+
+            let result = try LocalTransferService().copyFiles(
+                source: source,
+                destination: destination,
+                files: [FileRecord(path: relativePath, size: Int64(bytes.count), modifiedAt: Date())]
+            )
+
+            XCTAssertEqual(result.copied, [relativePath])
+            XCTAssertFalse(FileManager.default.fileExists(atPath: stale.path))
+            XCTAssertTrue(FileManager.default.fileExists(atPath: unrelated.path))
+            XCTAssertEqual(try Data(contentsOf: destination.appendingPathComponent(relativePath)), bytes)
+        }
+    }
+
     func testSimulationWorkspaceRunsEndToEndInLocalFolders() throws {
         try withTemporaryDirectory { root in
             let workspace = SimulationWorkspace(root: root.appendingPathComponent("Simulation", isDirectory: true))

@@ -47,6 +47,7 @@ enum StreamingFileIO {
         from source: URL,
         to destination: URL,
         chunkSize: Int = 4 * 1024 * 1024,
+        expectedByteCount: Int64? = nil,
         progress: (Int) -> Void
     ) throws {
         let input = try openDescriptor(source, flags: O_RDONLY)
@@ -55,6 +56,7 @@ enum StreamingFileIO {
         defer { Darwin.close(output) }
 
         var buffer = [UInt8](repeating: 0, count: chunkSize)
+        var totalCopied: Int64 = 0
         while true {
             let count = buffer.withUnsafeMutableBytes { rawBuffer in
                 Darwin.read(input, rawBuffer.baseAddress, rawBuffer.count)
@@ -64,6 +66,14 @@ enum StreamingFileIO {
                 throw posixError(operation: "read", url: source)
             }
             guard count > 0 else {
+                if let expectedByteCount, totalCopied != expectedByteCount {
+                    throw ToolkitError.commandFailed(
+                        "Copy stopped early for \(source.lastPathComponent): expected \(expectedByteCount) bytes but received \(totalCopied). The source drive may have disconnected."
+                    )
+                }
+                guard Darwin.fsync(output) == 0 else {
+                    throw posixError(operation: "finish writing", url: destination)
+                }
                 return
             }
 
@@ -79,6 +89,7 @@ enum StreamingFileIO {
                     offset += written
                 }
             }
+            totalCopied += Int64(count)
             progress(count)
         }
     }
