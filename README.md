@@ -8,7 +8,7 @@ Camera Toolkit is the native macOS app I use to move photos and video off my cam
 
 I built it because a camera card is not always one event. A single card can cover several shoots, and one event can span multiple cards or folders. I wanted to select those files quickly, save the event once, preview Sony RAW files without depending on Finder, and hand the resulting folders to Photomator or another editor without reorganizing everything by hand.
 
-The safety rule is simple: the camera source stays read-only. Previewing never copies bytes, copy operations never overwrite conflicts, and archive operations verify checksums before reporting success.
+The safety rule is simple: the camera source stays read-only while browsing, previewing, copying, and archiving. Copy operations never overwrite conflicts, and archive operations verify checksums before reporting success. The sole destructive source action is an explicit **Free Up Camera** flow after verification; it re-hashes the complete selected set, requires typed confirmation, and removes nothing if any Buffer copy is missing or different.
 
 ## What I use it for
 
@@ -18,6 +18,7 @@ The safety rule is simple: the camera source stays read-only. Previewing never c
 4. Copy only that event into a temporary workspace and verify every copied file.
 5. Open the RAW files in Photomator and keep exports beside the event in a consistent layout.
 6. Archive the verified originals into my long-term photo library without overwriting conflicts.
+7. Optionally free the verified space on the camera after one final checksum recheck.
 
 ## What the app does
 
@@ -28,6 +29,7 @@ The safety rule is simple: the camera source stays read-only. Previewing never c
 - Shows a fast metadata-only import preview before any copy starts.
 - Opens a separate persistent Transfer Queue window with per-file bytes copied, speed, verification state, and clear disconnect failures.
 - Copies selected files to a buffer, verifies their checksums, then organizes verified originals into the photo library without overwriting conflicts.
+- Offers **Free Up Camera** only for a completed, fully verified transfer. It shows the exact file count and size, requires typing `REMOVE`, rechecks every source/Buffer checksum, and permanently removes the source set only when all files still match.
 - Stores event/file relationships in SQLite through [GRDB](https://github.com/groue/GRDB.swift) and includes a bounded, read-only SQL inspector.
 - Checks whether known files already exist in Immich and stores per-event album/upload preferences. Photo upload is not enabled yet.
 
@@ -75,6 +77,7 @@ No removable-drive, network-share, username, or home-directory path is compiled 
 4. Use **Preview Event** for a quick path-and-size comparison.
 5. Use **Copy Event + Verify** to copy the bytes into the buffer and checksum them.
 6. Use **Archive + Verify** to organize verified originals in the library and write a manifest.
+7. Optionally open **Transfers → Free Up Camera** to recheck and remove those exact files from the source device.
 
 The default layout is intentionally readable:
 
@@ -111,11 +114,12 @@ Photo Library/Originals/<year>/<event>/<camera>/
 
 ## Safety model
 
-- Camera-source operations are read-only.
+- Camera browsing, previews, copies, and archives are source-read-only.
+- **Free Up Camera** is the only source-destructive action. It is available only after full Buffer verification, requires typing `REMOVE`, performs a fresh all-files checksum pass, and permanently removes nothing when any file fails that pass.
 - Metadata previews do not claim checksum verification.
 - Copy and archive paths refuse to overwrite a different existing file.
 - Archive success requires checksum verification and writes a manifest.
-- Cleanup moves verified files into a recoverable `_Trash/<batch>` area; permanent deletion is separate and confirmation-gated.
+- Buffer-to-archive cleanup moves verified Buffer files into a recoverable `_Trash/<batch>` area; permanent Buffer-trash deletion remains separate and confirmation-gated.
 - Tests operate only in temporary directories.
 
 See [Safety](docs/SAFETY.md), [Configuration](docs/CONFIGURATION.md), and [Architecture](docs/ARCHITECTURE.md) for implementation details.

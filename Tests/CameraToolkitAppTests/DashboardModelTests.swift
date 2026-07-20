@@ -313,6 +313,62 @@ final class DashboardModelTests: XCTestCase {
         }
     }
 
+    func testVerifiedTransferCanSafelyFreeItsExplicitCameraFiles() async throws {
+        try await withTemporaryDirectoryAsync { root in
+            let source = root.appendingPathComponent("Camera", isDirectory: true)
+            let buffer = root.appendingPathComponent("Buffer", isDirectory: true)
+            let relativePath = "DCIM/verified.OSV"
+            let bytes = Data("checksum-matched-video".utf8)
+            try writeFile(source.appendingPathComponent(relativePath), bytes)
+            try writeFile(buffer.appendingPathComponent(relativePath), bytes)
+            let queueStore = TransferQueueStore(url: root.appendingPathComponent("transfer-queue.json"))
+            let model = DashboardModel(
+                activePlan: CopyPlan(),
+                jobs: [],
+                configuration: AppConfiguration(
+                    demoRootPath: root.appendingPathComponent("Safety Test").path,
+                    importSourcePath: source.path,
+                    archivePath: root.appendingPathComponent("Library").path,
+                    bufferPath: buffer.path,
+                    activityLogPath: root.appendingPathComponent("activity.jsonl").path
+                ),
+                configurationStore: ConfigurationStore(url: root.appendingPathComponent("config.json")),
+                transferQueueStore: queueStore
+            )
+            let queue = TransferQueueSnapshot(
+                state: .completed,
+                sourcePath: source.path,
+                destinationPath: buffer.path,
+                items: [
+                    TransferQueueItem(
+                        relativePath: relativePath,
+                        size: Int64(bytes.count),
+                        copiedBytes: Int64(bytes.count),
+                        state: .verified
+                    )
+                ],
+                progress: 1,
+                processedBytes: Int64(bytes.count),
+                totalBytes: Int64(bytes.count),
+                phase: "Transfer complete"
+            )
+            model.transferQueue = queue
+
+            model.removeVerifiedSourceFiles(
+                queueID: queue.id,
+                confirmation: SourceCleanupService.confirmationToken
+            )
+            try await waitForIdle(model)
+
+            XCTAssertFalse(FileManager.default.fileExists(atPath: source.appendingPathComponent(relativePath).path))
+            XCTAssertEqual(try Data(contentsOf: buffer.appendingPathComponent(relativePath)), bytes)
+            XCTAssertEqual(model.transferQueue?.items.first?.state, .sourceRemoved)
+            XCTAssertEqual(model.transferQueue?.sourceRemovedCount, 1)
+            XCTAssertTrue(model.sourceCleanupMessage?.contains("Buffer copies remain verified") == true)
+            XCTAssertEqual(try queueStore.load()?.items.first?.state, .sourceRemoved)
+        }
+    }
+
     func testEventSelectionCanSpanMultipleSourceRootsWithoutMisattribution() throws {
         try withTemporaryDirectory { root in
             let firstCard = root.appendingPathComponent("Camera Card A", isDirectory: true)

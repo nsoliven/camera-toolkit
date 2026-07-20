@@ -91,8 +91,16 @@ final class DashboardModel {
     var catalogReport: CatalogBootstrapReport?
     var catalogMessage: String = "Photo list has not been prepared yet."
     var transferQueue: TransferQueueSnapshot?
+    var sourceCleanupMessage: String?
+    var sourceCleanupError: String?
     var activeJob: JobSnapshot? {
         jobs.first { $0.state == .running || $0.state == .queued }
+    }
+    var sourceCleanupJob: JobSnapshot? {
+        jobs.first { $0.action == .freeUp }
+    }
+    var isSourceCleanupRunning: Bool {
+        sourceCleanupJob?.state == .running || sourceCleanupJob?.state == .queued
     }
     @ObservationIgnored private let configurationStore: ConfigurationStore
     @ObservationIgnored private let transferQueueStore: TransferQueueStore
@@ -992,6 +1000,92 @@ extension DashboardModel {
         try? transferQueueStore.remove()
     }
 
+    func prepareSourceCleanup() {
+        guard !isSourceCleanupRunning else { return }
+        sourceCleanupMessage = nil
+        sourceCleanupError = nil
+    }
+
+    func removeVerifiedSourceFiles(queueID: UUID, confirmation: String) {
+        guard !isBusy, !isSourceCleanupRunning else {
+            sourceCleanupError = "Another file job is already running. Wait for it to finish, then try again."
+            return
+        }
+        guard let queue = transferQueue,
+              queue.id == queueID,
+              queue.state == .completed,
+              queue.verifiedCount == queue.items.count else {
+            sourceCleanupError = "Every selected file must be checksum verified in the Buffer first."
+            return
+        }
+
+        let removableItems = queue.items.filter {
+            $0.state == .verified || $0.state == .alreadyPresent
+        }
+        guard !removableItems.isEmpty else {
+            sourceCleanupError = "These source files have already been removed from the camera."
+            return
+        }
+
+        let records = removableItems.map {
+            FileRecord(path: $0.relativePath, size: $0.size, modifiedAt: .distantPast)
+        }
+        let sourcePath = queue.sourcePath
+        let bufferPath = queue.destinationPath
+        let source = URL(fileURLWithPath: sourcePath, isDirectory: true)
+        let buffer = URL(fileURLWithPath: bufferPath, isDirectory: true)
+        let command = Self.commandLine([
+            "free-up-camera", "--recheck", sourcePath, bufferPath, "\(records.count) files"
+        ])
+
+        sourceCleanupMessage = nil
+        sourceCleanupError = nil
+
+        runBackgroundJob(
+            action: .freeUp,
+            runningNote: "Rechecking camera files against the Buffer before removal",
+            logTitle: "Freed verified camera space",
+            logDetail: "Re-hashed the explicit source and Buffer files before permanently removing only matching camera originals.",
+            command: command,
+            sourcePath: sourcePath,
+            destinationPath: bufferPath,
+            operation: { jobProgress in
+                try SourceCleanupService().removeVerifiedFiles(
+                    sourceRoot: source,
+                    bufferRoot: buffer,
+                    files: records,
+                    confirmation: confirmation
+                ) { update in
+                    jobProgress(Self.jobUpdate(
+                        from: update,
+                        lowerBound: 0.02,
+                        upperBound: 0.98,
+                        notePrefix: "Safely freeing camera space",
+                        command: command,
+                        sourcePath: sourcePath,
+                        destinationPath: bufferPath
+                    ))
+                }
+            },
+            completion: { report in
+                self.applySourceCleanupReport(report, queueID: queueID)
+
+                guard report.removed.count == records.count else {
+                    let summary = Self.sourceCleanupFailureSummary(
+                        report,
+                        requestedCount: records.count
+                    )
+                    self.sourceCleanupError = summary
+                    throw ToolkitError.commandFailed(summary)
+                }
+
+                let summary = "Removed \(report.removed.count) checksum-matched file(s) from the camera and freed \(report.removedBytes.formattedBytes). Buffer copies remain verified."
+                self.sourceCleanupMessage = summary
+                return summary
+            }
+        )
+    }
+
     var isBufferVerifiedForArchive: Bool {
         !activePlan.existing.isEmpty
             && activePlan.new.isEmpty
@@ -1337,6 +1431,54 @@ extension DashboardModel {
         transferQueue = queue
         persistTransferQueue(force: true)
         NotificationCenter.default.post(name: .cameraToolkitShowTransferQueue, object: nil)
+    }
+
+    private func applySourceCleanupReport(_ report: SourceCleanupReport, queueID: UUID) {
+        guard var queue = transferQueue, queue.id == queueID else { return }
+        let removed = Set(report.removed)
+        for index in queue.items.indices where removed.contains(queue.items[index].relativePath) {
+            queue.items[index].state = .sourceRemoved
+            queue.items[index].detail = "Removed from the camera after a fresh checksum match with the Buffer."
+        }
+        if !removed.isEmpty {
+            queue.phase = report.removed.count == queue.items.count
+                ? "Camera space freed"
+                : "Some camera files removed"
+            queue.message = "Removed \(report.removed.count) checksum-matched source file(s), freeing \(report.removedBytes.formattedBytes). Buffer copies remain verified."
+            queue.technicalDetail = report.errors.isEmpty
+                ? nil
+                : report.errors.sorted { $0.key < $1.key }.map { "\($0.key): \($0.value)" }.joined(separator: "\n")
+            queue.updatedAt = Date()
+            transferQueue = queue
+            persistTransferQueue(force: true)
+            BrowserCommand.post(.reload)
+        }
+    }
+
+    nonisolated private static func sourceCleanupFailureSummary(
+        _ report: SourceCleanupReport,
+        requestedCount: Int
+    ) -> String {
+        var reasons: [String] = []
+        if !report.missingSource.isEmpty {
+            reasons.append("\(report.missingSource.count) source file(s) are already missing")
+        }
+        if !report.missingBuffer.isEmpty {
+            reasons.append("\(report.missingBuffer.count) Buffer copy/copies are missing")
+        }
+        if !report.differ.isEmpty {
+            reasons.append("\(report.differ.count) checksum(s) differ")
+        }
+        if !report.errors.isEmpty {
+            reasons.append("\(report.errors.count) file(s) changed or could not be checked")
+        }
+        if report.removed.count < requestedCount, reasons.isEmpty {
+            reasons.append("not every source file could be removed")
+        }
+        let prefix = report.removed.isEmpty
+            ? "Nothing was removed."
+            : "Removed \(report.removed.count) file(s), then stopped safely."
+        return "\(prefix) \(reasons.joined(separator: "; ")). Buffer copies were untouched."
     }
 
     private func failTransferQueue(error: Error, message: String) {

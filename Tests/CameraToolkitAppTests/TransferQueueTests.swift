@@ -52,6 +52,30 @@ final class TransferQueueTests: XCTestCase {
         )
     }
 
+    func testSourceRemovedFilesRemainVerifiedAndShowFreedStatus() {
+        let item = TransferQueueItem(
+            relativePath: "DCIM/first.OSV",
+            size: 100,
+            copiedBytes: 100,
+            state: .sourceRemoved
+        )
+        let queue = TransferQueueSnapshot(
+            state: .completed,
+            sourcePath: "/Volumes/Camera",
+            destinationPath: "/Volumes/Buffer",
+            items: [item],
+            progress: 1,
+            totalBytes: 100
+        )
+
+        XCTAssertEqual(queue.verifiedCount, 1)
+        XCTAssertEqual(queue.sourceRemovedCount, 1)
+        XCTAssertEqual(
+            queue.sidebarSummary,
+            TransferQueueSidebarSummary(detail: "1 file removed from camera", badge: "Freed")
+        )
+    }
+
     func testStoppedQueueDoesNotClaimUntouchedFilesAreStillWaiting() {
         let untouched = TransferQueueItem(relativePath: "DCIM/later.ARW", size: 300)
         let queue = TransferQueueSnapshot(
