@@ -2,6 +2,7 @@ import AppKit
 import CameraToolkitCore
 import QuickLookUI
 import SwiftUI
+import UniformTypeIdentifiers
 
 private struct BrowserItem: Identifiable, Hashable, Sendable {
     var id: String { url.path }
@@ -981,6 +982,8 @@ struct PhotoBrowserView: View {
     @ViewBuilder
     private func browserContextMenu(for selection: Set<String>) -> some View {
         let selectedItems = visibleBrowserItems.filter { selection.contains($0.id) }
+        let contextURLs = selectedItems.map(\.url)
+        let selectedPreviewURLs = contextURLs.filter(CameraPreviewSupport.canDecode)
 
         if selectedItems.isEmpty {
             browserBackgroundContextMenu
@@ -1006,36 +1009,70 @@ struct PhotoBrowserView: View {
                     }
                 }
 
-                Divider()
+                if !item.isDirectory {
+                    openWithMenu(for: contextURLs, supportsPhotomator: !selectedPreviewURLs.isEmpty)
+                }
+            } else {
+                Button {
+                    openWithDefaultApplications(contextURLs)
+                } label: {
+                    Label("Open \(selectedItems.count) Items", systemImage: "arrow.up.forward.app")
+                }
 
+                if !selectedPreviewURLs.isEmpty {
+                    Button {
+                        CameraPreviewController.shared.preview(
+                            selectedPreviewURLs,
+                            startingAt: selectedPreviewURLs.first
+                        )
+                    } label: {
+                        Label("Preview \(selectedPreviewURLs.count) Photo\(selectedPreviewURLs.count == 1 ? "" : "s")", systemImage: "eye")
+                    }
+                }
+
+                if selectedItems.allSatisfy({ !$0.isDirectory }) {
+                    openWithMenu(
+                        for: contextURLs,
+                        supportsPhotomator: selectedPreviewURLs.count == contextURLs.count
+                    )
+                }
+            }
+
+            Divider()
+
+            if selectedItems.count == 1, let item = selectedItems.first {
                 Button {
                     rename(item)
                 } label: {
                     Label("Rename…", systemImage: "pencil")
                 }
                 .disabled(browserOperationLabel != nil)
-
-                if item.isDirectory {
-                    Button(role: .destructive) {
-                        confirmDeleteEmptyFolder(item)
-                    } label: {
-                        Label("Delete Empty Folder…", systemImage: "trash")
-                    }
-                    .disabled(browserOperationLabel != nil)
-                }
             }
 
             Button {
-                FileClipboardWriter.copy(selectedItems.map(\.url))
+                FileClipboardWriter.copy(contextURLs)
             } label: {
                 Label(copyMenuTitle(for: selectedItems.count), systemImage: "doc.on.doc")
             }
 
             Button {
-                FileClipboardWriter.copyPaths(selectedItems.map(\.url))
+                FileClipboardWriter.copyPaths(contextURLs)
             } label: {
                 Label(copyPathMenuTitle(for: selectedItems.count), systemImage: "doc.on.clipboard")
             }
+
+            ShareLink(items: contextURLs) {
+                Label(selectedItems.count == 1 ? "Share…" : "Share \(selectedItems.count) Items…", systemImage: "square.and.arrow.up")
+            }
+
+            Divider()
+
+            Button {
+                createFolder()
+            } label: {
+                Label("New Folder…", systemImage: "folder.badge.plus")
+            }
+            .disabled(browserOperationLabel != nil)
 
             let assignableSelections = selectedItems.compactMap(eventSelection(for:))
             if let event = model.selectedEvent, !assignableSelections.isEmpty {
@@ -1052,10 +1089,52 @@ struct PhotoBrowserView: View {
             Divider()
 
             Button {
-                NSWorkspace.shared.activateFileViewerSelecting(selectedItems.map(\.url))
+                NSWorkspace.shared.activateFileViewerSelecting(contextURLs)
             } label: {
-                Label("Reveal in Finder", systemImage: "finder")
+                Label("Show in Finder", systemImage: "finder")
             }
+
+            Button {
+                FinderItemActions.showInfo(for: contextURLs)
+            } label: {
+                Label(selectedItems.count == 1 ? "Get Info" : "Get Info for \(selectedItems.count) Items", systemImage: "info.circle")
+            }
+
+            if selectedItems.count == 1,
+               let item = selectedItems.first,
+               item.isDirectory {
+                Divider()
+
+                Button(role: .destructive) {
+                    confirmDeleteEmptyFolder(item)
+                } label: {
+                    Label("Delete Empty Folder…", systemImage: "trash")
+                }
+                .disabled(browserOperationLabel != nil)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func openWithMenu(for urls: [URL], supportsPhotomator: Bool) -> some View {
+        Menu {
+            Button("Default Application") {
+                openWithDefaultApplications(urls)
+            }
+
+            if supportsPhotomator {
+                Button("Photomator") {
+                    PhotomatorLauncher.open(urls)
+                }
+            }
+
+            Divider()
+
+            Button("Choose Application…") {
+                chooseApplication(toOpen: urls)
+            }
+        } label: {
+            Label("Open With", systemImage: "app.badge")
         }
     }
 
@@ -1989,6 +2068,31 @@ struct PhotoBrowserView: View {
         } else {
             NSWorkspace.shared.open(item.url)
         }
+    }
+
+    private func openWithDefaultApplications(_ urls: [URL]) {
+        urls.forEach { NSWorkspace.shared.open($0) }
+    }
+
+    private func chooseApplication(toOpen urls: [URL]) {
+        guard !urls.isEmpty else { return }
+
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [.application]
+        panel.treatsFilePackagesAsDirectories = false
+        panel.directoryURL = URL(fileURLWithPath: "/Applications", isDirectory: true)
+        panel.title = "Choose an Application"
+        panel.message = "Choose an app to open \(urls.count == 1 ? urls[0].lastPathComponent : "\(urls.count) selected items")."
+        panel.prompt = "Open"
+
+        guard panel.runModal() == .OK, let applicationURL = panel.url else { return }
+
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = true
+        NSWorkspace.shared.open(urls, withApplicationAt: applicationURL, configuration: configuration)
     }
 
     private func previewSelection() {
