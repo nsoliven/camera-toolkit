@@ -111,6 +111,13 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate {
         fileMenuItem.submenu = fileMenu
         addBrowserCommand(
             to: fileMenu,
+            title: "Get Selected Location Info",
+            command: .showSelectedLocationInformation,
+            keyEquivalent: "i"
+        )
+        fileMenu.addItem(.separator())
+        addBrowserCommand(
+            to: fileMenu,
             title: "Open Selected Item",
             command: .openSelection,
             keyEquivalent: "o"
