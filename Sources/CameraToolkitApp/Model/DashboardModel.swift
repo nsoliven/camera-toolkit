@@ -101,6 +101,7 @@ final class DashboardModel {
     var storageCapacityRevision: Int = 0
     var sourceCleanupMessage: String?
     var sourceCleanupError: String?
+    var selectedEventCopyAvailability = EventCopyAvailability()
     var activeJob: JobSnapshot? {
         jobs.first { $0.state == .running || $0.state == .queued }
     }
@@ -117,6 +118,8 @@ final class DashboardModel {
     @ObservationIgnored private var catalogSyncTask: Task<Void, Never>?
     @ObservationIgnored private var lastTransferQueuePersistence = Date.distantPast
     @ObservationIgnored private var lastStorageCapacityRefreshRequest = Date.distantPast
+    @ObservationIgnored private var eventCopyAvailabilityTask: Task<EventCopyAvailability, Never>?
+    @ObservationIgnored private var eventCopyAvailabilityGeneration = UUID()
 
     init(
         activePlan: CopyPlan,
@@ -203,6 +206,21 @@ final class DashboardModel {
         guard totalBytes > 0 else { return 0 }
         return min(max(Double(processedBytes) / Double(totalBytes), 0), 1)
     }
+
+    private static func eventFileFingerprint(_ files: [FileRecord]) -> UInt64 {
+        var value: UInt64 = 14_695_981_039_346_656_037
+        for file in files.sorted(by: { $0.path < $1.path }) {
+            for byte in file.path.utf8 {
+                value ^= UInt64(byte)
+                value &*= 1_099_511_628_211
+            }
+            value ^= UInt64(bitPattern: file.size)
+            value &*= 1_099_511_628_211
+            value ^= UInt64(bitPattern: Int64(file.modifiedAt.timeIntervalSince1970.rounded()))
+            value &*= 1_099_511_628_211
+        }
+        return value
+    }
 }
 
 extension DashboardModel {
@@ -249,6 +267,77 @@ extension DashboardModel {
                 modifiedAt: assignment.modifiedAt
             )
         }.sorted { $0.path < $1.path }
+    }
+
+    var selectedEventCopyAvailabilityRefreshID: String {
+        let eventID = configuration.selectedEventID?.uuidString ?? "none"
+        let source = URL(fileURLWithPath: expandedImportSourcePath, isDirectory: true).standardizedFileURL.path
+        let destination = URL(fileURLWithPath: expandedBufferIngestPath, isDirectory: true).standardizedFileURL.path
+        let assignments = selectedEventFiles
+        let fingerprint = Self.eventFileFingerprint(assignments)
+        let transferRevision = transferQueue.map {
+            "\($0.id.uuidString):\($0.state.rawValue):\($0.items.count):\($0.sourceRemovedCount)"
+        } ?? "none"
+        return [
+            eventID,
+            source,
+            destination,
+            String(assignments.count),
+            String(fingerprint),
+            String(storageCapacityRevision),
+            transferRevision,
+            String(pendingTransferFileCount),
+        ].joined(separator: "|")
+    }
+
+    var hasSelectedEventFilesReadyToCopy: Bool {
+        selectedEventCopyAvailability.phase == .ready
+            && selectedEventCopyAvailability.contextID == selectedEventCopyAvailabilityRefreshID
+            && selectedEventCopyAvailability.hasFilesReadyToCopy
+    }
+
+    func refreshSelectedEventCopyAvailability() async {
+        let contextID = selectedEventCopyAvailabilityRefreshID
+        let files = selectedEventFiles
+        guard configuration.selectedEventID != nil, !files.isEmpty else {
+            eventCopyAvailabilityTask?.cancel()
+            selectedEventCopyAvailability = EventCopyAvailability(
+                phase: .ready,
+                contextID: contextID,
+                assignedCount: files.count
+            )
+            return
+        }
+
+        selectedEventCopyAvailability = .checking(
+            contextID: contextID,
+            assignedCount: files.count
+        )
+        eventCopyAvailabilityTask?.cancel()
+        let generation = UUID()
+        eventCopyAvailabilityGeneration = generation
+
+        let source = URL(fileURLWithPath: expandedImportSourcePath, isDirectory: true)
+        let destination = URL(fileURLWithPath: expandedBufferIngestPath, isDirectory: true)
+        let scheduledPaths = scheduledTransferPaths(sourcePath: source.path, destinationPath: destination.path)
+        let task = Task.detached(priority: .utility) {
+            EventCopyAvailabilityScanner.scan(
+                contextID: contextID,
+                files: files,
+                sourceRoot: source,
+                bufferRoot: destination,
+                scheduledPaths: scheduledPaths
+            )
+        }
+        eventCopyAvailabilityTask = task
+        let result = await task.value
+
+        guard !Task.isCancelled,
+              generation == eventCopyAvailabilityGeneration,
+              result.contextID == selectedEventCopyAvailabilityRefreshID else {
+            return
+        }
+        selectedEventCopyAvailability = result
     }
 
     func toggleSidebar() {
@@ -303,7 +392,8 @@ extension DashboardModel {
         }
         activePlan = CopyPlan()
         organizedArchivePlan = OrganizedArchivePlan()
-        queuedFilePaths = Set(selectedEventFiles.map(\.path))
+        queuedFilePaths.removeAll()
+        selectedEventCopyAvailability = EventCopyAvailability()
         createSelectedEventFolders()
         return true
     }
@@ -320,7 +410,8 @@ extension DashboardModel {
         }
         activePlan = CopyPlan()
         organizedArchivePlan = OrganizedArchivePlan()
-        queuedFilePaths = Set(selectedEventFiles.map(\.path))
+        queuedFilePaths.removeAll()
+        selectedEventCopyAvailability = EventCopyAvailability()
         statusMessage = selectedEventFiles.isEmpty
             ? "Selected \(event.name). Select photos and assign them to this event."
             : "Selected \(event.name) with \(selectedEventFiles.count) assigned file(s)."
@@ -384,20 +475,34 @@ extension DashboardModel {
         )
         let sourceCount = Set(validSelections.map(\.sourceRootPath)).count
         let sourceNote = sourceCount == 1 ? "" : " across \(sourceCount) camera sources"
+        selectedEventCopyAvailability = EventCopyAvailability()
         statusMessage = "Assigned \(validSelections.count) file(s)\(sourceNote) to \(event.name)."
     }
 
     func queueSelectedEventFiles() {
-        queuedFilePaths = Set(selectedEventFiles.map(\.path))
-        statusMessage = selectedEventFiles.isEmpty
-            ? "This event has no assigned files on the selected camera source."
-            : "Queued \(selectedEventFiles.count) file(s) assigned to \(selectedEvent?.name ?? "the event")."
+        guard selectedEventCopyAvailability.contextID == selectedEventCopyAvailabilityRefreshID,
+              selectedEventCopyAvailability.phase == .ready else {
+            statusMessage = "Checking which assigned files are still on the source and need copying…"
+            Task { await refreshSelectedEventCopyAvailability() }
+            return
+        }
+        let files = selectedEventCopyAvailability.filesReadyToCopy
+        queuedFilePaths = Set(files.map(\.path))
+        statusMessage = files.isEmpty
+            ? "Nothing needs copying from this source."
+            : "Queued \(files.count) file(s) that are present on the source and not already in the Buffer."
     }
 
     func copySelectedEventFilesToBuffer() {
-        let files = selectedEventFiles
+        guard selectedEventCopyAvailability.contextID == selectedEventCopyAvailabilityRefreshID,
+              selectedEventCopyAvailability.phase == .ready else {
+            statusMessage = "Checking which assigned files are still on the source and need copying…"
+            Task { await refreshSelectedEventCopyAvailability() }
+            return
+        }
+        let files = selectedEventCopyAvailability.filesReadyToCopy
         guard !files.isEmpty else {
-            statusMessage = "Assign files to the selected event before copying to the Buffer."
+            statusMessage = "Nothing needs copying. Assigned files are already in the Buffer, unavailable, missing, or already queued."
             return
         }
         queuedFilePaths = Set(files.map(\.path))
@@ -1038,9 +1143,15 @@ extension DashboardModel {
     }
 
     func previewSelectedEventImport() {
-        let selectedFiles = selectedEventFiles
+        guard selectedEventCopyAvailability.contextID == selectedEventCopyAvailabilityRefreshID,
+              selectedEventCopyAvailability.phase == .ready else {
+            statusMessage = "Checking which assigned files are still available for preview…"
+            Task { await refreshSelectedEventCopyAvailability() }
+            return
+        }
+        let selectedFiles = selectedEventCopyAvailability.presentFiles
         guard !selectedFiles.isEmpty else {
-            statusMessage = "Assign photos to the selected event before previewing it."
+            statusMessage = "No assigned files are currently present on this source."
             return
         }
 
@@ -1163,6 +1274,24 @@ extension DashboardModel {
             eventName: batch.eventName,
             deviceID: batch.deviceID
         )
+    }
+
+    private func scheduledTransferPaths(sourcePath: String, destinationPath: String) -> Set<String> {
+        let standardizedSource = URL(fileURLWithPath: sourcePath, isDirectory: true).standardizedFileURL.path
+        let standardizedDestination = URL(fileURLWithPath: destinationPath, isDirectory: true).standardizedFileURL.path
+        var paths = Set<String>()
+
+        if let active = transferQueue,
+           active.state == .running,
+           URL(fileURLWithPath: active.sourcePath, isDirectory: true).standardizedFileURL.path == standardizedSource,
+           URL(fileURLWithPath: active.destinationPath, isDirectory: true).standardizedFileURL.path == standardizedDestination {
+            paths.formUnion(active.items.map(\.relativePath))
+        }
+        for batch in pendingTransferBatches
+        where batch.sourcePath == standardizedSource && batch.destinationPath == standardizedDestination {
+            paths.formUnion(batch.files.map(\.path))
+        }
+        return paths
     }
 
     private func enqueueTransfer(

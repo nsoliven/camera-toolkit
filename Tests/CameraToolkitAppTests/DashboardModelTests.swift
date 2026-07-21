@@ -208,6 +208,7 @@ final class DashboardModelTests: XCTestCase {
             XCTAssertTrue(FileManager.default.fileExists(atPath: model.expandedBufferEditsPath))
             XCTAssertTrue(FileManager.default.fileExists(atPath: model.configuration.bufferExportFolderPath("Masters")))
 
+            await model.refreshSelectedEventCopyAvailability()
             model.previewSelectedEventImport()
             try await waitForIdle(model)
             XCTAssertEqual(model.activePlan.new.map(\.path), [includedPath])
@@ -227,7 +228,8 @@ final class DashboardModelTests: XCTestCase {
             let card = root.appendingPathComponent("Camera Card", isDirectory: true)
             let buffer = root.appendingPathComponent("Buffer", isDirectory: true)
             let relativePath = "DCIM/100MSDCF/TRUNCATED.ARW"
-            try writeFile(card.appendingPathComponent(relativePath), Data("short".utf8))
+            let sourceBytes = Data(repeating: 0x41, count: 500)
+            let sourceURL = try writeFile(card.appendingPathComponent(relativePath), sourceBytes)
             let configStore = ConfigurationStore(url: root.appendingPathComponent("config.json"))
             let queueStore = TransferQueueStore(url: root.appendingPathComponent("transfer-queue.json"))
             let model = DashboardModel(
@@ -247,8 +249,16 @@ final class DashboardModelTests: XCTestCase {
 
             model.createEvent(named: "Transfer Failure Test", on: Date())
             model.assignFilesToSelectedEvent([
-                FileRecord(path: relativePath, size: 500, modifiedAt: Date())
+                FileRecord(
+                    path: relativePath,
+                    size: Int64(sourceBytes.count),
+                    modifiedAt: try XCTUnwrap(
+                        sourceURL.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+                    )
+                )
             ])
+            await model.refreshSelectedEventCopyAvailability()
+            try FileManager.default.removeItem(at: sourceURL)
             model.copySelectedEventFilesToBuffer()
             try await waitForIdle(model)
 
@@ -304,6 +314,7 @@ final class DashboardModelTests: XCTestCase {
                 )
             ])
             let firstDestination = model.expandedBufferIngestPath
+            await model.refreshSelectedEventCopyAvailability()
             model.copySelectedEventFilesToBuffer()
 
             XCTAssertTrue(model.createEvent(named: "Evening Event", on: Date(timeIntervalSince1970: 200)))
@@ -315,6 +326,7 @@ final class DashboardModelTests: XCTestCase {
                 )
             ])
             let secondDestination = model.expandedBufferIngestPath
+            await model.refreshSelectedEventCopyAvailability()
             model.copySelectedEventFilesToBuffer()
 
             XCTAssertEqual(model.pendingTransferBatches.map(\.eventName), ["Morning Event", "Evening Event"])
@@ -340,12 +352,28 @@ final class DashboardModelTests: XCTestCase {
         }
     }
 
-    func testQueueingDuringActiveTransferAddsOnlyNewlyAssignedFiles() throws {
-        try withTemporaryDirectory { root in
+    func testQueueingDuringActiveTransferAddsOnlyNewlyAssignedFiles() async throws {
+        try await withTemporaryDirectoryAsync { root in
             let card = root.appendingPathComponent("Camera", isDirectory: true)
             let buffer = root.appendingPathComponent("Buffer", isDirectory: true)
-            let first = FileRecord(path: "DCIM/FIRST.ARW", size: 10, modifiedAt: Date(timeIntervalSince1970: 10))
-            let second = FileRecord(path: "DCIM/SECOND.ARW", size: 20, modifiedAt: Date(timeIntervalSince1970: 20))
+            let firstBytes = Data(repeating: 0x31, count: 10)
+            let secondBytes = Data(repeating: 0x32, count: 20)
+            let firstURL = try writeFile(card.appendingPathComponent("DCIM/FIRST.ARW"), firstBytes)
+            let secondURL = try writeFile(card.appendingPathComponent("DCIM/SECOND.ARW"), secondBytes)
+            let first = FileRecord(
+                path: "DCIM/FIRST.ARW",
+                size: Int64(firstBytes.count),
+                modifiedAt: try XCTUnwrap(
+                    firstURL.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+                )
+            )
+            let second = FileRecord(
+                path: "DCIM/SECOND.ARW",
+                size: Int64(secondBytes.count),
+                modifiedAt: try XCTUnwrap(
+                    secondURL.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+                )
+            )
             let model = DashboardModel(
                 activePlan: CopyPlan(),
                 jobs: [],
@@ -371,11 +399,12 @@ final class DashboardModelTests: XCTestCase {
             )
             model.isBusy = true
 
+            await model.refreshSelectedEventCopyAvailability()
             model.copySelectedEventFilesToBuffer()
 
             XCTAssertEqual(model.pendingTransferBatches.count, 1)
             XCTAssertEqual(model.pendingTransferBatches[0].files, [second])
-            XCTAssertEqual(model.queuedFilePaths, [first.path, second.path])
+            XCTAssertEqual(model.queuedFilePaths, [second.path])
         }
     }
 
@@ -565,6 +594,112 @@ final class DashboardModelTests: XCTestCase {
             XCTAssertEqual(try Data(contentsOf: video), Data("video".utf8))
             XCTAssertTrue(model.organizedArchivePlan.isVerified)
             XCTAssertTrue(model.statusMessage.contains("Library archive verified"))
+        }
+    }
+
+    func testEventCopyAvailabilitySeparatesReadyBufferedMissingScheduledAndConflictingFiles() throws {
+        try withTemporaryDirectory { root in
+            let source = root.appendingPathComponent("Card", isDirectory: true)
+            let buffer = root.appendingPathComponent("Buffer", isDirectory: true)
+            let readyURL = try writeFile(source.appendingPathComponent("DCIM/READY.ARW"), Data("ready".utf8))
+            let bufferedURL = try writeFile(source.appendingPathComponent("DCIM/BUFFERED.ARW"), Data("buffered".utf8))
+            let scheduledURL = try writeFile(source.appendingPathComponent("DCIM/SCHEDULED.ARW"), Data("scheduled".utf8))
+            let conflictURL = try writeFile(source.appendingPathComponent("DCIM/CONFLICT.ARW"), Data("conflict".utf8))
+            try writeFile(buffer.appendingPathComponent("DCIM/BUFFERED.ARW"), Data("buffered".utf8))
+            try writeFile(buffer.appendingPathComponent("DCIM/CONFLICT.ARW"), Data("short".utf8))
+
+            func record(_ url: URL) throws -> FileRecord {
+                let values = try url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
+                return FileRecord(
+                    path: "DCIM/\(url.lastPathComponent)",
+                    size: Int64(try XCTUnwrap(values.fileSize)),
+                    modifiedAt: try XCTUnwrap(values.contentModificationDate)
+                )
+            }
+            let files = try [
+                record(readyURL),
+                record(bufferedURL),
+                record(scheduledURL),
+                record(conflictURL),
+                FileRecord(path: "DCIM/MISSING.ARW", size: 100, modifiedAt: .distantPast),
+            ]
+
+            let result = EventCopyAvailabilityScanner.scan(
+                contextID: "test",
+                files: files,
+                sourceRoot: source,
+                bufferRoot: buffer,
+                scheduledPaths: ["DCIM/SCHEDULED.ARW"]
+            )
+
+            XCTAssertEqual(result.phase, .ready)
+            XCTAssertEqual(result.assignedCount, 5)
+            XCTAssertEqual(result.presentFiles.count, 4)
+            XCTAssertEqual(result.filesReadyToCopy.map(\.path), ["DCIM/READY.ARW"])
+            XCTAssertEqual(result.alreadyInBufferCount, 1)
+            XCTAssertEqual(result.missingFromSourceCount, 1)
+            XCTAssertEqual(result.scheduledCount, 1)
+            XCTAssertEqual(result.bufferConflictCount, 1)
+            XCTAssertFalse(result.sourceIsUnavailable)
+        }
+    }
+
+    func testEventCopyQueuesOnlyFilesStillPresentAndNotAlreadyInBuffer() async throws {
+        try await withTemporaryDirectoryAsync { root in
+            let source = root.appendingPathComponent("Card", isDirectory: true)
+            let buffer = root.appendingPathComponent("Buffer", isDirectory: true)
+            let readyBytes = Data("needs-copy".utf8)
+            let bufferedBytes = Data("already-buffered".utf8)
+            let readyURL = try writeFile(source.appendingPathComponent("DCIM/READY.ARW"), readyBytes)
+            let bufferedURL = try writeFile(source.appendingPathComponent("DCIM/BUFFERED.ARW"), bufferedBytes)
+            let model = DashboardModel(
+                activePlan: CopyPlan(),
+                jobs: [],
+                configuration: AppConfiguration(
+                    demoRootPath: root.appendingPathComponent("Safety Test").path,
+                    importSourcePath: source.path,
+                    archivePath: root.appendingPathComponent("Library/Originals").path,
+                    bufferPath: buffer.path,
+                    activityLogPath: root.appendingPathComponent("activity.jsonl").path,
+                    selectedDeviceID: "sony-a7v"
+                ),
+                configurationStore: ConfigurationStore(url: root.appendingPathComponent("config.json")),
+                transferQueueStore: TransferQueueStore(url: root.appendingPathComponent("transfer-queue.json")),
+                pendingTransferQueueStore: PendingTransferQueueStore(url: root.appendingPathComponent("pending-transfers.json"))
+            )
+
+            XCTAssertTrue(model.createEvent(named: "Availability Test", on: Date()))
+            try writeFile(
+                URL(fileURLWithPath: model.expandedBufferIngestPath).appendingPathComponent("DCIM/BUFFERED.ARW"),
+                bufferedBytes
+            )
+            let readyValues = try readyURL.resourceValues(forKeys: [.contentModificationDateKey])
+            let bufferedValues = try bufferedURL.resourceValues(forKeys: [.contentModificationDateKey])
+            model.assignFilesToSelectedEvent([
+                FileRecord(
+                    path: "DCIM/READY.ARW",
+                    size: Int64(readyBytes.count),
+                    modifiedAt: try XCTUnwrap(readyValues.contentModificationDate)
+                ),
+                FileRecord(
+                    path: "DCIM/BUFFERED.ARW",
+                    size: Int64(bufferedBytes.count),
+                    modifiedAt: try XCTUnwrap(bufferedValues.contentModificationDate)
+                ),
+                FileRecord(path: "DCIM/MISSING.ARW", size: 50, modifiedAt: .distantPast),
+            ])
+
+            await model.refreshSelectedEventCopyAvailability()
+            XCTAssertEqual(model.selectedEventFiles.count, 3)
+            XCTAssertEqual(model.selectedEventCopyAvailability.filesReadyToCopy.map(\.path), ["DCIM/READY.ARW"])
+            XCTAssertEqual(model.selectedEventCopyAvailability.alreadyInBufferCount, 1)
+            XCTAssertEqual(model.selectedEventCopyAvailability.missingFromSourceCount, 1)
+
+            model.isBusy = true
+            model.copySelectedEventFilesToBuffer()
+
+            XCTAssertEqual(model.pendingTransferBatches.count, 1)
+            XCTAssertEqual(model.pendingTransferBatches[0].files.map(\.path), ["DCIM/READY.ARW"])
         }
     }
 }

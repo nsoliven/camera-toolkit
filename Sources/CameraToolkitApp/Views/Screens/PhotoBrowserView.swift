@@ -181,6 +181,7 @@ struct PhotoBrowserView: View {
     @State private var previewPaneWidth: CGFloat = 390
     @State private var browserOperationLabel: String?
     @State private var storageCapacities: [String: StorageCapacitySnapshot] = [:]
+    @State private var copyAvailabilityRefreshRevision = 0
     @AppStorage("CameraToolkit.browserThumbnailHeight") private var thumbnailHeight = BrowserThumbnailSizing.defaultHeight
     @FocusState private var isFileTableFocused: Bool
 
@@ -252,6 +253,9 @@ struct PhotoBrowserView: View {
         }
         .task(id: currentURL.path) {
             await loadCurrentDirectory()
+        }
+        .task(id: selectedEventCopyAvailabilityTaskID) {
+            await model.refreshSelectedEventCopyAvailability()
         }
         .task(id: storageCapacityRefreshID) {
             while !Task.isCancelled {
@@ -541,6 +545,13 @@ struct PhotoBrowserView: View {
     private var storageCapacityRefreshID: String {
         let paths = capacityLocations.map { "\($0.id)=\($0.path)" }.joined(separator: "|")
         return "\(model.storageCapacityRevision)|\(paths)"
+    }
+
+    private var selectedEventCopyAvailabilityTaskID: String {
+        [
+            model.selectedEventCopyAvailabilityRefreshID,
+            String(copyAvailabilityRefreshRevision),
+        ].joined(separator: "|")
     }
 
     private var capacityLocations: [BrowserLocation] {
@@ -1337,9 +1348,65 @@ struct PhotoBrowserView: View {
                 bufferDestinationRow
             }
             Divider()
-            importActionRow
+            selectedEventImportState
         }
         .background(.bar)
+    }
+
+    @ViewBuilder
+    private var selectedEventImportState: some View {
+        if model.selectedEvent == nil {
+            importActionRow
+        } else if !selectedEventCopyAvailabilityIsCurrent
+                    || model.selectedEventCopyAvailability.phase == .checking
+                    || model.selectedEventCopyAvailability.phase == .idle {
+            copyAvailabilityCheckingRow
+        } else if model.selectedEventCopyAvailability.hasFilesReadyToCopy {
+            importActionRow
+        } else {
+            copyUnavailableOrCompleteRow
+        }
+    }
+
+    private var copyAvailabilityCheckingRow: some View {
+        HStack(spacing: 10) {
+            ProgressView()
+                .controlSize(.small)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Checking source and Buffer")
+                    .font(.headline)
+                Text("Finding which assigned files still exist and actually need copying…")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+    }
+
+    private var copyUnavailableOrCompleteRow: some View {
+        HStack(spacing: 10) {
+            Image(systemName: copyAvailabilityStatusSymbol)
+                .foregroundStyle(copyAvailabilityStatusColor)
+                .font(.title3)
+                .frame(width: 24)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(copyAvailabilityStatusTitle)
+                    .font(.headline)
+                Text(copyAvailabilityStatusDetail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+            Spacer()
+            Button("Refresh Status") {
+                copyAvailabilityRefreshRevision &+= 1
+            }
+            .help("Check the source and Buffer again without copying anything")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
     }
 
     private var eventControls: some View {
@@ -1438,6 +1505,7 @@ struct PhotoBrowserView: View {
             Button("Open Buffer") {
                 model.openEventFolder(model.expandedBufferIngestPath)
             }
+            .disabled(model.selectedEventCopyAvailability.bufferIsUnavailable)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 7)
@@ -1459,14 +1527,14 @@ struct PhotoBrowserView: View {
                 hasRequestedImportPreview = true
                 model.previewSelectedEventImport()
             }
-            .disabled(model.isBusy || model.selectedEventFiles.isEmpty)
+            .disabled(model.isBusy || model.selectedEventCopyAvailability.presentFiles.isEmpty)
             .help("Quickly compare assigned file paths and sizes; checksums run during Copy + Verify")
 
             Button(copyButtonTitle) {
                 model.copySelectedEventFilesToBuffer()
             }
             .buttonStyle(.borderedProminent)
-            .disabled(model.selectedEventFiles.isEmpty)
+            .disabled(!model.hasSelectedEventFilesReadyToCopy)
             .help(model.isBusy
                 ? "Add these assigned files to the transfer queue while the current job continues"
                 : "Copy only the files assigned to this event into the Buffer, then checksum-verify them")
@@ -1515,10 +1583,11 @@ struct PhotoBrowserView: View {
     }
 
     private var copyButtonTitle: String {
+        let count = model.selectedEventCopyAvailability.filesReadyToCopy.count
         if model.isBusy || model.isStorageBenchmarkRunning {
-            return "Queue \(model.selectedEventFiles.count) for Transfer"
+            return "Queue \(count) for Transfer"
         }
-        return "Copy \(model.selectedEventFiles.count) to Buffer + Verify"
+        return "Copy \(count) to Buffer + Verify"
     }
 
     @ViewBuilder
@@ -1846,7 +1915,24 @@ struct PhotoBrowserView: View {
             return "The selected rows are folders or unsupported file types"
         }
         if !model.selectedEventFiles.isEmpty {
-            return "\(model.selectedEventFiles.count) assigned · ready to copy to Buffer"
+            guard selectedEventCopyAvailabilityIsCurrent,
+                  model.selectedEventCopyAvailability.phase == .ready else {
+                return "\(model.selectedEventFiles.count) assigned · checking source and Buffer"
+            }
+            let availability = model.selectedEventCopyAvailability
+            if availability.sourceIsUnavailable {
+                return "\(availability.assignedCount) assigned · source drive unavailable"
+            }
+            if availability.bufferIsUnavailable {
+                return "\(availability.assignedCount) assigned · Buffer drive unavailable"
+            }
+            if availability.hasFilesReadyToCopy {
+                return "\(availability.filesReadyToCopy.count) ready to copy · \(availability.assignedCount) assigned"
+            }
+            if availability.alreadyInBufferCount > 0 {
+                return "\(availability.assignedCount) assigned · nothing new to copy"
+            }
+            return "\(availability.assignedCount) assigned · none currently available to copy"
         }
         return "Select files in the list above, then assign them"
     }
@@ -1858,10 +1944,107 @@ struct PhotoBrowserView: View {
         if model.selectedEventFiles.isEmpty {
             return "Nothing will move until files are assigned above"
         }
+        guard selectedEventCopyAvailabilityIsCurrent,
+              model.selectedEventCopyAvailability.phase == .ready else {
+            return "Checking assigned files without blocking the browser"
+        }
+        let availability = model.selectedEventCopyAvailability
+        if availability.hasFilesReadyToCopy {
+            var detail = "\(availability.filesReadyToCopy.count) present and not yet in Buffer"
+            if availability.alreadyInBufferCount > 0 {
+                detail += " · \(availability.alreadyInBufferCount) already there"
+            }
+            if availability.missingFromSourceCount > 0 {
+                detail += " · \(availability.missingFromSourceCount) missing"
+            }
+            return detail
+        }
         if model.isBufferVerifiedForArchive {
             return "Verified in Buffer · the camera files remain untouched"
         }
-        return "\(model.selectedEventFiles.count) assigned file(s) · camera stays untouched"
+        return "Nothing needs copying from this source"
+    }
+
+    private var selectedEventCopyAvailabilityIsCurrent: Bool {
+        model.selectedEventCopyAvailability.contextID == model.selectedEventCopyAvailabilityRefreshID
+    }
+
+    private var copyAvailabilityStatusTitle: String {
+        let availability = model.selectedEventCopyAvailability
+        if availability.sourceIsUnavailable { return "Source drive unavailable" }
+        if availability.bufferIsUnavailable { return "Buffer drive unavailable" }
+        if availability.assignedCount == 0 { return "Nothing assigned yet" }
+        if availability.bufferConflictCount > 0 || availability.changedOnSourceCount > 0 {
+            return "Assigned files need attention"
+        }
+        if availability.alreadyInBufferCount > 0 { return "Nothing new to copy" }
+        if availability.scheduledCount > 0 { return "Transfer already queued" }
+        if availability.missingFromSourceCount > 0 { return "No assigned files remain on this source" }
+        return "Nothing to copy"
+    }
+
+    private var copyAvailabilityStatusDetail: String {
+        let availability = model.selectedEventCopyAvailability
+        if availability.sourceIsUnavailable {
+            return "Reconnect \(selectedSourceName) to check its \(availability.assignedCount) assigned file(s)."
+        }
+        if availability.bufferIsUnavailable {
+            return "Reconnect the selected Buffer drive before copying these \(availability.assignedCount) assigned file(s)."
+        }
+        if availability.assignedCount == 0 {
+            return "Select files above and assign them to this event."
+        }
+
+        var parts: [String] = []
+        if availability.alreadyInBufferCount > 0 {
+            parts.append("\(availability.alreadyInBufferCount) already present in Buffer")
+        }
+        if availability.scheduledCount > 0 {
+            parts.append("\(availability.scheduledCount) transferring or queued")
+        }
+        if availability.missingFromSourceCount > 0 {
+            parts.append("\(availability.missingFromSourceCount) no longer on \(selectedSourceName)")
+        }
+        if availability.changedOnSourceCount > 0 {
+            parts.append("\(availability.changedOnSourceCount) changed since assignment")
+        }
+        if availability.bufferConflictCount > 0 {
+            parts.append("\(availability.bufferConflictCount) Buffer path conflict(s)")
+        }
+        let summary = parts.isEmpty ? "No assigned files currently need copying" : parts.joined(separator: " · ")
+        return "\(summary). Event assignments are kept as history."
+    }
+
+    private var copyAvailabilityStatusSymbol: String {
+        let availability = model.selectedEventCopyAvailability
+        if availability.sourceIsUnavailable { return "externaldrive.badge.questionmark" }
+        if availability.bufferIsUnavailable { return "externaldrive.badge.exclamationmark" }
+        if availability.bufferConflictCount > 0 || availability.changedOnSourceCount > 0 {
+            return "exclamationmark.triangle.fill"
+        }
+        if availability.alreadyInBufferCount > 0 { return "checkmark.circle.fill" }
+        if availability.scheduledCount > 0 { return "clock.badge.checkmark.fill" }
+        return "tray"
+    }
+
+    private var copyAvailabilityStatusColor: Color {
+        let availability = model.selectedEventCopyAvailability
+        if availability.bufferIsUnavailable
+            || availability.bufferConflictCount > 0
+            || availability.changedOnSourceCount > 0 {
+            return .orange
+        }
+        if availability.alreadyInBufferCount > 0 { return .green }
+        if availability.scheduledCount > 0 { return .blue }
+        return .secondary
+    }
+
+    private var selectedSourceName: String {
+        let name = URL(
+            fileURLWithPath: DashboardModel.expandedPath(model.configuration.importSourcePath),
+            isDirectory: true
+        ).lastPathComponent
+        return name.isEmpty ? "the selected source" : name
     }
 
     private var previewableURLs: [URL] {
@@ -2045,6 +2228,7 @@ struct PhotoBrowserView: View {
     private func reloadBrowserTree() {
         guard !isLoading else { return }
         resetBrowserTree()
+        copyAvailabilityRefreshRevision &+= 1
         Task { await loadCurrentDirectory() }
     }
 
