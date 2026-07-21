@@ -448,6 +448,94 @@ struct PhotoBrowserView: View {
                 .help(locationConnectionHelp(isMounted: isMounted, capacity: capacity))
         }
         .tag(location.id)
+        .contextMenu {
+            Button {
+                showDriveInformation(location)
+            } label: {
+                Label("Get Info", systemImage: "info.circle")
+            }
+
+            Divider()
+
+            Button {
+                openLocation(location)
+            } label: {
+                Label("Open", systemImage: "folder")
+            }
+            .disabled(!isMounted)
+
+            Button {
+                revealLocation(location)
+            } label: {
+                Label("Show in Finder", systemImage: "finder")
+            }
+            .disabled(!isMounted)
+
+            Button {
+                copyLocationPath(location)
+            } label: {
+                Label("Copy Path", systemImage: "doc.on.clipboard")
+            }
+
+            Divider()
+
+            Button {
+                StorageBenchmarkWindowController.shared.show(model: model)
+            } label: {
+                Label("Run Speed Test…", systemImage: "gauge.with.dots.needle.50percent")
+            }
+            .disabled(!isMounted || model.isBusy)
+        }
+    }
+
+    private func showDriveInformation(_ location: BrowserLocation) {
+        DriveInformationWindowController.shared.show(
+            request: DriveInformationRequest(
+                id: location.id,
+                name: location.name,
+                path: DashboardModel.expandedPath(location.path),
+                symbol: location.symbol,
+                role: locationRoleName(location)
+            ),
+            capacity: storageCapacities[location.id],
+            model: model
+        )
+    }
+
+    private func openLocation(_ location: BrowserLocation) {
+        NSWorkspace.shared.open(
+            URL(
+                fileURLWithPath: DashboardModel.expandedPath(location.path),
+                isDirectory: true
+            )
+        )
+    }
+
+    private func revealLocation(_ location: BrowserLocation) {
+        NSWorkspace.shared.activateFileViewerSelecting([
+            URL(
+                fileURLWithPath: DashboardModel.expandedPath(location.path),
+                isDirectory: true
+            )
+        ])
+    }
+
+    private func copyLocationPath(_ location: BrowserLocation) {
+        FileClipboardWriter.copyPaths([
+            URL(
+                fileURLWithPath: DashboardModel.expandedPath(location.path),
+                isDirectory: true
+            )
+        ])
+    }
+
+    private func locationRoleName(_ location: BrowserLocation) -> String {
+        switch location.kind {
+        case .source: "Camera Source"
+        case .workspace: "Buffer"
+        case .library: "Photo Library"
+        case .favorite: "Favorite"
+        }
     }
 
     private var storageCapacityRefreshID: String {
@@ -2132,6 +2220,12 @@ struct PhotoBrowserView: View {
             decreaseThumbnailSize()
         case .reload:
             reloadBrowserTree()
+        case .showSelectedLocationInformation:
+            guard let selectedLocationID,
+                  let location = locations.first(where: { $0.id == selectedLocationID }) else {
+                return
+            }
+            showDriveInformation(location)
         }
     }
 

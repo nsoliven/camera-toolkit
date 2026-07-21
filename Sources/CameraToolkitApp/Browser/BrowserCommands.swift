@@ -17,6 +17,7 @@ enum BrowserCommand: String, Sendable {
     case increaseThumbnailSize
     case decreaseThumbnailSize
     case reload
+    case showSelectedLocationInformation
 
     static let notification = Notification.Name("CameraToolkit.BrowserCommand")
 
@@ -145,6 +146,7 @@ enum CameraToolkitShortcutCatalog {
                 .init(action: "Open SQL Inspector", keys: "⇧⌘I", detail: "Browses the SQLite photo list, schema, and read-only SQL queries."),
                 .init(action: "New folder", keys: "⇧⌘N", detail: "Creates a folder in the location currently being browsed."),
                 .init(action: "Reveal in Finder", keys: "⇧⌘R", detail: "Shows the selected files in Finder."),
+                .init(action: "Get drive information", keys: "⌘I / Right-click", detail: "Shows live capacity, model, connection, filesystem, and available SMART health for the selected sidebar location."),
             ]
         ),
         KeyboardShortcutSection(
