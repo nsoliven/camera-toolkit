@@ -49,6 +49,26 @@ final class BrowserCommandsTests: XCTestCase {
         )
     }
 
+    func testBrowserTreeMutationRemovesOnlyChangedSubtree() {
+        let expanded: Set<String> = [
+            "/Volumes/LEXAR/DCIM",
+            "/Volumes/LEXAR/DCIM/EMPTY",
+            "/Volumes/LEXAR/DCIM/EMPTY/NESTED",
+            "/Volumes/LEXAR/Exported",
+        ]
+
+        XCTAssertEqual(
+            BrowserTreeMutationState.removingSubtrees(
+                from: expanded,
+                rootedAt: ["/Volumes/LEXAR/DCIM/EMPTY"]
+            ),
+            [
+                "/Volumes/LEXAR/DCIM",
+                "/Volumes/LEXAR/Exported",
+            ]
+        )
+    }
+
     func testThumbnailSizingUsesDisplayScaleForDecodeBudget() {
         XCTAssertEqual(BrowserThumbnailSizing.width(for: 60), 80)
         XCTAssertEqual(BrowserThumbnailSizing.maximumPixelSize(for: 32), 128)
