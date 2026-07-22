@@ -1,6 +1,35 @@
 import CameraToolkitCore
 import SwiftUI
 
+extension ConfiguredLocationRole {
+    var settingsCurrentLabel: String {
+        switch self {
+        case .importSource: "Import Default"
+        case .archive: "Originals Destination"
+        case .buffer: "Buffer Destination"
+        }
+    }
+
+    var settingsSelectionButtonTitle: String {
+        switch self {
+        case .importSource: "Set as Default"
+        case .archive: "Use for Originals"
+        case .buffer: "Use as Buffer"
+        }
+    }
+
+    var settingsSelectionExplanation: String {
+        switch self {
+        case .importSource:
+            "Import Default is the camera or card Camera Toolkit starts with. You can still browse any connected source from the sidebar."
+        case .archive:
+            "Originals Destination receives the permanent, checksum-verified archive after files are copied to the buffer."
+        case .buffer:
+            "Buffer Destination receives the first temporary, checksum-verified copy from a camera or card."
+        }
+    }
+}
+
 struct ConfigView: View {
     @Bindable var model: DashboardModel
 
@@ -103,6 +132,63 @@ struct ConfigView: View {
                 }
             }
 
+            Section("TrueNAS Capacity") {
+                TextField(
+                    "Server URL",
+                    text: Binding(
+                        get: { model.configuration.trueNASServerURL },
+                        set: { model.setTrueNASServerURL($0) }
+                    ),
+                    prompt: Text("https://nas.example.com")
+                )
+                TextField(
+                    "API username",
+                    text: Binding(
+                        get: { model.configuration.trueNASUsername },
+                        set: { model.setTrueNASUsername($0) }
+                    )
+                )
+                TextField(
+                    "Dataset",
+                    text: Binding(
+                        get: { model.configuration.trueNASDataset },
+                        set: { model.setTrueNASDataset($0) }
+                    ),
+                    prompt: Text("Optional — detect from mounted SMB share")
+                )
+                Text("Leave Dataset blank to match the mounted Library root to its TrueNAS SMB share automatically.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                SecureField("API key", text: $model.trueNASAPIKeyDraft)
+
+                LabeledContent("TLS certificate") {
+                    Text(model.configuration.trueNASTLSPinnedCertificateSHA256.isEmpty ? "System trust only" : "Pinned to this NAS")
+                        .foregroundStyle(
+                            model.configuration.trueNASTLSPinnedCertificateSHA256.isEmpty
+                                ? Color.secondary
+                                : Color.green
+                        )
+                }
+                Text(model.trueNASConnectionStatus)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                HStack {
+                    Button(model.trueNASIsInspectingCertificate ? "Reading…" : "Trust Current Certificate") {
+                        model.trustCurrentTrueNASCertificate()
+                    }
+                    .disabled(model.trueNASIsInspectingCertificate || model.trueNASIsTestingConnection)
+                    Button("Save Key") { model.saveTrueNASAPIKey() }
+                    Button(model.trueNASIsTestingConnection ? "Testing…" : "Test NAS") {
+                        model.testTrueNASConnection()
+                    }
+                    .disabled(model.trueNASIsTestingConnection || model.trueNASIsInspectingCertificate)
+                }
+                Text("The mounted SMB folder provides files. This read-only TrueNAS connection provides exact ZFS dataset and pool capacity. The API key stays in macOS Keychain; only the server, dataset, username, and pinned certificate fingerprint are saved locally.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             Section("Local App Data") {
                 PathSettingRow(
                     title: "Test data",
@@ -159,7 +245,7 @@ private struct LocationSettingsSection: View {
     }
 
     var body: some View {
-        Section(title) {
+        Section {
             ForEach(locations) { location in
                 LocationSettingRow(
                     location: location,
@@ -169,6 +255,10 @@ private struct LocationSettingsSection: View {
                 )
             }
             Button(addTitle) { model.addConfiguredLocation(role: role) }
+        } header: {
+            Text(title)
+        } footer: {
+            Text(role.settingsSelectionExplanation)
         }
     }
 }
@@ -194,10 +284,14 @@ private struct LocationSettingRow: View {
                     )
                 )
                 if isSelected {
-                    Label("Selected", systemImage: "checkmark.circle.fill")
+                    Label(currentLocation.role.settingsCurrentLabel, systemImage: "checkmark.circle.fill")
                         .foregroundStyle(.green)
+                        .help(currentLocation.role.settingsSelectionExplanation)
                 } else {
-                    Button("Use") { model.useConfiguredLocation(currentLocation) }
+                    Button(currentLocation.role.settingsSelectionButtonTitle) {
+                        model.useConfiguredLocation(currentLocation)
+                    }
+                    .help(currentLocation.role.settingsSelectionExplanation)
                 }
                 Button("Choose…") { model.chooseConfiguredLocationFolder(currentLocation) }
                 Button(role: .destructive) {

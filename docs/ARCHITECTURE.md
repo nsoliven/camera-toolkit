@@ -3,7 +3,7 @@
 Camera Toolkit is a Swift Package with two targets:
 
 - `CameraToolkitApp` owns the AppKit lifecycle, SwiftUI views, keyboard commands, preview cache, Keychain access, and window controllers.
-- `CameraToolkitCore` owns configuration, scanning, transfer planning, immutable copy behavior, archive organization, manifests, SQLite catalog access, and Immich reads.
+- `CameraToolkitCore` owns configuration, scanning, transfer planning, immutable copy behavior, archive organization, manifests, SQLite catalog access, Immich reads, and read-only TrueNAS capacity queries.
 
 ## Source layout
 
@@ -51,9 +51,9 @@ photo library originals
 
 ## Catalog and configuration
 
-`AppConfiguration` is JSON-encoded local state. It stores selected locations, events, file assignments, and Immich policy—not API keys. `CatalogStore` mirrors those relationships into SQLite for fast cross-drive event browsing. Catalog writes are serialized through GRDB, and the in-app inspector accepts bounded read-only queries only.
+`AppConfiguration` is JSON-encoded local state. It stores selected locations, events, file assignments, integration endpoints, and policy—not API keys. `CatalogStore` mirrors those relationships into SQLite for fast cross-drive event browsing. Catalog writes are serialized through GRDB, and the in-app inspector accepts bounded read-only queries only.
 
-The Immich API key is stored separately by `KeychainSecretStore`. `ImmichClient` currently performs connection and checksum-presence reads; it has no upload method.
+Integration API keys are stored separately by `KeychainSecretStore`. `ImmichClient` currently performs connection and checksum-presence reads; it has no upload method. `TrueNASClient` uses the secure JSON-RPC WebSocket API, optionally pins a self-signed TLS certificate, resolves a mounted SMB share to its deepest matching dataset, and reads dataset/pool capacity without changing NAS state.
 
 ## Responsiveness and memory
 

@@ -2,15 +2,59 @@ import AppKit
 import CameraToolkitCore
 import QuickLookUI
 import SwiftUI
+import UniformTypeIdentifiers
 
 private struct BrowserItem: Identifiable, Hashable, Sendable {
     var id: String { url.path }
     var url: URL
     var name: String
     var isDirectory: Bool
+    var isSymbolicLink: Bool
     var size: Int64
     var modifiedAt: Date
     var kind: String
+    var depth: Int
+
+    var canExpand: Bool {
+        isDirectory && !isSymbolicLink
+    }
+}
+
+private enum BrowserDirectoryReader {
+    static func load(_ url: URL, depth: Int) throws -> [BrowserItem] {
+        let keys: Set<URLResourceKey> = [
+            .isDirectoryKey,
+            .isRegularFileKey,
+            .isSymbolicLinkKey,
+            .fileSizeKey,
+            .contentModificationDateKey,
+            .localizedTypeDescriptionKey,
+            .isHiddenKey,
+        ]
+        let urls = try FileManager.default.contentsOfDirectory(
+            at: url,
+            includingPropertiesForKeys: Array(keys),
+            options: [.skipsHiddenFiles]
+        )
+        return try urls.compactMap { child -> BrowserItem? in
+            let values = try child.resourceValues(forKeys: keys)
+            guard values.isDirectory == true || values.isRegularFile == true else { return nil }
+            return BrowserItem(
+                url: child,
+                name: child.lastPathComponent,
+                isDirectory: values.isDirectory == true,
+                isSymbolicLink: values.isSymbolicLink == true,
+                size: Int64(values.fileSize ?? 0),
+                modifiedAt: values.contentModificationDate ?? .distantPast,
+                kind: values.isDirectory == true ? "Folder" : (values.localizedTypeDescription ?? child.pathExtension.uppercased()),
+                depth: depth
+            )
+        }
+        .sorted {
+            if $0.isDirectory != $1.isDirectory { return $0.isDirectory }
+            return $0.name.localizedStandardCompare($1.name) == .orderedAscending
+        }
+    }
 }
 
 private struct BrowserFileIdentity: Hashable {
@@ -117,6 +161,10 @@ struct PhotoBrowserView: View {
     @State private var columnVisibility: NavigationSplitViewVisibility
     @State private var currentURL: URL
     @State private var items: [BrowserItem] = []
+    @State private var expandedFolderIDs: Set<String> = []
+    @State private var childrenByFolderID: [String: [BrowserItem]] = [:]
+    @State private var loadingFolderIDs: Set<String> = []
+    @State private var folderExpansionErrors: [String: String] = [:]
     @State private var selectedItemIDs: Set<String> = []
     @State private var selectedLocationID: String?
     @State private var backHistory: [URL] = []
@@ -132,6 +180,8 @@ struct PhotoBrowserView: View {
     @State private var isShowingCollectedFiles = false
     @State private var previewPaneWidth: CGFloat = 390
     @State private var browserOperationLabel: String?
+    @State private var storageCapacities: [String: StorageCapacitySnapshot] = [:]
+    @State private var copyAvailabilityRefreshRevision = 0
     @AppStorage("CameraToolkit.browserThumbnailHeight") private var thumbnailHeight = BrowserThumbnailSizing.defaultHeight
     @FocusState private var isFileTableFocused: Bool
 
@@ -146,7 +196,7 @@ struct PhotoBrowserView: View {
     var body: some View {
         NavigationSplitView(columnVisibility: $columnVisibility) {
             sidebar
-                .navigationSplitViewColumnWidth(min: 185, ideal: 215, max: 270)
+                .navigationSplitViewColumnWidth(min: 220, ideal: 250, max: 320)
         } detail: {
             VStack(spacing: 0) {
                 browserToolbar
@@ -204,6 +254,15 @@ struct PhotoBrowserView: View {
         .task(id: currentURL.path) {
             await loadCurrentDirectory()
         }
+        .task(id: selectedEventCopyAvailabilityTaskID) {
+            await model.refreshSelectedEventCopyAvailability()
+        }
+        .task(id: storageCapacityRefreshID) {
+            while !Task.isCancelled {
+                await refreshStorageCapacities()
+                try? await Task.sleep(for: .seconds(10))
+            }
+        }
         .onChange(of: selectedLocationID) { _, newValue in
             guard let location = locations.first(where: { $0.id == newValue }) else { return }
             hasRequestedImportPreview = false
@@ -212,11 +271,6 @@ struct PhotoBrowserView: View {
                 model.useConfiguredLocation(configured)
             }
             navigate(to: URL(fileURLWithPath: DashboardModel.expandedPath(location.path), isDirectory: true))
-        }
-        .onChange(of: model.isBusy) { wasBusy, isBusy in
-            if wasBusy && !isBusy {
-                Task { await loadCurrentDirectory() }
-            }
         }
         .onChange(of: model.isRefreshing) { wasRefreshing, isRefreshing in
             if wasRefreshing && !isRefreshing {
@@ -284,6 +338,61 @@ struct PhotoBrowserView: View {
                         locationRow(location)
                     }
                 }
+
+                Section("Activity") {
+                    sidebarActionButton(
+                        title: "Transfers",
+                        detail: transferSidebarDetail,
+                        symbol: transferSidebarSymbol,
+                        color: transferSidebarColor,
+                        badge: transferSidebarBadge,
+                        help: "Open the separate Transfer Queue window and see copy or checksum progress"
+                    ) {
+                        TransferQueueWindowController.shared.show(model: model)
+                    }
+                }
+
+                Section("Tools") {
+                    sidebarActionButton(
+                        title: "Speed Tests",
+                        detail: model.isStorageBenchmarkRunning ? "Measuring connected storage" : "Find the slowest drive or USB link",
+                        symbol: "gauge.with.dots.needle.50percent",
+                        color: model.isStorageBenchmarkRunning ? .blue : .secondary,
+                        help: "Measure camera read speed and Buffer or library read/write speed in a separate window"
+                    ) {
+                        StorageBenchmarkWindowController.shared.show(model: model)
+                    }
+
+                    sidebarActionButton(
+                        title: "Events",
+                        detail: "Browse \(model.savedEvents.count) saved event\(model.savedEvents.count == 1 ? "" : "s")",
+                        symbol: "calendar.badge.clock",
+                        color: .blue,
+                        help: "Open the Event Library in a separate window"
+                    ) {
+                        EventLibraryWindowController.shared.show(model: model)
+                    }
+
+                    sidebarActionButton(
+                        title: "Photo Database",
+                        detail: "Files, locations, and read-only SQL",
+                        symbol: "cylinder.split.1x2",
+                        color: .secondary,
+                        help: "Open the photo database and read-only SQL inspector in a separate window"
+                    ) {
+                        CatalogInspectorWindowController.shared.show(model: model)
+                    }
+
+                    sidebarActionButton(
+                        title: "Keyboard Shortcuts",
+                        detail: "See every app shortcut",
+                        symbol: "keyboard",
+                        color: .secondary,
+                        help: "Open the keyboard shortcut reference in a separate window"
+                    ) {
+                        KeyboardShortcutsWindowController.shared.show()
+                    }
+                }
             }
             .listStyle(.sidebar)
 
@@ -313,19 +422,314 @@ struct PhotoBrowserView: View {
 
     @ViewBuilder
     private func locationRow(_ location: BrowserLocation) -> some View {
+        let isMounted = folderExists(location.path)
+        let capacity = storageCapacities[location.id]
         HStack(spacing: 8) {
             Image(systemName: location.symbol)
                 .foregroundStyle(locationColor(location))
                 .frame(width: 18)
-            Text(location.name)
-                .lineLimit(1)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(location.name)
+                    .lineLimit(1)
+                if let capacity {
+                    HStack(spacing: 6) {
+                        ProgressView(value: capacity.usedFraction)
+                            .progressViewStyle(.linear)
+                            .tint(storageCapacityColor(capacity))
+                            .frame(width: 54)
+                        Text(storageCapacityLabel(capacity))
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                    .help(storageCapacityHelp(capacity))
+                }
+            }
             Spacer(minLength: 4)
             Circle()
-                .fill(folderExists(location.path) ? Color.green : Color.secondary.opacity(0.35))
+                .fill(locationConnectionColor(isMounted: isMounted, capacity: capacity))
                 .frame(width: 7, height: 7)
-                .help(folderExists(location.path) ? "Connected" : "Not mounted")
+                .help(locationConnectionHelp(isMounted: isMounted, capacity: capacity))
         }
         .tag(location.id)
+        .contextMenu {
+            Button {
+                showDriveInformation(location)
+            } label: {
+                Label("Get Info", systemImage: "info.circle")
+            }
+
+            Divider()
+
+            Button {
+                openLocation(location)
+            } label: {
+                Label("Open", systemImage: "folder")
+            }
+            .disabled(!isMounted)
+
+            Button {
+                revealLocation(location)
+            } label: {
+                Label("Show in Finder", systemImage: "finder")
+            }
+            .disabled(!isMounted)
+
+            Button {
+                copyLocationPath(location)
+            } label: {
+                Label("Copy Path", systemImage: "doc.on.clipboard")
+            }
+
+            Divider()
+
+            Button {
+                StorageBenchmarkWindowController.shared.show(model: model)
+            } label: {
+                Label("Run Speed Test…", systemImage: "gauge.with.dots.needle.50percent")
+            }
+            .disabled(!isMounted || model.isBusy)
+        }
+    }
+
+    private func showDriveInformation(_ location: BrowserLocation) {
+        DriveInformationWindowController.shared.show(
+            request: DriveInformationRequest(
+                id: location.id,
+                name: location.name,
+                path: DashboardModel.expandedPath(location.path),
+                symbol: location.symbol,
+                role: locationRoleName(location)
+            ),
+            capacity: storageCapacities[location.id],
+            model: model
+        )
+    }
+
+    private func openLocation(_ location: BrowserLocation) {
+        NSWorkspace.shared.open(
+            URL(
+                fileURLWithPath: DashboardModel.expandedPath(location.path),
+                isDirectory: true
+            )
+        )
+    }
+
+    private func revealLocation(_ location: BrowserLocation) {
+        NSWorkspace.shared.activateFileViewerSelecting([
+            URL(
+                fileURLWithPath: DashboardModel.expandedPath(location.path),
+                isDirectory: true
+            )
+        ])
+    }
+
+    private func copyLocationPath(_ location: BrowserLocation) {
+        FileClipboardWriter.copyPaths([
+            URL(
+                fileURLWithPath: DashboardModel.expandedPath(location.path),
+                isDirectory: true
+            )
+        ])
+    }
+
+    private func locationRoleName(_ location: BrowserLocation) -> String {
+        switch location.kind {
+        case .source: "Camera Source"
+        case .workspace: "Buffer"
+        case .library: "Photo Library"
+        case .favorite: "Favorite"
+        }
+    }
+
+    private var storageCapacityRefreshID: String {
+        let paths = capacityLocations.map { "\($0.id)=\($0.path)" }.joined(separator: "|")
+        return "\(model.storageCapacityRevision)|\(paths)"
+    }
+
+    private var selectedEventCopyAvailabilityTaskID: String {
+        [
+            model.selectedEventCopyAvailabilityRefreshID,
+            String(copyAvailabilityRefreshRevision),
+        ].joined(separator: "|")
+    }
+
+    private var capacityLocations: [BrowserLocation] {
+        (sourceLocations + workspaceLocations + libraryLocations).filter {
+            !$0.path.lowercased().contains("/cameratoolkit/simulation/")
+        }
+    }
+
+    @MainActor
+    private func refreshStorageCapacities() async {
+        let targets = capacityLocations.map { ($0.id, $0.path) }
+        let targetIDs = Set(targets.map(\.0))
+        storageCapacities = storageCapacities.filter { targetIDs.contains($0.key) }
+
+        await withTaskGroup(of: (String, StorageCapacitySnapshot?).self) { group in
+            for (id, path) in targets {
+                group.addTask(priority: .utility) {
+                    (id, StorageCapacityReader.read(path: path))
+                }
+            }
+            for await (id, capacity) in group {
+                guard !Task.isCancelled else { return }
+                if let capacity {
+                    storageCapacities[id] = capacity
+                } else {
+                    storageCapacities[id] = nil
+                }
+            }
+        }
+
+        if let authoritative = await model.readAuthoritativeTrueNASCapacity() {
+            let configuredNASVolume = StorageCapacityReader.mountedVolumeName(
+                for: model.configuration.cameraLibraryRootPath
+            )
+            for location in libraryLocations where
+                configuredNASVolume != nil
+                && StorageCapacityReader.mountedVolumeName(for: location.path) == configuredNASVolume {
+                storageCapacities[location.id] = authoritative
+            }
+        }
+    }
+
+    private func storageCapacityColor(_ capacity: StorageCapacitySnapshot) -> Color {
+        if case .networkShareEstimate = capacity.source { return .orange }
+        if case .trueNAS(_, _, _, _, false) = capacity.source { return .red }
+        if capacity.availableFraction < 0.10 { return .red }
+        if capacity.availableFraction < 0.20 { return .orange }
+        return .blue
+    }
+
+    private func storageCapacityHelp(_ capacity: StorageCapacitySnapshot) -> String {
+        let usedPercent = capacity.usedFraction.formatted(.percent.precision(.fractionLength(0)))
+        let basic = "\(capacity.availableBytes.formattedWholeStorage) available out of \(capacity.totalBytes.formattedWholeStorage) · \(usedPercent) used"
+        switch capacity.source {
+        case .localVolume:
+            return basic
+        case .networkShareEstimate:
+            return "\(basic) · SMB estimate only; TrueNAS dataset usage has not been verified"
+        case .trueNAS(let dataset, let pool, let poolAvailable, let poolTotal, let poolHealthy):
+            let health = poolHealthy ? "healthy" : "needs attention"
+            return "\(basic) for TrueNAS dataset \(dataset) · pool \(pool): \(poolAvailable.formattedWholeStorage) free of \(poolTotal.formattedWholeStorage), \(health)"
+        }
+    }
+
+    private func storageCapacityLabel(_ capacity: StorageCapacitySnapshot) -> String {
+        switch capacity.source {
+        case .localVolume:
+            "\(capacity.availableBytes.formattedWholeStorage) free"
+        case .networkShareEstimate:
+            "\(capacity.availableBytes.formattedWholeStorage) · SMB estimate"
+        case .trueNAS(_, _, _, let poolTotal, _):
+            "\(capacity.availableBytes.formattedWholeStorage) free · \(poolTotal.formattedWholeStorage) pool"
+        }
+    }
+
+    private func locationConnectionColor(
+        isMounted: Bool,
+        capacity: StorageCapacitySnapshot?
+    ) -> Color {
+        guard isMounted else { return Color.secondary.opacity(0.35) }
+        guard let capacity else { return .green }
+        switch capacity.source {
+        case .networkShareEstimate:
+            return .orange
+        case .trueNAS(_, _, _, _, let poolHealthy):
+            return poolHealthy ? .green : .red
+        case .localVolume:
+            return .green
+        }
+    }
+
+    private func locationConnectionHelp(
+        isMounted: Bool,
+        capacity: StorageCapacitySnapshot?
+    ) -> String {
+        guard isMounted else { return "Not mounted" }
+        guard let capacity else { return "Connected" }
+        switch capacity.source {
+        case .networkShareEstimate:
+            return "SMB mounted, but authoritative NAS capacity is not connected"
+        case .trueNAS(_, _, _, _, let poolHealthy):
+            return poolHealthy ? "Mounted and verified with TrueNAS" : "Mounted, but TrueNAS reports a pool problem"
+        case .localVolume:
+            return "Connected"
+        }
+    }
+
+    private func sidebarActionButton(
+        title: String,
+        detail: String,
+        symbol: String,
+        color: Color,
+        badge: String? = nil,
+        help: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            HStack(spacing: 9) {
+                Image(systemName: symbol)
+                    .foregroundStyle(color)
+                    .frame(width: 18)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(title)
+                        .foregroundStyle(.primary)
+                    Text(detail)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 4)
+                if let badge {
+                    Text(badge)
+                        .font(.caption2.weight(.semibold).monospacedDigit())
+                        .foregroundStyle(color)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(color.opacity(0.12), in: Capsule())
+                }
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(help)
+        .accessibilityLabel("\(title), \(detail)")
+    }
+
+    private var transferSidebarDetail: String {
+        if model.pendingTransferFileCount > 0 {
+            if let active = model.transferQueue, active.state == .running {
+                return "\(active.sidebarSummary.detail) · \(model.pendingTransferFileCount) next"
+            }
+            return "\(model.pendingTransferFileCount) file\(model.pendingTransferFileCount == 1 ? "" : "s") waiting"
+        }
+        return model.transferQueue?.sidebarSummary.detail ?? "Nothing running"
+    }
+
+    private var transferSidebarBadge: String? {
+        model.transferQueue?.sidebarSummary.badge ?? (model.pendingTransferFileCount > 0 ? "\(model.pendingTransferFileCount)" : nil)
+    }
+
+    private var transferSidebarSymbol: String {
+        switch model.transferQueue?.state {
+        case .running: "arrow.down.circle.fill"
+        case .completed: "checkmark.circle.fill"
+        case .failed: "exclamationmark.circle.fill"
+        case .cancelled: "xmark.circle.fill"
+        case nil: model.pendingTransferFileCount > 0 ? "clock.arrow.circlepath" : "arrow.down.circle"
+        }
+    }
+
+    private var transferSidebarColor: Color {
+        switch model.transferQueue?.state {
+        case .running: .blue
+        case .completed: .green
+        case .failed: .red
+        case .cancelled: .secondary
+        case nil: model.pendingTransferFileCount > 0 ? .blue : .secondary
+        }
     }
 
     private var browserToolbar: some View {
@@ -406,22 +810,6 @@ struct PhotoBrowserView: View {
                 }
             }
 
-            Button {
-                EventLibraryWindowController.shared.show(model: model)
-            } label: {
-                Image(systemName: "calendar.badge.clock")
-            }
-            .accessibilityLabel("Open Event Library")
-            .help("Browse every event across its source, buffer, library, and Immich locations (Option-Command-E)")
-
-            Button {
-                CatalogInspectorWindowController.shared.show(model: model)
-            } label: {
-                Image(systemName: "cylinder.split.1x2")
-            }
-            .accessibilityLabel("Open Photo List SQL Inspector")
-            .help("Browse SQLite tables, schema, and read-only SQL (Shift-Command-I)")
-
             Divider().frame(height: 18)
 
             if !isCurrentImportSource {
@@ -434,14 +822,14 @@ struct PhotoBrowserView: View {
             Button {
                 createFolder()
             } label: {
-                Image(systemName: "folder.badge.plus")
+                Label("New Folder", systemImage: "folder.badge.plus")
             }
             .help("New Folder")
 
             Button {
                 previewSelection()
             } label: {
-                Image(systemName: "eye")
+                Label("Preview", systemImage: "eye")
             }
             .disabled(selectedURLs.isEmpty)
             .help("Preview in Camera Toolkit (Space)")
@@ -449,13 +837,13 @@ struct PhotoBrowserView: View {
             Button {
                 revealSelection()
             } label: {
-                Image(systemName: "arrow.right.circle")
+                Label("Show in Finder", systemImage: "arrow.right.circle")
             }
             .disabled(selectedURLs.isEmpty)
             .help("Reveal in Finder")
 
             Button {
-                Task { await loadCurrentDirectory() }
+                reloadBrowserTree()
             } label: {
                 Image(systemName: "arrow.clockwise")
             }
@@ -489,7 +877,7 @@ struct PhotoBrowserView: View {
             } label: {
                 HStack(spacing: 4) {
                     Image(systemName: "photo.on.rectangle")
-                    Text("\(Int(thumbnailHeight))")
+                    Text("Thumbnails \(Int(thumbnailHeight))")
                         .font(.caption.monospacedDigit())
                 }
             }
@@ -498,13 +886,6 @@ struct PhotoBrowserView: View {
             .accessibilityLabel("Thumbnail Size, \(Int(thumbnailHeight)) Points")
             .help("Thumbnail size: \(Int(thumbnailHeight)) pt (Command-Plus / Command-Minus)")
 
-            Button {
-                KeyboardShortcutsWindowController.shared.show()
-            } label: {
-                Image(systemName: "keyboard")
-            }
-            .accessibilityLabel("Keyboard Shortcuts")
-            .help("Keyboard Shortcuts (Shift-Command-K)")
         }
         .buttonStyle(.borderless)
         .padding(.horizontal, 12)
@@ -537,9 +918,10 @@ struct PhotoBrowserView: View {
                 )
                 .contextMenu { browserBackgroundContextMenu }
             } else {
-                Table(items, selection: $selectedItemIDs) {
+                Table(visibleBrowserItems, selection: $selectedItemIDs) {
                     TableColumn("Name") { item in
                         HStack(spacing: 7) {
+                            folderDisclosure(for: item)
                             if isCollectingEventFiles,
                                eventSelection(for: item) != nil {
                                 Button {
@@ -637,7 +1019,7 @@ struct PhotoBrowserView: View {
                 } primaryAction: { selection in
                     guard selection.count == 1,
                           let id = selection.first,
-                          let item = items.first(where: { $0.id == id }) else {
+                          let item = visibleBrowserItems.first(where: { $0.id == id }) else {
                         return
                     }
                     open(item)
@@ -664,6 +1046,14 @@ struct PhotoBrowserView: View {
                     selectAdjacentItem(offset: 1)
                     return .handled
                 }
+                .onKeyPress(.leftArrow) {
+                    guard isFileTableFocused else { return .ignored }
+                    return collapseSelectionOrSelectParent()
+                }
+                .onKeyPress(.rightArrow) {
+                    guard isFileTableFocused else { return .ignored }
+                    return expandSelectionOrSelectFirstChild()
+                }
                 .onKeyPress(.return) {
                     guard isFileTableFocused else { return .ignored }
                     openSelection()
@@ -689,6 +1079,39 @@ struct PhotoBrowserView: View {
     }
 
     @ViewBuilder
+    private func folderDisclosure(for item: BrowserItem) -> some View {
+        Color.clear
+            .frame(width: CGFloat(item.depth) * 14, height: 1)
+
+        if item.canExpand {
+            if loadingFolderIDs.contains(item.id) {
+                ProgressView()
+                    .controlSize(.mini)
+                    .frame(width: 13, height: 16)
+                    .accessibilityLabel("Loading \(item.name)")
+            } else {
+                Button {
+                    toggleFolderExpansion(item)
+                } label: {
+                    Image(systemName: folderExpansionErrors[item.id] == nil
+                        ? (expandedFolderIDs.contains(item.id) ? "chevron.down" : "chevron.right")
+                        : "exclamationmark.triangle.fill")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(folderExpansionErrors[item.id] == nil ? Color.secondary : Color.orange)
+                        .frame(width: 13, height: 16)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(disclosureAccessibilityLabel(for: item))
+                .help(disclosureHelp(for: item))
+            }
+        } else {
+            Color.clear
+                .frame(width: 13, height: 16)
+        }
+    }
+
+    @ViewBuilder
     private var browserBackgroundContextMenu: some View {
         Button {
             createFolder()
@@ -700,7 +1123,7 @@ struct PhotoBrowserView: View {
         Divider()
 
         Button {
-            selectedItemIDs = Set(items.map(\.id))
+            selectedItemIDs = Set(visibleBrowserItems.map(\.id))
         } label: {
             Label("Select All", systemImage: "checkmark.circle")
         }
@@ -715,7 +1138,7 @@ struct PhotoBrowserView: View {
         Divider()
 
         Button {
-            Task { await loadCurrentDirectory() }
+            reloadBrowserTree()
         } label: {
             Label("Reload", systemImage: "arrow.clockwise")
         }
@@ -724,7 +1147,9 @@ struct PhotoBrowserView: View {
 
     @ViewBuilder
     private func browserContextMenu(for selection: Set<String>) -> some View {
-        let selectedItems = items.filter { selection.contains($0.id) }
+        let selectedItems = visibleBrowserItems.filter { selection.contains($0.id) }
+        let contextURLs = selectedItems.map(\.url)
+        let selectedPreviewURLs = contextURLs.filter(CameraPreviewSupport.canDecode)
 
         if selectedItems.isEmpty {
             browserBackgroundContextMenu
@@ -750,8 +1175,38 @@ struct PhotoBrowserView: View {
                     }
                 }
 
-                Divider()
+                if !item.isDirectory {
+                    openWithMenu(for: contextURLs, supportsPhotomator: !selectedPreviewURLs.isEmpty)
+                }
+            } else {
+                Button {
+                    openWithDefaultApplications(contextURLs)
+                } label: {
+                    Label("Open \(selectedItems.count) Items", systemImage: "arrow.up.forward.app")
+                }
 
+                if !selectedPreviewURLs.isEmpty {
+                    Button {
+                        CameraPreviewController.shared.preview(
+                            selectedPreviewURLs,
+                            startingAt: selectedPreviewURLs.first
+                        )
+                    } label: {
+                        Label("Preview \(selectedPreviewURLs.count) Photo\(selectedPreviewURLs.count == 1 ? "" : "s")", systemImage: "eye")
+                    }
+                }
+
+                if selectedItems.allSatisfy({ !$0.isDirectory }) {
+                    openWithMenu(
+                        for: contextURLs,
+                        supportsPhotomator: selectedPreviewURLs.count == contextURLs.count
+                    )
+                }
+            }
+
+            Divider()
+
+            if selectedItems.count == 1, let item = selectedItems.first {
                 Button {
                     rename(item)
                 } label: {
@@ -760,11 +1215,40 @@ struct PhotoBrowserView: View {
                 .disabled(browserOperationLabel != nil)
             }
 
+            Button(role: .destructive) {
+                confirmMoveToTrash(selectedItems)
+            } label: {
+                Label(
+                    selectedItems.count == 1 ? "Move to Trash…" : "Move \(selectedItems.count) Items to Trash…",
+                    systemImage: "trash"
+                )
+            }
+            .disabled(browserOperationLabel != nil)
+
             Button {
-                FileClipboardWriter.copy(selectedItems.map(\.url))
+                FileClipboardWriter.copy(contextURLs)
             } label: {
                 Label(copyMenuTitle(for: selectedItems.count), systemImage: "doc.on.doc")
             }
+
+            Button {
+                FileClipboardWriter.copyPaths(contextURLs)
+            } label: {
+                Label(copyPathMenuTitle(for: selectedItems.count), systemImage: "doc.on.clipboard")
+            }
+
+            ShareLink(items: contextURLs) {
+                Label(selectedItems.count == 1 ? "Share…" : "Share \(selectedItems.count) Items…", systemImage: "square.and.arrow.up")
+            }
+
+            Divider()
+
+            Button {
+                createFolder()
+            } label: {
+                Label("New Folder…", systemImage: "folder.badge.plus")
+            }
+            .disabled(browserOperationLabel != nil)
 
             let assignableSelections = selectedItems.compactMap(eventSelection(for:))
             if let event = model.selectedEvent, !assignableSelections.isEmpty {
@@ -781,15 +1265,61 @@ struct PhotoBrowserView: View {
             Divider()
 
             Button {
-                NSWorkspace.shared.activateFileViewerSelecting(selectedItems.map(\.url))
+                NSWorkspace.shared.activateFileViewerSelecting(contextURLs)
             } label: {
-                Label("Reveal in Finder", systemImage: "finder")
+                Label("Show in Finder", systemImage: "finder")
             }
+
+            Button {
+                FinderItemActions.showInfo(for: contextURLs)
+            } label: {
+                Label(selectedItems.count == 1 ? "Get Info" : "Get Info for \(selectedItems.count) Items", systemImage: "info.circle")
+            }
+
+            if selectedItems.count == 1,
+               let item = selectedItems.first,
+               item.isDirectory {
+                Divider()
+
+                Button(role: .destructive) {
+                    confirmDeleteEmptyFolder(item)
+                } label: {
+                    Label("Delete Empty Folder…", systemImage: "trash")
+                }
+                .disabled(browserOperationLabel != nil)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func openWithMenu(for urls: [URL], supportsPhotomator: Bool) -> some View {
+        Menu {
+            Button("Default Application") {
+                openWithDefaultApplications(urls)
+            }
+
+            if supportsPhotomator {
+                Button("Photomator") {
+                    PhotomatorLauncher.open(urls)
+                }
+            }
+
+            Divider()
+
+            Button("Choose Application…") {
+                chooseApplication(toOpen: urls)
+            }
+        } label: {
+            Label("Open With", systemImage: "app.badge")
         }
     }
 
     private func copyMenuTitle(for count: Int) -> String {
         count == 1 ? "Copy" : "Copy \(count) Items"
+    }
+
+    private func copyPathMenuTitle(for count: Int) -> String {
+        count == 1 ? "Copy Path" : "Copy \(count) Paths"
     }
 
     private var safeImportArea: some View {
@@ -818,9 +1348,65 @@ struct PhotoBrowserView: View {
                 bufferDestinationRow
             }
             Divider()
-            importActionRow
+            selectedEventImportState
         }
         .background(.bar)
+    }
+
+    @ViewBuilder
+    private var selectedEventImportState: some View {
+        if model.selectedEvent == nil {
+            importActionRow
+        } else if !selectedEventCopyAvailabilityIsCurrent
+                    || model.selectedEventCopyAvailability.phase == .checking
+                    || model.selectedEventCopyAvailability.phase == .idle {
+            copyAvailabilityCheckingRow
+        } else if model.selectedEventCopyAvailability.hasFilesReadyToCopy {
+            importActionRow
+        } else {
+            copyUnavailableOrCompleteRow
+        }
+    }
+
+    private var copyAvailabilityCheckingRow: some View {
+        HStack(spacing: 10) {
+            ProgressView()
+                .controlSize(.small)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Checking source and Buffer")
+                    .font(.headline)
+                Text("Finding which assigned files still exist and actually need copying…")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+    }
+
+    private var copyUnavailableOrCompleteRow: some View {
+        HStack(spacing: 10) {
+            Image(systemName: copyAvailabilityStatusSymbol)
+                .foregroundStyle(copyAvailabilityStatusColor)
+                .font(.title3)
+                .frame(width: 24)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(copyAvailabilityStatusTitle)
+                    .font(.headline)
+                Text(copyAvailabilityStatusDetail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+            Spacer()
+            Button("Refresh Status") {
+                copyAvailabilityRefreshRevision &+= 1
+            }
+            .help("Check the source and Buffer again without copying anything")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
     }
 
     private var eventControls: some View {
@@ -919,6 +1505,7 @@ struct PhotoBrowserView: View {
             Button("Open Buffer") {
                 model.openEventFolder(model.expandedBufferIngestPath)
             }
+            .disabled(model.selectedEventCopyAvailability.bufferIsUnavailable)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 7)
@@ -940,15 +1527,17 @@ struct PhotoBrowserView: View {
                 hasRequestedImportPreview = true
                 model.previewSelectedEventImport()
             }
-            .disabled(model.isBusy || model.selectedEventFiles.isEmpty)
+            .disabled(model.isBusy || model.selectedEventCopyAvailability.presentFiles.isEmpty)
             .help("Quickly compare assigned file paths and sizes; checksums run during Copy + Verify")
 
-            Button("Copy \(model.selectedEventFiles.count) to Buffer + Verify") {
+            Button(copyButtonTitle) {
                 model.copySelectedEventFilesToBuffer()
             }
             .buttonStyle(.borderedProminent)
-            .disabled(model.isBusy || model.selectedEventFiles.isEmpty)
-            .help("Copy only the files assigned to this event into the Buffer, then checksum-verify them")
+            .disabled(!model.hasSelectedEventFilesReadyToCopy)
+            .help(model.isBusy
+                ? "Add these assigned files to the transfer queue while the current job continues"
+                : "Copy only the files assigned to this event into the Buffer, then checksum-verify them")
 
             if model.isBufferVerifiedForArchive {
                 Button("Archive to Library + Verify") {
@@ -991,6 +1580,14 @@ struct PhotoBrowserView: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 9)
+    }
+
+    private var copyButtonTitle: String {
+        let count = model.selectedEventCopyAvailability.filesReadyToCopy.count
+        if model.isBusy || model.isStorageBenchmarkRunning {
+            return "Queue \(count) for Transfer"
+        }
+        return "Copy \(count) to Buffer + Verify"
     }
 
     @ViewBuilder
@@ -1249,13 +1846,22 @@ struct PhotoBrowserView: View {
         ]
     }
 
+    private var visibleBrowserItems: [BrowserItem] {
+        BrowserTreeProjection.flattened(
+            roots: items,
+            childrenByParentID: childrenByFolderID,
+            expandedParentIDs: expandedFolderIDs,
+            id: \.id
+        )
+    }
+
     private var selectedURLs: [URL] {
-        items.filter { selectedItemIDs.contains($0.id) }.map(\.url)
+        visibleBrowserItems.filter { selectedItemIDs.contains($0.id) }.map(\.url)
     }
 
     private var selectedPreviewURL: URL? {
         guard selectedItemIDs.count == 1,
-              let item = items.first(where: { selectedItemIDs.contains($0.id) }),
+              let item = visibleBrowserItems.first(where: { selectedItemIDs.contains($0.id) }),
               !item.isDirectory,
               CameraPreviewSupport.canDecode(item.url) else {
             return nil
@@ -1264,7 +1870,7 @@ struct PhotoBrowserView: View {
     }
 
     private var selectedEventFileSelections: [EventFileSelection] {
-        items
+        visibleBrowserItems
             .filter { selectedItemIDs.contains($0.id) }
             .compactMap(eventSelection(for:))
     }
@@ -1309,7 +1915,24 @@ struct PhotoBrowserView: View {
             return "The selected rows are folders or unsupported file types"
         }
         if !model.selectedEventFiles.isEmpty {
-            return "\(model.selectedEventFiles.count) assigned · ready to copy to Buffer"
+            guard selectedEventCopyAvailabilityIsCurrent,
+                  model.selectedEventCopyAvailability.phase == .ready else {
+                return "\(model.selectedEventFiles.count) assigned · checking source and Buffer"
+            }
+            let availability = model.selectedEventCopyAvailability
+            if availability.sourceIsUnavailable {
+                return "\(availability.assignedCount) assigned · source drive unavailable"
+            }
+            if availability.bufferIsUnavailable {
+                return "\(availability.assignedCount) assigned · Buffer drive unavailable"
+            }
+            if availability.hasFilesReadyToCopy {
+                return "\(availability.filesReadyToCopy.count) ready to copy · \(availability.assignedCount) assigned"
+            }
+            if availability.alreadyInBufferCount > 0 {
+                return "\(availability.assignedCount) assigned · nothing new to copy"
+            }
+            return "\(availability.assignedCount) assigned · none currently available to copy"
         }
         return "Select files in the list above, then assign them"
     }
@@ -1321,14 +1944,111 @@ struct PhotoBrowserView: View {
         if model.selectedEventFiles.isEmpty {
             return "Nothing will move until files are assigned above"
         }
+        guard selectedEventCopyAvailabilityIsCurrent,
+              model.selectedEventCopyAvailability.phase == .ready else {
+            return "Checking assigned files without blocking the browser"
+        }
+        let availability = model.selectedEventCopyAvailability
+        if availability.hasFilesReadyToCopy {
+            var detail = "\(availability.filesReadyToCopy.count) present and not yet in Buffer"
+            if availability.alreadyInBufferCount > 0 {
+                detail += " · \(availability.alreadyInBufferCount) already there"
+            }
+            if availability.missingFromSourceCount > 0 {
+                detail += " · \(availability.missingFromSourceCount) missing"
+            }
+            return detail
+        }
         if model.isBufferVerifiedForArchive {
             return "Verified in Buffer · the camera files remain untouched"
         }
-        return "\(model.selectedEventFiles.count) assigned file(s) · camera stays untouched"
+        return "Nothing needs copying from this source"
+    }
+
+    private var selectedEventCopyAvailabilityIsCurrent: Bool {
+        model.selectedEventCopyAvailability.contextID == model.selectedEventCopyAvailabilityRefreshID
+    }
+
+    private var copyAvailabilityStatusTitle: String {
+        let availability = model.selectedEventCopyAvailability
+        if availability.sourceIsUnavailable { return "Source drive unavailable" }
+        if availability.bufferIsUnavailable { return "Buffer drive unavailable" }
+        if availability.assignedCount == 0 { return "Nothing assigned yet" }
+        if availability.bufferConflictCount > 0 || availability.changedOnSourceCount > 0 {
+            return "Assigned files need attention"
+        }
+        if availability.alreadyInBufferCount > 0 { return "Nothing new to copy" }
+        if availability.scheduledCount > 0 { return "Transfer already queued" }
+        if availability.missingFromSourceCount > 0 { return "No assigned files remain on this source" }
+        return "Nothing to copy"
+    }
+
+    private var copyAvailabilityStatusDetail: String {
+        let availability = model.selectedEventCopyAvailability
+        if availability.sourceIsUnavailable {
+            return "Reconnect \(selectedSourceName) to check its \(availability.assignedCount) assigned file(s)."
+        }
+        if availability.bufferIsUnavailable {
+            return "Reconnect the selected Buffer drive before copying these \(availability.assignedCount) assigned file(s)."
+        }
+        if availability.assignedCount == 0 {
+            return "Select files above and assign them to this event."
+        }
+
+        var parts: [String] = []
+        if availability.alreadyInBufferCount > 0 {
+            parts.append("\(availability.alreadyInBufferCount) already present in Buffer")
+        }
+        if availability.scheduledCount > 0 {
+            parts.append("\(availability.scheduledCount) transferring or queued")
+        }
+        if availability.missingFromSourceCount > 0 {
+            parts.append("\(availability.missingFromSourceCount) no longer on \(selectedSourceName)")
+        }
+        if availability.changedOnSourceCount > 0 {
+            parts.append("\(availability.changedOnSourceCount) changed since assignment")
+        }
+        if availability.bufferConflictCount > 0 {
+            parts.append("\(availability.bufferConflictCount) Buffer path conflict(s)")
+        }
+        let summary = parts.isEmpty ? "No assigned files currently need copying" : parts.joined(separator: " · ")
+        return "\(summary). Event assignments are kept as history."
+    }
+
+    private var copyAvailabilityStatusSymbol: String {
+        let availability = model.selectedEventCopyAvailability
+        if availability.sourceIsUnavailable { return "externaldrive.badge.questionmark" }
+        if availability.bufferIsUnavailable { return "externaldrive.badge.exclamationmark" }
+        if availability.bufferConflictCount > 0 || availability.changedOnSourceCount > 0 {
+            return "exclamationmark.triangle.fill"
+        }
+        if availability.alreadyInBufferCount > 0 { return "checkmark.circle.fill" }
+        if availability.scheduledCount > 0 { return "clock.badge.checkmark.fill" }
+        return "tray"
+    }
+
+    private var copyAvailabilityStatusColor: Color {
+        let availability = model.selectedEventCopyAvailability
+        if availability.bufferIsUnavailable
+            || availability.bufferConflictCount > 0
+            || availability.changedOnSourceCount > 0 {
+            return .orange
+        }
+        if availability.alreadyInBufferCount > 0 { return .green }
+        if availability.scheduledCount > 0 { return .blue }
+        return .secondary
+    }
+
+    private var selectedSourceName: String {
+        let name = URL(
+            fileURLWithPath: DashboardModel.expandedPath(model.configuration.importSourcePath),
+            isDirectory: true
+        ).lastPathComponent
+        return name.isEmpty ? "the selected source" : name
     }
 
     private var previewableURLs: [URL] {
-        items.compactMap { item in
+        visibleBrowserItems.compactMap { item in
             guard !item.isDirectory, CameraPreviewSupport.canDecode(item.url) else { return nil }
             return item.url
         }
@@ -1394,7 +2114,7 @@ struct PhotoBrowserView: View {
     }
 
     private func collectItems(withIDs ids: Set<String>) {
-        for item in items where ids.contains(item.id) {
+        for item in visibleBrowserItems where ids.contains(item.id) {
             guard let selection = eventSelection(for: item) else { continue }
             collectedEventFiles[selection.id] = selection
         }
@@ -1425,6 +2145,105 @@ struct PhotoBrowserView: View {
         ).standardizedFileURL.path
     }
 
+    private func disclosureAccessibilityLabel(for item: BrowserItem) -> String {
+        if folderExpansionErrors[item.id] != nil {
+            return "Retry Loading \(item.name)"
+        }
+        return expandedFolderIDs.contains(item.id) ? "Collapse \(item.name)" : "Expand \(item.name)"
+    }
+
+    private func disclosureHelp(for item: BrowserItem) -> String {
+        if let error = folderExpansionErrors[item.id] {
+            return "Could not show this folder: \(error)\nClick to try again."
+        }
+        return expandedFolderIDs.contains(item.id)
+            ? "Hide this folder’s contents (Left Arrow)"
+            : "Show this folder’s contents inline (Right Arrow)"
+    }
+
+    private func toggleFolderExpansion(_ item: BrowserItem) {
+        guard item.canExpand else { return }
+        if folderExpansionErrors[item.id] != nil {
+            requestFolderExpansion(item, forceReload: true)
+        } else if expandedFolderIDs.contains(item.id) {
+            collapseFolder(item)
+        } else {
+            requestFolderExpansion(item)
+        }
+        isFileTableFocused = true
+    }
+
+    private func requestFolderExpansion(_ item: BrowserItem, forceReload: Bool = false) {
+        guard item.canExpand else { return }
+        expandedFolderIDs.insert(item.id)
+        folderExpansionErrors[item.id] = nil
+        if forceReload {
+            childrenByFolderID[item.id] = nil
+        }
+        guard childrenByFolderID[item.id] == nil,
+              !loadingFolderIDs.contains(item.id) else {
+            return
+        }
+
+        loadingFolderIDs.insert(item.id)
+        Task { await loadFolderChildren(for: item) }
+    }
+
+    @MainActor
+    private func loadFolderChildren(for item: BrowserItem) async {
+        let directoryID = item.id
+        let expectedRoot = currentURL.standardizedFileURL
+        do {
+            let loaded = try await Task.detached(priority: .userInitiated) {
+                try BrowserDirectoryReader.load(item.url, depth: item.depth + 1)
+            }.value
+            guard currentURL.standardizedFileURL == expectedRoot else { return }
+            childrenByFolderID[directoryID] = loaded
+            folderExpansionErrors[directoryID] = nil
+        } catch {
+            guard currentURL.standardizedFileURL == expectedRoot else { return }
+            childrenByFolderID[directoryID] = nil
+            folderExpansionErrors[directoryID] = error.localizedDescription
+        }
+        loadingFolderIDs.remove(directoryID)
+    }
+
+    private func collapseFolder(_ item: BrowserItem) {
+        expandedFolderIDs.remove(item.id)
+        let descendantPrefix = item.id.hasSuffix("/") ? item.id : item.id + "/"
+        let hiddenSelection = selectedItemIDs.filter { $0.hasPrefix(descendantPrefix) }
+        if !hiddenSelection.isEmpty {
+            selectedItemIDs.subtract(hiddenSelection)
+            selectedItemIDs.insert(item.id)
+        }
+    }
+
+    private func resetBrowserTree() {
+        expandedFolderIDs.removeAll()
+        childrenByFolderID.removeAll()
+        loadingFolderIDs.removeAll()
+        folderExpansionErrors.removeAll()
+    }
+
+    private func reloadBrowserTree() {
+        guard !isLoading else { return }
+        resetBrowserTree()
+        copyAvailabilityRefreshRevision &+= 1
+        Task { await loadCurrentDirectory() }
+    }
+
+    private func pruneBrowserTree(to roots: [BrowserItem]) {
+        let rootIDs = roots.filter(\.canExpand).map(\.id)
+        func belongsToVisibleRoot(_ id: String) -> Bool {
+            rootIDs.contains { id == $0 || id.hasPrefix($0 + "/") }
+        }
+
+        expandedFolderIDs = expandedFolderIDs.filter(belongsToVisibleRoot)
+        childrenByFolderID = childrenByFolderID.filter { belongsToVisibleRoot($0.key) }
+        loadingFolderIDs = loadingFolderIDs.filter(belongsToVisibleRoot)
+        folderExpansionErrors = folderExpansionErrors.filter { belongsToVisibleRoot($0.key) }
+    }
+
     @MainActor
     private func loadCurrentDirectory() async {
         let url = currentURL.standardizedFileURL
@@ -1441,39 +2260,20 @@ struct PhotoBrowserView: View {
 
         do {
             let loaded = try await Task.detached(priority: .userInitiated) {
-                let keys: Set<URLResourceKey> = [.isDirectoryKey, .isRegularFileKey, .fileSizeKey, .contentModificationDateKey, .localizedTypeDescriptionKey, .isHiddenKey]
-                let urls = try FileManager.default.contentsOfDirectory(
-                    at: url,
-                    includingPropertiesForKeys: Array(keys),
-                    options: [.skipsHiddenFiles]
-                )
-                return try urls.compactMap { child -> BrowserItem? in
-                    let values = try child.resourceValues(forKeys: keys)
-                    guard values.isDirectory == true || values.isRegularFile == true else { return nil }
-                    return BrowserItem(
-                        url: child,
-                        name: child.lastPathComponent,
-                        isDirectory: values.isDirectory == true,
-                        size: Int64(values.fileSize ?? 0),
-                        modifiedAt: values.contentModificationDate ?? .distantPast,
-                        kind: values.isDirectory == true ? "Folder" : (values.localizedTypeDescription ?? child.pathExtension.uppercased())
-                    )
-                }
-                .sorted {
-                    if $0.isDirectory != $1.isDirectory { return $0.isDirectory }
-                    return $0.name.localizedStandardCompare($1.name) == .orderedAscending
-                }
+                try BrowserDirectoryReader.load(url, depth: 0)
             }.value
             guard currentURL.standardizedFileURL == url else { return }
             items = loaded
+            pruneBrowserTree(to: loaded)
             loadedDirectoryURL = url
             if isRefreshingCurrentDirectory {
-                let availableIDs = Set(loaded.map(\.id))
+                let availableIDs = Set(visibleBrowserItems.map(\.id))
                 selectedItemIDs.formIntersection(availableIDs)
             }
         } catch {
             guard currentURL.standardizedFileURL == url else { return }
             items = []
+            resetBrowserTree()
             browserError = error.localizedDescription
         }
         if loadingDirectoryURL?.standardizedFileURL == url {
@@ -1489,6 +2289,7 @@ struct PhotoBrowserView: View {
             backHistory.append(currentURL)
             forwardHistory.removeAll()
         }
+        resetBrowserTree()
         currentURL = normalized
     }
 
@@ -1509,12 +2310,47 @@ struct PhotoBrowserView: View {
     }
 
     private func selectAdjacentItem(offset: Int) {
-        guard !items.isEmpty else { return }
-        let selectedIndex = items.firstIndex { selectedItemIDs.contains($0.id) }
-        let startingIndex = selectedIndex ?? (offset > 0 ? -1 : items.count)
-        let destinationIndex = min(max(startingIndex + offset, 0), items.count - 1)
-        selectedItemIDs = [items[destinationIndex].id]
+        let visibleItems = visibleBrowserItems
+        guard !visibleItems.isEmpty else { return }
+        let selectedIndex = visibleItems.firstIndex { selectedItemIDs.contains($0.id) }
+        let startingIndex = selectedIndex ?? (offset > 0 ? -1 : visibleItems.count)
+        let destinationIndex = min(max(startingIndex + offset, 0), visibleItems.count - 1)
+        selectedItemIDs = [visibleItems[destinationIndex].id]
         isFileTableFocused = true
+    }
+
+    private func collapseSelectionOrSelectParent() -> KeyPress.Result {
+        guard selectedItemIDs.count == 1,
+              let selectedID = selectedItemIDs.first,
+              let item = visibleBrowserItems.first(where: { $0.id == selectedID }) else {
+            return .ignored
+        }
+        if item.canExpand, expandedFolderIDs.contains(item.id) {
+            collapseFolder(item)
+            return .handled
+        }
+        guard item.depth > 0 else { return .ignored }
+        let parentID = item.url.deletingLastPathComponent().standardizedFileURL.path
+        guard visibleBrowserItems.contains(where: { $0.id == parentID }) else { return .ignored }
+        selectedItemIDs = [parentID]
+        return .handled
+    }
+
+    private func expandSelectionOrSelectFirstChild() -> KeyPress.Result {
+        guard selectedItemIDs.count == 1,
+              let selectedID = selectedItemIDs.first,
+              let item = visibleBrowserItems.first(where: { $0.id == selectedID }),
+              item.canExpand else {
+            return .ignored
+        }
+        if expandedFolderIDs.contains(item.id) {
+            if let firstChild = childrenByFolderID[item.id]?.first {
+                selectedItemIDs = [firstChild.id]
+            }
+        } else {
+            requestFolderExpansion(item)
+        }
+        return .handled
     }
 
     private func selectPreviousSource() {
@@ -1538,8 +2374,12 @@ struct PhotoBrowserView: View {
         switch command {
         case .copySelection:
             FileClipboardWriter.copy(selectedURLs)
+        case .moveSelectionToTrash:
+            guard isFileTableFocused else { return }
+            let selectedItems = visibleBrowserItems.filter { selectedItemIDs.contains($0.id) }
+            confirmMoveToTrash(selectedItems)
         case .selectAll:
-            selectedItemIDs = Set(items.map(\.id))
+            selectedItemIDs = Set(visibleBrowserItems.map(\.id))
         case .openSelection:
             openSelection()
         case .previewSelection:
@@ -1562,6 +2402,14 @@ struct PhotoBrowserView: View {
             increaseThumbnailSize()
         case .decreaseThumbnailSize:
             decreaseThumbnailSize()
+        case .reload:
+            reloadBrowserTree()
+        case .showSelectedLocationInformation:
+            guard let selectedLocationID,
+                  let location = locations.first(where: { $0.id == selectedLocationID }) else {
+                return
+            }
+            showDriveInformation(location)
         }
     }
 
@@ -1581,6 +2429,31 @@ struct PhotoBrowserView: View {
         }
     }
 
+    private func openWithDefaultApplications(_ urls: [URL]) {
+        urls.forEach { NSWorkspace.shared.open($0) }
+    }
+
+    private func chooseApplication(toOpen urls: [URL]) {
+        guard !urls.isEmpty else { return }
+
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [.application]
+        panel.treatsFilePackagesAsDirectories = false
+        panel.directoryURL = URL(fileURLWithPath: "/Applications", isDirectory: true)
+        panel.title = "Choose an Application"
+        panel.message = "Choose an app to open \(urls.count == 1 ? urls[0].lastPathComponent : "\(urls.count) selected items")."
+        panel.prompt = "Open"
+
+        guard panel.runModal() == .OK, let applicationURL = panel.url else { return }
+
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = true
+        NSWorkspace.shared.open(urls, withApplicationAt: applicationURL, configuration: configuration)
+    }
+
     private func previewSelection() {
         let selectedPreviewURL = selectedURLs.first { CameraPreviewSupport.canDecode($0) }
         CameraPreviewController.shared.preview(
@@ -1591,7 +2464,7 @@ struct PhotoBrowserView: View {
 
     private func openSelection() {
         guard selectedItemIDs.count == 1,
-              let item = items.first(where: { selectedItemIDs.contains($0.id) }) else {
+              let item = visibleBrowserItems.first(where: { selectedItemIDs.contains($0.id) }) else {
             return
         }
         open(item)
@@ -1633,7 +2506,11 @@ struct PhotoBrowserView: View {
             return
         }
         let destination = currentURL.appendingPathComponent(name, isDirectory: true)
-        runBrowserMutation(label: "Creating folder…", selecting: destination) {
+        runBrowserMutation(
+            label: "Creating folder…",
+            selecting: destination,
+            refreshingFolders: [currentURL]
+        ) {
             try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: false)
         }
     }
@@ -1661,7 +2538,12 @@ struct PhotoBrowserView: View {
             name,
             isDirectory: item.isDirectory
         )
-        runBrowserMutation(label: "Renaming…", selecting: destination) {
+        runBrowserMutation(
+            label: "Renaming…",
+            selecting: destination,
+            refreshingFolders: [item.url.deletingLastPathComponent()],
+            removingSubtrees: [item.url]
+        ) {
             if FileManager.default.fileExists(atPath: destination.path) {
                 throw CocoaError(.fileWriteFileExists)
             }
@@ -1669,9 +2551,89 @@ struct PhotoBrowserView: View {
         }
     }
 
+    private func confirmDeleteEmptyFolder(_ item: BrowserItem) {
+        guard item.isDirectory else { return }
+
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Delete Empty Folder?"
+        alert.informativeText = "\(item.url.path)\n\nOnly this folder will be removed. If it contains anything, including a hidden file, Camera Toolkit will refuse to delete it."
+        let deleteButton = alert.addButton(withTitle: "Delete Empty Folder")
+        deleteButton.hasDestructiveAction = true
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        let protectedURLs = protectedBrowserFolderURLs
+        runBrowserMutation(
+            label: "Deleting empty folder…",
+            selecting: nil,
+            errorTitle: "Folder Was Not Deleted",
+            refreshingFolders: [item.url.deletingLastPathComponent()],
+            removingSubtrees: [item.url]
+        ) {
+            try EmptyFolderDeletionService.delete(item.url, protectedURLs: protectedURLs)
+        }
+    }
+
+    private func confirmMoveToTrash(_ selectedItems: [BrowserItem]) {
+        guard !selectedItems.isEmpty else { return }
+
+        let urls = selectedItems.map(\.url)
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        if selectedItems.count == 1, let item = selectedItems.first {
+            alert.messageText = "Move “\(item.name)” to Trash?"
+            alert.informativeText = "\(item.url.path)\n\nCamera Toolkit will use macOS Trash. You can restore this item until Trash is emptied."
+        } else {
+            let names = selectedItems.prefix(5).map { "• \($0.name)" }.joined(separator: "\n")
+            let remainingCount = max(0, selectedItems.count - 5)
+            let remainder = remainingCount == 0 ? "" : "\n…and \(remainingCount) more"
+            alert.messageText = "Move \(selectedItems.count) Items to Trash?"
+            alert.informativeText = "\(names)\(remainder)\n\nCamera Toolkit will use macOS Trash. You can restore these items until Trash is emptied."
+        }
+        let trashButton = alert.addButton(withTitle: "Move to Trash")
+        trashButton.hasDestructiveAction = true
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        let protectedURLs = protectedBrowserFolderURLs
+        runBrowserMutation(
+            label: selectedItems.count == 1 ? "Moving item to Trash…" : "Moving \(selectedItems.count) items to Trash…",
+            selecting: nil,
+            errorTitle: "Items Were Not Moved to Trash",
+            refreshAfterFailure: true,
+            refreshingFolders: urls.map { $0.deletingLastPathComponent() },
+            removingSubtrees: urls
+        ) {
+            _ = try FileTrashService.moveToTrash(urls, protectedURLs: protectedURLs)
+        }
+    }
+
+    private var protectedBrowserFolderURLs: [URL] {
+        var paths = model.configuration.configuredLocations.map(\.path)
+        paths.append(contentsOf: [
+            model.configuration.importSourcePath,
+            model.configuration.bufferPath,
+            model.configuration.archivePath,
+            model.configuration.cameraLibraryRootPath,
+            FileManager.default.homeDirectoryForCurrentUser.path,
+            FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Pictures", isDirectory: true).path,
+            currentURL.path,
+        ])
+
+        return Set(paths.lazy
+            .map(DashboardModel.expandedPath)
+            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty })
+            .map { URL(fileURLWithPath: $0, isDirectory: true).standardizedFileURL }
+    }
+
     private func runBrowserMutation(
         label: String,
         selecting destination: URL?,
+        errorTitle: String = "The File Operation Failed",
+        refreshAfterFailure: Bool = false,
+        refreshingFolders: [URL] = [],
+        removingSubtrees: [URL] = [],
         operation: @escaping @Sendable () throws -> Void
     ) {
         guard browserOperationLabel == nil else { return }
@@ -1689,15 +2651,74 @@ struct PhotoBrowserView: View {
 
             browserOperationLabel = nil
             if let errorMessage {
-                showBrowserOperationError(title: "The File Operation Failed", message: errorMessage)
+                if refreshAfterFailure {
+                    model.storageCapacityRevision &+= 1
+                    await refreshBrowserAfterMutation(
+                        refreshingFolders: refreshingFolders,
+                        removingSubtrees: []
+                    )
+                }
+                showBrowserOperationError(title: errorTitle, message: errorMessage)
                 return
             }
 
-            await loadCurrentDirectory()
+            model.storageCapacityRevision &+= 1
+            await refreshBrowserAfterMutation(
+                refreshingFolders: refreshingFolders,
+                removingSubtrees: removingSubtrees
+            )
             if let destination {
                 selectedItemIDs = [destination.path]
             }
         }
+    }
+
+    @MainActor
+    private func refreshBrowserAfterMutation(
+        refreshingFolders: [URL],
+        removingSubtrees: [URL]
+    ) async {
+        let previousSelection = selectedItemIDs
+        let stalePaths = removingSubtrees.map { $0.standardizedFileURL.path }
+
+        expandedFolderIDs = BrowserTreeMutationState.removingSubtrees(
+            from: expandedFolderIDs,
+            rootedAt: stalePaths
+        )
+        childrenByFolderID = childrenByFolderID.filter { id, _ in
+            !BrowserTreeMutationState.isInsideSubtree(id, rootedAt: stalePaths)
+        }
+        loadingFolderIDs = BrowserTreeMutationState.removingSubtrees(
+            from: loadingFolderIDs,
+            rootedAt: stalePaths
+        )
+        folderExpansionErrors = folderExpansionErrors.filter { id, _ in
+            !BrowserTreeMutationState.isInsideSubtree(id, rootedAt: stalePaths)
+        }
+
+        let currentRootID = currentURL.standardizedFileURL.path
+        let folderIDs = Set(refreshingFolders.map { $0.standardizedFileURL.path })
+        for folderID in folderIDs where folderID != currentRootID {
+            childrenByFolderID[folderID] = nil
+            loadingFolderIDs.remove(folderID)
+            folderExpansionErrors[folderID] = nil
+        }
+
+        await loadCurrentDirectory()
+
+        for folderID in folderIDs.sorted(by: {
+            URL(fileURLWithPath: $0).pathComponents.count
+                < URL(fileURLWithPath: $1).pathComponents.count
+        }) where folderID != currentRootID && expandedFolderIDs.contains(folderID) {
+            guard let folder = visibleBrowserItems.first(where: { $0.id == folderID && $0.canExpand }) else {
+                continue
+            }
+            loadingFolderIDs.insert(folderID)
+            await loadFolderChildren(for: folder)
+        }
+
+        let availableIDs = Set(visibleBrowserItems.map(\.id))
+        selectedItemIDs = previousSelection.intersection(availableIDs)
     }
 
     private func showBrowserOperationError(title: String, message: String) {

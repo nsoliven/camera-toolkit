@@ -9,21 +9,64 @@ final class BrowserCommandsTests: XCTestCase {
         let actions = Set(shortcuts.map(\.action))
 
         XCTAssertTrue(actions.contains("Previous or next item"))
+        XCTAssertTrue(actions.contains("Expand or collapse a folder"))
         XCTAssertTrue(actions.contains("Copy selected files"))
+        XCTAssertTrue(actions.contains("Copy file paths"))
         XCTAssertTrue(actions.contains("Rename selected item"))
+        XCTAssertTrue(actions.contains("Move selected items to Trash"))
+        XCTAssertTrue(actions.contains("Delete an empty folder"))
         XCTAssertTrue(actions.contains("Select across folders"))
         XCTAssertTrue(actions.contains("Larger or smaller thumbnails"))
         XCTAssertTrue(actions.contains("Previous or next camera"))
         XCTAssertTrue(actions.contains("Zoom to fit"))
         XCTAssertTrue(actions.contains("Open in Photomator"))
-        XCTAssertTrue(actions.contains("Move, paste, or delete"))
+        XCTAssertTrue(actions.contains("Move files to Trash"))
+        XCTAssertTrue(actions.contains("Paste or permanently delete files"))
     }
 
     func testThumbnailSizingStepsThroughPresetsAndClampsAtEnds() {
         XCTAssertEqual(BrowserThumbnailSizing.larger(than: 32), 44)
-        XCTAssertEqual(BrowserThumbnailSizing.smaller(than: 32), 24)
+        XCTAssertEqual(BrowserThumbnailSizing.smaller(than: 24), 16)
         XCTAssertEqual(BrowserThumbnailSizing.larger(than: 104), 104)
-        XCTAssertEqual(BrowserThumbnailSizing.smaller(than: 24), 24)
+        XCTAssertEqual(BrowserThumbnailSizing.smaller(than: 16), 16)
+    }
+
+    func testBrowserTreeProjectionExpandsOnlyRequestedFoldersInOrder() {
+        let children = [
+            "DCIM": ["DCIM/100MEDIA", "DCIM/README.txt"],
+            "DCIM/100MEDIA": ["DCIM/100MEDIA/PHOTO.ARW"],
+            "M4ROOT": ["M4ROOT/CLIP"]
+        ]
+
+        XCTAssertEqual(
+            BrowserTreeProjection.flattened(
+                roots: ["DCIM", "M4ROOT"],
+                childrenByParentID: children,
+                expandedParentIDs: ["DCIM", "DCIM/100MEDIA"],
+                id: { $0 }
+            ),
+            ["DCIM", "DCIM/100MEDIA", "DCIM/100MEDIA/PHOTO.ARW", "DCIM/README.txt", "M4ROOT"]
+        )
+    }
+
+    func testBrowserTreeMutationRemovesOnlyChangedSubtree() {
+        let expanded: Set<String> = [
+            "/Volumes/LEXAR/DCIM",
+            "/Volumes/LEXAR/DCIM/EMPTY",
+            "/Volumes/LEXAR/DCIM/EMPTY/NESTED",
+            "/Volumes/LEXAR/Exported",
+        ]
+
+        XCTAssertEqual(
+            BrowserTreeMutationState.removingSubtrees(
+                from: expanded,
+                rootedAt: ["/Volumes/LEXAR/DCIM/EMPTY"]
+            ),
+            [
+                "/Volumes/LEXAR/DCIM",
+                "/Volumes/LEXAR/Exported",
+            ]
+        )
     }
 
     func testThumbnailSizingUsesDisplayScaleForDecodeBudget() {
@@ -65,6 +108,31 @@ final class BrowserCommandsTests: XCTestCase {
         )
         XCTAssertEqual(copiedURLs.map(\.standardizedFileURL), [first.standardizedFileURL, second.standardizedFileURL])
         pasteboard.clearContents()
+    }
+
+    func testFileClipboardWriterCopiesPathsAsPlainText() {
+        let pasteboard = NSPasteboard(name: NSPasteboard.Name("CameraToolkitPathTests-\(UUID().uuidString)"))
+        let first = URL(fileURLWithPath: "/tmp/Camera Toolkit/ONE.ARW")
+        let second = URL(fileURLWithPath: "/Volumes/Source Card/DCIM")
+
+        XCTAssertTrue(FileClipboardWriter.copyPaths([first, second], to: pasteboard))
+        XCTAssertEqual(
+            pasteboard.string(forType: .string),
+            "/tmp/Camera Toolkit/ONE.ARW\n/Volumes/Source Card/DCIM"
+        )
+        pasteboard.clearContents()
+    }
+
+    func testFinderInfoPassesPathsAsArgumentsInsteadOfEmbeddingThemInScript() {
+        let first = URL(fileURLWithPath: "/tmp/Camera Toolkit/ONE.ARW")
+        let second = URL(fileURLWithPath: "/Volumes/Source \"Card\"/DCIM")
+
+        let arguments = FinderItemActions.informationArguments(for: [first, second])
+
+        XCTAssertEqual(Array(arguments.prefix(3)), ["-e", FinderItemActions.informationWindowScript, "--"])
+        XCTAssertEqual(Array(arguments.suffix(2)), [first.path, second.path])
+        XCTAssertFalse(FinderItemActions.informationWindowScript.contains(first.path))
+        XCTAssertFalse(FinderItemActions.informationWindowScript.contains(second.path))
     }
 
     func testEventMediaSupportIncludesDJIOsmo360Files() {

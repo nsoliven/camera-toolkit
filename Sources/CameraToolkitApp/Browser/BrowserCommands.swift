@@ -3,6 +3,7 @@ import SwiftUI
 
 enum BrowserCommand: String, Sendable {
     case copySelection
+    case moveSelectionToTrash
     case selectAll
     case openSelection
     case previewSelection
@@ -15,6 +16,8 @@ enum BrowserCommand: String, Sendable {
     case nextSource
     case increaseThumbnailSize
     case decreaseThumbnailSize
+    case reload
+    case showSelectedLocationInformation
 
     static let notification = Notification.Name("CameraToolkit.BrowserCommand")
 
@@ -26,7 +29,7 @@ enum BrowserCommand: String, Sendable {
 
 enum BrowserThumbnailSizing {
     static let defaultHeight = 32.0
-    static let presets = [24.0, 32.0, 44.0, 60.0, 80.0, 104.0]
+    static let presets = [16.0, 24.0, 32.0, 44.0, 60.0, 80.0, 104.0]
 
     static func larger(than current: Double) -> Double {
         presets.first(where: { $0 > current + 0.5 }) ?? presets.last ?? defaultHeight
@@ -42,6 +45,48 @@ enum BrowserThumbnailSizing {
 
     static func maximumPixelSize(for height: Double) -> Int {
         max(128, Int((height * 2).rounded(.up)))
+    }
+}
+
+enum BrowserTreeProjection {
+    static func flattened<Item>(
+        roots: [Item],
+        childrenByParentID: [String: [Item]],
+        expandedParentIDs: Set<String>,
+        id: (Item) -> String
+    ) -> [Item] {
+        var result: [Item] = []
+        var visited: Set<String> = []
+
+        func append(_ items: [Item]) {
+            for item in items {
+                let itemID = id(item)
+                guard visited.insert(itemID).inserted else { continue }
+                result.append(item)
+                if expandedParentIDs.contains(itemID),
+                   let children = childrenByParentID[itemID] {
+                    append(children)
+                }
+            }
+        }
+
+        append(roots)
+        return result
+    }
+}
+
+enum BrowserTreeMutationState {
+    static func isInsideSubtree(_ id: String, rootedAt subtreeRoots: [String]) -> Bool {
+        subtreeRoots.contains { root in
+            id == root || id.hasPrefix(root.hasSuffix("/") ? root : root + "/")
+        }
+    }
+
+    static func removingSubtrees(
+        from ids: Set<String>,
+        rootedAt subtreeRoots: [String]
+    ) -> Set<String> {
+        ids.filter { !isInsideSubtree($0, rootedAt: subtreeRoots) }
     }
 }
 
@@ -100,17 +145,23 @@ enum CameraToolkitShortcutCatalog {
             symbol: "folder",
             shortcuts: [
                 .init(action: "Previous or next item", keys: "↑  ↓", detail: "Moves the file selection and updates the side preview."),
+                .init(action: "Expand or collapse a folder", keys: "→  ←", detail: "Shows or hides a folder’s contents inline without navigating away."),
                 .init(action: "Open selected item", keys: "Return  /  ⌘O  /  ⌘↓", detail: "Opens a folder or the selected file in its default app."),
                 .init(action: "Preview selected photos", keys: "Space  /  ⌘Y", detail: "Opens Camera Toolkit's large preview without decoding the full RAW."),
                 .init(action: "Copy selected files", keys: "⌘C", detail: "Copies Finder-compatible file references to the clipboard."),
+                .init(action: "Copy file paths", keys: "Right-click", detail: "Copies each selected file or folder path as plain text, one path per line."),
                 .init(action: "Rename selected item", keys: "Right-click", detail: "Renames one item without reading or rewriting its file contents."),
-                .init(action: "Select all", keys: "⌘A", detail: "Selects every item in the current folder."),
+                .init(action: "Move selected items to Trash", keys: "⌘Delete / Right-click", detail: "Confirms, then uses macOS Trash for files, non-empty folders, or a multi-selection. Configured locations and drive roots stay protected."),
+                .init(action: "Delete an empty folder", keys: "Right-click", detail: "Confirms, then removes only a truly empty folder. Hidden files make the operation fail safely."),
+                .init(action: "Select all", keys: "⌘A", detail: "Selects every visible row, including contents from expanded folders."),
                 .init(action: "Larger or smaller thumbnails", keys: "⌘+  ⌘−", detail: "Resizes browser thumbnails and remembers the chosen size."),
                 .init(action: "Select across folders", keys: "+ button", detail: "Starts an event-selection basket that stays with you while browsing folders or camera sources."),
                 .init(action: "Open Event Library", keys: "⌥⌘E", detail: "Shows event photos across their camera, buffer, library, and Immich locations."),
+                .init(action: "Open Transfer Queue", keys: "⌥⌘T", detail: "Shows what is copying or verifying, current speed, progress, and any problem."),
                 .init(action: "Open SQL Inspector", keys: "⇧⌘I", detail: "Browses the SQLite photo list, schema, and read-only SQL queries."),
                 .init(action: "New folder", keys: "⇧⌘N", detail: "Creates a folder in the location currently being browsed."),
                 .init(action: "Reveal in Finder", keys: "⇧⌘R", detail: "Shows the selected files in Finder."),
+                .init(action: "Get drive information", keys: "⌘I / Right-click", detail: "Shows live capacity, model, connection, filesystem, and available SMART health for the selected sidebar location."),
             ]
         ),
         KeyboardShortcutSection(
@@ -142,7 +193,8 @@ enum CameraToolkitShortcutCatalog {
             title: "Safety",
             symbol: "lock.shield",
             shortcuts: [
-                .init(action: "Move, paste, or delete", keys: "Disabled", detail: "Camera Toolkit never binds destructive Finder shortcuts while browsing a camera card."),
+                .init(action: "Move files to Trash", keys: "Always confirms", detail: "Camera Toolkit uses macOS Trash, refuses configured locations and drive roots, and reports partial failures honestly."),
+                .init(action: "Paste or permanently delete files", keys: "Disabled", detail: "Permanent source cleanup remains a separate verified workflow and never runs from a normal browser shortcut."),
             ]
         ),
     ]
@@ -156,6 +208,46 @@ enum FileClipboardWriter {
         guard !fileURLs.isEmpty else { return false }
         pasteboard.clearContents()
         return pasteboard.writeObjects(fileURLs as [NSURL])
+    }
+
+    @discardableResult
+    static func copyPaths(_ urls: [URL], to pasteboard: NSPasteboard = .general) -> Bool {
+        let paths = urls.filter(\.isFileURL).map(\.path)
+        guard !paths.isEmpty else { return false }
+        pasteboard.clearContents()
+        return pasteboard.setString(paths.joined(separator: "\n"), forType: .string)
+    }
+}
+
+enum FinderItemActions {
+    static let informationWindowScript = """
+    on run itemPaths
+        tell application "Finder"
+            activate
+            repeat with itemPath in itemPaths
+                try
+                    open information window of ((POSIX file itemPath) as alias)
+                end try
+            end repeat
+        end tell
+    end run
+    """
+
+    static func informationArguments(for urls: [URL]) -> [String] {
+        ["-e", informationWindowScript, "--"] + urls.filter(\.isFileURL).map(\.path)
+    }
+
+    @MainActor
+    static func showInfo(for urls: [URL]) {
+        let arguments = informationArguments(for: urls)
+        guard arguments.count > 3 else { return }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        process.arguments = arguments
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try? process.run()
     }
 }
 
@@ -180,9 +272,9 @@ final class KeyboardShortcutsWindowController: NSObject, NSWindowDelegate {
         )
         window.title = "Camera Toolkit Keyboard Shortcuts"
         window.identifier = NSUserInterfaceItemIdentifier("CameraToolkitKeyboardShortcutsWindow")
-        window.minSize = NSSize(width: 620, height: 480)
         window.isReleasedWhenClosed = false
         window.contentViewController = NSHostingController(rootView: KeyboardShortcutsReferenceView())
+        CameraToolkitWindowSizing.configure(window, as: .keyboardShortcuts)
         window.delegate = self
         window.center()
         window.makeKeyAndOrderFront(nil)

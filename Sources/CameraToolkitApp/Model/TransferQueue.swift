@@ -1,4 +1,5 @@
 import Foundation
+import CameraToolkitCore
 
 extension Notification.Name {
     static let cameraToolkitShowTransferQueue = Notification.Name("CameraToolkitShowTransferQueue")
@@ -18,6 +19,7 @@ enum TransferQueueItemState: String, Codable, Sendable {
     case verifying
     case verified
     case alreadyPresent
+    case sourceRemoved
     case conflict
     case failed
 
@@ -29,10 +31,21 @@ enum TransferQueueItemState: String, Codable, Sendable {
         case .verifying: "Verifying"
         case .verified: "Verified"
         case .alreadyPresent: "Already verified"
+        case .sourceRemoved: "Removed from camera"
         case .conflict: "Conflict"
         case .failed: "Stopped"
         }
     }
+}
+
+struct TransferQueueItemStatusText: Equatable, Sendable {
+    var label: String
+    var detail: String?
+}
+
+struct TransferQueueSidebarSummary: Equatable, Sendable {
+    var detail: String
+    var badge: String?
 }
 
 struct TransferQueueItem: Identifiable, Codable, Sendable {
@@ -69,6 +82,8 @@ struct TransferQueueSnapshot: Codable, Sendable {
     var progress: Double
     var processedBytes: Int64
     var totalBytes: Int64
+    var phaseProcessedBytes: Int64?
+    var phaseTotalBytes: Int64?
     var bytesPerSecond: Double
     var phase: String
     var message: String?
@@ -85,8 +100,10 @@ struct TransferQueueSnapshot: Codable, Sendable {
         progress: Double = 0,
         processedBytes: Int64 = 0,
         totalBytes: Int64,
+        phaseProcessedBytes: Int64? = nil,
+        phaseTotalBytes: Int64? = nil,
         bytesPerSecond: Double = 0,
-        phase: String = "Waiting to copy",
+        phase: String = "Preparing transfer",
         message: String? = nil,
         technicalDetail: String? = nil,
         createdAt: Date = Date(),
@@ -100,6 +117,8 @@ struct TransferQueueSnapshot: Codable, Sendable {
         self.progress = progress
         self.processedBytes = processedBytes
         self.totalBytes = totalBytes
+        self.phaseProcessedBytes = phaseProcessedBytes
+        self.phaseTotalBytes = phaseTotalBytes
         self.bytesPerSecond = bytesPerSecond
         self.phase = phase
         self.message = message
@@ -109,7 +128,111 @@ struct TransferQueueSnapshot: Codable, Sendable {
     }
 
     var verifiedCount: Int {
-        items.count { $0.state == .verified || $0.state == .alreadyPresent }
+        items.count {
+            $0.state == .verified || $0.state == .alreadyPresent || $0.state == .sourceRemoved
+        }
+    }
+
+    var sourceRemovedCount: Int {
+        items.count { $0.state == .sourceRemoved }
+    }
+
+    var sidebarSummary: TransferQueueSidebarSummary {
+        switch state {
+        case .running:
+            let percent = Int((min(max(progress, 0), 1) * 100).rounded())
+            guard !items.isEmpty else {
+                return TransferQueueSidebarSummary(detail: "Preparing transfer", badge: "\(percent)%")
+            }
+            let activeIndex = items.firstIndex {
+                $0.state == .copying || $0.state == .verifying
+            } ?? items.firstIndex { $0.state == .waiting } ?? 0
+            let action = switch items[activeIndex].state {
+            case .verifying: "Verifying"
+            case .copying: "Copying"
+            default: "Starting"
+            }
+            return TransferQueueSidebarSummary(
+                detail: "\(action) file \(activeIndex + 1) of \(items.count)",
+                badge: "\(percent)%"
+            )
+        case .completed:
+            if sourceRemovedCount > 0 {
+                return TransferQueueSidebarSummary(
+                    detail: "\(sourceRemovedCount) file\(sourceRemovedCount == 1 ? "" : "s") removed from camera",
+                    badge: "Freed"
+                )
+            }
+            return TransferQueueSidebarSummary(
+                detail: "\(verifiedCount) file\(verifiedCount == 1 ? "" : "s") verified",
+                badge: "Done"
+            )
+        case .failed:
+            return TransferQueueSidebarSummary(detail: "Stopped · open for details", badge: "!")
+        case .cancelled:
+            return TransferQueueSidebarSummary(detail: "Cancelled · open for details", badge: nil)
+        }
+    }
+
+    func statusText(for item: TransferQueueItem) -> TransferQueueItemStatusText {
+        guard item.state == .waiting else {
+            return TransferQueueItemStatusText(label: item.state.label, detail: nil)
+        }
+
+        switch state {
+        case .failed:
+            return TransferQueueItemStatusText(label: "Not started", detail: "transfer stopped")
+        case .cancelled:
+            return TransferQueueItemStatusText(label: "Not started", detail: "transfer cancelled")
+        case .completed:
+            return TransferQueueItemStatusText(label: "Not started", detail: "needs attention")
+        case .running:
+            guard let index = items.firstIndex(where: { $0.id == item.id }) else {
+                return TransferQueueItemStatusText(label: "Waiting", detail: "for its turn")
+            }
+            let hasActiveItem = items.contains { $0.state == .copying || $0.state == .verifying }
+            let firstWaitingIndex = items.firstIndex { $0.state == .waiting }
+            if !hasActiveItem, firstWaitingIndex == index {
+                let detail = index == 0 ? "opening drives" : "opening next file"
+                return TransferQueueItemStatusText(label: "Starting", detail: detail)
+            }
+            return TransferQueueItemStatusText(label: "Waiting", detail: "for file \(index)")
+        }
+    }
+}
+
+struct PendingTransferBatch: Identifiable, Codable, Equatable, Sendable {
+    var id: UUID
+    var eventID: UUID?
+    var eventName: String
+    var deviceID: String
+    var sourcePath: String
+    var destinationPath: String
+    var files: [FileRecord]
+    var createdAt: Date
+
+    init(
+        id: UUID = UUID(),
+        eventID: UUID? = nil,
+        eventName: String,
+        deviceID: String,
+        sourcePath: String,
+        destinationPath: String,
+        files: [FileRecord],
+        createdAt: Date = Date()
+    ) {
+        self.id = id
+        self.eventID = eventID
+        self.eventName = eventName
+        self.deviceID = deviceID
+        self.sourcePath = sourcePath
+        self.destinationPath = destinationPath
+        self.files = files
+        self.createdAt = createdAt
+    }
+
+    var totalBytes: Int64 {
+        files.reduce(Int64(0)) { $0 + $1.size }
     }
 }
 
@@ -135,6 +258,40 @@ struct TransferQueueStore {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         encoder.dateEncodingStrategy = .iso8601
         try encoder.encode(snapshot).write(to: url, options: .atomic)
+    }
+
+    func remove() throws {
+        guard fileManager.fileExists(atPath: url.path) else { return }
+        try fileManager.removeItem(at: url)
+    }
+}
+
+struct PendingTransferQueueStore {
+    let url: URL
+    private let fileManager: FileManager
+
+    init(url: URL, fileManager: FileManager = .default) {
+        self.url = url
+        self.fileManager = fileManager
+    }
+
+    func load() throws -> [PendingTransferBatch] {
+        guard fileManager.fileExists(atPath: url.path) else { return [] }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return try decoder.decode([PendingTransferBatch].self, from: Data(contentsOf: url))
+    }
+
+    func save(_ batches: [PendingTransferBatch]) throws {
+        if batches.isEmpty {
+            try remove()
+            return
+        }
+        try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(batches).write(to: url, options: .atomic)
     }
 
     func remove() throws {

@@ -29,7 +29,7 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate {
             object: nil
         )
         CameraToolkitMainWindow.shared.show(model: model)
-        if model.transferQueue != nil {
+        if model.transferQueue != nil || !model.pendingTransferBatches.isEmpty {
             TransferQueueWindowController.shared.show(model: model)
         }
     }
@@ -111,6 +111,13 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate {
         fileMenuItem.submenu = fileMenu
         addBrowserCommand(
             to: fileMenu,
+            title: "Get Selected Location Info",
+            command: .showSelectedLocationInformation,
+            keyEquivalent: "i"
+        )
+        fileMenu.addItem(.separator())
+        addBrowserCommand(
+            to: fileMenu,
             title: "Open Selected Item",
             command: .openSelection,
             keyEquivalent: "o"
@@ -135,6 +142,13 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate {
             command: .revealSelection,
             keyEquivalent: "r",
             modifiers: [.command, .shift]
+        )
+        fileMenu.addItem(.separator())
+        addBrowserCommand(
+            to: fileMenu,
+            title: "Move to Trash…",
+            command: .moveSelectionToTrash,
+            keyEquivalent: "\u{8}"
         )
 
         let editMenuItem = NSMenuItem()
@@ -288,10 +302,19 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate {
         let transferQueueItem = NSMenuItem(
             title: "Transfer Queue…",
             action: #selector(openTransferQueue),
-            keyEquivalent: ""
+            keyEquivalent: "t"
         )
+        transferQueueItem.keyEquivalentModifierMask = [.command, .option]
         transferQueueItem.target = self
         windowMenu.addItem(transferQueueItem)
+
+        let storageSpeedItem = NSMenuItem(
+            title: "Storage Speed Tests…",
+            action: #selector(openStorageSpeedTests),
+            keyEquivalent: ""
+        )
+        storageSpeedItem.target = self
+        windowMenu.addItem(storageSpeedItem)
         NSApp.windowsMenu = windowMenu
 
         let helpMenuItem = NSMenuItem()
@@ -366,6 +389,10 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate {
         TransferQueueWindowController.shared.show(model: model)
     }
 
+    @objc private func openStorageSpeedTests() {
+        StorageBenchmarkWindowController.shared.show(model: model)
+    }
+
     @objc private func handleTransferQueueRequest(_ notification: Notification) {
         openTransferQueue()
     }
@@ -433,7 +460,12 @@ final class CameraToolkitConfigWindow: NSObject, NSWindowDelegate {
 
         let hostingController = NSHostingController(
             rootView: ConfigView(model: model)
-                .frame(width: 760, height: 620)
+                .frame(
+                    minWidth: CameraToolkitPopOutWindow.settings.minimumContentSize.width,
+                    maxWidth: .infinity,
+                    minHeight: CameraToolkitPopOutWindow.settings.minimumContentSize.height,
+                    maxHeight: .infinity
+                )
         )
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 760, height: 620),
@@ -445,6 +477,7 @@ final class CameraToolkitConfigWindow: NSObject, NSWindowDelegate {
         window.identifier = NSUserInterfaceItemIdentifier("CameraToolkitConfigWindow")
         window.isRestorable = false
         window.contentViewController = hostingController
+        CameraToolkitWindowSizing.configure(window, as: .settings)
         window.isReleasedWhenClosed = false
         window.delegate = self
         window.center()

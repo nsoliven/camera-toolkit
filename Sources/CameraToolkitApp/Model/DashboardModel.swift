@@ -82,23 +82,44 @@ final class DashboardModel {
     var configMessage: String = "Config is saved automatically."
     var statusMessage: String = "Ready. Choose folders in Settings to begin."
     var isBusy: Bool = false
+    var isStorageBenchmarkRunning: Bool = false
     var immichAPIKeyDraft: String = ""
     var immichConnectionStatus: String = "Not connected. Add your server URL and API key in Config."
     var immichConnectionReport: ImmichConnectionReport?
     var immichIsTestingConnection: Bool = false
+    var trueNASAPIKeyDraft: String = ""
+    var trueNASConnectionStatus: String = "Not configured. Add the TrueNAS server in Settings."
+    var trueNASConnectionReport: TrueNASCapacityReport?
+    var trueNASIsTestingConnection: Bool = false
+    var trueNASIsInspectingCertificate: Bool = false
     var isRefreshing: Bool = false
     var lastRefreshedAt: Date?
     var catalogReport: CatalogBootstrapReport?
     var catalogMessage: String = "Photo list has not been prepared yet."
     var transferQueue: TransferQueueSnapshot?
+    var pendingTransferBatches: [PendingTransferBatch]
+    var storageCapacityRevision: Int = 0
+    var sourceCleanupMessage: String?
+    var sourceCleanupError: String?
+    var selectedEventCopyAvailability = EventCopyAvailability()
     var activeJob: JobSnapshot? {
         jobs.first { $0.state == .running || $0.state == .queued }
     }
+    var sourceCleanupJob: JobSnapshot? {
+        jobs.first { $0.action == .freeUp }
+    }
+    var isSourceCleanupRunning: Bool {
+        sourceCleanupJob?.state == .running || sourceCleanupJob?.state == .queued
+    }
     @ObservationIgnored private let configurationStore: ConfigurationStore
     @ObservationIgnored private let transferQueueStore: TransferQueueStore
+    @ObservationIgnored private let pendingTransferQueueStore: PendingTransferQueueStore
     @ObservationIgnored private let secretStore = KeychainSecretStore(service: "org.cameratoolkit.CameraToolkit")
     @ObservationIgnored private var catalogSyncTask: Task<Void, Never>?
     @ObservationIgnored private var lastTransferQueuePersistence = Date.distantPast
+    @ObservationIgnored private var lastStorageCapacityRefreshRequest = Date.distantPast
+    @ObservationIgnored private var eventCopyAvailabilityTask: Task<EventCopyAvailability, Never>?
+    @ObservationIgnored private var eventCopyAvailabilityGeneration = UUID()
 
     init(
         activePlan: CopyPlan,
@@ -107,6 +128,7 @@ final class DashboardModel {
         configuration: AppConfiguration = .defaults(applicationSupport: DashboardModel.defaultApplicationSupportURL),
         configurationStore: ConfigurationStore = ConfigurationStore(url: DashboardModel.defaultConfigurationURL),
         transferQueueStore: TransferQueueStore? = nil,
+        pendingTransferQueueStore: PendingTransferQueueStore? = nil,
         loadActivityLog: Bool = false
     ) {
         self.activePlan = activePlan
@@ -117,7 +139,23 @@ final class DashboardModel {
             url: configurationStore.url.deletingLastPathComponent().appendingPathComponent("transfer-queue.json")
         )
         self.transferQueueStore = resolvedTransferQueueStore
+        let resolvedPendingTransferQueueStore = pendingTransferQueueStore ?? PendingTransferQueueStore(
+            url: configurationStore.url.deletingLastPathComponent().appendingPathComponent("pending-transfers.json")
+        )
+        self.pendingTransferQueueStore = resolvedPendingTransferQueueStore
+        self.pendingTransferBatches = (try? resolvedPendingTransferQueueStore.load()) ?? []
         var restoredTransferQueue = try? resolvedTransferQueueStore.load()
+        if var legacyQueue = restoredTransferQueue,
+           legacyQueue.phaseProcessedBytes == nil || legacyQueue.phaseTotalBytes == nil {
+            legacyQueue.phaseProcessedBytes = legacyQueue.processedBytes
+            legacyQueue.phaseTotalBytes = legacyQueue.totalBytes
+            legacyQueue.progress = Self.transferProgress(
+                processedBytes: legacyQueue.processedBytes,
+                totalBytes: legacyQueue.totalBytes
+            )
+            restoredTransferQueue = legacyQueue
+            try? resolvedTransferQueueStore.save(legacyQueue)
+        }
         if var interruptedQueue = restoredTransferQueue, interruptedQueue.state == .running {
             interruptedQueue.state = .failed
             interruptedQueue.phase = "Transfer interrupted"
@@ -142,6 +180,9 @@ final class DashboardModel {
         if !configuration.immichServerURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             self.immichConnectionStatus = "Immich URL is saved. Keychain is checked only when you click Test Connection."
         }
+        if !configuration.trueNASServerURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            self.trueNASConnectionStatus = "TrueNAS settings are saved. The sidebar will verify the mounted SMB dataset with the Keychain API key."
+        }
     }
 
     static func live() -> DashboardModel {
@@ -160,6 +201,26 @@ final class DashboardModel {
         model.scheduleCatalogSync(configuration: configuration)
         return model
     }
+
+    private static func transferProgress(processedBytes: Int64, totalBytes: Int64) -> Double {
+        guard totalBytes > 0 else { return 0 }
+        return min(max(Double(processedBytes) / Double(totalBytes), 0), 1)
+    }
+
+    private static func eventFileFingerprint(_ files: [FileRecord]) -> UInt64 {
+        var value: UInt64 = 14_695_981_039_346_656_037
+        for file in files.sorted(by: { $0.path < $1.path }) {
+            for byte in file.path.utf8 {
+                value ^= UInt64(byte)
+                value &*= 1_099_511_628_211
+            }
+            value ^= UInt64(bitPattern: file.size)
+            value &*= 1_099_511_628_211
+            value ^= UInt64(bitPattern: Int64(file.modifiedAt.timeIntervalSince1970.rounded()))
+            value &*= 1_099_511_628_211
+        }
+        return value
+    }
 }
 
 extension DashboardModel {
@@ -169,6 +230,14 @@ extension DashboardModel {
             candidates[file.path] = file
         }
         return queuedFilePaths.compactMap { candidates[$0] }.sorted { $0.path < $1.path }
+    }
+
+    var pendingTransferFileCount: Int {
+        pendingTransferBatches.reduce(0) { $0 + $1.files.count }
+    }
+
+    var pendingTransferByteCount: Int64 {
+        pendingTransferBatches.reduce(Int64(0)) { $0 + $1.totalBytes }
     }
 
     var savedEvents: [SavedCameraEvent] {
@@ -198,6 +267,77 @@ extension DashboardModel {
                 modifiedAt: assignment.modifiedAt
             )
         }.sorted { $0.path < $1.path }
+    }
+
+    var selectedEventCopyAvailabilityRefreshID: String {
+        let eventID = configuration.selectedEventID?.uuidString ?? "none"
+        let source = URL(fileURLWithPath: expandedImportSourcePath, isDirectory: true).standardizedFileURL.path
+        let destination = URL(fileURLWithPath: expandedBufferIngestPath, isDirectory: true).standardizedFileURL.path
+        let assignments = selectedEventFiles
+        let fingerprint = Self.eventFileFingerprint(assignments)
+        let transferRevision = transferQueue.map {
+            "\($0.id.uuidString):\($0.state.rawValue):\($0.items.count):\($0.sourceRemovedCount)"
+        } ?? "none"
+        return [
+            eventID,
+            source,
+            destination,
+            String(assignments.count),
+            String(fingerprint),
+            String(storageCapacityRevision),
+            transferRevision,
+            String(pendingTransferFileCount),
+        ].joined(separator: "|")
+    }
+
+    var hasSelectedEventFilesReadyToCopy: Bool {
+        selectedEventCopyAvailability.phase == .ready
+            && selectedEventCopyAvailability.contextID == selectedEventCopyAvailabilityRefreshID
+            && selectedEventCopyAvailability.hasFilesReadyToCopy
+    }
+
+    func refreshSelectedEventCopyAvailability() async {
+        let contextID = selectedEventCopyAvailabilityRefreshID
+        let files = selectedEventFiles
+        guard configuration.selectedEventID != nil, !files.isEmpty else {
+            eventCopyAvailabilityTask?.cancel()
+            selectedEventCopyAvailability = EventCopyAvailability(
+                phase: .ready,
+                contextID: contextID,
+                assignedCount: files.count
+            )
+            return
+        }
+
+        selectedEventCopyAvailability = .checking(
+            contextID: contextID,
+            assignedCount: files.count
+        )
+        eventCopyAvailabilityTask?.cancel()
+        let generation = UUID()
+        eventCopyAvailabilityGeneration = generation
+
+        let source = URL(fileURLWithPath: expandedImportSourcePath, isDirectory: true)
+        let destination = URL(fileURLWithPath: expandedBufferIngestPath, isDirectory: true)
+        let scheduledPaths = scheduledTransferPaths(sourcePath: source.path, destinationPath: destination.path)
+        let task = Task.detached(priority: .utility) {
+            EventCopyAvailabilityScanner.scan(
+                contextID: contextID,
+                files: files,
+                sourceRoot: source,
+                bufferRoot: destination,
+                scheduledPaths: scheduledPaths
+            )
+        }
+        eventCopyAvailabilityTask = task
+        let result = await task.value
+
+        guard !Task.isCancelled,
+              generation == eventCopyAvailabilityGeneration,
+              result.contextID == selectedEventCopyAvailabilityRefreshID else {
+            return
+        }
+        selectedEventCopyAvailability = result
     }
 
     func toggleSidebar() {
@@ -252,7 +392,8 @@ extension DashboardModel {
         }
         activePlan = CopyPlan()
         organizedArchivePlan = OrganizedArchivePlan()
-        queuedFilePaths = Set(selectedEventFiles.map(\.path))
+        queuedFilePaths.removeAll()
+        selectedEventCopyAvailability = EventCopyAvailability()
         createSelectedEventFolders()
         return true
     }
@@ -269,7 +410,8 @@ extension DashboardModel {
         }
         activePlan = CopyPlan()
         organizedArchivePlan = OrganizedArchivePlan()
-        queuedFilePaths = Set(selectedEventFiles.map(\.path))
+        queuedFilePaths.removeAll()
+        selectedEventCopyAvailability = EventCopyAvailability()
         statusMessage = selectedEventFiles.isEmpty
             ? "Selected \(event.name). Select photos and assign them to this event."
             : "Selected \(event.name) with \(selectedEventFiles.count) assigned file(s)."
@@ -333,24 +475,45 @@ extension DashboardModel {
         )
         let sourceCount = Set(validSelections.map(\.sourceRootPath)).count
         let sourceNote = sourceCount == 1 ? "" : " across \(sourceCount) camera sources"
+        selectedEventCopyAvailability = EventCopyAvailability()
         statusMessage = "Assigned \(validSelections.count) file(s)\(sourceNote) to \(event.name)."
     }
 
     func queueSelectedEventFiles() {
-        queuedFilePaths = Set(selectedEventFiles.map(\.path))
-        statusMessage = selectedEventFiles.isEmpty
-            ? "This event has no assigned files on the selected camera source."
-            : "Queued \(selectedEventFiles.count) file(s) assigned to \(selectedEvent?.name ?? "the event")."
+        guard selectedEventCopyAvailability.contextID == selectedEventCopyAvailabilityRefreshID,
+              selectedEventCopyAvailability.phase == .ready else {
+            statusMessage = "Checking which assigned files are still on the source and need copying…"
+            Task { await refreshSelectedEventCopyAvailability() }
+            return
+        }
+        let files = selectedEventCopyAvailability.filesReadyToCopy
+        queuedFilePaths = Set(files.map(\.path))
+        statusMessage = files.isEmpty
+            ? "Nothing needs copying from this source."
+            : "Queued \(files.count) file(s) that are present on the source and not already in the Buffer."
     }
 
     func copySelectedEventFilesToBuffer() {
-        let files = selectedEventFiles
+        guard selectedEventCopyAvailability.contextID == selectedEventCopyAvailabilityRefreshID,
+              selectedEventCopyAvailability.phase == .ready else {
+            statusMessage = "Checking which assigned files are still on the source and need copying…"
+            Task { await refreshSelectedEventCopyAvailability() }
+            return
+        }
+        let files = selectedEventCopyAvailability.filesReadyToCopy
         guard !files.isEmpty else {
-            statusMessage = "Assign files to the selected event before copying to the Buffer."
+            statusMessage = "Nothing needs copying. Assigned files are already in the Buffer, unavailable, missing, or already queued."
             return
         }
         queuedFilePaths = Set(files.map(\.path))
-        copyQueuedFilesToBuffer()
+        enqueueTransfer(
+            files: files,
+            sourcePath: expandedImportSourcePath,
+            destinationPath: expandedBufferIngestPath,
+            eventID: selectedEvent?.id,
+            eventName: selectedEvent?.name ?? configuration.eventName,
+            deviceID: configuration.selectedDeviceID
+        )
     }
 
     func setEventImmichUploadEnabled(_ eventID: UUID, enabled: Bool) {
@@ -731,6 +894,142 @@ extension DashboardModel {
         updateConfiguration { $0.immichServerURL = value.trimmingCharacters(in: .whitespacesAndNewlines) }
     }
 
+    func setTrueNASServerURL(_ value: String) {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        updateConfiguration { configuration in
+            if configuration.trueNASServerURL != trimmed {
+                configuration.trueNASTLSPinnedCertificateSHA256 = ""
+            }
+            configuration.trueNASServerURL = trimmed
+        }
+        trueNASConnectionReport = nil
+        trueNASConnectionStatus = trimmed.isEmpty
+            ? "Not configured. Add the TrueNAS server in Settings."
+            : "Server saved. Trust its certificate, save the API key, then test the NAS."
+        storageCapacityRevision &+= 1
+    }
+
+    func setTrueNASUsername(_ value: String) {
+        updateConfiguration { $0.trueNASUsername = value.trimmingCharacters(in: .whitespacesAndNewlines) }
+        trueNASConnectionReport = nil
+        storageCapacityRevision &+= 1
+    }
+
+    func setTrueNASDataset(_ value: String) {
+        updateConfiguration { $0.trueNASDataset = value.trimmingCharacters(in: .whitespacesAndNewlines) }
+        trueNASConnectionReport = nil
+        storageCapacityRevision &+= 1
+    }
+
+    func trustCurrentTrueNASCertificate() {
+        let serverURL = configuration.trueNASServerURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !serverURL.isEmpty else {
+            trueNASConnectionStatus = "Add the TrueNAS server URL first."
+            return
+        }
+        trueNASIsInspectingCertificate = true
+        trueNASConnectionStatus = "Reading the TrueNAS TLS certificate…"
+        Task { @MainActor in
+            defer { trueNASIsInspectingCertificate = false }
+            do {
+                let fingerprint = try await TrueNASClient.certificateFingerprint(serverURL: serverURL)
+                updateConfiguration { $0.trueNASTLSPinnedCertificateSHA256 = fingerprint }
+                trueNASConnectionStatus = "Trusted this server certificate: \(Self.shortFingerprint(fingerprint))."
+            } catch {
+                trueNASConnectionStatus = "Could not trust the TrueNAS certificate: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    func saveTrueNASAPIKey() {
+        do {
+            try secretStore.save(trueNASAPIKeyDraft, account: Self.trueNASAPIKeyAccount)
+            trueNASConnectionStatus = trueNASAPIKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? "TrueNAS API key removed from Keychain."
+                : "TrueNAS API key saved in Keychain."
+            configMessage = "TrueNAS API key saved in macOS Keychain."
+        } catch {
+            trueNASConnectionStatus = "Could not save the TrueNAS API key: \(error.localizedDescription)"
+        }
+    }
+
+    func testTrueNASConnection() {
+        Task { @MainActor in
+            trueNASIsTestingConnection = true
+            trueNASConnectionStatus = "Testing exact TrueNAS capacity…"
+            defer { trueNASIsTestingConnection = false }
+            if let snapshot = await readAuthoritativeTrueNASCapacity() {
+                trueNASConnectionStatus = trueNASConnectionSummary(snapshot: snapshot)
+                storageCapacityRevision &+= 1
+            }
+        }
+    }
+
+    func readAuthoritativeTrueNASCapacity() async -> StorageCapacitySnapshot? {
+        let serverURL = configuration.trueNASServerURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let dataset = configuration.trueNASDataset.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !serverURL.isEmpty else {
+            trueNASConnectionReport = nil
+            return nil
+        }
+
+        var apiKey = trueNASAPIKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        do {
+            if apiKey.isEmpty {
+                apiKey = try secretStore.read(account: Self.trueNASAPIKeyAccount)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            } else {
+                try secretStore.save(apiKey, account: Self.trueNASAPIKeyAccount)
+            }
+            guard !apiKey.isEmpty else {
+                trueNASConnectionReport = nil
+                trueNASConnectionStatus = "The SMB folder is mounted, but no TrueNAS API key is saved. Capacity is only an SMB estimate."
+                return nil
+            }
+
+            let client = try TrueNASClient(
+                serverURL: serverURL,
+                username: configuration.trueNASUsername,
+                apiKey: apiKey,
+                pinnedCertificateSHA256: configuration.trueNASTLSPinnedCertificateSHA256
+            )
+            let report = try await client.readCapacity(
+                dataset: dataset,
+                smbShareName: StorageCapacityReader.mountedVolumeName(for: configuration.cameraLibraryRootPath)
+            )
+            if dataset.isEmpty {
+                updateConfiguration { $0.trueNASDataset = report.dataset }
+            }
+            trueNASConnectionReport = report
+            let snapshot = StorageCapacitySnapshot(
+                availableBytes: report.datasetAvailableBytes,
+                totalBytes: report.datasetTotalBytes,
+                source: .trueNAS(
+                    dataset: report.dataset,
+                    pool: report.poolName,
+                    poolAvailableBytes: report.poolFreeBytes,
+                    poolTotalBytes: report.poolTotalBytes,
+                    poolHealthy: report.poolHealthy
+                )
+            )
+            trueNASConnectionStatus = trueNASConnectionSummary(snapshot: snapshot)
+            return snapshot
+        } catch {
+            trueNASConnectionReport = nil
+            let certificateHint = configuration.trueNASTLSPinnedCertificateSHA256.isEmpty
+                ? " If this NAS uses its default self-signed certificate, click Trust Current Certificate first."
+                : ""
+            trueNASConnectionStatus = "TrueNAS capacity check failed: \(error.localizedDescription)\(certificateHint)"
+            return nil
+        }
+    }
+
+    private func trueNASConnectionSummary(snapshot: StorageCapacitySnapshot) -> String {
+        guard let report = trueNASConnectionReport else { return "TrueNAS dataset connected." }
+        let health = report.poolHealthy ? report.poolStatus : "\(report.poolStatus), needs attention"
+        return "Connected to \(report.dataset) on pool \(report.poolName) (\(health)): \(snapshot.availableBytes.formattedWholeStorage) free."
+    }
+
     func saveImmichAPIKey() {
         do {
             try secretStore.save(immichAPIKeyDraft, account: Self.immichAPIKeyAccount)
@@ -844,9 +1143,15 @@ extension DashboardModel {
     }
 
     func previewSelectedEventImport() {
-        let selectedFiles = selectedEventFiles
+        guard selectedEventCopyAvailability.contextID == selectedEventCopyAvailabilityRefreshID,
+              selectedEventCopyAvailability.phase == .ready else {
+            statusMessage = "Checking which assigned files are still available for preview…"
+            Task { await refreshSelectedEventCopyAvailability() }
+            return
+        }
+        let selectedFiles = selectedEventCopyAvailability.presentFiles
         guard !selectedFiles.isEmpty else {
-            statusMessage = "Assign photos to the selected event before previewing it."
+            statusMessage = "No assigned files are currently present on this source."
             return
         }
 
@@ -931,13 +1236,138 @@ extension DashboardModel {
             statusMessage = "Queue is empty. Preview files, then add files to the queue."
             return
         }
-        guard !isBusy else {
-            statusMessage = "Another file job is already running. Wait for it to finish, then try again."
+        enqueueTransfer(
+            files: selectedFiles,
+            sourcePath: expandedImportSourcePath,
+            destinationPath: expandedBufferIngestPath,
+            eventID: selectedEvent?.id,
+            eventName: selectedEvent?.name ?? configuration.eventName,
+            deviceID: configuration.selectedDeviceID
+        )
+    }
+
+    func resumePendingTransfers() {
+        guard !pendingTransferBatches.isEmpty else {
+            statusMessage = "There are no waiting transfers."
+            return
+        }
+        guard !isBusy, !isStorageBenchmarkRunning else {
+            statusMessage = "The queued transfers will start when the current job finishes."
+            return
+        }
+        startNextPendingTransferIfPossible()
+    }
+
+    func removePendingTransferBatch(_ id: UUID) {
+        guard let batch = pendingTransferBatches.first(where: { $0.id == id }) else { return }
+        pendingTransferBatches.removeAll { $0.id == id }
+        persistPendingTransfers()
+        statusMessage = "Removed \(batch.files.count) waiting file(s) from the transfer queue. No files were changed."
+    }
+
+    func enqueueTransferBatch(_ batch: PendingTransferBatch) {
+        enqueueTransfer(
+            files: batch.files,
+            sourcePath: batch.sourcePath,
+            destinationPath: batch.destinationPath,
+            eventID: batch.eventID,
+            eventName: batch.eventName,
+            deviceID: batch.deviceID
+        )
+    }
+
+    private func scheduledTransferPaths(sourcePath: String, destinationPath: String) -> Set<String> {
+        let standardizedSource = URL(fileURLWithPath: sourcePath, isDirectory: true).standardizedFileURL.path
+        let standardizedDestination = URL(fileURLWithPath: destinationPath, isDirectory: true).standardizedFileURL.path
+        var paths = Set<String>()
+
+        if let active = transferQueue,
+           active.state == .running,
+           URL(fileURLWithPath: active.sourcePath, isDirectory: true).standardizedFileURL.path == standardizedSource,
+           URL(fileURLWithPath: active.destinationPath, isDirectory: true).standardizedFileURL.path == standardizedDestination {
+            paths.formUnion(active.items.map(\.relativePath))
+        }
+        for batch in pendingTransferBatches
+        where batch.sourcePath == standardizedSource && batch.destinationPath == standardizedDestination {
+            paths.formUnion(batch.files.map(\.path))
+        }
+        return paths
+    }
+
+    private func enqueueTransfer(
+        files: [FileRecord],
+        sourcePath: String,
+        destinationPath: String,
+        eventID: UUID?,
+        eventName: String,
+        deviceID: String
+    ) {
+        let standardizedSource = URL(fileURLWithPath: sourcePath, isDirectory: true).standardizedFileURL.path
+        let standardizedDestination = URL(fileURLWithPath: destinationPath, isDirectory: true).standardizedFileURL.path
+        var alreadyScheduled = Set<String>()
+
+        if let active = transferQueue,
+           active.state == .running,
+           URL(fileURLWithPath: active.sourcePath, isDirectory: true).standardizedFileURL.path == standardizedSource,
+           URL(fileURLWithPath: active.destinationPath, isDirectory: true).standardizedFileURL.path == standardizedDestination {
+            alreadyScheduled.formUnion(active.items.map(\.relativePath))
+        }
+        for batch in pendingTransferBatches
+        where batch.sourcePath == standardizedSource && batch.destinationPath == standardizedDestination {
+            alreadyScheduled.formUnion(batch.files.map(\.path))
+        }
+
+        var uniqueFiles: [String: FileRecord] = [:]
+        for file in files where (try? PathSafety.validateRelativePath(file.path)) != nil {
+            guard !alreadyScheduled.contains(file.path) else { continue }
+            uniqueFiles[file.path] = file
+        }
+        let unscheduledFiles = uniqueFiles.values.sorted { $0.path < $1.path }
+        guard !unscheduledFiles.isEmpty else {
+            statusMessage = "Those files are already transferring or waiting in the transfer queue."
+            NotificationCenter.default.post(name: .cameraToolkitShowTransferQueue, object: nil)
             return
         }
 
-        let sourcePath = expandedImportSourcePath
-        let destinationPath = expandedBufferIngestPath
+        if let existingIndex = pendingTransferBatches.firstIndex(where: {
+            $0.eventID == eventID
+                && $0.sourcePath == standardizedSource
+                && $0.destinationPath == standardizedDestination
+        }) {
+            pendingTransferBatches[existingIndex].files.append(contentsOf: unscheduledFiles)
+            pendingTransferBatches[existingIndex].files.sort { $0.path < $1.path }
+        } else {
+            pendingTransferBatches.append(PendingTransferBatch(
+                eventID: eventID,
+                eventName: eventName,
+                deviceID: deviceID,
+                sourcePath: standardizedSource,
+                destinationPath: standardizedDestination,
+                files: unscheduledFiles
+            ))
+        }
+        persistPendingTransfers()
+        queuedFilePaths.formUnion(unscheduledFiles.map(\.path))
+        NotificationCenter.default.post(name: .cameraToolkitShowTransferQueue, object: nil)
+
+        if isBusy || isStorageBenchmarkRunning {
+            statusMessage = "Added \(unscheduledFiles.count) file(s) to the transfer queue. Keep browsing and assigning more while the current job runs."
+        } else {
+            startNextPendingTransferIfPossible()
+        }
+    }
+
+    func startNextPendingTransferIfPossible() {
+        guard !isBusy, !isStorageBenchmarkRunning, let batch = pendingTransferBatches.first else { return }
+        pendingTransferBatches.removeFirst()
+        persistPendingTransfers()
+        runTransfer(batch)
+    }
+
+    private func runTransfer(_ batch: PendingTransferBatch) {
+        let selectedFiles = batch.files
+        let sourcePath = batch.sourcePath
+        let destinationPath = batch.destinationPath
         let source = URL(fileURLWithPath: sourcePath, isDirectory: true)
         let destination = URL(fileURLWithPath: destinationPath, isDirectory: true)
         let command = Self.commandLine(["copy-queue", sourcePath, destinationPath, "\(selectedFiles.count) files"])
@@ -963,17 +1393,111 @@ extension DashboardModel {
             },
             completion: { result in
                 self.activePlan = result.plan
-                self.queuedFilePaths.removeAll()
+                self.queuedFilePaths.subtract(selectedFiles.map(\.path))
                 self.completeTransferQueue(copy: result.copy, plan: result.plan)
                 return "Copied \(result.copy.copied.count) queued file(s) to buffer, skipped \(result.copy.skippedIdentical.count) already there, left \(result.copy.conflicts.count) conflict(s) untouched."
             }
         )
     }
 
+    private func persistPendingTransfers() {
+        do {
+            try pendingTransferQueueStore.save(pendingTransferBatches)
+        } catch {
+            statusMessage = "The transfer was queued in this session, but its waiting list could not be saved: \(error.localizedDescription)"
+        }
+    }
+
     func dismissTransferQueue() {
         guard transferQueue?.state != .running else { return }
         transferQueue = nil
         try? transferQueueStore.remove()
+    }
+
+    func prepareSourceCleanup() {
+        guard !isSourceCleanupRunning else { return }
+        sourceCleanupMessage = nil
+        sourceCleanupError = nil
+    }
+
+    func removeVerifiedSourceFiles(queueID: UUID, confirmation: String) {
+        guard !isBusy, !isSourceCleanupRunning, !isStorageBenchmarkRunning else {
+            sourceCleanupError = "Another file job is already running. Wait for it to finish, then try again."
+            return
+        }
+        guard let queue = transferQueue,
+              queue.id == queueID,
+              queue.state == .completed,
+              queue.verifiedCount == queue.items.count else {
+            sourceCleanupError = "Every selected file must be checksum verified in the Buffer first."
+            return
+        }
+
+        let removableItems = queue.items.filter {
+            $0.state == .verified || $0.state == .alreadyPresent
+        }
+        guard !removableItems.isEmpty else {
+            sourceCleanupError = "These source files have already been removed from the camera."
+            return
+        }
+
+        let records = removableItems.map {
+            FileRecord(path: $0.relativePath, size: $0.size, modifiedAt: .distantPast)
+        }
+        let sourcePath = queue.sourcePath
+        let bufferPath = queue.destinationPath
+        let source = URL(fileURLWithPath: sourcePath, isDirectory: true)
+        let buffer = URL(fileURLWithPath: bufferPath, isDirectory: true)
+        let command = Self.commandLine([
+            "free-up-camera", "--recheck", sourcePath, bufferPath, "\(records.count) files"
+        ])
+
+        sourceCleanupMessage = nil
+        sourceCleanupError = nil
+
+        runBackgroundJob(
+            action: .freeUp,
+            runningNote: "Rechecking camera files against the Buffer before removal",
+            logTitle: "Freed verified camera space",
+            logDetail: "Re-hashed the explicit source and Buffer files before permanently removing only matching camera originals.",
+            command: command,
+            sourcePath: sourcePath,
+            destinationPath: bufferPath,
+            operation: { jobProgress in
+                try SourceCleanupService().removeVerifiedFiles(
+                    sourceRoot: source,
+                    bufferRoot: buffer,
+                    files: records,
+                    confirmation: confirmation
+                ) { update in
+                    jobProgress(Self.jobUpdate(
+                        from: update,
+                        lowerBound: 0.02,
+                        upperBound: 0.98,
+                        notePrefix: "Safely freeing camera space",
+                        command: command,
+                        sourcePath: sourcePath,
+                        destinationPath: bufferPath
+                    ))
+                }
+            },
+            completion: { report in
+                self.applySourceCleanupReport(report, queueID: queueID)
+
+                guard report.removed.count == records.count else {
+                    let summary = Self.sourceCleanupFailureSummary(
+                        report,
+                        requestedCount: records.count
+                    )
+                    self.sourceCleanupError = summary
+                    throw ToolkitError.commandFailed(summary)
+                }
+
+                let summary = "Removed \(report.removed.count) checksum-matched file(s) from the camera and freed \(report.removedBytes.formattedBytes). Buffer copies remain verified."
+                self.sourceCleanupMessage = summary
+                return summary
+            }
+        )
     }
 
     var isBufferVerifiedForArchive: Bool {
@@ -1227,7 +1751,9 @@ extension DashboardModel {
             sourcePath: sourcePath,
             destinationPath: destinationPath,
             items: sorted.map { TransferQueueItem(relativePath: $0.path, size: $0.size) },
-            totalBytes: sorted.reduce(Int64(0)) { $0 + $1.size }
+            totalBytes: sorted.reduce(Int64(0)) { $0 + $1.size },
+            phaseProcessedBytes: 0,
+            phaseTotalBytes: sorted.reduce(Int64(0)) { $0 + $1.size }
         )
         persistTransferQueue(force: true)
         NotificationCenter.default.post(name: .cameraToolkitShowTransferQueue, object: nil)
@@ -1235,7 +1761,13 @@ extension DashboardModel {
 
     private func updateTransferQueue(_ update: BackgroundJobUpdate) {
         guard var queue = transferQueue, queue.state == .running else { return }
-        queue.progress = min(max(update.progress, 0), 1)
+        if update.totalBytes > 0 {
+            queue.progress = min(max(Double(update.processedBytes) / Double(update.totalBytes), 0), 1)
+        } else {
+            queue.progress = min(max(update.progress, 0), 1)
+        }
+        queue.phaseProcessedBytes = update.processedBytes
+        queue.phaseTotalBytes = update.totalBytes
         queue.bytesPerSecond = update.bytesPerSecond
         queue.phase = Self.displayPhase(update.phase)
         queue.updatedAt = Date()
@@ -1302,6 +1834,8 @@ extension DashboardModel {
         queue.state = issueCount == 0 ? .completed : .failed
         queue.progress = 1
         queue.processedBytes = queue.totalBytes
+        queue.phaseProcessedBytes = queue.totalBytes
+        queue.phaseTotalBytes = queue.totalBytes
         queue.bytesPerSecond = 0
         queue.phase = issueCount == 0 ? "Transfer complete" : "Completed with issues"
         queue.message = issueCount == 0
@@ -1311,6 +1845,54 @@ extension DashboardModel {
         transferQueue = queue
         persistTransferQueue(force: true)
         NotificationCenter.default.post(name: .cameraToolkitShowTransferQueue, object: nil)
+    }
+
+    private func applySourceCleanupReport(_ report: SourceCleanupReport, queueID: UUID) {
+        guard var queue = transferQueue, queue.id == queueID else { return }
+        let removed = Set(report.removed)
+        for index in queue.items.indices where removed.contains(queue.items[index].relativePath) {
+            queue.items[index].state = .sourceRemoved
+            queue.items[index].detail = "Removed from the camera after a fresh checksum match with the Buffer."
+        }
+        if !removed.isEmpty {
+            queue.phase = report.removed.count == queue.items.count
+                ? "Camera space freed"
+                : "Some camera files removed"
+            queue.message = "Removed \(report.removed.count) checksum-matched source file(s), freeing \(report.removedBytes.formattedBytes). Buffer copies remain verified."
+            queue.technicalDetail = report.errors.isEmpty
+                ? nil
+                : report.errors.sorted { $0.key < $1.key }.map { "\($0.key): \($0.value)" }.joined(separator: "\n")
+            queue.updatedAt = Date()
+            transferQueue = queue
+            persistTransferQueue(force: true)
+            BrowserCommand.post(.reload)
+        }
+    }
+
+    nonisolated private static func sourceCleanupFailureSummary(
+        _ report: SourceCleanupReport,
+        requestedCount: Int
+    ) -> String {
+        var reasons: [String] = []
+        if !report.missingSource.isEmpty {
+            reasons.append("\(report.missingSource.count) source file(s) are already missing")
+        }
+        if !report.missingBuffer.isEmpty {
+            reasons.append("\(report.missingBuffer.count) Buffer copy/copies are missing")
+        }
+        if !report.differ.isEmpty {
+            reasons.append("\(report.differ.count) checksum(s) differ")
+        }
+        if !report.errors.isEmpty {
+            reasons.append("\(report.errors.count) file(s) changed or could not be checked")
+        }
+        if report.removed.count < requestedCount, reasons.isEmpty {
+            reasons.append("not every source file could be removed")
+        }
+        let prefix = report.removed.isEmpty
+            ? "Nothing was removed."
+            : "Removed \(report.removed.count) file(s), then stopped safely."
+        return "\(prefix) \(reasons.joined(separator: "; ")). Buffer copies were untouched."
     }
 
     private func failTransferQueue(error: Error, message: String) {
@@ -1374,7 +1956,7 @@ extension DashboardModel {
         operation: @escaping @Sendable (@escaping @Sendable (BackgroundJobUpdate) -> Void) throws -> Result,
         completion: @escaping (Result) throws -> String
     ) {
-        guard !isBusy else {
+        guard !isBusy, !isStorageBenchmarkRunning else {
             statusMessage = "Another file job is already running. Wait for it to finish, then try again."
             return
         }
@@ -1427,6 +2009,9 @@ extension DashboardModel {
                     logTitle: logTitle,
                     logDetail: logDetail
                 )
+                if !tracksTransferQueue || transferQueue?.state == .completed {
+                    startNextPendingTransferIfPossible()
+                }
             } catch is CancellationError {
                 let summary = "Cancelled."
                 statusMessage = summary
@@ -1475,6 +2060,14 @@ extension DashboardModel {
         jobs[index].processedBytes = update.processedBytes
         jobs[index].totalBytes = update.totalBytes
         jobs[index].bytesPerSecond = update.bytesPerSecond
+
+        let phase = update.phase.lowercased()
+        let changesStoredBytes = phase.contains("copying") || phase.contains("removing from camera")
+        let now = Date()
+        if changesStoredBytes, now.timeIntervalSince(lastStorageCapacityRefreshRequest) >= 1 {
+            storageCapacityRevision &+= 1
+            lastStorageCapacityRefreshRequest = now
+        }
     }
 
     private func finishJob(
@@ -1502,6 +2095,7 @@ extension DashboardModel {
             detail: logDetail
         )
         isBusy = false
+        storageCapacityRevision &+= 1
     }
 
     private func recordActivity(action: JobAction, state: JobState, title: String, summary: String, detail: String) {
@@ -1574,6 +2168,17 @@ extension DashboardModel {
     }
 
     private static let immichAPIKeyAccount = "immich-api-key"
+    private static let trueNASAPIKeyAccount = "truenas-api-key"
+
+    private static func shortFingerprint(_ fingerprint: String) -> String {
+        let compact = fingerprint.uppercased().filter(\.isHexDigit)
+        let groups = stride(from: 0, to: min(compact.count, 16), by: 2).map { offset -> String in
+            let start = compact.index(compact.startIndex, offsetBy: offset)
+            let end = compact.index(start, offsetBy: min(2, compact.distance(from: start, to: compact.endIndex)))
+            return String(compact[start..<end])
+        }
+        return groups.joined(separator: ":") + (compact.count > 16 ? "…" : "")
+    }
 
     static func expandedPath(_ path: String) -> String {
         NSString(string: path).expandingTildeInPath

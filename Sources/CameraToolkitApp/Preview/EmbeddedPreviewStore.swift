@@ -465,7 +465,7 @@ struct CameraSelectionPreview: View {
 @MainActor
 final class EmbeddedPreviewWindowController {
     static let shared = EmbeddedPreviewWindowController()
-    private static let minimumContentSize = NSSize(width: 640, height: 440)
+    private static let minimumContentSize = CameraToolkitPopOutWindow.preview.minimumContentSize
     private static let defaultContentSize = NSSize(width: 1_080, height: 760)
 
     private var window: NSWindow?
@@ -487,8 +487,7 @@ final class EmbeddedPreviewWindowController {
             let hadCollapsedFrame = previousFrame.width < Self.minimumContentSize.width
                 || previousFrame.height < Self.minimumContentSize.height
             window.contentViewController = NSHostingController(rootView: content)
-            window.contentMinSize = Self.minimumContentSize
-            window.minSize = window.frameRect(forContentRect: NSRect(origin: .zero, size: Self.minimumContentSize)).size
+            CameraToolkitWindowSizing.configure(window, as: .preview)
             if hadCollapsedFrame {
                 window.setContentSize(Self.defaultContentSize)
                 window.center()
@@ -510,10 +509,9 @@ final class EmbeddedPreviewWindowController {
             defer: false
         )
         window.title = "Camera Toolkit Preview"
-        window.contentMinSize = Self.minimumContentSize
-        window.minSize = window.frameRect(forContentRect: NSRect(origin: .zero, size: Self.minimumContentSize)).size
         window.isReleasedWhenClosed = false
         window.contentViewController = NSHostingController(rootView: content)
+        CameraToolkitWindowSizing.configure(window, as: .preview)
         // Assigning the hosting controller makes AppKit adopt SwiftUI's
         // minimum fitting size. Re-apply the intended first-open size after
         // that assignment so a new preview starts comfortably large.
@@ -613,14 +611,19 @@ private struct EmbeddedPreviewView: View {
 
 enum PhotomatorLauncher {
     static func open(_ url: URL) {
+        open([url])
+    }
+
+    static func open(_ urls: [URL]) {
+        guard !urls.isEmpty else { return }
         guard let app = NSWorkspace.shared.urlForApplication(
             withBundleIdentifier: "com.pixelmatorteam.pixelmator.touch.x.photo"
         ) else {
-            NSWorkspace.shared.open(url)
+            urls.forEach { NSWorkspace.shared.open($0) }
             return
         }
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.activates = true
-        NSWorkspace.shared.open([url], withApplicationAt: app, configuration: configuration)
+        NSWorkspace.shared.open(urls, withApplicationAt: app, configuration: configuration)
     }
 }
