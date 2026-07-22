@@ -75,6 +75,21 @@ enum BrowserTreeProjection {
     }
 }
 
+enum BrowserTreeMutationState {
+    static func isInsideSubtree(_ id: String, rootedAt subtreeRoots: [String]) -> Bool {
+        subtreeRoots.contains { root in
+            id == root || id.hasPrefix(root.hasSuffix("/") ? root : root + "/")
+        }
+    }
+
+    static func removingSubtrees(
+        from ids: Set<String>,
+        rootedAt subtreeRoots: [String]
+    ) -> Set<String> {
+        ids.filter { !isInsideSubtree($0, rootedAt: subtreeRoots) }
+    }
+}
+
 enum BrowserThumbnailShortcut {
     static func command(
         for charactersIgnoringModifiers: String?,

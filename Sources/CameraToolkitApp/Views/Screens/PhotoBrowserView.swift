@@ -2506,7 +2506,11 @@ struct PhotoBrowserView: View {
             return
         }
         let destination = currentURL.appendingPathComponent(name, isDirectory: true)
-        runBrowserMutation(label: "Creating folder…", selecting: destination) {
+        runBrowserMutation(
+            label: "Creating folder…",
+            selecting: destination,
+            refreshingFolders: [currentURL]
+        ) {
             try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: false)
         }
     }
@@ -2534,7 +2538,12 @@ struct PhotoBrowserView: View {
             name,
             isDirectory: item.isDirectory
         )
-        runBrowserMutation(label: "Renaming…", selecting: destination) {
+        runBrowserMutation(
+            label: "Renaming…",
+            selecting: destination,
+            refreshingFolders: [item.url.deletingLastPathComponent()],
+            removingSubtrees: [item.url]
+        ) {
             if FileManager.default.fileExists(atPath: destination.path) {
                 throw CocoaError(.fileWriteFileExists)
             }
@@ -2558,7 +2567,9 @@ struct PhotoBrowserView: View {
         runBrowserMutation(
             label: "Deleting empty folder…",
             selecting: nil,
-            errorTitle: "Folder Was Not Deleted"
+            errorTitle: "Folder Was Not Deleted",
+            refreshingFolders: [item.url.deletingLastPathComponent()],
+            removingSubtrees: [item.url]
         ) {
             try EmptyFolderDeletionService.delete(item.url, protectedURLs: protectedURLs)
         }
@@ -2590,7 +2601,9 @@ struct PhotoBrowserView: View {
             label: selectedItems.count == 1 ? "Moving item to Trash…" : "Moving \(selectedItems.count) items to Trash…",
             selecting: nil,
             errorTitle: "Items Were Not Moved to Trash",
-            refreshAfterFailure: true
+            refreshAfterFailure: true,
+            refreshingFolders: urls.map { $0.deletingLastPathComponent() },
+            removingSubtrees: urls
         ) {
             _ = try FileTrashService.moveToTrash(urls, protectedURLs: protectedURLs)
         }
@@ -2619,6 +2632,8 @@ struct PhotoBrowserView: View {
         selecting destination: URL?,
         errorTitle: String = "The File Operation Failed",
         refreshAfterFailure: Bool = false,
+        refreshingFolders: [URL] = [],
+        removingSubtrees: [URL] = [],
         operation: @escaping @Sendable () throws -> Void
     ) {
         guard browserOperationLabel == nil else { return }
@@ -2638,20 +2653,72 @@ struct PhotoBrowserView: View {
             if let errorMessage {
                 if refreshAfterFailure {
                     model.storageCapacityRevision &+= 1
-                    resetBrowserTree()
-                    await loadCurrentDirectory()
+                    await refreshBrowserAfterMutation(
+                        refreshingFolders: refreshingFolders,
+                        removingSubtrees: []
+                    )
                 }
                 showBrowserOperationError(title: errorTitle, message: errorMessage)
                 return
             }
 
             model.storageCapacityRevision &+= 1
-            resetBrowserTree()
-            await loadCurrentDirectory()
+            await refreshBrowserAfterMutation(
+                refreshingFolders: refreshingFolders,
+                removingSubtrees: removingSubtrees
+            )
             if let destination {
                 selectedItemIDs = [destination.path]
             }
         }
+    }
+
+    @MainActor
+    private func refreshBrowserAfterMutation(
+        refreshingFolders: [URL],
+        removingSubtrees: [URL]
+    ) async {
+        let previousSelection = selectedItemIDs
+        let stalePaths = removingSubtrees.map { $0.standardizedFileURL.path }
+
+        expandedFolderIDs = BrowserTreeMutationState.removingSubtrees(
+            from: expandedFolderIDs,
+            rootedAt: stalePaths
+        )
+        childrenByFolderID = childrenByFolderID.filter { id, _ in
+            !BrowserTreeMutationState.isInsideSubtree(id, rootedAt: stalePaths)
+        }
+        loadingFolderIDs = BrowserTreeMutationState.removingSubtrees(
+            from: loadingFolderIDs,
+            rootedAt: stalePaths
+        )
+        folderExpansionErrors = folderExpansionErrors.filter { id, _ in
+            !BrowserTreeMutationState.isInsideSubtree(id, rootedAt: stalePaths)
+        }
+
+        let currentRootID = currentURL.standardizedFileURL.path
+        let folderIDs = Set(refreshingFolders.map { $0.standardizedFileURL.path })
+        for folderID in folderIDs where folderID != currentRootID {
+            childrenByFolderID[folderID] = nil
+            loadingFolderIDs.remove(folderID)
+            folderExpansionErrors[folderID] = nil
+        }
+
+        await loadCurrentDirectory()
+
+        for folderID in folderIDs.sorted(by: {
+            URL(fileURLWithPath: $0).pathComponents.count
+                < URL(fileURLWithPath: $1).pathComponents.count
+        }) where folderID != currentRootID && expandedFolderIDs.contains(folderID) {
+            guard let folder = visibleBrowserItems.first(where: { $0.id == folderID && $0.canExpand }) else {
+                continue
+            }
+            loadingFolderIDs.insert(folderID)
+            await loadFolderChildren(for: folder)
+        }
+
+        let availableIDs = Set(visibleBrowserItems.map(\.id))
+        selectedItemIDs = previousSelection.intersection(availableIDs)
     }
 
     private func showBrowserOperationError(title: String, message: String) {
