@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """Copy camera folders into the Swift Camera Toolkit library layout.
 
-Does not delete sources. Never overwrites a different file. Skips identical
-name+size destinations. Uses rclone copy --checksum --immutable.
+Does not delete sources. Never overwrites a different file.
+
+Sony RAWs reuse names (DSC02101.ARW) and sit in a tight size band, so
+name+size is not identity. A destination is skipped only when SHA-256
+matches. Same name + different hash is copied beside it as name~1.ext.
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
 import subprocess
 import sys
@@ -168,32 +172,40 @@ def walk_media(src: Path, device: str) -> list[tuple[Path, str]]:
                 media = media_folder(path, device)
                 if media:
                     out.append((path, media))
-    # de-dupe by dest name+media keeping first
-    seen = set()
-    unique = []
-    for path, media in out:
-        key = (media, path.name.lower())
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append((path, media))
-    return unique
+    return out
 
 
-def rclone_copy(src: Path, dest: Path) -> int:
-    dest.mkdir(parents=True, exist_ok=True)
-    cmd = [
-        RCLONE, "copy", str(src), str(dest),
-        "--checksum", "--immutable",
-        "--transfers", "4",
-        "--stats", "30s",
-        "--stats-one-line",
-        "--log-level", "INFO",
-    ]
-    for pattern in EXCLUDES:
-        cmd.extend(["--exclude", pattern])
-    print(f"  $ rclone copy {src} -> {dest}", flush=True)
-    return subprocess.call(cmd)
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def unused_name(directory: Path, name: str) -> Path:
+    candidate = directory / name
+    if not candidate.exists():
+        return candidate
+    stem = Path(name).stem
+    suffix = Path(name).suffix
+    index = 1
+    while True:
+        candidate = directory / f"{stem}~{index}{suffix}"
+        if not candidate.exists():
+            return candidate
+        index += 1
+
+
+def classify_existing(source: Path, dest: Path) -> str:
+    """same / different / missing. Size mismatch means different; size match still hashes."""
+    if not dest.exists():
+        return "missing"
+    if dest.stat().st_size != source.stat().st_size:
+        return "different"
+    if sha256_file(source) == sha256_file(dest):
+        return "same"
+    return "different"
 
 
 def copy_job(job: dict) -> dict:
@@ -221,44 +233,66 @@ def copy_job(job: dict) -> dict:
         for path in paths:
             by_parent.setdefault(path.parent, []).append(path)
         for parent, group in by_parent.items():
-            wanted = {p.name for p in group}
             already = 0
-            to_copy = []
+            to_copy: list[tuple[str, str]] = []  # (source name, dest name)
             for path in group:
                 target = dest / path.name
-                if target.exists():
-                    if target.stat().st_size == path.stat().st_size:
-                        already += 1
-                    else:
-                        print(f"  CONFLICT {path.name} exists at dest with different size — left untouched", flush=True)
-                        failed += 1
+                verdict = classify_existing(path, target)
+                if verdict == "same":
+                    already += 1
+                    continue
+                if verdict == "different":
+                    renamed = unused_name(dest, path.name)
+                    print(
+                        f"  COLLISION {path.name} exists with different SHA-256 — keeping both as {renamed.name}",
+                        flush=True,
+                    )
+                    to_copy.append((path.name, renamed.name))
                 else:
-                    to_copy.append(path)
+                    to_copy.append((path.name, path.name))
             skipped += already
             if not to_copy:
                 continue
-            list_file = dest / f".offload-{os.getpid()}.files"
-            list_file.write_text("\n".join(p.name for p in to_copy) + "\n")
-            cmd = [
-                RCLONE, "copy", str(parent), str(dest),
-                "--files-from", str(list_file),
-                "--checksum", "--immutable",
-                "--transfers", "4",
-                "--stats", "30s",
-                "--stats-one-line",
-                "--log-level", "INFO",
-            ]
-            print(f"  rclone {len(to_copy)} files  {parent} -> {dest}", flush=True)
-            code = subprocess.call(cmd)
-            try:
-                list_file.unlink()
-            except OSError:
-                pass
-            if code != 0:
-                print(f"  FAIL rclone {code} for {parent} -> {dest}", flush=True)
-                failed += len(to_copy)
-            else:
-                copied += len(to_copy)
+            # rclone copy keeps source filenames. Same-name copies go as a
+            # batch; renamed collisions use copyto so the dest name can change.
+            same_name = [src_name for src_name, dest_name in to_copy if src_name == dest_name]
+            renamed = [(src_name, dest_name) for src_name, dest_name in to_copy if src_name != dest_name]
+            if same_name:
+                list_file = dest / f".offload-{os.getpid()}.files"
+                list_file.write_text("\n".join(same_name) + "\n")
+                cmd = [
+                    RCLONE, "copy", str(parent), str(dest),
+                    "--files-from", str(list_file),
+                    "--checksum", "--immutable",
+                    "--transfers", "4",
+                    "--stats", "30s",
+                    "--stats-one-line",
+                    "--log-level", "INFO",
+                ]
+                print(f"  rclone {len(same_name)} files  {parent} -> {dest}", flush=True)
+                code = subprocess.call(cmd)
+                try:
+                    list_file.unlink()
+                except OSError:
+                    pass
+                if code != 0:
+                    print(f"  FAIL rclone {code} for {parent} -> {dest}", flush=True)
+                    failed += len(same_name)
+                else:
+                    copied += len(same_name)
+            for src_name, dest_name in renamed:
+                cmd = [
+                    RCLONE, "copyto", str(parent / src_name), str(dest / dest_name),
+                    "--checksum", "--immutable",
+                    "--log-level", "INFO",
+                ]
+                print(f"  rclone copyto {src_name} -> {dest_name}", flush=True)
+                code = subprocess.call(cmd)
+                if code != 0:
+                    print(f"  FAIL rclone {code} for {src_name} -> {dest_name}", flush=True)
+                    failed += 1
+                else:
+                    copied += 1
     status = "ok" if failed == 0 else "partial"
     print(f"  done {job['name']}: copied={copied} skipped={skipped} failed={failed}", flush=True)
     return {"name": job["name"], "status": status, "copied": copied, "skipped": skipped, "failed": failed}
