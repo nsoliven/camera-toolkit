@@ -105,6 +105,7 @@ public struct OrganizedArchiveLayout: Sendable {
         case "sony-a7v": "Sony A7V"
         case "osmo-360": "DJI Osmo 360"
         case "dji-mini-2": "DJI Mini 2"
+        case "dji-nano": "DJI Nano"
         case "action-6": "DJI Action 6"
         case "iphone": "iPhone"
         default: Self.pathComponent(deviceID, fallback: "Camera")
