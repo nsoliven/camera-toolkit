@@ -3,9 +3,10 @@
 
 Does not delete sources. Never overwrites a different file.
 
-Sony RAWs reuse names (DSC02101.ARW) and sit in a tight size band, so
-name+size is not identity. A destination is skipped only when SHA-256
-matches. Same name + different hash is copied beside it as name~1.ext.
+Cheap filters first, hash only to confirm a skip:
+  1. dest name missing          → copy, no hash
+  2. dest name exists, size !=  → different file, keep both as name~1.ext, no hash
+  3. dest name exists, size ==  → SHA-256 both; match skips the copy, mismatch keeps both
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from pathlib import Path
 
 LIBRARY = Path("/Volumes/nc_files_24/zurzi2/files/Media/Camera")
 DRIVE = Path("/Volumes/1TB Crucial")
+JOURNAL = Path.home() / "Library/Logs/camera-toolkit-offload.done"
 RCLONE = "rclone"
 EXCLUDES = ["._*", ".DS_Store", ".Trashes/**", ".Spotlight-V100/**", ".fseventsd/**"]
 
@@ -197,13 +199,38 @@ def unused_name(directory: Path, name: str) -> Path:
         index += 1
 
 
-def classify_existing(source: Path, dest: Path) -> str:
-    """same / different / missing. Size mismatch means different; size match still hashes."""
+def load_journal() -> set[str]:
+    if not JOURNAL.is_file():
+        return set()
+    return {line.strip() for line in JOURNAL.read_text().splitlines() if line.strip()}
+
+
+def journal_key(job_name: str, dest: Path) -> str:
+    return f"{job_name}\t{dest}"
+
+
+def remember(job_name: str, dest: Path) -> None:
+    JOURNAL.parent.mkdir(parents=True, exist_ok=True)
+    with JOURNAL.open("a") as handle:
+        handle.write(journal_key(job_name, dest) + "\n")
+
+
+def classify_existing(source: Path, dest: Path, *, job_name: str, journal: set[str]) -> str:
+    """missing / same / different.
+
+    Hash only when the dest name exists and the sizes already match. That is
+    the last check before we decide not to copy. A dest this job already wrote
+    (journal) is not hashed again on resume.
+    """
     if not dest.exists():
         return "missing"
     if dest.stat().st_size != source.stat().st_size:
         return "different"
+    if journal_key(job_name, dest) in journal:
+        return "same"
     if sha256_file(source) == sha256_file(dest):
+        remember(job_name, dest)
+        journal.add(journal_key(job_name, dest))
         return "same"
     return "different"
 
@@ -224,6 +251,7 @@ def copy_job(job: dict) -> dict:
         f"({sum(len(v) for v in by_media.values())} files) ===",
         flush=True,
     )
+    journal = load_journal()
     copied = skipped = failed = 0
     for media, paths in sorted(by_media.items()):
         dest = dest_dir(job, media)
@@ -237,14 +265,16 @@ def copy_job(job: dict) -> dict:
             to_copy: list[tuple[str, str]] = []  # (source name, dest name)
             for path in group:
                 target = dest / path.name
-                verdict = classify_existing(path, target)
+                verdict = classify_existing(
+                    path, target, job_name=job["name"], journal=journal
+                )
                 if verdict == "same":
                     already += 1
                     continue
                 if verdict == "different":
                     renamed = unused_name(dest, path.name)
                     print(
-                        f"  COLLISION {path.name} exists with different SHA-256 — keeping both as {renamed.name}",
+                        f"  COLLISION {path.name} already at dest — keeping both as {renamed.name}",
                         flush=True,
                     )
                     to_copy.append((path.name, renamed.name))
@@ -263,7 +293,7 @@ def copy_job(job: dict) -> dict:
                 cmd = [
                     RCLONE, "copy", str(parent), str(dest),
                     "--files-from", str(list_file),
-                    "--checksum", "--immutable",
+                    "--immutable",
                     "--transfers", "4",
                     "--stats", "30s",
                     "--stats-one-line",
@@ -280,10 +310,13 @@ def copy_job(job: dict) -> dict:
                     failed += len(same_name)
                 else:
                     copied += len(same_name)
+                    for src_name in same_name:
+                        remember(job["name"], dest / src_name)
+                        journal.add(journal_key(job["name"], dest / src_name))
             for src_name, dest_name in renamed:
                 cmd = [
                     RCLONE, "copyto", str(parent / src_name), str(dest / dest_name),
-                    "--checksum", "--immutable",
+                    "--immutable",
                     "--log-level", "INFO",
                 ]
                 print(f"  rclone copyto {src_name} -> {dest_name}", flush=True)
@@ -293,6 +326,8 @@ def copy_job(job: dict) -> dict:
                     failed += 1
                 else:
                     copied += 1
+                    remember(job["name"], dest / dest_name)
+                    journal.add(journal_key(job["name"], dest / dest_name))
     status = "ok" if failed == 0 else "partial"
     print(f"  done {job['name']}: copied={copied} skipped={skipped} failed={failed}", flush=True)
     return {"name": job["name"], "status": status, "copied": copied, "skipped": skipped, "failed": failed}
