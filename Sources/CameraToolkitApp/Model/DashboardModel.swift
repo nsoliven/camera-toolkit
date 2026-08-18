@@ -789,6 +789,7 @@ extension DashboardModel {
             .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
             .lowercased()
 
+        if fingerprint.contains("nano") { return "dji-nano" }
         if fingerprint.contains("osmo") { return "osmo-360" }
         if fingerprint.contains("sony") || fingerprint.contains("a7v") { return "sony-a7v" }
         if fingerprint.contains("mini 2") || fingerprint.contains("mini-2") || fingerprint.contains("mini_2") {
@@ -806,6 +807,7 @@ extension DashboardModel {
         case "sony-a7v": "Sony A7V"
         case "osmo-360": "DJI Osmo 360"
         case "dji-mini-2": "DJI Mini 2"
+        case "dji-nano": "DJI Nano"
         case "action-6": "DJI Action 6"
         case "iphone": "iPhone"
         default: "the selected camera"

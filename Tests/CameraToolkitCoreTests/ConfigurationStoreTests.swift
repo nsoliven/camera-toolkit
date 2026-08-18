@@ -26,7 +26,7 @@ final class ConfigurationStoreTests: XCTestCase {
                 trueNASUsername: "camera-reader",
                 trueNASDataset: "vault/photos",
                 trueNASTLSPinnedCertificateSHA256: "AABBCCDD",
-                selectedDeviceID: "dji-mini-2",
+                selectedDeviceID: "dji-nano",
                 eventName: "Test Trip"
             )
 

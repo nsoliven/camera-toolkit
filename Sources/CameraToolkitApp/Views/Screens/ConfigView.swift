@@ -99,6 +99,7 @@ struct ConfigView: View {
                     Text("Sony A7V").tag("sony-a7v")
                     Text("DJI Osmo 360").tag("osmo-360")
                     Text("DJI Mini 2").tag("dji-mini-2")
+                    Text("DJI Nano").tag("dji-nano")
                     Text("DJI Action 6").tag("action-6")
                     Text("iPhone").tag("iphone")
                 }

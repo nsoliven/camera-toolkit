@@ -735,6 +735,7 @@ private struct EventLibraryView: View {
         case "sony-a7v": "Sony A7V"
         case "osmo-360": "DJI Osmo 360"
         case "dji-mini-2": "DJI Mini 2"
+        case "dji-nano": "DJI Nano"
         case "action-6": "DJI Action 6"
         case "iphone": "iPhone"
         case .some(let value): value

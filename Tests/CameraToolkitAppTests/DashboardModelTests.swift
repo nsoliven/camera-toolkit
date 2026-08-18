@@ -22,6 +22,22 @@ final class DashboardModelTests: XCTestCase {
             )),
             "sony-a7v"
         )
+        XCTAssertEqual(
+            DashboardModel.inferredDeviceID(for: ConfiguredLocation(
+                role: .importSource,
+                name: "OsmoNano · DJI Nano",
+                path: "/Volumes/OsmoNano"
+            )),
+            "dji-nano"
+        )
+        XCTAssertEqual(
+            DashboardModel.inferredDeviceID(for: ConfiguredLocation(
+                role: .importSource,
+                name: "DJI NANO",
+                path: "/Volumes/1TB Crucial/Wit Trip Utah /DJI NANO"
+            )),
+            "dji-nano"
+        )
     }
 
     func testStartupMatchesCameraToAlreadySelectedSource() throws {

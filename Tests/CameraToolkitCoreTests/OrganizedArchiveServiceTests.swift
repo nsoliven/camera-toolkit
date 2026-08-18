@@ -32,6 +32,16 @@ final class OrganizedArchiveServiceTests: XCTestCase {
         XCTAssertEqual(layout.mediaFolder(for: "DCIM/CAM_0001.LRF"), .video)
     }
 
+    func testNanoVideoLandsUnderDJINano() throws {
+        let layout = OrganizedArchiveLayout(eventDate: "2026-07-11", eventName: "Wit Trip Utah", deviceID: "dji-nano")
+        XCTAssertEqual(layout.deviceFolder, "DJI Nano")
+        XCTAssertEqual(
+            try layout.destinationRelativePath(for: "DJI_001/DJI_20260802_0035_D.MP4"),
+            "Originals/2026/2026-07-11 Wit Trip Utah/DJI Nano/Video/DJI_20260802_0035_D.MP4"
+        )
+        XCTAssertEqual(layout.mediaFolder(for: "DJI_001/DJI_20260802_0035_D.LRF"), .video)
+    }
+
     func testArchiveCopiesVerifiesWritesManifestAndNeverOverwritesConflict() throws {
         try withTemporaryDirectory { root in
             let workspace = root.appendingPathComponent("Buffer/Card Copy", isDirectory: true)
