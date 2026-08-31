@@ -9,7 +9,8 @@ let package = Package(
     ],
     products: [
         .library(name: "CameraToolkitCore", targets: ["CameraToolkitCore"]),
-        .executable(name: "CameraToolkit", targets: ["CameraToolkitApp"])
+        .executable(name: "CameraToolkit", targets: ["CameraToolkitApp"]),
+        .executable(name: "CameraToolkitCatalogRebuilder", targets: ["CameraToolkitCatalogRebuilder"])
     ],
     dependencies: [
         .package(url: "https://github.com/groue/GRDB.swift.git", from: "7.10.0")
@@ -26,6 +27,10 @@ let package = Package(
         ),
         .executableTarget(
             name: "CameraToolkitApp",
+            dependencies: ["CameraToolkitCore"]
+        ),
+        .executableTarget(
+            name: "CameraToolkitCatalogRebuilder",
             dependencies: ["CameraToolkitCore"]
         ),
         .testTarget(
