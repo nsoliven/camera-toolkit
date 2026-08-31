@@ -61,6 +61,26 @@ open dist/CameraToolkit.app
 
 To install that bundle into `/Applications`, run `scripts/package-app.sh --install`. Set `CAMERA_TOOLKIT_INSTALL_DIR` to install into a different directory.
 
+### Rebuild a catalog from existing folders
+
+`CameraToolkitCatalogRebuilder` is a non-destructive maintenance command for
+recovering or reconciling an existing Camera Toolkit installation. It reads an
+event plan, scans every source with the same `FileScanner` used by the app, and
+writes separate candidate configuration and SQLite files. It preserves events
+outside the plan and replaces only assignments for source roots named by the
+plan. It never moves or deletes media and refuses to overwrite candidate files.
+
+```sh
+swift run CameraToolkitCatalogRebuilder \
+  --configuration /path/to/config.json \
+  --plan /path/to/event-plan.json \
+  --output-configuration /path/to/config.candidate.json \
+  --output-catalog /path/to/catalog.candidate.sqlite
+```
+
+Review and validate the candidates before installing them. Filesystem copying
+and checksum verification are deliberately separate operations.
+
 ## First-run setup
 
 Open **Camera Toolkit → Settings** and choose:
