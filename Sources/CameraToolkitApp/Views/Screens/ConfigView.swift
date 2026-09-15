@@ -35,6 +35,44 @@ struct ConfigView: View {
 
     var body: some View {
         Form {
+            Section {
+                PlaceRow(
+                    title: "Shared Buffer",
+                    symbol: "externaldrive.fill",
+                    tint: .blue,
+                    status: PlaceStatus.check(EventStorageLocations(configuration: model.configuration).bufferRoot),
+                    missingIsFine: false
+                ) {
+                    if model.chooseFolder(title: "Choose the Shared Buffer Folder", keyPath: \.bufferPath) {
+                        NotificationCenter.default.post(name: .cameraToolkitStorageLocationsChanged, object: nil)
+                    }
+                }
+                PlaceRow(
+                    title: "Private (hidden)",
+                    symbol: "lock.fill",
+                    tint: .purple,
+                    status: PlaceStatus.check(EventStorageLocations(configuration: model.configuration).privateStagingRoot, includeFreeSpace: false),
+                    missingIsFine: true
+                ) {
+                    if model.chooseFolder(title: "Choose the Private Folder", keyPath: \.privateStagingPath) {
+                        NotificationCenter.default.post(name: .cameraToolkitStorageLocationsChanged, object: nil)
+                    }
+                }
+                PlaceRow(
+                    title: "NAS Library",
+                    symbol: "server.rack",
+                    tint: .green,
+                    status: PlaceStatus.check(EventStorageLocations(configuration: model.configuration).libraryRoot, includeFreeSpace: false),
+                    missingIsFine: false
+                ) {
+                    model.chooseCameraLibraryRoot()
+                }
+            } header: {
+                Text("Where Things Live")
+            } footer: {
+                Text("Shared events live in the Buffer. Private events wait in the hidden folder until they’re on the NAS. The NAS library is the permanent home.")
+            }
+
             Section("Photo Library") {
                 PathSettingRow(
                     title: "Library root",
