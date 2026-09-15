@@ -167,6 +167,15 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate {
             command: .selectAll,
             keyEquivalent: "a"
         )
+        editMenu.addItem(.separator())
+        let undoSortItem = NSMenuItem(
+            title: "Undo Sort",
+            action: #selector(undoSort),
+            keyEquivalent: "z"
+        )
+        undoSortItem.keyEquivalentModifierMask = [.command]
+        undoSortItem.target = self
+        editMenu.addItem(undoSortItem)
 
         let goMenuItem = NSMenuItem()
         mainMenu.addItem(goMenuItem)
@@ -239,6 +248,26 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate {
             command: .decreaseThumbnailSize,
             keyEquivalent: "-"
         )
+
+        viewMenu.addItem(.separator())
+
+        let eventsModeItem = NSMenuItem(
+            title: "Events",
+            action: #selector(showEventsMode),
+            keyEquivalent: "1"
+        )
+        eventsModeItem.keyEquivalentModifierMask = [.command, .option]
+        eventsModeItem.target = self
+        viewMenu.addItem(eventsModeItem)
+
+        let filesModeItem = NSMenuItem(
+            title: "File Browser",
+            action: #selector(showFilesMode),
+            keyEquivalent: "2"
+        )
+        filesModeItem.keyEquivalentModifierMask = [.command, .option]
+        filesModeItem.target = self
+        viewMenu.addItem(filesModeItem)
 
         viewMenu.addItem(.separator())
 
@@ -373,6 +402,20 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate {
         KeyboardShortcutsWindowController.shared.show()
     }
 
+    @objc private func showEventsMode() {
+        AppShellMode.show(.events)
+        CameraToolkitMainWindow.shared.show(model: model)
+    }
+
+    @objc private func showFilesMode() {
+        AppShellMode.show(.files)
+        CameraToolkitMainWindow.shared.show(model: model)
+    }
+
+    @objc private func undoSort() {
+        NotificationCenter.default.post(name: .cameraToolkitUndoSort, object: nil)
+    }
+
     @objc private func openEventLibrary() {
         EventLibraryWindowController.shared.show(model: model)
     }
@@ -405,6 +448,7 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate {
 @MainActor
 private enum CameraToolkitRuntime {
     static let model = DashboardModel.live()
+    static let workspace = EventsWorkspace(model: model)
 }
 
 @MainActor
@@ -421,7 +465,7 @@ private final class CameraToolkitMainWindow: NSObject, NSWindowDelegate {
         }
 
         let hostingController = NSHostingController(
-            rootView: AppShell(model: model)
+            rootView: AppShell(model: model, workspace: CameraToolkitRuntime.workspace)
                 .frame(minWidth: 1040, minHeight: 720)
         )
         let window = NSWindow(
