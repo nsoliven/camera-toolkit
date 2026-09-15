@@ -4,9 +4,12 @@ import Foundation
 import Observation
 import SwiftUI
 
+extension Notification.Name {
+    static let cameraToolkitStorageLocationsChanged = Notification.Name("CameraToolkit.StorageLocationsChanged")
+}
+
 /// Places in the window the guide outlines while explaining them.
 enum GuideTarget: Hashable {
-    case places
     case addFolder
     case discovered
     case grid
@@ -62,14 +65,13 @@ enum SetupGuideStep: Int, CaseIterable {
 
     var highlight: GuideTarget? {
         switch self {
-        case .buffer, .privateFolder, .library: .places
         case .unsorted: .addFolder
         case .existingEvents: .discovered
         case .browse: .grid
         case .createEvent: .assignBar
         case .apply: .applyButton
         case .eventPage: .storageStrip
-        case .welcome, .done: nil
+        case .welcome, .buffer, .privateFolder, .library, .done: nil
         }
     }
 

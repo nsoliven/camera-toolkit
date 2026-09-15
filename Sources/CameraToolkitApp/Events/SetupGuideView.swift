@@ -146,7 +146,7 @@ struct SetupGuidePanel: View {
                     .disabled(!status.exists)
                 Button("Choose a Different Folder…") { guide.chooseBuffer() }
             }
-            Text("You can change this later with Change… next to Shared Buffer at the top of the sidebar.")
+            Text("You can change this later in Settings, under Where Things Live.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -385,7 +385,7 @@ struct SetupGuidePanel: View {
         VStack(alignment: .leading, spacing: 12) {
             Text("That’s the whole loop: sort, Apply, then archive each event when the NAS is connected.")
             GuideBullet(symbol: "keyboard", text: "Space previews · 1–9 sorts · N makes an event · Command-Z undoes.")
-            GuideBullet(symbol: "externaldrive", text: "Where Things Live at the top of the sidebar shows your Buffer, private folder, and NAS. Change… points them somewhere else.")
+            GuideBullet(symbol: "externaldrive", text: "Settings › Where Things Live shows your Buffer, private folder, and NAS, and lets you change them.")
             GuideBullet(symbol: "questionmark.circle", text: "Open this guide again any time with the Guide button in the sidebar or Help › Setup Guide.")
         }
     }
@@ -476,7 +476,7 @@ struct PlaceStatusCard: View {
     }
 }
 
-struct SidebarPlaceRow: View {
+struct PlaceRow: View {
     let title: String
     let symbol: String
     let tint: Color

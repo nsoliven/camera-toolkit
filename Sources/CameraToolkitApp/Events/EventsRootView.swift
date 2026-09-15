@@ -2,8 +2,9 @@ import AppKit
 import CameraToolkitCore
 import SwiftUI
 
-/// The main window: where things live, unsorted folders, and events on the
-/// left; the selected folder's burst board or the selected event on the right.
+/// The main window: unsorted folders and events on the left; the selected
+/// folder's burst board or the selected event on the right. Storage
+/// locations live in Settings to keep this window simple.
 struct EventsRootView: View {
     @Bindable var model: DashboardModel
     @Bindable var workspace: EventsWorkspace
@@ -28,6 +29,9 @@ struct EventsRootView: View {
         .onAppear { workspace.start() }
         .onReceive(NotificationCenter.default.publisher(for: .cameraToolkitUndoSort)) { _ in
             workspace.undoLastSort()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .cameraToolkitStorageLocationsChanged)) { _ in
+            workspace.discoverDriveEvents()
         }
         .sheet(item: $workspace.newEventRequest) { request in
             EventDetailsSheet(
@@ -120,11 +124,6 @@ struct EventsSidebar: View {
             Divider()
 
             List(selection: $workspace.selection) {
-                Section("Where Things Live") {
-                    places
-                        .guideHighlight(.places, in: workspace)
-                }
-
                 if !workspace.discoveredDriveEvents.isEmpty {
                     Section("Found on Your Drive") {
                         discoveryBanner
@@ -201,42 +200,6 @@ struct EventsSidebar: View {
             Divider()
             footer
         }
-    }
-
-    private var places: some View {
-        let locations = workspace.locations
-        return VStack(alignment: .leading, spacing: 8) {
-            SidebarPlaceRow(
-                title: "Shared Buffer",
-                symbol: "externaldrive.fill",
-                tint: .blue,
-                status: PlaceStatus.check(locations.bufferRoot),
-                missingIsFine: false
-            ) {
-                if model.chooseFolder(title: "Choose the Shared Buffer Folder", keyPath: \.bufferPath) {
-                    workspace.discoverDriveEvents()
-                }
-            }
-            SidebarPlaceRow(
-                title: "Private (hidden)",
-                symbol: "lock.fill",
-                tint: .purple,
-                status: PlaceStatus.check(locations.privateStagingRoot, includeFreeSpace: false),
-                missingIsFine: true
-            ) {
-                _ = model.chooseFolder(title: "Choose the Private Folder", keyPath: \.privateStagingPath)
-            }
-            SidebarPlaceRow(
-                title: "NAS Library",
-                symbol: "server.rack",
-                tint: .green,
-                status: PlaceStatus.check(locations.libraryRoot, includeFreeSpace: false),
-                missingIsFine: false
-            ) {
-                model.chooseCameraLibraryRoot()
-            }
-        }
-        .padding(.vertical, 4)
     }
 
     private var discoveryBanner: some View {
