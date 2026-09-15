@@ -12,6 +12,8 @@ The safety rule is simple: sorting only records assignments, moves on the same d
 
 ## What I use it for
 
+New here? Press **Start Guided Setup** on the welcome screen, or **Guide** in the sidebar. It checks the Buffer, private folder, and NAS, finds unsorted photo folders on connected drives, adds event folders already on the drive, and walks through sorting and applying a first burst.
+
 1. Add a card or an unsorted folder. The app groups bursts and splits the shots by day using each camera's own clock.
 2. Select photos and press 1–9, drag them onto an event, or press N to make a new event.
 3. Mark an event **Private · NAS only** when it should never sit in the shared Buffer.

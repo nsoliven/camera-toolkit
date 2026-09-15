@@ -323,7 +323,9 @@ public struct DriveMoveService {
         let formatter = DateFormatter()
         formatter.calendar = Calendar(identifier: .gregorian)
         formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        // Millisecond precision keeps back-to-back moves in order, so Undo
+        // always reverses the most recent one.
+        formatter.dateFormat = "yyyyMMdd-HHmmss-SSS"
         return formatter.string(from: date)
     }
 }

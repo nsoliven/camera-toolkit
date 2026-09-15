@@ -20,6 +20,7 @@ struct EventBoardView: View {
             VStack(spacing: 0) {
                 header(event)
                 StorageStrip(model: model, workspace: workspace, event: event, summary: workspace.presence[eventID])
+                    .guideHighlight(.storageStrip, in: workspace)
                     .padding(.horizontal, 16)
                     .padding(.bottom, 12)
                 Divider()

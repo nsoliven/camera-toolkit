@@ -2,25 +2,30 @@ import AppKit
 import CameraToolkitCore
 import SwiftUI
 
-/// The main window: unsorted folders and events on the left, the selected
-/// folder's burst board or the selected event's storage view on the right.
+/// The main window: where things live, unsorted folders, and events on the
+/// left; the selected folder's burst board or the selected event on the right.
 struct EventsRootView: View {
     @Bindable var model: DashboardModel
     @Bindable var workspace: EventsWorkspace
 
     var body: some View {
+        let panelAlignment: Alignment = (workspace.guide?.step.prefersTop ?? false) ? .topTrailing : .bottomTrailing
         NavigationSplitView {
             EventsSidebar(model: model, workspace: workspace)
-                .navigationSplitViewColumnWidth(min: 240, ideal: 290, max: 380)
+                .navigationSplitViewColumnWidth(min: 260, ideal: 300, max: 400)
         } detail: {
             detail
                 .background(Color(nsColor: .windowBackgroundColor))
         }
         .navigationSplitViewStyle(.balanced)
-        .onAppear { workspace.start() }
-        .onChange(of: workspace.selection) { _, _ in
-            workspace.selectionChanged()
+        .overlay(alignment: panelAlignment) {
+            if let guide = workspace.guide {
+                SetupGuidePanel(guide: guide, workspace: workspace, model: model)
+                    .padding(.horizontal, 20)
+                    .padding(.vertical, guide.step.prefersTop ? 70 : 40)
+            }
         }
+        .onAppear { workspace.start() }
         .onReceive(NotificationCenter.default.publisher(for: .cameraToolkitUndoSort)) { _ in
             workspace.undoLastSort()
         }
@@ -102,25 +107,32 @@ struct EventsSidebar: View {
                     .font(.headline)
                 Spacer()
                 Button {
-                    workspace.requestNewEvent(from: nil)
+                    workspace.startGuide()
                 } label: {
-                    Image(systemName: "plus")
+                    Label("Guide", systemImage: "questionmark.circle")
                 }
-                .buttonStyle(.borderless)
-                .help("New event")
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .help("Open the step-by-step setup guide")
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 10)
             Divider()
 
             List(selection: $workspace.selection) {
+                Section("Where Things Live") {
+                    places
+                        .guideHighlight(.places, in: workspace)
+                }
+
                 if !workspace.discoveredDriveEvents.isEmpty {
-                    Section {
+                    Section("Found on Your Drive") {
                         discoveryBanner
+                            .guideHighlight(.discovered, in: workspace)
                     }
                 }
 
-                Section("Unsorted") {
+                Section("Unsorted Photos") {
                     ForEach(workspace.unsortedLocations) { location in
                         unsortedRow(location)
                             .tag(Optional(EventsSidebarSelection.unsorted(location.id)))
@@ -139,9 +151,10 @@ struct EventsSidebar: View {
                         Label("Add Folder or Card…", systemImage: "plus.rectangle.on.folder")
                     }
                     .buttonStyle(.borderless)
+                    .guideHighlight(.addFolder, in: workspace)
                 }
 
-                Section("Events") {
+                Section {
                     if workspace.events.isEmpty {
                         Text("No events yet")
                             .foregroundStyle(.secondary)
@@ -168,6 +181,19 @@ struct EventsSidebar: View {
                                 .disabled(workspace.assignmentCount(for: event.id) > 0)
                             }
                     }
+                } header: {
+                    HStack {
+                        Text("Events")
+                        Spacer()
+                        Button {
+                            workspace.requestNewEvent(from: nil)
+                        } label: {
+                            Label("New Event", systemImage: "plus")
+                                .font(.caption)
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Make a new event")
+                    }
                 }
             }
             .listStyle(.sidebar)
@@ -177,20 +203,62 @@ struct EventsSidebar: View {
         }
     }
 
+    private var places: some View {
+        let locations = workspace.locations
+        return VStack(alignment: .leading, spacing: 8) {
+            SidebarPlaceRow(
+                title: "Shared Buffer",
+                symbol: "externaldrive.fill",
+                tint: .blue,
+                status: PlaceStatus.check(locations.bufferRoot),
+                missingIsFine: false
+            ) {
+                if model.chooseFolder(title: "Choose the Shared Buffer Folder", keyPath: \.bufferPath) {
+                    workspace.discoverDriveEvents()
+                }
+            }
+            SidebarPlaceRow(
+                title: "Private (hidden)",
+                symbol: "lock.fill",
+                tint: .purple,
+                status: PlaceStatus.check(locations.privateStagingRoot, includeFreeSpace: false),
+                missingIsFine: true
+            ) {
+                _ = model.chooseFolder(title: "Choose the Private Folder", keyPath: \.privateStagingPath)
+            }
+            SidebarPlaceRow(
+                title: "NAS Library",
+                symbol: "server.rack",
+                tint: .green,
+                status: PlaceStatus.check(locations.libraryRoot, includeFreeSpace: false),
+                missingIsFine: false
+            ) {
+                model.chooseCameraLibraryRoot()
+            }
+        }
+        .padding(.vertical, 4)
+    }
+
     private var discoveryBanner: some View {
         let found = workspace.discoveredDriveEvents
         return VStack(alignment: .leading, spacing: 6) {
-            Label(
-                "\(found.count) event folder\(found.count == 1 ? "" : "s") already on the drive",
-                systemImage: "sparkle.magnifyingglass"
-            )
-            .font(.callout.weight(.semibold))
-            Text(found.prefix(4).map { "\($0.dateString) \($0.name) · \($0.files.count) files" }.joined(separator: "\n") + (found.count > 4 ? "\n…" : ""))
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            Text("\(found.count) event folder\(found.count == 1 ? " is" : "s are") on your drive but not in the list yet.")
+                .font(.callout.weight(.semibold))
+                .fixedSize(horizontal: false, vertical: true)
+            ForEach(found.prefix(3)) { event in
+                Text("\(event.name) · \(event.files.count) files")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            if found.count > 3 {
+                Text("and \(found.count - 3) more")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             Button("Add to Events") { workspace.adoptDiscoveredDriveEvents() }
                 .controlSize(.small)
-                .help("Adds these folders as events. No files move.")
+                .help("Lists these folders as events. No files move.")
         }
         .padding(.vertical, 4)
     }
@@ -302,37 +370,56 @@ struct EventsWelcomeView: View {
     @Bindable var workspace: EventsWorkspace
 
     var body: some View {
-        VStack(spacing: 18) {
-            Image(systemName: "rectangle.3.group")
-                .font(.system(size: 48))
-                .foregroundStyle(.blue)
-            Text("Everything Is an Event")
-                .font(.largeTitle.bold())
-            VStack(alignment: .leading, spacing: 10) {
-                step(1, "Pick an Unsorted folder or card on the left. Bursts are grouped and each day gets its own section.")
-                step(2, "Select photos and press 1–9, drag them onto an event, or press N for a new event.")
-                step(3, "Press Apply. Files on the same drive move instantly. Files on a card are copied with checksums.")
-                step(4, "Open an event to see where it lives: card, Buffer or Private, NAS, and Immich.")
-            }
-            .frame(maxWidth: 580)
-            HStack {
-                Button("Add Folder or Card…") { workspace.addUnsortedFolder() }
-                    .buttonStyle(.borderedProminent)
-                Button("New Event") { workspace.requestNewEvent(from: nil) }
-            }
-        }
-        .padding(40)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
+        ScrollView {
+            VStack(spacing: 20) {
+                Image(systemName: "rectangle.3.group")
+                    .font(.system(size: 52))
+                    .foregroundStyle(.blue)
+                    .padding(.top, 40)
+                Text("Welcome to Camera Toolkit")
+                    .font(.largeTitle.bold())
+                Text("Sort your photos into events, then keep each event on your drive, your NAS, and Immich.")
+                    .font(.title3)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 560)
 
-    private func step(_ number: Int, _ text: String) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 10) {
-            Text("\(number)")
-                .font(.callout.weight(.bold).monospacedDigit())
-                .frame(width: 22, height: 22)
-                .background(Color.accentColor.opacity(0.15), in: Circle())
-            Text(text)
-                .font(.body)
+                Button {
+                    workspace.startGuide()
+                } label: {
+                    Label("Start Guided Setup", systemImage: "play.circle.fill")
+                        .font(.title3.weight(.semibold))
+                        .padding(.horizontal, 20)
+                        .padding(.vertical, 8)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+
+                Text("It checks your drives, finds your unsorted photos, and walks you through sorting your first burst. Nothing moves or gets deleted without a plan you confirm.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 520)
+
+                GroupBox {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("Where your photos go")
+                            .font(.headline)
+                        PlacesExplainer()
+                    }
+                    .padding(8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxWidth: 600)
+
+                HStack {
+                    Button("Add Folder or Card…") { workspace.addUnsortedFolder() }
+                    Button("New Event") { workspace.requestNewEvent(from: nil) }
+                }
+                .padding(.bottom, 40)
+            }
+            .padding(.horizontal, 40)
+            .frame(maxWidth: .infinity)
         }
     }
 }
