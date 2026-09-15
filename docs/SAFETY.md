@@ -15,12 +15,24 @@ Camera Toolkit treats source media as read-only during normal browsing and trans
 - Buffer-to-archive cleanup quarantines matching Buffer files under `_Trash/<batch>` on the same volume. It does not immediately delete them.
 - Emptying quarantine requires an explicit confirmation token and rejects paths outside an `_Trash` hierarchy.
 
+## Event organizer
+
+- Sorting a photo into an event only records the assignment. No file moves until **Apply**, which first shows the exact plan.
+- Apply moves a file only when its source and its event folder are on the same drive. The move is a rename: file bytes are never rewritten. A destination that already exists is left untouched and the source stays where it was. A cross-drive request is refused by the move service and handled as a checksum-verified copy instead, which leaves the original in place.
+- Every Apply, move between events, and return to Unsorted writes a journal before its first rename. **Undo** renames the completed moves back and restores the event assignments they changed.
+- Folders emptied by a move are removed only when they contain nothing but Finder metadata, and never at or above the Unsorted, Buffer, or private staging root. This keeps a private event's folder name from lingering in the shared Buffer.
+- Private events never enter the shared Buffer. Their originals wait in a hidden `.Camera Toolkit/Private` folder on the same drive, or a folder chosen in Settings. Hidden folders are not access control; anyone who shows hidden files or reads the drive elsewhere can open them.
+- **Take Off Drive** is available only for files that already have a NAS copy. It requires typing `REMOVE`, re-hashes every drive copy and its NAS copy, validates the whole set before the first move, and then moves the drive copies into `.Camera Toolkit/_Trash/<batch>` on the same drive. Nothing is deleted until the removed-files folder is emptied in Settings with a separate `DELETE` confirmation.
+- **Free Up Source** re-hashes each card or unsorted-folder original against its drive copy and permanently removes the source originals only when the whole set matches, exactly like Free Up Camera. It is never offered for files whose only copy is the drive copy.
+- Adopting event folders already on the drive only records assignments. No file moves.
+- Immich upload sends only files in events marked **Send to Immich**, skips content Immich already has by SHA-1, and keeps the API key in Keychain.
+
 ## Failure behavior
 
 A missing destination is treated as a new copy. A same-name file with different bytes is a conflict. Read, write, or verification errors remain visible in the job result and never become a successful state. Source cleanup validates all requested files before removal begins; a removal-system error can still stop a final deletion pass after an earlier file was removed, and that partial result remains visible in the persistent transfer queue and activity log.
 
 ## Testing boundary
 
-Tests create isolated temporary folders and synthetic media bytes. They do not enumerate or write to mounted camera cards, removable drives, network shares, or a user's photo library.
+Tests create isolated temporary folders and synthetic media bytes. They do not enumerate or write to mounted camera cards, removable drives, network shares, or a user's photo library. Immich tests use a recording transport and never contact a server.
 
 Before changing transfer or cleanup behavior, add a regression test that proves conflict refusal and byte preservation.

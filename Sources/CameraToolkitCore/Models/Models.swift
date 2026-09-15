@@ -166,6 +166,8 @@ public enum JobAction: String, Codable, CaseIterable, Sendable {
     case verifyManifest
     case diskSpeed
     case networkSpeed
+    case organize
+    case immichUpload
 }
 
 public struct JobSnapshot: Identifiable, Codable, Hashable, Sendable {

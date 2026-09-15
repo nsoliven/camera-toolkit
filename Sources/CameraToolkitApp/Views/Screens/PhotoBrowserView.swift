@@ -399,6 +399,15 @@ struct PhotoBrowserView: View {
             Divider()
             VStack(spacing: 2) {
                 Button {
+                    AppShellMode.show(.events)
+                } label: {
+                    Label("Events", systemImage: "rectangle.grid.2x2")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
+                }
+                .help("Switch to the event organizer (Option-Command-1)")
+
+                Button {
                     chooseAnyFolder()
                 } label: {
                     Label("Choose Folder…", systemImage: "folder.badge.plus")

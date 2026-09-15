@@ -23,7 +23,7 @@ private struct OrganizedArchiveJobResult: Sendable {
     var plan: OrganizedArchivePlan
 }
 
-private struct BackgroundJobUpdate: Sendable {
+struct BackgroundJobUpdate: Sendable {
     var progress: Double
     var note: String
     var phase: String
@@ -99,6 +99,9 @@ final class DashboardModel {
     var transferQueue: TransferQueueSnapshot?
     var pendingTransferBatches: [PendingTransferBatch]
     var storageCapacityRevision: Int = 0
+    /// Increments on every saved configuration change so views can cheaply
+    /// rebuild indexes derived from events and assignments.
+    var configurationRevision: Int = 0
     var sourceCleanupMessage: String?
     var sourceCleanupError: String?
     var selectedEventCopyAvailability = EventCopyAvailability()
@@ -114,7 +117,7 @@ final class DashboardModel {
     @ObservationIgnored private let configurationStore: ConfigurationStore
     @ObservationIgnored private let transferQueueStore: TransferQueueStore
     @ObservationIgnored private let pendingTransferQueueStore: PendingTransferQueueStore
-    @ObservationIgnored private let secretStore = KeychainSecretStore(service: "org.cameratoolkit.CameraToolkit")
+    @ObservationIgnored let secretStore = KeychainSecretStore(service: "org.cameratoolkit.CameraToolkit")
     @ObservationIgnored private var catalogSyncTask: Task<Void, Never>?
     @ObservationIgnored private var lastTransferQueuePersistence = Date.distantPast
     @ObservationIgnored private var lastStorageCapacityRefreshRequest = Date.distantPast
@@ -1296,7 +1299,7 @@ extension DashboardModel {
         return paths
     }
 
-    private func enqueueTransfer(
+    func enqueueTransfer(
         files: [FileRecord],
         sourcePath: String,
         destinationPath: String,
@@ -1581,6 +1584,7 @@ extension DashboardModel {
         do {
             let defaults = AppConfiguration.defaults(applicationSupport: Self.defaultApplicationSupportURL)
             configuration = try configurationStore.load(defaults: defaults)
+            configurationRevision &+= 1
             configMessage = "Config reloaded at \(Self.defaultConfigurationURL.path)."
             notes.append("config")
         } catch {
@@ -1639,7 +1643,7 @@ extension DashboardModel {
         }
     }
 
-    nonisolated private static func jobUpdate(
+    nonisolated static func jobUpdate(
         from update: FileOperationProgress,
         lowerBound: Double = 0.02,
         upperBound: Double = 0.95,
@@ -1946,7 +1950,7 @@ extension DashboardModel {
         return "The transfer stopped safely: \(detail) Camera originals were untouched."
     }
 
-    private func runBackgroundJob<Result: Sendable>(
+    func runBackgroundJob<Result: Sendable>(
         action: JobAction,
         runningNote: String,
         logTitle: String,
@@ -2046,7 +2050,7 @@ extension DashboardModel {
         }
     }
 
-    private func updateJob(id: UUID, update: BackgroundJobUpdate) {
+    func updateJob(id: UUID, update: BackgroundJobUpdate) {
         guard let index = jobs.firstIndex(where: { $0.id == id }) else {
             return
         }
@@ -2072,7 +2076,7 @@ extension DashboardModel {
         }
     }
 
-    private func finishJob(
+    func finishJob(
         id: UUID,
         action: JobAction,
         state: JobState,
@@ -2100,7 +2104,7 @@ extension DashboardModel {
         storageCapacityRevision &+= 1
     }
 
-    private func recordActivity(action: JobAction, state: JobState, title: String, summary: String, detail: String) {
+    func recordActivity(action: JobAction, state: JobState, title: String, summary: String, detail: String) {
         let entry = ActivityLogEntry(
             action: action,
             state: state,
@@ -2116,12 +2120,13 @@ extension DashboardModel {
         }
     }
 
-    private func updateConfiguration(_ mutate: (inout AppConfiguration) -> Void) {
+    func updateConfiguration(_ mutate: (inout AppConfiguration) -> Void) {
         var next = configuration
         mutate(&next)
         next.normalizeLocationSelections()
         next.normalizeEventSelection()
         configuration = next
+        configurationRevision &+= 1
         do {
             try configurationStore.save(next)
             configMessage = "Config saved at \(Self.defaultConfigurationURL.path)."
@@ -2160,7 +2165,7 @@ extension DashboardModel {
         }
     }
 
-    private static var defaultApplicationSupportURL: URL {
+    static var defaultApplicationSupportURL: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? FileManager.default.temporaryDirectory
     }
@@ -2169,7 +2174,7 @@ extension DashboardModel {
         defaultApplicationSupportURL.appendingPathComponent("CameraToolkit/config.json")
     }
 
-    private static let immichAPIKeyAccount = "immich-api-key"
+    static let immichAPIKeyAccount = "immich-api-key"
     private static let trueNASAPIKeyAccount = "truenas-api-key"
 
     private static func shortFingerprint(_ fingerprint: String) -> String {
