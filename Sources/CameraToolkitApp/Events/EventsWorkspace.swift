@@ -155,7 +155,12 @@ private struct SourceCleanupGroup: Sendable {
 final class EventsWorkspace {
     let model: DashboardModel
 
-    var selection: EventsSidebarSelection?
+    var selection: EventsSidebarSelection? {
+        didSet {
+            if oldValue != selection { selectionChanged() }
+        }
+    }
+    var guide: SetupGuide?
     var sources: [UUID: UnsortedSourceState] = [:]
     var selectedStackIDs: Set<String> = []
     var focusedStackID: String?
@@ -357,6 +362,14 @@ final class EventsWorkspace {
     func start() {
         refreshLatestJournal()
         discoverDriveEvents()
+    }
+
+    func startGuide() {
+        AppShellMode.show(.events)
+        if guide == nil {
+            guide = SetupGuide(workspace: self)
+        }
+        guide?.isCollapsed = false
     }
 
     func selectionChanged() {

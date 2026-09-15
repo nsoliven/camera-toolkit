@@ -359,6 +359,14 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate {
         shortcutsItem.keyEquivalentModifierMask = [.command, .shift]
         shortcutsItem.target = self
         helpMenu.addItem(shortcutsItem)
+
+        let guideItem = NSMenuItem(
+            title: "Setup Guide…",
+            action: #selector(startSetupGuide),
+            keyEquivalent: ""
+        )
+        guideItem.target = self
+        helpMenu.addItem(guideItem)
         NSApp.helpMenu = helpMenu
 
         NSApp.mainMenu = mainMenu
@@ -400,6 +408,12 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate {
 
     @objc private func openKeyboardShortcuts() {
         KeyboardShortcutsWindowController.shared.show()
+    }
+
+    @objc private func startSetupGuide() {
+        AppShellMode.show(.events)
+        CameraToolkitMainWindow.shared.show(model: model)
+        CameraToolkitRuntime.workspace.startGuide()
     }
 
     @objc private func showEventsMode() {

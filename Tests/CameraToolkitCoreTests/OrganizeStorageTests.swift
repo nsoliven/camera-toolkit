@@ -138,6 +138,21 @@ final class OrganizeStorageTests: XCTestCase {
         }
     }
 
+    func testUndoPicksTheMostRecentMoveEvenWithinTheSameSecond() throws {
+        try withTemporaryDirectory { root in
+            let journals = root.appendingPathComponent("Journals", isDirectory: true)
+            for index in 1...5 {
+                let source = try writeFile(root.appendingPathComponent("Unsorted/DSC0000\(index).ARW"), "\(index)")
+                _ = try DriveMoveService().apply(
+                    [DriveMove(sourcePath: source.path, destinationPath: root.appendingPathComponent("Event/DSC0000\(index).ARW").path, byteCount: 1)],
+                    title: "Move \(index)",
+                    journalFolder: journals
+                )
+            }
+            XCTAssertEqual(DriveMoveService.latestUndoableJournal(in: journals)?.journal.title, "Move 5")
+        }
+    }
+
     func testPruneRemovesOnlyEmptiedFoldersInsideBoundary() throws {
         try withTemporaryDirectory { root in
             let buffer = root.appendingPathComponent("Buffer", isDirectory: true)

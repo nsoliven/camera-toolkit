@@ -26,6 +26,7 @@ struct UnsortedBoardView: View {
             Divider()
             if let result {
                 assignBar(orderedIDs: ordered.map(\.id))
+                    .guideHighlight(.assignBar, in: workspace)
                 Divider()
                 if days.isEmpty {
                     ContentUnavailableView(
@@ -38,6 +39,7 @@ struct UnsortedBoardView: View {
                     .frame(maxHeight: .infinity)
                 } else {
                     grid(days)
+                        .guideHighlight(.grid, in: workspace)
                 }
                 Divider()
                 applyBar(result)
@@ -275,6 +277,7 @@ struct UnsortedBoardView: View {
             }
             .buttonStyle(.borderedProminent)
             .disabled(sorted.files == 0 || model.isBusy)
+            .guideHighlight(.applyButton, in: workspace)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)

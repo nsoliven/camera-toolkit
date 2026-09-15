@@ -346,6 +346,12 @@ struct OrganizeGrid<MenuContent: View>: View {
                 handleKey(press, ordered: ordered, orderedIDs: orderedIDs, proxy: proxy)
             }
             .onAppear { isFocused = true }
+            .onChange(of: workspace.focusedStackID) { _, id in
+                guard let id else { return }
+                withAnimation(.easeOut(duration: 0.15)) {
+                    proxy.scrollTo(id)
+                }
+            }
         }
     }
 

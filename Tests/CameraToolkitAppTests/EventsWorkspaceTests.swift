@@ -130,6 +130,54 @@ final class EventsWorkspaceTests: XCTestCase {
         }
     }
 
+    func testSetupGuideAddsChosenFoldersHidesTestSourcesAndOpensThem() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let unsorted = root.appendingPathComponent("Drive/Unparsed A7V", isDirectory: true)
+            try writeOrganizerARW(unsorted.appendingPathComponent("DSC00001.ARW"), "2026:08:26 10:00:00", "000")
+            let testSource = ConfiguredLocation(
+                role: .importSource,
+                name: "Old Test Card",
+                path: root.appendingPathComponent("Library/Application Support/CameraToolkit/Simulation/Source Card").path
+            )
+            model.updateConfiguration { $0.configuredLocations.append(testSource) }
+            XCTAssertTrue(SetupGuide.isTestSource(testSource))
+
+            workspace.startGuide()
+            let guide = try XCTUnwrap(workspace.guide)
+            guide.go(to: SetupGuideStep.unsorted.rawValue)
+            XCTAssertTrue(guide.removableLocationIDs.contains(testSource.id))
+            guide.candidates = [UnsortedFolderCandidate(
+                path: unsorted.path,
+                name: "Unparsed A7V",
+                volumeName: "Drive",
+                cameraFileCount: 1,
+                byteCount: 100,
+                isCameraCard: false,
+                isSuggested: true
+            )]
+            guide.chosenCandidatePaths = [unsorted.path]
+            guide.applyUnsortedChoices()
+
+            let added = try XCTUnwrap(workspace.unsortedLocations.first { $0.path == unsorted.path })
+            XCTAssertEqual(added.deviceID, "sony-a7v")
+            XCTAssertFalse(workspace.unsortedLocations.contains { $0.id == testSource.id })
+
+            guide.go(to: SetupGuideStep.browse.rawValue)
+            XCTAssertEqual(guide.browseLocationID, added.id)
+            guide.openBrowse()
+            XCTAssertEqual(workspace.selection, .unsorted(added.id))
+            workspace.scan(added)
+            try await waitUntil { workspace.sources[added.id]?.result != nil }
+            guide.pickFirstBurstAndCreateEvent()
+            XCTAssertNotNil(workspace.newEventRequest)
+            XCTAssertEqual(workspace.newEventRequest?.stackIDs.count, 1)
+
+            guide.finish()
+            XCTAssertNil(workspace.guide)
+            UserDefaults.standard.removeObject(forKey: SetupGuide.completedKey)
+        }
+    }
+
     // MARK: - Helpers
 
     private func withOrganizerSandbox(
