@@ -24,6 +24,10 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
     public var savedEvents: [SavedCameraEvent]
     public var selectedEventID: UUID?
     public var photoEventAssignments: [PhotoEventAssignment]
+    /// Where events marked "Private · NAS only" wait on the working drive
+    /// before and while they are archived. Empty means a hidden
+    /// `.Camera Toolkit/Private` folder beside the Buffer on the same drive.
+    public var privateStagingPath: String
 
     public init(
         demoRootPath: String,
@@ -48,7 +52,8 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         batchID: String = "",
         savedEvents: [SavedCameraEvent] = [],
         selectedEventID: UUID? = nil,
-        photoEventAssignments: [PhotoEventAssignment] = []
+        photoEventAssignments: [PhotoEventAssignment] = [],
+        privateStagingPath: String = ""
     ) {
         self.demoRootPath = demoRootPath
         self.importSourcePath = importSourcePath
@@ -73,6 +78,7 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         self.savedEvents = savedEvents
         self.selectedEventID = selectedEventID
         self.photoEventAssignments = photoEventAssignments
+        self.privateStagingPath = privateStagingPath
         self.normalizeLocationSelections()
         self.normalizeEventSelection()
     }
@@ -101,6 +107,7 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         case savedEvents
         case selectedEventID
         case photoEventAssignments
+        case privateStagingPath
     }
 
     public init(from decoder: Decoder) throws {
@@ -135,6 +142,7 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         savedEvents = try values.decodeIfPresent([SavedCameraEvent].self, forKey: .savedEvents) ?? []
         selectedEventID = try values.decodeIfPresent(UUID.self, forKey: .selectedEventID)
         photoEventAssignments = try values.decodeIfPresent([PhotoEventAssignment].self, forKey: .photoEventAssignments) ?? []
+        privateStagingPath = try values.decodeIfPresent(String.self, forKey: .privateStagingPath) ?? ""
         normalizeLocationSelections()
         normalizeEventSelection()
     }
@@ -453,6 +461,8 @@ public struct SavedCameraEvent: Identifiable, Codable, Equatable, Hashable, Send
     public var immichUploadEnabled: Bool?
     public var immichAlbumPolicy: ImmichAlbumPolicy?
     public var immichAlbumName: String?
+    /// `nil` is the migration-safe default and behaves like `.buffer`.
+    public var storagePolicy: EventStoragePolicy?
 
     public init(
         id: UUID = UUID(),
@@ -462,7 +472,8 @@ public struct SavedCameraEvent: Identifiable, Codable, Equatable, Hashable, Send
         lastUsedAt: Date = Date(),
         immichUploadEnabled: Bool? = nil,
         immichAlbumPolicy: ImmichAlbumPolicy? = nil,
-        immichAlbumName: String? = nil
+        immichAlbumName: String? = nil,
+        storagePolicy: EventStoragePolicy? = nil
     ) {
         self.id = id
         self.name = name
@@ -472,10 +483,30 @@ public struct SavedCameraEvent: Identifiable, Codable, Equatable, Hashable, Send
         self.immichUploadEnabled = immichUploadEnabled
         self.immichAlbumPolicy = immichAlbumPolicy
         self.immichAlbumName = immichAlbumName
+        self.storagePolicy = storagePolicy
     }
 
     public var sendsToImmich: Bool { immichUploadEnabled ?? false }
     public var resolvedImmichAlbumPolicy: ImmichAlbumPolicy { immichAlbumPolicy ?? .none }
+    public var resolvedStoragePolicy: EventStoragePolicy { storagePolicy ?? .buffer }
+}
+
+/// Where an event lives on the working drive.
+public enum EventStoragePolicy: String, Codable, CaseIterable, Identifiable, Sendable {
+    /// The event's originals sit in the shared Camera Buffer folder.
+    case buffer
+    /// The event never goes into the shared Buffer. Originals wait in the
+    /// hidden private staging folder until they are archived to the NAS.
+    case archiveOnly
+
+    public var id: String { rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .buffer: "Shared Buffer"
+        case .archiveOnly: "Private · NAS only"
+        }
+    }
 }
 
 public enum ImmichAlbumPolicy: String, Codable, CaseIterable, Identifiable, Sendable {
@@ -571,17 +602,21 @@ public struct ConfiguredLocation: Identifiable, Codable, Hashable, Sendable {
     public var role: ConfiguredLocationRole
     public var name: String
     public var path: String
+    /// Camera that produced this source's files. `nil` infers it from the name.
+    public var deviceID: String?
 
     public init(
         id: UUID = UUID(),
         role: ConfiguredLocationRole,
         name: String,
-        path: String
+        path: String,
+        deviceID: String? = nil
     ) {
         self.id = id
         self.role = role
         self.name = name
         self.path = path
+        self.deviceID = deviceID
     }
 }
 

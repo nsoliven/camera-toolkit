@@ -35,6 +35,44 @@ struct ConfigView: View {
 
     var body: some View {
         Form {
+            Section {
+                PlaceRow(
+                    title: "Shared Buffer",
+                    symbol: "externaldrive.fill",
+                    tint: .blue,
+                    status: PlaceStatus.check(EventStorageLocations(configuration: model.configuration).bufferRoot),
+                    missingIsFine: false
+                ) {
+                    if model.chooseFolder(title: "Choose the Shared Buffer Folder", keyPath: \.bufferPath) {
+                        NotificationCenter.default.post(name: .cameraToolkitStorageLocationsChanged, object: nil)
+                    }
+                }
+                PlaceRow(
+                    title: "Private (hidden)",
+                    symbol: "lock.fill",
+                    tint: .purple,
+                    status: PlaceStatus.check(EventStorageLocations(configuration: model.configuration).privateStagingRoot, includeFreeSpace: false),
+                    missingIsFine: true
+                ) {
+                    if model.chooseFolder(title: "Choose the Private Folder", keyPath: \.privateStagingPath) {
+                        NotificationCenter.default.post(name: .cameraToolkitStorageLocationsChanged, object: nil)
+                    }
+                }
+                PlaceRow(
+                    title: "NAS Library",
+                    symbol: "server.rack",
+                    tint: .green,
+                    status: PlaceStatus.check(EventStorageLocations(configuration: model.configuration).libraryRoot, includeFreeSpace: false),
+                    missingIsFine: false
+                ) {
+                    model.chooseCameraLibraryRoot()
+                }
+            } header: {
+                Text("Where Things Live")
+            } footer: {
+                Text("Shared events live in the Buffer. Private events wait in the hidden folder until they’re on the NAS. The NAS library is the permanent home.")
+            }
+
             Section("Photo Library") {
                 PathSettingRow(
                     title: "Library root",
@@ -86,6 +124,34 @@ struct ConfigView: View {
                 addTitle: "Add Buffer Drive",
                 model: model
             )
+
+            Section {
+                PathSettingRow(
+                    title: "Private staging",
+                    path: Binding(
+                        get: { model.configuration.privateStagingPath },
+                        set: { model.setConfigPath(\.privateStagingPath, to: $0) }
+                    ),
+                    choose: {
+                        _ = model.chooseFolder(title: "Choose Private Staging Folder", keyPath: \.privateStagingPath)
+                    }
+                )
+                LabeledContent("In use") {
+                    Text(EventStorageLocations(configuration: model.configuration).privateStagingRoot.path)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                }
+                LabeledContent("Taken off the drive") {
+                    Text(EventStorageLocations(configuration: model.configuration).removedFilesRoot.path)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                }
+                EmptyRemovedFilesRow(model: model)
+            } header: {
+                Text("Private Events")
+            } footer: {
+                Text("Events marked Private · NAS only never enter the shared Buffer. Their originals wait in the private staging folder, which Finder hides, until they are archived to the NAS. Leave the path empty to use a hidden folder on the Buffer drive. Files taken off the drive stay recoverable until you empty them here.")
+            }
 
             Section("Import Defaults") {
                 Picker(
@@ -311,5 +377,40 @@ private struct LocationSettingRow: View {
             )
             .frame(minHeight: 28)
         }
+    }
+}
+
+private struct EmptyRemovedFilesRow: View {
+    @Bindable var model: DashboardModel
+    @State private var confirmation = ""
+    @State private var message: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                TextField("Type DELETE to empty permanently", text: $confirmation)
+                    .frame(maxWidth: 260)
+                Button("Empty Taken-Off Files", role: .destructive, action: emptyRemovedFiles)
+                    .disabled(confirmation != FreeUpService.confirmationToken || model.isBusy)
+            }
+            if let message {
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func emptyRemovedFiles() {
+        let root = EventStorageLocations(configuration: model.configuration).removedFilesRoot
+        do {
+            let result = try FreeUpService().emptyTrash(trashRoot: root, confirm: confirmation)
+            message = result.deletedBatches.isEmpty
+                ? "There was nothing to empty."
+                : "Permanently deleted \(result.deletedBatches.count) batch(es), freeing \(result.freedBytes.formattedBytes)."
+        } catch {
+            message = error.localizedDescription
+        }
+        confirmation = ""
     }
 }
