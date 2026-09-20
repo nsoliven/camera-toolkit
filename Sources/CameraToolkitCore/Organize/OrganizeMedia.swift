@@ -247,23 +247,23 @@ public struct OrganizeDay: Identifiable, Hashable, Sendable {
 }
 
 public enum OrganizeStacker {
-    public static let maximumBurstGap: TimeInterval = 1.0
-
     /// Groups items into bursts and singles.
     ///
     /// A folder whose files already carry `B0001_` prefixes is trusted as-is:
     /// every prefix is one burst and unprefixed files stay single. Other
-    /// folders chain consecutive still frames at most `maximumGap` seconds
-    /// apart with neighbouring frame numbers. Video never stacks.
-    public static func stacks(for items: [OrganizeItem], maximumGap: TimeInterval = maximumBurstGap) -> [OrganizeStack] {
-        var byFolder: [String: [OrganizeItem]] = [:]
-        for item in items {
-            byFolder[item.primary.folderPath, default: []].append(item)
-        }
-
+    /// folders chain consecutive still frames with neighbouring frame
+    /// numbers. Gaps up to `configuration.automaticGapSeconds` link directly;
+    /// gaps through `maximumGapSeconds` link only when `visualLinks` (from
+    /// `BurstVisualLinker`) cleared the pair; longer gaps never link. Chains
+    /// smaller than `minimumGroupSize` split back into singles. Video never
+    /// stacks.
+    public static func stacks(
+        for items: [OrganizeItem],
+        configuration: BurstGroupingConfiguration = BurstGroupingConfiguration(),
+        visualLinks: Set<BurstVisualLink> = []
+    ) -> [OrganizeStack] {
         var groups: [[OrganizeItem]] = []
-        for (_, folderItems) in byFolder {
-            let sorted = folderItems.sorted(by: capturedBefore)
+        for sorted in sortedItemsByFolder(items) {
             if sorted.contains(where: { $0.burstPrefix != nil }) {
                 var prefixed: [String: [OrganizeItem]] = [:]
                 for item in sorted {
@@ -277,14 +277,14 @@ public enum OrganizeStacker {
             } else {
                 var current: [OrganizeItem] = []
                 for item in sorted {
-                    if let last = current.last, canChain(last, item, maximumGap: maximumGap) {
+                    if let last = current.last, canChain(last, item, configuration: configuration, visualLinks: visualLinks) {
                         current.append(item)
                     } else {
-                        if !current.isEmpty { groups.append(current) }
+                        append(current, to: &groups, minimumGroupSize: configuration.minimumGroupSize)
                         current = [item]
                     }
                 }
-                if !current.isEmpty { groups.append(current) }
+                append(current, to: &groups, minimumGroupSize: configuration.minimumGroupSize)
             }
         }
 
@@ -313,22 +313,73 @@ public enum OrganizeStacker {
         }
     }
 
+    /// Items grouped by folder, each in capture order — the order burst
+    /// links are decided in.
+    static func sortedItemsByFolder(_ items: [OrganizeItem]) -> [[OrganizeItem]] {
+        var byFolder: [String: [OrganizeItem]] = [:]
+        for item in items {
+            byFolder[item.primary.folderPath, default: []].append(item)
+        }
+        return byFolder.values.map { $0.sorted(by: capturedBefore) }
+    }
+
     static func capturedBefore(_ lhs: OrganizeItem, _ rhs: OrganizeItem) -> Bool {
         if lhs.captureDate != rhs.captureDate { return lhs.captureDate < rhs.captureDate }
         return lhs.primary.path < rhs.primary.path
     }
 
-    static func canChain(_ previous: OrganizeItem, _ next: OrganizeItem, maximumGap: TimeInterval) -> Bool {
+    /// How two neighbours may link: stills in one folder with camera dates
+    /// and neighbouring frame numbers fall into the automatic or
+    /// visual-recovery band by gap; everything else stays separate. The
+    /// frame-number gate applies to the recovery band too, matching the Sony
+    /// Burst Grouper rule.
+    public static func linkRequirement(
+        from previous: OrganizeItem,
+        to next: OrganizeItem,
+        configuration: BurstGroupingConfiguration = BurstGroupingConfiguration()
+    ) -> BurstLinkRequirement {
         let stills: Set<OrganizeMediaKind> = [.raw, .photo]
         guard stills.contains(previous.kind), stills.contains(next.kind),
-              previous.hasCameraDate, next.hasCameraDate else { return false }
+              previous.hasCameraDate, next.hasCameraDate,
+              previous.primary.folderPath == next.primary.folderPath else { return .separate }
         let gap = next.captureDate.timeIntervalSince(previous.captureDate)
-        guard gap >= 0, gap <= maximumGap else { return false }
-        if let a = previous.frameNumber, let b = next.frameNumber {
-            let step = b - a
-            let rolledOver = a >= 9_990 && b <= 10
-            return (step >= 1 && step <= 3) || rolledOver
+        guard gap >= 0, framesAreConsecutive(previous, next) else { return .separate }
+        if gap <= configuration.automaticGapSeconds { return .automatic }
+        let recoveryLimit = max(configuration.maximumGapSeconds, configuration.automaticGapSeconds)
+        guard configuration.useVisualRecovery, gap <= recoveryLimit else { return .separate }
+        return .visualCheck
+    }
+
+    /// Frame numbers step forward by 1–3, or wrap from 9990+ back to a low
+    /// number. Frames without a usable number can't be disproved, so they
+    /// pass.
+    static func framesAreConsecutive(_ previous: OrganizeItem, _ next: OrganizeItem) -> Bool {
+        guard let a = previous.frameNumber, let b = next.frameNumber else { return true }
+        let step = b - a
+        let rolledOver = a >= 9_990 && b <= 10
+        return (step >= 1 && step <= 3) || rolledOver
+    }
+
+    private static func canChain(
+        _ previous: OrganizeItem,
+        _ next: OrganizeItem,
+        configuration: BurstGroupingConfiguration,
+        visualLinks: Set<BurstVisualLink>
+    ) -> Bool {
+        switch linkRequirement(from: previous, to: next, configuration: configuration) {
+        case .automatic: return true
+        case .visualCheck: return visualLinks.contains(BurstVisualLink(previous: previous, next: next))
+        case .separate: return false
         }
-        return true
+    }
+
+    /// Groups below `minimumGroupSize` split back into single-item groups.
+    private static func append(_ group: [OrganizeItem], to groups: inout [[OrganizeItem]], minimumGroupSize: Int) {
+        guard !group.isEmpty else { return }
+        if group.count >= max(1, minimumGroupSize) {
+            groups.append(group)
+        } else {
+            groups.append(contentsOf: group.map { [$0] })
+        }
     }
 }

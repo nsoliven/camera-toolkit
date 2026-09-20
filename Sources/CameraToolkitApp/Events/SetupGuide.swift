@@ -176,9 +176,19 @@ final class SetupGuide {
 
     // MARK: Places
 
-    var bufferStatus: PlaceStatus { PlaceStatus.check(workspace.locations.bufferRoot) }
-    var privateStatus: PlaceStatus { PlaceStatus.check(workspace.locations.privateStagingRoot) }
-    var libraryStatus: PlaceStatus { PlaceStatus.check(workspace.locations.libraryRoot, includeFreeSpace: false) }
+    var bufferStatus: PlaceStatus {
+        // Tracked read: place statuses re-check when connectivity is refreshed.
+        _ = workspace.connectivityRevision
+        return PlaceStatus.check(workspace.locations.bufferRoot)
+    }
+    var privateStatus: PlaceStatus {
+        _ = workspace.connectivityRevision
+        return PlaceStatus.check(workspace.locations.privateStagingRoot)
+    }
+    var libraryStatus: PlaceStatus {
+        _ = workspace.connectivityRevision
+        return PlaceStatus.check(workspace.locations.libraryRoot, includeFreeSpace: false)
+    }
 
     var usesDefaultPrivateFolder: Bool {
         model.configuration.privateStagingPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty

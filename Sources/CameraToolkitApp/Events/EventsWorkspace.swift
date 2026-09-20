@@ -5,6 +5,9 @@ import Observation
 
 extension Notification.Name {
     static let cameraToolkitUndoSort = Notification.Name("CameraToolkit.UndoSort")
+    /// Posted after a Trash batch is restored so unsorted boards rescan and
+    /// show the files that came back.
+    static let cameraToolkitMediaTrashChanged = Notification.Name("CameraToolkit.MediaTrashChanged")
 }
 
 enum EventsSidebarSelection: Hashable, Sendable {
@@ -24,6 +27,8 @@ struct NewEventRequest: Identifiable {
     var suggestedDate: Date
     var sourceLocationID: UUID?
     var stackIDs: Set<String>
+    /// Preselected parent for "New Subevent…"; nil means a top-level event.
+    var parentEventID: UUID?
 }
 
 struct RenameEventRequest: Identifiable {
@@ -60,6 +65,9 @@ struct OrganizeApplyPlan: Identifiable, Sendable {
         var alreadyThere: Int
         var unavailable: Int
         var destinationFolder: String
+        /// The event's resolved private flag (subevents inherit it), for the
+        /// chip lock in the plan sheet.
+        var isPrivate: Bool
         var byteCount: Int64
 
         var copyFileCount: Int { copies.reduce(0) { $0 + $1.files.count } }
@@ -147,6 +155,12 @@ private struct SourceCleanupGroup: Sendable {
     var files: [FileRecord]
 }
 
+/// NSWorkspace notification tokens. Kept in a Sendable box so `deinit` can
+/// unregister them; the workspace itself is main-actor bound.
+private final class MountObserverBox: @unchecked Sendable {
+    var observers: [NSObjectProtocol] = []
+}
+
 /// State and actions for the event-first organizer: sorting unsorted folders
 /// into events, moving events between the shared Buffer and private staging,
 /// archiving to the NAS, freeing cards and drives, and sending to Immich.
@@ -173,6 +187,10 @@ final class EventsWorkspace {
     var pendingApplyPlan: OrganizeApplyPlan?
     var pendingRemoval: RemovalRequest?
     var latestMoveJournalTitle: String?
+    /// Bumped by `refreshConnectivity()`. `isConnected` reads it so views that
+    /// ask about connectivity re-render after a mount, unmount, or manual
+    /// refresh.
+    private(set) var connectivityRevision = 0
     private var assignmentUndoStack: [AssignmentChange] = []
 
     @ObservationIgnored private var selectionAnchorID: String?
@@ -184,6 +202,8 @@ final class EventsWorkspace {
     @ObservationIgnored private var eventAssetsByPathKey: [UUID: [String: EventAssetPresence]] = [:]
     @ObservationIgnored private var refreshGenerations: [UUID: UUID] = [:]
     @ObservationIgnored private var loadedCaptureDateCache: CaptureDateCache?
+    @ObservationIgnored private var lastConnectivityRefresh = Date.distantPast
+    @ObservationIgnored private let mountObservers = MountObserverBox()
 
     /// Holds move journals and the capture-time cache.
     let supportFolder: URL
@@ -191,6 +211,13 @@ final class EventsWorkspace {
     init(model: DashboardModel, supportFolder: URL = EventsWorkspace.defaultSupportFolder) {
         self.model = model
         self.supportFolder = supportFolder
+    }
+
+    deinit {
+        let center = NSWorkspace.shared.notificationCenter
+        for observer in mountObservers.observers {
+            center.removeObserver(observer)
+        }
     }
 
     // MARK: - Lookups
@@ -222,6 +249,47 @@ final class EventsWorkspace {
         model.savedEvents
     }
 
+    /// Events flattened for the sidebar: parents newest-first, each followed
+    /// by its subevents (depth drives the indent). Orphaned or looping parent
+    /// links surface as top-level rows instead of disappearing.
+    var sidebarEvents: [(event: SavedCameraEvent, depth: Int)] {
+        EventHierarchy.flattened(model.configuration.savedEvents)
+    }
+
+    /// "Parent / Child" title for menus, headers, and plan rows.
+    func eventTitle(_ event: SavedCameraEvent) -> String {
+        locations.displayName(for: event)
+    }
+
+    /// The event's effective storage policy, following parent inheritance.
+    func resolvedPolicy(for event: SavedCameraEvent) -> EventStoragePolicy {
+        locations.resolvedPolicy(for: event)
+    }
+
+    /// Events that may parent `eventID` — every event except it and its own
+    /// subevents, so the picker can never create a loop. Returned in
+    /// flattened sidebar order for the parent picker's indented menu.
+    func parentCandidates(excluding eventID: UUID?) -> [(event: SavedCameraEvent, depth: Int)] {
+        sidebarEvents.filter { row in
+            guard let eventID else { return true }
+            return row.event.id != eventID
+                && !EventHierarchy.ancestors(of: row.event, in: model.configuration.savedEvents).contains { $0.id == eventID }
+        }
+    }
+
+    /// `candidate` when it can parent `eventID` — it exists, is not the
+    /// event itself, and is not one of its subevents. Otherwise nil.
+    func validParentEventID(_ candidate: UUID?, for eventID: UUID?) -> UUID? {
+        guard let candidate,
+              candidate != eventID,
+              let parent = event(candidate) else { return nil }
+        if let eventID,
+           EventHierarchy.ancestors(of: parent, in: model.configuration.savedEvents).contains(where: { $0.id == eventID }) {
+            return nil
+        }
+        return candidate
+    }
+
     /// Up to nine recently created events in date order. The order stays put
     /// while sorting, so each number key keeps meaning the same event.
     var quickEvents: [SavedCameraEvent] {
@@ -244,6 +312,9 @@ final class EventsWorkspace {
     }
 
     func isConnected(_ location: ConfiguredLocation) -> Bool {
+        // Tracked read: views that call this re-evaluate when
+        // `refreshConnectivity()` bumps `connectivityRevision`.
+        _ = connectivityRevision
         let url = URL(fileURLWithPath: DashboardModel.expandedPath(location.path), isDirectory: true)
         return VolumeInfo.isAvailable(url) && FileManager.default.fileExists(atPath: url.path)
     }
@@ -351,7 +422,7 @@ final class EventsWorkspace {
             return nil
         }
         if asset.drive == .present { return nil }
-        if asset.otherDrive == .present { return event.resolvedStoragePolicy == .buffer ? .inPrivate : .inBuffer }
+        if asset.otherDrive == .present { return locations.resolvedPolicy(for: event) == .buffer ? .inPrivate : .inBuffer }
         if asset.source == .present { return .onSource }
         if asset.archive == .present { return .nasOnly }
         return nil
@@ -360,6 +431,7 @@ final class EventsWorkspace {
     // MARK: - Startup and selection
 
     func start() {
+        observeVolumeChanges()
         refreshLatestJournal()
         discoverDriveEvents()
     }
@@ -504,7 +576,7 @@ final class EventsWorkspace {
         Task { @MainActor [weak self] in
             let outcome: Result<OrganizeScanResult, any Error> = await Task.detached(priority: .userInitiated) {
                 Result {
-                    try OrganizeScanner().scan(root: root, cache: cache, progress: reportProgress)
+                    try OrganizeScanner().scan(root: root, cache: cache, burstGrouping: BurstGroupingConfiguration.resolved(), progress: reportProgress)
                 }
             }.value
             guard let self else { return }
@@ -518,6 +590,74 @@ final class EventsWorkspace {
             sources[id]?.isScanning = false
             sources[id]?.progress = nil
         }
+    }
+
+    // MARK: - Connectivity
+
+    /// Re-checks which configured places are reachable. This is cheap — mount
+    /// table and folder stat probes only, never a file-content scan. Cached
+    /// event presence and drive-event discovery are refreshed so Offline
+    /// badges clear, and unsorted sources that failed while offline scan again
+    /// once they are reachable. When `mountedVolume` is set (that volume just
+    /// mounted), sources on it are scanned even if they were never tried.
+    ///
+    /// Refresh never mounts anything itself: the configuration stores local
+    /// paths and service URLs, not network share URLs, so there is no share
+    /// URL to hand to the mounter.
+    func refreshConnectivity(mountedVolume: URL? = nil) {
+        connectivityRevision &+= 1
+        lastConnectivityRefresh = Date()
+
+        discoverDriveEvents()
+        for eventID in Set(presence.keys).union(eventStacks.keys) {
+            Task { await refreshEvent(eventID) }
+        }
+
+        let mountedRoot = mountedVolume?.standardizedFileURL
+        for location in unsortedLocations {
+            let state = sources[location.id]
+            // Healthy cached results are never rescanned here.
+            guard state?.isScanning != true, state?.result == nil else { continue }
+            guard isConnected(location) else { continue }
+            if let mountedRoot {
+                let locationURL = URL(fileURLWithPath: DashboardModel.expandedPath(location.path), isDirectory: true)
+                guard VolumeInfo.volumeRoot(for: locationURL) == mountedRoot else { continue }
+            } else if state == nil {
+                // A global refresh only retries sources that failed before.
+                // Fresh sources scan when selected or when their volume mounts.
+                continue
+            }
+            scan(location)
+        }
+    }
+
+    /// For app activation: connectivity re-checks at most every `maxAge`
+    /// seconds so returning to the app updates offline badges without redoing
+    /// presence work on every activate.
+    func refreshConnectivityIfStale(maxAge: TimeInterval = 15) {
+        guard Date().timeIntervalSince(lastConnectivityRefresh) >= maxAge else { return }
+        refreshConnectivity()
+    }
+
+    /// Registers once for volume mount/unmount notifications so offline rows,
+    /// presence summaries, and failed scans update themselves when a drive or
+    /// card appears or disappears. Safe to call repeatedly.
+    func observeVolumeChanges() {
+        guard mountObservers.observers.isEmpty else { return }
+        let center = NSWorkspace.shared.notificationCenter
+        mountObservers.observers = [
+            center.addObserver(forName: NSWorkspace.didMountNotification, object: nil, queue: nil) { [weak self] notification in
+                let url = notification.userInfo?[NSWorkspace.volumeURLUserInfoKey] as? URL
+                Task { @MainActor [weak self] in
+                    self?.refreshConnectivity(mountedVolume: url)
+                }
+            },
+            center.addObserver(forName: NSWorkspace.didUnmountNotification, object: nil, queue: nil) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.refreshConnectivity()
+                }
+            },
+        ]
     }
 
     // MARK: - Sorting
@@ -567,11 +707,11 @@ final class EventsWorkspace {
             }
         }
 
-        let change = AssignmentChange(title: "Sort into \(event.name)", removed: removed, added: added)
+        let change = AssignmentChange(title: "Sort into \(eventTitle(event))", removed: removed, added: added)
         applyAssignmentChange(change, touching: eventID)
         pushUndo(change)
         let skipped = files.count - eligible.count
-        model.statusMessage = "Sorted \(stacks.count) item\(stacks.count == 1 ? "" : "s") (\(eligible.count) file\(eligible.count == 1 ? "" : "s")) into \(event.name). Nothing moves until you press Apply."
+        model.statusMessage = "Sorted \(stacks.count) item\(stacks.count == 1 ? "" : "s") (\(eligible.count) file\(eligible.count == 1 ? "" : "s")) into \(eventTitle(event)). Nothing moves until you press Apply."
             + (skipped > 0 ? " \(skipped) file(s) already live in another event's folder and were left alone." : "")
         advanceFocus(past: stackIDs, orderedIDs: orderedIDs)
     }
@@ -641,43 +781,49 @@ final class EventsWorkspace {
 
     // MARK: - Events
 
-    func requestNewEvent(from locationID: UUID?) {
+    func requestNewEvent(from locationID: UUID?, parentEventID: UUID? = nil) {
         let stacks = locationID.flatMap { id in
             sources[id]?.result?.stacks.filter { targetStackIDs().contains($0.id) }
         } ?? []
         newEventRequest = NewEventRequest(
             suggestedDate: stacks.map(\.captureDate).min() ?? Date(),
             sourceLocationID: locationID,
-            stackIDs: Set(stacks.map(\.id))
+            stackIDs: Set(stacks.map(\.id)),
+            parentEventID: validParentEventID(parentEventID, for: nil)
         )
     }
 
     @discardableResult
-    func createEvent(name rawName: String, date: Date, policy: EventStoragePolicy) -> UUID? {
+    func createEvent(name rawName: String, date: Date, policy: EventStoragePolicy?, parentEventID: UUID? = nil) -> UUID? {
         let validation = EventNamePolicy.validate(rawName)
         guard validation.isValid else {
             model.statusMessage = validation.errorMessage ?? "Choose a different event name."
             return nil
         }
         let day = Calendar.current.startOfDay(for: date)
+        let parentID = validParentEventID(parentEventID, for: nil)
+        // The dated folder name is unique per parent: the same name and date
+        // under a different parent is a different folder, not a duplicate.
         if let existing = model.configuration.savedEvents.first(where: {
             $0.name.localizedCaseInsensitiveCompare(validation.normalizedName) == .orderedSame
                 && Calendar.current.isDate($0.eventDate, inSameDayAs: day)
+                && $0.parentEventID == parentID
         }) {
             return existing.id
         }
         let event = SavedCameraEvent(
             name: validation.normalizedName,
             eventDate: day,
-            storagePolicy: policy == .buffer ? nil : policy
+            storagePolicy: policy,
+            parentEventID: parentID
         )
         model.updateConfiguration { $0.savedEvents.append(event) }
-        model.statusMessage = "Created \(event.name). Sort photos into it, then press Apply."
+        model.statusMessage = "Created \(eventTitle(event)). Sort photos into it, then press Apply."
         return event.id
     }
 
-    func completeNewEvent(_ request: NewEventRequest, name: String, date: Date, policy: EventStoragePolicy) {
-        guard let eventID = createEvent(name: name, date: date, policy: policy) else { return }
+    func completeNewEvent(_ request: NewEventRequest, name: String, date: Date, policy: EventStoragePolicy?, parentEventID: UUID?) {
+        guard let eventID = createEvent(name: name, date: date, policy: policy, parentEventID: parentEventID) else { return }
         newEventRequest = nil
         if let locationID = request.sourceLocationID, !request.stackIDs.isEmpty {
             assign(stackIDs: request.stackIDs, from: locationID, to: eventID)
@@ -691,23 +837,34 @@ final class EventsWorkspace {
             model.statusMessage = "Only an event with no photos can be deleted. Move or return its photos first."
             return
         }
+        guard EventHierarchy.descendants(of: eventID, in: model.configuration.savedEvents).isEmpty else {
+            model.statusMessage = "\(eventTitle(event)) has subevents. Move or delete them first."
+            return
+        }
         model.updateConfiguration { $0.savedEvents.removeAll { $0.id == eventID } }
         if selection == .event(eventID) { selection = nil }
         model.statusMessage = "Deleted the empty event \(event.name)."
     }
 
-    func setPolicy(_ eventID: UUID, _ policy: EventStoragePolicy) {
+    /// `nil` leaves the policy unset: a subevent then follows its parent's
+    /// setting, and a top-level event resolves to the shared Buffer.
+    func setPolicy(_ eventID: UUID, _ policy: EventStoragePolicy?) {
         model.updateConfiguration { configuration in
             guard let index = configuration.savedEvents.firstIndex(where: { $0.id == eventID }) else { return }
-            configuration.savedEvents[index].storagePolicy = policy == .buffer ? nil : policy
+            configuration.savedEvents[index].storagePolicy = policy
         }
-        model.statusMessage = policy == .archiveOnly
-            ? "Private event. Its originals stay out of the shared Buffer. Use Move to Private for any copies already there."
-            : "Shared event. Use Put on Buffer to move its originals into the shared Buffer."
+        switch policy {
+        case .archiveOnly:
+            model.statusMessage = "Private event. Its originals stay out of the shared Buffer. Use Move to Private for any copies already there."
+        case .buffer:
+            model.statusMessage = "Shared event. Use Put on Buffer to move its originals into the shared Buffer."
+        case nil:
+            model.statusMessage = "This subevent now follows its parent event's storage setting."
+        }
         Task { await refreshEvent(eventID) }
     }
 
-    func renameEvent(_ eventID: UUID, name rawName: String, date: Date, policy: EventStoragePolicy) {
+    func renameEvent(_ eventID: UUID, name rawName: String, date: Date, policy: EventStoragePolicy?, parentEventID: UUID?) {
         renameRequest = nil
         guard let event = event(eventID) else { return }
         let validation = EventNamePolicy.validate(rawName)
@@ -718,8 +875,14 @@ final class EventsWorkspace {
         var renamed = event
         renamed.name = validation.normalizedName
         renamed.eventDate = Calendar.current.startOfDay(for: date)
+        renamed.parentEventID = validParentEventID(parentEventID, for: eventID)
+        renamed.storagePolicy = policy
         let locations = self.locations
         let fileManager = FileManager.default
+        let oldResolved = locations.resolvedPolicy(for: event)
+        var futureEvents = model.configuration.savedEvents
+        if let index = futureEvents.firstIndex(where: { $0.id == eventID }) { futureEvents[index] = renamed }
+        let newResolved = EventHierarchy.resolvedPolicy(of: renamed, in: futureEvents)
 
         var folderMoves: [(URL, URL)] = []
         for candidate in EventStoragePolicy.allCases {
@@ -748,15 +911,21 @@ final class EventsWorkspace {
             }
         }
 
+        // Subevent folders move with the renamed parent, so their adopted
+        // assignments need the same path rewrite.
+        let touchedIDs = Set(EventHierarchy.descendants(of: eventID, in: model.configuration.savedEvents).map(\.id))
+            .union([eventID])
         model.updateConfiguration { configuration in
             guard let index = configuration.savedEvents.firstIndex(where: { $0.id == eventID }) else { return }
             configuration.savedEvents[index].name = renamed.name
             configuration.savedEvents[index].eventDate = renamed.eventDate
+            configuration.savedEvents[index].parentEventID = renamed.parentEventID
+            configuration.savedEvents[index].storagePolicy = renamed.storagePolicy
             // Adopted assignments point straight at the old folder.
             for (old, new) in moved {
                 let oldPrefix = old.standardizedFileURL.path + "/"
                 for assignmentIndex in configuration.photoEventAssignments.indices
-                where configuration.photoEventAssignments[assignmentIndex].eventID == eventID {
+                where touchedIDs.contains(configuration.photoEventAssignments[assignmentIndex].eventID) {
                     let root = configuration.photoEventAssignments[assignmentIndex].sourceRootPath
                     if root.hasPrefix(oldPrefix) {
                         configuration.photoEventAssignments[assignmentIndex].sourceRootPath =
@@ -765,18 +934,24 @@ final class EventsWorkspace {
                 }
             }
         }
-        let oldNAS = locations.libraryRoot
+        let oldLayout = locations.layout(for: event, deviceID: nil)
+        var oldNAS = locations.libraryRoot
             .appendingPathComponent("Originals", isDirectory: true)
-            .appendingPathComponent(locations.layout(for: event, deviceID: nil).year, isDirectory: true)
-            .appendingPathComponent(locations.layout(for: event, deviceID: nil).eventFolder, isDirectory: true)
+            .appendingPathComponent(oldLayout.year, isDirectory: true)
+        for folder in oldLayout.parentEventFolders {
+            oldNAS.appendPathComponent(folder, isDirectory: true)
+        }
+        oldNAS.appendPathComponent(oldLayout.eventFolder, isDirectory: true)
         let nasNote = VolumeInfo.isAvailable(oldNAS) && fileManager.fileExists(atPath: oldNAS.path)
             ? " NAS copies keep the old folder name until you archive again."
             : ""
-        model.statusMessage = "Renamed to \(renamed.name)." + nasNote
-        if policy != event.resolvedStoragePolicy {
-            setPolicy(eventID, policy)
-        } else {
-            Task { await refreshEvent(eventID) }
+        model.statusMessage = "Renamed to \(eventTitle(renamed))." + nasNote
+            + (newResolved == oldResolved ? ""
+                : newResolved == .archiveOnly
+                    ? " Its originals stay out of the shared Buffer. Use Move to Private for any copies already there."
+                    : " It's a shared event now. Use Put on Buffer for copies still in Private.")
+        for touchedID in touchedIDs {
+            Task { await refreshEvent(touchedID) }
         }
     }
 
@@ -904,7 +1079,7 @@ final class EventsWorkspace {
         var groups: [OrganizeApplyPlan.EventGroup] = []
 
         for event in events {
-            let policy = event.resolvedStoragePolicy
+            let policy = locations.resolvedPolicy(for: event)
             let driveRoot = locations.driveRoot(for: policy)
             let assignments = configuration.photoEventAssignments.filter { $0.eventID == event.id }
             let summary = EventPresenceScanner.scan(event: event, assignments: assignments, locations: locations, mountedVolumes: mounted)
@@ -976,6 +1151,7 @@ final class EventsWorkspace {
                 alreadyThere: alreadyThere,
                 unavailable: unavailable,
                 destinationFolder: locations.eventFolder(for: event, policy: policy).path,
+                isPrivate: policy == .archiveOnly,
                 byteCount: bytes
             ))
         }
@@ -1027,7 +1203,7 @@ final class EventsWorkspace {
                 sourcePath: batch.sourceRoot,
                 destinationPath: batch.destinationRoot,
                 eventID: event.id,
-                eventName: event.name,
+                eventName: locations.displayName(for: event),
                 deviceID: batch.deviceID
             )
         }
@@ -1107,7 +1283,7 @@ final class EventsWorkspace {
         let assets = stacks.filter { stackIDs.contains($0.id) }.flatMap { self.assets(for: $0, in: sourceEventID) }
         guard !assets.isEmpty else { return }
         let locations = self.locations
-        let targetPolicy = to.resolvedStoragePolicy
+        let targetPolicy = locations.resolvedPolicy(for: to)
         var targetNames = Set(model.configuration.photoEventAssignments
             .filter { $0.eventID == targetEventID }
             .map { $0.relativePath.lowercased() })
@@ -1136,7 +1312,7 @@ final class EventsWorkspace {
             plans.append(PlannedReassignment(removed: asset.assignment, added: moved, moveSourcePath: moveSource))
         }
         guard !plans.isEmpty else {
-            model.statusMessage = "\(to.name) already has files with those names. Nothing moved."
+            model.statusMessage = "\(eventTitle(to)) already has files with those names. Nothing moved."
             return
         }
 
@@ -1145,24 +1321,24 @@ final class EventsWorkspace {
                   let destination = locations.driveURL(for: plan.added, event: to, policy: targetPolicy) else { return nil }
             return DriveMove(sourcePath: source, destinationPath: destination.path, byteCount: plan.added.fileSize)
         }
-        let collisionNote = collisions > 0 ? " \(collisions) file(s) stayed because \(to.name) already has that name." : ""
+        let collisionNote = collisions > 0 ? " \(collisions) file(s) stayed because \(eventTitle(to)) already has that name." : ""
         guard !moves.isEmpty else {
-            let change = AssignmentChange(title: "Move to \(to.name)", removed: plans.map(\.removed), added: plans.map(\.added))
+            let change = AssignmentChange(title: "Move to \(eventTitle(to))", removed: plans.map(\.removed), added: plans.map(\.added))
             applyAssignmentChange(change, touching: targetEventID)
             pushUndo(change)
-            model.statusMessage = "Moved \(plans.count) file(s) from \(from.name) to \(to.name).\(collisionNote)"
+            model.statusMessage = "Moved \(plans.count) file(s) from \(eventTitle(from)) to \(eventTitle(to)).\(collisionNote)"
             refreshBoth(sourceEventID, targetEventID)
             return
         }
 
         let journalFolder = self.journalFolder
         let boundaries = [locations.bufferRoot, locations.privateStagingRoot]
-        let title = "Move to \(to.name)"
+        let title = "Move to \(eventTitle(to))"
         let removed = plans.map(\.removed)
         let added = plans.map(\.added)
         model.runBackgroundJob(
             action: .organize,
-            runningNote: "Moving \(moves.count) file(s) from \(from.name) to \(to.name)",
+            runningNote: "Moving \(moves.count) file(s) from \(eventTitle(from)) to \(eventTitle(to))",
             logTitle: title,
             logDetail: "Renamed originals between event folders on the same drive. NAS copies were not changed.",
             operation: { progress in
@@ -1191,7 +1367,7 @@ final class EventsWorkspace {
                 refreshLatestJournal()
                 refreshBoth(sourceEventID, targetEventID)
                 let skippedNote = report.skipped.isEmpty ? "" : " \(report.skipped.count) could not move: \(report.skipped[0].reason)"
-                return "Moved \(applied.count) file(s) to \(to.name).\(skippedNote)\(collisionNote)"
+                return "Moved \(applied.count) file(s) to \(eventTitle(to)).\(skippedNote)\(collisionNote)"
             }
         )
     }
@@ -1233,14 +1409,14 @@ final class EventsWorkspace {
             let change = AssignmentChange(title: "Return to Unsorted", removed: removed, added: [])
             applyAssignmentChange(change, touching: nil)
             pushUndo(change)
-            model.statusMessage = "Returned \(removed.count) file(s) from \(event.name) to Unsorted. \(notes)"
+            model.statusMessage = "Returned \(removed.count) file(s) from \(eventTitle(event)) to Unsorted. \(notes)"
             Task { await refreshEvent(eventID) }
             return
         }
         let journalFolder = self.journalFolder
         let locations = self.locations
         let boundaries = [locations.bufferRoot, locations.privateStagingRoot]
-        let title = "Return to Unsorted from \(event.name)"
+        let title = "Return to Unsorted from \(eventTitle(event))"
         let plannedMoves = moves
         let plannedRemoved = removed
         model.runBackgroundJob(
@@ -1294,7 +1470,7 @@ final class EventsWorkspace {
             model.statusMessage = "The NAS library is not connected: \(locations.libraryRoot.path)"
             return
         }
-        let policy = event.resolvedStoragePolicy
+        let policy = locations.resolvedPolicy(for: event)
         let otherPolicy: EventStoragePolicy = policy == .buffer ? .archiveOnly : .buffer
         var groups: [String: NASArchiveGroup] = [:]
         for asset in summary.assets where asset.archive != .present {
@@ -1315,7 +1491,7 @@ final class EventsWorkspace {
         }
         guard !groups.isEmpty else {
             model.statusMessage = summary.onArchive == summary.total
-                ? "\(event.name) is already on the NAS."
+                ? "\(eventTitle(event)) is already on the NAS."
                 : "No reachable copy of the remaining files. Connect the drive or card that has them."
             return
         }
@@ -1324,8 +1500,8 @@ final class EventsWorkspace {
         let fileCount = archiveGroups.reduce(0) { $0 + $1.files.count }
         model.runBackgroundJob(
             action: .syncBuffer,
-            runningNote: "Archiving \(fileCount) file(s) from \(event.name) to the NAS",
-            logTitle: "Archived \(event.name) to the NAS",
+            runningNote: "Archiving \(fileCount) file(s) from \(eventTitle(event)) to the NAS",
+            logTitle: "Archived \(eventTitle(event)) to the NAS",
             logDetail: "Copied originals into Library Originals and checked every copy with SHA-256. Different existing files were never overwritten.",
             operation: { progress in
                 var outcome = NASArchiveOutcome()
@@ -1352,7 +1528,7 @@ final class EventsWorkspace {
             },
             completion: { [weak self] outcome in
                 Task { await self?.refreshEvent(eventID) }
-                return "NAS archive verified for \(event.name): \(outcome.copied) copied, \(outcome.alreadySafe) already safe, \(outcome.conflicts) conflict(s) left untouched."
+                return "NAS archive verified for \(self?.eventTitle(event) ?? event.name): \(outcome.copied) copied, \(outcome.alreadySafe) already safe, \(outcome.conflicts) conflict(s) left untouched."
             }
         )
     }
@@ -1398,8 +1574,8 @@ final class EventsWorkspace {
     private func removeFromDrive(_ eventID: UUID, confirmation: String) {
         guard let event = event(eventID), let summary = presence[eventID] else { return }
         let locations = self.locations
-        let policy = event.resolvedStoragePolicy
-        let eventFolder = locations.layout(for: event, deviceID: nil).eventFolder
+        let policy = locations.resolvedPolicy(for: event)
+        let eventFolderPath = locations.layout(for: event, deviceID: nil).eventFolderPath
         var pairs: [VerifiedRemovalPair] = []
         for asset in summary.assets where asset.archive == .present {
             guard let archive = asset.archivePath else { continue }
@@ -1413,7 +1589,7 @@ final class EventsWorkspace {
                 pairs.append(VerifiedRemovalPair(
                     driveCopyPath: path,
                     referencePath: archive,
-                    batchRelativePath: "\(copyPolicy == .buffer ? "Buffer" : "Private")/\(eventFolder)/\(deviceFolder)/\(asset.assignment.relativePath)",
+                    batchRelativePath: "\(copyPolicy == .buffer ? "Buffer" : "Private")/\(eventFolderPath)/\(deviceFolder)/\(asset.assignment.relativePath)",
                     byteCount: asset.assignment.fileSize
                 ))
             }
@@ -1424,8 +1600,8 @@ final class EventsWorkspace {
         let boundaries = [locations.bufferRoot, locations.privateStagingRoot]
         model.runBackgroundJob(
             action: .freeUp,
-            runningNote: "Rechecking \(pairs.count) drive copies of \(event.name) against the NAS",
-            logTitle: "Took \(event.name) off the drive",
+            runningNote: "Rechecking \(pairs.count) drive copies of \(eventTitle(event)) against the NAS",
+            logTitle: "Took \(eventTitle(event)) off the drive",
             logDetail: "Re-hashed every drive copy against its NAS copy, then moved the drive copies into the drive's hidden _Trash folder. Nothing was deleted.",
             operation: { progress in
                 try VerifiedRemovalService().moveVerifiedCopiesAside(
@@ -1450,7 +1626,7 @@ final class EventsWorkspace {
                             + ": " + reasons.joined(separator: "; ") + "."
                     )
                 }
-                return "Took \(report.moved.count) file(s) (\(report.movedBytes.formattedBytes)) of \(event.name) off the drive. They stay recoverable in \(report.batchPath ?? trashRoot.path) until you empty it in Settings."
+                return "Took \(report.moved.count) file(s) (\(report.movedBytes.formattedBytes)) of \(self?.eventTitle(event) ?? event.name) off the drive. They stay recoverable in \(report.batchPath ?? trashRoot.path) until you empty it in Settings."
             }
         )
     }
@@ -1461,7 +1637,7 @@ final class EventsWorkspace {
         var groups: [String: SourceCleanupGroup] = [:]
         for asset in summary.assets where asset.isOnSeparateSource && asset.drive == .present {
             let sourceRoot = URL(fileURLWithPath: DashboardModel.expandedPath(asset.assignment.sourceRootPath), isDirectory: true)
-            let driveRoot = locations.cardCopyRoot(for: event, deviceID: asset.assignment.deviceID, policy: event.resolvedStoragePolicy)
+            let driveRoot = locations.cardCopyRoot(for: event, deviceID: asset.assignment.deviceID, policy: locations.resolvedPolicy(for: event))
             let key = sourceRoot.path + "\u{0}" + driveRoot.path
             groups[key, default: SourceCleanupGroup(sourceRoot: sourceRoot, driveRoot: driveRoot, files: [])].files.append(
                 FileRecord(path: asset.assignment.relativePath, size: asset.assignment.fileSize, modifiedAt: asset.assignment.modifiedAt)
@@ -1472,8 +1648,8 @@ final class EventsWorkspace {
         let total = cleanupGroups.reduce(0) { $0 + $1.files.count }
         model.runBackgroundJob(
             action: .freeUp,
-            runningNote: "Rechecking \(total) source files of \(event.name) against the drive",
-            logTitle: "Freed source space for \(event.name)",
+            runningNote: "Rechecking \(total) source files of \(eventTitle(event)) against the drive",
+            logTitle: "Freed source space for \(eventTitle(event))",
             logDetail: "Re-hashed each source file against its drive copy before permanently removing only matching source originals.",
             operation: { progress in
                 var removed = 0
@@ -1502,6 +1678,105 @@ final class EventsWorkspace {
                 return "Removed \(outcome.0) checksum-matched file(s) from the source, freeing \(outcome.1.formattedBytes). Drive copies remain."
             }
         )
+    }
+
+    // MARK: - Trash
+
+    /// Moves every file of the given stacks — primaries and companions — into
+    /// the drive-local `.Camera Toolkit/_Trash` batch on whichever volume
+    /// each file lives. Recoverable from Settings → Trash.
+    func trash(stackIDs: Set<String>, from locationID: UUID) {
+        guard let result = sources[locationID]?.result else { return }
+        let items = result.stacks.filter { stackIDs.contains($0.id) }.flatMap(\.items)
+        trashItems(items, from: locationID)
+    }
+
+    /// Moves individual frames — each item's primary plus its sidecars and
+    /// RAW+JPEG companions — into the drive-local `_Trash`. The burst preview
+    /// calls this for single frames; a stack left with fewer items is
+    /// restacked automatically when the scan result updates.
+    func trashItems(_ items: [OrganizeItem], from locationID: UUID) {
+        guard let location = location(locationID) else { return }
+        let files = items.flatMap(\.files)
+        guard !files.isEmpty else {
+            model.statusMessage = "Select photos first, then move them to Trash."
+            return
+        }
+        guard !model.isBusy, !model.isStorageBenchmarkRunning else {
+            model.statusMessage = "Another file job is already running. Wait for it to finish, then try again."
+            return
+        }
+
+        refreshIndexIfNeeded()
+        // Capture each file's current event so the manifest records where it
+        // lived, then drop the assignments — a trashed file no longer belongs
+        // to an event. This uses the same removal machinery as Unsort so the
+        // indexes stay consistent. It is not pushed onto the sort undo stack:
+        // undoing would restore assignments for files that are in the Trash.
+        var eventIDs: [String: UUID] = [:]
+        var removedAssignments: [PhotoEventAssignment] = []
+        for file in files {
+            let key = EventStorageLocations.pathKey(file.path)
+            if let assignment = assignmentsByPathKey[key] {
+                eventIDs[key] = assignment.eventID
+                removedAssignments.append(assignment)
+            }
+        }
+        if !removedAssignments.isEmpty {
+            applyAssignmentChange(AssignmentChange(title: "Move to Trash", removed: removedAssignments, added: []), touching: nil)
+        }
+
+        let trashedStackIDs = affectedStackIDs(for: items, in: locationID)
+        let context = TrashContext(
+            locationName: location.name,
+            deviceID: deviceID(for: location),
+            eventIDsByPathKey: eventIDs
+        )
+        let originRoot = URL(fileURLWithPath: DashboardModel.expandedPath(location.path), isDirectory: true).standardizedFileURL
+        let fallbackTrashRoot = locations.removedFilesRoot
+        model.runBackgroundJob(
+            action: .organize,
+            runningNote: "Moving \(files.count) file(s) to Trash",
+            logTitle: "Moved files to Trash",
+            logDetail: "Renamed files into the drive-local .Camera Toolkit/_Trash folder and wrote a manifest recording where each file lived. Nothing was deleted; batches are restorable from Settings.",
+            operation: { progress in
+                try MediaTrashService(removedFilesRoot: fallbackTrashRoot).trash(
+                    files: files,
+                    originRoot: originRoot,
+                    context: context
+                ) { update in
+                    progress(DashboardModel.jobUpdate(from: update, notePrefix: "Moving to Trash", command: ""))
+                }
+            },
+            completion: { [weak self] batch in
+                guard let self else { return "" }
+                let movedKeys = Set(batch.entries.map { EventStorageLocations.pathKey($0.originalAbsolutePath) })
+                if let result = sources[locationID]?.result {
+                    sources[locationID]?.result = result.removingFiles(withPathKeys: movedKeys)
+                }
+                selectedStackIDs.subtract(trashedStackIDs)
+                if let focusedStackID, trashedStackIDs.contains(focusedStackID) {
+                    self.focusedStackID = nil
+                    selectionAnchorID = nil
+                }
+                let skippedNote = batch.skipped.isEmpty
+                    ? ""
+                    : " \(batch.skipped.count) stayed in place: \(batch.skipped[0].reason)"
+                return batch.entries.isEmpty
+                    ? "Nothing moved to Trash.\(skippedNote)"
+                    : "Moved \(batch.entries.count) files to Trash — restorable from Settings.\(skippedNote)"
+            }
+        )
+    }
+
+    /// Stack IDs whose stacks contain any of the given items, for clearing
+    /// the selection after they leave the board.
+    private func affectedStackIDs(for items: [OrganizeItem], in locationID: UUID) -> Set<String> {
+        guard let result = sources[locationID]?.result else { return [] }
+        let itemIDs = Set(items.map(\.id))
+        return Set(result.stacks.filter { stack in
+            stack.items.contains { itemIDs.contains($0.id) }
+        }.map(\.id))
     }
 
     // MARK: - Immich
@@ -1535,7 +1810,7 @@ final class EventsWorkspace {
         guard !candidates.isEmpty else {
             model.statusMessage = event.sendsToImmich
                 ? "No reachable photos or videos to send. Connect the drive or NAS that has them."
-                : "Turn on Send to Immich for \(event.name) first."
+                : "Turn on Send to Immich for \(eventTitle(event)) first."
             return
         }
         let albumName: String? = switch event.resolvedImmichAlbumPolicy {
@@ -1549,8 +1824,8 @@ final class EventsWorkspace {
 
         model.runAsyncJob(
             action: .immichUpload,
-            runningNote: "Sending \(candidates.count) file(s) from \(event.name) to Immich",
-            logTitle: "Sent \(event.name) to Immich",
+            runningNote: "Sending \(candidates.count) file(s) from \(eventTitle(event)) to Immich",
+            logTitle: "Sent \(eventTitle(event)) to Immich",
             logDetail: "Checked each file's SHA-1 with Immich, uploaded only missing originals, and kept the API key in Keychain.",
             operation: { progress in
                 let client = try ImmichClient(serverURL: serverURL, apiKey: immichKey)

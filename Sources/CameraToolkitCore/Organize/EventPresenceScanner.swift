@@ -53,7 +53,7 @@ public enum EventPresenceScanner {
         mountedVolumes: Set<String>? = nil
     ) -> EventPresenceSummary {
         let mounted = mountedVolumes ?? VolumeInfo.mountedVolumePaths()
-        let policy = event.resolvedStoragePolicy
+        let policy = locations.resolvedPolicy(for: event)
         let otherPolicy: EventStoragePolicy = policy == .buffer ? .archiveOnly : .buffer
 
         let assets = assignments.map { assignment -> EventAssetPresence in

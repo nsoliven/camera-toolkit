@@ -316,10 +316,13 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
 
     public func bufferEventFolderPath() -> String {
         let layout = OrganizedArchiveLayout(configuration: self)
-        return URL(fileURLWithPath: bufferPath, isDirectory: true)
+        var url = URL(fileURLWithPath: bufferPath, isDirectory: true)
             .appendingPathComponent(layout.year, isDirectory: true)
-            .appendingPathComponent(layout.eventFolder, isDirectory: true)
-            .path
+        // A selected subevent's folder nests inside its parent's folder.
+        for folder in layout.parentEventFolders {
+            url.appendPathComponent(folder, isDirectory: true)
+        }
+        return url.appendingPathComponent(layout.eventFolder, isDirectory: true).path
     }
 
     public func bufferIngestFolderPath() -> String {
@@ -462,7 +465,12 @@ public struct SavedCameraEvent: Identifiable, Codable, Equatable, Hashable, Send
     public var immichAlbumPolicy: ImmichAlbumPolicy?
     public var immichAlbumName: String?
     /// `nil` is the migration-safe default and behaves like `.buffer`.
+    /// On a subevent, `nil` inherits the parent's resolved policy instead.
     public var storagePolicy: EventStoragePolicy?
+    /// The event this subevent nests inside. `nil` is the migration-safe
+    /// default for top-level events; the folder then sits directly under the
+    /// drive's year folder.
+    public var parentEventID: UUID?
 
     public init(
         id: UUID = UUID(),
@@ -473,7 +481,8 @@ public struct SavedCameraEvent: Identifiable, Codable, Equatable, Hashable, Send
         immichUploadEnabled: Bool? = nil,
         immichAlbumPolicy: ImmichAlbumPolicy? = nil,
         immichAlbumName: String? = nil,
-        storagePolicy: EventStoragePolicy? = nil
+        storagePolicy: EventStoragePolicy? = nil,
+        parentEventID: UUID? = nil
     ) {
         self.id = id
         self.name = name
@@ -484,11 +493,108 @@ public struct SavedCameraEvent: Identifiable, Codable, Equatable, Hashable, Send
         self.immichAlbumPolicy = immichAlbumPolicy
         self.immichAlbumName = immichAlbumName
         self.storagePolicy = storagePolicy
+        self.parentEventID = parentEventID
     }
 
     public var sendsToImmich: Bool { immichUploadEnabled ?? false }
     public var resolvedImmichAlbumPolicy: ImmichAlbumPolicy { immichAlbumPolicy ?? .none }
+    /// The event's own policy. For a subevent this ignores inheritance —
+    /// prefer `EventHierarchy.resolvedPolicy` when the parent link matters.
     public var resolvedStoragePolicy: EventStoragePolicy { storagePolicy ?? .buffer }
+}
+
+/// Parent/child structure between events. A subevent's folder lives inside
+/// its parent's folder, so every path and breadcrumb resolves through the
+/// ancestor chain. A missing parent or a link loop ends the chain — the
+/// event then behaves as top-level instead of trapping callers in a cycle.
+public enum EventHierarchy {
+    private static func index(_ events: [SavedCameraEvent]) -> [UUID: SavedCameraEvent] {
+        var byID: [UUID: SavedCameraEvent] = [:]
+        for event in events where byID[event.id] == nil { byID[event.id] = event }
+        return byID
+    }
+
+    /// Ancestors of `event`, root first. Stops at a missing parent or a cycle.
+    public static func ancestors(of event: SavedCameraEvent, in events: [SavedCameraEvent]) -> [SavedCameraEvent] {
+        let byID = index(events)
+        var chain: [SavedCameraEvent] = []
+        var seen: Set<UUID> = [event.id]
+        var current = event
+        while let parentID = current.parentEventID,
+              let parent = byID[parentID],
+              seen.insert(parent.id).inserted {
+            chain.append(parent)
+            current = parent
+        }
+        return chain.reversed()
+    }
+
+    /// `event` with its ancestors, root first.
+    public static func chain(of event: SavedCameraEvent, in events: [SavedCameraEvent]) -> [SavedCameraEvent] {
+        ancestors(of: event, in: events) + [event]
+    }
+
+    /// The first explicit storage policy walking up from `event`; `.buffer`
+    /// when the whole chain leaves it unset.
+    public static func resolvedPolicy(of event: SavedCameraEvent, in events: [SavedCameraEvent]) -> EventStoragePolicy {
+        let byID = index(events)
+        var seen: Set<UUID> = [event.id]
+        var current = event
+        while true {
+            if let policy = current.storagePolicy { return policy }
+            guard let parentID = current.parentEventID,
+                  let parent = byID[parentID],
+                  seen.insert(parent.id).inserted else { return .buffer }
+            current = parent
+        }
+    }
+
+    /// Events whose ancestor chain contains `eventID` — its subevents at any
+    /// depth. Used to keep a parent picker from offering a descendant and to
+    /// rewrite every assignment a rename moves on disk.
+    public static func descendants(of eventID: UUID, in events: [SavedCameraEvent]) -> [SavedCameraEvent] {
+        events.filter { candidate in
+            candidate.id != eventID && ancestors(of: candidate, in: events).contains { $0.id == eventID }
+        }
+    }
+
+    /// "Parent / Child" title for menus and headers.
+    public static func displayName(of event: SavedCameraEvent, in events: [SavedCameraEvent]) -> String {
+        chain(of: event, in: events).map(\.name).joined(separator: " / ")
+    }
+
+    /// Events flattened for list display: parents in the usual newest-first
+    /// order, each followed by its subevents (depth drives indentation).
+    /// Members of a parent loop have no top-level root; they surface sorted
+    /// at the end instead of vanishing.
+    public static func flattened(_ events: [SavedCameraEvent]) -> [(event: SavedCameraEvent, depth: Int)] {
+        let order: (SavedCameraEvent, SavedCameraEvent) -> Bool = {
+            $0.eventDate == $1.eventDate ? $0.name < $1.name : $0.eventDate > $1.eventDate
+        }
+        var children: [UUID: [SavedCameraEvent]] = [:]
+        var roots: [SavedCameraEvent] = []
+        for event in events {
+            if let parent = ancestors(of: event, in: events).last {
+                children[parent.id, default: []].append(event)
+            } else {
+                roots.append(event)
+            }
+        }
+        var rows: [(event: SavedCameraEvent, depth: Int)] = []
+        var visited: Set<UUID> = []
+        func walk(_ event: SavedCameraEvent, _ depth: Int) {
+            guard visited.insert(event.id).inserted else { return }
+            rows.append((event, depth))
+            for child in (children[event.id] ?? []).sorted(by: order) {
+                walk(child, depth + 1)
+            }
+        }
+        for root in roots.sorted(by: order) { walk(root, 0) }
+        for event in events.sorted(by: order) where !visited.contains(event.id) {
+            walk(event, 0)
+        }
+        return rows
+    }
 }
 
 /// Where an event lives on the working drive.

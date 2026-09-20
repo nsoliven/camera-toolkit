@@ -33,16 +33,23 @@ struct EventsRootView: View {
         .onReceive(NotificationCenter.default.publisher(for: .cameraToolkitStorageLocationsChanged)) { _ in
             workspace.discoverDriveEvents()
         }
+        .onReceive(NotificationCenter.default.publisher(for: .cameraToolkitMediaTrashChanged)) { _ in
+            for location in workspace.unsortedLocations where workspace.sources[location.id]?.result != nil {
+                workspace.scan(location, force: true)
+            }
+        }
         .sheet(item: $workspace.newEventRequest) { request in
             EventDetailsSheet(
                 title: "New Event",
                 confirmTitle: request.stackIDs.isEmpty ? "Create Event" : "Create and Sort \(request.stackIDs.count)",
                 initialName: "",
                 initialDate: request.suggestedDate,
-                initialPolicy: .buffer,
+                initialPolicy: request.parentEventID == nil ? .buffer : nil,
+                initialParentEventID: request.parentEventID,
+                parents: workspace.parentCandidates(excluding: nil),
                 onCancel: { workspace.newEventRequest = nil },
-                onSave: { name, date, policy in
-                    workspace.completeNewEvent(request, name: name, date: date, policy: policy)
+                onSave: { name, date, policy, parentEventID in
+                    workspace.completeNewEvent(request, name: name, date: date, policy: policy, parentEventID: parentEventID)
                 }
             )
         }
@@ -53,10 +60,12 @@ struct EventsRootView: View {
                     confirmTitle: "Save",
                     initialName: event.name,
                     initialDate: event.eventDate,
-                    initialPolicy: event.resolvedStoragePolicy,
+                    initialPolicy: event.storagePolicy,
+                    initialParentEventID: event.parentEventID,
+                    parents: workspace.parentCandidates(excluding: event.id),
                     onCancel: { workspace.renameRequest = nil },
-                    onSave: { name, date, policy in
-                        workspace.renameEvent(request.eventID, name: name, date: date, policy: policy)
+                    onSave: { name, date, policy, parentEventID in
+                        workspace.renameEvent(request.eventID, name: name, date: date, policy: policy, parentEventID: parentEventID)
                     }
                 )
             }
@@ -71,7 +80,7 @@ struct EventsRootView: View {
         .sheet(item: $workspace.pendingRemoval) { request in
             RemovalConfirmSheet(
                 request: request,
-                eventName: workspace.event(request.eventID)?.name ?? "this event",
+                eventName: workspace.event(request.eventID).map { workspace.eventTitle($0) } ?? "this event",
                 onCancel: { workspace.pendingRemoval = nil },
                 onConfirm: { workspace.confirmRemoval(request, confirmation: $0) }
             )
@@ -158,26 +167,32 @@ struct EventsSidebar: View {
                         Text("No events yet")
                             .foregroundStyle(.secondary)
                     }
-                    ForEach(workspace.events) { event in
-                        eventRow(event)
-                            .tag(Optional(EventsSidebarSelection.event(event.id)))
+                    // Parents newest-first; each subevent sits indented under
+                    // its parent — the flat row style stays the same.
+                    ForEach(workspace.sidebarEvents, id: \.event.id) { row in
+                        eventRow(row.event)
+                            .padding(.leading, CGFloat(row.depth) * 16)
+                            .tag(Optional(EventsSidebarSelection.event(row.event.id)))
                             .dropDestination(for: String.self) { items, _ in
-                                workspace.handleDrop(items, onto: event.id)
+                                workspace.handleDrop(items, onto: row.event.id)
                             } isTargeted: { targeted in
                                 if targeted {
-                                    targetedEventID = event.id
-                                } else if targetedEventID == event.id {
+                                    targetedEventID = row.event.id
+                                } else if targetedEventID == row.event.id {
                                     targetedEventID = nil
                                 }
                             }
                             .contextMenu {
+                                Button("New Subevent…") {
+                                    workspace.requestNewEvent(from: nil, parentEventID: row.event.id)
+                                }
                                 Button("Rename or Change Date…") {
-                                    workspace.renameRequest = RenameEventRequest(eventID: event.id)
+                                    workspace.renameRequest = RenameEventRequest(eventID: row.event.id)
                                 }
                                 Button("Delete Empty Event", role: .destructive) {
-                                    workspace.deleteEmptyEvent(event.id)
+                                    workspace.deleteEmptyEvent(row.event.id)
                                 }
-                                .disabled(workspace.assignmentCount(for: event.id) > 0)
+                                .disabled(workspace.assignmentCount(for: row.event.id) > 0)
                             }
                     }
                 } header: {
@@ -244,6 +259,16 @@ struct EventsSidebar: View {
             if workspace.sources[location.id]?.isScanning == true {
                 ProgressView()
                     .controlSize(.mini)
+            } else if !connected {
+                Button {
+                    workspace.refreshConnectivity()
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .buttonStyle(.borderless)
+                .controlSize(.small)
+                .foregroundStyle(.secondary)
+                .help("Check again — the drive or card may have just connected")
             }
         }
         .padding(.vertical, 2)
@@ -264,7 +289,7 @@ struct EventsSidebar: View {
                     .foregroundStyle(.secondary)
             }
             Spacer(minLength: 0)
-            if event.resolvedStoragePolicy == .archiveOnly {
+            if workspace.resolvedPolicy(for: event) == .archiveOnly {
                 Image(systemName: "lock.fill")
                     .font(.caption)
                     .foregroundStyle(.purple)
@@ -390,12 +415,18 @@ struct EventsWelcomeView: View {
 struct EventDetailsSheet: View {
     let title: String
     let confirmTitle: String
+    /// Candidate parents in sidebar order (the edited event and its subevents
+    /// are already excluded, so a parent loop can't be picked).
+    let parents: [(event: SavedCameraEvent, depth: Int)]
     let onCancel: () -> Void
-    let onSave: (String, Date, EventStoragePolicy) -> Void
+    /// (name, date, storagePolicy, parentEventID) — a nil policy follows the
+    /// parent's setting for a subevent, or the shared Buffer at top level.
+    let onSave: (String, Date, EventStoragePolicy?, UUID?) -> Void
 
     @State private var name: String
     @State private var date: Date
-    @State private var policy: EventStoragePolicy
+    @State private var policy: EventStoragePolicy?
+    @State private var parentEventID: UUID?
     @FocusState private var isNameFocused: Bool
 
     init(
@@ -403,17 +434,21 @@ struct EventDetailsSheet: View {
         confirmTitle: String,
         initialName: String,
         initialDate: Date,
-        initialPolicy: EventStoragePolicy,
+        initialPolicy: EventStoragePolicy?,
+        initialParentEventID: UUID?,
+        parents: [(event: SavedCameraEvent, depth: Int)],
         onCancel: @escaping () -> Void,
-        onSave: @escaping (String, Date, EventStoragePolicy) -> Void
+        onSave: @escaping (String, Date, EventStoragePolicy?, UUID?) -> Void
     ) {
         self.title = title
         self.confirmTitle = confirmTitle
+        self.parents = parents
         self.onCancel = onCancel
         self.onSave = onSave
         _name = State(initialValue: initialName)
         _date = State(initialValue: initialDate)
         _policy = State(initialValue: initialPolicy)
+        _parentEventID = State(initialValue: initialParentEventID)
     }
 
     private var validation: EventNameValidation {
@@ -434,14 +469,32 @@ struct EventDetailsSheet: View {
                         .foregroundStyle(.red)
                 }
                 DatePicker("Date", selection: $date, displayedComponents: .date)
-                Picker("Keep on drive", selection: $policy) {
-                    Text("Shared Buffer").tag(EventStoragePolicy.buffer)
-                    Text("Private · NAS only").tag(EventStoragePolicy.archiveOnly)
+                Picker("Inside event", selection: $parentEventID) {
+                    Text("None — top level").tag(UUID?.none)
+                    ForEach(parents, id: \.event.id) { row in
+                        Text(String(repeating: "    ", count: row.depth) + row.event.name)
+                            .tag(UUID?.some(row.event.id))
+                    }
                 }
-                .pickerStyle(.radioGroup)
-                Text(policy == .buffer
-                    ? "Originals go into the shared Camera Buffer, where anyone browsing the drive can see them."
-                    : "Originals never enter the shared Buffer. They wait in a hidden folder on the drive until they are archived to the NAS, and then you can take them off the drive.")
+                .help("A subevent's folder lives inside its parent event's folder.")
+                if parentEventID == nil {
+                    Picker("Keep on drive", selection: Binding(
+                        get: { policy ?? .buffer },
+                        set: { policy = $0 }
+                    )) {
+                        Text("Shared Buffer").tag(EventStoragePolicy.buffer)
+                        Text("Private · NAS only").tag(EventStoragePolicy.archiveOnly)
+                    }
+                    .pickerStyle(.radioGroup)
+                } else {
+                    Picker("Keep on drive", selection: $policy) {
+                        Text("Same as parent").tag(EventStoragePolicy?.none)
+                        Text("Shared Buffer").tag(EventStoragePolicy?.some(.buffer))
+                        Text("Private · NAS only").tag(EventStoragePolicy?.some(.archiveOnly))
+                    }
+                    .pickerStyle(.radioGroup)
+                }
+                Text(policyHelp)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -460,9 +513,22 @@ struct EventDetailsSheet: View {
         .onAppear { isNameFocused = true }
     }
 
+    private var policyHelp: String {
+        let shared = "Originals go into the shared Camera Buffer, where anyone browsing the drive can see them."
+        let private_ = "Originals never enter the shared Buffer. They wait in a hidden folder on the drive until they are archived to the NAS, and then you can take them off the drive."
+        if parentEventID != nil, policy == nil {
+            let parent = parents.first { $0.event.id == parentEventID }?.event
+            let resolved = parent.map {
+                EventHierarchy.resolvedPolicy(of: $0, in: parents.map(\.event))
+            } ?? .buffer
+            return "Follows the parent event's setting (currently \(resolved == .buffer ? "Shared Buffer" : "Private · NAS only"))."
+        }
+        return (policy ?? .buffer) == .buffer ? shared : private_
+    }
+
     private func save() {
         guard validation.isValid else { return }
-        onSave(validation.normalizedName, date, policy)
+        onSave(validation.normalizedName, date, policy, parentEventID)
     }
 }
 
@@ -480,7 +546,7 @@ struct ApplyPlanSheet: View {
             List(plan.groups) { group in
                 VStack(alignment: .leading, spacing: 4) {
                     HStack {
-                        EventChip(event: group.event)
+                        EventChip(event: group.event, isPrivate: group.isPrivate)
                         Text(group.event.eventDate.formatted(date: .abbreviated, time: .omitted))
                             .font(.caption)
                             .foregroundStyle(.secondary)
