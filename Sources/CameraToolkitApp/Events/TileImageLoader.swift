@@ -25,12 +25,17 @@ final class TileImageLoader: @unchecked Sendable {
         queue.qualityOfService = .userInitiated
     }
 
+    /// Decode sizes are bucketed so tile and preview requests share cache
+    /// entries. The 4800 bucket exists for the burst review overlay, which
+    /// upgrades the displayed frame once the user zooms past fit — roughly
+    /// 60–90 MB decoded per frame inside the cost-limited NSCache.
     static func bucket(for pixels: Int) -> Int {
         switch pixels {
         case ...384: 384
         case ...768: 768
         case ...1_280: 1_280
-        default: 2_400
+        case ...2_400: 2_400
+        default: 4_800
         }
     }
 

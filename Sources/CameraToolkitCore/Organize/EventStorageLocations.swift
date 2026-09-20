@@ -60,6 +60,8 @@ public struct EventStorageLocations: Sendable {
     public var removedFilesRoot: URL
     public var libraryRoot: URL
     public var fallbackDeviceID: String
+    /// Known events, so subevent paths resolve through their parent chain.
+    public var events: [SavedCameraEvent]
 
     public static let toolkitFolderName = ".Camera Toolkit"
 
@@ -78,6 +80,7 @@ public struct EventStorageLocations: Sendable {
             isDirectory: true
         ).standardizedFileURL
         fallbackDeviceID = configuration.selectedDeviceID
+        events = configuration.savedEvents
     }
 
     /// `/Volumes/Drive/.Camera Toolkit` for a Buffer on an external drive,
@@ -98,11 +101,33 @@ public struct EventStorageLocations: Sendable {
         return formatter.string(from: date)
     }
 
+    /// Ancestors of `event`, root first. Unknown or looping parent links end
+    /// the chain, so such an event resolves like a top-level one.
+    public func ancestors(of event: SavedCameraEvent) -> [SavedCameraEvent] {
+        EventHierarchy.ancestors(of: event, in: events)
+    }
+
+    /// The event's effective storage policy: its own, else the nearest
+    /// ancestor's, else `.buffer`.
+    public func resolvedPolicy(for event: SavedCameraEvent) -> EventStoragePolicy {
+        EventHierarchy.resolvedPolicy(of: event, in: events)
+    }
+
+    /// "Parent / Child" breadcrumb for titles, menus, and plan summaries.
+    public func displayName(for event: SavedCameraEvent) -> String {
+        EventHierarchy.displayName(of: event, in: events)
+    }
+
     public func layout(for event: SavedCameraEvent, deviceID: String?) -> OrganizedArchiveLayout {
-        OrganizedArchiveLayout(
+        let ancestors = ancestors(of: event)
+        return OrganizedArchiveLayout(
             eventDate: Self.eventDateString(event.eventDate),
             eventName: event.name,
-            deviceID: deviceID ?? fallbackDeviceID
+            deviceID: deviceID ?? fallbackDeviceID,
+            parentEventFolders: ancestors.map {
+                OrganizedArchiveLayout.eventFolderName(date: Self.eventDateString($0.eventDate), name: $0.name)
+            },
+            year: String(Self.eventDateString((ancestors.first ?? event).eventDate).prefix(4))
         )
     }
 
@@ -113,18 +138,21 @@ public struct EventStorageLocations: Sendable {
         }
     }
 
+    /// `<root>/<year>/<parent event folder>/…/<event folder>` — a subevent's
+    /// folder nests inside its parent's, under the root ancestor's year.
     public func eventFolder(for event: SavedCameraEvent, policy: EventStoragePolicy) -> URL {
         let layout = layout(for: event, deviceID: nil)
-        return driveRoot(for: policy)
+        var url = driveRoot(for: policy)
             .appendingPathComponent(layout.year, isDirectory: true)
-            .appendingPathComponent(layout.eventFolder, isDirectory: true)
+        for folder in layout.parentEventFolders {
+            url.appendPathComponent(folder, isDirectory: true)
+        }
+        return url.appendingPathComponent(layout.eventFolder, isDirectory: true)
     }
 
     public func cardCopyRoot(for event: SavedCameraEvent, deviceID: String?, policy: EventStoragePolicy) -> URL {
         let layout = layout(for: event, deviceID: deviceID)
-        return driveRoot(for: policy)
-            .appendingPathComponent(layout.year, isDirectory: true)
-            .appendingPathComponent(layout.eventFolder, isDirectory: true)
+        return eventFolder(for: event, policy: policy)
             .appendingPathComponent(layout.deviceFolder, isDirectory: true)
             .appendingPathComponent("Card Copy", isDirectory: true)
     }

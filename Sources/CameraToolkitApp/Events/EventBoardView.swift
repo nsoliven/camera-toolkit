@@ -45,11 +45,12 @@ struct EventBoardView: View {
                         eventForStack: { _ in event },
                         onAssign: { stack, target in
                             workspace.moveStacks([stack.id], fromEvent: eventID, toEvent: target.id)
-                        }
+                        },
+                        isPrivate: { workspace.resolvedPolicy(for: $0) == .archiveOnly }
                     )
                 }
             }
-            .task(id: "\(eventID.uuidString)-\(workspace.assignmentCount(for: eventID))-\(event.resolvedStoragePolicy.rawValue)") {
+            .task(id: "\(eventID.uuidString)-\(workspace.assignmentCount(for: eventID))-\(workspace.resolvedPolicy(for: event).rawValue)") {
                 await workspace.refreshEvent(eventID)
             }
             .onReceive(NotificationCenter.default.publisher(for: BrowserCommand.notification)) { notification in
@@ -67,7 +68,7 @@ struct EventBoardView: View {
                 .fill(EventPalette.color(for: event.id))
                 .frame(width: 12, height: 12)
             VStack(alignment: .leading, spacing: 2) {
-                Text(event.name)
+                Text(workspace.eventTitle(event))
                     .font(.title2.bold())
                     .lineLimit(1)
                 Text("\(event.eventDate.formatted(date: .complete, time: .omitted)) · \(workspace.assignmentCount(for: eventID)) files · \(workspace.assignmentBytes(for: eventID).formattedBytes)")
@@ -76,7 +77,7 @@ struct EventBoardView: View {
             }
             Spacer()
             Picker("Keep on drive", selection: Binding(
-                get: { event.resolvedStoragePolicy },
+                get: { workspace.resolvedPolicy(for: event) },
                 set: { workspace.setPolicy(eventID, $0) }
             )) {
                 Label("Shared Buffer", systemImage: "externaldrive").tag(EventStoragePolicy.buffer)
@@ -95,18 +96,24 @@ struct EventBoardView: View {
                 Label("Refresh", systemImage: "arrow.clockwise")
             }
             Menu {
+                Button("New Subevent…") {
+                    workspace.requestNewEvent(from: nil, parentEventID: eventID)
+                }
                 Button("Rename or Change Date…") {
                     workspace.renameRequest = RenameEventRequest(eventID: eventID)
                 }
                 Button("Reveal Drive Folder") {
-                    reveal(workspace.locations.eventFolder(for: event, policy: event.resolvedStoragePolicy))
+                    reveal(workspace.locations.eventFolder(for: event, policy: workspace.resolvedPolicy(for: event)))
                 }
                 Button("Reveal NAS Folder") {
                     let layout = workspace.locations.layout(for: event, deviceID: nil)
-                    reveal(workspace.locations.libraryRoot
+                    var url = workspace.locations.libraryRoot
                         .appendingPathComponent("Originals", isDirectory: true)
                         .appendingPathComponent(layout.year, isDirectory: true)
-                        .appendingPathComponent(layout.eventFolder, isDirectory: true))
+                    for folder in layout.parentEventFolders {
+                        url.appendPathComponent(folder, isDirectory: true)
+                    }
+                    reveal(url.appendingPathComponent(layout.eventFolder, isDirectory: true))
                 }
                 Divider()
                 Button("Undo Last Move") { workspace.undoLastMove() }
@@ -130,6 +137,14 @@ struct EventBoardView: View {
             Text(count == 0
                 ? "Open an Unsorted folder or card, select photos, and press a number key or drag them onto \(event.name)."
                 : "\(count) files belong to this event, but no connected drive, card, or NAS has them right now.")
+        } actions: {
+            if count > 0 {
+                Button("Check Again") {
+                    workspace.refreshConnectivity()
+                    Task { await workspace.refreshEvent(eventID) }
+                }
+                .help("Re-check every drive, card, and the NAS for this event's files")
+            }
         }
         .frame(maxHeight: .infinity)
     }
@@ -160,8 +175,8 @@ struct EventBoardView: View {
     private func contextMenu(_ stack: OrganizeStack) -> some View {
         let targets = workspace.targetStackIDs(including: stack.id)
         Menu("Move to Event") {
-            ForEach(workspace.events.filter { $0.id != eventID }) { event in
-                Button(event.name) {
+            ForEach(workspace.sidebarEvents.map(\.event).filter { $0.id != eventID }) { event in
+                Button(workspace.eventTitle(event)) {
                     workspace.moveStacks(targets, fromEvent: eventID, toEvent: event.id)
                 }
             }
@@ -239,6 +254,16 @@ struct StorageStrip: View {
 
     private var assets: [EventAssetPresence] { summary?.assets ?? [] }
 
+    /// Re-checks connections and re-probes where this event's files are. Used
+    /// on cards that are showing Offline.
+    private var checkAgainButton: some View {
+        Button("Check Again") {
+            workspace.refreshConnectivity()
+            Task { await workspace.refreshEvent(event.id) }
+        }
+        .help("Re-check this connection right now")
+    }
+
     private var sourceCard: some View {
         let separate = assets.filter { !$0.sourceIsDriveCopy }
         let onSource = separate.count { $0.source == .present }
@@ -271,11 +296,14 @@ struct StorageStrip: View {
                     .disabled(model.isBusy)
                     .help("Re-hash each source file against its drive copy, then remove the source originals")
             }
+            if offline > 0 {
+                checkAgainButton
+            }
         }
     }
 
     private var driveCard: some View {
-        let policy = event.resolvedStoragePolicy
+        let policy = workspace.resolvedPolicy(for: event)
         let total = assets.count
         let onDrive = assets.count { $0.drive == .present }
         let onOther = assets.count { $0.otherDrive == .present }
@@ -318,6 +346,9 @@ struct StorageStrip: View {
                     .disabled(model.isBusy)
                     .help("Only files whose NAS copy matches byte for byte leave the drive")
             }
+            if offline {
+                checkAgainButton
+            }
         }
     }
 
@@ -340,6 +371,9 @@ struct StorageStrip: View {
                 Button("Archive to NAS") { workspace.archiveToNAS(event.id) }
                     .disabled(model.isBusy)
                     .help("Copy with a SHA-256 check of every file. Existing different files are never overwritten.")
+            }
+            if offline {
+                checkAgainButton
             }
         }
     }

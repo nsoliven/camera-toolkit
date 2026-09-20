@@ -97,6 +97,7 @@ public struct CatalogStore {
             immich_upload_enabled INTEGER NOT NULL DEFAULT 0,
             immich_album_policy TEXT NOT NULL DEFAULT 'none',
             immich_album_name TEXT,
+            parent_event_id TEXT,
             created_at TEXT NOT NULL,
             last_used_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
@@ -132,6 +133,10 @@ public struct CatalogStore {
             FOREIGN KEY(event_asset_id) REFERENCES event_assets(id) ON DELETE CASCADE
         );
         """, database: database)
+
+        // `parent_event_id` was added after the first catalogs shipped, so
+        // databases that already have `events` need the column grafted on.
+        try ensureColumn(table: "events", column: "parent_event_id", definition: "parent_event_id TEXT", database: database)
 
         try execute("BEGIN IMMEDIATE;", database: database)
         do {
@@ -267,21 +272,25 @@ public struct CatalogStore {
 
     private func synchronizeEvents(configuration: AppConfiguration, database: OpaquePointer) throws {
         let now = Self.isoTimestamp()
-        let eventsByID = Dictionary(uniqueKeysWithValues: configuration.savedEvents.map { ($0.id, $0) })
+        var eventsByID: [UUID: SavedCameraEvent] = [:]
+        for event in configuration.savedEvents where eventsByID[event.id] == nil {
+            eventsByID[event.id] = event
+        }
 
         for event in configuration.savedEvents {
             try runUpsert(
                 """
                 INSERT INTO events(
                     id, name, event_date, immich_upload_enabled, immich_album_policy,
-                    immich_album_name, created_at, last_used_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    immich_album_name, parent_event_id, created_at, last_used_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     name = excluded.name,
                     event_date = excluded.event_date,
                     immich_upload_enabled = excluded.immich_upload_enabled,
                     immich_album_policy = excluded.immich_album_policy,
                     immich_album_name = excluded.immich_album_name,
+                    parent_event_id = excluded.parent_event_id,
                     last_used_at = excluded.last_used_at,
                     updated_at = excluded.updated_at;
                 """,
@@ -292,6 +301,7 @@ public struct CatalogStore {
                     event.sendsToImmich ? "1" : "0",
                     event.resolvedImmichAlbumPolicy.rawValue,
                     event.immichAlbumName ?? "",
+                    event.parentEventID?.uuidString,
                     Self.isoTimestamp(event.createdAt),
                     Self.isoTimestamp(event.lastUsedAt),
                     now
@@ -370,7 +380,27 @@ public struct CatalogStore {
         )
     }
 
-    private func runUpsert(_ sql: String, values: [String], database: OpaquePointer) throws {
+    /// Adds `column` to an existing table; a no-op once it is present. Keeps
+    /// catalogs created before a column existed on the current schema.
+    private func ensureColumn(table: String, column: String, definition: String, database: OpaquePointer) throws {
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(database, "PRAGMA table_info(\(table));", -1, &statement, nil) == SQLITE_OK,
+              let statement else {
+            throw ToolkitError.commandFailed("Could not inspect catalog table \(table)")
+        }
+        var exists = false
+        while sqlite3_step(statement) == SQLITE_ROW {
+            if let name = sqlite3_column_text(statement, 1), String(cString: name) == column {
+                exists = true
+            }
+        }
+        sqlite3_finalize(statement)
+        if !exists {
+            try execute("ALTER TABLE \(table) ADD COLUMN \(definition);", database: database)
+        }
+    }
+
+    private func runUpsert(_ sql: String, values: [String?], database: OpaquePointer) throws {
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK, let statement else {
             throw ToolkitError.commandFailed("Could not prepare catalog statement: \(String(cString: sqlite3_errmsg(database)))")
@@ -378,7 +408,11 @@ public struct CatalogStore {
         defer { sqlite3_finalize(statement) }
 
         for (index, value) in values.enumerated() {
-            sqlite3_bind_text(statement, Int32(index + 1), value, -1, Self.transient)
+            if let value {
+                sqlite3_bind_text(statement, Int32(index + 1), value, -1, Self.transient)
+            } else {
+                sqlite3_bind_null(statement, Int32(index + 1))
+            }
         }
 
         guard sqlite3_step(statement) == SQLITE_DONE else {

@@ -27,9 +27,12 @@ struct AppShell: View {
         }
         .onAppear {
             model.refreshAllIfStale(maxAge: 0)
+            workspace.observeVolumeChanges()
+            workspace.refreshConnectivity()
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             model.refreshAllIfStale()
+            workspace.refreshConnectivityIfStale()
         }
     }
 }

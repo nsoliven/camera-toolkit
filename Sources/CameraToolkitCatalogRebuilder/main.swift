@@ -147,15 +147,29 @@ private func configuredEvent(
 private func bufferURL(
     for assignment: PhotoEventAssignment,
     event: SavedCameraEvent,
-    bufferRoot: URL
+    bufferRoot: URL,
+    events: [SavedCameraEvent]
 ) -> URL {
+    let ancestors = EventHierarchy.ancestors(of: event, in: events)
+    var url = bufferRoot.appendingPathComponent(
+        String(dayFormatter.string(from: (ancestors.first ?? event).eventDate).prefix(4)),
+        isDirectory: true
+    )
+    for ancestor in ancestors {
+        url.appendPathComponent(
+            OrganizedArchiveLayout.eventFolderName(
+                date: dayFormatter.string(from: ancestor.eventDate),
+                name: ancestor.name
+            ),
+            isDirectory: true
+        )
+    }
     let layout = OrganizedArchiveLayout(
         eventDate: dayFormatter.string(from: event.eventDate),
         eventName: event.name,
         deviceID: assignment.deviceID ?? "generic-camera"
     )
-    return bufferRoot
-        .appendingPathComponent(layout.year, isDirectory: true)
+    return url
         .appendingPathComponent(layout.eventFolder, isDirectory: true)
         .appendingPathComponent(layout.deviceFolder, isDirectory: true)
         .appendingPathComponent("Card Copy", isDirectory: true)
@@ -243,7 +257,7 @@ private func run() throws {
                 CatalogPresenceObservation(eventAssetID: eventAssetID, location: .source, state: .present)
             )
 
-            let destination = bufferURL(for: assignment, event: event, bufferRoot: bufferRoot)
+            let destination = bufferURL(for: assignment, event: event, bufferRoot: bufferRoot, events: configuration.savedEvents)
             let destinationSize = try? destination.resourceValues(forKeys: [.fileSizeKey]).fileSize
             let isPresent = destinationSize.map(Int64.init) == assignment.fileSize
             if isPresent { bufferPresentCount += 1 }

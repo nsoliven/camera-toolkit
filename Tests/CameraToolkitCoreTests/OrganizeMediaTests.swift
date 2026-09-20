@@ -1,5 +1,8 @@
 import CameraToolkitCore
+import CoreGraphics
 import Foundation
+import ImageIO
+import UniformTypeIdentifiers
 import XCTest
 
 final class OrganizeMediaTests: XCTestCase {
@@ -132,5 +135,245 @@ final class OrganizeMediaTests: XCTestCase {
             XCTAssertEqual(result.days.map(\.id).first, "2026-08-27")
             XCTAssertEqual(result.fileCount, 7)
         }
+    }
+
+    // MARK: - Hybrid burst grouping
+
+    func testBurstLinkRequirementDecidesAutomaticVisualOrSeparate() {
+        let t0 = Date(timeIntervalSince1970: 1_800_000_000)
+        let configuration = BurstGroupingConfiguration()
+        func requirement(_ a: OrganizeItem, _ b: OrganizeItem, _ config: BurstGroupingConfiguration = configuration) -> BurstLinkRequirement {
+            OrganizeStacker.linkRequirement(from: a, to: b, configuration: config)
+        }
+        func frame(_ number: Int, at offset: TimeInterval, kind: OrganizeMediaKind = .raw, folder: String = "/s", cameraDate: Bool = true) -> OrganizeItem {
+            let name = kind == .video ? String(format: "C%04d.MP4", number) : String(format: "DSC%05d.ARW", number)
+            return organizeItem("\(folder)/\(name)", kind: kind, date: t0.addingTimeInterval(offset), hasCameraDate: cameraDate)
+        }
+
+        // Automatic band: gap at or below one second.
+        XCTAssertEqual(requirement(frame(1, at: 0), frame(2, at: 0.5)), .automatic)
+        XCTAssertEqual(requirement(frame(1, at: 0), frame(2, at: 1.0)), .automatic)
+        // Recovery band: (1.0, 2.0].
+        XCTAssertEqual(requirement(frame(1, at: 0), frame(2, at: 1.29)), .visualCheck)
+        XCTAssertEqual(requirement(frame(1, at: 0), frame(2, at: 2.0)), .visualCheck)
+        // Beyond the maximum, or with recovery off.
+        XCTAssertEqual(requirement(frame(1, at: 0), frame(2, at: 2.01)), .separate)
+        var noRecovery = configuration
+        noRecovery.useVisualRecovery = false
+        XCTAssertEqual(requirement(frame(1, at: 0), frame(2, at: 1.29), noRecovery), .separate)
+        XCTAssertEqual(requirement(frame(1, at: 0), frame(2, at: 0.5), noRecovery), .automatic)
+
+        // The frame-number gate applies to the recovery band too.
+        XCTAssertEqual(requirement(frame(1, at: 0), frame(9, at: 1.5)), .separate)
+        XCTAssertEqual(requirement(frame(2, at: 0), frame(1, at: 1.5)), .separate) // not a forward step
+        XCTAssertEqual(requirement(frame(9_995, at: 0), frame(2, at: 1.5)), .visualCheck) // rollover
+        // Frames without a usable number can't be disproved, so they pass.
+        XCTAssertEqual(
+            OrganizeStacker.linkRequirement(
+                from: organizeItem("/s/IMG_5108A.ARW", date: t0),
+                to: organizeItem("/s/IMG_5109A.ARW", date: t0.addingTimeInterval(1.5)),
+                configuration: configuration),
+            .visualCheck)
+
+        // Stills only, camera dates only, same folder only, forward in time.
+        XCTAssertEqual(requirement(frame(1, at: 0), frame(2, at: 0.5, kind: .video)), .separate)
+        XCTAssertEqual(requirement(frame(1, at: 0), frame(2, at: 0.5, cameraDate: false)), .separate)
+        XCTAssertEqual(requirement(frame(1, at: 0), frame(2, at: 0.5, folder: "/other")), .separate)
+        XCTAssertEqual(requirement(frame(1, at: 1.0), frame(2, at: 0.5)), .separate)
+    }
+
+    func testRecoveryBandChainsOnlyWithVisualLink() {
+        let t0 = Date(timeIntervalSince1970: 1_800_000_000)
+        let items = [
+            organizeItem("/s/DSC00001.ARW", date: t0),
+            organizeItem("/s/DSC00002.ARW", date: t0.addingTimeInterval(1.4)),
+            organizeItem("/s/DSC00003.ARW", date: t0.addingTimeInterval(2.8)),
+            organizeItem("/s/DSC00004.ARW", date: t0.addingTimeInterval(4.2)),
+            organizeItem("/s/DSC00005.ARW", date: t0.addingTimeInterval(6.4)),
+        ]
+        let linkAB = BurstVisualLink(previous: items[0], next: items[1])
+        let linkBC = BurstVisualLink(previous: items[1], next: items[2])
+        let linkCD = BurstVisualLink(previous: items[2], next: items[3])
+        // D→E is a 2.2 s gap: beyond the maximum, so no link can recover it.
+        let linkDE = BurstVisualLink(previous: items[3], next: items[4])
+
+        // Without links every frame stands alone — same as the old 1 s rule.
+        XCTAssertEqual(OrganizeStacker.stacks(for: items).map(\.items.count), [1, 1, 1, 1, 1])
+        // A cleared link merges just its pair; a missing link keeps them apart.
+        XCTAssertEqual(
+            OrganizeStacker.stacks(for: items, visualLinks: [linkAB, linkCD]).map(\.items.count),
+            [2, 2, 1])
+        // Links chain transitively and cannot cross the maximum gap.
+        XCTAssertEqual(
+            OrganizeStacker.stacks(for: items, visualLinks: [linkAB, linkBC, linkCD, linkDE]).map(\.items.count),
+            [4, 1])
+    }
+
+    func testDisabledVisualRecoveryIsPureTimeGrouping() {
+        let t0 = Date(timeIntervalSince1970: 1_800_000_000)
+        var configuration = BurstGroupingConfiguration()
+        configuration.useVisualRecovery = false
+        let items = [
+            organizeItem("/s/DSC00001.ARW", date: t0),
+            organizeItem("/s/DSC00002.ARW", date: t0.addingTimeInterval(1.4)),
+        ]
+        let links: Set<BurstVisualLink> = [BurstVisualLink(previous: items[0], next: items[1])]
+        let stacks = OrganizeStacker.stacks(for: items, configuration: configuration, visualLinks: links)
+        XCTAssertEqual(stacks.map(\.items.count), [1, 1])
+        XCTAssertTrue(BurstVisualLinker.recoveryPairs(for: items, configuration: configuration).isEmpty)
+    }
+
+    func testMinimumGroupSizeSplitsShortChains() {
+        let t0 = Date(timeIntervalSince1970: 1_800_000_000)
+        var configuration = BurstGroupingConfiguration()
+        configuration.minimumGroupSize = 3
+        let items = [
+            organizeItem("/s/DSC00001.ARW", date: t0),
+            organizeItem("/s/DSC00002.ARW", date: t0.addingTimeInterval(0.3)),
+            organizeItem("/s/DSC00003.ARW", date: t0.addingTimeInterval(5)),
+            organizeItem("/s/DSC00004.ARW", date: t0.addingTimeInterval(5.3)),
+            organizeItem("/s/DSC00005.ARW", date: t0.addingTimeInterval(5.6)),
+        ]
+        // The two-frame chain falls under the minimum and becomes singles;
+        // the three-frame chain stays a burst.
+        XCTAssertEqual(
+            OrganizeStacker.stacks(for: items, configuration: configuration).map(\.items.count),
+            [1, 1, 3])
+    }
+
+    func testPrefixedFoldersStayTrustedUnderGroupingConfiguration() {
+        let t0 = Date(timeIntervalSince1970: 1_800_000_000)
+        var configuration = BurstGroupingConfiguration()
+        configuration.useVisualRecovery = false
+        configuration.minimumGroupSize = 3
+        let items = [
+            organizeItem("/s/B0001_DSC00001.ARW", date: t0),
+            organizeItem("/s/B0001_DSC00002.ARW", date: t0.addingTimeInterval(0.2)),
+            organizeItem("/s/DSC00003.ARW", date: t0.addingTimeInterval(0.4)),
+        ]
+        let stacks = OrganizeStacker.stacks(for: items, configuration: configuration)
+        XCTAssertEqual(stacks.map(\.items.count), [2, 1])
+        XCTAssertEqual(stacks.first?.burstLabel, "B0001")
+    }
+
+    func testBurstGroupingConfigurationCodableRoundTripsAndDefaults() throws {
+        let decoded = try JSONDecoder().decode(BurstGroupingConfiguration.self, from: Data("{}".utf8))
+        XCTAssertEqual(decoded, BurstGroupingConfiguration())
+        var configuration = BurstGroupingConfiguration()
+        configuration.maximumGapSeconds = 3.5
+        configuration.useVisualRecovery = false
+        configuration.maximumVisionDistance = 0.3
+        let reloaded = try JSONDecoder().decode(
+            BurstGroupingConfiguration.self,
+            from: JSONEncoder().encode(configuration))
+        XCTAssertEqual(reloaded, configuration)
+        XCTAssertEqual(reloaded.minimumGroupSize, 2)
+    }
+
+    /// Vision feature prints work on synthetic images: two near-identical
+    /// scenes score far below the 0.48 threshold while a scene change scores
+    /// far above it, so the whole recovery path can run end to end.
+    func testVisualLinkerLinksSimilarFramesInRecoveryBand() throws {
+        try withTemporaryDirectory { root in
+            let folder = root.appendingPathComponent("DCIM", isDirectory: true)
+            let sceneA = SyntheticImage.scene(seed: 42)
+            let sceneB = SyntheticImage.scene(seed: 42, extraMark: true)
+            let different = SyntheticImage.solidBlack()
+            let a = try SyntheticImage.writeJPEG(sceneA, to: folder.appendingPathComponent("DSC00001.JPG"))
+            let b = try SyntheticImage.writeJPEG(sceneB, to: folder.appendingPathComponent("DSC00002.JPG"))
+            let c = try SyntheticImage.writeJPEG(different, to: folder.appendingPathComponent("DSC00003.JPG"))
+            let d = try SyntheticImage.writeJPEG(sceneA, to: folder.appendingPathComponent("DSC00004.JPG"))
+
+            let t0 = Date(timeIntervalSince1970: 1_800_000_000)
+            let items = [
+                organizeItem(a.path, kind: .photo, date: t0),
+                organizeItem(b.path, kind: .photo, date: t0.addingTimeInterval(1.4)),
+                organizeItem(c.path, kind: .photo, date: t0.addingTimeInterval(2.8)),
+                organizeItem(d.path, kind: .photo, date: t0.addingTimeInterval(5.5)),
+            ]
+
+            // Only the two recovery-band pairs are fingerprint candidates.
+            let candidates = BurstVisualLinker.recoveryPairs(for: items)
+            XCTAssertEqual(
+                candidates.map { [$0.previous.primary.name, $0.next.primary.name] },
+                [["DSC00001.JPG", "DSC00002.JPG"], ["DSC00002.JPG", "DSC00003.JPG"]])
+
+            let similar = try BurstVisualLinker.featurePrintDistance(from: a, to: b)
+            let changed = try BurstVisualLinker.featurePrintDistance(from: b, to: c)
+            XCTAssertLessThan(similar, 0.2)
+            XCTAssertGreaterThan(changed, BurstGroupingConfiguration().maximumVisionDistance)
+
+            let links = BurstVisualLinker.links(for: items, concurrency: 2)
+            XCTAssertEqual(links, [BurstVisualLink(previous: items[0], next: items[1])])
+
+            let stacks = OrganizeStacker.stacks(for: items, visualLinks: links)
+            XCTAssertEqual(stacks.map(\.items.count), [2, 1, 1])
+            XCTAssertEqual(stacks.first?.items.map(\.primary.name), ["DSC00001.JPG", "DSC00002.JPG"])
+        }
+    }
+}
+
+/// Deterministic synthetic scenes for Vision feature prints. A seeded
+/// gradient-and-blobs scene gives near-zero distance to a re-render of itself
+/// and a ~1.0 distance to a solid frame, so both sides of the 0.48 threshold
+/// are exercised without real photos.
+private enum SyntheticImage {
+    static func scene(seed: UInt64, extraMark: Bool = false, width: Int = 640, height: Int = 480) -> CGImage {
+        var rng = seed
+        func next() -> UInt64 {
+            rng = rng &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+            return rng >> 33
+        }
+        let context = makeContext(width: width, height: height)
+        for y in 0..<height {
+            let t = Double(y) / Double(height)
+            context.setFillColor(CGColor(red: t, green: 0.4, blue: 1 - t, alpha: 1))
+            context.fill(CGRect(x: 0, y: y, width: width, height: 1))
+        }
+        for _ in 0..<40 {
+            let x = Double(next() % UInt64(width))
+            let y = Double(next() % UInt64(height))
+            let w = 20 + Double(next() % 80)
+            let h = 20 + Double(next() % 80)
+            context.setFillColor(CGColor(
+                red: Double(next() % 255) / 255,
+                green: Double(next() % 255) / 255,
+                blue: Double(next() % 255) / 255,
+                alpha: 0.8))
+            context.fillEllipse(in: CGRect(x: x, y: y, width: w, height: h))
+        }
+        if extraMark {
+            context.setFillColor(CGColor(red: 1, green: 0, blue: 0, alpha: 1))
+            context.fillEllipse(in: CGRect(x: 300, y: 200, width: 12, height: 12))
+        }
+        return context.makeImage()!
+    }
+
+    static func solidBlack(width: Int = 640, height: Int = 480) -> CGImage {
+        let context = makeContext(width: width, height: height)
+        context.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        return context.makeImage()!
+    }
+
+    static func writeJPEG(_ image: CGImage, to url: URL) throws -> URL {
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        guard let destination = CGImageDestinationCreateWithURL(
+            url as CFURL, UTType.jpeg.identifier as CFString, 1, nil)
+        else { throw CocoaError(.fileWriteUnknown) }
+        CGImageDestinationAddImage(destination, image, nil)
+        guard CGImageDestinationFinalize(destination) else { throw CocoaError(.fileWriteUnknown) }
+        return url
+    }
+
+    private static func makeContext(width: Int, height: Int) -> CGContext {
+        CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)!
     }
 }

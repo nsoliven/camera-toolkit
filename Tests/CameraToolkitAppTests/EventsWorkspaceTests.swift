@@ -178,6 +178,240 @@ final class EventsWorkspaceTests: XCTestCase {
         }
     }
 
+    func testConnectivityRefreshRescansSourcesThatFailedWhileOffline() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let missing = root.appendingPathComponent("Late Card", isDirectory: true)
+            let location = addUnsorted(missing, to: model)
+
+            workspace.scan(location)
+            XCTAssertNotNil(workspace.sources[location.id]?.error)
+            XCTAssertNil(workspace.sources[location.id]?.result)
+
+            // Still unreachable: a refresh re-checks but does not clear the error.
+            workspace.refreshConnectivity()
+            XCTAssertNotNil(workspace.sources[location.id]?.error)
+            XCTAssertNil(workspace.sources[location.id]?.result)
+
+            try FileManager.default.createDirectory(at: missing, withIntermediateDirectories: true)
+            try writeOrganizerARW(missing.appendingPathComponent("DSC00001.ARW"), "2026:08:26 10:00:00", "000")
+
+            let revision = workspace.connectivityRevision
+            workspace.refreshConnectivity()
+            XCTAssertEqual(workspace.connectivityRevision, revision + 1)
+            try await waitUntil { workspace.sources[location.id]?.result != nil }
+            XCTAssertNil(workspace.sources[location.id]?.error)
+            XCTAssertEqual(workspace.sources[location.id]?.result?.items.count, 1)
+        }
+    }
+
+    func testConnectivityRefreshLeavesHealthyCachedScansAlone() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let folder = root.appendingPathComponent("Card", isDirectory: true)
+            try writeOrganizerARW(folder.appendingPathComponent("DSC00001.ARW"), "2026:08:26 10:00:00", "000")
+            let location = addUnsorted(folder, to: model)
+            workspace.scan(location)
+            try await waitUntil { workspace.sources[location.id]?.result != nil }
+
+            // A file landing after the first scan is not picked up by a
+            // connectivity refresh — it re-checks reachability, not contents.
+            try writeOrganizerARW(folder.appendingPathComponent("DSC00002.ARW"), "2026:08:26 10:01:00", "000")
+            workspace.refreshConnectivity()
+            try await Task.sleep(for: .milliseconds(300))
+
+            XCTAssertEqual(workspace.sources[location.id]?.isScanning, false)
+            XCTAssertEqual(workspace.sources[location.id]?.result?.items.count, 1)
+        }
+    }
+
+    func testTrashStackMovesFilesIntoDriveTrashAndDropsAssignments() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let unsorted = root.appendingPathComponent("Drive/Unsorted A7V", isDirectory: true)
+            let frame1 = try writeOrganizerARW(unsorted.appendingPathComponent("Transfer 1/B0001_DSC00001.ARW"), "2026:08:26 10:00:00", "100")
+            let frame2 = try writeOrganizerARW(unsorted.appendingPathComponent("Transfer 1/B0001_DSC00002.ARW"), "2026:08:26 10:00:00", "400")
+            let sidecar = try organizerWrite(unsorted.appendingPathComponent("Transfer 1/B0001_DSC00001.xmp"), "<xmp/>")
+            let kept = try writeOrganizerARW(unsorted.appendingPathComponent("Transfer 1/DSC00010.ARW"), "2026:08:26 11:00:00", "000")
+            let location = addUnsorted(unsorted, to: model)
+            workspace.scan(location)
+            try await waitUntil { workspace.sources[location.id]?.result != nil }
+            let result = try XCTUnwrap(workspace.sources[location.id]?.result)
+
+            let eventID = try XCTUnwrap(workspace.createEvent(name: "Beach Day", date: organizerDay("2026-08-26"), policy: .buffer))
+            let burst = try XCTUnwrap(result.stacks.first { $0.isBurst })
+            workspace.assign(stackIDs: [burst.id], from: location.id, to: eventID)
+            XCTAssertEqual(model.configuration.photoEventAssignments.count, 3)
+            workspace.selectStacks([burst.id])
+
+            workspace.trash(stackIDs: [burst.id], from: location.id)
+            try await waitUntil { !model.isBusy && workspace.sources[location.id]?.result?.items.count == 1 }
+
+            // Companions travel together: both RAWs and the XMP moved into the
+            // drive-local _Trash, preserving their folder structure.
+            let trash = root.appendingPathComponent("Drive/.Camera Toolkit/_Trash", isDirectory: true)
+            let batchFolders = try FileManager.default.contentsOfDirectory(at: trash, includingPropertiesForKeys: [.isDirectoryKey])
+            let batchFolder = try XCTUnwrap(batchFolders.first { $0.lastPathComponent != ".DS_Store" })
+            for url in [frame1, frame2, sidecar] {
+                XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+                XCTAssertTrue(FileManager.default.fileExists(atPath: batchFolder.appendingPathComponent("Transfer 1/\(url.lastPathComponent)").path))
+            }
+            XCTAssertTrue(FileManager.default.fileExists(atPath: kept.path))
+
+            // The manifest records where each file lived and what it was sorted into.
+            let manifestData = try Data(contentsOf: batchFolder.appendingPathComponent("manifest.json"))
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            let manifest = try decoder.decode(MediaTrashManifest.self, from: manifestData)
+            XCTAssertEqual(manifest.entries.count, 3)
+            let entry = try XCTUnwrap(manifest.entries.first { $0.trashedRelativePath == "Transfer 1/B0001_DSC00001.ARW" })
+            XCTAssertEqual(entry.originalAbsolutePath, frame1.standardizedFileURL.path)
+            XCTAssertEqual(entry.eventID, eventID)
+            XCTAssertEqual(entry.deviceID, "sony-a7v")
+            XCTAssertEqual(entry.originalLocationName, location.name)
+
+            // Scan result and assignments dropped the trashed files; the
+            // untrashed single stays. Selection of the trashed stack cleared.
+            XCTAssertEqual(workspace.sources[location.id]?.result?.items.count, 1)
+            XCTAssertEqual(workspace.sources[location.id]?.result?.items.first?.primary.name, "DSC00010.ARW")
+            XCTAssertTrue(model.configuration.photoEventAssignments.isEmpty)
+            XCTAssertTrue(workspace.selectedStackIDs.isEmpty)
+            XCTAssertTrue(model.statusMessage.contains("Moved 3 files to Trash"))
+
+            // The batch lists under the removed-files root and restores cleanly.
+            let svc = MediaTrashService(removedFilesRoot: workspace.locations.removedFilesRoot)
+            let batches = svc.listBatches(under: [workspace.locations.removedFilesRoot])
+            XCTAssertEqual(batches.count, 1)
+            let report = svc.restore(batch: try XCTUnwrap(batches.first))
+            XCTAssertEqual(report.restored.count, 3)
+            XCTAssertTrue(report.conflicts.isEmpty)
+            XCTAssertEqual(try Data(contentsOf: sidecar), Data("<xmp/>".utf8))
+        }
+    }
+
+    func testSubeventCreationDedupAndSidebarNesting() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            _ = root
+            let parentA = try XCTUnwrap(workspace.createEvent(name: "PHIL2026", date: organizerDay("2026-08-21"), policy: .buffer))
+            let parentB = try XCTUnwrap(workspace.createEvent(name: "Other Trip", date: organizerDay("2026-08-21"), policy: .buffer))
+            let child = try XCTUnwrap(workspace.createEvent(name: "Matcha", date: organizerDay("2026-08-23"), policy: nil, parentEventID: parentA))
+
+            // Same name and date under a different parent is a different
+            // folder, so it creates a new event rather than matching.
+            let childB = try XCTUnwrap(workspace.createEvent(name: "Matcha", date: organizerDay("2026-08-23"), policy: nil, parentEventID: parentB))
+            XCTAssertNotEqual(child, childB)
+            // Same name, date, and parent matches the existing event.
+            XCTAssertEqual(workspace.createEvent(name: "Matcha", date: organizerDay("2026-08-23"), policy: nil, parentEventID: parentA), child)
+
+            let events = model.configuration.savedEvents
+            XCTAssertEqual(events.first { $0.id == child }?.parentEventID, parentA)
+            XCTAssertEqual(events.first { $0.id == childB }?.parentEventID, parentB)
+
+            // The sidebar nests children under their parent.
+            let rows = workspace.sidebarEvents
+            guard let parentIndex = rows.firstIndex(where: { $0.event.id == parentA }),
+                  let childIndex = rows.firstIndex(where: { $0.event.id == child }) else {
+                return XCTFail("Sidebar is missing the parent or subevent")
+            }
+            XCTAssertEqual(rows[parentIndex].depth, 0)
+            XCTAssertEqual(rows[childIndex].depth, 1)
+            XCTAssertEqual(childIndex, parentIndex + 1)
+
+            // A descendant can never be picked as a parent.
+            XCTAssertNil(workspace.validParentEventID(child, for: parentA))
+            XCTAssertEqual(workspace.validParentEventID(parentB, for: parentA), parentB)
+
+            XCTAssertEqual(workspace.eventTitle(try XCTUnwrap(workspace.event(child))), "PHIL2026 / Matcha")
+        }
+    }
+
+    func testRenamingParentMovesSubeventFolderAndRewritesAssignments() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let parent = try XCTUnwrap(workspace.createEvent(name: "PHIL2026", date: organizerDay("2026-08-21"), policy: .buffer))
+            let child = try XCTUnwrap(workspace.createEvent(name: "Matcha", date: organizerDay("2026-08-23"), policy: nil, parentEventID: parent))
+            let cardCopy = root.appendingPathComponent("Drive/Camera Buffer/2026/2026-08-21 PHIL2026/2026-08-23 Matcha/Sony A7V/Card Copy", isDirectory: true)
+            try writeOrganizerARW(cardCopy.appendingPathComponent("DSC00001.ARW"), "2026:08:23 10:00:00", "000")
+            model.updateConfiguration { configuration in
+                configuration.photoEventAssignments.append(PhotoEventAssignment(
+                    sourceRootPath: cardCopy.path,
+                    relativePath: "DSC00001.ARW",
+                    fileSize: 1,
+                    modifiedAt: Date(),
+                    eventID: child,
+                    deviceID: "sony-a7v"
+                ))
+            }
+
+            workspace.renameEvent(parent, name: "PHIL2026 Renamed", date: organizerDay("2026-08-21"), policy: .buffer, parentEventID: nil)
+
+            let movedFolder = root.appendingPathComponent("Drive/Camera Buffer/2026/2026-08-21 PHIL2026 Renamed", isDirectory: true)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("Drive/Camera Buffer/2026/2026-08-21 PHIL2026").path))
+            XCTAssertTrue(FileManager.default.fileExists(atPath: movedFolder.appendingPathComponent("2026-08-23 Matcha/Sony A7V/Card Copy/DSC00001.ARW").path))
+            XCTAssertEqual(
+                model.configuration.photoEventAssignments.first?.sourceRootPath,
+                movedFolder.appendingPathComponent("2026-08-23 Matcha/Sony A7V/Card Copy").path
+            )
+        }
+    }
+
+    func testReparentingMovesTheEventFolder() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let parent = try XCTUnwrap(workspace.createEvent(name: "PHIL2026", date: organizerDay("2026-08-21"), policy: .buffer))
+            let child = try XCTUnwrap(workspace.createEvent(name: "Matcha", date: organizerDay("2026-08-23"), policy: nil, parentEventID: parent))
+            let nestedFolder = root.appendingPathComponent("Drive/Camera Buffer/2026/2026-08-21 PHIL2026/2026-08-23 Matcha/Sony A7V/Card Copy", isDirectory: true)
+            try writeOrganizerARW(nestedFolder.appendingPathComponent("DSC00001.ARW"), "2026:08:23 10:00:00", "000")
+
+            workspace.renameEvent(child, name: "Matcha", date: organizerDay("2026-08-23"), policy: nil, parentEventID: nil)
+
+            XCTAssertNil(workspace.event(child)?.parentEventID)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: nestedFolder.path))
+            XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("Drive/Camera Buffer/2026/2026-08-23 Matcha/Sony A7V/Card Copy/DSC00001.ARW").path))
+        }
+    }
+
+    func testDeleteEmptyEventRefusesAParentWithSubevents() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            _ = root
+            let parent = try XCTUnwrap(workspace.createEvent(name: "PHIL2026", date: organizerDay("2026-08-21"), policy: .buffer))
+            _ = try XCTUnwrap(workspace.createEvent(name: "Matcha", date: organizerDay("2026-08-23"), policy: nil, parentEventID: parent))
+
+            workspace.deleteEmptyEvent(parent)
+            XCTAssertNotNil(workspace.event(parent))
+            XCTAssertTrue(model.statusMessage.contains("subevents"))
+        }
+    }
+
+    func testApplySortsSubeventFilesIntoTheNestedFolder() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let unsorted = root.appendingPathComponent("Drive/Unsorted A7V", isDirectory: true)
+            try writeOrganizerARW(unsorted.appendingPathComponent("Transfer 1/DSC00001.ARW"), "2026:08:23 10:00:00", "000")
+            let location = addUnsorted(unsorted, to: model)
+            workspace.scan(location)
+            try await waitUntil { workspace.sources[location.id]?.result != nil }
+            let stack = try XCTUnwrap(workspace.sources[location.id]?.result?.stacks.first)
+
+            let parent = try XCTUnwrap(workspace.createEvent(name: "PHIL2026", date: organizerDay("2026-08-21"), policy: .archiveOnly))
+            let child = try XCTUnwrap(workspace.createEvent(name: "Matcha", date: organizerDay("2026-08-23"), policy: nil, parentEventID: parent))
+            workspace.assign(stackIDs: [stack.id], from: location.id, to: child)
+
+            let plan = EventsWorkspace.buildApplyPlan(
+                events: [try XCTUnwrap(workspace.event(child))],
+                configuration: model.configuration,
+                locations: workspace.locations,
+                onlyUnder: unsorted.path,
+                title: "Apply",
+                unsortedRoots: [unsorted]
+            )
+            // The subevent inherits its parent's private policy.
+            XCTAssertEqual(plan.groups.first?.isPrivate, true)
+            XCTAssertEqual(plan.moveCount, 1)
+
+            workspace.performApply(plan)
+            try await waitUntil { !model.isBusy && workspace.latestMoveJournalTitle != nil }
+
+            let nested = root.appendingPathComponent("Drive/.Camera Toolkit/Private/2026/2026-08-21 PHIL2026/2026-08-23 Matcha/Sony A7V/Card Copy/DSC00001.ARW")
+            XCTAssertTrue(FileManager.default.fileExists(atPath: nested.path))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("Drive/Camera Buffer/2026/2026-08-23 Matcha").path))
+        }
+    }
+
     // MARK: - Helpers
 
     private func withOrganizerSandbox(

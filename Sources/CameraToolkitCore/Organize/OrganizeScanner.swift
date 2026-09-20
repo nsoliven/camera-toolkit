@@ -26,6 +26,10 @@ public struct OrganizeScanResult: Sendable {
     /// Camera clock minus file modification time, rounded to 15 minutes.
     public var clockOffset: TimeInterval
     public var scannedAt: Date
+    /// Burst grouping settings and the visual links the scan resolved, kept
+    /// so `removingFiles` restacks with the same decisions.
+    public var burstGrouping: BurstGroupingConfiguration = BurstGroupingConfiguration()
+    public var visualLinks: Set<BurstVisualLink> = []
 
     public var fileCount: Int { items.reduce(0) { $0 + 1 + $1.companions.count } }
     public var byteCount: Int64 { items.reduce(Int64(0)) { $0 + $1.byteCount } }
@@ -40,7 +44,11 @@ public struct OrganizeScanResult: Sendable {
             kept.companions.removeAll { keys.contains(EventStorageLocations.pathKey($0.path)) }
             return kept
         }
-        copy.stacks = OrganizeStacker.stacks(for: copy.items)
+        let surviving = Set(copy.items.map(\.primary.path))
+        let links = visualLinks.filter {
+            surviving.contains($0.previousPath) && surviving.contains($0.nextPath)
+        }
+        copy.stacks = OrganizeStacker.stacks(for: copy.items, configuration: burstGrouping, visualLinks: links)
         copy.days = OrganizeStacker.days(for: copy.stacks)
         return copy
     }
@@ -57,6 +65,7 @@ public struct OrganizeScanner: Sendable {
     public func scan(
         root: URL,
         cache: CaptureDateCache? = nil,
+        burstGrouping: BurstGroupingConfiguration = BurstGroupingConfiguration(),
         progress: (@Sendable (OrganizeScanProgress) -> Void)? = nil
     ) throws -> OrganizeScanResult {
         let rootURL = root.standardizedFileURL
@@ -73,8 +82,16 @@ public struct OrganizeScanner: Sendable {
         let duplicateNames = Set(nameCounts.filter { $0.value > 1 }.keys)
 
         let built = Self.items(for: files, cache: cache, concurrency: concurrency, progress: progress)
+        // Fingerprints run only for pairs in the visual-recovery band; when
+        // recovery is off or no pair qualifies this returns immediately.
+        let visualLinks = BurstVisualLinker.links(
+            for: built.items,
+            configuration: burstGrouping,
+            concurrency: concurrency,
+            progress: progress
+        )
         progress?(OrganizeScanProgress(phase: "Grouping bursts", processed: 1, total: 1))
-        let stacks = OrganizeStacker.stacks(for: built.items)
+        let stacks = OrganizeStacker.stacks(for: built.items, configuration: burstGrouping, visualLinks: visualLinks)
         return OrganizeScanResult(
             rootPath: rootURL.path,
             items: built.items,
@@ -82,7 +99,9 @@ public struct OrganizeScanner: Sendable {
             days: OrganizeStacker.days(for: stacks),
             duplicateNames: duplicateNames,
             clockOffset: built.clockOffset,
-            scannedAt: Date()
+            scannedAt: Date(),
+            burstGrouping: burstGrouping,
+            visualLinks: visualLinks
         )
     }
 

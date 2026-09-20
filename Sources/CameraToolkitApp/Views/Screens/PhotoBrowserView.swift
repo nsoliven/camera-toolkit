@@ -263,6 +263,12 @@ struct PhotoBrowserView: View {
                 try? await Task.sleep(for: .seconds(10))
             }
         }
+        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didMountNotification)) { _ in
+            handleVolumeChange()
+        }
+        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didUnmountNotification)) { _ in
+            handleVolumeChange()
+        }
         .onChange(of: selectedLocationID) { _, newValue in
             guard let location = locations.first(where: { $0.id == newValue }) else { return }
             hasRequestedImportPreview = false
@@ -283,8 +289,8 @@ struct PhotoBrowserView: View {
             }
         }
         .sheet(isPresented: $isCreatingEvent) {
-            NewCameraEventSheet { name, date in
-                model.createEvent(named: name, on: date)
+            NewCameraEventSheet(parents: model.displayEvents) { name, date, parentEventID in
+                model.createEvent(named: name, on: date, parentEventID: parentEventID)
                 isCreatingEvent = false
             }
         }
@@ -1265,7 +1271,7 @@ struct PhotoBrowserView: View {
                     model.assignFilesToSelectedEvent(assignableSelections)
                 } label: {
                     Label(
-                        "Assign \(assignableSelections.count) to \(event.name)",
+                        "Assign \(assignableSelections.count) to \(model.eventTitle(event))",
                         systemImage: "calendar.badge.plus"
                     )
                 }
@@ -1437,9 +1443,9 @@ struct PhotoBrowserView: View {
                 }
             )) {
                 Text("Choose an event").tag(UUID?.none)
-                ForEach(model.savedEvents) { event in
-                    Text("\(event.name) · \(event.eventDate.formatted(date: .abbreviated, time: .omitted))")
-                        .tag(Optional(event.id))
+                ForEach(model.displayEvents, id: \.event.id) { row in
+                    Text("\(model.eventTitle(row.event)) · \(row.event.eventDate.formatted(date: .abbreviated, time: .omitted))")
+                        .tag(Optional(row.event.id))
                 }
             }
             .frame(width: 250)
@@ -1677,7 +1683,7 @@ struct PhotoBrowserView: View {
 
     private var archiveOriginalsRelativePath: String {
         let layout = OrganizedArchiveLayout(configuration: model.configuration)
-        return ["Originals", layout.year, layout.eventFolder, layout.deviceFolder].joined(separator: "/")
+        return ["Originals", layout.year, layout.eventFolderPath, layout.deviceFolder].joined(separator: "/")
     }
 
     private var archiveOriginalsBasePath: String {
@@ -2092,7 +2098,10 @@ struct PhotoBrowserView: View {
             fileURLWithPath: DashboardModel.expandedPath(model.configuration.importSourcePath),
             isDirectory: true
         ).standardizedFileURL.path
-        let eventsByID = Dictionary(uniqueKeysWithValues: model.savedEvents.map { ($0.id, $0) })
+        var eventsByID: [UUID: SavedCameraEvent] = [:]
+        for event in model.savedEvents where eventsByID[event.id] == nil {
+            eventsByID[event.id] = event
+        }
         var result: [BrowserFileIdentity: SavedCameraEvent] = [:]
         for assignment in model.configuration.photoEventAssignments where
             URL(fileURLWithPath: assignment.sourceRootPath, isDirectory: true).standardizedFileURL.path == root {
@@ -2745,6 +2754,24 @@ struct PhotoBrowserView: View {
         return FileManager.default.fileExists(atPath: DashboardModel.expandedPath(path), isDirectory: &directory) && directory.boolValue
     }
 
+    /// A volume mounted or unmounted: refresh the sidebar dots and capacities
+    /// right away (the 10s poll would catch up anyway), reload the current
+    /// folder when its drive just came back, and flag it when its drive left.
+    private func handleVolumeChange() {
+        copyAvailabilityRefreshRevision &+= 1
+        Task { await refreshStorageCapacities() }
+        guard !isLoading else { return }
+        if folderExists(currentURL.path) {
+            if browserError != nil {
+                Task { await loadCurrentDirectory() }
+            }
+        } else if browserError == nil {
+            items = []
+            resetBrowserTree()
+            browserError = "This folder is on a drive that is not connected right now."
+        }
+    }
+
     private func sourceDisplayName(_ location: ConfiguredLocation) -> String {
         let path = location.path.lowercased()
         if path.contains("/cameratoolkit/simulation/") { return "Safety Test Card" }
@@ -2907,11 +2934,14 @@ private struct CollectedEventFilesView: View {
 }
 
 private struct NewCameraEventSheet: View {
-    var onCreate: (String, Date) -> Void
+    /// Candidate parents in flattened sidebar order for the "Inside event" picker.
+    var parents: [(event: SavedCameraEvent, depth: Int)] = []
+    var onCreate: (String, Date, UUID?) -> Void
 
     @Environment(\.dismiss) private var dismiss
     @State private var name = ""
     @State private var date = Date()
+    @State private var parentEventID: UUID?
     @State private var hasAttemptedCreate = false
     @FocusState private var isNameFocused: Bool
 
@@ -2959,6 +2989,14 @@ private struct NewCameraEventSheet: View {
                     }
                 }
                 DatePicker("Event date", selection: $date, displayedComponents: .date)
+                Picker("Inside event", selection: $parentEventID) {
+                    Text("None — top level").tag(UUID?.none)
+                    ForEach(parents, id: \.event.id) { row in
+                        Text(String(repeating: "    ", count: row.depth) + row.event.name)
+                            .tag(UUID?.some(row.event.id))
+                    }
+                }
+                .help("A subevent's folder lives inside its parent event's folder.")
             }
             .formStyle(.grouped)
 
@@ -2986,7 +3024,7 @@ private struct NewCameraEventSheet: View {
             isNameFocused = true
             return
         }
-        onCreate(validation.normalizedName, date)
+        onCreate(validation.normalizedName, date, parentEventID)
     }
 }
 

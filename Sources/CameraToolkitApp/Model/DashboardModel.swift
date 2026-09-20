@@ -250,6 +250,17 @@ extension DashboardModel {
         }
     }
 
+    /// Events in sidebar order — parents newest-first, subevents nested under
+    /// them — for pickers and menus.
+    var displayEvents: [(event: SavedCameraEvent, depth: Int)] {
+        EventHierarchy.flattened(configuration.savedEvents)
+    }
+
+    /// "Parent / Child" breadcrumb title for menus and headers.
+    func eventTitle(_ event: SavedCameraEvent) -> String {
+        EventHierarchy.displayName(of: event, in: configuration.savedEvents)
+    }
+
     var selectedEvent: SavedCameraEvent? {
         guard let id = configuration.selectedEventID else { return nil }
         return configuration.savedEvents.first { $0.id == id }
@@ -368,24 +379,31 @@ extension DashboardModel {
     }
 
     @discardableResult
-    func createEvent(named rawName: String, on eventDate: Date) -> Bool {
+    func createEvent(named rawName: String, on eventDate: Date, parentEventID: UUID? = nil) -> Bool {
         let validation = EventNamePolicy.validate(rawName)
         guard validation.isValid else {
             statusMessage = validation.errorMessage ?? "Choose a different event name."
             return false
         }
         let name = validation.normalizedName
+        // A missing or self-referencing parent resolves to top-level.
+        let parentID = parentEventID.flatMap { id in
+            configuration.savedEvents.contains { $0.id == id } ? id : nil
+        }
 
         var selectedID: UUID?
         updateConfiguration { configuration in
+            // The dated folder name is unique per parent: a same-named event
+            // under a different parent is a different folder, not a duplicate.
             if let index = configuration.savedEvents.firstIndex(where: {
-                $0.name.localizedCaseInsensitiveCompare(name) == .orderedSame
+                $0.parentEventID == parentID
+                    && $0.name.localizedCaseInsensitiveCompare(name) == .orderedSame
                     && Calendar.current.isDate($0.eventDate, inSameDayAs: eventDate)
             }) {
                 configuration.savedEvents[index].lastUsedAt = Date()
                 selectedID = configuration.savedEvents[index].id
             } else {
-                let event = SavedCameraEvent(name: name, eventDate: eventDate)
+                let event = SavedCameraEvent(name: name, eventDate: eventDate, parentEventID: parentID)
                 configuration.savedEvents.append(event)
                 selectedID = event.id
             }
@@ -416,8 +434,8 @@ extension DashboardModel {
         queuedFilePaths.removeAll()
         selectedEventCopyAvailability = EventCopyAvailability()
         statusMessage = selectedEventFiles.isEmpty
-            ? "Selected \(event.name). Select photos and assign them to this event."
-            : "Selected \(event.name) with \(selectedEventFiles.count) assigned file(s)."
+            ? "Selected \(eventTitle(event)). Select photos and assign them to this event."
+            : "Selected \(eventTitle(event)) with \(selectedEventFiles.count) assigned file(s)."
     }
 
     func assignFilesToSelectedEvent(_ files: [FileRecord]) {
@@ -479,7 +497,7 @@ extension DashboardModel {
         let sourceCount = Set(validSelections.map(\.sourceRootPath)).count
         let sourceNote = sourceCount == 1 ? "" : " across \(sourceCount) camera sources"
         selectedEventCopyAvailability = EventCopyAvailability()
-        statusMessage = "Assigned \(validSelections.count) file(s)\(sourceNote) to \(event.name)."
+        statusMessage = "Assigned \(validSelections.count) file(s)\(sourceNote) to \(eventTitle(event))."
     }
 
     func queueSelectedEventFiles() {
@@ -514,7 +532,7 @@ extension DashboardModel {
             sourcePath: expandedImportSourcePath,
             destinationPath: expandedBufferIngestPath,
             eventID: selectedEvent?.id,
-            eventName: selectedEvent?.name ?? configuration.eventName,
+            eventName: selectedEvent.map { eventTitle($0) } ?? configuration.eventName,
             deviceID: configuration.selectedDeviceID
         )
     }
@@ -590,9 +608,9 @@ extension DashboardModel {
                     withIntermediateDirectories: true
                 )
             }
-            statusMessage = "Created the \(event.name) card-copy, Photomator, Masters, Web, and Social folders."
+            statusMessage = "Created the \(eventTitle(event)) card-copy, Photomator, Masters, Web, and Social folders."
         } catch {
-            statusMessage = "Could not create folders for \(event.name): \(error.localizedDescription)"
+            statusMessage = "Could not create folders for \(eventTitle(event)): \(error.localizedDescription)"
         }
     }
 
@@ -1246,7 +1264,7 @@ extension DashboardModel {
             sourcePath: expandedImportSourcePath,
             destinationPath: expandedBufferIngestPath,
             eventID: selectedEvent?.id,
-            eventName: selectedEvent?.name ?? configuration.eventName,
+            eventName: selectedEvent.map { eventTitle($0) } ?? configuration.eventName,
             deviceID: configuration.selectedDeviceID
         )
     }

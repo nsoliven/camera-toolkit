@@ -66,9 +66,14 @@ struct UnsortedBoardView: View {
                     stacks: ordered,
                     stackID: $previewStackID,
                     quickEvents: workspace.quickEvents,
+                    rootPath: result?.rootPath,
                     eventForStack: { workspace.assignedEvent(for: $0).event },
                     onAssign: { stack, event in
                         workspace.assign(stackIDs: [stack.id], from: location.id, to: event.id)
+                    },
+                    isPrivate: { workspace.resolvedPolicy(for: $0) == .archiveOnly },
+                    onTrashItems: { items in
+                        workspace.trashItems(items, from: location.id)
                     }
                 )
             }
@@ -124,6 +129,11 @@ struct UnsortedBoardView: View {
                 Button("Reveal in Finder") {
                     NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: DashboardModel.expandedPath(location.path))])
                 }
+                Button("Move to Trash…") {
+                    workspace.trash(stackIDs: workspace.targetStackIDs(), from: location.id)
+                }
+                .disabled(workspace.targetStackIDs().isEmpty)
+                .help("Move the selected items to the drive's Trash folder. Restorable from Settings.")
                 Divider()
                 Button("Remove from Unsorted List") {
                     workspace.removeUnsortedFolder(location.id)
@@ -156,17 +166,17 @@ struct UnsortedBoardView: View {
                     Button {
                         workspace.assign(stackIDs: targets, from: location.id, to: event.id, orderedIDs: orderedIDs)
                     } label: {
-                        EventChip(event: event, number: index + 1)
+                        EventChip(event: event, number: index + 1, isPrivate: workspace.resolvedPolicy(for: event) == .archiveOnly)
                     }
                     .buttonStyle(.plain)
                     .opacity(targets.isEmpty ? 0.5 : 1)
                     .disabled(targets.isEmpty)
-                    .help("Sort into \(event.name) (press \(index + 1))")
+                    .help("Sort into \(workspace.eventTitle(event)) (press \(index + 1))")
                 }
                 Menu {
-                    ForEach(workspace.events) { event in
-                        Button(event.name) {
-                            workspace.assign(stackIDs: targets, from: location.id, to: event.id, orderedIDs: orderedIDs)
+                    ForEach(workspace.sidebarEvents, id: \.event.id) { row in
+                        Button(workspace.eventTitle(row.event)) {
+                            workspace.assign(stackIDs: targets, from: location.id, to: row.event.id, orderedIDs: orderedIDs)
                         }
                     }
                 } label: {
@@ -208,6 +218,7 @@ struct UnsortedBoardView: View {
             tileWidth: tileWidth,
             origin: .unsorted,
             containerID: location.id,
+            rootPath: state.result?.rootPath,
             daySubtitle: { day in
                 "\(day.stacks.count) items · \(day.frameCount) frames · \(day.byteCount.formattedBytes)"
             },
@@ -227,9 +238,9 @@ struct UnsortedBoardView: View {
     private func contextMenu(_ stack: OrganizeStack) -> some View {
         let targets = workspace.targetStackIDs(including: stack.id)
         Menu("Sort Into") {
-            ForEach(workspace.events) { event in
-                Button(event.name) {
-                    workspace.assign(stackIDs: targets, from: location.id, to: event.id)
+            ForEach(workspace.sidebarEvents, id: \.event.id) { row in
+                Button(workspace.eventTitle(row.event)) {
+                    workspace.assign(stackIDs: targets, from: location.id, to: row.event.id)
                 }
             }
         }
@@ -250,6 +261,11 @@ struct UnsortedBoardView: View {
         Button("Reveal in Finder") {
             NSWorkspace.shared.activateFileViewerSelecting(urls(for: targets))
         }
+        Divider()
+        Button("Move to Trash…") {
+            workspace.trash(stackIDs: targets, from: location.id)
+        }
+        .help("Move to the drive's Trash folder. Restorable from Settings.")
     }
 
     private func urls(for ids: Set<String>) -> [URL] {

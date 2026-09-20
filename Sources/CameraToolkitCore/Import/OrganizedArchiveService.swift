@@ -82,23 +82,53 @@ public struct OrganizedArchiveLayout: Sendable {
     public let eventDate: String
     public let eventName: String
     public let deviceID: String
+    /// Dated folder names of the event's ancestors, root first. A subevent's
+    /// folder lives inside its parent's event folder.
+    public let parentEventFolders: [String]
+    /// The top-level grouping year: the root ancestor's year, which can
+    /// differ from this event's own date when it nests inside a parent.
+    public let year: String
 
-    public init(eventDate: String, eventName: String, deviceID: String) {
+    public init(
+        eventDate: String,
+        eventName: String,
+        deviceID: String,
+        parentEventFolders: [String] = [],
+        year: String? = nil
+    ) {
         self.eventDate = Self.safeDate(eventDate)
         self.eventName = EventNamePolicy.folderName(for: eventName, fallback: "Import")
         self.deviceID = deviceID
+        self.parentEventFolders = parentEventFolders
+        self.year = year ?? String(self.eventDate.prefix(4))
     }
 
     public init(configuration: AppConfiguration) {
+        let selected = configuration.selectedEventID.flatMap { id in
+            configuration.savedEvents.first { $0.id == id }
+        }
+        let ancestors = selected.map { EventHierarchy.ancestors(of: $0, in: configuration.savedEvents) } ?? []
         self.init(
             eventDate: configuration.archiveEventDate,
             eventName: configuration.eventName,
-            deviceID: configuration.selectedDeviceID
+            deviceID: configuration.selectedDeviceID,
+            parentEventFolders: ancestors.map {
+                Self.eventFolderName(date: EventStorageLocations.eventDateString($0.eventDate), name: $0.name)
+            },
+            year: ancestors.first.map { String(EventStorageLocations.eventDateString($0.eventDate).prefix(4)) }
         )
     }
 
-    public var year: String { String(eventDate.prefix(4)) }
+    /// The `<yyyy-MM-dd> <Name>` folder component for one event.
+    public static func eventFolderName(date: String, name: String) -> String {
+        "\(safeDate(date)) \(EventNamePolicy.folderName(for: name, fallback: "Import"))"
+    }
+
     public var eventFolder: String { "\(eventDate) \(eventName)" }
+    /// `eventFolder` prefixed by its ancestor folders, e.g.
+    /// `2026-08-21 PHIL2026/2026-08-23 Matcha`. A single path fragment, so it
+    /// can join a larger relative path directly.
+    public var eventFolderPath: String { (parentEventFolders + [eventFolder]).joined(separator: "/") }
 
     public var deviceFolder: String {
         switch deviceID {
@@ -116,7 +146,7 @@ public struct OrganizedArchiveLayout: Sendable {
         try PathSafety.validateRelativePath(sourcePath)
         let fileName = URL(fileURLWithPath: sourcePath).lastPathComponent
         let folder = mediaFolder(for: sourcePath).rawValue
-        return ["Originals", year, eventFolder, deviceFolder, folder, fileName]
+        return ["Originals", year, eventFolderPath, deviceFolder, folder, fileName]
             .joined(separator: "/")
     }
 
@@ -138,16 +168,16 @@ public struct OrganizedArchiveLayout: Sendable {
 
     public func requiredFolders(for sourcePaths: [String]) -> [String] {
         var folders: Set<String> = [
-            ["Originals", year, eventFolder, deviceFolder].joined(separator: "/"),
-            ["Edited", year, eventFolder, "Masters"].joined(separator: "/"),
-            ["Edited", year, eventFolder, "Web"].joined(separator: "/"),
-            ["Edited", year, eventFolder, "Social"].joined(separator: "/"),
+            ["Originals", year, eventFolderPath, deviceFolder].joined(separator: "/"),
+            ["Edited", year, eventFolderPath, "Masters"].joined(separator: "/"),
+            ["Edited", year, eventFolderPath, "Web"].joined(separator: "/"),
+            ["Edited", year, eventFolderPath, "Social"].joined(separator: "/"),
             "System/Manifests",
             "System/Import History"
         ]
         for path in sourcePaths {
             let media = mediaFolder(for: path).rawValue
-            folders.insert(["Originals", year, eventFolder, deviceFolder, media].joined(separator: "/"))
+            folders.insert(["Originals", year, eventFolderPath, deviceFolder, media].joined(separator: "/"))
         }
         return folders.sorted()
     }

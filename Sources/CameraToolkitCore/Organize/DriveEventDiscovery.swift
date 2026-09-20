@@ -3,6 +3,9 @@ import Foundation
 public struct DiscoveredDriveEvent: Identifiable, Hashable, Sendable {
     public var id: String { cardCopyPath }
     public var eventFolderPath: String
+    /// On-disk path of the parent event folder, when this folder nests inside
+    /// another dated event folder. Adoption turns it into `parentEventID`.
+    public var parentEventFolderPath: String?
     public var name: String
     public var dateString: String
     public var deviceID: String
@@ -18,6 +21,8 @@ public struct DiscoveredDriveEvent: Identifiable, Hashable, Sendable {
 /// Finds event folders already on the working drive
 /// (`<yyyy>/<yyyy-MM-dd Name>/<Camera>/Card Copy`) that the configuration does
 /// not know about yet, so a drive organized by hand can join the catalog.
+/// A dated folder inside an event folder is a subevent root — it can hold
+/// device folders of its own and deeper subevents.
 public enum DriveEventDiscovery {
     public static func deviceID(forDeviceFolder name: String) -> String {
         switch name.lowercased() {
@@ -40,7 +45,10 @@ public enum DriveEventDiscovery {
     ) throws -> [DiscoveredDriveEvent] {
         guard fileManager.fileExists(atPath: driveRoot.path) else { return [] }
         let locations = EventStorageLocations(configuration: configuration)
-        let events = Dictionary(uniqueKeysWithValues: configuration.savedEvents.map { ($0.id, $0) })
+        var events: [UUID: SavedCameraEvent] = [:]
+        for event in configuration.savedEvents where events[event.id] == nil {
+            events[event.id] = event
+        }
 
         var covered: Set<String> = []
         for assignment in configuration.photoEventAssignments {
@@ -59,39 +67,100 @@ public enum DriveEventDiscovery {
         for year in try directories(in: driveRoot, fileManager: fileManager)
         where year.lastPathComponent.count == 4 && year.lastPathComponent.allSatisfy(\.isNumber) {
             for eventFolder in try directories(in: year, fileManager: fileManager) {
-                guard let parsed = parseEventFolder(eventFolder.lastPathComponent) else { continue }
-                for deviceFolder in try directories(in: eventFolder, fileManager: fileManager) {
-                    let cardCopy = deviceFolder.appendingPathComponent("Card Copy", isDirectory: true)
-                    var isDirectory: ObjCBool = false
-                    guard fileManager.fileExists(atPath: cardCopy.path, isDirectory: &isDirectory), isDirectory.boolValue else {
-                        continue
-                    }
-                    let files = try FileScanner(fileManager: fileManager).scan(root: cardCopy).filter { file in
-                        !covered.contains(EventStorageLocations.pathKey(cardCopy.appendingPathComponent(file.path).path))
-                    }
-                    guard !files.isEmpty else { continue }
-                    let matching = configuration.savedEvents.first {
-                        $0.name.localizedCaseInsensitiveCompare(parsed.name) == .orderedSame
-                            && EventStorageLocations.eventDateString($0.eventDate) == parsed.date
-                    }
-                    discovered.append(DiscoveredDriveEvent(
-                        eventFolderPath: eventFolder.standardizedFileURL.path,
-                        name: parsed.name,
-                        dateString: parsed.date,
-                        deviceID: deviceID(forDeviceFolder: deviceFolder.lastPathComponent),
-                        cardCopyPath: cardCopy.standardizedFileURL.path,
-                        files: files,
-                        policy: policy,
-                        matchingEventID: matching?.id
-                    ))
-                }
+                try scanEventFolder(
+                    eventFolder,
+                    parentEventFolderPath: nil,
+                    driveRoot: driveRoot,
+                    policy: policy,
+                    locations: locations,
+                    configuration: configuration,
+                    covered: covered,
+                    fileManager: fileManager,
+                    into: &discovered
+                )
             }
         }
         return discovered.sorted { $0.dateString == $1.dateString ? $0.name < $1.name : $0.dateString < $1.dateString }
     }
 
+    /// Scans one dated event folder: dated subdirectories are subevent roots
+    /// and recurse; anything else is treated as a camera/device folder that
+    /// may hold a `Card Copy`.
+    private static func scanEventFolder(
+        _ eventFolder: URL,
+        parentEventFolderPath: String?,
+        driveRoot: URL,
+        policy: EventStoragePolicy,
+        locations: EventStorageLocations,
+        configuration: AppConfiguration,
+        covered: Set<String>,
+        fileManager: FileManager,
+        into discovered: inout [DiscoveredDriveEvent]
+    ) throws {
+        guard let parsed = parseEventFolder(eventFolder.lastPathComponent) else { return }
+        let eventFolderPath = eventFolder.standardizedFileURL.path
+        for subdirectory in try directories(in: eventFolder, fileManager: fileManager) {
+            if parseEventFolder(subdirectory.lastPathComponent) != nil {
+                try scanEventFolder(
+                    subdirectory,
+                    parentEventFolderPath: eventFolderPath,
+                    driveRoot: driveRoot,
+                    policy: policy,
+                    locations: locations,
+                    configuration: configuration,
+                    covered: covered,
+                    fileManager: fileManager,
+                    into: &discovered
+                )
+                continue
+            }
+            let cardCopy = subdirectory.appendingPathComponent("Card Copy", isDirectory: true)
+            var isDirectory: ObjCBool = false
+            guard fileManager.fileExists(atPath: cardCopy.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+                continue
+            }
+            let files = try FileScanner(fileManager: fileManager).scan(root: cardCopy).filter { file in
+                !covered.contains(EventStorageLocations.pathKey(cardCopy.appendingPathComponent(file.path).path))
+            }
+            guard !files.isEmpty else { continue }
+            let components = relativeComponents(of: eventFolder, under: driveRoot)
+            let matching = configuration.savedEvents.first {
+                folderComponents(of: $0, locations: locations) == components
+            }
+            discovered.append(DiscoveredDriveEvent(
+                eventFolderPath: eventFolderPath,
+                parentEventFolderPath: parentEventFolderPath,
+                name: parsed.name,
+                dateString: parsed.date,
+                deviceID: deviceID(forDeviceFolder: subdirectory.lastPathComponent),
+                cardCopyPath: cardCopy.standardizedFileURL.path,
+                files: files,
+                policy: policy,
+                matchingEventID: matching?.id
+            ))
+        }
+    }
+
+    /// `<year>/<parent event folder>/…/<event folder>` components of `url`
+    /// relative to `root`. Independent of which drive the path sits on, so it
+    /// can be compared against a saved event's expected layout.
+    static func relativeComponents(of url: URL, under root: URL) -> [String] {
+        let rootPath = root.standardizedFileURL.path
+        let path = url.standardizedFileURL.path
+        guard path.hasPrefix(rootPath + "/") else { return [] }
+        return String(path.dropFirst(rootPath.count + 1)).split(separator: "/").map(String.init)
+    }
+
+    /// The `<year>/<…>/<event folder>` components `event` should occupy.
+    static func folderComponents(of event: SavedCameraEvent, locations: EventStorageLocations) -> [String] {
+        let layout = locations.layout(for: event, deviceID: nil)
+        return [layout.year] + layout.parentEventFolders + [layout.eventFolder]
+    }
+
     /// Adds discovered folders as events. Their files stay exactly where they
-    /// are; each assignment points at the drive copy itself.
+    /// are; each assignment points at the drive copy itself. Subevent folders
+    /// get their `parentEventID` from the event occupying the parent folder,
+    /// creating that event from the folder name when needed.
     @discardableResult
     public static func adopt(
         _ discovered: [DiscoveredDriveEvent],
@@ -102,26 +171,61 @@ public enum DriveEventDiscovery {
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.timeZone = .current
         formatter.dateFormat = "yyyy-MM-dd"
+        var locations = EventStorageLocations(configuration: configuration)
 
         var created = 0
         var added = 0
+        /// The event occupying `folderPath` on `policy`'s drive — an existing
+        /// event when the path matches, otherwise a freshly created one.
+        /// Returns nil for a non-dated folder (e.g. a bare year folder).
+        func ensureEventID(forFolderPath folderPath: String, policy: EventStoragePolicy) -> UUID? {
+            guard let parsed = parseEventFolder(URL(fileURLWithPath: folderPath).lastPathComponent),
+                  let date = formatter.date(from: parsed.date) else { return nil }
+            locations.events = configuration.savedEvents
+            let components = relativeComponents(
+                of: URL(fileURLWithPath: folderPath),
+                under: locations.driveRoot(for: policy)
+            )
+            if let existing = configuration.savedEvents.first(where: {
+                folderComponents(of: $0, locations: locations) == components
+            }) {
+                return existing.id
+            }
+            var parentID: UUID?
+            if components.count > 2 {
+                let parentPath = URL(fileURLWithPath: folderPath).deletingLastPathComponent().path
+                parentID = ensureEventID(forFolderPath: parentPath, policy: policy)
+            }
+            let event = SavedCameraEvent(
+                name: parsed.name,
+                eventDate: date,
+                storagePolicy: policy == .buffer ? nil : policy,
+                parentEventID: parentID
+            )
+            configuration.savedEvents.append(event)
+            locations.events = configuration.savedEvents
+            created += 1
+            return event.id
+        }
+
         for folder in discovered {
             let eventID: UUID
-            if let existing = folder.matchingEventID ?? configuration.savedEvents.first(where: {
-                $0.name.localizedCaseInsensitiveCompare(folder.name) == .orderedSame
-                    && EventStorageLocations.eventDateString($0.eventDate) == folder.dateString
-            })?.id {
+            locations.events = configuration.savedEvents
+            let components = relativeComponents(
+                of: URL(fileURLWithPath: folder.eventFolderPath),
+                under: locations.driveRoot(for: folder.policy)
+            )
+            if let existing = folder.matchingEventID
+                ?? configuration.savedEvents.first(where: {
+                    folderComponents(of: $0, locations: locations) == components
+                })?.id {
                 eventID = existing
+            } else if let createdID = ensureEventID(forFolderPath: folder.eventFolderPath, policy: folder.policy) {
+                // `ensureEventID` walks the folder path upward, so a nested
+                // folder also materializes any missing ancestor events.
+                eventID = createdID
             } else {
-                guard let date = formatter.date(from: folder.dateString) else { continue }
-                let event = SavedCameraEvent(
-                    name: folder.name,
-                    eventDate: date,
-                    storagePolicy: folder.policy == .buffer ? nil : folder.policy
-                )
-                configuration.savedEvents.append(event)
-                eventID = event.id
-                created += 1
+                continue
             }
             for file in folder.files {
                 configuration.photoEventAssignments.append(PhotoEventAssignment(

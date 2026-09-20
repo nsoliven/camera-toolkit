@@ -134,7 +134,9 @@ struct SetupGuidePanel: View {
         let status = guide.bufferStatus
         return VStack(alignment: .leading, spacing: 12) {
             Text("The shared Buffer is the folder on your travel drive where shared events live. Each event gets its own folder inside it. Anyone who plugs in the drive can browse it.")
-            PlaceStatusCard(title: "Shared Buffer", symbol: "externaldrive.fill", tint: .blue, status: status)
+            PlaceStatusCard(title: "Shared Buffer", symbol: "externaldrive.fill", tint: .blue, status: status) {
+                workspace.refreshConnectivity()
+            }
             ForEach(guide.bufferSuggestions, id: \.path) { suggestion in
                 Button("Use \(PlaceStatus.check(suggestion, includeFreeSpace: false).locationName)") {
                     guide.useBuffer(suggestion)
@@ -161,7 +163,9 @@ struct SetupGuidePanel: View {
                 tint: .purple,
                 status: guide.privateStatus,
                 missingNote: "Created the first time you move a private event here."
-            )
+            ) {
+                workspace.refreshConnectivity()
+            }
             Text("Finder hides this folder, but it isn’t locked. Anyone who turns on hidden files can still open it.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -180,7 +184,9 @@ struct SetupGuidePanel: View {
         let status = guide.libraryStatus
         return VStack(alignment: .leading, spacing: 12) {
             Text("The NAS library is the permanent home. Archive to NAS copies an event there and checks every file.")
-            PlaceStatusCard(title: "NAS library", symbol: "server.rack", tint: .green, status: status)
+            PlaceStatusCard(title: "NAS library", symbol: "server.rack", tint: .green, status: status) {
+                workspace.refreshConnectivity()
+            }
             if !status.isConnected {
                 Text("Your NAS isn’t connected right now. That’s fine. You can sort and use the drive today, and archive later.")
                     .font(.callout)
@@ -424,6 +430,7 @@ struct PlaceStatusCard: View {
     let tint: Color
     let status: PlaceStatus
     var missingNote: String?
+    var onRefresh: (() -> Void)?
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
@@ -435,6 +442,13 @@ struct PlaceStatusCard: View {
                     Text(title).font(.headline)
                     Spacer()
                     stateLabel
+                    if !status.isConnected, let onRefresh {
+                        Button(action: onRefresh) {
+                            Image(systemName: "arrow.clockwise")
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Check again — the drive or share may have just connected")
+                    }
                 }
                 Text(status.url.path)
                     .font(.caption.monospaced())
@@ -482,6 +496,7 @@ struct PlaceRow: View {
     let tint: Color
     let status: PlaceStatus
     let missingIsFine: Bool
+    var onRefresh: (() -> Void)?
     let change: () -> Void
 
     var body: some View {
@@ -499,6 +514,14 @@ struct PlaceRow: View {
                     .truncationMode(.middle)
             }
             Spacer(minLength: 4)
+            if !status.isConnected, let onRefresh {
+                Button(action: onRefresh) {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .buttonStyle(.borderless)
+                .font(.caption)
+                .help("Check again — the drive or share may have just connected")
+            }
             Button("Change…", action: change)
                 .buttonStyle(.borderless)
                 .font(.caption)

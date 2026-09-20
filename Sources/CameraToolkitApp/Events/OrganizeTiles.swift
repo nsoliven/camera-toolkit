@@ -17,6 +17,9 @@ enum EventPalette {
 struct EventChip: View {
     let event: SavedCameraEvent
     var number: Int?
+    /// Resolved private flag. Pass it when the event's own `storagePolicy`
+    /// can be nil — a subevent inherits the lock from a private parent.
+    var isPrivate: Bool?
 
     var body: some View {
         HStack(spacing: 4) {
@@ -26,7 +29,7 @@ struct EventChip: View {
                     .padding(.horizontal, 4)
                     .background(Color.white.opacity(0.25), in: RoundedRectangle(cornerRadius: 3))
             }
-            if event.resolvedStoragePolicy == .archiveOnly {
+            if isPrivate ?? (event.resolvedStoragePolicy == .archiveOnly) {
                 Image(systemName: "lock.fill")
                     .font(.caption2)
             }
@@ -143,9 +146,15 @@ struct StackTileView: View {
     let isSelected: Bool
     let isFocused: Bool
     let event: SavedCameraEvent?
+    /// Resolved private flag for `event` — a subevent can inherit the lock
+    /// from a private parent, so the caller resolves it.
+    var isPrivate: Bool? = nil
     let isMixed: Bool
     let isDimmed: Bool
     let badge: TileLocationBadge?
+    /// Subfolder the stack lives in, relative to the scan root — shown as a
+    /// tooltip. Nil when the stack sits directly in the scanned folder.
+    var originFolder: String? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
@@ -181,7 +190,7 @@ struct StackTileView: View {
                     Spacer(minLength: 0)
                     HStack(spacing: 4) {
                         if let event {
-                            EventChip(event: event)
+                            EventChip(event: event, isPrivate: isPrivate)
                         }
                         if isMixed {
                             Label("Mixed", systemImage: "square.split.2x1")
@@ -218,6 +227,7 @@ struct StackTileView: View {
         }
         .opacity(isDimmed ? 0.45 : 1)
         .contentShape(Rectangle())
+        .help(originFolder.map { "In \($0)" } ?? stack.coverItem.primary.name)
     }
 
     private var borderColor: Color {
@@ -295,6 +305,9 @@ struct OrganizeGrid<MenuContent: View>: View {
     let tileWidth: CGFloat
     let origin: OrganizeDragPayload.Origin
     let containerID: UUID
+    /// Scan root used to label each tile's origin subfolder; nil hides the
+    /// label (event boards have no single scan root).
+    var rootPath: String? = nil
     let daySubtitle: (OrganizeDay) -> String
     let eventForStack: (OrganizeStack) -> (event: SavedCameraEvent?, mixed: Bool)
     let isDimmed: (OrganizeStack) -> Bool
@@ -363,9 +376,14 @@ struct OrganizeGrid<MenuContent: View>: View {
             isSelected: workspace.selectedStackIDs.contains(stack.id),
             isFocused: workspace.focusedStackID == stack.id,
             event: assigned.event,
+            isPrivate: assigned.event.map { workspace.resolvedPolicy(for: $0) == .archiveOnly },
             isMixed: assigned.mixed,
             isDimmed: isDimmed(stack),
-            badge: badge(stack)
+            badge: badge(stack),
+            originFolder: OrganizeFolderLabel.subfolder(
+                forFolderPath: stack.coverItem.primary.folderPath,
+                rootPath: rootPath
+            )
         )
         .id(stack.id)
         .onTapGesture {
@@ -429,16 +447,80 @@ struct OrganizeGrid<MenuContent: View>: View {
     }
 }
 
+/// Folder labels for tiles and the burst review header: where an item
+/// physically lives relative to the scan root.
+enum OrganizeFolderLabel {
+    /// The item's folder under `rootPath` — e.g. "Transfer 3/100MSDCF" — or the
+    /// root's own name for files sitting directly in it. Falls back to the
+    /// folder's name when the item isn't under the root at all.
+    static func title(forFolderPath folderPath: String, rootPath: String?) -> String {
+        let folder = standardized(folderPath)
+        let folderName = folder.isEmpty ? folderPath : (folder as NSString).lastPathComponent
+        guard let root = standardizedRoot(rootPath) else { return folderName }
+        if let sub = subfolder(forFolderPath: folderPath, rootPath: rootPath) {
+            let rootName = (root as NSString).lastPathComponent
+            return rootName.isEmpty ? sub : "\(rootName)/\(sub)"
+        }
+        if let range = folder.range(of: root, options: [.anchored, .caseInsensitive]),
+           folder[range.upperBound...].isEmpty {
+            return (root as NSString).lastPathComponent
+        }
+        return folderName
+    }
+
+    /// Path of the item's folder below `rootPath` ("100MSDCF", "A/B"), or nil
+    /// when the item sits directly in the root or outside it.
+    static func subfolder(forFolderPath folderPath: String, rootPath: String?) -> String? {
+        guard let root = standardizedRoot(rootPath) else { return nil }
+        let folder = standardized(folderPath)
+        guard let range = folder.range(of: root, options: [.anchored, .caseInsensitive]) else { return nil }
+        let rest = folder[range.upperBound...]
+        guard !rest.isEmpty else { return nil }
+        guard rest.hasPrefix("/") else { return nil }
+        let relative = rest.dropFirst()
+        return relative.isEmpty ? nil : String(relative)
+    }
+
+    private static func standardized(_ path: String) -> String {
+        URL(fileURLWithPath: path).standardizedFileURL.path
+    }
+
+    private static func standardizedRoot(_ rootPath: String?) -> String? {
+        guard let rootPath, !rootPath.isEmpty else { return nil }
+        return standardized(rootPath)
+    }
+}
+
 /// Full-size review of one burst at a time with a filmstrip of every frame.
+/// The image area is the shared interactive canvas: click toggles zoom at the
+/// pointer, drag pans while zoomed, `+`/`-`/`0`/`⌘1` step or reset zoom, and
+/// a deeper decode swaps in once zoom passes 1.5×. Right-click offers
+/// "Move to Trash" when the board supports it.
 struct StackPreviewOverlay: View {
     let stacks: [OrganizeStack]
     @Binding var stackID: String?
     let quickEvents: [SavedCameraEvent]
+    /// Scan root used to show where each item lives ("Card/DCIM"); nil shows
+    /// just the folder name (event boards have no single scan root).
+    var rootPath: String? = nil
     let eventForStack: (OrganizeStack) -> SavedCameraEvent?
     let onAssign: (OrganizeStack, SavedCameraEvent) -> Void
+    /// Resolved private flag for chip locks — a subevent can inherit it from
+    /// a private parent, so the caller resolves it.
+    var isPrivate: (SavedCameraEvent) -> Bool = { $0.resolvedStoragePolicy == .archiveOnly }
+    /// Enables the right-click "Move to Trash" item on the frame and on each
+    /// filmstrip thumbnail. Nil hides the menu entirely.
+    var onTrashItems: (([OrganizeItem]) -> Void)? = nil
 
     @State private var frameIndex = 0
     @State private var image: CGImage?
+    /// Path of the frame a high-resolution decode was requested for — set the
+    /// moment zoom passes fit so a stale frame never triggers a fetch.
+    @State private var hiResRequestPath: String?
+    /// The decoded 4800 px frame paired with the path it belongs to.
+    @State private var hiResImage: (path: String, image: CGImage)?
+    @State private var failed = false
+    @State private var zoomCommand: PreviewZoomCommand?
     @FocusState private var isFocused: Bool
 
     private var stackIndex: Int? { stacks.firstIndex { $0.id == stackID } }
@@ -447,27 +529,50 @@ struct StackPreviewOverlay: View {
         stack.map { $0.items[min(max(frameIndex, 0), $0.items.count - 1)] }
     }
 
+    /// The frame the canvas should draw: the hi-res decode once it exists for
+    /// the current item, scaled so its layout matches the base image exactly.
+    private var displayImage: (image: CGImage, scale: CGFloat)? {
+        if let hiResImage,
+           hiResImage.path == item?.primary.path,
+           hiResImage.image.width > (image?.width ?? 0) {
+            let scale = image.map { CGFloat(hiResImage.image.width) / CGFloat($0.width) } ?? 1
+            return (hiResImage.image, scale)
+        }
+        return image.map { ($0, CGFloat(1)) }
+    }
+
+    private var hintText: String {
+        var text = "← → frames · ↑ ↓ items · click zoom · drag pan · + − 0 zoom · 1–9 sort · O open"
+        if onTrashItems != nil { text += " · right-click trash" }
+        return text + " · Esc close"
+    }
+
     var body: some View {
         ZStack {
             Color.black.opacity(0.95)
             if let stack, let item {
                 VStack(spacing: 10) {
                     header(stack: stack, item: item)
-                    ZStack {
-                        if let image {
-                            Image(decorative: image, scale: 1)
-                                .resizable()
-                                .scaledToFit()
-                        } else {
-                            ProgressView()
-                                .tint(.white)
+                    InteractivePreviewCanvas(
+                        image: displayImage?.image,
+                        isLoading: !failed,
+                        imageScale: displayImage?.scale ?? 1,
+                        unavailableTitle: "No Preview",
+                        unavailableDescription: "Camera Toolkit could not decode a preview for this file.",
+                        zoomCommand: $zoomCommand,
+                        onZoomChange: { zoom in
+                            if zoom > 1.5 {
+                                hiResRequestPath = item.primary.path
+                            }
                         }
-                    }
+                    )
+                    .id(item.primary.path)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .contextMenu { frameContextMenu(item) }
                     if stack.items.count > 1 {
                         filmstrip(stack)
                     }
-                    Text("← → frames · ↑ ↓ items · 1–9 sort into an event · O open in Photomator · Space or Esc to close")
+                    Text(hintText)
                         .font(.caption)
                         .foregroundStyle(.white.opacity(0.6))
                 }
@@ -480,7 +585,25 @@ struct StackPreviewOverlay: View {
         .onAppear { isFocused = true }
         .onKeyPress(phases: .down) { handle($0) }
         .onChange(of: stackID) { _, _ in frameIndex = 0 }
+        .onChange(of: item?.primary.path) { _, _ in
+            // New frame: release the previous hi-res decode (the NSCache still
+            // has it if the user zooms back) and stop any in-flight request.
+            hiResImage = nil
+            hiResRequestPath = nil
+        }
+        .onChange(of: stackIndex) { old, new in
+            // The current stack vanished — e.g. its remaining frames were
+            // trashed or it was moved to an event. Show whatever slid into its
+            // slot, or close when nothing is left.
+            guard new == nil, stackID != nil else { return }
+            if stacks.isEmpty {
+                stackID = nil
+            } else {
+                stackID = stacks[min(max(old ?? 0, 0), stacks.count - 1)].id
+            }
+        }
         .task(id: item?.primary.path) { await load() }
+        .task(id: hiResRequestPath) { await loadHiRes() }
     }
 
     private func header(stack: OrganizeStack, item: OrganizeItem) -> some View {
@@ -489,19 +612,19 @@ struct StackPreviewOverlay: View {
                 Text(item.primary.name)
                     .font(.headline)
                     .foregroundStyle(.white)
-                Text("\(item.captureDate.formatted(date: .abbreviated, time: .standard)) · frame \(min(frameIndex, stack.items.count - 1) + 1) of \(stack.items.count) · item \((stackIndex ?? 0) + 1) of \(stacks.count)")
+                Text("\(item.captureDate.formatted(date: .abbreviated, time: .standard)) · frame \(min(frameIndex, stack.items.count - 1) + 1) of \(stack.items.count) · item \((stackIndex ?? 0) + 1) of \(stacks.count) · \(OrganizeFolderLabel.title(forFolderPath: item.primary.folderPath, rootPath: rootPath))")
                     .font(.caption)
                     .foregroundStyle(.white.opacity(0.7))
             }
             if let event = eventForStack(stack) {
-                EventChip(event: event)
+                EventChip(event: event, isPrivate: isPrivate(event))
             }
             Spacer()
             ForEach(Array(quickEvents.enumerated()), id: \.element.id) { index, event in
                 Button {
                     assign(stack, to: event)
                 } label: {
-                    EventChip(event: event, number: index + 1)
+                    EventChip(event: event, number: index + 1, isPrivate: isPrivate(event))
                 }
                 .buttonStyle(.plain)
             }
@@ -535,6 +658,7 @@ struct StackPreviewOverlay: View {
                             }
                             .id(index)
                             .onTapGesture { frameIndex = index }
+                            .contextMenu { frameContextMenu(frame) }
                     }
                 }
             }
@@ -545,11 +669,23 @@ struct StackPreviewOverlay: View {
         }
     }
 
+    @ViewBuilder
+    private func frameContextMenu(_ item: OrganizeItem) -> some View {
+        if let onTrashItems {
+            Button("Move to Trash") {
+                onTrashItems([item])
+            }
+        }
+    }
+
     private func handle(_ press: KeyPress) -> KeyPress.Result {
+        // Close always works, even if the stack vanished under us.
+        if press.key == .escape || press.key == .space {
+            stackID = nil
+            return .handled
+        }
         guard let stack, let index = stackIndex else { return .ignored }
         switch press.key {
-        case .escape, .space:
-            stackID = nil
         case .leftArrow:
             frameIndex = max(0, frameIndex - 1)
         case .rightArrow:
@@ -559,6 +695,23 @@ struct StackPreviewOverlay: View {
         case .downArrow:
             if index + 1 < stacks.count { stackID = stacks[index + 1].id }
         default:
+            // Unmodified and Shift-modified keys only: ⌘0/⌘1 are handled by
+            // the canvas's own buttons, and ⌘O should stay free.
+            if press.modifiers.isEmpty || press.modifiers == .shift {
+                switch press.characters {
+                case "+", "=":
+                    zoomCommand = .zoomIn
+                    return .handled
+                case "-", "_":
+                    zoomCommand = .zoomOut
+                    return .handled
+                case "0":
+                    zoomCommand = .fit
+                    return .handled
+                default:
+                    break
+                }
+            }
             if press.characters.lowercased() == "o", let item {
                 PhotomatorLauncher.open(item.files.map(\.url))
                 return .handled
@@ -582,6 +735,7 @@ struct StackPreviewOverlay: View {
 
     private func load() async {
         guard let url = item?.primary.url else { return }
+        failed = false
         if let full = TileImageLoader.shared.cachedImage(for: url, maximumPixelSize: 2_400) {
             image = full
         } else {
@@ -589,6 +743,9 @@ struct StackPreviewOverlay: View {
                 ?? TileImageLoader.shared.cachedImage(for: url, maximumPixelSize: 384)
             if let full = await TileImageLoader.shared.image(for: url, maximumPixelSize: 2_400), !Task.isCancelled {
                 image = full
+            }
+            if !Task.isCancelled, image == nil {
+                failed = true
             }
         }
         guard let stack, !Task.isCancelled else { return }
@@ -598,5 +755,28 @@ struct StackPreviewOverlay: View {
                 _ = await TileImageLoader.shared.image(for: next, maximumPixelSize: 2_400)
             }
         }
+    }
+
+    /// Zooming past fit asks for the 4800 px decode of the current frame. The
+    /// swap is invisible: `displayImage` scales the bigger image to the exact
+    /// point size the base decode was shown at.
+    private func loadHiRes() async {
+        guard let path = hiResRequestPath, path == item?.primary.path else { return }
+        let url = URL(fileURLWithPath: path)
+        if let cached = TileImageLoader.shared.cachedImage(for: url, maximumPixelSize: 4_800) {
+            guard !Task.isCancelled else { return }
+            storeHiRes(cached, path: path)
+            return
+        }
+        if let loaded = await TileImageLoader.shared.image(for: url, maximumPixelSize: 4_800), !Task.isCancelled {
+            storeHiRes(loaded, path: path)
+        }
+    }
+
+    private func storeHiRes(_ loaded: CGImage, path: String) {
+        // A decode that isn't larger than what's on screen adds nothing — the
+        // source was smaller than the bucket.
+        if let image, loaded.width <= image.width { return }
+        hiResImage = (path, loaded)
     }
 }
