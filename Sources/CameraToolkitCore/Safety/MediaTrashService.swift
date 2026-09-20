@@ -195,7 +195,7 @@ public struct MediaTrashService {
     ) throws -> MediaTrashBatch {
         var seen: Set<String> = []
         let unique = files
-            .filter { seen.insert(EventStorageLocations.pathKey($0.path)).inserted }
+            .filter { seen.insert($0.pathKey).inserted }
             .sorted { $0.path < $1.path }
         guard !unique.isEmpty else {
             throw ToolkitError.commandFailed("There are no files to move to Trash.")
@@ -203,6 +203,9 @@ public struct MediaTrashService {
 
         var skipped: [MediaTrashSkip] = []
         var planned: [PlannedMove] = []
+        // `lstat` once per Trash root: every file on a volume shares the same
+        // `_Trash` folder, so the device check repeats identical syscalls.
+        var trashDevices: [URL: UInt64?] = [:]
         for file in unique {
             let source = file.url.standardizedFileURL
             guard DriveMoveService.isRegularFile(source.path) else {
@@ -217,8 +220,16 @@ public struct MediaTrashService {
             // Renames only work on one device; `deviceNumber` walks up to the
             // nearest existing ancestor, so the not-yet-created batch folder
             // still resolves to its volume.
+            let rootKey = trashRoot.standardizedFileURL
+            let trashDevice: UInt64?
+            if let cached = trashDevices[rootKey] {
+                trashDevice = cached
+            } else {
+                trashDevice = VolumeInfo.deviceNumber(for: trashRoot)
+                trashDevices[rootKey] = trashDevice
+            }
             guard let sourceDevice = VolumeInfo.deviceNumber(for: source),
-                  let trashDevice = VolumeInfo.deviceNumber(for: trashRoot),
+                  let trashDevice,
                   sourceDevice == trashDevice else {
                 skipped.append(MediaTrashSkip(path: source.path, reason: "The drive's Trash folder is on a different device. Nothing was copied."))
                 continue
@@ -279,10 +290,19 @@ public struct MediaTrashService {
 
         var movedEntries: [URL: [MediaTrashEntry]] = [:]
         var processedFiles = 0
+        // Destination parents repeat for files that lived in one folder;
+        // only mkdir each once. A failed mkdir is not remembered so a later
+        // file retries it.
+        var createdFolders: Set<String> = []
         for (folder, moves) in prepared {
+            createdFolders.insert(folder.path)
             for move in moves {
                 do {
-                    try fileManager.createDirectory(at: move.destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+                    let parent = move.destination.deletingLastPathComponent()
+                    if !createdFolders.contains(parent.path) {
+                        try fileManager.createDirectory(at: parent, withIntermediateDirectories: true)
+                        createdFolders.insert(parent.path)
+                    }
                     try DriveMoveService.renameExclusive(from: move.source.path, to: move.destination.path)
                     DriveMoveService.moveAppleDoubleIfNeeded(from: move.source.path, to: move.destination.path)
                     movedEntries[folder, default: []].append(entry(for: move, batchFolder: folder, context: context))
@@ -478,7 +498,7 @@ public struct MediaTrashService {
     }
 
     private func entry(for move: PlannedMove, batchFolder: URL, context: TrashContext) -> MediaTrashEntry {
-        let key = EventStorageLocations.pathKey(move.source.path)
+        let key = move.file.pathKey
         return MediaTrashEntry(
             trashedRelativePath: FileScanner.relativePath(for: move.destination, under: batchFolder),
             originalAbsolutePath: move.source.path,

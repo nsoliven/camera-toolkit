@@ -39,6 +39,7 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate {
         if let thumbnailShortcutMonitor {
             NSEvent.removeMonitor(thumbnailShortcutMonitor)
         }
+        model.flushConfigurationSave()
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -166,6 +167,13 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate {
             title: "Select All",
             command: .selectAll,
             keyEquivalent: "a"
+        )
+        editMenu.addItem(.separator())
+        addBrowserCommand(
+            to: editMenu,
+            title: "Find…",
+            command: .find,
+            keyEquivalent: "f"
         )
         editMenu.addItem(.separator())
         let undoSortItem = NSMenuItem(

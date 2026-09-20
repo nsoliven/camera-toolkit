@@ -119,6 +119,7 @@ final class DashboardModel {
     @ObservationIgnored private let pendingTransferQueueStore: PendingTransferQueueStore
     @ObservationIgnored let secretStore = KeychainSecretStore(service: "org.cameratoolkit.CameraToolkit")
     @ObservationIgnored private var catalogSyncTask: Task<Void, Never>?
+    @ObservationIgnored private var configurationSaveTask: Task<Void, Never>?
     @ObservationIgnored private var lastTransferQueuePersistence = Date.distantPast
     @ObservationIgnored private var lastStorageCapacityRefreshRequest = Date.distantPast
     @ObservationIgnored private var eventCopyAvailabilityTask: Task<EventCopyAvailability, Never>?
@@ -1600,6 +1601,9 @@ extension DashboardModel {
         var notes: [String] = []
 
         do {
+            // Flush first: a pending debounced save must reach disk before a
+            // reload, or the read would revert mutations made moments ago.
+            flushConfigurationSave()
             let defaults = AppConfiguration.defaults(applicationSupport: Self.defaultApplicationSupportURL)
             configuration = try configurationStore.load(defaults: defaults)
             configurationRevision &+= 1
@@ -2145,13 +2149,42 @@ extension DashboardModel {
         next.normalizeEventSelection()
         configuration = next
         configurationRevision &+= 1
+        scheduleConfigurationSave()
+        scheduleCatalogSync(configuration: next)
+    }
+
+    /// Config JSON writes are debounced so a burst of mutations (sorting,
+    /// event edits, Settings changes) costs one disk write shortly after the
+    /// last change. The write runs on the main actor, so saves stay in order;
+    /// `flushConfigurationSave()` forces a synchronous write on termination.
+    private func scheduleConfigurationSave() {
+        configurationSaveTask?.cancel()
+        configurationSaveTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(for: .milliseconds(250))
+            } catch {
+                return
+            }
+            self?.saveConfigurationNow()
+        }
+    }
+
+    /// Writes the current configuration synchronously, cancelling any pending
+    /// debounced save. Called from `applicationWillTerminate` so the last
+    /// mutations of a session always reach disk.
+    func flushConfigurationSave() {
+        configurationSaveTask?.cancel()
+        configurationSaveTask = nil
+        saveConfigurationNow()
+    }
+
+    private func saveConfigurationNow() {
         do {
-            try configurationStore.save(next)
+            try configurationStore.save(configuration)
             configMessage = "Config saved at \(Self.defaultConfigurationURL.path)."
         } catch {
             configMessage = "Could not save config: \(error.localizedDescription)"
         }
-        scheduleCatalogSync(configuration: next)
     }
 
     private func scheduleCatalogSync(configuration: AppConfiguration) {

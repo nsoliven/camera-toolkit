@@ -262,6 +262,44 @@ final class OrganizeStorageTests: XCTestCase {
         XCTAssertEqual(roundTrip.savedEvents.first?.resolvedStoragePolicy, .archiveOnly)
         XCTAssertEqual(roundTrip.privateStagingPath, "/Volumes/Drive/Vault")
     }
+
+    /// `OrganizeFile` caches `pathKey` at construction so lookup loops do not
+    /// re-standardize; the cached key must always equal the canonical
+    /// lowercased standardized path, including inputs that still need URL
+    /// standardization or symlink resolution.
+    func testOrganizeFilePathKeyMatchesCanonicalKey() {
+        let inputs = [
+            "/Volumes/Card/DCIM/100MSDCF/DSC00001.ARW",
+            "/Volumes/Card/DCIM/100MSDCF/",
+            "/Volumes/Card//DCIM",
+            "/Volumes/Card/./DCIM",
+            "/Volumes/Card/DCIM/../100MSDCF",
+            "/Volumes/Café Caméra/DSC 0001.JPG",
+            "/tmp/UNICODE-åäö/文件.ARW",
+        ]
+        for input in inputs {
+            let file = OrganizeFile(path: input, size: 1, modifiedAt: .distantPast)
+            XCTAssertEqual(
+                file.pathKey,
+                EventStorageLocations.pathKey(input),
+                "cached pathKey diverged for \(input.debugDescription)"
+            )
+        }
+        // A path through a symlinked ancestor resolves identically on both
+        // sides ("/var" → "/private/var" on macOS).
+        let symlinked = "/var/tmp/Camera Toolkit PathKey Check"
+        let file = OrganizeFile(path: symlinked, size: 1, modifiedAt: .distantPast)
+        XCTAssertEqual(file.pathKey, EventStorageLocations.pathKey(symlinked))
+
+        // Mutating the path refreshes the cached key.
+        var moved = OrganizeFile(path: "/Volumes/Card/A/DSC1.ARW", size: 1, modifiedAt: .distantPast)
+        moved.path = "/Volumes/Card/B/DSC1.ARW"
+        XCTAssertEqual(moved.pathKey, EventStorageLocations.pathKey("/Volumes/Card/B/DSC1.ARW"))
+        XCTAssertEqual(
+            OrganizeFile(path: "/Volumes/CARD/DCIM/DSC00001.ARW", size: 1, modifiedAt: .distantPast).pathKey,
+            OrganizeFile(path: "/Volumes/Card/DCIM/DSC00001.ARW", size: 1, modifiedAt: .distantPast).pathKey
+        )
+    }
 }
 
 extension DateFormatter {

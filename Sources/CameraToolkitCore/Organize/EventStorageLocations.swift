@@ -61,7 +61,12 @@ public struct EventStorageLocations: Sendable {
     public var libraryRoot: URL
     public var fallbackDeviceID: String
     /// Known events, so subevent paths resolve through their parent chain.
-    public var events: [SavedCameraEvent]
+    public var events: [SavedCameraEvent] {
+        didSet { eventsByID = EventHierarchy.index(events) }
+    }
+    /// Shared event index for the hierarchy lookups below, built once per
+    /// event list instead of once per ancestor/policy/name call.
+    private var eventsByID: [UUID: SavedCameraEvent]
 
     public static let toolkitFolderName = ".Camera Toolkit"
 
@@ -81,6 +86,7 @@ public struct EventStorageLocations: Sendable {
         ).standardizedFileURL
         fallbackDeviceID = configuration.selectedDeviceID
         events = configuration.savedEvents
+        eventsByID = EventHierarchy.index(configuration.savedEvents)
     }
 
     /// `/Volumes/Drive/.Camera Toolkit` for a Buffer on an external drive,
@@ -104,18 +110,18 @@ public struct EventStorageLocations: Sendable {
     /// Ancestors of `event`, root first. Unknown or looping parent links end
     /// the chain, so such an event resolves like a top-level one.
     public func ancestors(of event: SavedCameraEvent) -> [SavedCameraEvent] {
-        EventHierarchy.ancestors(of: event, in: events)
+        EventHierarchy.ancestors(of: event, byID: eventsByID)
     }
 
     /// The event's effective storage policy: its own, else the nearest
     /// ancestor's, else `.buffer`.
     public func resolvedPolicy(for event: SavedCameraEvent) -> EventStoragePolicy {
-        EventHierarchy.resolvedPolicy(of: event, in: events)
+        EventHierarchy.resolvedPolicy(of: event, byID: eventsByID)
     }
 
     /// "Parent / Child" breadcrumb for titles, menus, and plan summaries.
     public func displayName(for event: SavedCameraEvent) -> String {
-        EventHierarchy.displayName(of: event, in: events)
+        EventHierarchy.displayName(of: event, byID: eventsByID)
     }
 
     public func layout(for event: SavedCameraEvent, deviceID: String?) -> OrganizedArchiveLayout {
@@ -178,7 +184,10 @@ public struct EventStorageLocations: Sendable {
     }
 
     /// Lower-cased standardized absolute path used to match files to
-    /// assignments on case-insensitive camera drives.
+    /// assignments on case-insensitive camera drives. Standardization resolves
+    /// symlinked ancestors (`/var` → `/private/var`), so there is no cheaper
+    /// string-only equivalent — hot loops use `OrganizeFile.pathKey`, which
+    /// computes this once per file.
     public static func pathKey(_ path: String) -> String {
         URL(fileURLWithPath: path).standardizedFileURL.path.lowercased()
     }
@@ -214,7 +223,7 @@ public enum OrganizeAssignmentBuilder {
 
         return files.map { file in
             let lowered = file.name.lowercased()
-            let ownKey = EventStorageLocations.pathKey(file.path)
+            let ownKey = file.pathKey
             let collidesInEvent = eventNames[lowered].map { !$0.subtracting([ownKey]).isEmpty } ?? false
             let needsLongIdentity = duplicateNames.contains(lowered) || (batchNames[lowered] ?? 0) > 1 || collidesInEvent
             let sourceRoot: String

@@ -412,6 +412,62 @@ final class EventsWorkspaceTests: XCTestCase {
         }
     }
 
+    func testSearchFiltersSidebarRowsLocationsAndVisibleDays() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let unsorted = root.appendingPathComponent("Drive/Unsorted A7V", isDirectory: true)
+            try writeOrganizerARW(unsorted.appendingPathComponent("Transfer 1/B0001_DSC00001.ARW"), "2026:08:26 10:00:00", "100")
+            try writeOrganizerARW(unsorted.appendingPathComponent("Transfer 1/B0001_DSC00002.ARW"), "2026:08:26 10:00:00", "400")
+            try writeOrganizerARW(unsorted.appendingPathComponent("Extra/DSC00009.ARW"), "2026:08:26 11:00:00", "000")
+            let location = addUnsorted(unsorted, to: model)
+            workspace.scan(location)
+            try await waitUntil { workspace.sources[location.id]?.result != nil }
+            let result = try XCTUnwrap(workspace.sources[location.id]?.result)
+            let burst = try XCTUnwrap(result.stacks.first { $0.isBurst })
+            let single = try XCTUnwrap(result.stacks.first { $0.coverItem.primary.name == "DSC00009.ARW" })
+
+            let parent = try XCTUnwrap(workspace.createEvent(name: "PHIL2026", date: organizerDay("2026-08-21"), policy: .buffer))
+            let child = try XCTUnwrap(workspace.createEvent(name: "Matcha", date: organizerDay("2026-08-23"), policy: nil, parentEventID: parent))
+            let other = try XCTUnwrap(workspace.createEvent(name: "Other Trip", date: organizerDay("2026-08-21"), policy: .buffer))
+
+            // Sidebar events: a parent-name hit reveals the subevent row too;
+            // a child-name hit keeps only the matching child.
+            XCTAssertEqual(Set(workspace.sidebarRows(matching: "phil").map(\.event.id)), [parent, child])
+            XCTAssertEqual(workspace.sidebarRows(matching: "matcha").map(\.event.id), [child])
+            XCTAssertEqual(Set(workspace.sidebarRows(matching: "").map(\.event.id)), [parent, child, other])
+
+            // Unsorted locations match on name or path.
+            XCTAssertEqual(workspace.unsortedLocations(matching: "unsorted a7v").map(\.id), [location.id])
+            XCTAssertEqual(workspace.unsortedLocations(matching: unsorted.path).map(\.id), [location.id])
+            XCTAssertTrue(workspace.unsortedLocations(matching: "nowhere").isEmpty)
+
+            // Board days match file name, burst label, and origin subfolder.
+            XCTAssertEqual(workspace.visibleDays(result, hideSorted: false, matching: "dsc00009").flatMap(\.stacks).map(\.id), [single.id])
+            XCTAssertEqual(workspace.visibleDays(result, hideSorted: false, matching: "b0001").flatMap(\.stacks).map(\.id), [burst.id])
+            XCTAssertEqual(workspace.visibleDays(result, hideSorted: false, matching: "extra").flatMap(\.stacks).map(\.id), [single.id])
+            XCTAssertEqual(workspace.visibleDays(result, hideSorted: false, matching: "zzz").flatMap(\.stacks).count, 0)
+
+            // The assigned event's breadcrumb title matches — the parent's
+            // name still finds a stack sorted into the subevent.
+            workspace.assign(stackIDs: [burst.id], from: location.id, to: child)
+            XCTAssertEqual(workspace.visibleDays(result, hideSorted: false, matching: "matcha").flatMap(\.stacks).map(\.id), [burst.id])
+            XCTAssertEqual(workspace.visibleDays(result, hideSorted: false, matching: "phil").flatMap(\.stacks).map(\.id), [burst.id])
+
+            // hideSorted composes with the query: a sorted stack matching the
+            // query is still hidden, an unsorted match stays.
+            XCTAssertTrue(workspace.visibleDays(result, hideSorted: true, matching: "b0001").isEmpty)
+            XCTAssertEqual(workspace.visibleDays(result, hideSorted: true, matching: "dsc00009").flatMap(\.stacks).map(\.id), [single.id])
+
+            // Discovered drive events filter by name for the banner.
+            let cardCopy = root.appendingPathComponent("Drive/Camera Buffer/2026/2026-08-26 Found Day/Sony A7V/Card Copy", isDirectory: true)
+            try writeOrganizerARW(cardCopy.appendingPathComponent("DSC00050.ARW"), "2026:08:26 12:00:00", "000")
+            workspace.discoverDriveEvents()
+            try await waitUntil { !workspace.discoveredDriveEvents.isEmpty }
+            XCTAssertEqual(workspace.discoveredDriveEvents(matching: "found day").count, 1)
+            XCTAssertEqual(workspace.discoveredDriveEvents(matching: "").count, workspace.discoveredDriveEvents.count)
+            XCTAssertTrue(workspace.discoveredDriveEvents(matching: "zzz").isEmpty)
+        }
+    }
+
     // MARK: - Helpers
 
     private func withOrganizerSandbox(

@@ -203,6 +203,16 @@ final class EventsWorkspace {
     @ObservationIgnored private var refreshGenerations: [UUID: UUID] = [:]
     @ObservationIgnored private var loadedCaptureDateCache: CaptureDateCache?
     @ObservationIgnored private var lastConnectivityRefresh = Date.distantPast
+    @ObservationIgnored private var connectivityRefreshTask: Task<Void, Never>?
+    /// Standardized paths of volumes that mounted during the pending
+    /// debounce window; the coalesced refresh still rescans their sources.
+    @ObservationIgnored private var pendingMountedVolumes: Set<URL> = []
+    /// Mounted-volume set for `isConnected`, rebuilt once per connectivity
+    /// revision instead of once per sidebar row.
+    @ObservationIgnored private var mountedVolumesCache: (revision: Int, paths: Set<String>)?
+    /// Storage-location resolver reused within one configuration revision so
+    /// event hierarchy lookups share its index.
+    @ObservationIgnored private var locationsCache: (revision: Int, locations: EventStorageLocations)?
     @ObservationIgnored private let mountObservers = MountObserverBox()
 
     /// Holds move journals and the capture-time cache.
@@ -238,7 +248,12 @@ final class EventsWorkspace {
     }
 
     var locations: EventStorageLocations {
-        EventStorageLocations(configuration: model.configuration)
+        if let cached = locationsCache, cached.revision == model.configurationRevision {
+            return cached.locations
+        }
+        let built = EventStorageLocations(configuration: model.configuration)
+        locationsCache = (model.configurationRevision, built)
+        return built
     }
 
     var unsortedLocations: [ConfiguredLocation] {
@@ -254,6 +269,36 @@ final class EventsWorkspace {
     /// links surface as top-level rows instead of disappearing.
     var sidebarEvents: [(event: SavedCameraEvent, depth: Int)] {
         EventHierarchy.flattened(model.configuration.savedEvents)
+    }
+
+    // MARK: - Search
+
+    /// Sidebar rows matching the search query. Matching runs on each event's
+    /// breadcrumb title, so a hit on a parent's name still reveals its
+    /// subevents ("phil" shows PHIL2026 / Matcha). Empty query returns all.
+    func sidebarRows(matching query: String) -> [(event: SavedCameraEvent, depth: Int)] {
+        let needle = OrganizeSearch.needle(query)
+        guard !needle.isEmpty else { return sidebarEvents }
+        return sidebarEvents.filter { OrganizeSearch.matches(eventTitle($0.event), needle: needle) }
+    }
+
+    /// Unsorted sidebar locations matching the search query on name or path.
+    func unsortedLocations(matching query: String) -> [ConfiguredLocation] {
+        let needle = OrganizeSearch.needle(query)
+        guard !needle.isEmpty else { return unsortedLocations }
+        return unsortedLocations.filter { location in
+            OrganizeSearch.matches(location.name, needle: needle)
+                || OrganizeSearch.matches(location.path, needle: needle)
+                || OrganizeSearch.matches(DashboardModel.expandedPath(location.path), needle: needle)
+        }
+    }
+
+    /// Discovered drive events matching the search query on name, for the
+    /// "Found on Your Drive" banner while it is showing.
+    func discoveredDriveEvents(matching query: String) -> [DiscoveredDriveEvent] {
+        let needle = OrganizeSearch.needle(query)
+        guard !needle.isEmpty else { return discoveredDriveEvents }
+        return discoveredDriveEvents.filter { OrganizeSearch.matches($0.name, needle: needle) }
     }
 
     /// "Parent / Child" title for menus, headers, and plan rows.
@@ -316,7 +361,18 @@ final class EventsWorkspace {
         // `refreshConnectivity()` bumps `connectivityRevision`.
         _ = connectivityRevision
         let url = URL(fileURLWithPath: DashboardModel.expandedPath(location.path), isDirectory: true)
-        return VolumeInfo.isAvailable(url) && FileManager.default.fileExists(atPath: url.path)
+        return VolumeInfo.isAvailable(url, mountedVolumes: mountedVolumePaths()) && FileManager.default.fileExists(atPath: url.path)
+    }
+
+    /// The mounted volume set, read once per connectivity revision instead of
+    /// once per `isConnected` call in a sidebar render.
+    private func mountedVolumePaths() -> Set<String> {
+        if let cached = mountedVolumesCache, cached.revision == connectivityRevision {
+            return cached.paths
+        }
+        let paths = VolumeInfo.mountedVolumePaths()
+        mountedVolumesCache = (connectivityRevision, paths)
+        return paths
     }
 
     static func sourceKey(_ assignment: PhotoEventAssignment) -> String {
@@ -346,7 +402,7 @@ final class EventsWorkspace {
 
     func assignment(for file: OrganizeFile) -> PhotoEventAssignment? {
         refreshIndexIfNeeded()
-        guard let assignment = assignmentsByPathKey[EventStorageLocations.pathKey(file.path)],
+        guard let assignment = assignmentsByPathKey[file.pathKey],
               assignment.fileSize == file.size else { return nil }
         return assignment
     }
@@ -381,10 +437,24 @@ final class EventsWorkspace {
         stack.items.allSatisfy { assignment(for: $0.primary) != nil }
     }
 
-    func visibleDays(_ result: OrganizeScanResult, hideSorted: Bool) -> [OrganizeDay] {
-        guard hideSorted else { return result.days }
+    /// The days a board should show: `hideSorted` drops fully assigned stacks
+    /// and a non-empty `query` keeps only stacks matching file name, burst
+    /// label, origin subfolder, or assigned event title. Days that lose every
+    /// stack drop out entirely.
+    func visibleDays(_ result: OrganizeScanResult, hideSorted: Bool, matching query: String = "") -> [OrganizeDay] {
+        let needle = OrganizeSearch.needle(query)
+        guard hideSorted || !needle.isEmpty else { return result.days }
         return result.days.compactMap { day in
-            let stacks = day.stacks.filter { !isSorted($0) }
+            let stacks = day.stacks.filter { stack in
+                if hideSorted, isSorted(stack) { return false }
+                guard !needle.isEmpty else { return true }
+                return OrganizeSearch.matches(
+                    stack: stack,
+                    needle: needle,
+                    rootPath: result.rootPath,
+                    eventTitle: assignedEvent(for: stack).event.map { eventTitle($0) }
+                )
+            }
             return stacks.isEmpty ? nil : OrganizeDay(id: day.id, date: day.date, stacks: stacks)
         }
     }
@@ -413,12 +483,12 @@ final class EventsWorkspace {
 
     func assets(for stack: OrganizeStack, in eventID: UUID) -> [EventAssetPresence] {
         let index = eventAssetsByPathKey[eventID] ?? [:]
-        return stack.files.compactMap { index[EventStorageLocations.pathKey($0.path)] }
+        return stack.files.compactMap { index[$0.pathKey] }
     }
 
     func badge(for stack: OrganizeStack, in eventID: UUID) -> TileLocationBadge? {
         guard let event = event(eventID),
-              let asset = eventAssetsByPathKey[eventID]?[EventStorageLocations.pathKey(stack.coverItem.primary.path)] else {
+              let asset = eventAssetsByPathKey[eventID]?[stack.coverItem.primary.pathKey] else {
             return nil
         }
         if asset.drive == .present { return nil }
@@ -598,13 +668,14 @@ final class EventsWorkspace {
     /// table and folder stat probes only, never a file-content scan. Cached
     /// event presence and drive-event discovery are refreshed so Offline
     /// badges clear, and unsorted sources that failed while offline scan again
-    /// once they are reachable. When `mountedVolume` is set (that volume just
-    /// mounted), sources on it are scanned even if they were never tried.
+    /// once they are reachable. When `mountedVolumes` is non-empty (those
+    /// volumes just mounted), sources on them are scanned even if they were
+    /// never tried.
     ///
     /// Refresh never mounts anything itself: the configuration stores local
     /// paths and service URLs, not network share URLs, so there is no share
     /// URL to hand to the mounter.
-    func refreshConnectivity(mountedVolume: URL? = nil) {
+    func refreshConnectivity(mountedVolumes: Set<URL> = []) {
         connectivityRevision &+= 1
         lastConnectivityRefresh = Date()
 
@@ -613,15 +684,16 @@ final class EventsWorkspace {
             Task { await refreshEvent(eventID) }
         }
 
-        let mountedRoot = mountedVolume?.standardizedFileURL
+        let mountedRoots = Set(mountedVolumes.map { $0.standardizedFileURL.path })
         for location in unsortedLocations {
             let state = sources[location.id]
             // Healthy cached results are never rescanned here.
             guard state?.isScanning != true, state?.result == nil else { continue }
             guard isConnected(location) else { continue }
-            if let mountedRoot {
+            if !mountedRoots.isEmpty {
                 let locationURL = URL(fileURLWithPath: DashboardModel.expandedPath(location.path), isDirectory: true)
-                guard VolumeInfo.volumeRoot(for: locationURL) == mountedRoot else { continue }
+                guard let volumeRoot = VolumeInfo.volumeRoot(for: locationURL),
+                      mountedRoots.contains(volumeRoot.path) else { continue }
             } else if state == nil {
                 // A global refresh only retries sources that failed before.
                 // Fresh sources scan when selected or when their volume mounts.
@@ -641,7 +713,9 @@ final class EventsWorkspace {
 
     /// Registers once for volume mount/unmount notifications so offline rows,
     /// presence summaries, and failed scans update themselves when a drive or
-    /// card appears or disappears. Safe to call repeatedly.
+    /// card appears or disappears. Notifications are debounced, so a burst of
+    /// mount/unmount events (a flapping hub) collapses into one refresh pass.
+    /// Safe to call repeatedly.
     func observeVolumeChanges() {
         guard mountObservers.observers.isEmpty else { return }
         let center = NSWorkspace.shared.notificationCenter
@@ -649,15 +723,37 @@ final class EventsWorkspace {
             center.addObserver(forName: NSWorkspace.didMountNotification, object: nil, queue: nil) { [weak self] notification in
                 let url = notification.userInfo?[NSWorkspace.volumeURLUserInfoKey] as? URL
                 Task { @MainActor [weak self] in
-                    self?.refreshConnectivity(mountedVolume: url)
+                    self?.scheduleConnectivityRefresh(mountedVolume: url)
                 }
             },
             center.addObserver(forName: NSWorkspace.didUnmountNotification, object: nil, queue: nil) { [weak self] _ in
                 Task { @MainActor [weak self] in
-                    self?.refreshConnectivity()
+                    self?.scheduleConnectivityRefresh()
                 }
             },
         ]
+    }
+
+    /// Trailing-edge debounce for mount notifications: a burst coalesces into
+    /// a single `refreshConnectivity` about 0.75 s after the last event.
+    /// Volumes reported during the window are remembered so sources on a
+    /// just-mounted volume still rescan once.
+    private func scheduleConnectivityRefresh(mountedVolume: URL? = nil) {
+        if let mountedVolume {
+            pendingMountedVolumes.insert(mountedVolume.standardizedFileURL)
+        }
+        connectivityRefreshTask?.cancel()
+        connectivityRefreshTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(for: .milliseconds(750))
+            } catch {
+                return
+            }
+            guard let self, !Task.isCancelled else { return }
+            let mounted = self.pendingMountedVolumes
+            self.pendingMountedVolumes = []
+            self.refreshConnectivity(mountedVolumes: mounted)
+        }
     }
 
     // MARK: - Sorting
@@ -674,17 +770,17 @@ final class EventsWorkspace {
         }
         refreshIndexIfNeeded()
         let locations = self.locations
-        let keys = Set(files.map { EventStorageLocations.pathKey($0.path) })
+        let keys = Set(files.map(\.pathKey))
         let previous = keys.compactMap { assignmentsByPathKey[$0] }
         let blockedKeys = Set(previous.filter { prior in
             prior.eventID != eventID && hasDriveCopy(prior, locations: locations)
         }.map(Self.sourceKey))
-        let eligible = files.filter { !blockedKeys.contains(EventStorageLocations.pathKey($0.path)) }
+        let eligible = files.filter { !blockedKeys.contains($0.pathKey) }
         guard !eligible.isEmpty else {
             model.statusMessage = "Those files already have a copy in another event's folder. Open that event to move them."
             return
         }
-        let eligibleKeys = Set(eligible.map { EventStorageLocations.pathKey($0.path) })
+        let eligibleKeys = Set(eligible.map(\.pathKey))
         let existingInEvent = model.configuration.photoEventAssignments.filter {
             $0.eventID == eventID && !eligibleKeys.contains(Self.sourceKey($0))
         }
@@ -721,7 +817,7 @@ final class EventsWorkspace {
         let files = result.stacks.filter { stackIDs.contains($0.id) }.flatMap(\.files)
         refreshIndexIfNeeded()
         let locations = self.locations
-        let previous = Set(files.map { EventStorageLocations.pathKey($0.path) }).compactMap { assignmentsByPathKey[$0] }
+        let previous = Set(files.map(\.pathKey)).compactMap { assignmentsByPathKey[$0] }
         let removable = previous.filter { !hasDriveCopy($0, locations: locations) }
         guard !removable.isEmpty else {
             model.statusMessage = previous.isEmpty
@@ -1716,7 +1812,7 @@ final class EventsWorkspace {
         var eventIDs: [String: UUID] = [:]
         var removedAssignments: [PhotoEventAssignment] = []
         for file in files {
-            let key = EventStorageLocations.pathKey(file.path)
+            let key = file.pathKey
             if let assignment = assignmentsByPathKey[key] {
                 eventIDs[key] = assignment.eventID
                 removedAssignments.append(assignment)

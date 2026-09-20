@@ -2429,6 +2429,9 @@ struct PhotoBrowserView: View {
                 return
             }
             showDriveInformation(location)
+        case .find:
+            // The file browser has no search field; Events boards handle it.
+            break
         }
     }
 

@@ -39,9 +39,9 @@ public struct OrganizeScanResult: Sendable {
         guard !keys.isEmpty else { return self }
         var copy = self
         copy.items = items.compactMap { item in
-            if keys.contains(EventStorageLocations.pathKey(item.primary.path)) { return nil }
+            if keys.contains(item.primary.pathKey) { return nil }
             var kept = item
-            kept.companions.removeAll { keys.contains(EventStorageLocations.pathKey($0.path)) }
+            kept.companions.removeAll { keys.contains($0.pathKey) }
             return kept
         }
         let surviving = Set(copy.items.map(\.primary.path))
