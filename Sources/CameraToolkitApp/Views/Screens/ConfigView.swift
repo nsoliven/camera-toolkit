@@ -435,7 +435,7 @@ private struct EmptyRemovedFilesRow: View {
             HStack {
                 TextField("Type DELETE to empty permanently", text: $confirmation)
                     .frame(maxWidth: 260)
-                Button("Empty Taken-Off Files", role: .destructive, action: emptyRemovedFiles)
+                Button("Empty Trash", role: .destructive, action: emptyRemovedFiles)
                     .disabled(confirmation != FreeUpService.confirmationToken || model.isBusy)
             }
             if let message {
@@ -446,18 +446,47 @@ private struct EmptyRemovedFilesRow: View {
         }
     }
 
+    /// Empties every `_Trash` root the Trash section lists — the configured
+    /// removed-files folder plus each configured volume's Trash — off the
+    /// main thread. A root that fails keeps its batches and is reported.
     private func emptyRemovedFiles() {
-        let root = EventStorageLocations(configuration: model.configuration).removedFilesRoot
-        do {
-            let result = try FreeUpService().emptyTrash(trashRoot: root, confirm: confirmation)
-            message = result.deletedBatches.isEmpty
-                ? "There was nothing to empty."
-                : "Permanently deleted \(result.deletedBatches.count) batch(es), freeing \(result.freedBytes.formattedBytes)."
-        } catch {
-            message = error.localizedDescription
-        }
-        confirmation = ""
-        NotificationCenter.default.post(name: .cameraToolkitMediaTrashChanged, object: nil)
+        let roots = trashRoots(configuration: model.configuration)
+        let token = confirmation
+        model.runBackgroundJob(
+            action: .freeUp,
+            runningNote: "Emptying Trash folders",
+            logTitle: "Emptied Trash",
+            logDetail: "Permanently removed _Trash batches under every configured Trash root after the DELETE confirmation.",
+            operation: { _ in
+                let service = FreeUpService()
+                var deleted: [String] = []
+                var freed: Int64 = 0
+                var failures: [String] = []
+                for root in roots {
+                    do {
+                        let result = try service.emptyTrash(trashRoot: root, confirm: token)
+                        deleted.append(contentsOf: result.deletedBatches)
+                        freed += result.freedBytes
+                    } catch {
+                        failures.append("\(root.lastPathComponent): \(error.localizedDescription)")
+                    }
+                }
+                return (deleted, freed, failures)
+            },
+            completion: { outcome in
+                var parts = [
+                    outcome.0.isEmpty
+                        ? (outcome.2.isEmpty ? "There was nothing to empty." : "Nothing was deleted.")
+                        : "Permanently deleted \(outcome.0.count) batch(es), freeing \(outcome.1.formattedBytes)."
+                ]
+                parts.append(contentsOf: outcome.2)
+                let summary = parts.joined(separator: " ")
+                message = summary
+                confirmation = ""
+                NotificationCenter.default.post(name: .cameraToolkitMediaTrashChanged, object: nil)
+                return summary
+            }
+        )
     }
 }
 
@@ -520,30 +549,6 @@ private struct TrashBatchesView: View {
         }
     }
 
-    /// `_Trash` roots to look under: the configured removed-files folder plus
-    /// `.Camera Toolkit/_Trash` on the volume of every configured location.
-    private func trashRoots() -> [URL] {
-        let locations = EventStorageLocations(configuration: model.configuration)
-        var roots = [locations.removedFilesRoot]
-        var seen = Set(roots.map { EventStorageLocations.pathKey($0.path) })
-        var paths = model.configuration.configuredLocations.map(\.path)
-        paths.append(model.configuration.bufferPath)
-        paths.append(model.configuration.privateStagingPath)
-        paths.append(model.configuration.cameraLibraryRootPath)
-        for path in paths {
-            let url = URL(fileURLWithPath: NSString(string: path).expandingTildeInPath, isDirectory: true)
-                .standardizedFileURL
-            guard let volume = VolumeInfo.volumeRoot(for: url) else { continue }
-            let root = volume
-                .appendingPathComponent(EventStorageLocations.toolkitFolderName, isDirectory: true)
-                .appendingPathComponent("_Trash", isDirectory: true)
-            if seen.insert(EventStorageLocations.pathKey(root.path)).inserted {
-                roots.append(root)
-            }
-        }
-        return roots
-    }
-
     private func whereabouts(_ batch: MediaTrashBatch) -> String {
         let places = batch.segments.map { segment -> String in
             if let volume = VolumeInfo.volumeRoot(for: segment.folder) {
@@ -560,7 +565,7 @@ private struct TrashBatchesView: View {
     }
 
     private func reload() {
-        let roots = trashRoots()
+        let roots = trashRoots(configuration: model.configuration)
         let fallback = EventStorageLocations(configuration: model.configuration).removedFilesRoot
         Task { @MainActor in
             let found = await Task.detached(priority: .utility) {
@@ -601,4 +606,29 @@ private struct TrashBatchesView: View {
             }
         )
     }
+}
+
+/// `_Trash` roots shown in Settings' Trash section: the configured
+/// removed-files folder plus `.Camera Toolkit/_Trash` on the volume of every
+/// configured location. Listing and emptying share this scope.
+private func trashRoots(configuration: AppConfiguration) -> [URL] {
+    let locations = EventStorageLocations(configuration: configuration)
+    var roots = [locations.removedFilesRoot]
+    var seen = Set(roots.map { EventStorageLocations.pathKey($0.path) })
+    var paths = configuration.configuredLocations.map(\.path)
+    paths.append(configuration.bufferPath)
+    paths.append(configuration.privateStagingPath)
+    paths.append(configuration.cameraLibraryRootPath)
+    for path in paths {
+        let url = URL(fileURLWithPath: NSString(string: path).expandingTildeInPath, isDirectory: true)
+            .standardizedFileURL
+        guard let volume = VolumeInfo.volumeRoot(for: url) else { continue }
+        let root = volume
+            .appendingPathComponent(EventStorageLocations.toolkitFolderName, isDirectory: true)
+            .appendingPathComponent("_Trash", isDirectory: true)
+        if seen.insert(EventStorageLocations.pathKey(root.path)).inserted {
+            roots.append(root)
+        }
+    }
+    return roots
 }

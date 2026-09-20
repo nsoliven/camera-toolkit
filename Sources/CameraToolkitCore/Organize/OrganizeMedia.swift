@@ -160,14 +160,33 @@ public enum OrganizeFileClassifier {
 
 public struct OrganizeFile: Codable, Hashable, Sendable {
     /// Absolute, standardized path.
-    public var path: String
+    public var path: String {
+        didSet { pathKey = EventStorageLocations.pathKey(path) }
+    }
     public var size: Int64
     public var modifiedAt: Date
+    /// `EventStorageLocations.pathKey(path)`, computed once here instead of
+    /// re-standardizing inside every lookup loop.
+    public private(set) var pathKey: String
 
     public init(path: String, size: Int64, modifiedAt: Date) {
         self.path = path
         self.size = size
         self.modifiedAt = modifiedAt
+        pathKey = EventStorageLocations.pathKey(path)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case path, size, modifiedAt
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            path: try container.decode(String.self, forKey: .path),
+            size: try container.decode(Int64.self, forKey: .size),
+            modifiedAt: try container.decode(Date.self, forKey: .modifiedAt)
+        )
     }
 
     public var url: URL { URL(fileURLWithPath: path) }

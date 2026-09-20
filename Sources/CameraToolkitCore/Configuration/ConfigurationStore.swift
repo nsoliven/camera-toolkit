@@ -508,7 +508,11 @@ public struct SavedCameraEvent: Identifiable, Codable, Equatable, Hashable, Send
 /// ancestor chain. A missing parent or a link loop ends the chain — the
 /// event then behaves as top-level instead of trapping callers in a cycle.
 public enum EventHierarchy {
-    private static func index(_ events: [SavedCameraEvent]) -> [UUID: SavedCameraEvent] {
+    /// ID → event lookup. Callers evaluating many events against the same
+    /// array (flattened, descendants, `EventStorageLocations`) build it once
+    /// and share it through the `byID` overloads instead of rebuilding per
+    /// event.
+    static func index(_ events: [SavedCameraEvent]) -> [UUID: SavedCameraEvent] {
         var byID: [UUID: SavedCameraEvent] = [:]
         for event in events where byID[event.id] == nil { byID[event.id] = event }
         return byID
@@ -516,7 +520,10 @@ public enum EventHierarchy {
 
     /// Ancestors of `event`, root first. Stops at a missing parent or a cycle.
     public static func ancestors(of event: SavedCameraEvent, in events: [SavedCameraEvent]) -> [SavedCameraEvent] {
-        let byID = index(events)
+        ancestors(of: event, byID: index(events))
+    }
+
+    static func ancestors(of event: SavedCameraEvent, byID: [UUID: SavedCameraEvent]) -> [SavedCameraEvent] {
         var chain: [SavedCameraEvent] = []
         var seen: Set<UUID> = [event.id]
         var current = event
@@ -531,13 +538,20 @@ public enum EventHierarchy {
 
     /// `event` with its ancestors, root first.
     public static func chain(of event: SavedCameraEvent, in events: [SavedCameraEvent]) -> [SavedCameraEvent] {
-        ancestors(of: event, in: events) + [event]
+        chain(of: event, byID: index(events))
+    }
+
+    static func chain(of event: SavedCameraEvent, byID: [UUID: SavedCameraEvent]) -> [SavedCameraEvent] {
+        ancestors(of: event, byID: byID) + [event]
     }
 
     /// The first explicit storage policy walking up from `event`; `.buffer`
     /// when the whole chain leaves it unset.
     public static func resolvedPolicy(of event: SavedCameraEvent, in events: [SavedCameraEvent]) -> EventStoragePolicy {
-        let byID = index(events)
+        resolvedPolicy(of: event, byID: index(events))
+    }
+
+    static func resolvedPolicy(of event: SavedCameraEvent, byID: [UUID: SavedCameraEvent]) -> EventStoragePolicy {
         var seen: Set<UUID> = [event.id]
         var current = event
         while true {
@@ -553,14 +567,19 @@ public enum EventHierarchy {
     /// depth. Used to keep a parent picker from offering a descendant and to
     /// rewrite every assignment a rename moves on disk.
     public static func descendants(of eventID: UUID, in events: [SavedCameraEvent]) -> [SavedCameraEvent] {
-        events.filter { candidate in
-            candidate.id != eventID && ancestors(of: candidate, in: events).contains { $0.id == eventID }
+        let byID = index(events)
+        return events.filter { candidate in
+            candidate.id != eventID && ancestors(of: candidate, byID: byID).contains { $0.id == eventID }
         }
     }
 
     /// "Parent / Child" title for menus and headers.
     public static func displayName(of event: SavedCameraEvent, in events: [SavedCameraEvent]) -> String {
-        chain(of: event, in: events).map(\.name).joined(separator: " / ")
+        displayName(of: event, byID: index(events))
+    }
+
+    static func displayName(of event: SavedCameraEvent, byID: [UUID: SavedCameraEvent]) -> String {
+        chain(of: event, byID: byID).map(\.name).joined(separator: " / ")
     }
 
     /// Events flattened for list display: parents in the usual newest-first
@@ -571,10 +590,11 @@ public enum EventHierarchy {
         let order: (SavedCameraEvent, SavedCameraEvent) -> Bool = {
             $0.eventDate == $1.eventDate ? $0.name < $1.name : $0.eventDate > $1.eventDate
         }
+        let byID = index(events)
         var children: [UUID: [SavedCameraEvent]] = [:]
         var roots: [SavedCameraEvent] = []
         for event in events {
-            if let parent = ancestors(of: event, in: events).last {
+            if let parent = ancestors(of: event, byID: byID).last {
                 children[parent.id, default: []].append(event)
             } else {
                 roots.append(event)

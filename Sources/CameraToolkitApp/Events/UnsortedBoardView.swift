@@ -11,6 +11,8 @@ struct UnsortedBoardView: View {
     @AppStorage("CameraToolkit.organize.tileWidth") private var tileWidth: Double = 220
     @AppStorage("CameraToolkit.organize.hideSorted") private var hideSorted = false
     @State private var previewStackID: String?
+    @State private var searchQuery = ""
+    @FocusState private var searchFocused: Bool
 
     private var state: UnsortedSourceState {
         workspace.sources[location.id] ?? UnsortedSourceState()
@@ -18,8 +20,9 @@ struct UnsortedBoardView: View {
 
     var body: some View {
         let result = state.result
-        let days = result.map { workspace.visibleDays($0, hideSorted: hideSorted) } ?? []
+        let days = result.map { workspace.visibleDays($0, hideSorted: hideSorted, matching: searchQuery) } ?? []
         let ordered = days.flatMap(\.stacks)
+        let searching = !OrganizeSearch.needle(searchQuery).isEmpty
 
         VStack(spacing: 0) {
             header(result)
@@ -30,11 +33,13 @@ struct UnsortedBoardView: View {
                 Divider()
                 if days.isEmpty {
                     ContentUnavailableView(
-                        hideSorted ? "Everything here is sorted" : "No photos or videos",
-                        systemImage: hideSorted ? "checkmark.circle" : "photo",
-                        description: Text(hideSorted
-                            ? "Turn off Hide Sorted to review, or press Apply to move the files into their events."
-                            : "This folder has no camera files.")
+                        searching ? "No Matches" : (hideSorted ? "Everything here is sorted" : "No photos or videos"),
+                        systemImage: searching ? "magnifyingglass" : (hideSorted ? "checkmark.circle" : "photo"),
+                        description: Text(searching
+                            ? "Nothing in \(location.name) matches “\(searchQuery)”. Try a file name, burst, folder, or event."
+                            : hideSorted
+                                ? "Turn off Hide Sorted to review, or press Apply to move the files into their events."
+                                : "This folder has no camera files.")
                     )
                     .frame(maxHeight: .infinity)
                 } else {
@@ -103,6 +108,29 @@ struct UnsortedBoardView: View {
                     .lineLimit(1)
             }
             Spacer()
+            HStack(spacing: 5) {
+                Image(systemName: "magnifyingglass")
+                    .foregroundStyle(.secondary)
+                TextField("Search", text: $searchQuery)
+                    .textFieldStyle(.plain)
+                    .frame(width: 140)
+                    .focused($searchFocused)
+                if !searchQuery.isEmpty {
+                    Button {
+                        searchQuery = ""
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Clear search")
+                }
+            }
+            .font(.callout)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 4)
+            .background(.quaternary, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+            .help("Filter by file name, burst, folder, or event (⌘F)")
             Picker("Camera", selection: Binding(
                 get: { workspace.deviceID(for: location) },
                 set: { workspace.setDevice($0, for: location.id) }
@@ -351,6 +379,8 @@ struct UnsortedBoardView: View {
             NSWorkspace.shared.activateFileViewerSelecting(urls(for: workspace.targetStackIDs()))
         case .reload:
             workspace.scan(location, force: true)
+        case .find:
+            searchFocused = true
         default:
             break
         }

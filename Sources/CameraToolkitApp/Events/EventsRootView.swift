@@ -110,6 +110,7 @@ struct EventsSidebar: View {
     @Bindable var model: DashboardModel
     @Bindable var workspace: EventsWorkspace
     @State private var targetedEventID: UUID?
+    @State private var searchText = ""
 
     var body: some View {
         VStack(spacing: 0) {
@@ -133,15 +134,16 @@ struct EventsSidebar: View {
             Divider()
 
             List(selection: $workspace.selection) {
-                if !workspace.discoveredDriveEvents.isEmpty {
+                let discovered = workspace.discoveredDriveEvents(matching: searchText)
+                if !discovered.isEmpty {
                     Section("Found on Your Drive") {
-                        discoveryBanner
+                        discoveryBanner(discovered)
                             .guideHighlight(.discovered, in: workspace)
                     }
                 }
 
                 Section("Unsorted Photos") {
-                    ForEach(workspace.unsortedLocations) { location in
+                    ForEach(workspace.unsortedLocations(matching: searchText)) { location in
                         unsortedRow(location)
                             .tag(Optional(EventsSidebarSelection.unsorted(location.id)))
                             .contextMenu {
@@ -169,7 +171,7 @@ struct EventsSidebar: View {
                     }
                     // Parents newest-first; each subevent sits indented under
                     // its parent — the flat row style stays the same.
-                    ForEach(workspace.sidebarEvents, id: \.event.id) { row in
+                    ForEach(workspace.sidebarRows(matching: searchText), id: \.event.id) { row in
                         eventRow(row.event)
                             .padding(.leading, CGFloat(row.depth) * 16)
                             .tag(Optional(EventsSidebarSelection.event(row.event.id)))
@@ -211,15 +213,15 @@ struct EventsSidebar: View {
                 }
             }
             .listStyle(.sidebar)
+            .searchable(text: $searchText, placement: .sidebar, prompt: "Search")
 
             Divider()
             footer
         }
     }
 
-    private var discoveryBanner: some View {
-        let found = workspace.discoveredDriveEvents
-        return VStack(alignment: .leading, spacing: 6) {
+    private func discoveryBanner(_ found: [DiscoveredDriveEvent]) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
             Text("\(found.count) event folder\(found.count == 1 ? " is" : "s are") on your drive but not in the list yet.")
                 .font(.callout.weight(.semibold))
                 .fixedSize(horizontal: false, vertical: true)

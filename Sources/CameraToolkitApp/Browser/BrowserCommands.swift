@@ -18,6 +18,9 @@ enum BrowserCommand: String, Sendable {
     case decreaseThumbnailSize
     case reload
     case showSelectedLocationInformation
+    /// Focus the search field of whichever board supports it (the organize
+    /// board today). Boards without a search field ignore it.
+    case find
 
     static let notification = Notification.Name("CameraToolkit.BrowserCommand")
 
