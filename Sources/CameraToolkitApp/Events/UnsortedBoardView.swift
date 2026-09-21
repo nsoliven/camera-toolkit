@@ -442,6 +442,9 @@ struct UnsortedBoardView: View {
     }
 
     private func handleKey(_ press: KeyPress, orderedIDs: [String]) -> KeyPress.Result {
+        // Never board keys while a text field owns typing — Delete edits
+        // the field, it does not unsort the selection.
+        guard !KeyboardTextFocus.isTypingInTextField() else { return .ignored }
         let targets = workspace.targetStackIDs()
         if press.key == .delete || press.key == .deleteForward {
             guard !targets.isEmpty else { return .ignored }
@@ -471,6 +474,7 @@ struct UnsortedBoardView: View {
     }
 
     private func handle(_ command: BrowserCommand, ordered: [OrganizeStack]) {
+        guard command.isAllowedWhileTyping || !KeyboardTextFocus.isTypingInTextField() else { return }
         switch command {
         case .selectAll:
             workspace.selectStacks(ordered.map(\.id))
