@@ -28,6 +28,10 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
     /// before and while they are archived. Empty means a hidden
     /// `.Camera Toolkit/Private` folder beside the Buffer on the same drive.
     public var privateStagingPath: String
+    /// Display-time rotation per file identity key (see
+    /// `DisplayRotation.fileKey`), in quarter-turns clockwise. Applied while
+    /// decoding tiles and previews; media bytes are never rewritten.
+    public var displayOrientations: [String: Int]
 
     public init(
         demoRootPath: String,
@@ -53,7 +57,8 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         savedEvents: [SavedCameraEvent] = [],
         selectedEventID: UUID? = nil,
         photoEventAssignments: [PhotoEventAssignment] = [],
-        privateStagingPath: String = ""
+        privateStagingPath: String = "",
+        displayOrientations: [String: Int] = [:]
     ) {
         self.demoRootPath = demoRootPath
         self.importSourcePath = importSourcePath
@@ -79,6 +84,7 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         self.selectedEventID = selectedEventID
         self.photoEventAssignments = photoEventAssignments
         self.privateStagingPath = privateStagingPath
+        self.displayOrientations = displayOrientations
         self.normalizeLocationSelections()
         self.normalizeEventSelection()
     }
@@ -108,6 +114,7 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         case selectedEventID
         case photoEventAssignments
         case privateStagingPath
+        case displayOrientations
     }
 
     public init(from decoder: Decoder) throws {
@@ -143,6 +150,7 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         selectedEventID = try values.decodeIfPresent(UUID.self, forKey: .selectedEventID)
         photoEventAssignments = try values.decodeIfPresent([PhotoEventAssignment].self, forKey: .photoEventAssignments) ?? []
         privateStagingPath = try values.decodeIfPresent(String.self, forKey: .privateStagingPath) ?? ""
+        displayOrientations = try values.decodeIfPresent([String: Int].self, forKey: .displayOrientations) ?? [:]
         normalizeLocationSelections()
         normalizeEventSelection()
     }
