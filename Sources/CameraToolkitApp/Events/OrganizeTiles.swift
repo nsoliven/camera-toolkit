@@ -62,7 +62,7 @@ struct PersonChip: View {
         .padding(.horizontal, 7)
         .padding(.vertical, 3)
         .background(EventPalette.color(for: person.id), in: Capsule())
-        .help("\(person.faceCount) face\(person.faceCount == 1 ? "" : "s") in this event")
+        .help("\(person.faceCount) detection\(person.faceCount == 1 ? "" : "s") in this event")
     }
 }
 
