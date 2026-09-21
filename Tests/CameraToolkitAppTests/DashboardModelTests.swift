@@ -749,6 +749,44 @@ final class DashboardModelTests: XCTestCase {
             XCTAssertEqual(persisted, "fuji-x100vi")
         }
     }
+
+    /// The apply board correlates its in-flight route diagram with the rename
+    /// job through the id `runBackgroundJob` hands back.
+    func testRunBackgroundJobReturnsIDAndRefusesWhileBusy() async throws {
+        try await withTemporaryDirectoryAsync { root in
+            let model = DashboardModel(
+                activePlan: CopyPlan(),
+                jobs: [],
+                configuration: AppConfiguration.defaults(applicationSupport: root),
+                configurationStore: ConfigurationStore(url: root.appendingPathComponent("config.json"))
+            )
+
+            let jobID = model.runBackgroundJob(
+                action: .organize,
+                runningNote: "Working",
+                logTitle: "Job",
+                logDetail: "",
+                operation: { _ in 42 },
+                completion: { _ in "Done" }
+            )
+            XCTAssertNotNil(jobID)
+            XCTAssertEqual(model.jobs.first?.id, jobID)
+            XCTAssertEqual(model.jobs.first?.state, .running)
+
+            let refused = model.runBackgroundJob(
+                action: .organize,
+                runningNote: "Working",
+                logTitle: "Job",
+                logDetail: "",
+                operation: { _ in 42 },
+                completion: { _ in "Done" }
+            )
+            XCTAssertNil(refused)
+
+            try await waitForIdle(model)
+            XCTAssertEqual(model.jobs.first?.state, .done)
+        }
+    }
 }
 
 @discardableResult
