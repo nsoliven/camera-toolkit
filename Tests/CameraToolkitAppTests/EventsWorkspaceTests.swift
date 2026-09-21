@@ -1,4 +1,5 @@
 import CameraToolkitCore
+import CoreGraphics
 import Foundation
 @testable import CameraToolkitApp
 import XCTest
@@ -538,6 +539,96 @@ final class EventsWorkspaceTests: XCTestCase {
         }
     }
 
+    func testFaceScanRefusesUntilBurstGroupingFinishes() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let unsorted = root.appendingPathComponent("Card", isDirectory: true)
+            try writeOrganizerARW(unsorted.appendingPathComponent("DSC00001.ARW"), "2026:08:26 10:00:00", "000")
+            let location = addUnsorted(unsorted, to: model)
+
+            // No scan result yet: face scan is gated on grouping existing.
+            let noResultBlocker = try XCTUnwrap(workspace.faceScanBlocker(for: location))
+            XCTAssertTrue(noResultBlocker.contains("grouping") || noResultBlocker.contains("scan"))
+            workspace.faceScan(location)
+            XCTAssertFalse(model.jobs.contains { $0.action == .faceScan })
+
+            // While grouping runs, the blocker says so and no job starts.
+            workspace.scan(location)
+            XCTAssertEqual(workspace.sources[location.id]?.isScanning, true)
+            let groupingBlocker = try XCTUnwrap(workspace.faceScanBlocker(for: location))
+            XCTAssertTrue(groupingBlocker.contains("grouping"))
+            workspace.faceScan(location)
+            XCTAssertTrue(model.statusMessage.contains("grouping"))
+            XCTAssertFalse(model.jobs.contains { $0.action == .faceScan })
+
+            // Once grouping finishes the gate lifts.
+            try await waitUntil {
+                workspace.sources[location.id]?.result != nil
+                    && workspace.sources[location.id]?.isScanning == false
+            }
+            XCTAssertNil(workspace.faceScanBlocker(for: location))
+        }
+    }
+
+    func testFaceScanRunsAsTrackedJobAfterGrouping() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let unsorted = root.appendingPathComponent("Card", isDirectory: true)
+            try writeOrganizerARW(unsorted.appendingPathComponent("B0001_DSC00001.ARW"), "2026:08:26 10:00:00", "100")
+            try writeOrganizerARW(unsorted.appendingPathComponent("B0001_DSC00002.ARW"), "2026:08:26 10:00:00", "400")
+            let location = addUnsorted(unsorted, to: model)
+            workspace.scan(location)
+            try await waitUntil {
+                workspace.sources[location.id]?.result != nil
+                    && workspace.sources[location.id]?.isScanning == false
+            }
+
+            workspace.faceEmbedderProvider = { StubFaceEmbedder() }
+            workspace.faceScan(location)
+            try await waitUntil { !model.isBusy }
+
+            // The Jobs window lists model.jobs — the face scan appears there.
+            let job = try XCTUnwrap(model.jobs.first { $0.action == .faceScan })
+            XCTAssertEqual(job.state, .done)
+            XCTAssertEqual(job.action.displayName, "Face Scan")
+            XCTAssertTrue(model.statusMessage.contains("Face scan done"))
+        }
+    }
+
+    func testRegroupBurstsRerunsGroupingAsAnOrganizeJob() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let unsorted = root.appendingPathComponent("Card", isDirectory: true)
+            try writeOrganizerARW(unsorted.appendingPathComponent("B0001_DSC00001.ARW"), "2026:08:26 10:00:00", "100")
+            try writeOrganizerARW(unsorted.appendingPathComponent("B0001_DSC00002.ARW"), "2026:08:26 10:00:00", "400")
+            try writeOrganizerARW(unsorted.appendingPathComponent("DSC00010.ARW"), "2026:08:26 11:00:00", "000")
+            let location = addUnsorted(unsorted, to: model)
+
+            // Nothing to regroup before the first scan — refused with a
+            // message, no job.
+            workspace.regroupBursts(location)
+            XCTAssertTrue(model.statusMessage.contains("nothing to regroup"))
+            XCTAssertFalse(model.jobs.contains { $0.action == .organize })
+
+            workspace.scan(location)
+            try await waitUntil {
+                workspace.sources[location.id]?.result != nil
+                    && workspace.sources[location.id]?.isScanning == false
+            }
+
+            workspace.regroupBursts(location)
+            XCTAssertTrue(model.jobs.contains { $0.action == .organize })
+            try await waitUntil {
+                !model.isBusy && workspace.sources[location.id]?.isScanning == false
+            }
+
+            // The board's stacks were rebuilt from the same items: the
+            // B0001_ pair stays one burst, the lone file stays single.
+            let result = try XCTUnwrap(workspace.sources[location.id]?.result)
+            XCTAssertEqual(result.stacks.map(\.items.count).sorted(), [1, 2])
+            let job = try XCTUnwrap(model.jobs.first { $0.action == .organize })
+            XCTAssertEqual(job.state, .done)
+            XCTAssertTrue(job.note.contains("Regrouped"))
+        }
+    }
+
     // MARK: - Helpers
 
     private func withOrganizerSandbox(
@@ -620,5 +711,13 @@ final class EventsWorkspaceTests: XCTestCase {
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         try Data(bytes).write(to: url)
         return url
+    }
+}
+
+/// Embeds nothing real — a fixed unit vector — so face scans can run in
+/// tests without the CoreML package.
+private struct StubFaceEmbedder: FaceEmbeddingProviding {
+    func embed(_ image: CGImage) throws -> [Float] {
+        FaceEmbeddingMath.l2Normalized([Float](repeating: 1, count: 512))
     }
 }

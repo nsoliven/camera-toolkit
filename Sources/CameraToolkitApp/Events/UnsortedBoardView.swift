@@ -57,6 +57,7 @@ struct UnsortedBoardView: View {
                     Text(error)
                 } actions: {
                     Button("Rescan") { workspace.scan(location, force: true) }
+                        .disabled(state.isScanning || model.isBusy)
                 }
                 .frame(maxHeight: .infinity)
             } else {
@@ -152,12 +153,22 @@ struct UnsortedBoardView: View {
             } label: {
                 Label("Rescan", systemImage: "arrow.clockwise")
             }
-            .disabled(state.isScanning)
+            .disabled(state.isScanning || model.isBusy)
+            .help("Re-read every file and rebuild the board. Disabled while a scan or job is running.")
+            Button {
+                workspace.regroupBursts(location)
+            } label: {
+                Label("Regroup Bursts", systemImage: "square.stack.3d.up")
+            }
+            .disabled(state.isScanning || model.isBusy || result == nil)
+            .help("Re-run burst grouping on the scanned files with the current Settings sliders — Sony prefixes, the time gap, then the Vision check. Files are not re-read and nothing moves.")
             Menu {
                 Button("Scan for Faces (Low · Fast)") {
                     workspace.faceScan(location)
                 }
-                .help("Detect and match faces on still photos. Writes only to the catalog — media is read, never touched.")
+                .disabled(workspace.faceScanBlocker(for: location) != nil)
+                .help(workspace.faceScanBlocker(for: location)
+                    ?? "Detect and match faces on a sample of each burst — not every frame — plus single stills and video poster frames. Writes only to the catalog — media is read, never touched.")
                 Divider()
                 Button("Reveal in Finder") {
                     NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: DashboardModel.expandedPath(location.path))])
@@ -182,6 +193,9 @@ struct UnsortedBoardView: View {
     }
 
     private func summaryLine(_ result: OrganizeScanResult?) -> String {
+        if state.isScanning {
+            return state.progress.map { "\($0.phase)…" } ?? "Working…"
+        }
         guard let result else { return location.path }
         let bursts = result.stacks.count { $0.isBurst }
         let left = result.stacks.count { !workspace.isSorted($0) }

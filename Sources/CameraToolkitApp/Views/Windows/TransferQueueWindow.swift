@@ -22,7 +22,7 @@ final class TransferQueueWindowController: NSObject, NSWindowDelegate {
             backing: .buffered,
             defer: false
         )
-        window.title = "Transfer Queue"
+        window.title = "Jobs"
         window.identifier = NSUserInterfaceItemIdentifier("CameraToolkitTransferQueueWindow")
         window.isRestorable = false
         window.isReleasedWhenClosed = false
@@ -47,13 +47,13 @@ private struct TransferQueueView: View {
         Group {
             if let queue = model.transferQueue {
                 queueContent(queue)
-            } else if !model.pendingTransferBatches.isEmpty {
-                pendingOnlyContent
+            } else if !model.pendingTransferBatches.isEmpty || !model.jobs.isEmpty {
+                idleContent
             } else {
                 ContentUnavailableView(
-                    "No Transfers Yet",
-                    systemImage: "arrow.down.circle",
-                    description: Text("Start Copy to Buffer from the camera browser. This window opens automatically when a transfer starts.")
+                    "No Jobs Yet",
+                    systemImage: "list.bullet.clipboard",
+                    description: Text("Transfers, burst regrouping, face scans, and other background work appear here while they run.")
                 )
             }
         }
@@ -80,6 +80,11 @@ private struct TransferQueueView: View {
                 pendingBatchesSection
             }
 
+            if !model.jobs.isEmpty {
+                Divider()
+                jobsSection
+            }
+
             Divider()
             queueList(queue)
             Divider()
@@ -90,33 +95,138 @@ private struct TransferQueueView: View {
         }
     }
 
-    private var pendingOnlyContent: some View {
+    /// No transfer in flight: waiting batches on top, the shared job list
+    /// filling the rest — this is the window's whole story when a face scan
+    /// or regroup runs without a copy queued.
+    private var idleContent: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 12) {
-                Image(systemName: "clock.arrow.circlepath")
-                    .font(.system(size: 22, weight: .medium))
-                    .foregroundStyle(.blue)
-                    .frame(width: 36, height: 36)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Transfers Waiting")
-                        .font(.headline)
-                    Text("The list is saved. Start it when the camera and Buffer are connected.")
-                        .font(.caption)
+            if !model.pendingTransferBatches.isEmpty {
+                HStack(spacing: 12) {
+                    Image(systemName: "clock.arrow.circlepath")
+                        .font(.system(size: 22, weight: .medium))
+                        .foregroundStyle(.blue)
+                        .frame(width: 36, height: 36)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Transfers Waiting")
+                            .font(.headline)
+                        Text("The list is saved. Start it when the camera and Buffer are connected.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button("Start Next Transfer") {
+                        model.resumePendingTransfers()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(model.isBusy || model.isStorageBenchmarkRunning)
+                }
+                .padding(16)
+                .background(.bar)
+
+                Divider()
+                pendingBatchesSection
+                Divider()
+            }
+            jobsSection
+        }
+    }
+
+    /// Every background job this session — transfers, organize work, burst
+    /// regrouping, face scans — newest first. The single-job gate keeps at
+    /// most one running.
+    private var jobsSection: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("JOBS")
+                .font(.caption2.weight(.bold))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+
+            ScrollView {
+                LazyVStack(spacing: 0) {
+                    ForEach(Array(model.jobs.prefix(30))) { job in
+                        jobRow(job)
+                        if job.id != model.jobs.prefix(30).last?.id {
+                            Divider().padding(.leading, 48)
+                        }
+                    }
+                }
+            }
+            .frame(maxHeight: model.transferQueue == nil ? .infinity : 150)
+        }
+        .background(Color(nsColor: .textBackgroundColor))
+    }
+
+    private func jobRow(_ job: JobSnapshot) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: jobSymbol(job))
+                .font(.system(size: 15, weight: .medium))
+                .foregroundStyle(jobColor(job.state))
+                .frame(width: 24, height: 24)
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(job.action.displayName)
+                    .font(.subheadline.weight(.medium))
+                    .lineLimit(1)
+                Text(job.note)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            VStack(alignment: .trailing, spacing: 4) {
+                if job.state == .running || job.state == .queued {
+                    ProgressView(value: job.progress)
+                        .frame(width: 110)
+                    Text(job.progress.formatted(.percent.precision(.fractionLength(0))))
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text(job.state.displayName)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(jobColor(job.state))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(jobColor(job.state).opacity(0.10), in: Capsule())
+                    Text(job.finishedAt ?? job.createdAt, style: .time)
+                        .font(.caption2.monospacedDigit())
                         .foregroundStyle(.secondary)
                 }
-                Spacer()
-                Button("Start Next Transfer") {
-                    model.resumePendingTransfers()
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(model.isBusy || model.isStorageBenchmarkRunning)
             }
-            .padding(16)
-            .background(.bar)
+            .frame(width: 130, alignment: .trailing)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 7)
+        .help(job.detail.isEmpty ? job.note : job.detail)
+    }
 
-            Divider()
-            pendingBatchesSection
-            Spacer(minLength: 0)
+    private func jobSymbol(_ job: JobSnapshot) -> String {
+        switch job.state {
+        case .done: return "checkmark.circle.fill"
+        case .failed: return "exclamationmark.circle.fill"
+        case .cancelled: return "xmark.circle.fill"
+        case .queued: return "clock"
+        case .running:
+            switch job.action {
+            case .faceScan: return "person.crop.rectangle.stack"
+            case .organize: return "rectangle.3.group"
+            case .ingestCard: return "arrow.down.circle"
+            case .freeUp: return "trash"
+            case .immichScan, .immichUpload: return "square.and.arrow.up"
+            case .verifyManifest: return "checkmark.shield"
+            case .diskSpeed, .networkSpeed: return "gauge.with.dots.needle.33percent"
+            default: return "arrow.triangle.2.circlepath"
+            }
+        }
+    }
+
+    private func jobColor(_ state: JobState) -> Color {
+        switch state {
+        case .running, .queued: .blue
+        case .done: .green
+        case .failed: .red
+        case .cancelled: .secondary
         }
     }
 
@@ -154,7 +264,7 @@ private struct TransferQueueView: View {
                     }
                 }
             }
-            .frame(maxHeight: model.transferQueue == nil ? .infinity : 116)
+            .frame(maxHeight: model.transferQueue == nil && model.jobs.isEmpty ? .infinity : 116)
         }
         .background(Color(nsColor: .textBackgroundColor))
     }
@@ -537,6 +647,40 @@ private struct TransferQueueView: View {
         case .verified, .alreadyPresent: .green
         case .sourceRemoved: .teal
         case .conflict, .failed: .orange
+        }
+    }
+}
+
+extension JobAction {
+    /// Short label the Jobs window shows for each kind of background job.
+    var displayName: String {
+        switch self {
+        case .previewFiles: "Preview Files"
+        case .prepareTestData: "Prepare Test Data"
+        case .ingestCard: "Copy to Buffer"
+        case .syncBuffer: "Archive / Sync"
+        case .freeUp: "Free Up Space"
+        case .checkout: "Check Out"
+        case .checkinExports: "Check In Exports"
+        case .immichScan: "Immich Check"
+        case .verifyManifest: "Verify Manifest"
+        case .diskSpeed: "Disk Speed Test"
+        case .networkSpeed: "Network Speed Test"
+        case .organize: "Organize"
+        case .immichUpload: "Immich Upload"
+        case .faceScan: "Face Scan"
+        }
+    }
+}
+
+extension JobState {
+    var displayName: String {
+        switch self {
+        case .queued: "Queued"
+        case .running: "Running"
+        case .done: "Done"
+        case .failed: "Failed"
+        case .cancelled: "Cancelled"
         }
     }
 }

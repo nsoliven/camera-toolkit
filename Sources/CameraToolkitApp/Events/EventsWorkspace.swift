@@ -141,6 +141,12 @@ private struct ImmichCandidate: Sendable {
     var modifiedAt: Date
 }
 
+private struct BurstRegroupOutcome: Sendable {
+    var stacks: [OrganizeStack]
+    var links: Set<BurstVisualLink>
+    var grouping: BurstGroupingConfiguration
+}
+
 private struct ImmichUploadOutcome: Sendable {
     var uploaded = 0
     var duplicates = 0
@@ -2022,8 +2028,104 @@ final class EventsWorkspace {
         FaceModelCatalog.isModelInstalled(applicationSupport: DashboardModel.defaultApplicationSupportURL)
     }
 
-    /// "Face Scan (Low · Fast)" on a connected unsorted source: detect faces
-    /// on still photos, embed them with the on-device model, match named
+    /// Test seam: supplies the embedder so a face scan can run without the
+    /// on-disk CoreML package. Nil in production — the model loads per scan.
+    @ObservationIgnored var faceEmbedderProvider: (@Sendable () async throws -> FaceEmbeddingProviding?)?
+
+    /// Why Face Scan cannot start on this location right now, or nil when it
+    /// can. Faces are detected per burst stack, so a location must finish
+    /// grouping first; the board disables its button with this reason.
+    func faceScanBlocker(for location: ConfiguredLocation) -> String? {
+        if sources[location.id]?.isScanning == true {
+            return "Burst grouping is still running on \(location.name). Face Scan unlocks when it finishes."
+        }
+        if sources[location.id]?.result == nil {
+            return "Face Scan runs after burst grouping — scan \(location.name) first."
+        }
+        if model.isBusy || model.isStorageBenchmarkRunning {
+            return "Another job is already running. Wait for it to finish, then scan."
+        }
+        return nil
+    }
+
+    /// "Regroup Bursts" on the Unsorted board: re-runs the stacker and the
+    /// Vision recovery pass on the already-scanned items using the current
+    /// Settings sliders — no capture times are re-read and nothing moves.
+    /// Runs as an `.organize` job so it shows in the Jobs window.
+    func regroupBursts(_ location: ConfiguredLocation) {
+        let id = location.id
+        guard let result = sources[id]?.result else {
+            model.statusMessage = "Scan \(location.name) first — there is nothing to regroup yet."
+            return
+        }
+        guard sources[id]?.isScanning != true else {
+            model.statusMessage = "\(location.name) is already scanning or regrouping."
+            return
+        }
+        guard !model.isBusy, !model.isStorageBenchmarkRunning else {
+            model.statusMessage = "Another job is already running. Regroup Bursts starts when it finishes."
+            return
+        }
+        let items = result.items
+        let grouping = BurstGroupingConfiguration.resolved()
+        var state = sources[id] ?? UnsortedSourceState()
+        state.isScanning = true
+        state.error = nil
+        state.progress = OrganizeScanProgress(phase: "Regrouping bursts", processed: 0, total: 0)
+        sources[id] = state
+        let reportProgress: @Sendable (OrganizeScanProgress) -> Void = { [weak self] update in
+            Task { @MainActor in
+                self?.sources[id]?.progress = update
+            }
+        }
+        model.runBackgroundJob(
+            action: .organize,
+            runningNote: "Regrouping bursts on \(location.name)",
+            logTitle: "Regrouped bursts on \(location.name)",
+            logDetail: "Re-ran burst grouping on the already-scanned files using the current Settings thresholds, including the Vision similarity check. File contents were not re-read and nothing was moved.",
+            onSettled: { [weak self] in
+                self?.sources[id]?.isScanning = false
+                self?.sources[id]?.progress = nil
+            },
+            operation: { progress in
+                let links = BurstVisualLinker.links(for: items, configuration: grouping) { update in
+                    reportProgress(update)
+                    progress(DashboardModel.jobUpdate(
+                        from: FileOperationProgress(
+                            phase: update.phase,
+                            processedFiles: update.processed,
+                            totalFiles: update.total
+                        ),
+                        lowerBound: 0.05,
+                        upperBound: 0.9,
+                        notePrefix: "Regrouping bursts",
+                        command: ""
+                    ))
+                }
+                reportProgress(OrganizeScanProgress(phase: "Grouping bursts", processed: 0, total: 0))
+                return BurstRegroupOutcome(
+                    stacks: OrganizeStacker.stacks(for: items, configuration: grouping, visualLinks: links),
+                    links: links,
+                    grouping: grouping
+                )
+            },
+            completion: { [weak self] outcome in
+                guard let self else { return "" }
+                var updated = result
+                updated.stacks = outcome.stacks
+                updated.days = OrganizeStacker.days(for: outcome.stacks)
+                updated.burstGrouping = outcome.grouping
+                updated.visualLinks = outcome.links
+                sources[id]?.result = updated
+                let bursts = outcome.stacks.count { $0.isBurst }
+                return "Regrouped \(location.name): \(outcome.stacks.count) item(s), \(bursts) burst(s). Nothing moved."
+            }
+        )
+    }
+
+    /// "Face Scan (Low · Fast)" on a connected, grouped unsorted source:
+    /// detect faces on a small sample of each burst plus single stills and
+    /// video poster frames, embed them with the on-device model, match named
     /// people, and group the rest. Writes only to the catalog — media files
     /// are only read.
     func faceScan(_ location: ConfiguredLocation) {
@@ -2031,13 +2133,16 @@ final class EventsWorkspace {
             model.statusMessage = "\(location.name) is not connected. Plug it in, then scan again."
             return
         }
-        guard faceModelInstalled else {
+        if let blocker = faceScanBlocker(for: location) {
+            model.statusMessage = blocker
+            return
+        }
+        let embedderProvider = faceEmbedderProvider
+        guard faceModelInstalled || embedderProvider != nil else {
             model.statusMessage = "The face model is not installed yet. Run scripts/convert-arcface.sh once on this Mac, then scan again."
             return
         }
-        let root = URL(fileURLWithPath: DashboardModel.expandedPath(location.path), isDirectory: true)
-        let existing = sources[location.id]?.result
-        let cache = captureDateCache
+        guard let stacks = sources[location.id]?.result?.stacks else { return }
         let support = DashboardModel.defaultApplicationSupportURL
         let catalogURL = catalogDatabaseURL
         let configuration = model.configuration
@@ -2045,7 +2150,7 @@ final class EventsWorkspace {
             action: .faceScan,
             runningNote: "Scanning \(location.name) for faces",
             logTitle: "Face scan: \(location.name)",
-            logDetail: "Detected faces on still photos, embedded them on-device, matched named people, and grouped the rest. Files were only read — nothing was written or moved.",
+            logDetail: "Detected faces on a small sample of each burst, single stills, and video poster frames; embedded them on-device, matched named people, and grouped the rest. Files were only read — nothing was written or moved.",
             operation: { progress in
                 // Bootstrap is idempotent: it guarantees the face tables
                 // exist even if no catalog sync has run since the upgrade.
@@ -2054,30 +2159,19 @@ final class EventsWorkspace {
                     createBackup: false,
                     createLibraryFolders: false
                 )
-                guard let embedder = try await FaceModelCatalog.loadEmbedder(applicationSupport: support) else {
+                let embedder: FaceEmbeddingProviding?
+                if let embedderProvider {
+                    embedder = try await embedderProvider()
+                } else {
+                    embedder = try await FaceModelCatalog.loadEmbedder(applicationSupport: support)
+                }
+                guard let embedder else {
                     throw FaceIndexError.modelNotInstalled(FaceModelCatalog.modelURL(applicationSupport: support).path)
                 }
-                var items = existing?.items
-                if items == nil {
-                    items = try OrganizeScanner().scan(root: root, cache: cache) { update in
-                        progress(DashboardModel.jobUpdate(
-                            from: FileOperationProgress(
-                                phase: update.phase,
-                                processedFiles: update.processed,
-                                totalFiles: update.total
-                            ),
-                            lowerBound: 0.02,
-                            upperBound: 0.25,
-                            notePrefix: "Reading",
-                            command: ""
-                        ))
-                    }.items
-                }
-                let lowerBound = existing == nil ? 0.25 : 0.02
-                return try FaceIndexService(catalogURL: catalogURL).scan(items: items ?? [], embedder: embedder) { update in
+                return try FaceIndexService(catalogURL: catalogURL).scan(stacks: stacks, embedder: embedder) { update in
                     progress(DashboardModel.jobUpdate(
                         from: update,
-                        lowerBound: lowerBound,
+                        lowerBound: 0.02,
                         upperBound: 0.98,
                         notePrefix: "Face scan",
                         command: ""
@@ -2086,7 +2180,7 @@ final class EventsWorkspace {
             },
             completion: { [weak self] report in
                 self?.facesRevision &+= 1
-                return "Face scan done — \(report.facesDetected) face\(report.facesDetected == 1 ? "" : "s") on \(report.photosProcessed) new photo(s); \(report.photosSkipped) already scanned; \(report.facesProposed) matched to people, \(report.facesGrouped) grouped."
+                return "Face scan done — \(report.facesDetected) face\(report.facesDetected == 1 ? "" : "s") on \(report.photosProcessed) sampled photo(s); \(report.photosSkipped) already scanned; \(report.facesProposed) matched to people, \(report.facesGrouped) grouped."
             }
         )
     }

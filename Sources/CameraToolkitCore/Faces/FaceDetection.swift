@@ -1,3 +1,4 @@
+import AVFoundation
 import CoreGraphics
 import Foundation
 import ImageIO
@@ -130,6 +131,18 @@ public enum FaceImageDecoder {
     /// burst linker's preview path: embedded JPEG for RAW, ImageIO otherwise.
     public static func detectionImage(for url: URL, maximumPixelSize: Int) -> CGImage? {
         BurstVisualLinker.previewImage(for: url, maximumPixelSize: maximumPixelSize)
+    }
+
+    /// A clip's representative frame — one second in, unlimited seek
+    /// tolerance, track transform applied, the same poster the tile grid
+    /// shows — so a video contributes faces without sweeping keyframes.
+    public static func posterImage(for url: URL, maximumPixelSize: Int) -> CGImage? {
+        let generator = AVAssetImageGenerator(asset: AVURLAsset(url: url))
+        generator.appliesPreferredTrackTransform = true
+        generator.maximumSize = CGSize(width: maximumPixelSize, height: maximumPixelSize)
+        generator.requestedTimeToleranceBefore = .positiveInfinity
+        generator.requestedTimeToleranceAfter = .positiveInfinity
+        return try? generator.copyCGImage(at: CMTime(seconds: 1, preferredTimescale: 600), actualTime: nil)
     }
 
     /// The native pixel size of the image detection actually ran on — for a
