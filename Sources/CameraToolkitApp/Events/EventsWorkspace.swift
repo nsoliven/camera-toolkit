@@ -341,17 +341,28 @@ final class EventsWorkspace {
 
     // MARK: - Search
 
+    /// The board filter popover's shared state — unsorted boards, event
+    /// boards, and the sidebar's Events list all respond to its People
+    /// picks; each board field also edits its text needle.
+    var search = OrganizeSearchFilter()
+
     /// Sidebar rows matching the search query. Matching runs on each event's
     /// breadcrumb title, so a hit on a parent's name still reveals its
     /// subevents ("phil" shows PHIL2026 / Matcha), and on the named people
     /// detected in the event ("dad" keeps events where Dad was seen).
-    /// Empty query returns all.
-    func sidebarRows(matching query: String) -> [(event: SavedCameraEvent, depth: Int)] {
+    /// `peopleIDs` — the popover's People picks — keeps only events whose
+    /// `event.people` roster intersects them. Empty query and no picks
+    /// returns all.
+    func sidebarRows(matching query: String, peopleIDs: Set<UUID> = []) -> [(event: SavedCameraEvent, depth: Int)] {
         let needle = OrganizeSearch.needle(query)
-        guard !needle.isEmpty else { return sidebarEvents }
-        return sidebarEvents.filter {
-            OrganizeSearch.matches(eventTitle($0.event), needle: needle)
-                || eventPeople($0.event.id).contains { OrganizeSearch.matches($0.name, needle: needle) }
+        guard !needle.isEmpty || !peopleIDs.isEmpty else { return sidebarEvents }
+        return sidebarEvents.filter { row in
+            let textHit = needle.isEmpty
+                || OrganizeSearch.matches(eventTitle(row.event), needle: needle)
+                || eventPeople(row.event.id).contains { OrganizeSearch.matches($0.name, needle: needle) }
+            let peopleHit = peopleIDs.isEmpty
+                || eventPeople(row.event.id).contains { peopleIDs.contains($0.id) }
+            return textHit && peopleHit
         }
     }
 
@@ -594,15 +605,20 @@ final class EventsWorkspace {
     }
 
     /// The stacks an event board should show under the same search state.
-    /// Every facet applies except Event — the board is one event already.
+    /// Every facet applies except Event — the board is one event already,
+    /// so a pick carried over from another board's popover is dropped
+    /// rather than emptying this one.
     func visibleEventStacks(_ eventID: UUID, search: OrganizeSearchFilter) -> [OrganizeStack] {
         let stacks = eventStacks[eventID] ?? []
-        guard !search.isEmpty else { return stacks }
-        let peopleByStackID = search.peopleIDs.isEmpty ? [:] : boardPeople(for: stacks).byStackID
+        var scoped = search
+        scoped.eventIDs = []
+        scoped.includeUnsorted = false
+        guard !scoped.isEmpty else { return stacks }
+        let peopleByStackID = scoped.peopleIDs.isEmpty ? [:] : boardPeople(for: stacks).byStackID
         return stacks.filter {
             OrganizeSearch.matches(
                 stack: $0,
-                search: search,
+                search: scoped,
                 rootPath: nil,
                 facts: stackFacts($0, peopleByStackID: peopleByStackID)
             )

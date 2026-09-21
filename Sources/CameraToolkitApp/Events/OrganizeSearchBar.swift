@@ -64,6 +64,13 @@ struct OrganizeSearchBar: View {
         }
     }
 
+    /// Facets filtering right now — the funnel's accent state. Counts only
+    /// the chips this board shows: an Event pick carried over from an
+    /// unsorted board must not badge an event board's hidden facet.
+    private var visibleFacetCount: Int {
+        facets.reduce(0) { $0 + (selectionCount($1) > 0 ? 1 : 0) }
+    }
+
     var body: some View {
         HStack(spacing: 5) {
             Image(systemName: "magnifyingglass")
@@ -85,10 +92,10 @@ struct OrganizeSearchBar: View {
             Button {
                 showFilters.toggle()
             } label: {
-                Image(systemName: search.activeFacetCount > 0
+                Image(systemName: visibleFacetCount > 0
                     ? "line.3.horizontal.decrease.circle.fill"
                     : "line.3.horizontal.decrease.circle")
-                    .foregroundStyle(search.activeFacetCount > 0 ? Color.accentColor : Color.secondary)
+                    .foregroundStyle(visibleFacetCount > 0 ? Color.accentColor : Color.secondary)
             }
             .buttonStyle(.plain)
             .help("Filter by people, date, event, or media kind")

@@ -15,7 +15,6 @@ struct EventBoardView: View {
     @AppStorage("CameraToolkit.organize.order") private var sortOrder: OrganizeBoardOrder = .oldestFirst
     @State private var previewStackID: String?
     @State private var previewFrameIndex = 0
-    @State private var search = OrganizeSearchFilter()
     @FocusState private var searchFocused: Bool
 
     /// Grouping that makes sense inside one event — every stack belongs to
@@ -28,7 +27,7 @@ struct EventBoardView: View {
 
     private var boardGroups: [OrganizeBoardGroup] {
         OrganizeBoardPlan.groups(
-            for: workspace.visibleEventStacks(eventID, search: search),
+            for: workspace.visibleEventStacks(eventID, search: workspace.search),
             grouping: effectiveGrouping,
             order: sortOrder
         )
@@ -47,7 +46,7 @@ struct EventBoardView: View {
                     .guideHighlight(.storageStrip, in: workspace)
                 if stacks != nil {
                     if groups.isEmpty {
-                        if search.isEmpty {
+                        if workspace.search.isEmpty {
                             emptyState(event)
                         } else {
                             ContentUnavailableView(
@@ -139,7 +138,7 @@ struct EventBoardView: View {
                 workspace: workspace,
                 stacks: workspace.eventStacks[eventID] ?? [],
                 showsEventFacet: false,
-                search: $search,
+                search: $workspace.search,
                 focused: $searchFocused,
                 matchedCount: boardGroups.reduce(0) { $0 + $1.stacks.count }
             )

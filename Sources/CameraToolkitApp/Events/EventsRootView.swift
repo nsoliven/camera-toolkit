@@ -235,9 +235,22 @@ struct EventsSidebar: View {
                         Text("No events yet")
                             .foregroundStyle(.secondary)
                     }
+                    // A board popover's People picks narrow this list to
+                    // events whose event.people include them.
+                    if !workspace.search.peopleIDs.isEmpty {
+                        Button {
+                            workspace.search.peopleIDs = []
+                        } label: {
+                            Label("Filtered by People — clear", systemImage: "person.2.fill")
+                                .font(.caption)
+                        }
+                        .buttonStyle(.borderless)
+                        .foregroundStyle(Color.accentColor)
+                        .help("A board's People filter is hiding events without those people — click to show every event")
+                    }
                     // Parents newest-first; each subevent sits indented under
                     // its parent — the flat row style stays the same.
-                    ForEach(workspace.sidebarRows(matching: searchText), id: \.event.id) { row in
+                    ForEach(workspace.sidebarRows(matching: searchText, peopleIDs: workspace.search.peopleIDs), id: \.event.id) { row in
                         eventRow(row.event, depth: row.depth)
                             .tag(EventsSidebarSelection.event(row.event.id) as EventsSidebarSelection?)
                             .contentShape(Rectangle())
