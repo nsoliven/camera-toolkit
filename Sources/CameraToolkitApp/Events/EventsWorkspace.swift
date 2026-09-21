@@ -40,7 +40,7 @@ struct RenameEventRequest: Identifiable {
 }
 
 /// Pending "Scan for Faces" sheet — the location to scan; the sheet picks
-/// quality and the FAST throttle before the job starts.
+/// quality and whether Fast pins the Mac before the job starts.
 struct FaceScanRequest: Identifiable {
     var id: UUID { locationID }
     var locationID: UUID
@@ -2454,7 +2454,7 @@ final class EventsWorkspace {
     }
 
     /// Opens the "Scan for Faces" sheet for a location — quality and the
-    /// FAST throttle are picked there before any job starts.
+    /// Fast (pin the Mac) are picked there before any job starts.
     func requestFaceScan(_ location: ConfiguredLocation) {
         faceScanRequest = FaceScanRequest(locationID: location.id)
     }

@@ -783,8 +783,8 @@ struct RemovalConfirmSheet: View {
     }
 }
 
-/// The one compute sheet for face scans: quality tier plus the FAST
-/// throttle. No model names — the owner picks how hard to look, the models
+/// The one compute sheet for face scans: quality tier plus Fast (pin the
+/// Mac). No model names — the owner picks how hard to look, the models
 /// are fixed.
 struct FaceScanSheet: View {
     let location: ConfiguredLocation
@@ -810,8 +810,8 @@ struct FaceScanSheet: View {
                     Text("High").tag(FaceScanGrade.high)
                 }
                 .pickerStyle(.segmented)
-                Toggle("Fast — lighter on the Mac", isOn: $fast)
-                    .help("Caps how much of the machine the scan uses. Same quality, slower wall clock.")
+                Toggle("Fast — pin the Mac", isOn: $fast)
+                    .help("Uses every core it can and will run hot. Turn off to keep the machine quiet; same quality, longer wait.")
             }
             .formStyle(.grouped)
             Text(modeHelp)
