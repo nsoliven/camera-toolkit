@@ -1054,6 +1054,27 @@ struct StackPreviewOverlay: View {
     @State private var hiResImage: (key: HiResRequest, image: CGImage)?
     @State private var failed = false
     @State private var zoomCommand: PreviewZoomCommand?
+    /// Face rows for the frame on screen, resolved off the main actor from
+    /// the ArcFace catalog — independent of image loading, which never
+    /// waits on them.
+    @State private var facesOnFrame: [FaceRecord] = []
+    /// nil means the file was never face-scanned — the inspector shows
+    /// "Not scanned" and no boxes draw.
+    @State private var framePhotoRecord: FacePhotoRecord?
+    @State private var facePersonNames: [UUID: String] = [:]
+    /// Roster for the tag picker's person list.
+    @State private var rosterPeople: [FacePerson] = []
+    /// The current frame's EXIF — read on a background queue after paint.
+    @State private var frameMetadata: PhotoMetadata?
+    @State private var frameMetadataLoaded = false
+    /// The `i` inspector's slide-out state.
+    @State private var inspectorVisible = false
+    /// Markup mode: drags on the canvas draw a face box instead of panning.
+    @State private var tagMode = false
+    /// The photo's displayed rect in canvas coordinates, reported by the
+    /// canvas — face boxes align to it.
+    @State private var canvasImageFrame: CGRect = .zero
+    @State private var tagRequest: FaceTagRequest?
     @FocusState private var isFocused: Bool
 
     private var stackIndex: Int? { stacks.firstIndex { $0.id == stackID } }
@@ -1091,7 +1112,7 @@ struct StackPreviewOverlay: View {
             if onTrashItems != nil { text += " · ⌫/right-click trash" }
             return text + " · Esc close"
         }
-        var text = "← → frames · ⇧← → select · ⇧/⌘-click frames · ↑ ↓ items · click zoom · drag pan · + − 0 zoom · [ ] rotate · 1–3 sort · O open"
+        var text = "← → frames · ⇧← → select · ⇧/⌘-click frames · ↑ ↓ items · click zoom · drag pan · + − 0 zoom · [ ] rotate · 1–3 sort · O open · T tag face · I info"
         if onTrashItems != nil { text += " · ⌫/right-click trash" }
         return text + " · Esc close"
     }
@@ -1100,40 +1121,32 @@ struct StackPreviewOverlay: View {
         ZStack {
             Color.black.opacity(0.95)
             if let stack, let item {
-                VStack(spacing: 10) {
-                    header(stack: stack, item: item)
-                    Group {
-                        if item.kind == .video {
-                            videoPane(item)
-                        } else {
-                            InteractivePreviewCanvas(
-                                image: displayImage?.image,
-                                isLoading: !failed,
-                                imageScale: displayImage?.scale ?? 1,
-                                file: item.primary.url,
-                                unavailableTitle: "No Preview",
-                                unavailableDescription: "Camera Toolkit could not decode a preview for this file.",
-                                zoomCommand: $zoomCommand,
-                                onZoomChange: { zoom in
-                                    if zoom > 1.5 {
-                                        hiResRequest = currentHiResKey
-                                    }
-                                }
-                            )
+                HStack(spacing: 0) {
+                    VStack(spacing: 10) {
+                        header(stack: stack, item: item)
+                        previewPane(stack: stack, item: item)
+                        if stack.items.count > 1 {
+                            filmstrip(stack)
                         }
+                        Text(hintText)
+                            .font(.caption)
+                            .foregroundStyle(.white.opacity(0.6))
                     }
-                    .id(item.primary.path)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .contextMenu {
-                        frameContextMenu(stack, index: min(max(frameIndex, 0), stack.items.count - 1))
+                    if inspectorVisible {
+                        FrameInspectorPanel(
+                            item: item,
+                            photoRecord: framePhotoRecord,
+                            faces: facesOnFrame,
+                            personNames: facePersonNames,
+                            metadata: frameMetadata,
+                            metadataLoaded: frameMetadataLoaded
+                        )
+                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                        .padding(.leading, 10)
+                        .transition(.move(edge: .trailing).combined(with: .opacity))
                     }
-                    if stack.items.count > 1 {
-                        filmstrip(stack)
-                    }
-                    Text(hintText)
-                        .font(.caption)
-                        .foregroundStyle(.white.opacity(0.6))
                 }
+                .animation(.easeInOut(duration: 0.18), value: inspectorVisible)
                 .padding(16)
             }
         }
@@ -1180,6 +1193,12 @@ struct StackPreviewOverlay: View {
         }
         .task(id: "\(item?.primary.path ?? "")#\(itemRotation)") { await load() }
         .task(id: hiResRequest) { await loadHiRes() }
+        // Face rows and EXIF ride their own tasks, detached from `load()` —
+        // the cheap preview paint never waits on the catalog or ImageIO.
+        .task(id: "\(item?.primary.pathKey ?? "")#\(workspace.facesRevision)") {
+            await loadFaceInfo()
+        }
+        .task(id: item?.primary.path) { await loadMetadata() }
     }
 
     private func header(stack: OrganizeStack, item: OrganizeItem) -> some View {
@@ -1204,6 +1223,28 @@ struct StackPreviewOverlay: View {
                 onAssign: { assign(stack, to: $0) },
                 onNewEvent: { onNewEvent(stack) }
             )
+            if item.kind != .video {
+                Button {
+                    tagMode.toggle()
+                    isFocused = true
+                } label: {
+                    Image(systemName: "person.badge.plus")
+                        .font(.system(size: 14, weight: .semibold))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(tagMode ? Color.accentColor : Color.white.opacity(0.8))
+                .help(tagMode ? "Stop drawing face boxes (T)" : "Draw a box on the photo to tag a face (T)")
+            }
+            Button {
+                inspectorVisible.toggle()
+                isFocused = true
+            } label: {
+                Image(systemName: inspectorVisible ? "info.circle.fill" : "info.circle")
+                    .font(.system(size: 15))
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.white.opacity(0.8))
+            .help("Frame info — people, capture time, camera, file (I)")
             if onRotate != nil {
                 Menu {
                     Button { rotate(by: -1) } label: {
@@ -1237,6 +1278,65 @@ struct StackPreviewOverlay: View {
             .buttonStyle(.plain)
             .foregroundStyle(.white.opacity(0.8))
         }
+    }
+
+    /// The zoomable still canvas — or the video pane — plus the face boxes
+    /// keyed to the canvas's reported image frame and the floating tag
+    /// picker. Face rows are read only from the catalog; nothing here waits
+    /// on them before the image paints.
+    private func previewPane(stack: OrganizeStack, item: OrganizeItem) -> some View {
+        Group {
+            if item.kind == .video {
+                videoPane(item)
+            } else {
+                stillPane(item)
+            }
+        }
+        .id(item.primary.path)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .overlay {
+            if item.kind != .video {
+                FaceBoxesOverlay(
+                    faces: facesOnFrame,
+                    personNames: facePersonNames,
+                    rotation: itemRotation,
+                    imageFrame: canvasImageFrame,
+                    onConfirm: { workspace.confirmFace($0.id) },
+                    onTag: { face, rect in
+                        tagRequest = FaceTagRequest(target: .face(face.id), anchor: rect)
+                    }
+                )
+            }
+        }
+        .clipped()
+        .overlay {
+            if let tagRequest {
+                tagPickerLayer(tagRequest)
+            }
+        }
+        .contextMenu {
+            frameContextMenu(stack, index: min(max(frameIndex, 0), stack.items.count - 1))
+        }
+    }
+
+    private func stillPane(_ item: OrganizeItem) -> InteractivePreviewCanvas {
+        InteractivePreviewCanvas(
+            image: displayImage?.image,
+            isLoading: !failed,
+            imageScale: displayImage?.scale ?? 1,
+            file: item.primary.url,
+            unavailableTitle: "No Preview",
+            unavailableDescription: "Camera Toolkit could not decode a preview for this file.",
+            zoomCommand: $zoomCommand,
+            onZoomChange: { zoom in
+                if zoom > 1.5 {
+                    hiResRequest = currentHiResKey
+                }
+            },
+            markupActive: $tagMode,
+            onMarkupRect: { rect in handleMarkupRect(rect) },
+            onImageFrameChange: { frame in canvasImageFrame = frame }
+        )
     }
 
     /// Real playback via AVKit's `AVPlayerView` (wrapped by
@@ -1370,9 +1470,16 @@ struct StackPreviewOverlay: View {
         // Never overlay keys while a text field owns typing — Delete edits
         // the field, it does not trash filmstrip frames.
         guard !KeyboardTextFocus.isTypingInTextField() else { return .ignored }
-        // Close always works, even if the stack vanished under us.
+        // Close always works, even if the stack vanished under us — but a
+        // tag picker or draw mode peels off first.
         if press.key == .escape {
-            stackID = nil
+            if tagRequest != nil {
+                tagRequest = nil
+            } else if tagMode {
+                tagMode = false
+            } else {
+                stackID = nil
+            }
             return .handled
         }
         if press.key == .space {
@@ -1440,6 +1547,14 @@ struct StackPreviewOverlay: View {
                     return .handled
                 case "R":
                     rotate(by: -1)
+                    return .handled
+                case "i", "I":
+                    inspectorVisible.toggle()
+                    return .handled
+                case "t", "T":
+                    if item?.kind != .video {
+                        tagMode.toggle()
+                    }
                     return .handled
                 default:
                     break
@@ -1560,5 +1675,150 @@ struct StackPreviewOverlay: View {
         // source was smaller than the bucket.
         if let image, loaded.width <= image.width { return }
         hiResImage = (key, loaded)
+    }
+
+    // MARK: - Faces and frame metadata
+
+    /// Reads the frame's face rows off the main actor. Lookup is by file
+    /// identity (name + size + modified second) — the same key the scan
+    /// attributes faces to — so boxes survive the file moving into an
+    /// event folder. A file that was never scanned simply yields no rows;
+    /// no detection ever runs here.
+    private func loadFaceInfo() async {
+        guard let item else {
+            facesOnFrame = []
+            framePhotoRecord = nil
+            facePersonNames = [:]
+            return
+        }
+        let file = item.primary
+        let store = workspace.faceStore
+        let result = await Task.detached(priority: .userInitiated) {
+            () -> (FacePhotoRecord?, [FaceRecord], [UUID: String], [FacePerson]) in
+            let records = (try? store.photos(
+                fileName: file.name,
+                byteCount: file.size,
+                modifiedAt: file.modifiedAt
+            )) ?? []
+            let photo = records.first { $0.pathKey == file.pathKey }
+                ?? records.max { $0.scanGrade < $1.scanGrade }
+            let faces = (try? store.faces(
+                fileName: file.name,
+                byteCount: file.size,
+                modifiedAt: file.modifiedAt,
+                preferredPathKey: file.pathKey
+            )) ?? []
+            var names: [UUID: String] = [:]
+            for id in Set(faces.compactMap(\.personID)) {
+                if let person = try? store.person(id) {
+                    names[id] = person.name
+                }
+            }
+            return (photo, faces, names, (try? store.rosterPeople()) ?? [])
+        }.value
+        guard !Task.isCancelled else { return }
+        framePhotoRecord = result.0
+        facesOnFrame = result.1
+        facePersonNames = result.2
+        rosterPeople = result.3
+    }
+
+    /// EXIF for the inspector, read through ImageIO properties on a utility
+    /// queue — never on the paint path.
+    private func loadMetadata() async {
+        guard let item else {
+            frameMetadata = nil
+            frameMetadataLoaded = false
+            return
+        }
+        frameMetadata = nil
+        frameMetadataLoaded = false
+        let url = item.primary.url
+        let isStill = item.kind == .raw || item.kind == .photo
+        let read = await Task.detached(priority: .utility) {
+            isStill ? PhotoMetadataReader.metadata(for: url) : PhotoMetadata()
+        }.value
+        guard !Task.isCancelled else { return }
+        frameMetadata = read
+        frameMetadataLoaded = true
+    }
+
+    /// A markup drag ended: the rect the owner drew (in the rotated display
+    /// space) becomes a stored-space box plus an aligned crop, and the tag
+    /// picker opens at the drawn spot.
+    private func handleMarkupRect(_ normalized: CGRect) {
+        guard item != nil else { return }
+        let storedRect = FaceBoxProjection.unrotatedTopLeftRect(normalized, quarterTurnsCW: itemRotation)
+        let box = FaceBoxProjection.box(ofTopLeftRect: storedRect)
+        var crop: Data?
+        if let decoded = displayImage?.image {
+            let displayedBox = CGRect(
+                x: normalized.minX,
+                y: 1 - normalized.minY - normalized.height,
+                width: normalized.width,
+                height: normalized.height
+            )
+            if let cropped = FaceAligner.boxCrop(decoded, box: displayedBox) {
+                crop = FaceAligner.jpegData(cropped)
+            }
+        }
+        let anchor = CGRect(
+            x: canvasImageFrame.minX + normalized.minX * canvasImageFrame.width,
+            y: canvasImageFrame.minY + normalized.minY * canvasImageFrame.height,
+            width: normalized.width * canvasImageFrame.width,
+            height: normalized.height * canvasImageFrame.height
+        )
+        tagRequest = FaceTagRequest(target: .drawnBox(box, crop: crop), anchor: anchor)
+    }
+
+    /// The floating person picker, dimmed against the canvas and anchored
+    /// near the box it is tagging. Clicks outside dismiss it.
+    private func tagPickerLayer(_ request: FaceTagRequest) -> some View {
+        GeometryReader { geometry in
+            let panelSize = CGSize(width: 240, height: 320)
+            let preferred = CGPoint(x: request.anchor.midX, y: request.anchor.maxY + panelSize.height / 2 + 14)
+            let center = CGPoint(
+                x: min(max(preferred.x, panelSize.width / 2 + 8), geometry.size.width - panelSize.width / 2 - 8),
+                y: min(max(preferred.y, panelSize.height / 2 + 8), geometry.size.height - panelSize.height / 2 - 8)
+            )
+            ZStack {
+                Color.black.opacity(0.001)
+                    .contentShape(Rectangle())
+                    .onTapGesture { tagRequest = nil }
+                FaceTagPicker(
+                    people: rosterPeople,
+                    onPick: { person in applyTag(person) },
+                    onCreate: { name in
+                        if let person = workspace.createRosterPerson(named: name) {
+                            applyTag(person)
+                        }
+                    },
+                    onCancel: { tagRequest = nil }
+                )
+                .position(center)
+            }
+        }
+    }
+
+    /// Applies the picker's choice: an existing face is assigned+confirmed;
+    /// a drawn box becomes a new confirmed catalog face. Both go through
+    /// the store — confirmed faces stay frozen, photos are never rewritten.
+    private func applyTag(_ person: FacePerson) {
+        guard let request = tagRequest else { return }
+        switch request.target {
+        case .face(let faceID):
+            workspace.tagFace(faceID, as: person.id)
+        case .drawnBox(let box, let crop):
+            if let item {
+                workspace.tagDrawnFace(
+                    on: item.primary,
+                    box: box,
+                    personID: person.id,
+                    takenAt: item.captureDate,
+                    crop: crop
+                )
+            }
+        }
+        tagRequest = nil
     }
 }

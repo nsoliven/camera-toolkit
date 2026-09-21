@@ -188,3 +188,66 @@ public enum FaceAligner {
         return CGPoint(x: x / n, y: y / n)
     }
 }
+
+/// Projection between stored face boxes and the space a preview draws in.
+///
+/// `NormalizedFaceBox` is normalized with a bottom-left origin (Vision's
+/// convention, matching what the detector produced). SwiftUI and CoreGraphics
+/// drawing code work in top-left-origin space, and the burst preview may
+/// rotate the decoded image by whole quarter-turns via `DisplayRotation` —
+/// these helpers convert a stored box to the rotated display space and a
+/// hand-drawn rect back to the stored space. Pure math, so it stays
+/// testable away from the views.
+public enum FaceBoxProjection {
+    /// A stored box as a top-left-origin normalized rect.
+    public static func topLeftRect(of box: NormalizedFaceBox) -> CGRect {
+        CGRect(x: box.x, y: 1 - box.y - box.height, width: box.width, height: box.height)
+    }
+
+    /// A top-left-origin normalized rect as a stored box.
+    public static func box(ofTopLeftRect rect: CGRect) -> NormalizedFaceBox {
+        NormalizedFaceBox(
+            x: rect.minX,
+            y: 1 - rect.minY - rect.height,
+            width: rect.width,
+            height: rect.height
+        )
+    }
+
+    /// Rotates a top-left normalized rect `turns` quarter-turns clockwise —
+    /// the same transform `DisplayRotation.rotate` applies to the pixels it
+    /// is drawn over.
+    public static func rotatedTopLeftRect(_ rect: CGRect, quarterTurnsCW turns: Int) -> CGRect {
+        switch DisplayRotation.normalized(turns) {
+        case 1:
+            return CGRect(
+                x: 1 - rect.minY - rect.height,
+                y: rect.minX,
+                width: rect.height,
+                height: rect.width
+            )
+        case 2:
+            return CGRect(
+                x: 1 - rect.minX - rect.width,
+                y: 1 - rect.minY - rect.height,
+                width: rect.width,
+                height: rect.height
+            )
+        case 3:
+            return CGRect(
+                x: rect.minY,
+                y: 1 - rect.minX - rect.width,
+                width: rect.height,
+                height: rect.width
+            )
+        default:
+            return rect
+        }
+    }
+
+    /// Inverse of `rotatedTopLeftRect`: the stored-space rect behind a rect
+    /// the owner drew on the rotated display.
+    public static func unrotatedTopLeftRect(_ rect: CGRect, quarterTurnsCW turns: Int) -> CGRect {
+        rotatedTopLeftRect(rect, quarterTurnsCW: -turns)
+    }
+}
