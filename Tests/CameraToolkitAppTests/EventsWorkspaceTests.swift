@@ -1046,6 +1046,168 @@ final class EventsWorkspaceTests: XCTestCase {
         }
     }
 
+    /// "Not this person" is a real move: the face leaves the person
+    /// immediately, lands in an unnamed group, and `facesRevision` bumps
+    /// so the open People grid and Unsure list re-read. The persisted
+    /// verdict keeps it off the person through a later Re-match.
+    func testRejectFaceMovesItOutImmediatelyAndStaysOut() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let catalog = root.appendingPathComponent("catalog.sqlite")
+            _ = try CatalogStore(url: catalog).bootstrap(
+                configuration: model.configuration,
+                createBackup: false,
+                createLibraryFolders: false
+            )
+            let store = workspace.faceStore
+            let dad = try store.createPerson(name: "Dad", isRoster: true)
+            let photo = FacePhotoRecord(
+                pathKey: EventStorageLocations.pathKey("/Card/DCIM/RJ1.JPG"),
+                path: "/Card/DCIM/RJ1.JPG",
+                fileName: "RJ1.JPG",
+                byteCount: 4_096,
+                modifiedAt: Date(timeIntervalSince1970: 1_752_000_000),
+                scanGrade: .med
+            )
+            let face = FaceRecord(
+                photoID: photo.pathKey,
+                personID: dad.id,
+                box: NormalizedFaceBox(x: 0.1, y: 0.1, width: 0.2, height: 0.2),
+                detScore: 0.9,
+                embedding: [0.5, 0.5],
+                state: .proposed
+            )
+            try store.replaceFaces(photo: photo, faces: [face])
+
+            workspace.rejectFace(face.id)
+
+            XCTAssertEqual(workspace.facesRevision, 1)
+            let moved = try XCTUnwrap(store.face(id: face.id))
+            XCTAssertEqual(moved.state, .other)
+            let group = try XCTUnwrap(moved.personID.flatMap { try? store.person($0) })
+            XCTAssertFalse(group.isRoster)
+            XCTAssertTrue(model.statusMessage.contains("Dad"))
+            XCTAssertTrue(try store.faceRejections().blocks(faceID: face.id, personID: dad.id))
+
+            // Re-match can never put the face back on Dad.
+            workspace.rematchFaces()
+            try await waitUntil { !model.isBusy }
+            let after = try XCTUnwrap(store.face(id: face.id))
+            XCTAssertNotEqual(after.personID, dad.id)
+            XCTAssertEqual(after.state, .other)
+        }
+    }
+
+    /// Re-match runs with unnamed groups and no roster at all: a drifted
+    /// drawer of two identities splits into real groups, the job is
+    /// tracked, and the status line reports the moves.
+    func testRematchFacesRebundlesUnnamedGroupsWithoutRoster() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let catalog = root.appendingPathComponent("catalog.sqlite")
+            _ = try CatalogStore(url: catalog).bootstrap(
+                configuration: model.configuration,
+                createBackup: false,
+                createLibraryFolders: false
+            )
+            let store = workspace.faceStore
+            let drawer = try store.createPerson(name: "Person 27", isRoster: false)
+            let photo = FacePhotoRecord(
+                pathKey: EventStorageLocations.pathKey("/Card/DCIM/RB1.JPG"),
+                path: "/Card/DCIM/RB1.JPG",
+                fileName: "RB1.JPG",
+                byteCount: 4_096,
+                modifiedAt: Date(timeIntervalSince1970: 1_752_000_000),
+                scanGrade: .med
+            )
+            // Two near-orthogonal identities shoved into one group.
+            let a = FaceRecord(
+                photoID: photo.pathKey,
+                box: NormalizedFaceBox(x: 0.1, y: 0.1, width: 0.2, height: 0.2),
+                detScore: 0.9,
+                embedding: [1, 0],
+                state: .cached
+            )
+            let b = FaceRecord(
+                photoID: photo.pathKey,
+                box: NormalizedFaceBox(x: 0.5, y: 0.1, width: 0.2, height: 0.2),
+                detScore: 0.8,
+                embedding: [0, 1],
+                state: .cached
+            )
+            try store.replaceFaces(photo: photo, faces: [a, b])
+            try store.assignFace(a.id, to: drawer.id, state: .other, score: 0.9)
+            try store.assignFace(b.id, to: drawer.id, state: .other, score: 0.9)
+
+            workspace.rematchFaces()
+            try await waitUntil { !model.isBusy }
+
+            let job = try XCTUnwrap(model.jobs.first { $0.action == .faceScan })
+            XCTAssertEqual(job.state, .done)
+            XCTAssertEqual(workspace.facesRevision, 1)
+            XCTAssertNotEqual(try store.face(id: a.id)?.personID, try store.face(id: b.id)?.personID)
+            XCTAssertTrue(model.statusMessage.contains("Re-match done"))
+            XCTAssertTrue(model.statusMessage.contains("moved"))
+        }
+    }
+
+    /// Junk removes only the group the user confirmed — the neighboring
+    /// group and its faces stay, photos keep their scan grade, and named
+    /// people refuse the junk path entirely.
+    func testJunkGroupRemovesOnlyTheConfirmedGroup() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let catalog = root.appendingPathComponent("catalog.sqlite")
+            _ = try CatalogStore(url: catalog).bootstrap(
+                configuration: model.configuration,
+                createBackup: false,
+                createLibraryFolders: false
+            )
+            let store = workspace.faceStore
+            let junk = try store.createPerson(name: "Person 3", isRoster: false)
+            let keep = try store.createPerson(name: "Person 4", isRoster: false)
+            let photoA = FacePhotoRecord(
+                pathKey: EventStorageLocations.pathKey("/Card/DCIM/JK1.JPG"),
+                path: "/Card/DCIM/JK1.JPG",
+                fileName: "JK1.JPG",
+                byteCount: 4_096,
+                modifiedAt: Date(timeIntervalSince1970: 1_752_000_000),
+                scanGrade: .med
+            )
+            let photoB = FacePhotoRecord(
+                pathKey: EventStorageLocations.pathKey("/Card/DCIM/JK2.JPG"),
+                path: "/Card/DCIM/JK2.JPG",
+                fileName: "JK2.JPG",
+                byteCount: 4_096,
+                modifiedAt: Date(timeIntervalSince1970: 1_752_000_000),
+                scanGrade: .med
+            )
+            let box = NormalizedFaceBox(x: 0.1, y: 0.1, width: 0.2, height: 0.2)
+            let junkFace = FaceRecord(photoID: photoA.pathKey, personID: junk.id, box: box, detScore: 0.9, embedding: [0.5, 0.5], state: .other)
+            let keepFace = FaceRecord(photoID: photoB.pathKey, personID: keep.id, box: box, detScore: 0.9, embedding: [0.5, 0.5], state: .other)
+            try store.replaceFaces(photo: photoA, faces: [junkFace])
+            try store.replaceFaces(photo: photoB, faces: [keepFace])
+
+            workspace.junkGroup(junk.id)
+
+            XCTAssertEqual(workspace.facesRevision, 1)
+            XCTAssertNil(try store.person(junk.id))
+            XCTAssertNil(try store.face(id: junkFace.id))
+            XCTAssertNotNil(try store.person(keep.id))
+            XCTAssertEqual(try store.face(id: keepFace.id)?.personID, keep.id)
+            XCTAssertTrue(model.statusMessage.contains("Person 3"))
+            XCTAssertEqual(
+                try store.photos(pathKeys: [photoB.pathKey])[photoB.pathKey]?.scanGrade,
+                .med
+            )
+
+            // A named person refuses the junk path — no group is removed
+            // and nothing else moves.
+            let dad = try store.createPerson(name: "Dad", isRoster: true)
+            workspace.junkGroup(dad.id)
+            XCTAssertNotNil(try store.person(dad.id))
+            XCTAssertEqual(workspace.facesRevision, 1)
+            XCTAssertTrue(model.statusMessage.contains("named person"))
+        }
+    }
+
     func testBoardSearchMatchesRosterPersonNames() async throws {
         try await withOrganizerSandbox { root, model, workspace in
             let unsorted = root.appendingPathComponent("Card", isDirectory: true)

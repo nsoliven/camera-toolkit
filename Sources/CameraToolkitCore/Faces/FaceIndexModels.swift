@@ -225,6 +225,34 @@ public struct FaceRecord: Identifiable, Equatable, Sendable {
     }
 }
 
+/// Persisted "not this person" / "not this group" verdicts, indexed for
+/// the match and group passes. A rejected face can never be assigned back
+/// to that person (`blocks`), and its embedding doubles as a negative
+/// example: a candidate closer to a rejected face than to the person's
+/// own templates or group centroid is vetoed (`vetoes`). Rejections die
+/// only with the face or person row — Clear Face Scan wipes the table.
+public struct FaceRejectionIndex: Sendable {
+    /// face id → the persons it must never be assigned to.
+    public var personIDsByFaceID: [UUID: Set<UUID>] = [:]
+    /// person id → embeddings of faces rejected from it.
+    public var embeddingsByPersonID: [UUID: [[Float]]] = [:]
+
+    public init() {}
+
+    /// True when this face may never be assigned to this person.
+    public func blocks(faceID: UUID, personID: UUID) -> Bool {
+        personIDsByFaceID[faceID]?.contains(personID) ?? false
+    }
+
+    /// True when `embedding` is closer to one of the person's rejected
+    /// faces than `score` — the cheap negative check that keeps rejected
+    /// looks from re-seeding a person or joining a group, no model needed.
+    public func vetoes(_ embedding: [Float], personID: UUID, score: Float) -> Bool {
+        guard let rejected = embeddingsByPersonID[personID] else { return false }
+        return rejected.contains { FaceEmbeddingMath.cosine(embedding, $0) > score }
+    }
+}
+
 /// A named roster person or an unnamed "Other" group. `isRoster == false`
 /// marks an auto-created cluster the user may name, merge, or junk.
 public struct FacePerson: Identifiable, Equatable, Sendable {
@@ -421,6 +449,12 @@ public struct FaceScanReport: Equatable, Sendable {
     /// Burst members covered by a sibling's sample — stamped at the
     /// executed grade without being decoded.
     public var photosBurstCovered: Int = 0
+    /// Faces whose assigned person changed in the match/group pass — the
+    /// "did anything actually move" count the Re-match status line shows.
+    public var facesMoved: Int = 0
+    /// Auto "Person N" groups the rebundle dissolved outright — rows left
+    /// with no faces after their members re-pooled.
+    public var groupsDissolved: Int = 0
     /// The detector packages that ran — e.g. "det_10g 640/960/1024" — for
     /// the Jobs log, which may name packages. Nil on the Vision path.
     public var detectorSummary: String?
