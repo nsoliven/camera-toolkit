@@ -218,11 +218,194 @@ public final class FaceIndexStore: @unchecked Sendable {
     /// Faces on a photo that may still move — everything but confirmed.
     public func faces(photoID: String) throws -> [FaceRecord] {
         try database().read { database in
+            try faces(photoID: photoID, database: database)
+        }
+    }
+
+    private func faces(photoID: String, database: Database) throws -> [FaceRecord] {
+        try Row.fetchAll(
+            database,
+            sql: "\(Self.faceSelect) WHERE f.photo_id = ? ORDER BY f.det_score DESC",
+            arguments: [photoID]
+        ).map { Self.faceRecord($0) }
+    }
+
+    /// Photo rows matching a file's identity — name + byte count + modified
+    /// second, the same key `fileKey` composes — regardless of where the
+    /// file sits now. This is the lookup that keeps faces attached when a
+    /// file moves between the unsorted folder and an event folder.
+    public func photos(fileName: String, byteCount: Int64, modifiedAt: Date) throws -> [FacePhotoRecord] {
+        try database().read { database in
             try Row.fetchAll(
                 database,
-                sql: "\(Self.faceSelect) WHERE f.photo_id = ? ORDER BY f.det_score DESC",
-                arguments: [photoID]
-            ).map { Self.faceRecord($0) }
+                sql: "SELECT * FROM face_photos WHERE file_name = ? AND byte_count = ?",
+                arguments: [fileName, byteCount]
+            )
+            .map(Self.photoRecord)
+            .filter { abs($0.modifiedAt.timeIntervalSince(modifiedAt)) < 1 }
+        }
+    }
+
+    /// Faces on a photo looked up by file identity instead of path, so a
+    /// file scanned in the unsorted folder keeps its faces after moving
+    /// into an event folder. When several photo rows share the identity —
+    /// the same file scanned under different paths — the rows merge and
+    /// overlapping boxes dedupe with the rescan's IoU rule: confirmed faces
+    /// always win an overlap (a confirmed tag is never shadowed by a bare
+    /// re-detection), then `preferredPathKey`'s row.
+    public func faces(
+        fileName: String,
+        byteCount: Int64,
+        modifiedAt: Date,
+        preferredPathKey: String? = nil
+    ) throws -> [FaceRecord] {
+        let records = try photos(fileName: fileName, byteCount: byteCount, modifiedAt: modifiedAt)
+        let ordered = records.sorted { lhs, rhs in
+            let leftPreferred = lhs.pathKey == preferredPathKey
+            let rightPreferred = rhs.pathKey == preferredPathKey
+            if leftPreferred != rightPreferred { return leftPreferred }
+            if lhs.scanGrade != rhs.scanGrade { return lhs.scanGrade > rhs.scanGrade }
+            return lhs.faceCount > rhs.faceCount
+        }
+        var stream: [FaceRecord] = []
+        for record in ordered {
+            stream.append(contentsOf: try faces(photoID: record.pathKey))
+        }
+        // Confirmed faces merge first so they claim overlaps before any
+        // unconfirmed duplicate of the same detection.
+        let deduped = stream.filter { $0.state == .confirmed }
+        var faces = deduped
+        for face in stream where face.state != .confirmed {
+            let duplicate = faces.contains { existing in
+                existing.box.iou(with: face.box) > 0.5
+            }
+            if !duplicate { faces.append(face) }
+        }
+        return faces
+    }
+
+    /// Inserts a face the owner placed by hand. Manual tags are `confirmed`
+    /// from the start — frozen like any confirmed face, so no rescan or
+    /// re-match reclassifies them. The photo row is created at grade
+    /// `.none` when the file was never scanned; an existing row keeps its
+    /// scan grade and refreshes its location/identity. When the row's
+    /// recorded bytes no longer match the file, stale non-confirmed
+    /// detections are dropped — the same rule `markCovered` applies.
+    ///
+    /// A box drawn over an existing detection claims it instead of
+    /// inserting a duplicate: an unconfirmed face is promoted to confirmed
+    /// (keeping its embedding and crop); an already-confirmed face is
+    /// frozen and returned untouched.
+    @discardableResult
+    public func addManualFace(
+        photo: FacePhotoRecord,
+        box: NormalizedFaceBox,
+        personID: UUID,
+        crop: Data? = nil
+    ) throws -> FaceRecord {
+        let formatter = Self.formatter()
+        let now = formatter.string(from: Date())
+        return try database().write { database -> FaceRecord in
+            let stale = try Row.fetchOne(
+                database,
+                sql: "SELECT byte_count, modified_at FROM face_photos WHERE path_key = ?",
+                arguments: [photo.pathKey]
+            ).map { row -> Bool in
+                let size: Int64 = row["byte_count"]
+                let stamp: String = row["modified_at"]
+                return size != photo.byteCount
+                    || abs((formatter.date(from: stamp) ?? .distantPast).timeIntervalSince(photo.modifiedAt)) >= 1
+            } ?? false
+            if stale {
+                try database.execute(
+                    sql: "DELETE FROM faces WHERE photo_id = ? AND state != 'confirmed'",
+                    arguments: [photo.pathKey]
+                )
+            }
+            try database.execute(
+                sql: """
+                INSERT INTO face_photos(
+                    path_key, path, file_name, byte_count, modified_at,
+                    taken_at, scan_grade, face_count, indexed_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'none', 0, ?, ?)
+                ON CONFLICT(path_key) DO UPDATE SET
+                    path = excluded.path,
+                    file_name = excluded.file_name,
+                    byte_count = excluded.byte_count,
+                    modified_at = excluded.modified_at,
+                    taken_at = COALESCE(excluded.taken_at, face_photos.taken_at),
+                    updated_at = excluded.updated_at
+                """,
+                arguments: [
+                    photo.pathKey,
+                    photo.path,
+                    photo.fileName,
+                    photo.byteCount,
+                    Self.timestamp(photo.modifiedAt, formatter),
+                    photo.takenAt.map { Self.timestamp($0, formatter) },
+                    now,
+                    now,
+                ]
+            )
+            let overlapping = try faces(photoID: photo.pathKey, database: database)
+            // Same overlap rule replaceFaces uses for confirmed faces.
+            func overlaps(_ face: FaceRecord) -> Bool {
+                face.box.iou(with: box) > 0.5
+            }
+            if let confirmed = overlapping.first(where: { $0.state == .confirmed && overlaps($0) }) {
+                return confirmed
+            }
+            if let promotable = overlapping
+                .filter({ $0.state != .confirmed && overlaps($0) })
+                .max(by: { $0.box.iou(with: box) < $1.box.iou(with: box) }) {
+                try database.execute(
+                    sql: "UPDATE faces SET person_id = ?, state = 'confirmed', updated_at = ? WHERE id = ?",
+                    arguments: [personID.uuidString, now, promotable.id.uuidString]
+                )
+                return FaceRecord(
+                    id: promotable.id,
+                    photoID: photo.pathKey,
+                    personID: personID,
+                    box: promotable.box,
+                    detScore: promotable.detScore,
+                    matchScore: promotable.matchScore,
+                    embedding: promotable.embedding,
+                    crop: promotable.crop,
+                    model: promotable.model,
+                    state: .confirmed,
+                    scanGrade: promotable.scanGrade,
+                    photoPath: photo.path
+                )
+            }
+            let face = FaceRecord(
+                photoID: photo.pathKey,
+                personID: personID,
+                box: box,
+                detScore: 1,
+                crop: crop,
+                model: "manual",
+                state: .confirmed,
+                scanGrade: .none,
+                photoPath: photo.path
+            )
+            try insertFace(face, database: database, now: now, formatter: formatter)
+            try database.execute(
+                sql: """
+                UPDATE face_photos SET face_count = (
+                    SELECT COUNT(*) FROM faces WHERE faces.photo_id = face_photos.path_key
+                ) WHERE path_key = ?
+                """,
+                arguments: [photo.pathKey]
+            )
+            try database.execute(
+                sql: """
+                UPDATE people SET face_count = (
+                    SELECT COUNT(*) FROM faces WHERE person_id = ?
+                ) WHERE id = ?
+                """,
+                arguments: [personID.uuidString, personID.uuidString]
+            )
+            return face
         }
     }
 
