@@ -228,18 +228,42 @@ public struct FaceIndexService: Sendable {
     ) throws {
         let options = self.options
         let total = pending.count
-        progress?(FileOperationProgress(phase: "Detecting faces", processedFiles: 0, totalFiles: total))
+        let totalBytes = pending.reduce(Int64(0)) { $0 + $1.primary.size }
+        let telemetry = FaceScanTelemetry()
+        let models = Self.telemetryModels(engine: engine, embedder: embedder)
+        let facts = Self.telemetryFacts(for: options)
+        // Stable for the whole parallel pass — it was decided when pending
+        // was split — so a let keeps the Sendable emit closure honest.
+        let skipped = report.photosSkipped
+        func snapshot() -> JobTelemetry {
+            telemetry.snapshot(skipped: skipped, models: models, facts: facts)
+        }
+        progress?(FileOperationProgress(
+            phase: "Detecting faces",
+            processedFiles: 0,
+            totalFiles: total,
+            totalBytes: totalBytes,
+            telemetry: snapshot()
+        ))
         let store = self.store
         let items = pending
         let results = OrganizeScanner.parallelMap(
             count: total,
             width: options.concurrency,
             onCompleted: { completed in
-                if completed == total || completed % 5 == 0 {
+                if telemetry.shouldEmit(force: completed == total) {
                     progress?(FileOperationProgress(
                         phase: "Detecting faces",
                         processedFiles: completed,
-                        totalFiles: total
+                        totalFiles: total,
+                        processedBytes: telemetry.totalBytesRead,
+                        totalBytes: totalBytes,
+                        bytesPerSecond: telemetry.bytesPerSecond,
+                        telemetry: telemetry.snapshot(
+                            skipped: skipped,
+                            models: models,
+                            facts: facts
+                        )
                     ))
                 }
             },
@@ -247,10 +271,12 @@ public struct FaceIndexService: Sendable {
                 autoreleasepool {
                     Self.processItem(
                         items[index],
+                        token: index,
                         options: options,
                         detector: engine,
                         embedder: embedder,
-                        store: store
+                        store: store,
+                        telemetry: telemetry
                     )
                 }
             }
@@ -287,7 +313,56 @@ public struct FaceIndexService: Sendable {
             report.photosBurstCovered += 1
         }
 
-        try matchAndGroup(report: &report, progress: progress)
+        try matchAndGroup(
+            report: &report,
+            progress: progress,
+            telemetry: telemetry,
+            models: models,
+            facts: facts
+        )
+    }
+
+    /// The engine/embedder identities the Jobs debug pane lists — actual
+    /// package names, not marketing labels: SCRFD's converted files per
+    /// installed input size, the ArcFace package, or the concrete stub type
+    /// when a test double stands in.
+    private static func telemetryModels(
+        engine: FaceDetecting,
+        embedder: FaceEmbeddingProviding
+    ) -> [String] {
+        var models: [String] = []
+        if let scrfd = engine as? SCRFDDetector {
+            models.append(contentsOf: scrfd.nativeInputSizes.map {
+                FaceModelCatalog.detectorFileName(size: $0)
+            })
+        } else if engine is VisionDetector {
+            models.append("Apple Vision (VNDetectFaceLandmarks)")
+        } else {
+            models.append(String(describing: type(of: engine)))
+        }
+        models.append(
+            embedder is ArcFaceEmbedder
+                ? FaceModelCatalog.modelFileName
+                : String(describing: type(of: embedder))
+        )
+        return models
+    }
+
+    /// How this pass is configured — the mode, worker width, and the
+    /// thresholds that change what it reads.
+    private static func telemetryFacts(for options: FaceScanOptions) -> [String] {
+        var facts = [
+            options.mode.rawValue.uppercased(),
+            options.fast ? "FAST · \(options.concurrency) workers" : "Quiet · \(options.concurrency) workers",
+            "min face \(Int(options.minimumFacePixels)) px",
+        ]
+        if options.detectorKind == .scrfd {
+            facts.append("scales \(options.detectorScales.map(String.init).joined(separator: "/"))")
+        }
+        if let stride = options.videoFrameStride, options.scansVideo {
+            facts.append("video every \(Int(stride)) s")
+        }
+        return facts
     }
 
     /// The frames a burst actually scans: every frame of a small burst,
@@ -304,7 +379,12 @@ public struct FaceIndexService: Sendable {
     /// ML runs.
     public func rematchRoster(progress: FileOperationProgressHandler? = nil) throws {
         var report = FaceScanReport()
-        try matchAndGroup(report: &report, progress: progress)
+        try matchAndGroup(
+            report: &report,
+            progress: progress,
+            telemetry: FaceScanTelemetry(),
+            facts: ["Vectors only — no decode, no ML"]
+        )
     }
 
     /// Sends faces back through the grouping pass — used when a face is
@@ -339,15 +419,18 @@ public struct FaceIndexService: Sendable {
 
     private static func processItem(
         _ item: OrganizeItem,
+        token: Int,
         options: FaceScanOptions,
         detector: FaceDetecting,
         embedder: FaceEmbeddingProviding,
-        store: FaceIndexStore
+        store: FaceIndexStore,
+        telemetry: FaceScanTelemetry?
     ) -> PhotoOutcome {
+        telemetry?.begin(token, file: item.primary)
         if item.kind == .video {
-            return processVideo(item, options: options, detector: detector, embedder: embedder, store: store)
+            return processVideo(item, token: token, options: options, detector: detector, embedder: embedder, store: store, telemetry: telemetry)
         }
-        return processPhoto(item, options: options, detector: detector, embedder: embedder, store: store)
+        return processPhoto(item, token: token, options: options, detector: detector, embedder: embedder, store: store, telemetry: telemetry)
     }
 
     /// Detect → align → embed for every face on one image. Shared by still
@@ -357,10 +440,13 @@ public struct FaceIndexService: Sendable {
         _ image: CGImage,
         pixelSize: CGSize,
         file: OrganizeFile,
+        token: Int,
         options: FaceScanOptions,
         detector: FaceDetecting,
-        embedder: FaceEmbeddingProviding
+        embedder: FaceEmbeddingProviding,
+        telemetry: FaceScanTelemetry?
     ) -> [FaceRecord] {
+        telemetry?.step(token, .detect)
         let detections = detector.detect(
             in: image,
             imagePixelSize: pixelSize,
@@ -368,14 +454,16 @@ public struct FaceIndexService: Sendable {
         )
         var faces: [FaceRecord] = []
         for detection in detections {
+            telemetry?.step(token, .align)
             let aligned: CGImage?
             if let landmarks = detection.landmarks {
                 aligned = FaceAligner.alignedImage(image, landmarks: landmarks)
             } else {
                 aligned = FaceAligner.boxCrop(image, box: detection.boundingBox)
             }
-            guard let aligned,
-                  let embedding = try? embedder.embed(aligned) else { continue }
+            guard let aligned else { continue }
+            telemetry?.step(token, .embed)
+            guard let embedding = try? embedder.embed(aligned) else { continue }
             faces.append(FaceRecord(
                 photoID: file.pathKey,
                 box: NormalizedFaceBox(
@@ -397,16 +485,20 @@ public struct FaceIndexService: Sendable {
 
     private static func processPhoto(
         _ item: OrganizeItem,
+        token: Int,
         options: FaceScanOptions,
         detector: FaceDetecting,
         embedder: FaceEmbeddingProviding,
-        store: FaceIndexStore
+        store: FaceIndexStore,
+        telemetry: FaceScanTelemetry?
     ) -> PhotoOutcome {
         let file = item.primary
         let url = file.url
         guard let image = FaceImageDecoder.detectionImage(for: url, maximumPixelSize: options.detectPixels) else {
+            telemetry?.finish(token, faces: 0, videoFramesRead: 0, failed: true)
             return .failed
         }
+        telemetry?.noteReadBytes(file.size)
         let fullSize = FaceImageDecoder.pixelSize(of: url)
             ?? CGSize(width: image.width, height: image.height)
 
@@ -414,11 +506,14 @@ public struct FaceIndexService: Sendable {
             image,
             pixelSize: fullSize,
             file: file,
+            token: token,
             options: options,
             detector: detector,
-            embedder: embedder
+            embedder: embedder,
+            telemetry: telemetry
         )
 
+        telemetry?.step(token, .write)
         let photo = FacePhotoRecord(
             pathKey: file.pathKey,
             path: file.path,
@@ -430,8 +525,10 @@ public struct FaceIndexService: Sendable {
             faceCount: faces.count
         )
         guard (try? store.replaceFaces(photo: photo, faces: faces)) != nil else {
+            telemetry?.finish(token, faces: 0, videoFramesRead: 0, failed: true)
             return .failed
         }
+        telemetry?.finish(token, faces: faces.count, videoFramesRead: 0, failed: false)
         return .processed(faces: faces.count, videoFrames: 0)
     }
 
@@ -441,14 +538,17 @@ public struct FaceIndexService: Sendable {
     /// about who was there, not how long they were on screen.
     private static func processVideo(
         _ item: OrganizeItem,
+        token: Int,
         options: FaceScanOptions,
         detector: FaceDetecting,
         embedder: FaceEmbeddingProviding,
-        store: FaceIndexStore
+        store: FaceIndexStore,
+        telemetry: FaceScanTelemetry?
     ) -> PhotoOutcome {
         let file = item.primary
         guard let stride = options.videoFrameStride,
               let sampler = FaceVideoSampler(url: file.url, maximumPixelSize: options.detectPixels) else {
+            telemetry?.finish(token, faces: 0, videoFramesRead: 0, failed: true)
             return .failed
         }
         let times = FaceVideoSampler.sampleTimes(
@@ -456,23 +556,36 @@ public struct FaceIndexService: Sendable {
             stride: stride,
             maxFrames: options.maximumVideoFrames
         )
-        guard !times.isEmpty else { return .failed }
+        guard !times.isEmpty else {
+            telemetry?.finish(token, faces: 0, videoFramesRead: 0, failed: true)
+            return .failed
+        }
 
+        // Frame sampling seeks, it does not stream: charge each decoded
+        // frame for the share of the clip it spans (≈ stride/duration of
+        // the file) so the read-rate stays an honest estimate.
+        let bytesPerFrame = Int64(
+            Double(file.size) * min(1, stride / max(sampler.duration, 0.001))
+        )
         let nativeSize = sampler.pixelSize.width > 0 ? sampler.pixelSize : nil
         var faces: [FaceRecord] = []
         var keptEmbeddings: [[Float]] = []
         var framesRead = 0
         for time in times {
+            telemetry?.step(token, .decode)
             guard let frame = sampler.frame(at: time) else { continue }
             framesRead += 1
+            telemetry?.noteReadBytes(bytesPerFrame)
             let size = nativeSize ?? CGSize(width: frame.width, height: frame.height)
             for face in facesOnImage(
                 frame,
                 pixelSize: size,
                 file: file,
+                token: token,
                 options: options,
                 detector: detector,
-                embedder: embedder
+                embedder: embedder,
+                telemetry: telemetry
             ) {
                 if let embedding = face.embedding,
                    keptEmbeddings.contains(where: {
@@ -485,6 +598,7 @@ public struct FaceIndexService: Sendable {
             }
         }
 
+        telemetry?.step(token, .write)
         let photo = FacePhotoRecord(
             pathKey: file.pathKey,
             path: file.path,
@@ -496,8 +610,10 @@ public struct FaceIndexService: Sendable {
             faceCount: faces.count
         )
         guard (try? store.replaceFaces(photo: photo, faces: faces)) != nil else {
+            telemetry?.finish(token, faces: 0, videoFramesRead: framesRead, failed: true)
             return .failed
         }
+        telemetry?.finish(token, faces: faces.count, videoFramesRead: framesRead, failed: false)
         return .processed(faces: faces.count, videoFrames: framesRead)
     }
 
@@ -505,14 +621,27 @@ public struct FaceIndexService: Sendable {
 
     private func matchAndGroup(
         report: inout FaceScanReport,
-        progress: FileOperationProgressHandler?
+        progress: FileOperationProgressHandler?,
+        telemetry: FaceScanTelemetry? = nil,
+        models: [String] = [],
+        facts: [String] = []
     ) throws {
         let faces = try store.matchableFaces()
-        progress?(FileOperationProgress(
-            phase: "Matching people",
-            processedFiles: 0,
-            totalFiles: faces.count
-        ))
+        let skipped = report.photosSkipped
+        telemetry?.enterStage("Match")
+        func matchProgress(_ processed: Int) -> FileOperationProgress {
+            FileOperationProgress(
+                phase: "Matching people",
+                processedFiles: processed,
+                totalFiles: faces.count,
+                telemetry: telemetry?.snapshot(
+                    skipped: skipped,
+                    models: models,
+                    facts: facts
+                )
+            )
+        }
+        progress?(matchProgress(0))
         let templates = try store.rosterTemplates()
         var unmatched: [FaceRecord] = []
         for (index, face) in faces.enumerated() {
@@ -520,6 +649,7 @@ public struct FaceIndexService: Sendable {
             if let match = Self.bestMatch(embedding, templates: templates, threshold: options.matchThreshold) {
                 try store.assignFace(face.id, to: match.personID, state: .proposed, score: Double(match.score))
                 report.facesProposed += 1
+                telemetry?.noteMatch()
             } else if let personID = face.personID,
                       let person = try store.person(personID), person.isRoster {
                 // A proposal that no longer holds returns to the pool.
@@ -530,23 +660,36 @@ public struct FaceIndexService: Sendable {
             }
             // Faces already in an Other group keep their grouping.
             if index % 200 == 0 {
-                progress?(FileOperationProgress(
-                    phase: "Matching people",
-                    processedFiles: index,
-                    totalFiles: faces.count
-                ))
+                progress?(matchProgress(index))
             }
         }
 
+        telemetry?.enterStage("Group")
         progress?(FileOperationProgress(
             phase: "Grouping faces",
             processedFiles: 0,
-            totalFiles: unmatched.count
+            totalFiles: unmatched.count,
+            telemetry: telemetry?.snapshot(
+                skipped: skipped,
+                models: models,
+                facts: facts
+            )
         ))
         let grouped = try assignToGroups(unmatched, options: options)
+        telemetry?.noteGrouped(assigned: grouped.assigned, groupsCreated: grouped.created)
         report.facesGrouped = grouped.assigned
         report.groupsCreated = grouped.created
         try store.refreshFaceCounts()
+        progress?(FileOperationProgress(
+            phase: "Grouping faces",
+            processedFiles: unmatched.count,
+            totalFiles: unmatched.count,
+            telemetry: telemetry?.snapshot(
+                skipped: skipped,
+                models: models,
+                facts: facts
+            )
+        ))
     }
 
     /// Best roster template for an embedding, or nil below the threshold.

@@ -42,6 +42,13 @@ private struct TransferQueueView: View {
     @Bindable var model: DashboardModel
     @State private var showingSpeedGuide = false
     @State private var showingSourceCleanup = false
+    /// A row the owner tapped wins over the default — otherwise the
+    /// currently running job expands itself.
+    @State private var inspectedJobID: UUID?
+    /// Live jobs the owner deliberately collapsed stay collapsed until the
+    /// next job starts.
+    @State private var dismissedLiveJobIDs: Set<UUID> = []
+    @State private var monitor = JobActivityMonitor()
 
     var body: some View {
         Group {
@@ -64,6 +71,14 @@ private struct TransferQueueView: View {
             maxHeight: .infinity
         )
         .background(Color(nsColor: .controlBackgroundColor))
+        .onChange(of: firstLiveJobID) { _, newID in
+            // Follow the job that is actually running; a finished job's
+            // pane collapses and stays reachable by tapping its row.
+            inspectedJobID = nil
+            if let newID {
+                dismissedLiveJobIDs.remove(newID)
+            }
+        }
     }
 
     private func queueContent(_ queue: TransferQueueSnapshot) -> some View {
@@ -136,72 +151,129 @@ private struct TransferQueueView: View {
 
     /// Every background job this session — transfers, organize work, burst
     /// regrouping, face scans — newest first. The single-job gate keeps at
-    /// most one running.
+    /// most one running; that job's row opens into the activity pane on
+    /// its own, and any row can be tapped open for its final counters.
     private var jobsSection: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Text("JOBS")
-                .font(.caption2.weight(.bold))
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 16)
-                .padding(.vertical, 8)
+        let jobs = Array(model.jobs.prefix(30))
+        let anyExpanded = jobs.contains(where: isExpanded)
+        return VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 8) {
+                Text("JOBS")
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(.secondary)
+                if let step = jobs.first(where: isExpanded)?.telemetry?.step {
+                    Text(step.uppercased())
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.tertiary)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
 
             ScrollView {
                 LazyVStack(spacing: 0) {
-                    ForEach(Array(model.jobs.prefix(30))) { job in
+                    ForEach(jobs) { job in
                         jobRow(job)
-                        if job.id != model.jobs.prefix(30).last?.id {
+                        if isExpanded(job) {
+                            JobActivityDetail(job: job, monitor: monitor)
+                        }
+                        if job.id != jobs.last?.id {
                             Divider().padding(.leading, 48)
                         }
                     }
                 }
             }
-            .frame(maxHeight: model.transferQueue == nil ? .infinity : 150)
+            .frame(maxHeight: model.transferQueue == nil ? .infinity : (anyExpanded ? 340 : 150))
         }
         .background(Color(nsColor: .textBackgroundColor))
     }
 
-    private func jobRow(_ job: JobSnapshot) -> some View {
-        HStack(spacing: 12) {
-            Image(systemName: jobSymbol(job))
-                .font(.system(size: 15, weight: .medium))
-                .foregroundStyle(jobColor(job.state))
-                .frame(width: 24, height: 24)
+    private var firstLiveJobID: UUID? {
+        model.jobs.first { $0.state == .running || $0.state == .queued }?.id
+    }
 
-            VStack(alignment: .leading, spacing: 3) {
-                Text(job.action.displayName)
-                    .font(.subheadline.weight(.medium))
-                    .lineLimit(1)
-                Text(job.note)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-
-            VStack(alignment: .trailing, spacing: 4) {
-                if job.state == .running || job.state == .queued {
-                    ProgressView(value: job.progress)
-                        .frame(width: 110)
-                    Text(job.progress.formatted(.percent.precision(.fractionLength(0))))
-                        .font(.caption2.monospacedDigit())
-                        .foregroundStyle(.secondary)
-                } else {
-                    Text(job.state.displayName)
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(jobColor(job.state))
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
-                        .background(jobColor(job.state).opacity(0.10), in: Capsule())
-                    Text(job.finishedAt ?? job.createdAt, style: .time)
-                        .font(.caption2.monospacedDigit())
-                        .foregroundStyle(.secondary)
-                }
-            }
-            .frame(width: 130, alignment: .trailing)
+    private func isExpanded(_ job: JobSnapshot) -> Bool {
+        if let inspectedJobID {
+            return inspectedJobID == job.id
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 7)
+        return job.id == firstLiveJobID && !dismissedLiveJobIDs.contains(job.id)
+    }
+
+    private func toggleJob(_ job: JobSnapshot) {
+        if isExpanded(job) {
+            inspectedJobID = nil
+            dismissedLiveJobIDs.insert(job.id)
+        } else {
+            inspectedJobID = job.id
+            dismissedLiveJobIDs.remove(job.id)
+        }
+    }
+
+    private func jobRow(_ job: JobSnapshot) -> some View {
+        Button {
+            toggleJob(job)
+        } label: {
+            HStack(spacing: 12) {
+                Image(systemName: jobSymbol(job))
+                    .font(.system(size: 15, weight: .medium))
+                    .foregroundStyle(job.state.tint)
+                    .frame(width: 24, height: 24)
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(job.action.displayName)
+                        .font(.subheadline.weight(.medium))
+                        .lineLimit(1)
+                    Text(jobSubtitle(job))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+                VStack(alignment: .trailing, spacing: 4) {
+                    if job.state == .running || job.state == .queued {
+                        ProgressView(value: job.progress)
+                            .frame(width: 110)
+                        Text(job.progress.formatted(.percent.precision(.fractionLength(0))))
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text(job.state.displayName)
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(job.state.tint)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(job.state.tint.opacity(0.10), in: Capsule())
+                        Text(job.finishedAt ?? job.createdAt, style: .time)
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .frame(width: 130, alignment: .trailing)
+
+                Image(systemName: "chevron.right")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.tertiary)
+                    .rotationEffect(.degrees(isExpanded(job) ? 90 : 0))
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 7)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
         .help(job.detail.isEmpty ? job.note : job.detail)
+    }
+
+    /// The compact second line: the live pipeline step and file when the
+    /// job reports them, else the coarse progress note (which already
+    /// names the stage for jobs without per-file detail).
+    private func jobSubtitle(_ job: JobSnapshot) -> String {
+        if let items = job.telemetry?.activeItems, let first = items.first {
+            let extra = items.count > 1 ? " · +\(items.count - 1) workers" : ""
+            return "\(first.step) · \(first.name)\(extra)"
+        }
+        return job.note
     }
 
     private func jobSymbol(_ job: JobSnapshot) -> String {
@@ -221,15 +293,6 @@ private struct TransferQueueView: View {
             case .diskSpeed, .networkSpeed: return "gauge.with.dots.needle.33percent"
             default: return "arrow.triangle.2.circlepath"
             }
-        }
-    }
-
-    private func jobColor(_ state: JobState) -> Color {
-        switch state {
-        case .running, .queued: .blue
-        case .done: .green
-        case .failed: .red
-        case .cancelled: .secondary
         }
     }
 
