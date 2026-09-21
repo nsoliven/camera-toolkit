@@ -1998,6 +1998,12 @@ final class EventsWorkspace {
         )
         let originRoot = URL(fileURLWithPath: DashboardModel.expandedPath(location.path), isDirectory: true).standardizedFileURL
         let fallbackTrashRoot = locations.removedFilesRoot
+        DebugLog.shared.log(
+            "trash.start",
+            subsystem: .trash,
+            level: .info,
+            detail: "\(files.count) file(s)"
+        )
         model.runBackgroundJob(
             action: .organize,
             runningNote: "Moving \(files.count) file(s) to Trash",
