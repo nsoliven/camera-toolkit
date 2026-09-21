@@ -2071,6 +2071,11 @@ final class EventsWorkspace {
         if !removedAssignments.isEmpty {
             applyAssignmentChange(AssignmentChange(title: "Move to Trash", removed: removedAssignments, added: []), touching: nil)
         }
+        // Don't leave the event board showing a tile whose file is in _Trash.
+        // Unsorted used to update only its own scan result; eventStacks stayed
+        // stale until the user hit Refresh.
+        let affectedEvents = Set(eventIDs.values)
+        removeFilesFromEventBoards(Set(files.map(\.pathKey)), events: [])
 
         let trashedStackIDs = affectedStackIDs(for: items, in: locationID)
         let context = TrashContext(
@@ -2110,6 +2115,11 @@ final class EventsWorkspace {
                 if let focusedStackID, trashedStackIDs.contains(focusedStackID) {
                     self.focusedStackID = nil
                     selectionAnchorID = nil
+                }
+                self.removeFilesFromEventBoards(movedKeys, events: [])
+                let refreshIDs = affectedEvents.isEmpty ? Set(self.eventStacks.keys) : affectedEvents
+                for eventID in refreshIDs {
+                    Task { await self.refreshEvent(eventID) }
                 }
                 let skippedNote = batch.skipped.isEmpty
                     ? ""
@@ -2202,6 +2212,21 @@ final class EventsWorkspace {
                     : "Moved \(batch.entries.count) files to Trash — restorable from Settings.\(skippedNote)"
             }
         )
+    }
+
+    /// Drop trashed files from cached event boards immediately so a tagged
+    /// burst cannot linger after Unsorted Trash.
+    private func removeFilesFromEventBoards(_ pathKeys: Set<String>, events: Set<UUID>) {
+        guard !pathKeys.isEmpty else { return }
+        let ids = events.isEmpty ? Set(eventStacks.keys) : events
+        let splits = model.configuration.burstSplits
+        for eventID in ids {
+            guard let stacks = eventStacks[eventID] else { continue }
+            let remaining = stacks.flatMap(\.items).filter { item in
+                !item.files.contains { pathKeys.contains($0.pathKey) }
+            }
+            eventStacks[eventID] = OrganizeStacker.stacks(for: remaining, splits: splits)
+        }
     }
 
     /// Stack IDs whose stacks contain any of the given items, for clearing
