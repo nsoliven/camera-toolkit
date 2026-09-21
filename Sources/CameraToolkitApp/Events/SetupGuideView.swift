@@ -351,7 +351,7 @@ struct SetupGuidePanel: View {
             Text("After that, sorting is fast")
                 .font(.headline)
                 .padding(.top, 4)
-            GuideBullet(symbol: "number", text: "Press 1–9 to send the selected photos to the numbered event in the bar above the photos.")
+            GuideBullet(symbol: "number", text: "Press 1–3 to send the selected photos to the numbered event in the bar above the photos. Event… searches the rest.")
             GuideBullet(symbol: "hand.draw", text: "Or drag tiles onto an event in the sidebar.")
             GuideBullet(symbol: "n.square", text: "Press N to make a new event from what’s selected.")
             GuideBullet(symbol: "arrow.uturn.left", text: "Command-Z undoes a sort. Sorting never moves files by itself.")
@@ -390,7 +390,7 @@ struct SetupGuidePanel: View {
     private var done: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("That’s the whole loop: sort, Apply, then archive each event when the NAS is connected.")
-            GuideBullet(symbol: "keyboard", text: "Space previews · 1–9 sorts · N makes an event · Command-Z undoes.")
+            GuideBullet(symbol: "keyboard", text: "Space previews · 1–3 sorts · N makes an event · Command-Z undoes.")
             GuideBullet(symbol: "externaldrive", text: "Settings › Where Things Live shows your Buffer, private folder, and NAS, and lets you change them.")
             GuideBullet(symbol: "questionmark.circle", text: "Open this guide again any time with the Guide button in the sidebar or Help › Setup Guide.")
         }
