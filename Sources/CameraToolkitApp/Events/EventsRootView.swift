@@ -244,22 +244,22 @@ struct EventsSidebar: View {
                         Text("No events yet")
                             .foregroundStyle(.secondary)
                     }
-                    // A board popover's People picks narrow this list to
-                    // events whose event.people include them.
-                    if !workspace.search.peopleIDs.isEmpty {
+                    // A board popover's condition rows narrow this list —
+                    // events are tested against the same OR-of-AND groups.
+                    if workspace.search.hasActiveConditions {
                         Button {
-                            workspace.search.peopleIDs = []
+                            workspace.search.groups = []
                         } label: {
-                            Label("Filtered by People — clear", systemImage: "person.2.fill")
+                            Label("Filtered — clear", systemImage: "line.3.horizontal.decrease.circle.fill")
                                 .font(.caption)
                         }
                         .buttonStyle(.borderless)
                         .foregroundStyle(Color.accentColor)
-                        .help("A board's People filter is hiding events without those people — click to show every event")
+                        .help("A board's filter is hiding events that don't match — click to show every event")
                     }
                     // Parents newest-first; each subevent sits indented under
                     // its parent — the flat row style stays the same.
-                    ForEach(workspace.sidebarRows(matching: searchText, peopleIDs: workspace.search.peopleIDs), id: \.event.id) { row in
+                    ForEach(workspace.sidebarRows(matching: searchText, applying: workspace.search), id: \.event.id) { row in
                         eventRow(row.event, depth: row.depth)
                             .tag(EventsSidebarSelection.event(row.event.id) as EventsSidebarSelection?)
                             .contentShape(Rectangle())
