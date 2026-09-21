@@ -2548,10 +2548,11 @@ final class EventsWorkspace {
     }
 
     /// "Scan for Faces" on a connected, grouped unsorted source: detect
-    /// faces with the mode's engine on a sample of each burst plus single
-    /// stills, embed them with the on-device model, match named people, and
-    /// group the rest. MED and above also sample video frames. Writes only
-    /// to the catalog — media files are only read.
+    /// faces with the mode's engine on a sample of each burst (every burst
+    /// frame at HIGH and above) plus single stills, embed them with the
+    /// on-device model, match named people, and group the rest. MED and
+    /// above also sample video frames. Writes only to the catalog — media
+    /// files are only read.
     func faceScan(_ location: ConfiguredLocation, options: FaceScanOptions = FaceScanOptions()) {
         guard isConnected(location) else {
             model.statusMessage = "\(location.name) is not connected. Plug it in, then scan again."
@@ -2576,11 +2577,12 @@ final class EventsWorkspace {
         let support = DashboardModel.defaultApplicationSupportURL
         let catalogURL = catalogDatabaseURL
         let configuration = model.configuration
+        let burstScope = options.mode < .high ? "a sample of each burst" : "every burst frame"
         model.runAsyncJob(
             action: .faceScan,
             runningNote: "Scanning \(location.name) for faces",
             logTitle: "Face scan: \(location.name)",
-            logDetail: "Detected faces on a sample of each burst, single stills, and — at MED and above — video frames; embedded them on-device, matched named people, and grouped the rest. Files were only read — nothing was written or moved.",
+            logDetail: "Quality \(options.mode.rawValue). Detected faces on \(burstScope), single stills, and — at MED and above — video frames; embedded them on-device, matched named people, and grouped the rest. Files were only read — nothing was written or moved.",
             operation: { progress in
                 // Bootstrap is idempotent: it guarantees the face tables
                 // exist even if no catalog sync has run since the upgrade.
@@ -2626,7 +2628,9 @@ final class EventsWorkspace {
                 self?.facesRevision &+= 1
                 let video = report.videoFramesRead > 0 ? "; \(report.videoFramesRead) video frames read" : ""
                 let burst = report.photosBurstCovered > 0 ? "; \(report.photosBurstCovered) burst frames covered by sampled siblings" : ""
-                return "Face scan done — \(report.facesDetected) face\(report.facesDetected == 1 ? "" : "s") on \(report.photosProcessed) sampled photo(s); \(report.photosSkipped) already scanned\(burst); \(report.facesProposed) matched to people, \(report.facesGrouped) grouped\(video)."
+                // The Jobs log may name packages — the scan sheet cannot.
+                let packages = report.detectorSummary.map { " Detector: \($0)." } ?? ""
+                return "Face scan done — \(report.facesDetected) face\(report.facesDetected == 1 ? "" : "s") on \(report.photosProcessed) sampled photo(s); \(report.photosSkipped) already scanned\(burst); \(report.facesProposed) matched to people, \(report.facesGrouped) grouped\(video).\(packages)"
             }
         )
     }

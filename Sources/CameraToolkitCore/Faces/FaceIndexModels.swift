@@ -223,7 +223,8 @@ public struct FaceScanOptions: Equatable, Sendable {
     /// FAST: use as many workers as the machine has. Default ON.
     public var fast: Bool
     /// Minimum face size in the photo's own pixels. LOW keeps large, clear
-    /// faces only; MED ~40px; HIGH ~30px — still a real face, not tourists.
+    /// faces only; MED ~40px; HIGH and XHIGH ~30px — still a real face,
+    /// not tourists.
     public var minimumFacePixels: Double
     /// Cosine threshold for proposing a roster person.
     public var matchThreshold: Float
@@ -231,21 +232,37 @@ public struct FaceScanOptions: Equatable, Sendable {
     public var clusterThreshold: Float
     /// Longer edge of the bounded decode detection runs on.
     public var detectPixels: Int
-    /// Most templates kept per person when a group is named.
+    /// Most templates kept per person — when a group is named, and as the
+    /// XHIGH gallery rebuild's cap.
     public var templateCap: Int
     /// Detector score floor for the SCRFD path.
     public var detScoreThreshold: Float
     /// Detector letterbox sizes for the SCRFD path — MED runs 640 only,
-    /// HIGH adds a 960 pass for smaller faces.
+    /// HIGH adds a 960 pass, XHIGH adds 1024 for smaller faces.
     public var detectorScales: [Int]
     /// Seconds between sampled video frames. Nil means video is skipped
-    /// (LOW stills-only); MED samples sparsely, HIGH ~1 fps.
+    /// (LOW stills-only); MED samples sparsely, HIGH ~1 fps, XHIGH ~2 fps.
     public var videoFrameStride: TimeInterval?
     /// Cap on sampled frames per clip so MED stays light on long videos.
     public var maximumVideoFrames: Int
     /// Cosine floor for treating two video-frame detections as the same
     /// appearance — 1 fps would otherwise record one face per second.
     public var videoDuplicateCosine: Float
+    /// XHIGH's horizontal-flip TTA: each face is embedded twice — the
+    /// aligned crop and its mirror — and the averaged vector is stored.
+    /// Same ArcFace model both times; the second view steadies the
+    /// embedding. Off below XHIGH.
+    public var flipTTA: Bool
+    /// XHIGH's gallery rebuild: after matching, each roster person's
+    /// templates are re-picked from their confirmed faces — a diverse
+    /// spread across photos instead of whatever happened to be pinned.
+    /// Off below XHIGH.
+    public var rebuildTemplates: Bool
+    /// The optional larger SCRFD sibling package — XHIGH's last resort
+    /// when the standard detector still misses real group-shot faces.
+    /// Default off; silently unused when no `det_34g*` package is
+    /// installed alongside the 10G ones. Never a different recognizer.
+    public var usesLargeDetector: Bool
 
     public init(
         mode: FaceScanGrade = .low,
@@ -254,12 +271,15 @@ public struct FaceScanOptions: Equatable, Sendable {
         matchThreshold: Float = 0.48,
         clusterThreshold: Float = 0.5,
         detectPixels: Int? = nil,
-        templateCap: Int = 8,
+        templateCap: Int? = nil,
         detScoreThreshold: Float = 0.5,
         detectorScales: [Int]? = nil,
         videoFrameStride: TimeInterval? = nil,
         maximumVideoFrames: Int? = nil,
-        videoDuplicateCosine: Float = 0.92
+        videoDuplicateCosine: Float = 0.92,
+        flipTTA: Bool? = nil,
+        rebuildTemplates: Bool? = nil,
+        usesLargeDetector: Bool = false
     ) {
         self.mode = mode
         self.fast = fast
@@ -267,12 +287,15 @@ public struct FaceScanOptions: Equatable, Sendable {
         self.matchThreshold = matchThreshold
         self.clusterThreshold = clusterThreshold
         self.detectPixels = detectPixels ?? Self.defaultDetectPixels(for: mode)
-        self.templateCap = templateCap
+        self.templateCap = templateCap ?? Self.defaultTemplateCap(for: mode)
         self.detScoreThreshold = detScoreThreshold
         self.detectorScales = detectorScales ?? Self.defaultDetectorScales(for: mode)
         self.videoFrameStride = videoFrameStride ?? Self.defaultVideoFrameStride(for: mode)
         self.maximumVideoFrames = maximumVideoFrames ?? Self.defaultMaximumVideoFrames(for: mode)
         self.videoDuplicateCosine = videoDuplicateCosine
+        self.flipTTA = flipTTA ?? (mode == .xhigh)
+        self.rebuildTemplates = rebuildTemplates ?? (mode == .xhigh)
+        self.usesLargeDetector = usesLargeDetector
     }
 
     /// The detector this mode runs.
@@ -280,10 +303,9 @@ public struct FaceScanOptions: Equatable, Sendable {
         mode == .low || mode == .none ? .vision : .scrfd
     }
 
-    /// The grade a scan actually achieves: MED and HIGH pipelines exist,
-    /// XHIGH does not — a request for it runs HIGH and stamps accordingly
-    /// so a later XHIGH implementation can still re-scan.
-    public static let implementedGrade = FaceScanGrade.high
+    /// The grade a scan actually achieves: every pipeline through XHIGH is
+    /// implemented, so a requested mode stamps itself.
+    public static let implementedGrade = FaceScanGrade.xhigh
 
     public static func defaultMinimumFacePixels(for mode: FaceScanGrade) -> Double {
         switch mode {
@@ -303,7 +325,17 @@ public struct FaceScanOptions: Equatable, Sendable {
     public static func defaultDetectorScales(for mode: FaceScanGrade) -> [Int] {
         switch mode {
         case .none, .low, .med: [640]
-        case .high, .xhigh: [640, 960]
+        case .high: [640, 960]
+        case .xhigh: [640, 960, 1024]
+        }
+    }
+
+    /// Most templates kept per roster person — 8 on the lower modes, 15
+    /// once XHIGH's rebuild has a deeper confirmed pool to pick from.
+    public static func defaultTemplateCap(for mode: FaceScanGrade) -> Int {
+        switch mode {
+        case .xhigh: 15
+        default: 8
         }
     }
 
@@ -311,7 +343,8 @@ public struct FaceScanOptions: Equatable, Sendable {
         switch mode {
         case .none, .low: nil
         case .med: 30
-        case .high, .xhigh: 1
+        case .high: 1
+        case .xhigh: 0.5
         }
     }
 
@@ -346,11 +379,14 @@ public struct FaceScanReport: Equatable, Sendable {
     public var facesProposed: Int = 0
     public var facesGrouped: Int = 0
     public var groupsCreated: Int = 0
-    /// Video frames sampled in MED/HIGH passes.
+    /// Video frames sampled in MED/HIGH/XHIGH passes.
     public var videoFramesRead: Int = 0
     /// Burst members covered by a sibling's sample — stamped at the
     /// executed grade without being decoded.
     public var photosBurstCovered: Int = 0
+    /// The detector packages that ran — e.g. "det_10g 640/960/1024" — for
+    /// the Jobs log, which may name packages. Nil on the Vision path.
+    public var detectorSummary: String?
 
     public init() {}
 }
