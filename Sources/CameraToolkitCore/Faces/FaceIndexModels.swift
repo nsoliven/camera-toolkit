@@ -208,6 +208,14 @@ public struct FacePerson: Identifiable, Equatable, Sendable {
     }
 }
 
+/// Which detector a scan runs. LOW uses Apple Vision on the Neural Engine;
+/// MED and above use the SCRFD detector from the same model pack as the
+/// embedder. The identity model never changes per mode.
+public enum FaceDetectorKind: String, Codable, Sendable {
+    case vision
+    case scrfd
+}
+
 /// Options for one face scan pass. `mode` is the quality knob; `fast`
 /// is the throttle — it only caps concurrency, never changes the models.
 public struct FaceScanOptions: Equatable, Sendable {
@@ -215,33 +223,109 @@ public struct FaceScanOptions: Equatable, Sendable {
     /// FAST: caps worker concurrency. Default ON per the plan.
     public var fast: Bool
     /// Minimum face size in the photo's own pixels. LOW keeps large, clear
-    /// faces only.
+    /// faces only; MED ~40px; HIGH ~30px — still a real face, not tourists.
     public var minimumFacePixels: Double
     /// Cosine threshold for proposing a roster person.
     public var matchThreshold: Float
     /// Cosine threshold for joining an existing Other group.
     public var clusterThreshold: Float
-    /// Longer edge of the bounded decode Vision runs on.
+    /// Longer edge of the bounded decode detection runs on.
     public var detectPixels: Int
     /// Most templates kept per person when a group is named.
     public var templateCap: Int
+    /// Detector score floor for the SCRFD path.
+    public var detScoreThreshold: Float
+    /// Detector letterbox sizes for the SCRFD path — MED runs 640 only,
+    /// HIGH adds a 960 pass for smaller faces.
+    public var detectorScales: [Int]
+    /// Seconds between sampled video frames. Nil means video is skipped
+    /// (LOW stills-only); MED samples sparsely, HIGH ~1 fps.
+    public var videoFrameStride: TimeInterval?
+    /// Cap on sampled frames per clip so MED stays light on long videos.
+    public var maximumVideoFrames: Int
+    /// Cosine floor for treating two video-frame detections as the same
+    /// appearance — 1 fps would otherwise record one face per second.
+    public var videoDuplicateCosine: Float
 
     public init(
         mode: FaceScanGrade = .low,
         fast: Bool = true,
-        minimumFacePixels: Double = 64,
+        minimumFacePixels: Double? = nil,
         matchThreshold: Float = 0.48,
         clusterThreshold: Float = 0.5,
-        detectPixels: Int = 1_600,
-        templateCap: Int = 8
+        detectPixels: Int? = nil,
+        templateCap: Int = 8,
+        detScoreThreshold: Float = 0.5,
+        detectorScales: [Int]? = nil,
+        videoFrameStride: TimeInterval? = nil,
+        maximumVideoFrames: Int? = nil,
+        videoDuplicateCosine: Float = 0.92
     ) {
         self.mode = mode
         self.fast = fast
-        self.minimumFacePixels = minimumFacePixels
+        self.minimumFacePixels = minimumFacePixels ?? Self.defaultMinimumFacePixels(for: mode)
         self.matchThreshold = matchThreshold
         self.clusterThreshold = clusterThreshold
-        self.detectPixels = detectPixels
+        self.detectPixels = detectPixels ?? Self.defaultDetectPixels(for: mode)
         self.templateCap = templateCap
+        self.detScoreThreshold = detScoreThreshold
+        self.detectorScales = detectorScales ?? Self.defaultDetectorScales(for: mode)
+        self.videoFrameStride = videoFrameStride ?? Self.defaultVideoFrameStride(for: mode)
+        self.maximumVideoFrames = maximumVideoFrames ?? Self.defaultMaximumVideoFrames(for: mode)
+        self.videoDuplicateCosine = videoDuplicateCosine
+    }
+
+    /// The detector this mode runs.
+    public var detectorKind: FaceDetectorKind {
+        mode == .low || mode == .none ? .vision : .scrfd
+    }
+
+    /// The grade a scan actually achieves: MED and HIGH pipelines exist,
+    /// XHIGH does not — a request for it runs HIGH and stamps accordingly
+    /// so a later XHIGH implementation can still re-scan.
+    public static let implementedGrade = FaceScanGrade.high
+
+    public static func defaultMinimumFacePixels(for mode: FaceScanGrade) -> Double {
+        switch mode {
+        case .none, .low: 64
+        case .med: 40
+        case .high, .xhigh: 30
+        }
+    }
+
+    public static func defaultDetectPixels(for mode: FaceScanGrade) -> Int {
+        switch mode {
+        case .none, .low: 1_600
+        case .med, .high, .xhigh: 2_560
+        }
+    }
+
+    public static func defaultDetectorScales(for mode: FaceScanGrade) -> [Int] {
+        switch mode {
+        case .none, .low, .med: [640]
+        case .high, .xhigh: [640, 960]
+        }
+    }
+
+    public static func defaultVideoFrameStride(for mode: FaceScanGrade) -> TimeInterval? {
+        switch mode {
+        case .none, .low: nil
+        case .med: 30
+        case .high, .xhigh: 1
+        }
+    }
+
+    public static func defaultMaximumVideoFrames(for mode: FaceScanGrade) -> Int {
+        switch mode {
+        case .none, .low: 0
+        case .med: 12
+        case .high, .xhigh: .max
+        }
+    }
+
+    /// Whether this pass reads video frames at all.
+    public var scansVideo: Bool {
+        videoFrameStride != nil && maximumVideoFrames > 0
     }
 
     /// Worker width for the decode/detect/embed stage.
@@ -259,17 +343,22 @@ public struct FaceScanReport: Equatable, Sendable {
     public var facesProposed: Int = 0
     public var facesGrouped: Int = 0
     public var groupsCreated: Int = 0
+    /// Video frames sampled in MED/HIGH passes.
+    public var videoFramesRead: Int = 0
 
     public init() {}
 }
 
 public enum FaceIndexError: Error, Equatable, LocalizedError {
     case modelNotInstalled(String)
+    case detectorNotInstalled(String)
 
     public var errorDescription: String? {
         switch self {
         case .modelNotInstalled(let path):
             "The face model is not installed. Run scripts/convert-arcface.sh once to build it at \(path)."
+        case .detectorNotInstalled(let path):
+            "The face detector is not installed. Run scripts/convert-scrfd.sh once to build it at \(path)."
         }
     }
 }

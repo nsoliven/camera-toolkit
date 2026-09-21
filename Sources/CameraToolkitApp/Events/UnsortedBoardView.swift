@@ -154,10 +154,10 @@ struct UnsortedBoardView: View {
             }
             .disabled(state.isScanning)
             Menu {
-                Button("Scan for Faces (Low · Fast)") {
-                    workspace.faceScan(location)
+                Button("Scan for Faces…") {
+                    workspace.requestFaceScan(location)
                 }
-                .help("Detect and match faces on still photos. Writes only to the catalog — media is read, never touched.")
+                .help("Detect and match faces on this folder's photos and videos. Writes only to the catalog — media is read, never touched.")
                 Divider()
                 Button("Reveal in Finder") {
                     NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: DashboardModel.expandedPath(location.path))])

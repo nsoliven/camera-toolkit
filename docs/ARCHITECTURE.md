@@ -77,24 +77,30 @@ Immich
 Faces exist to tag events: `event.people` is the unique set of named (roster) people detected on an event's photos, surfaced as chips on event headers and names in the sidebar. The pipeline is fully on-device and lives in `CameraToolkitCore/Faces/`:
 
 ```text
-unsorted stills (video skipped at LOW)
-    │ VisionFaceDetector: Vision rectangles+landmarks on a bounded decode,
-    │   min-size floor ~64px, RAW files read their embedded JPEG
+unsorted media (LOW scans stills only; MED/HIGH also sample video frames)
+    │ LOW:  VisionFaceDetector — Vision rectangles+landmarks on a bounded
+    │        decode, min-size floor ~64px
+    │ MED:  SCRFDDetector — SCRFD CoreML letterboxed to 640, ~40px floor,
+    │        stills + sparse video keyframes (one frame per ~30s, capped)
+    │ HIGH: SCRFDDetector at 640 and 960 canvas scales, ~30px floor,
+    │        stills + ~1fps video frames
     ▼
 FaceAligner: 5-point similarity warp to 112×112 (box-crop fallback)
     │ ArcFaceEmbedder: single frozen identity model → 512-d L2-normalized vector
     ▼
 FaceIndexService: cosine vs roster templates → proposed, else greedy
-    cosine clustering into unnamed "Other" groups
+    cosine clustering into unnamed "Other" groups; video faces dedup by
+    embedding cosine so a clip records distinct appearances, not seconds
     ▼
 FaceIndexStore: faces/people/face_templates/face_photos tables in the catalog
 ```
 
-- The identity model is a fixed, generated `.mlpackage` under `Application Support/CameraToolkit/Models`, produced once per machine by `scripts/convert-arcface.sh` — the only Python anywhere; nothing ships or re-trains. Embedding vectors are keyed by a fixed model name and never mix spaces.
-- Scan grades are ordered (`none < low < med < high < xhigh`); a photo whose recorded grade covers the requested mode is skipped, keyed by file identity (name + size + mtime) so replugging a drive or moving a file never re-runs detection. Only the LOW pipeline exists; a higher request still runs it and stamps the grade that actually ran.
+- The identity model is a fixed, generated `.mlpackage` under `Application Support/CameraToolkit/Models`, produced once per machine by `scripts/convert-arcface.sh` — the only Python anywhere; nothing ships or re-trains. Embedding vectors are keyed by a fixed model name and never mix spaces. The MED/HIGH detector comes from the same model pack via `scripts/convert-scrfd.sh`: one fixed-shape package per input size (`det_10g.mlpackage` at 640, `det_10g_960.mlpackage` at 960), decoded in-app by anchors at strides 8/16/32 with cross-scale NMS.
+- Scan grades are ordered (`none < low < med < high < xhigh`); a photo whose recorded grade covers the requested mode is skipped, keyed by file identity (name + size + mtime) so replugging a drive or moving a file never re-runs detection. The stamped grade is what actually ran — an XHIGH request runs the HIGH pipeline and stamps `.high` so a later XHIGH implementation still re-scans.
+- MED/HIGH refuse to run without the detector package installed rather than silently falling back to LOW detection; the scan sheet gates Medium/High on its presence.
 - Confirmed faces are frozen: photo re-scans never delete or reclassify them, and overlapping fresh detections are dropped instead of duplicating.
 - The People window (View → People, ⌘⌥P) offers the three review queues — roster, new groups, unsure — with name/merge/junk/confirm actions. Naming a group promotes it to the roster, confirms its faces, and pins distinct-photo members as match templates; merges keep unconfirmed faces reviewable as proposals. Re-match re-evaluates stored vectors against the gallery on CPU only.
-- Face work runs inside `runAsyncJob` like other file jobs; FAST is the default throttle (2 workers). `EventBoardView` and the sidebar read `eventPeople` through `EventsWorkspace`, cached per faces-revision so rows share one catalog pass.
+- Face work runs inside `runAsyncJob` like other file jobs; FAST is the default throttle (2 workers vs up to 6) and never changes models or floors — quality is the mode, speed is the cap. `EventBoardView` and the sidebar read `eventPeople` through `EventsWorkspace`, cached per faces-revision so rows share one catalog pass.
 
 Connectivity is refreshed explicitly instead of relying on Finder: `EventsWorkspace.refreshConnectivity()` re-checks each configured location with cheap mount-table and folder-stat probes, bumps `connectivityRevision` so views that call `isConnected` re-render, re-runs `DriveEventDiscovery` and the cached per-event presence summaries, and rescans only unsorted sources whose earlier scan failed — plus sources on a volume that just mounted. Healthy cached scan results are never rescanned by a connectivity refresh. `NSWorkspace` `didMount`/`didUnmount` observers (registered once via `observeVolumeChanges()`, called from `EventsWorkspace.start()` and `AppShell.onAppear`) drive it automatically through a ~0.75 s trailing debounce that remembers mounted volume URLs, so a flapping hub collapses into one refresh pass; sidebar rows, the setup guide's place cards, the Settings "Where Things Live" rows, and the event storage strip each offer a Refresh/Check Again control that calls it. Refresh never mounts shares itself — the configuration stores local paths and service URLs, not network share URLs, so there is no mount URL to retry. `PhotoBrowserView` listens for the same notifications to refresh capacity dots and reload the current folder when its drive comes back.
 

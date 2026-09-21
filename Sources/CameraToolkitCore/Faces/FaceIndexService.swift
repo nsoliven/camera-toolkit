@@ -1,9 +1,12 @@
 import CoreGraphics
 import Foundation
 
-/// The LOW-mode face pass: Vision detection on bounded decodes, ArcFace
-/// embeddings for every face that clears the size floor, cosine matching
-/// against roster templates, and greedy grouping of the leftovers.
+/// The face pass for every quality mode: detection on bounded decodes
+/// (Vision for LOW, SCRFD for MED+), ArcFace embeddings for every face
+/// that clears the mode's size floor, cosine matching against roster
+/// templates, and greedy grouping of the leftovers. MED/HIGH additionally
+/// sample video frames — stills plus a light frame pass at MED, ~1 fps at
+/// HIGH.
 ///
 /// The service writes only to the catalog database — media files are never
 /// touched. Skip rules come from `face_photos.scan_grade` plus the
@@ -27,26 +30,40 @@ public struct FaceIndexService: Sendable {
 
     // MARK: - Scan
 
-    /// Scans a location's stills (the photo and RAW primaries of an
-    /// `OrganizeScanner` result). Video is skipped entirely in LOW mode.
+    /// Scans a location's media (the photo, RAW, and — at MED and above —
+    /// video primaries of an `OrganizeScanner` result). `detector` is the
+    /// engine for the mode: nil resolves to Vision for LOW and throws for
+    /// MED+, where the SCRFD package must be installed.
     public func scan(
         items: [OrganizeItem],
         embedder: FaceEmbeddingProviding?,
+        detector: FaceDetecting? = nil,
         progress: FileOperationProgressHandler? = nil
     ) throws -> FaceScanReport {
         guard let embedder else {
             throw FaceIndexError.modelNotInstalled(FaceModelCatalog.modelFileName)
         }
+        let options = self.options
+        let engine: FaceDetecting
+        if let detector {
+            engine = detector
+        } else if options.detectorKind == .vision {
+            engine = VisionDetector()
+        } else {
+            throw FaceIndexError.detectorNotInstalled(FaceModelCatalog.detectorFileName)
+        }
 
         var report = FaceScanReport()
-        let stills = items.filter { $0.kind == .raw || $0.kind == .photo }
-        report.photosConsidered = stills.count
+        let eligible = items.filter {
+            $0.kind == .raw || $0.kind == .photo || (options.scansVideo && $0.kind == .video)
+        }
+        report.photosConsidered = eligible.count
 
         // New-files-only rule: a photo whose recorded grade covers this mode
         // — and whose size/mtime still match — is skipped without decoding.
-        let existing = try store.photos(pathKeys: stills.map(\.primary.pathKey))
+        let existing = try store.photos(pathKeys: eligible.map(\.primary.pathKey))
         var pending: [OrganizeItem] = []
-        for item in stills {
+        for item in eligible {
             let file = item.primary
             if let known = existing[file.pathKey],
                known.scanGrade.covers(options.mode),
@@ -59,7 +76,6 @@ public struct FaceIndexService: Sendable {
 
         let total = pending.count
         progress?(FileOperationProgress(phase: "Detecting faces", processedFiles: 0, totalFiles: total))
-        let options = self.options
         let store = self.store
         let items = pending
         let results = OrganizeScanner.parallelMap(
@@ -76,16 +92,23 @@ public struct FaceIndexService: Sendable {
             },
             transform: { index in
                 autoreleasepool {
-                    Self.processPhoto(items[index], options: options, embedder: embedder, store: store)
+                    Self.processItem(
+                        items[index],
+                        options: options,
+                        detector: engine,
+                        embedder: embedder,
+                        store: store
+                    )
                 }
             }
         )
 
         for outcome in results {
             switch outcome {
-            case .processed(let faces):
+            case .processed(let faces, let videoFrames):
                 report.photosProcessed += 1
                 report.facesDetected += faces
+                report.videoFramesRead += videoFrames
             case .failed:
                 report.photosFailed += 1
             case .skipped:
@@ -124,37 +147,47 @@ public struct FaceIndexService: Sendable {
     // MARK: - Per-photo pipeline
 
     private enum PhotoOutcome {
-        case processed(faces: Int)
+        case processed(faces: Int, videoFrames: Int)
         case failed
         case skipped
     }
 
-    /// The grade a scan actually achieves. Phase 1 implements only the
-    /// Vision-detect LOW pipeline — a higher requested mode still runs that
-    /// pipeline, so the photo is stamped with what ran and stays eligible
-    /// for the real MED/HIGH passes when they land.
-    private static let executedGrade = FaceScanGrade.low
+    /// The grade stamped on a photo: what actually ran, never higher than
+    /// the implemented pipeline. An XHIGH request runs the HIGH pipeline
+    /// and stamps `.high` so a later XHIGH pass still re-scans it.
+    private static func executedGrade(for mode: FaceScanGrade) -> FaceScanGrade {
+        min(mode, FaceScanOptions.implementedGrade)
+    }
 
-    private static func processPhoto(
+    private static func processItem(
         _ item: OrganizeItem,
         options: FaceScanOptions,
+        detector: FaceDetecting,
         embedder: FaceEmbeddingProviding,
         store: FaceIndexStore
     ) -> PhotoOutcome {
-        let file = item.primary
-        let url = file.url
-        guard let image = FaceImageDecoder.detectionImage(for: url, maximumPixelSize: options.detectPixels) else {
-            return .failed
+        if item.kind == .video {
+            return processVideo(item, options: options, detector: detector, embedder: embedder, store: store)
         }
-        let fullSize = FaceImageDecoder.pixelSize(of: url)
-            ?? CGSize(width: image.width, height: image.height)
+        return processPhoto(item, options: options, detector: detector, embedder: embedder, store: store)
+    }
 
-        let detections = VisionFaceDetector.detect(
+    /// Detect → align → embed for every face on one image. Shared by still
+    /// decodes and sampled video frames; `pixelSize` is the native image
+    /// size the min-face floor is measured against.
+    private static func facesOnImage(
+        _ image: CGImage,
+        pixelSize: CGSize,
+        file: OrganizeFile,
+        options: FaceScanOptions,
+        detector: FaceDetecting,
+        embedder: FaceEmbeddingProviding
+    ) -> [FaceRecord] {
+        let detections = detector.detect(
             in: image,
-            imagePixelSize: fullSize,
-            minimumFacePixels: options.minimumFacePixels
+            imagePixelSize: pixelSize,
+            options: options
         )
-
         var faces: [FaceRecord] = []
         for detection in detections {
             let aligned: CGImage?
@@ -177,9 +210,101 @@ public struct FaceIndexService: Sendable {
                 embedding: embedding,
                 crop: FaceAligner.jpegData(aligned),
                 state: .cached,
-                scanGrade: executedGrade,
+                scanGrade: executedGrade(for: options.mode),
                 photoPath: file.path
             ))
+        }
+        return faces
+    }
+
+    private static func processPhoto(
+        _ item: OrganizeItem,
+        options: FaceScanOptions,
+        detector: FaceDetecting,
+        embedder: FaceEmbeddingProviding,
+        store: FaceIndexStore
+    ) -> PhotoOutcome {
+        let file = item.primary
+        let url = file.url
+        guard let image = FaceImageDecoder.detectionImage(for: url, maximumPixelSize: options.detectPixels) else {
+            return .failed
+        }
+        let fullSize = FaceImageDecoder.pixelSize(of: url)
+            ?? CGSize(width: image.width, height: image.height)
+
+        let faces = facesOnImage(
+            image,
+            pixelSize: fullSize,
+            file: file,
+            options: options,
+            detector: detector,
+            embedder: embedder
+        )
+
+        let photo = FacePhotoRecord(
+            pathKey: file.pathKey,
+            path: file.path,
+            fileName: file.name,
+            byteCount: file.size,
+            modifiedAt: file.modifiedAt,
+            takenAt: item.captureDate,
+            scanGrade: executedGrade(for: options.mode),
+            faceCount: faces.count
+        )
+        guard (try? store.replaceFaces(photo: photo, faces: faces)) != nil else {
+            return .failed
+        }
+        return .processed(faces: faces.count, videoFrames: 0)
+    }
+
+    /// MED/HIGH video pass: sampled frames through the same
+    /// detect-align-embed path. Per-clip embedding dedup keeps one row per
+    /// distinct appearance instead of one per second — event people care
+    /// about who was there, not how long they were on screen.
+    private static func processVideo(
+        _ item: OrganizeItem,
+        options: FaceScanOptions,
+        detector: FaceDetecting,
+        embedder: FaceEmbeddingProviding,
+        store: FaceIndexStore
+    ) -> PhotoOutcome {
+        let file = item.primary
+        guard let stride = options.videoFrameStride,
+              let sampler = FaceVideoSampler(url: file.url, maximumPixelSize: options.detectPixels) else {
+            return .failed
+        }
+        let times = FaceVideoSampler.sampleTimes(
+            duration: sampler.duration,
+            stride: stride,
+            maxFrames: options.maximumVideoFrames
+        )
+        guard !times.isEmpty else { return .failed }
+
+        let nativeSize = sampler.pixelSize.width > 0 ? sampler.pixelSize : nil
+        var faces: [FaceRecord] = []
+        var keptEmbeddings: [[Float]] = []
+        var framesRead = 0
+        for time in times {
+            guard let frame = sampler.frame(at: time) else { continue }
+            framesRead += 1
+            let size = nativeSize ?? CGSize(width: frame.width, height: frame.height)
+            for face in facesOnImage(
+                frame,
+                pixelSize: size,
+                file: file,
+                options: options,
+                detector: detector,
+                embedder: embedder
+            ) {
+                if let embedding = face.embedding,
+                   keptEmbeddings.contains(where: {
+                       FaceEmbeddingMath.cosine($0, embedding) >= options.videoDuplicateCosine
+                   }) {
+                    continue
+                }
+                if let embedding = face.embedding { keptEmbeddings.append(embedding) }
+                faces.append(face)
+            }
         }
 
         let photo = FacePhotoRecord(
@@ -189,13 +314,13 @@ public struct FaceIndexService: Sendable {
             byteCount: file.size,
             modifiedAt: file.modifiedAt,
             takenAt: item.captureDate,
-            scanGrade: min(options.mode, executedGrade),
+            scanGrade: executedGrade(for: options.mode),
             faceCount: faces.count
         )
         guard (try? store.replaceFaces(photo: photo, faces: faces)) != nil else {
             return .failed
         }
-        return .processed(faces: faces.count)
+        return .processed(faces: faces.count, videoFrames: framesRead)
     }
 
     // MARK: - Match and group

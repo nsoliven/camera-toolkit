@@ -1,7 +1,7 @@
-import CameraToolkitCore
 import CoreGraphics
 import Foundation
 import SQLite3
+@testable import CameraToolkitCore
 import XCTest
 
 final class FaceIndexTests: XCTestCase {
@@ -403,6 +403,271 @@ final class FaceIndexTests: XCTestCase {
         }
     }
 
+    // MARK: - Quality modes (MED / HIGH)
+
+    func testModeDefaultsMatchThePlan() throws {
+        let low = FaceScanOptions(mode: .low)
+        XCTAssertEqual(low.detectorKind, .vision)
+        XCTAssertEqual(low.minimumFacePixels, 64)
+        XCTAssertEqual(low.detectorScales, [640])
+        XCTAssertNil(low.videoFrameStride)
+        XCTAssertFalse(low.scansVideo)
+
+        let med = FaceScanOptions(mode: .med)
+        XCTAssertEqual(med.detectorKind, .scrfd)
+        XCTAssertEqual(med.minimumFacePixels, 40)
+        XCTAssertEqual(med.detectorScales, [640])
+        XCTAssertEqual(med.videoFrameStride, 30)
+        XCTAssertTrue(med.scansVideo)
+
+        let high = FaceScanOptions(mode: .high)
+        XCTAssertEqual(high.detectorKind, .scrfd)
+        XCTAssertEqual(high.minimumFacePixels, 30)
+        XCTAssertEqual(high.detectorScales, [640, 960])
+        XCTAssertEqual(high.videoFrameStride, 1)
+        XCTAssertTrue(high.scansVideo)
+
+        // FAST caps concurrency without changing the models.
+        XCTAssertEqual(FaceScanOptions(mode: .med, fast: true).concurrency, 2)
+        XCTAssertGreaterThan(FaceScanOptions(mode: .med, fast: false).concurrency, 2)
+
+        // XHIGH runs the HIGH pipeline and stamps high — not itself.
+        XCTAssertEqual(FaceScanOptions.implementedGrade, .high)
+    }
+
+    func testScanSkipsByRecordedGrade() throws {
+        try withTemporaryDirectory { root in
+            let catalog = root.appendingPathComponent("catalog.sqlite")
+            _ = try CatalogStore(url: catalog).bootstrap(
+                configuration: faceTestConfiguration(root: root, catalog: catalog),
+                createBackup: false,
+                createLibraryFolders: false
+            )
+            let jpegURL = root.appendingPathComponent("card/DSC00042.JPG")
+            try writeJPEG(jpegURL, seed: 3)
+            let item = try organizeItem(forFileAt: jpegURL)
+            let store = FaceIndexStore(url: catalog)
+            let detector = StubDetector(detections: [])
+
+            // LOW stamps low; a repeat LOW pass skips.
+            var service = FaceIndexService(catalogURL: catalog, options: FaceScanOptions(mode: .low))
+            var report = try service.scan(items: [item], embedder: StubEmbedder(), detector: detector)
+            XCTAssertEqual(report.photosProcessed, 1)
+            XCTAssertEqual(try store.photos(pathKeys: [item.primary.pathKey])[item.primary.pathKey]?.scanGrade, .low)
+
+            report = try service.scan(items: [item], embedder: StubEmbedder(), detector: detector)
+            XCTAssertEqual(report.photosSkipped, 1)
+            XCTAssertEqual(report.photosProcessed, 0)
+
+            // MED re-runs (low does not cover med), then stamps med.
+            service = FaceIndexService(catalogURL: catalog, options: FaceScanOptions(mode: .med))
+            report = try service.scan(items: [item], embedder: StubEmbedder(), detector: detector)
+            XCTAssertEqual(report.photosProcessed, 1)
+            XCTAssertEqual(try store.photos(pathKeys: [item.primary.pathKey])[item.primary.pathKey]?.scanGrade, .med)
+
+            report = try service.scan(items: [item], embedder: StubEmbedder(), detector: detector)
+            XCTAssertEqual(report.photosSkipped, 1)
+
+            // HIGH re-runs; afterwards a MED request is covered and skipped.
+            service = FaceIndexService(catalogURL: catalog, options: FaceScanOptions(mode: .high))
+            report = try service.scan(items: [item], embedder: StubEmbedder(), detector: detector)
+            XCTAssertEqual(report.photosProcessed, 1)
+            XCTAssertEqual(try store.photos(pathKeys: [item.primary.pathKey])[item.primary.pathKey]?.scanGrade, .high)
+
+            service = FaceIndexService(catalogURL: catalog, options: FaceScanOptions(mode: .med))
+            report = try service.scan(items: [item], embedder: StubEmbedder(), detector: detector)
+            XCTAssertEqual(report.photosSkipped, 1)
+
+            // An XHIGH request runs the HIGH pipeline and stamps .high — so
+            // it is not skipped on the next XHIGH request, and never marks
+            // the photo as scanned at a grade nothing implemented.
+            service = FaceIndexService(catalogURL: catalog, options: FaceScanOptions(mode: .xhigh))
+            report = try service.scan(items: [item], embedder: StubEmbedder(), detector: detector)
+            XCTAssertEqual(report.photosSkipped, 0)
+            XCTAssertEqual(try store.photos(pathKeys: [item.primary.pathKey])[item.primary.pathKey]?.scanGrade, .high)
+        }
+    }
+
+    func testLowModeSkipsVideoEntirely() throws {
+        try withTemporaryDirectory { root in
+            let catalog = root.appendingPathComponent("catalog.sqlite")
+            _ = try CatalogStore(url: catalog).bootstrap(
+                configuration: faceTestConfiguration(root: root, catalog: catalog),
+                createBackup: false,
+                createLibraryFolders: false
+            )
+            let jpegURL = root.appendingPathComponent("card/DSC00001.JPG")
+            try writeJPEG(jpegURL, seed: 4)
+            // Bytes never get decoded at LOW — a bogus video file is enough
+            // to prove the item never enters the pipeline.
+            let videoURL = root.appendingPathComponent("card/C0001.MP4")
+            try writeFile(videoURL, Data("not a real video".utf8))
+            let photoItem = try organizeItem(forFileAt: jpegURL)
+            var videoItem = try organizeItem(forFileAt: videoURL)
+            videoItem = OrganizeItem(
+                primary: videoItem.primary,
+                kind: .video,
+                captureDate: videoItem.captureDate,
+                hasCameraDate: false
+            )
+
+            let service = FaceIndexService(catalogURL: catalog, options: FaceScanOptions(mode: .low))
+            let report = try service.scan(items: [photoItem, videoItem], embedder: StubEmbedder())
+            XCTAssertEqual(report.photosConsidered, 1)
+            XCTAssertEqual(report.photosProcessed, 1)
+            XCTAssertEqual(report.videoFramesRead, 0)
+            XCTAssertNil(try FaceIndexStore(url: catalog).photos(pathKeys: [videoItem.primary.pathKey])[videoItem.primary.pathKey])
+        }
+    }
+
+    func testMedModeRequiresDetectorAndFreezesConfirmed() throws {
+        try withTemporaryDirectory { root in
+            let catalog = root.appendingPathComponent("catalog.sqlite")
+            _ = try CatalogStore(url: catalog).bootstrap(
+                configuration: faceTestConfiguration(root: root, catalog: catalog),
+                createBackup: false,
+                createLibraryFolders: false
+            )
+            let jpegURL = root.appendingPathComponent("card/DSC00010.JPG")
+            try writeJPEG(jpegURL, seed: 5)
+            let item = try organizeItem(forFileAt: jpegURL)
+            let store = FaceIndexStore(url: catalog)
+
+            // MED without a detector refuses — it must not silently fall
+            // back to the LOW Vision path.
+            let medService = FaceIndexService(catalogURL: catalog, options: FaceScanOptions(mode: .med))
+            XCTAssertThrowsError(try medService.scan(items: [item], embedder: StubEmbedder())) { error in
+                XCTAssertEqual(error as? FaceIndexError, .detectorNotInstalled(FaceModelCatalog.detectorFileName))
+            }
+
+            // First pass finds one face; the owner confirms it as Dad.
+            let box = CGRect(x: 0.1, y: 0.6, width: 0.2, height: 0.2)
+            var detector = StubDetector(detections: [
+                DetectedFace(boundingBox: box, confidence: 0.95, landmarks: nil),
+            ])
+            var report = try medService.scan(items: [item], embedder: StubEmbedder(), detector: detector)
+            XCTAssertEqual(report.facesDetected, 1)
+
+            let dad = try store.createPerson(name: "Dad", isRoster: true)
+            let detected = try XCTUnwrap(store.faces(photoID: item.primary.pathKey).first)
+            try store.assignFace(detected.id, to: dad.id, state: .proposed, score: 0.9)
+            try store.confirmFace(detected.id)
+
+            // HIGH re-detects the same spot (overlapping box) plus a new
+            // face elsewhere. The confirmed face is untouched, the overlap
+            // is deduplicated, and the photo is now stamped high.
+            detector = StubDetector(detections: [
+                DetectedFace(boundingBox: box.offsetBy(dx: 0.01, dy: 0.01), confidence: 0.9, landmarks: nil),
+                DetectedFace(boundingBox: CGRect(x: 0.6, y: 0.6, width: 0.15, height: 0.15), confidence: 0.8, landmarks: nil),
+            ])
+            let highService = FaceIndexService(catalogURL: catalog, options: FaceScanOptions(mode: .high))
+            report = try highService.scan(items: [item], embedder: StubEmbedder(), detector: detector)
+            XCTAssertEqual(report.photosProcessed, 1)
+
+            let faces = try store.faces(photoID: item.primary.pathKey)
+            XCTAssertEqual(faces.count, 2)
+            let confirmed = try XCTUnwrap(store.face(id: detected.id))
+            XCTAssertEqual(confirmed.state, .confirmed)
+            XCTAssertEqual(confirmed.personID, dad.id)
+            XCTAssertEqual(faces.filter { $0.state != .confirmed }.count, 1)
+            XCTAssertEqual(
+                try store.photos(pathKeys: [item.primary.pathKey])[item.primary.pathKey]?.scanGrade,
+                .high
+            )
+        }
+    }
+
+    // MARK: - SCRFD decode math
+
+    func testSCRFDDecodeAnchorsAndNMS() throws {
+        // A 640 tensor: stride 8 → 80²·2 anchors, 16 → 3200, 32 → 800.
+        let anchors8 = 80 * 80 * 2
+        let anchors16 = 40 * 40 * 2
+        let anchors32 = 20 * 20 * 2
+
+        var scores8 = [Float](repeating: 0.01, count: anchors8)
+        var boxes8 = [Float](repeating: 0, count: anchors8 * 4)
+        var kpss8 = [Float](repeating: 0, count: anchors8 * 10)
+        // One hot anchor at cell (row 10, col 20), k = 0.
+        let anchor = (10 * 80 + 20) * 2
+        scores8[anchor] = 0.9
+        // Distances l=t=r=b=5 → box centered on (20.5·8, 10.5·8) = (164,84).
+        for offset in 0..<4 { boxes8[anchor * 4 + offset] = 5 }
+
+        let candidates = SCRFDDetector.decodeArrays(
+            scores: [scores8, [Float](repeating: 0.01, count: anchors16), [Float](repeating: 0.01, count: anchors32)],
+            boxes: [boxes8, [Float](repeating: 0, count: anchors16 * 4), [Float](repeating: 0, count: anchors32 * 4)],
+            kpss: [kpss8, [Float](repeating: 0, count: anchors16 * 10), [Float](repeating: 0, count: anchors32 * 10)],
+            tensorSide: 640,
+            scoreThreshold: 0.5
+        )
+        XCTAssertEqual(candidates.count, 1)
+        let hit = try XCTUnwrap(candidates.first)
+        XCTAssertEqual(Double(hit.box.midX), 164, accuracy: 0.01)
+        XCTAssertEqual(Double(hit.box.midY), 84, accuracy: 0.01)
+        XCTAssertEqual(Double(hit.box.width), 80, accuracy: 0.01)
+        // Zero kps offsets land the five landmarks on the anchor center.
+        XCTAssertEqual(hit.landmarks.count, 5)
+        XCTAssertEqual(Double(hit.landmarks[0].x), 164, accuracy: 0.01)
+
+        // Wrong anchor counts → the outputs are ignored, not misdecoded.
+        XCTAssertEqual(
+            SCRFDDetector.decodeArrays(
+                scores: [[Float](repeating: 0.9, count: 7)],
+                boxes: [[Float](repeating: 0, count: 28)],
+                kpss: [],
+                tensorSide: 640,
+                scoreThreshold: 0.5
+            ).count,
+            0
+        )
+
+        // NMS keeps the higher score of two overlapping candidates and all
+        // disjoint ones.
+        let overlapping = SCRFDDetector.Candidate(
+            score: 0.9,
+            box: CGRect(x: 100, y: 100, width: 80, height: 80),
+            landmarks: []
+        )
+        let weaker = SCRFDDetector.Candidate(
+            score: 0.7,
+            box: CGRect(x: 105, y: 105, width: 80, height: 80),
+            landmarks: []
+        )
+        let apart = SCRFDDetector.Candidate(
+            score: 0.6,
+            box: CGRect(x: 400, y: 400, width: 60, height: 60),
+            landmarks: []
+        )
+        let kept = SCRFDDetector.nonMaxSuppressed([weaker, apart, overlapping], iouThreshold: 0.4)
+        XCTAssertEqual(kept.count, 2)
+        XCTAssertTrue(kept.contains { $0.score == 0.9 })
+        XCTAssertTrue(kept.contains { $0.score == 0.6 })
+    }
+
+    // MARK: - Video sampling
+
+    func testVideoSampleTimes() throws {
+        // MED: half-stride start, sparse coverage, capped.
+        XCTAssertEqual(
+            FaceVideoSampler.sampleTimes(duration: 100, stride: 30, maxFrames: 12),
+            [15, 45, 75]
+        )
+        // HIGH: ~1 fps.
+        XCTAssertEqual(
+            FaceVideoSampler.sampleTimes(duration: 5.5, stride: 1, maxFrames: .max),
+            [0.5, 1.5, 2.5, 3.5, 4.5]
+        )
+        // A clip shorter than the stride still contributes one mid frame.
+        XCTAssertEqual(
+            FaceVideoSampler.sampleTimes(duration: 10, stride: 30, maxFrames: 12),
+            [5]
+        )
+        // The cap is respected on long clips.
+        XCTAssertEqual(FaceVideoSampler.sampleTimes(duration: 600, stride: 30, maxFrames: 12).count, 12)
+        XCTAssertTrue(FaceVideoSampler.sampleTimes(duration: 0, stride: 30, maxFrames: 12).isEmpty)
+    }
+
     // MARK: - CoreML round-trip (skipped when the model is not installed)
 
     func testArcFaceEmbedderRoundTrip() async throws {
@@ -427,6 +692,55 @@ final class FaceIndexTests: XCTestCase {
         XCTAssertEqual(norm, 1, accuracy: 0.01)
         XCTAssertGreaterThan(FaceEmbeddingMath.cosine(first, repeatA), 0.999)
         XCTAssertLessThan(FaceEmbeddingMath.cosine(first, other), 0.999)
+    }
+
+    /// The MED/HIGH detector, exercised end to end when the package is
+    /// installed: loads, accepts the letterbox input, and decodes a real
+    /// prediction. A synthetic gradient likely yields zero faces — a valid
+    /// run — so the assertions are about the plumbing, not recall.
+    func testSCRFDDetectorLoadsAndRuns() async throws {
+        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        guard FaceModelCatalog.isDetectorInstalled(applicationSupport: support) else {
+            throw XCTSkip("Face detector not installed — run scripts/convert-scrfd.sh once")
+        }
+
+        let loaded = try await FaceModelCatalog.loadDetector(applicationSupport: support)
+        let detector = try XCTUnwrap(loaded)
+        XCTAssertTrue(detector.nativeInputSizes.contains(640))
+
+        let image = try makeFaceTestImage(seed: 9)
+        let detections = detector.detect(
+            in: image,
+            imagePixelSize: CGSize(width: image.width, height: image.height),
+            options: FaceScanOptions(mode: .med)
+        )
+        for detection in detections {
+            XCTAssertGreaterThanOrEqual(detection.confidence, 0.5)
+            XCTAssertEqual(detection.landmarks?.points.count ?? 5, 5)
+        }
+
+        // The full service path with the real detector on a face-free image.
+        try withTemporaryDirectory { root in
+            let catalog = root.appendingPathComponent("catalog.sqlite")
+            _ = try CatalogStore(url: catalog).bootstrap(
+                configuration: faceTestConfiguration(root: root, catalog: catalog),
+                createBackup: false,
+                createLibraryFolders: false
+            )
+            let jpegURL = root.appendingPathComponent("card/DSC00099.JPG")
+            try writeJPEG(jpegURL, seed: 8)
+            let item = try organizeItem(forFileAt: jpegURL)
+            let report = try FaceIndexService(
+                catalogURL: catalog,
+                options: FaceScanOptions(mode: .med)
+            ).scan(items: [item], embedder: StubEmbedder(), detector: detector)
+            XCTAssertEqual(report.photosProcessed, 1)
+            XCTAssertEqual(
+                try FaceIndexStore(url: catalog).photos(pathKeys: [item.primary.pathKey])[item.primary.pathKey]?.scanGrade,
+                .med
+            )
+        }
     }
 
     // MARK: - Helpers
@@ -627,5 +941,15 @@ private struct SplitMix64: RandomNumberGenerator {
 private struct StubEmbedder: FaceEmbeddingProviding {
     func embed(_ image: CGImage) throws -> [Float] {
         FaceEmbeddingMath.l2Normalized([Float](repeating: 1, count: 512))
+    }
+}
+
+/// Canned detections so service tests exercise the real scan path without
+/// a detector model on disk.
+private struct StubDetector: FaceDetecting {
+    var detections: [DetectedFace]
+
+    func detect(in image: CGImage, imagePixelSize: CGSize, options: FaceScanOptions) -> [DetectedFace] {
+        detections
     }
 }
