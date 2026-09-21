@@ -10,13 +10,35 @@ struct EventBoardView: View {
     let eventID: UUID
 
     @AppStorage("CameraToolkit.organize.tileWidth") private var tileWidth: Double = 220
+    @AppStorage("CameraToolkit.organize.mode") private var boardMode: OrganizeBoardMode = .tiles
+    @AppStorage("CameraToolkit.eventboard.grouping") private var grouping: OrganizeBoardGrouping = .day
+    @AppStorage("CameraToolkit.organize.order") private var sortOrder: OrganizeBoardOrder = .oldestFirst
     @State private var previewStackID: String?
+    @State private var previewFrameIndex = 0
+
+    /// Grouping that makes sense inside one event — every stack belongs to
+    /// it, so "by event" would be a single useless section.
+    private static let groupings: [OrganizeBoardGrouping] = [.day, .kind]
+
+    private var effectiveGrouping: OrganizeBoardGrouping {
+        Self.groupings.contains(grouping) ? grouping : .day
+    }
+
+    private var boardGroups: [OrganizeBoardGroup] {
+        OrganizeBoardPlan.groups(
+            for: workspace.eventStacks[eventID] ?? [],
+            grouping: effectiveGrouping,
+            order: sortOrder
+        )
+    }
 
     var body: some View {
         if let event = workspace.event(eventID) {
             let stacks = workspace.eventStacks[eventID]
-            let days = stacks.map { OrganizeStacker.days(for: $0) } ?? []
-            let ordered = days.flatMap(\.stacks)
+            let groups = boardGroups
+            let ordered = groups
+                .filter { !workspace.collapsedGroupIDs.contains($0.id) }
+                .flatMap(\.stacks)
             VStack(spacing: 0) {
                 header(event)
                 StorageStrip(model: model, workspace: workspace, event: event, summary: workspace.presence[eventID])
@@ -24,17 +46,17 @@ struct EventBoardView: View {
                     .padding(.horizontal, 16)
                     .padding(.bottom, 12)
                 Divider()
-                if let stacks {
-                    if stacks.isEmpty {
+                if stacks != nil {
+                    if groups.isEmpty {
                         emptyState(event)
                     } else {
-                        grid(days: days)
+                        board(groups: groups)
                     }
                 } else {
                     ProgressView("Checking every copy of \(event.name)…")
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
-                OrganizeStatusLine(model: model)
+                OrganizeStatusLine(model: model, workspace: workspace)
             }
             .overlay {
                 if previewStackID != nil {
@@ -57,7 +79,8 @@ struct EventBoardView: View {
                         orientationForFile: { workspace.displayTurns(for: $0) },
                         onRotate: { stack, delta in
                             workspace.rotateStack(stack, quarterTurnsCW: delta)
-                        }
+                        },
+                        initialFrameIndex: previewFrameIndex
                     )
                 }
             }
@@ -112,9 +135,48 @@ struct EventBoardView: View {
             .labelsHidden()
             .frame(width: 320)
             .help("Shared events live in the Buffer everyone browses. Private events stay hidden on the drive until they are archived to the NAS.")
-            Slider(value: $tileWidth, in: 140...460)
-                .frame(width: 110)
-                .help("Tile size")
+            Picker("View", selection: $boardMode) {
+                ForEach(OrganizeBoardMode.allCases) { mode in
+                    Image(systemName: mode.symbol).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(width: 64)
+            .help("Tiles or a dense list")
+            Menu {
+                Section("Group By") {
+                    ForEach(Self.groupings) { option in
+                        Toggle(option.title, isOn: Binding(
+                            get: { effectiveGrouping == option },
+                            set: { _ in grouping = option }
+                        ))
+                    }
+                }
+                Section("Order") {
+                    ForEach(OrganizeBoardOrder.allCases) { option in
+                        Toggle(option.title, isOn: Binding(
+                            get: { sortOrder == option },
+                            set: { _ in sortOrder = option }
+                        ))
+                    }
+                }
+                Divider()
+                let anyCollapsed = boardGroups.contains { workspace.collapsedGroupIDs.contains($0.id) }
+                Button(anyCollapsed ? "Expand All Groups" : "Collapse All Groups") {
+                    workspace.setAllGroupsCollapsed(!anyCollapsed, groups: boardGroups)
+                }
+            } label: {
+                Image(systemName: "arrow.up.arrow.down.square")
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .help("Group, sort, and collapse the board")
+            if boardMode == .tiles {
+                Slider(value: $tileWidth, in: 88...460)
+                    .frame(width: 110)
+                    .help("Tile size — smaller fits more bursts on screen")
+            }
             Button {
                 Task { await workspace.refreshEvent(eventID) }
             } label: {
@@ -174,27 +236,31 @@ struct EventBoardView: View {
         .frame(maxHeight: .infinity)
     }
 
-    private func grid(days: [OrganizeDay]) -> some View {
+    private func board(groups: [OrganizeBoardGroup]) -> some View {
         OrganizeGrid(
             workspace: workspace,
-            days: days,
+            groups: groups,
+            mode: boardMode,
             tileWidth: tileWidth,
             origin: .event,
             containerID: eventID,
-            daySubtitle: { day in
-                "\(day.stacks.count) items · \(day.frameCount) frames · \(day.byteCount.formattedBytes)"
-            },
             eventForStack: { _ in (nil, false) },
             isDimmed: { _ in false },
             badge: { workspace.badge(for: $0, in: eventID) },
             orientationForFile: { workspace.displayTurns(for: $0) },
-            onOpen: { stack in
+            onOpen: { stack, frame in
                 workspace.select(stackID: stack.id, orderedIDs: [], extend: false, toggle: false)
+                previewFrameIndex = frame
                 previewStackID = stack.id
             },
             onKey: { press, _ in handleKey(press) },
             menu: { stack in contextMenu(stack) }
         )
+    }
+
+    private func openPreview(_ stackID: String, frame: Int = 0) {
+        previewFrameIndex = frame
+        previewStackID = stackID
     }
 
     @ViewBuilder
@@ -211,7 +277,7 @@ struct EventBoardView: View {
             workspace.returnToUnsorted(targets, eventID: eventID)
         }
         Divider()
-        Button("Preview") { previewStackID = stack.id }
+        Button("Preview") { openPreview(stack.id) }
         Button("Open in Photomator") {
             PhotomatorLauncher.open(urls(for: targets))
         }
@@ -240,7 +306,9 @@ struct EventBoardView: View {
         case .selectAll:
             workspace.selectStacks(ordered.map(\.id))
         case .previewSelection:
-            previewStackID = workspace.focusedStackID ?? workspace.selectedStackIDs.first
+            if let id = workspace.focusedStackID ?? workspace.selectedStackIDs.first {
+                openPreview(id)
+            }
         case .openSelection:
             PhotomatorLauncher.open(urls(for: workspace.targetStackIDs()))
         case .revealSelection:
