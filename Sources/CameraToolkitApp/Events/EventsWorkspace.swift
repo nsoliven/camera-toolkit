@@ -71,27 +71,6 @@ struct PendingTrashRequest: Identifiable {
     var byteCount: Int64
     var sampleNames: [String]
     var destinations: [MediaTrashDestinationPreview]
-
-    var alertMessage: String {
-        var lines: [String] = []
-        let count = "\(fileCount) file\(fileCount == 1 ? "" : "s") (\(byteCount.formattedBytes)) from \(locationName)."
-        lines.append(count)
-        if !sampleNames.isEmpty {
-            let listed = sampleNames.joined(separator: ", ")
-            let extra = fileCount > sampleNames.count ? " and \(fileCount - sampleNames.count) more" : ""
-            lines.append("Including \(listed)\(extra).")
-        }
-        if destinations.isEmpty {
-            lines.append("No reachable files to move.")
-        } else {
-            lines.append("They will be renamed into:")
-            for dest in destinations {
-                lines.append("• \(dest.trashFolderPath) (\(dest.volumeLabel))")
-            }
-        }
-        lines.append("Not Finder Trash. Restore from Settings → Trash. Nothing is permanently deleted until you empty Trash.")
-        return lines.joined(separator: "\n")
-    }
 }
 
 struct OrganizeApplyPlan: Identifiable, Sendable {
