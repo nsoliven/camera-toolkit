@@ -132,6 +132,59 @@ public struct CatalogStore {
             checked_at TEXT NOT NULL,
             FOREIGN KEY(event_asset_id) REFERENCES event_assets(id) ON DELETE CASCADE
         );
+        CREATE TABLE IF NOT EXISTS face_photos (
+            path_key TEXT PRIMARY KEY,
+            path TEXT NOT NULL,
+            file_name TEXT NOT NULL,
+            byte_count INTEGER NOT NULL,
+            modified_at TEXT NOT NULL,
+            taken_at TEXT,
+            scan_grade TEXT NOT NULL DEFAULT 'none',
+            face_count INTEGER NOT NULL DEFAULT 0,
+            indexed_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS face_photos_file_key
+            ON face_photos(file_name, byte_count, modified_at);
+        CREATE TABLE IF NOT EXISTS people (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            is_roster INTEGER NOT NULL DEFAULT 0,
+            face_count INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS faces (
+            id TEXT PRIMARY KEY,
+            photo_id TEXT NOT NULL,
+            person_id TEXT,
+            box_x REAL NOT NULL,
+            box_y REAL NOT NULL,
+            box_w REAL NOT NULL,
+            box_h REAL NOT NULL,
+            det_score REAL NOT NULL,
+            match_score REAL,
+            embedding BLOB,
+            model TEXT NOT NULL DEFAULT 'w600k_r50',
+            state TEXT NOT NULL DEFAULT 'cached',
+            scan_grade TEXT NOT NULL DEFAULT 'low',
+            crop BLOB,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(photo_id) REFERENCES face_photos(path_key) ON DELETE CASCADE,
+            FOREIGN KEY(person_id) REFERENCES people(id) ON DELETE SET NULL
+        );
+        CREATE INDEX IF NOT EXISTS faces_photo_id ON faces(photo_id);
+        CREATE INDEX IF NOT EXISTS faces_person_id ON faces(person_id);
+        CREATE INDEX IF NOT EXISTS faces_state ON faces(state);
+        CREATE TABLE IF NOT EXISTS face_templates (
+            person_id TEXT NOT NULL,
+            face_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(person_id, face_id),
+            FOREIGN KEY(person_id) REFERENCES people(id) ON DELETE CASCADE,
+            FOREIGN KEY(face_id) REFERENCES faces(id) ON DELETE CASCADE
+        );
         """, database: database)
 
         // `parent_event_id` was added after the first catalogs shipped, so

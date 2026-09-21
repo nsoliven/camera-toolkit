@@ -275,11 +275,16 @@ final class EventsWorkspace {
 
     /// Sidebar rows matching the search query. Matching runs on each event's
     /// breadcrumb title, so a hit on a parent's name still reveals its
-    /// subevents ("phil" shows PHIL2026 / Matcha). Empty query returns all.
+    /// subevents ("phil" shows PHIL2026 / Matcha), and on the named people
+    /// detected in the event ("dad" keeps events where Dad was seen).
+    /// Empty query returns all.
     func sidebarRows(matching query: String) -> [(event: SavedCameraEvent, depth: Int)] {
         let needle = OrganizeSearch.needle(query)
         guard !needle.isEmpty else { return sidebarEvents }
-        return sidebarEvents.filter { OrganizeSearch.matches(eventTitle($0.event), needle: needle) }
+        return sidebarEvents.filter {
+            OrganizeSearch.matches(eventTitle($0.event), needle: needle)
+                || eventPeople($0.event.id).contains { OrganizeSearch.matches($0.name, needle: needle) }
+        }
     }
 
     /// Unsorted sidebar locations matching the search query on name or path.
@@ -1987,6 +1992,247 @@ final class EventsWorkspace {
                 Task { await self?.refreshEvent(eventID) }
                 let album = outcome.albumName.map { " Added \(outcome.albumAdded) to the “\($0)” album." } ?? ""
                 return "Immich: \(outcome.uploaded) uploaded, \(outcome.alreadyPresent + outcome.duplicates) already there.\(album)"
+            }
+        )
+    }
+
+    // MARK: - Faces
+
+    /// Bumped whenever face rows change so people chips and the People
+    /// window re-read the catalog.
+    private(set) var facesRevision = 0
+
+    @ObservationIgnored private var faceStoreInstance: FaceIndexStore?
+    /// (facesRevision, configurationRevision, people by event) — rebuilt
+    /// lazily so sidebar rows share one catalog pass.
+    @ObservationIgnored private var eventPeopleCache: (Int, Int, [UUID: [FacePerson]])?
+
+    var faceStore: FaceIndexStore {
+        if let faceStoreInstance { return faceStoreInstance }
+        let store = FaceIndexStore(url: catalogDatabaseURL)
+        faceStoreInstance = store
+        return store
+    }
+
+    private var catalogDatabaseURL: URL {
+        URL(fileURLWithPath: DashboardModel.expandedPath(model.configuration.catalogDatabasePath))
+    }
+
+    var faceModelInstalled: Bool {
+        FaceModelCatalog.isModelInstalled(applicationSupport: DashboardModel.defaultApplicationSupportURL)
+    }
+
+    /// "Face Scan (Low · Fast)" on a connected unsorted source: detect faces
+    /// on still photos, embed them with the on-device model, match named
+    /// people, and group the rest. Writes only to the catalog — media files
+    /// are only read.
+    func faceScan(_ location: ConfiguredLocation) {
+        guard isConnected(location) else {
+            model.statusMessage = "\(location.name) is not connected. Plug it in, then scan again."
+            return
+        }
+        guard faceModelInstalled else {
+            model.statusMessage = "The face model is not installed yet. Run scripts/convert-arcface.sh once on this Mac, then scan again."
+            return
+        }
+        let root = URL(fileURLWithPath: DashboardModel.expandedPath(location.path), isDirectory: true)
+        let existing = sources[location.id]?.result
+        let cache = captureDateCache
+        let support = DashboardModel.defaultApplicationSupportURL
+        let catalogURL = catalogDatabaseURL
+        let configuration = model.configuration
+        model.runAsyncJob(
+            action: .faceScan,
+            runningNote: "Scanning \(location.name) for faces",
+            logTitle: "Face scan: \(location.name)",
+            logDetail: "Detected faces on still photos, embedded them on-device, matched named people, and grouped the rest. Files were only read — nothing was written or moved.",
+            operation: { progress in
+                // Bootstrap is idempotent: it guarantees the face tables
+                // exist even if no catalog sync has run since the upgrade.
+                _ = try CatalogStore(url: catalogURL).bootstrap(
+                    configuration: configuration,
+                    createBackup: false,
+                    createLibraryFolders: false
+                )
+                guard let embedder = try await FaceModelCatalog.loadEmbedder(applicationSupport: support) else {
+                    throw FaceIndexError.modelNotInstalled(FaceModelCatalog.modelURL(applicationSupport: support).path)
+                }
+                var items = existing?.items
+                if items == nil {
+                    items = try OrganizeScanner().scan(root: root, cache: cache) { update in
+                        progress(DashboardModel.jobUpdate(
+                            from: FileOperationProgress(
+                                phase: update.phase,
+                                processedFiles: update.processed,
+                                totalFiles: update.total
+                            ),
+                            lowerBound: 0.02,
+                            upperBound: 0.25,
+                            notePrefix: "Reading",
+                            command: ""
+                        ))
+                    }.items
+                }
+                let lowerBound = existing == nil ? 0.25 : 0.02
+                return try FaceIndexService(catalogURL: catalogURL).scan(items: items ?? [], embedder: embedder) { update in
+                    progress(DashboardModel.jobUpdate(
+                        from: update,
+                        lowerBound: lowerBound,
+                        upperBound: 0.98,
+                        notePrefix: "Face scan",
+                        command: ""
+                    ))
+                }
+            },
+            completion: { [weak self] report in
+                self?.facesRevision &+= 1
+                return "Face scan done — \(report.facesDetected) face\(report.facesDetected == 1 ? "" : "s") on \(report.photosProcessed) new photo(s); \(report.photosSkipped) already scanned; \(report.facesProposed) matched to people, \(report.facesGrouped) grouped."
+            }
+        )
+    }
+
+    /// Named people detected on this event's photos — the "event.people"
+    /// derivation. Confirmed and proposed roster faces count; unnamed groups
+    /// never appear here.
+    func eventPeople(_ eventID: UUID) -> [FacePerson] {
+        if let cache = eventPeopleCache,
+           cache.0 == facesRevision,
+           cache.1 == model.configurationRevision {
+            return cache.2[eventID] ?? []
+        }
+        var keysByEvent: [UUID: Set<String>] = [:]
+        for assignment in model.configuration.photoEventAssignments {
+            let name = (assignment.relativePath as NSString).lastPathComponent
+            keysByEvent[assignment.eventID, default: []].insert(
+                FaceIndexStore.fileKey(
+                    fileName: name,
+                    byteCount: assignment.fileSize,
+                    modifiedAt: assignment.modifiedAt
+                )
+            )
+        }
+        var people: [UUID: [FacePerson]] = [:]
+        for (id, keys) in keysByEvent {
+            people[id] = (try? faceStore.eventPeople(fileKeys: keys)) ?? []
+        }
+        eventPeopleCache = (facesRevision, model.configurationRevision, people)
+        return people[eventID] ?? []
+    }
+
+    // MARK: - Face review actions
+
+    /// Review data for the People window: roster, unnamed groups, and the
+    /// proposed faces awaiting confirmation.
+    func faceSnapshot() -> (roster: [FacePerson], groups: [FacePerson], unsure: [FaceRecord]) {
+        let store = faceStore
+        let roster = (try? store.rosterPeople()) ?? []
+        let groups = (try? store.otherGroups()) ?? []
+        let unsure = (try? store.unsureFaces()) ?? []
+        return (roster, groups, unsure)
+    }
+
+    func faces(for personID: UUID) -> [FaceRecord] {
+        (try? faceStore.faces(personID: personID)) ?? []
+    }
+
+    func renamePerson(_ personID: UUID, name: String) {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        try? faceStore.renamePerson(personID, name: trimmed)
+        facesRevision &+= 1
+        model.statusMessage = "Renamed to \(trimmed)."
+    }
+
+    /// Merges one person into another — faces and templates move, the empty
+    /// row is removed. Confirmed faces keep their frozen state.
+    func mergePerson(_ sourceID: UUID, into targetID: UUID) {
+        guard sourceID != targetID,
+              let source = try? faceStore.person(sourceID),
+              let target = try? faceStore.person(targetID) else { return }
+        try? faceStore.mergePerson(sourceID, into: targetID)
+        try? faceStore.refreshFaceCounts()
+        facesRevision &+= 1
+        model.statusMessage = "Merged \(source.name) into \(target.name)."
+    }
+
+    /// Takes a person off the roster; the faces become an unnamed group
+    /// again rather than disappearing.
+    func demotePerson(_ personID: UUID) {
+        try? faceStore.demoteFromRoster(personID)
+        facesRevision &+= 1
+        model.statusMessage = "Removed from the people list. The faces stay grouped under Other."
+    }
+
+    /// Names an Other group: it joins the roster, its faces are confirmed,
+    /// and a spread of them become the templates future scans match against.
+    /// Then cached vectors re-match against the new gallery.
+    func nameGroup(_ personID: UUID, name: String) {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        try? faceStore.promoteGroup(personID, name: trimmed, templateCap: FaceScanOptions().templateCap)
+        facesRevision &+= 1
+        model.statusMessage = "Named \(trimmed). Existing faces are being re-matched against the new gallery."
+        rematchFaces()
+    }
+
+    /// Junks an unnamed group (statues, dogs, strangers) — the cluster and
+    /// its face rows are removed. Photos keep their scan grade, so a same
+    /// mode scan does not bring them back.
+    func junkGroup(_ personID: UUID) {
+        try? faceStore.deletePersonAndFaces(personID)
+        facesRevision &+= 1
+        model.statusMessage = "Removed the group. Nothing on disk was touched."
+    }
+
+    /// Confirms a proposed face and pins it as a template — confirmed faces
+    /// are frozen and never reclassified.
+    func confirmFace(_ faceID: UUID) {
+        try? faceStore.confirmFace(faceID)
+        if let face = try? faceStore.face(id: faceID), let personID = face.personID {
+            try? faceStore.addTemplate(personID: personID, faceID: faceID)
+        }
+        try? faceStore.refreshFaceCounts()
+        facesRevision &+= 1
+    }
+
+    /// Rejects a proposed face: it leaves the person and re-groups with the
+    /// Other clusters.
+    func rejectFace(_ faceID: UUID) {
+        try? FaceIndexService(catalogURL: catalogDatabaseURL).regroup([faceID])
+        facesRevision &+= 1
+    }
+
+    /// Pins a face as a match reference — the reviewed views of a person
+    /// that future scans compare new faces against.
+    func pinTemplate(_ faceID: UUID, for personID: UUID) {
+        try? faceStore.addTemplate(personID: personID, faceID: faceID)
+        facesRevision &+= 1
+        model.statusMessage = "Pinned as a match reference for future scans."
+    }
+
+    /// Cheap CPU-only pass after roster changes: re-match stored vectors to
+    /// the gallery without re-reading a single photo.
+    func rematchFaces() {
+        let catalogURL = catalogDatabaseURL
+        let configuration = model.configuration
+        model.runAsyncJob(
+            action: .faceScan,
+            runningNote: "Re-matching faces to named people",
+            logTitle: "Re-matched faces",
+            logDetail: "Stored face vectors were compared to the current roster. No photos were re-read and no ML ran.",
+            operation: { progress in
+                _ = try CatalogStore(url: catalogURL).bootstrap(
+                    configuration: configuration,
+                    createBackup: false,
+                    createLibraryFolders: false
+                )
+                try FaceIndexService(catalogURL: catalogURL).rematchRoster { update in
+                    progress(DashboardModel.jobUpdate(from: update, notePrefix: "Matching", command: ""))
+                }
+            },
+            completion: { [weak self] _ in
+                self?.facesRevision &+= 1
+                return "Re-matched faces against the updated roster."
             }
         )
     }

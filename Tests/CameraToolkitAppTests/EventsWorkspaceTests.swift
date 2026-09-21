@@ -468,6 +468,76 @@ final class EventsWorkspaceTests: XCTestCase {
         }
     }
 
+    func testEventPeopleDriveChipsAndSidebarPersonFilter() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let beach = try XCTUnwrap(workspace.createEvent(name: "Beach Day", date: organizerDay("2026-08-26"), policy: .buffer))
+            let hike = try XCTUnwrap(workspace.createEvent(name: "Hike", date: organizerDay("2026-08-27"), policy: .buffer))
+            let modified = Date(timeIntervalSince1970: 1_752_000_000)
+            model.updateConfiguration { configuration in
+                configuration.photoEventAssignments.append(PhotoEventAssignment(
+                    sourceRootPath: "/Card/DCIM",
+                    relativePath: "DSC00001.ARW",
+                    fileSize: 4_096,
+                    modifiedAt: modified,
+                    eventID: beach,
+                    deviceID: "sony-a7v"
+                ))
+                configuration.photoEventAssignments.append(PhotoEventAssignment(
+                    sourceRootPath: "/Card/DCIM",
+                    relativePath: "DSC00002.ARW",
+                    fileSize: 4_096,
+                    modifiedAt: modified,
+                    eventID: hike,
+                    deviceID: "sony-a7v"
+                ))
+            }
+
+            // Seed the face index as if a scan ran: Dad confirmed on the
+            // Beach Day photo, an unnamed group on the Hike photo.
+            let catalog = root.appendingPathComponent("catalog.sqlite")
+            _ = try CatalogStore(url: catalog).bootstrap(
+                configuration: model.configuration,
+                createBackup: false,
+                createLibraryFolders: false
+            )
+            let store = workspace.faceStore
+            let dad = try store.createPerson(name: "Dad", isRoster: true)
+            let stranger = try store.createPerson(name: "Person 1", isRoster: false)
+            let beachPhoto = FacePhotoRecord(
+                pathKey: EventStorageLocations.pathKey("/Card/DCIM/DSC00001.ARW"),
+                path: "/Card/DCIM/DSC00001.ARW",
+                fileName: "DSC00001.ARW",
+                byteCount: 4_096,
+                modifiedAt: modified,
+                scanGrade: .low
+            )
+            let hikePhoto = FacePhotoRecord(
+                pathKey: EventStorageLocations.pathKey("/Card/DCIM/DSC00002.ARW"),
+                path: "/Card/DCIM/DSC00002.ARW",
+                fileName: "DSC00002.ARW",
+                byteCount: 4_096,
+                modifiedAt: modified,
+                scanGrade: .low
+            )
+            let box = NormalizedFaceBox(x: 0.1, y: 0.1, width: 0.2, height: 0.2)
+            try store.replaceFaces(photo: beachPhoto, faces: [
+                FaceRecord(photoID: beachPhoto.pathKey, personID: dad.id, box: box, detScore: 0.9, embedding: [0.5, 0.5], state: .confirmed),
+            ])
+            try store.replaceFaces(photo: hikePhoto, faces: [
+                FaceRecord(photoID: hikePhoto.pathKey, personID: stranger.id, box: box, detScore: 0.9, embedding: [0.5, 0.5], state: .other),
+            ])
+
+            // event.people: roster people only, per event.
+            XCTAssertEqual(workspace.eventPeople(beach).map(\.name), ["Dad"])
+            XCTAssertEqual(workspace.eventPeople(hike), [])
+
+            // Sidebar search filters events by roster person name; unnamed
+            // group labels never leak into event filtering.
+            XCTAssertEqual(workspace.sidebarRows(matching: "dad").map(\.event.id), [beach])
+            XCTAssertTrue(workspace.sidebarRows(matching: "person").isEmpty)
+        }
+    }
+
     // MARK: - Helpers
 
     private func withOrganizerSandbox(

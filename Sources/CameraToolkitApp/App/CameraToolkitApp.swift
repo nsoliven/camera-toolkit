@@ -288,6 +288,15 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate {
         eventLibraryItem.target = self
         viewMenu.addItem(eventLibraryItem)
 
+        let peopleItem = NSMenuItem(
+            title: "People…",
+            action: #selector(openPeople),
+            keyEquivalent: "p"
+        )
+        peopleItem.keyEquivalentModifierMask = [.command, .option]
+        peopleItem.target = self
+        viewMenu.addItem(peopleItem)
+
         let catalogInspectorItem = NSMenuItem(
             title: "Photo List SQL Inspector…",
             action: #selector(openCatalogInspector),
@@ -440,6 +449,11 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate {
 
     @objc private func openEventLibrary() {
         EventLibraryWindowController.shared.show(model: model)
+    }
+
+    @objc private func openPeople() {
+        AppShellMode.show(.events)
+        PeopleWindowController.shared.show(model: model, workspace: CameraToolkitRuntime.workspace)
     }
 
     @objc private func openCatalogInspector() {
