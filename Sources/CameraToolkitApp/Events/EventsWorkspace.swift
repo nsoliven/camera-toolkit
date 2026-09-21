@@ -1080,11 +1080,10 @@ final class EventsWorkspace {
     func completeNewEvent(_ request: NewEventRequest, name: String, date: Date, policy: EventStoragePolicy?, parentEventID: UUID?) {
         guard let eventID = createEvent(name: name, date: date, policy: policy, parentEventID: parentEventID) else { return }
         newEventRequest = nil
-        if let locationID = request.sourceLocationID, !request.stackIDs.isEmpty {
-            assign(stackIDs: request.stackIDs, from: locationID, to: eventID)
-        } else if let fromEvent = request.moveFromEventID, !request.stackIDs.isEmpty {
-            moveStacks(request.stackIDs, fromEvent: fromEvent, toEvent: eventID)
-        } else if request.sourceLocationID == nil {
+        // Creating an event never sorts or moves photos. Assign is a separate
+        // click on the board; Apply is the later move. Auto-assign made every
+        // selected burst go gray the moment the sheet confirmed.
+        if request.sourceLocationID == nil, request.moveFromEventID == nil {
             selection = .event(eventID)
         }
     }
