@@ -323,7 +323,7 @@ struct BoardGroupHeader: View {
             Button("Select", action: onSelect)
                 .buttonStyle(.borderless)
                 .font(.callout)
-                .disabled(group.stacks.isEmpty || isCollapsed)
+                .disabled(group.stacks.isEmpty)
                 .help("Select everything in this group")
         }
         .padding(.vertical, 8)
@@ -583,16 +583,15 @@ struct OrganizeGrid<MenuContent: View>: View {
     @FocusState private var isFocused: Bool
     @State private var columns = 1
 
-    /// Stacks the board is actually showing — collapsed groups hide theirs.
-    private var visibleGroups: [OrganizeBoardGroup] {
-        groups.map { group in
-            guard workspace.collapsedGroupIDs.contains(group.id) else { return group }
-            return OrganizeBoardGroup(id: group.id, title: group.title, symbol: group.symbol, stacks: [])
-        }
+    /// One section per group — collapsing hides a group's rows, never the
+    /// group itself, so headers keep their real counts and Select still
+    /// sees the stacks.
+    private var sections: [OrganizeBoardSection] {
+        OrganizeBoardPlan.sections(for: groups, collapsedIDs: workspace.collapsedGroupIDs)
     }
 
     var body: some View {
-        let ordered = visibleGroups.flatMap(\.stacks)
+        let ordered = sections.flatMap(\.visibleStacks)
         let orderedIDs = ordered.map(\.id)
         ScrollViewReader { proxy in
             ScrollView {
@@ -625,9 +624,9 @@ struct OrganizeGrid<MenuContent: View>: View {
             spacing: 14,
             pinnedViews: [.sectionHeaders]
         ) {
-            ForEach(visibleGroups) { group in
+            ForEach(sections) { section in
                 Section {
-                    ForEach(group.stacks) { stack in
+                    ForEach(section.visibleStacks) { stack in
                         if workspace.expandedStackIDs.contains(stack.id), stack.isBurst {
                             expansion(stack)
                                 .gridCellColumns(max(columns, 1))
@@ -637,13 +636,13 @@ struct OrganizeGrid<MenuContent: View>: View {
                     }
                 } header: {
                     BoardGroupHeader(
-                        group: group,
-                        isCollapsed: workspace.collapsedGroupIDs.contains(group.id),
+                        group: section.group,
+                        isCollapsed: section.isCollapsed,
                         onToggleCollapse: {
-                            workspace.setGroupCollapsed(group.id, collapsed: !workspace.collapsedGroupIDs.contains(group.id))
+                            workspace.setGroupCollapsed(section.id, collapsed: !section.isCollapsed)
                         },
                         onSelect: {
-                            workspace.selectStacks(group.stacks.map(\.id))
+                            workspace.selectStacks(section.group.stacks.map(\.id))
                             isFocused = true
                         }
                     )
@@ -662,9 +661,9 @@ struct OrganizeGrid<MenuContent: View>: View {
 
     private func listBoard(orderedIDs: [String]) -> some View {
         LazyVStack(spacing: 0, pinnedViews: [.sectionHeaders]) {
-            ForEach(visibleGroups) { group in
+            ForEach(sections) { section in
                 Section {
-                    ForEach(group.stacks) { stack in
+                    ForEach(section.visibleStacks) { stack in
                         row(stack, orderedIDs: orderedIDs)
                         if workspace.expandedStackIDs.contains(stack.id), stack.isBurst {
                             expansion(stack, compact: true)
@@ -675,13 +674,13 @@ struct OrganizeGrid<MenuContent: View>: View {
                     }
                 } header: {
                     BoardGroupHeader(
-                        group: group,
-                        isCollapsed: workspace.collapsedGroupIDs.contains(group.id),
+                        group: section.group,
+                        isCollapsed: section.isCollapsed,
                         onToggleCollapse: {
-                            workspace.setGroupCollapsed(group.id, collapsed: !workspace.collapsedGroupIDs.contains(group.id))
+                            workspace.setGroupCollapsed(section.id, collapsed: !section.isCollapsed)
                         },
                         onSelect: {
-                            workspace.selectStacks(group.stacks.map(\.id))
+                            workspace.selectStacks(section.group.stacks.map(\.id))
                             isFocused = true
                         }
                     )

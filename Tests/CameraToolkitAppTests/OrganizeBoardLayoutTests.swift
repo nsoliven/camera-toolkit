@@ -120,6 +120,80 @@ final class OrganizeBoardLayoutTests: XCTestCase {
         XCTAssertTrue(group.subtitle.contains("2 frames"))
     }
 
+    // MARK: - Collapsed sections
+
+    /// The old board blanked a collapsed group's stacks and fed the empty
+    /// copy to the header, so every collapsed day read "0 items · 0 frames
+    /// · Zero KB" and Select had nothing to act on. A section's rows hide;
+    /// its group must keep telling the truth.
+    func testCollapsedSectionHidesRowsButKeepsTrueCounts() {
+        let stacks = [
+            OrganizeStack(items: [
+                item("/Card/B0001_DSC00001.ARW", at: date(2026, 8, 26, hour: 9)),
+                item("/Card/B0001_DSC00002.ARW", at: date(2026, 8, 26, hour: 9, minute: 1)),
+            ]),
+            OrganizeStack(items: [item("/Card/DSC00003.ARW", at: date(2026, 8, 26, hour: 12))]),
+        ]
+        let groups = OrganizeBoardPlan.groups(for: stacks, grouping: .day, order: .oldestFirst)
+        let sections = OrganizeBoardPlan.sections(for: groups, collapsedIDs: [groups[0].id])
+
+        let collapsed = sections[0]
+        XCTAssertTrue(collapsed.isCollapsed)
+        XCTAssertTrue(collapsed.visibleStacks.isEmpty)
+        // Same stacks, same counts, same subtitle as the expanded group —
+        // Select on the collapsed day selects these.
+        XCTAssertEqual(collapsed.group.stacks.map(\.id), groups[0].stacks.map(\.id))
+        XCTAssertEqual(collapsed.group.subtitle, groups[0].subtitle)
+        XCTAssertEqual(collapsed.group.stacks.count, 2)
+        XCTAssertEqual(collapsed.group.frameCount, 3)
+        XCTAssertEqual(collapsed.group.byteCount, 300)
+        XCTAssertFalse(collapsed.group.subtitle.hasPrefix("0 items"))
+    }
+
+    func testCollapseLeavesOtherSectionsUntouched() {
+        let stacks = [
+            OrganizeStack(items: [item("/Card/DSC00001.ARW", at: date(2026, 8, 26))]),
+            OrganizeStack(items: [item("/Card/DSC00002.ARW", at: date(2026, 8, 27))]),
+        ]
+        let groups = OrganizeBoardPlan.groups(for: stacks, grouping: .day, order: .oldestFirst)
+        let sections = OrganizeBoardPlan.sections(for: groups, collapsedIDs: [groups[0].id])
+
+        XCTAssertEqual(sections.map(\.id), groups.map(\.id))
+        XCTAssertTrue(sections[0].visibleStacks.isEmpty)
+        XCTAssertFalse(sections[1].isCollapsed)
+        XCTAssertEqual(sections[1].visibleStacks.map(\.id), groups[1].stacks.map(\.id))
+        // The board's stack order only contains rows that are on screen.
+        XCTAssertEqual(sections.flatMap(\.visibleStacks).map(\.id), [stacks[1].id])
+    }
+
+    /// A group exists because stacks landed in it — for every grouping the
+    /// plan must never emit a zero-stack section, and a day with stacks
+    /// must never format as 0 items.
+    func testBoardPlanNeverProducesAZeroStackGroup() {
+        let stacks = [
+            OrganizeStack(items: [
+                item("/Card/DCIM/B0001_DSC00001.ARW", at: date(2026, 8, 26)),
+                item("/Card/DCIM/B0001_DSC00002.ARW", at: date(2026, 8, 26, minute: 1)),
+            ]),
+            OrganizeStack(items: [item("/Card/DCIM/C0001.MP4", kind: .video, at: date(2026, 8, 27))]),
+            OrganizeStack(items: [item("/Card/DSC00003.ARW", kind: .photo, at: date(2026, 8, 28))]),
+        ]
+        for grouping in OrganizeBoardGrouping.allCases {
+            let groups = OrganizeBoardPlan.groups(
+                for: stacks,
+                grouping: grouping,
+                order: .oldestFirst,
+                rootPath: "/Card"
+            )
+            XCTAssertFalse(groups.isEmpty, "\(grouping) dropped every group")
+            for group in groups {
+                XCTAssertFalse(group.stacks.isEmpty, "\(grouping) produced a zero-stack group: \(group.id)")
+                XCTAssertFalse(group.subtitle.hasPrefix("0 items"), "\(group.id) formats as 0 items")
+            }
+        }
+        XCTAssertTrue(OrganizeBoardPlan.groups(for: [], grouping: .day, order: .oldestFirst).isEmpty)
+    }
+
     func testRouteLabelBreadcrumbDropsVolumesPrefix() {
         XCTAssertEqual(
             OrganizeRouteLabel.breadcrumb(for: "/Volumes/A7V/DCIM/Transfer 1"),
