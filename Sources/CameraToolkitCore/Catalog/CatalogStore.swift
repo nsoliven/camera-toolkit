@@ -16,6 +16,24 @@ public struct CatalogBootstrapReport: Codable, Equatable, Sendable {
 }
 
 public struct CatalogStore {
+    /// A catalog SQL failure that keeps the SQLite result code so the
+    /// bootstrap retry can tell a NAS lock/IO stutter from a real error.
+    /// Its description matches the `ToolkitError` text the store has
+    /// always thrown.
+    private struct SQLiteError: Error, LocalizedError {
+        let code: Int32
+        let message: String
+        var errorDescription: String? { message }
+    }
+
+    /// True when `error` carries a transient BUSY/IOERR — the failures a
+    /// network volume returns for a momentary lock. Anything else is a
+    /// real failure and ends the retry.
+    private static func isTransientSQLiteError(_ error: Error) -> Bool {
+        guard let error = error as? SQLiteError else { return false }
+        return CatalogTransactionRetry.isTransient(error.code)
+    }
+
     public let url: URL
     private let fileManager: FileManager
 
@@ -204,27 +222,35 @@ public struct CatalogStore {
         // catalogs get it grafted on the same way.
         try ensureColumn(table: "people", column: "cover_face_id", definition: "cover_face_id TEXT", database: database)
 
-        try execute("BEGIN IMMEDIATE;", database: database)
-        do {
-            try upsertAppState("cameraLibraryRootPath", value: configuration.cameraLibraryRootPath, database: database)
-            try upsertAppState("archivePath", value: configuration.archivePath, database: database)
-            try upsertAppState("bufferPath", value: configuration.bufferPath, database: database)
-            try upsertAppState("catalogBackupFolderPath", value: configuration.catalogBackupFolderPath, database: database)
+        // The whole bootstrap transaction — BEGIN IMMEDIATE through
+        // COMMIT — retries a transient BUSY/IOERR with a short backoff:
+        // on a network volume a lock stutter surfaces as SQLITE_IOERR
+        // (10), not a clean busy. A failure that outlasts the retries is
+        // rethrown with the real SQLite message. Every attempt starts
+        // clean because the previous one rolled back.
+        try CatalogTransactionRetry.run(isTransient: Self.isTransientSQLiteError) {
+            try execute("BEGIN IMMEDIATE;", database: database)
+            do {
+                try upsertAppState("cameraLibraryRootPath", value: configuration.cameraLibraryRootPath, database: database)
+                try upsertAppState("archivePath", value: configuration.archivePath, database: database)
+                try upsertAppState("bufferPath", value: configuration.bufferPath, database: database)
+                try upsertAppState("catalogBackupFolderPath", value: configuration.catalogBackupFolderPath, database: database)
 
-            for folder in CameraLibraryFolder.allCases {
-                try upsertLibraryFolder(folder, path: configuration.libraryFolderPath(folder).path, database: database)
+                for folder in CameraLibraryFolder.allCases {
+                    try upsertLibraryFolder(folder, path: configuration.libraryFolderPath(folder).path, database: database)
+                }
+
+                for location in configuration.configuredLocations {
+                    let selected = configuration.selectedLocationID(for: location.role) == location.id
+                    try upsertStorageLocation(location, selected: selected, database: database)
+                }
+
+                try synchronizeEvents(configuration: configuration, database: database)
+                try execute("COMMIT;", database: database)
+            } catch {
+                try? execute("ROLLBACK;", database: database)
+                throw error
             }
-
-            for location in configuration.configuredLocations {
-                let selected = configuration.selectedLocationID(for: location.role) == location.id
-                try upsertStorageLocation(location, selected: selected, database: database)
-            }
-
-            try synchronizeEvents(configuration: configuration, database: database)
-            try execute("COMMIT;", database: database)
-        } catch {
-            try? execute("ROLLBACK;", database: database)
-            throw error
         }
 
         let backupURL = createBackup ? try backupIfConfigured(configuration: configuration) : nil
@@ -281,10 +307,11 @@ public struct CatalogStore {
 
     private func execute(_ sql: String, database: OpaquePointer) throws {
         var error: UnsafeMutablePointer<CChar>?
-        guard sqlite3_exec(database, sql, nil, nil, &error) == SQLITE_OK else {
+        let code = sqlite3_exec(database, sql, nil, nil, &error)
+        guard code == SQLITE_OK else {
             let message = error.map { String(cString: $0) } ?? String(cString: sqlite3_errmsg(database))
             sqlite3_free(error)
-            throw ToolkitError.commandFailed("Catalog SQL failed: \(message)")
+            throw SQLiteError(code: code, message: "Catalog SQL failed: \(message)")
         }
     }
 
@@ -469,7 +496,10 @@ public struct CatalogStore {
     private func runUpsert(_ sql: String, values: [String?], database: OpaquePointer) throws {
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK, let statement else {
-            throw ToolkitError.commandFailed("Could not prepare catalog statement: \(String(cString: sqlite3_errmsg(database)))")
+            throw SQLiteError(
+                code: sqlite3_errcode(database),
+                message: "Could not prepare catalog statement: \(String(cString: sqlite3_errmsg(database)))"
+            )
         }
         defer { sqlite3_finalize(statement) }
 
@@ -481,8 +511,12 @@ public struct CatalogStore {
             }
         }
 
-        guard sqlite3_step(statement) == SQLITE_DONE else {
-            throw ToolkitError.commandFailed("Could not write catalog row: \(String(cString: sqlite3_errmsg(database)))")
+        let code = sqlite3_step(statement)
+        guard code == SQLITE_DONE else {
+            throw SQLiteError(
+                code: code,
+                message: "Could not write catalog row: \(String(cString: sqlite3_errmsg(database)))"
+            )
         }
     }
 
