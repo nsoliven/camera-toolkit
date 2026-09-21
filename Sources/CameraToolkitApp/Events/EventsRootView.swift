@@ -116,16 +116,31 @@ struct EventsRootView: View {
             )
         }
         .sheet(item: $workspace.faceScanRequest) { request in
-            if let location = workspace.location(request.locationID) {
-                FaceScanSheet(
-                    location: location,
-                    detectorInstalled: workspace.faceDetectorInstalled,
-                    onCancel: { workspace.faceScanRequest = nil },
-                    onScan: { options in
-                        workspace.faceScanRequest = nil
-                        workspace.faceScan(location, options: options)
-                    }
-                )
+            switch request.subject {
+            case .location(let locationID):
+                if let location = workspace.location(locationID) {
+                    FaceScanSheet(
+                        name: location.name,
+                        detectorInstalled: workspace.faceDetectorInstalled,
+                        onCancel: { workspace.faceScanRequest = nil },
+                        onScan: { options in
+                            workspace.faceScanRequest = nil
+                            workspace.faceScan(location, options: options)
+                        }
+                    )
+                }
+            case .event(let eventID):
+                if let event = workspace.event(eventID) {
+                    FaceScanSheet(
+                        name: workspace.eventTitle(event),
+                        detectorInstalled: workspace.faceDetectorInstalled,
+                        onCancel: { workspace.faceScanRequest = nil },
+                        onScan: { options in
+                            workspace.faceScanRequest = nil
+                            workspace.faceScan(event, options: options)
+                        }
+                    )
+                }
             }
         }
     }
@@ -260,6 +275,10 @@ struct EventsSidebar: View {
                                 Button("Rename or Change Date…") {
                                     workspace.renameRequest = RenameEventRequest(eventID: row.event.id)
                                 }
+                                Button("Scan for Faces…") { workspace.requestFaceScan(row.event) }
+                                    .disabled(workspace.faceScanBlocker(for: row.event) != nil)
+                                    .help(workspace.faceScanBlocker(for: row.event)
+                                        ?? "Detect and match faces on a sample of each burst — not every frame. Writes only to the catalog — media is read, never touched.")
                                 Button("Delete Empty Event", role: .destructive) {
                                     workspace.deleteEmptyEvent(row.event.id)
                                 }
@@ -787,7 +806,9 @@ struct RemovalConfirmSheet: View {
 /// Mac). No model names — the owner picks how hard to look, the models
 /// are fixed.
 struct FaceScanSheet: View {
-    let location: ConfiguredLocation
+    /// What is being scanned — an unsorted location's name or an event's
+    /// breadcrumb title.
+    let name: String
     /// MED and above need the converted detector package; without it the
     /// scan button stays off and the fix is spelled out inline.
     let detectorInstalled: Bool
@@ -801,13 +822,14 @@ struct FaceScanSheet: View {
         VStack(alignment: .leading, spacing: 16) {
             Text("Scan for Faces")
                 .font(.title2.bold())
-            Text(location.name)
+            Text(name)
                 .foregroundStyle(.secondary)
             Form {
                 Picker("Quality", selection: $mode) {
                     Text("Low").tag(FaceScanGrade.low)
                     Text("Medium").tag(FaceScanGrade.med)
                     Text("High").tag(FaceScanGrade.high)
+                    Text("Extra High").tag(FaceScanGrade.xhigh)
                 }
                 .pickerStyle(.segmented)
                 Toggle("Fast — pin the Mac", isOn: $fast)
@@ -850,6 +872,8 @@ struct FaceScanSheet: View {
             "A more careful pass: stills plus a light sample of video frames, and it finds smaller faces down to about 40 px."
         case .high:
             "The deep pass: stills at two scales, faces down to about 30 px, and roughly one frame per second of video. Takes a while on big libraries."
+        case .xhigh:
+            "Reserved for the deepest pass. Today it runs the High pipeline and marks its photos so a future Extra High engine can re-scan them."
         default:
             "The quick pass: still photos only, faces large enough to matter. Videos are skipped."
         }

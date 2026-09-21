@@ -687,6 +687,158 @@ final class EventsWorkspaceTests: XCTestCase {
         }
     }
 
+    func testEventFaceScanBlockerRequiresAssignedReachableFiles() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            // An event with nothing sorted into it has nothing to scan.
+            let empty = try XCTUnwrap(workspace.createEvent(name: "Empty", date: organizerDay("2026-08-26"), policy: .buffer))
+            let emptyEvent = try XCTUnwrap(workspace.event(empty))
+            let noFiles = try XCTUnwrap(workspace.faceScanBlocker(for: emptyEvent))
+            XCTAssertTrue(noFiles.contains("Sort photos"))
+            workspace.faceScan(emptyEvent)
+            XCTAssertFalse(model.jobs.contains { $0.action == .faceScan })
+
+            // Assigned files that exist nowhere right now still block the
+            // scan — presence resolves to zero reachable stacks.
+            let ghost = try XCTUnwrap(workspace.createEvent(name: "Ghost", date: organizerDay("2026-08-26"), policy: .buffer))
+            model.updateConfiguration { configuration in
+                configuration.photoEventAssignments.append(PhotoEventAssignment(
+                    sourceRootPath: "/Volumes/MissingCard/DCIM",
+                    relativePath: "DSC00009.ARW",
+                    fileSize: 4_096,
+                    modifiedAt: Date(timeIntervalSince1970: 1_752_000_000),
+                    eventID: ghost,
+                    deviceID: "sony-a7v"
+                ))
+            }
+            let ghostEvent = try XCTUnwrap(workspace.event(ghost))
+            await workspace.refreshEvent(ghost)
+            XCTAssertEqual(workspace.eventStacks[ghost], [])
+            let offline = try XCTUnwrap(workspace.faceScanBlocker(for: ghostEvent))
+            XCTAssertTrue(offline.contains("No reachable copies"))
+            workspace.faceScan(ghostEvent)
+            XCTAssertFalse(model.jobs.contains { $0.action == .faceScan })
+
+            // Once presence finds reachable copies the gate lifts.
+            let unsorted = root.appendingPathComponent("Card", isDirectory: true)
+            try writeOrganizerARW(unsorted.appendingPathComponent("DSC00001.ARW"), "2026:08:26 10:00:00", "000")
+            let location = addUnsorted(unsorted, to: model)
+            workspace.scan(location)
+            try await waitUntil {
+                workspace.sources[location.id]?.result != nil
+                    && workspace.sources[location.id]?.isScanning == false
+            }
+            let beach = try XCTUnwrap(workspace.createEvent(name: "Beach Day", date: organizerDay("2026-08-26"), policy: .buffer))
+            for stack in workspace.sources[location.id]?.result?.stacks ?? [] {
+                workspace.assign(stackIDs: [stack.id], from: location.id, to: beach)
+            }
+            let beachEvent = try XCTUnwrap(workspace.event(beach))
+            // Before any refresh the blocker warms presence itself; once
+            // that pass lands the gate lifts.
+            let warming = try XCTUnwrap(workspace.faceScanBlocker(for: beachEvent))
+            XCTAssertTrue(warming.contains("checking"))
+            try await waitUntil { workspace.eventStacks[beach] != nil }
+            XCTAssertEqual(workspace.eventStacks[beach]?.count, 1)
+            XCTAssertNil(workspace.faceScanBlocker(for: beachEvent))
+        }
+    }
+
+    func testEventFaceScanRunsAsTrackedJobOnReachableFiles() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let unsorted = root.appendingPathComponent("Card", isDirectory: true)
+            try writeOrganizerARW(unsorted.appendingPathComponent("B0001_DSC00001.ARW"), "2026:08:26 10:00:00", "100")
+            try writeOrganizerARW(unsorted.appendingPathComponent("B0001_DSC00002.ARW"), "2026:08:26 10:00:00", "400")
+            let location = addUnsorted(unsorted, to: model)
+            workspace.scan(location)
+            try await waitUntil {
+                workspace.sources[location.id]?.result != nil
+                    && workspace.sources[location.id]?.isScanning == false
+            }
+            let result = try XCTUnwrap(workspace.sources[location.id]?.result)
+
+            let beach = try XCTUnwrap(workspace.createEvent(name: "Beach Day", date: organizerDay("2026-08-26"), policy: .buffer))
+            for stack in result.stacks {
+                workspace.assign(stackIDs: [stack.id], from: location.id, to: beach)
+            }
+            let event = try XCTUnwrap(workspace.event(beach))
+            await workspace.refreshEvent(beach)
+            XCTAssertEqual(workspace.eventStacks[beach]?.count, 1)
+
+            workspace.faceEmbedderProvider = { StubFaceEmbedder() }
+            workspace.faceScan(event)
+            try await waitUntil { !model.isBusy }
+
+            // The Jobs window lists model.jobs — the event's scan appears
+            // there, and finishing bumps facesRevision so the board's
+            // people chips re-read the catalog.
+            let job = try XCTUnwrap(model.jobs.first { $0.action == .faceScan })
+            XCTAssertEqual(job.state, .done)
+            XCTAssertTrue(model.statusMessage.contains("Face scan done"))
+            XCTAssertEqual(workspace.facesRevision, 1)
+        }
+    }
+
+    func testBoardSearchMatchesRosterPersonNames() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let unsorted = root.appendingPathComponent("Card", isDirectory: true)
+            try writeOrganizerARW(unsorted.appendingPathComponent("DSC00001.ARW"), "2026:08:26 10:00:00", "000")
+            try writeOrganizerARW(unsorted.appendingPathComponent("DSC00002.ARW"), "2026:08:26 12:00:00", "000")
+            let location = addUnsorted(unsorted, to: model)
+            workspace.scan(location)
+            try await waitUntil {
+                workspace.sources[location.id]?.result != nil
+                    && workspace.sources[location.id]?.isScanning == false
+            }
+            let result = try XCTUnwrap(workspace.sources[location.id]?.result)
+
+            let beach = try XCTUnwrap(workspace.createEvent(name: "Beach Day", date: organizerDay("2026-08-26"), policy: .buffer))
+            for stack in result.stacks {
+                workspace.assign(stackIDs: [stack.id], from: location.id, to: beach)
+            }
+            await workspace.refreshEvent(beach)
+            let eventStacks = try XCTUnwrap(workspace.eventStacks[beach])
+            XCTAssertEqual(eventStacks.count, 2)
+
+            // Seed the face index as if a scan ran: Dad confirmed on
+            // DSC00001's file identity (name + size + mtime).
+            let catalog = root.appendingPathComponent("catalog.sqlite")
+            _ = try CatalogStore(url: catalog).bootstrap(
+                configuration: model.configuration,
+                createBackup: false,
+                createLibraryFolders: false
+            )
+            let store = workspace.faceStore
+            let dad = try store.createPerson(name: "Dad", isRoster: true)
+            let dadFile = try XCTUnwrap(eventStacks.flatMap(\.files).first { $0.name == "DSC00001.ARW" })
+            let photo = FacePhotoRecord(
+                pathKey: EventStorageLocations.pathKey(dadFile.path),
+                path: dadFile.path,
+                fileName: dadFile.name,
+                byteCount: dadFile.size,
+                modifiedAt: dadFile.modifiedAt,
+                scanGrade: .low
+            )
+            try store.replaceFaces(photo: photo, faces: [
+                FaceRecord(photoID: photo.pathKey, personID: dad.id, box: NormalizedFaceBox(x: 0.1, y: 0.1, width: 0.2, height: 0.2), detScore: 0.9, embedding: [0.5, 0.5], state: .confirmed),
+            ])
+            XCTAssertEqual(workspace.eventPeople(beach).map(\.name), ["Dad"])
+
+            // A roster name keeps the stack holding that person's photo on
+            // both the event board and the unsorted board.
+            let dadStacks = workspace.visibleEventStacks(beach, matching: "dad")
+            XCTAssertEqual(dadStacks.count, 1)
+            XCTAssertTrue(dadStacks.flatMap(\.files).contains { $0.name == "DSC00001.ARW" })
+            XCTAssertTrue(workspace.visibleEventStacks(beach, matching: "stranger").isEmpty)
+            let unsortedMatches = workspace.visibleStacks(result, hideSorted: false, matching: "dad")
+            XCTAssertEqual(unsortedMatches.count, 1)
+            XCTAssertTrue(unsortedMatches.flatMap(\.files).contains { $0.name == "DSC00001.ARW" })
+            XCTAssertTrue(workspace.visibleStacks(result, hideSorted: false, matching: "stranger").isEmpty)
+
+            // File-name search still matches the other stack.
+            let byName = workspace.visibleEventStacks(beach, matching: "dsc00002")
+            XCTAssertTrue(byName.flatMap(\.files).contains { $0.name == "DSC00002.ARW" })
+        }
+    }
+
     func testRegroupBurstsRerunsGroupingAsAnOrganizeJob() async throws {
         try await withOrganizerSandbox { root, model, workspace in
             let unsorted = root.appendingPathComponent("Card", isDirectory: true)
