@@ -41,7 +41,7 @@ struct EventBoardView: View {
                 .filter { !workspace.collapsedGroupIDs.contains($0.id) }
                 .flatMap(\.stacks)
             VStack(spacing: 0) {
-                header(event)
+                header(event, groups: groups)
                 StorageStrip(model: model, workspace: workspace, event: event, summary: workspace.presence[eventID])
                     .guideHighlight(.storageStrip, in: workspace)
                 if stacks != nil {
@@ -106,7 +106,7 @@ struct EventBoardView: View {
         }
     }
 
-    private func header(_ event: SavedCameraEvent) -> some View {
+    private func header(_ event: SavedCameraEvent, groups: [OrganizeBoardGroup]) -> some View {
         HStack(alignment: .center, spacing: 12) {
             Circle()
                 .fill(EventPalette.color(for: event.id))
@@ -140,7 +140,7 @@ struct EventBoardView: View {
                 showsEventFacet: false,
                 search: $workspace.search,
                 focused: $searchFocused,
-                matchedCount: boardGroups.reduce(0) { $0 + $1.stacks.count }
+                matchedCount: groups.reduce(0) { $0 + $1.stacks.count }
             )
             Picker("Keep on drive", selection: Binding(
                 get: { workspace.resolvedPolicy(for: event) },
@@ -180,9 +180,9 @@ struct EventBoardView: View {
                     }
                 }
                 Divider()
-                let anyCollapsed = boardGroups.contains { workspace.collapsedGroupIDs.contains($0.id) }
+                let anyCollapsed = groups.contains { workspace.collapsedGroupIDs.contains($0.id) }
                 Button(anyCollapsed ? "Expand All Groups" : "Collapse All Groups") {
-                    workspace.setAllGroupsCollapsed(!anyCollapsed, groups: boardGroups)
+                    workspace.setAllGroupsCollapsed(!anyCollapsed, groups: groups)
                 }
             } label: {
                 Image(systemName: "arrow.up.arrow.down.square")

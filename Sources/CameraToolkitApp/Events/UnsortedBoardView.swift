@@ -35,7 +35,7 @@ struct UnsortedBoardView: View {
     /// Stacks in display order — collapsed groups contribute nothing, so
     /// selection ranges, keyboard focus, and the preview follow what the
     /// owner actually sees.
-    private var orderedStacks: [OrganizeStack] {
+    private func orderedStacks(in groups: [OrganizeBoardGroup]) -> [OrganizeStack] {
         groups
             .filter { !workspace.collapsedGroupIDs.contains($0.id) }
             .flatMap(\.stacks)
@@ -43,11 +43,14 @@ struct UnsortedBoardView: View {
 
     var body: some View {
         let result = state.result
-        let ordered = orderedStacks
+        // One grouping pass per render — the header, board, and counts all
+        // share it, so collapsing a group never re-plans the whole board.
+        let groups = self.groups
+        let ordered = orderedStacks(in: groups)
         let searching = !workspace.search.isEmpty
 
         VStack(spacing: 0) {
-            header(result)
+            header(result, groups: groups)
             Divider()
             if let result {
                 assignBar(orderedIDs: ordered.map(\.id))
@@ -65,7 +68,7 @@ struct UnsortedBoardView: View {
                     )
                     .frame(maxHeight: .infinity)
                 } else {
-                    board()
+                    board(groups: groups)
                         .guideHighlight(.grid, in: workspace)
                 }
                 Divider()
@@ -125,7 +128,7 @@ struct UnsortedBoardView: View {
         }
     }
 
-    private func header(_ result: OrganizeScanResult?) -> some View {
+    private func header(_ result: OrganizeScanResult?, groups: [OrganizeBoardGroup]) -> some View {
         HStack(spacing: 12) {
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 8) {
@@ -290,7 +293,7 @@ struct UnsortedBoardView: View {
         .padding(.vertical, 8)
     }
 
-    private func board() -> some View {
+    private func board(groups: [OrganizeBoardGroup]) -> some View {
         OrganizeGrid(
             workspace: workspace,
             groups: groups,

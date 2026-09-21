@@ -91,6 +91,20 @@ struct OrganizeBoardGroup: Identifiable, Sendable {
     }
 }
 
+/// A group as the board draws it. `group` always keeps its real stacks, so
+/// the header's counts and Select stay truthful while `isCollapsed` hides
+/// only the rows — `visibleStacks` is the one thing collapse empties.
+struct OrganizeBoardSection: Identifiable, Sendable {
+    var group: OrganizeBoardGroup
+    var isCollapsed: Bool
+
+    var id: String { group.id }
+
+    /// Rows the section renders — none while collapsed, so a hidden group
+    /// builds no tiles and decodes no thumbnails.
+    var visibleStacks: [OrganizeStack] { isCollapsed ? [] : group.stacks }
+}
+
 enum OrganizeBoardPlan {
     /// Builds the board's collapsible groups. `eventBucket` is only consulted
     /// for `.event` grouping; nil buckets collect under "Not Sorted Yet".
@@ -111,11 +125,12 @@ enum OrganizeBoardPlan {
             }
         }
 
+        let groups: [OrganizeBoardGroup]
         switch grouping {
         case .day:
             let days = OrganizeStacker.days(for: stacks)
             let ordered = ascending ? days : days.reversed()
-            return ordered.map { day in
+            groups = ordered.map { day in
                 OrganizeBoardGroup(
                     id: "day|\(day.id)",
                     title: day.date.formatted(.dateTime.weekday(.wide).month(.wide).day().year()),
@@ -136,7 +151,7 @@ enum OrganizeBoardPlan {
             let titles = byFolder.keys.sorted {
                 $0.localizedStandardCompare($1) == (ascending ? .orderedAscending : .orderedDescending)
             }
-            return titles.map { title in
+            groups = titles.map { title in
                 OrganizeBoardGroup(
                     id: "folder|\(title)",
                     title: title,
@@ -152,7 +167,7 @@ enum OrganizeBoardPlan {
                 ("photo", "Photos", "photo", { !$0.isBurst && ($0.kind == .raw || $0.kind == .photo) }),
                 ("other", "Other Files", "doc", { !$0.isBurst && $0.kind == .other })
             ]
-            return buckets.compactMap { bucket in
+            groups = buckets.compactMap { bucket in
                 let members = sortStacks(stacks.filter(bucket.match))
                 guard !members.isEmpty else { return nil }
                 return OrganizeBoardGroup(
@@ -177,9 +192,9 @@ enum OrganizeBoardPlan {
                     byKey[bucket.key, default: (bucket, [])].stacks.append(stack)
                 }
             }
-            var groups: [OrganizeBoardGroup] = []
+            var eventGroups: [OrganizeBoardGroup] = []
             if !unsorted.isEmpty {
-                groups.append(OrganizeBoardGroup(
+                eventGroups.append(OrganizeBoardGroup(
                     id: "event|\(OrganizeEventBucket.unsorted.key)",
                     title: OrganizeEventBucket.unsorted.title,
                     symbol: "questionmark.folder",
@@ -187,20 +202,20 @@ enum OrganizeBoardPlan {
                 ))
             }
             if !mixed.isEmpty {
-                groups.append(OrganizeBoardGroup(
+                eventGroups.append(OrganizeBoardGroup(
                     id: "event|\(OrganizeEventBucket.mixed.key)",
                     title: OrganizeEventBucket.mixed.title,
                     symbol: "square.split.2x1",
                     stacks: sortStacks(mixed)
                 ))
             }
-            let eventGroups = byKey.values.sorted { lhs, rhs in
+            let dated = byKey.values.sorted { lhs, rhs in
                 if lhs.bucket.date != rhs.bucket.date {
                     return ascending ? lhs.bucket.date < rhs.bucket.date : lhs.bucket.date > rhs.bucket.date
                 }
                 return lhs.bucket.title.localizedStandardCompare(rhs.bucket.title) == .orderedAscending
             }
-            groups.append(contentsOf: eventGroups.map { entry in
+            eventGroups.append(contentsOf: dated.map { entry in
                 OrganizeBoardGroup(
                     id: "event|\(entry.bucket.key)",
                     title: entry.bucket.title,
@@ -208,8 +223,19 @@ enum OrganizeBoardPlan {
                     stacks: sortStacks(entry.stacks)
                 )
             })
-            return groups
+            groups = eventGroups
         }
+        // A group only exists because stacks landed in it — a zero-stack
+        // section would read "0 items" and lie, so it never ships.
+        return groups.filter { !$0.stacks.isEmpty }
+    }
+
+    /// Applies the board's collapse state to finished groups. Sections keep
+    /// their real stacks — collapse hides rows, it never rewrites the
+    /// group — so a collapsed day's header keeps its true item, frame, and
+    /// byte counts and Select still reaches that day's stacks.
+    static func sections(for groups: [OrganizeBoardGroup], collapsedIDs: Set<String>) -> [OrganizeBoardSection] {
+        groups.map { OrganizeBoardSection(group: $0, isCollapsed: collapsedIDs.contains($0.id)) }
     }
 }
 
