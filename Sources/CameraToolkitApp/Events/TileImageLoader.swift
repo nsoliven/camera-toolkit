@@ -25,8 +25,18 @@ final class TileImageLoader: @unchecked Sendable {
         var finished = false
         var result: CGImage?
 
-        init(url: URL, bucket: Int, orientation: Int) {
+        init(url: URL, bucket: Int, orientation: Int, priority: Operation.QueuePriority) {
             operation = TileDecodeOperation(url: url, maximumPixelSize: bucket, orientation: orientation)
+            operation.queuePriority = priority
+            operation.qualityOfService = TileImageLoader.qos(for: priority)
+        }
+
+        /// A hero-frame request joining a queued filmstrip decode pulls it
+        /// ahead of other tiles — the shared decode would satisfy both anyway.
+        func boost(_ priority: Operation.QueuePriority) {
+            guard priority.rawValue > operation.queuePriority.rawValue else { return }
+            operation.queuePriority = priority
+            operation.qualityOfService = TileImageLoader.qos(for: priority)
         }
     }
 
@@ -64,14 +74,23 @@ final class TileImageLoader: @unchecked Sendable {
         cache.object(forKey: key(url, Self.bucket(for: maximumPixelSize), orientation) as NSString)?.image
     }
 
-    func image(for url: URL, maximumPixelSize: Int, orientation: Int = 0) async -> CGImage? {
+    /// `priority` maps onto the decode operation's queue priority: the
+    /// on-screen frame requests `.veryHigh`/`.high` so it never waits behind
+    /// filmstrip tiles (`.normal`) or prefetch (`.low`) on a slow volume.
+    /// Joining an already-queued decode boosts it to the higher priority.
+    func image(
+        for url: URL,
+        maximumPixelSize: Int,
+        orientation: Int = 0,
+        priority: Operation.QueuePriority = .normal
+    ) async -> CGImage? {
         let bucket = Self.bucket(for: maximumPixelSize)
         let cacheKey = key(url, bucket, orientation)
         if let cached = cache.object(forKey: cacheKey as NSString) {
             return cached.image
         }
 
-        let group = joinGroup(cacheKey: cacheKey, url: url, bucket: bucket, orientation: orientation)
+        let group = joinGroup(cacheKey: cacheKey, url: url, bucket: bucket, orientation: orientation, priority: priority)
         let id = UUID()
         return await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
@@ -84,14 +103,21 @@ final class TileImageLoader: @unchecked Sendable {
 
     /// Lock-guarded join: returns the in-flight decode for `cacheKey`,
     /// creating and queueing one when none exists.
-    private func joinGroup(cacheKey: String, url: URL, bucket: Int, orientation: Int) -> WaiterGroup {
+    private func joinGroup(
+        cacheKey: String,
+        url: URL,
+        bucket: Int,
+        orientation: Int,
+        priority: Operation.QueuePriority
+    ) -> WaiterGroup {
         lock.lock()
         defer { lock.unlock() }
         if let existing = inFlight[cacheKey] {
             existing.waiters += 1
+            existing.boost(priority)
             return existing
         }
-        let group = WaiterGroup(url: url, bucket: bucket, orientation: orientation)
+        let group = WaiterGroup(url: url, bucket: bucket, orientation: orientation, priority: priority)
         group.waiters = 1
         inFlight[cacheKey] = group
         group.operation.completionBlock = { [weak self] in
@@ -175,6 +201,16 @@ final class TileImageLoader: @unchecked Sendable {
 
     private func key(_ url: URL, _ bucket: Int, _ orientation: Int) -> String {
         "\(url.path)#\(bucket)#\(DisplayRotation.normalized(orientation))"
+    }
+
+    /// Thread QoS matching a queue priority: hero decodes get user-interactive
+    /// threads, prefetch drops to utility so it never competes with tiles.
+    private static func qos(for priority: Operation.QueuePriority) -> QualityOfService {
+        switch priority {
+        case .veryHigh, .high: .userInteractive
+        case .normal: .userInitiated
+        default: .utility
+        }
     }
 
     static func decode(url: URL, maximumPixelSize: Int, orientation: Int = 0) -> CGImage? {
