@@ -939,8 +939,14 @@ public struct FaceIndexService: Sendable {
         var personID: UUID
         var centroid: [Float]
         var seed: [Float]
-        var members: Int
+        /// Every member. A new face has to clear the cutoff against all of
+        /// them. Matching only the first face still builds a crowd: the
+        /// biggest automatic group was 176 faces, each at least 0.50 from
+        /// the first face, with pairs inside it down at 0.22.
+        var memberEmbeddings: [[Float]]
         var acceptsNewMembers: Bool
+
+        var members: Int { memberEmbeddings.count }
     }
 
     /// Greedy cosine grouping: faces in detection-confidence order join the
@@ -965,14 +971,17 @@ public struct FaceIndexService: Sendable {
             let seed = embeddings.max { lhs, rhs in
                 FaceEmbeddingMath.cosine(lhs, centroid) < FaceEmbeddingMath.cosine(rhs, centroid)
             } ?? centroid
-            let cohesive = embeddings.allSatisfy {
-                FaceEmbeddingMath.cosine($0, centroid) >= options.clusterThreshold
+            let threshold = options.clusterThreshold
+            let cohesive = embeddings.allSatisfy { candidate in
+                embeddings.allSatisfy {
+                    FaceEmbeddingMath.cosine(candidate, $0) >= threshold
+                }
             }
             clusters.append(OpenCluster(
                 personID: personID,
                 centroid: centroid,
                 seed: seed,
-                members: embeddings.count,
+                memberEmbeddings: embeddings,
                 acceptsNewMembers: cohesive
             ))
         }
@@ -990,11 +999,13 @@ public struct FaceIndexService: Sendable {
                 if !entry.acceptsNewMembers { continue }
                 // Never back to a person this face was rejected from.
                 if rejections.blocks(faceID: face.id, personID: entry.personID) { continue }
-                let score = FaceEmbeddingMath.cosine(embedding, entry.centroid)
-                // Must still look like the face that started the group, not
-                // only like the average the group has walked toward.
-                let seedScore = FaceEmbeddingMath.cosine(embedding, entry.seed)
-                if score >= bestScore, seedScore >= options.clusterThreshold {
+                // Must clear the cutoff against every member, not only the
+                // first face. Two strangers can both resemble one face and
+                // not resemble each other.
+                let score = entry.memberEmbeddings.reduce(Float.greatestFiniteMagnitude) { worst, member in
+                    min(worst, FaceEmbeddingMath.cosine(embedding, member))
+                }
+                if score >= bestScore {
                     // The group's rejected faces must not describe this
                     // face better than the group itself does.
                     if rejections.vetoes(embedding, personID: entry.personID, score: score) { continue }
@@ -1005,9 +1016,11 @@ public struct FaceIndexService: Sendable {
             let personID: UUID
             if let bestIndex {
                 personID = clusters[bestIndex].personID
-                var updated = clusters[bestIndex].centroid.map { $0 * Float(clusters[bestIndex].members) }
+                var updated = clusters[bestIndex].centroid.map {
+                    $0 * Float(clusters[bestIndex].members)
+                }
                 for i in updated.indices { updated[i] += embedding[i] }
-                clusters[bestIndex].members += 1
+                clusters[bestIndex].memberEmbeddings.append(embedding)
                 clusters[bestIndex].centroid = FaceEmbeddingMath.l2Normalized(updated)
             } else if let reuseIndex = reusable.firstIndex(where: {
                 !rejections.blocks(faceID: face.id, personID: $0)
@@ -1019,7 +1032,7 @@ public struct FaceIndexService: Sendable {
                     personID: personID,
                     centroid: embedding,
                     seed: embedding,
-                    members: 1,
+                    memberEmbeddings: [embedding],
                     acceptsNewMembers: true
                 ))
                 created += 1
@@ -1034,7 +1047,7 @@ public struct FaceIndexService: Sendable {
                     personID: personID,
                     centroid: embedding,
                     seed: embedding,
-                    members: 1,
+                    memberEmbeddings: [embedding],
                     acceptsNewMembers: true
                 ))
                 created += 1
