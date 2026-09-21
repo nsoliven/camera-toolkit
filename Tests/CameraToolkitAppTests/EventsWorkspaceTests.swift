@@ -631,6 +631,16 @@ final class EventsWorkspaceTests: XCTestCase {
             // group labels never leak into event filtering.
             XCTAssertEqual(workspace.sidebarRows(matching: "dad").map(\.event.id), [beach])
             XCTAssertTrue(workspace.sidebarRows(matching: "person").isEmpty)
+
+            // The popover's People picks hide sidebar events too — an event
+            // stays when a picked roster person is in its event.people.
+            XCTAssertEqual(workspace.sidebarRows(matching: "", peopleIDs: [dad.id]).map(\.event.id), [beach])
+            // The unnamed group is a valid board pick, but sidebar events
+            // only know roster people — a group-only pick hides them all.
+            XCTAssertTrue(workspace.sidebarRows(matching: "", peopleIDs: [stranger.id]).isEmpty)
+            // People picks AND with the text needle.
+            XCTAssertEqual(workspace.sidebarRows(matching: "beach", peopleIDs: [dad.id]).map(\.event.id), [beach])
+            XCTAssertTrue(workspace.sidebarRows(matching: "hike", peopleIDs: [dad.id]).isEmpty)
         }
     }
 
@@ -772,6 +782,13 @@ final class EventsWorkspaceTests: XCTestCase {
             eventSearch.peopleIDs = [group.id]
             XCTAssertEqual(workspace.visibleEventStacks(beach, search: eventSearch).map(\.id), [burst.id])
             XCTAssertEqual(workspace.visibleEventStacks(beach, search: OrganizeSearchFilter()).count, 3)
+
+            // Event picks carried over from an unsorted board's popover are
+            // dropped here — the board is one event already.
+            eventSearch = OrganizeSearchFilter()
+            eventSearch.eventIDs = [UUID()]
+            eventSearch.includeUnsorted = true
+            XCTAssertEqual(workspace.visibleEventStacks(beach, search: eventSearch).count, 3)
         }
     }
 

@@ -15,7 +15,6 @@ struct UnsortedBoardView: View {
     @AppStorage("CameraToolkit.organize.order") private var sortOrder: OrganizeBoardOrder = .oldestFirst
     @State private var previewStackID: String?
     @State private var previewFrameIndex = 0
-    @State private var search = OrganizeSearchFilter()
     @FocusState private var searchFocused: Bool
 
     private var state: UnsortedSourceState {
@@ -25,7 +24,7 @@ struct UnsortedBoardView: View {
     private var groups: [OrganizeBoardGroup] {
         guard let result = state.result else { return [] }
         return OrganizeBoardPlan.groups(
-            for: workspace.visibleStacks(result, hideSorted: hideSorted, search: search),
+            for: workspace.visibleStacks(result, hideSorted: hideSorted, search: workspace.search),
             grouping: grouping,
             order: sortOrder,
             rootPath: result.rootPath,
@@ -45,7 +44,7 @@ struct UnsortedBoardView: View {
     var body: some View {
         let result = state.result
         let ordered = orderedStacks
-        let searching = !search.isEmpty
+        let searching = !workspace.search.isEmpty
 
         VStack(spacing: 0) {
             header(result)
@@ -145,7 +144,7 @@ struct UnsortedBoardView: View {
             OrganizeSearchBar(
                 workspace: workspace,
                 stacks: result?.stacks ?? [],
-                search: $search,
+                search: $workspace.search,
                 focused: $searchFocused,
                 matchedCount: groups.reduce(0) { $0 + $1.stacks.count }
             )
