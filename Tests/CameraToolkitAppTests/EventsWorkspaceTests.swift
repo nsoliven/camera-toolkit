@@ -633,6 +633,164 @@ final class EventsWorkspaceTests: XCTestCase {
             // group labels never leak into event filtering.
             XCTAssertEqual(workspace.sidebarRows(matching: "dad").map(\.event.id), [beach])
             XCTAssertTrue(workspace.sidebarRows(matching: "person").isEmpty)
+
+            // The popover's People picks hide sidebar events too — an event
+            // stays when a picked roster person is in its event.people.
+            XCTAssertEqual(workspace.sidebarRows(matching: "", peopleIDs: [dad.id]).map(\.event.id), [beach])
+            // The unnamed group is a valid board pick, but sidebar events
+            // only know roster people — a group-only pick hides them all.
+            XCTAssertTrue(workspace.sidebarRows(matching: "", peopleIDs: [stranger.id]).isEmpty)
+            // People picks AND with the text needle.
+            XCTAssertEqual(workspace.sidebarRows(matching: "beach", peopleIDs: [dad.id]).map(\.event.id), [beach])
+            XCTAssertTrue(workspace.sidebarRows(matching: "hike", peopleIDs: [dad.id]).isEmpty)
+        }
+    }
+
+    /// The chip filter's full loop on a real scan: media, day range,
+    /// event (incl. Not Sorted Yet), and face-catalog people all ANDed
+    /// together with the text needle.
+    func testStructuredBoardSearchFiltersByMediaDateEventAndPeople() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let unsorted = root.appendingPathComponent("Drive/Unsorted A7V", isDirectory: true)
+            try writeOrganizerARW(unsorted.appendingPathComponent("Transfer 1/B0001_DSC00001.ARW"), "2026:08:26 10:00:00", "100")
+            try writeOrganizerARW(unsorted.appendingPathComponent("Transfer 1/B0001_DSC00002.ARW"), "2026:08:26 10:00:00", "400")
+            try writeOrganizerARW(unsorted.appendingPathComponent("Extra/DSC00009.ARW"), "2026:08:27 11:00:00", "000")
+            try organizerWrite(unsorted.appendingPathComponent("Extra/C0001.MP4"), "video")
+            let location = addUnsorted(unsorted, to: model)
+            workspace.scan(location)
+            try await waitUntil { workspace.sources[location.id]?.result != nil }
+            let result = try XCTUnwrap(workspace.sources[location.id]?.result)
+            let burst = try XCTUnwrap(result.stacks.first { $0.isBurst })
+            let single = try XCTUnwrap(result.stacks.first { $0.coverItem.primary.name == "DSC00009.ARW" })
+            let clip = try XCTUnwrap(result.stacks.first { $0.coverItem.primary.name == "C0001.MP4" })
+            @MainActor func board(_ search: OrganizeSearchFilter, hideSorted: Bool = false) -> Set<String> {
+                Set(workspace.visibleStacks(result, hideSorted: hideSorted, search: search).map(\.id))
+            }
+
+            // Empty search shows everything.
+            XCTAssertEqual(board(OrganizeSearchFilter()), [burst.id, single.id, clip.id])
+
+            // Media facet.
+            var search = OrganizeSearchFilter()
+            search.mediaKinds = [.video]
+            XCTAssertEqual(board(search), [clip.id])
+            search.mediaKinds = [.raw]
+            XCTAssertEqual(board(search), [burst.id, single.id])
+
+            // Date facet — inclusive bounds on each stack's capture day.
+            // The clip has no camera date; the scan's clock-offset
+            // correction still lands it on a day near the RAWs', so
+            // compare against the days the scanner actually assigned.
+            let calendar = Calendar.current
+            let burstDay = calendar.startOfDay(for: burst.captureDate)
+            let singleDay = calendar.startOfDay(for: single.captureDate)
+            let clipDay = calendar.startOfDay(for: clip.captureDate)
+            XCTAssertNotEqual(burstDay, singleDay)
+
+            search = OrganizeSearchFilter()
+            search.dayStart = burstDay
+            search.dayEnd = burstDay
+            XCTAssertTrue(board(search).contains(burst.id))
+            XCTAssertFalse(board(search).contains(single.id))
+            XCTAssertEqual(board(search).contains(clip.id), clipDay == burstDay)
+
+            search.dayStart = singleDay
+            search.dayEnd = singleDay
+            XCTAssertTrue(board(search).contains(single.id))
+            XCTAssertFalse(board(search).contains(burst.id))
+
+            search.dayStart = burstDay
+            search.dayEnd = singleDay
+            XCTAssertTrue(board(search).isSuperset(of: [burst.id, single.id]))
+
+            // A range starting after the last capture day matches nothing.
+            search.dayStart = calendar.date(byAdding: .day, value: 1, to: singleDay)
+            search.dayEnd = nil
+            XCTAssertTrue(board(search).isEmpty)
+
+            // Event facet, including "Not Sorted Yet".
+            let beach = try XCTUnwrap(workspace.createEvent(name: "Beach Day", date: burstDay, policy: .buffer))
+            workspace.assign(stackIDs: [burst.id], from: location.id, to: beach)
+            search = OrganizeSearchFilter()
+            search.eventIDs = [beach]
+            XCTAssertEqual(board(search), [burst.id])
+            search.includeUnsorted = true
+            XCTAssertEqual(board(search), [burst.id, single.id, clip.id])
+            search.eventIDs = []
+            XCTAssertEqual(board(search), [single.id, clip.id])
+            // hideSorted composes: the assigned burst drops out.
+            XCTAssertEqual(board(OrganizeSearchFilter(), hideSorted: true), [single.id, clip.id])
+
+            // People facet — seed the face index as if a scan ran: Dad
+            // confirmed on the single, an unnamed group on the burst's cover.
+            let catalog = root.appendingPathComponent("catalog.sqlite")
+            _ = try CatalogStore(url: catalog).bootstrap(
+                configuration: model.configuration,
+                createBackup: false,
+                createLibraryFolders: false
+            )
+            let store = workspace.faceStore
+            let dad = try store.createPerson(name: "Dad", isRoster: true)
+            let group = try store.createPerson(name: "Person 1", isRoster: false)
+            let box = NormalizedFaceBox(x: 0.1, y: 0.1, width: 0.2, height: 0.2)
+            for (file, person, state) in [
+                (single.coverItem.primary, dad, FaceState.confirmed),
+                (burst.coverItem.primary, group, FaceState.other),
+            ] as [(OrganizeFile, FacePerson, FaceState)] {
+                try store.replaceFaces(
+                    photo: FacePhotoRecord(
+                        pathKey: file.pathKey,
+                        path: file.path,
+                        fileName: file.name,
+                        byteCount: file.size,
+                        modifiedAt: file.modifiedAt,
+                        scanGrade: .low
+                    ),
+                    faces: [FaceRecord(photoID: file.pathKey, personID: person.id, box: box, detScore: 0.9, embedding: [0.5, 0.5], state: state)]
+                )
+            }
+
+            // Picker options: roster first, then groups — only people
+            // actually seen on this board.
+            let people = workspace.boardPeople(for: result.stacks)
+            XCTAssertEqual(people.options.map(\.name), ["Dad", "Person 1"])
+            XCTAssertEqual(people.options.map(\.isRoster), [true, false])
+            XCTAssertEqual(people.byStackID[single.id], [dad.id])
+            XCTAssertEqual(people.byStackID[burst.id], [group.id])
+            XCTAssertEqual(people.byStackID[clip.id], [])
+
+            search = OrganizeSearchFilter()
+            search.peopleIDs = [dad.id]
+            XCTAssertEqual(board(search), [single.id])
+            search.peopleIDs = [dad.id, group.id]
+            XCTAssertEqual(board(search), [burst.id, single.id])
+
+            // Facets AND together — and with the text needle.
+            search.mediaKinds = [.raw]
+            search.dayStart = singleDay
+            search.dayEnd = singleDay
+            XCTAssertEqual(board(search), [single.id])
+            search.text = "dsc00009"
+            XCTAssertEqual(board(search), [single.id])
+            search.eventIDs = [beach]
+            XCTAssertTrue(board(search).isEmpty)
+
+            // The event board runs the same facets minus Event.
+            workspace.eventStacks[beach] = [burst, single, clip]
+            var eventSearch = OrganizeSearchFilter()
+            eventSearch.mediaKinds = [.video]
+            XCTAssertEqual(workspace.visibleEventStacks(beach, search: eventSearch).map(\.id), [clip.id])
+            eventSearch = OrganizeSearchFilter()
+            eventSearch.peopleIDs = [group.id]
+            XCTAssertEqual(workspace.visibleEventStacks(beach, search: eventSearch).map(\.id), [burst.id])
+            XCTAssertEqual(workspace.visibleEventStacks(beach, search: OrganizeSearchFilter()).count, 3)
+
+            // Event picks carried over from an unsorted board's popover are
+            // dropped here — the board is one event already.
+            eventSearch = OrganizeSearchFilter()
+            eventSearch.eventIDs = [UUID()]
+            eventSearch.includeUnsorted = true
+            XCTAssertEqual(workspace.visibleEventStacks(beach, search: eventSearch).count, 3)
         }
     }
 

@@ -15,7 +15,6 @@ struct UnsortedBoardView: View {
     @AppStorage("CameraToolkit.organize.order") private var sortOrder: OrganizeBoardOrder = .oldestFirst
     @State private var previewStackID: String?
     @State private var previewFrameIndex = 0
-    @State private var searchQuery = ""
     @FocusState private var searchFocused: Bool
 
     private var state: UnsortedSourceState {
@@ -25,7 +24,7 @@ struct UnsortedBoardView: View {
     private var groups: [OrganizeBoardGroup] {
         guard let result = state.result else { return [] }
         return OrganizeBoardPlan.groups(
-            for: workspace.visibleStacks(result, hideSorted: hideSorted, matching: searchQuery),
+            for: workspace.visibleStacks(result, hideSorted: hideSorted, search: workspace.search),
             grouping: grouping,
             order: sortOrder,
             rootPath: result.rootPath,
@@ -45,7 +44,7 @@ struct UnsortedBoardView: View {
     var body: some View {
         let result = state.result
         let ordered = orderedStacks
-        let searching = !OrganizeSearch.needle(searchQuery).isEmpty
+        let searching = !workspace.search.isEmpty
 
         VStack(spacing: 0) {
             header(result)
@@ -59,7 +58,7 @@ struct UnsortedBoardView: View {
                         searching ? "No Matches" : (hideSorted ? "Everything here is sorted" : "No photos or videos"),
                         systemImage: searching ? "magnifyingglass" : (hideSorted ? "checkmark.circle" : "photo"),
                         description: Text(searching
-                            ? "Nothing in \(location.name) matches “\(searchQuery)”. Try a file name, burst, folder, event, or person."
+                            ? "Nothing in \(location.name) matches the current search and filters — Clear All resets them."
                             : hideSorted
                                 ? "Turn off Hide Sorted to review, or press Apply to move the files into their events."
                                 : "This folder has no camera files.")
@@ -142,29 +141,13 @@ struct UnsortedBoardView: View {
                     .lineLimit(1)
             }
             Spacer()
-            HStack(spacing: 5) {
-                Image(systemName: "magnifyingglass")
-                    .foregroundStyle(.secondary)
-                TextField("Search", text: $searchQuery)
-                    .textFieldStyle(.plain)
-                    .frame(width: 140)
-                    .focused($searchFocused)
-                if !searchQuery.isEmpty {
-                    Button {
-                        searchQuery = ""
-                    } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .foregroundStyle(.secondary)
-                    }
-                    .buttonStyle(.plain)
-                    .help("Clear search")
-                }
-            }
-            .font(.callout)
-            .padding(.horizontal, 7)
-            .padding(.vertical, 4)
-            .background(.quaternary, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
-            .help("Filter by file name, burst, folder, event, or person (⌘F)")
+            OrganizeSearchBar(
+                workspace: workspace,
+                stacks: result?.stacks ?? [],
+                search: $workspace.search,
+                focused: $searchFocused,
+                matchedCount: groups.reduce(0) { $0 + $1.stacks.count }
+            )
             Picker("Camera", selection: Binding(
                 get: { workspace.deviceID(for: location) },
                 set: { workspace.setDevice($0, for: location.id) }

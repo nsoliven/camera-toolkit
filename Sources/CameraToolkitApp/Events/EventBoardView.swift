@@ -15,6 +15,7 @@ struct EventBoardView: View {
     @AppStorage("CameraToolkit.organize.order") private var sortOrder: OrganizeBoardOrder = .oldestFirst
     @State private var previewStackID: String?
     @State private var previewFrameIndex = 0
+    @FocusState private var searchFocused: Bool
 
     /// Grouping that makes sense inside one event — every stack belongs to
     /// it, so "by event" would be a single useless section.
@@ -26,7 +27,7 @@ struct EventBoardView: View {
 
     private var boardGroups: [OrganizeBoardGroup] {
         OrganizeBoardPlan.groups(
-            for: workspace.eventStacks[eventID] ?? [],
+            for: workspace.visibleEventStacks(eventID, search: workspace.search),
             grouping: effectiveGrouping,
             order: sortOrder
         )
@@ -45,7 +46,16 @@ struct EventBoardView: View {
                     .guideHighlight(.storageStrip, in: workspace)
                 if stacks != nil {
                     if groups.isEmpty {
-                        emptyState(event)
+                        if workspace.search.isEmpty {
+                            emptyState(event)
+                        } else {
+                            ContentUnavailableView(
+                                "No Matches",
+                                systemImage: "magnifyingglass",
+                                description: Text("Nothing in \(workspace.eventTitle(event)) matches the current search and filters — Clear All resets them.")
+                            )
+                            .frame(maxHeight: .infinity)
+                        }
                     } else {
                         board(groups: groups)
                     }
@@ -124,6 +134,14 @@ struct EventBoardView: View {
                 }
             }
             Spacer()
+            OrganizeSearchBar(
+                workspace: workspace,
+                stacks: workspace.eventStacks[eventID] ?? [],
+                showsEventFacet: false,
+                search: $workspace.search,
+                focused: $searchFocused,
+                matchedCount: boardGroups.reduce(0) { $0 + $1.stacks.count }
+            )
             Picker("Keep on drive", selection: Binding(
                 get: { workspace.resolvedPolicy(for: event) },
                 set: { workspace.setPolicy(eventID, $0) }
@@ -356,6 +374,8 @@ struct EventBoardView: View {
             NSWorkspace.shared.activateFileViewerSelecting(urls(for: workspace.targetStackIDs()))
         case .reload:
             Task { await workspace.refreshEvent(eventID) }
+        case .find:
+            searchFocused = true
         case .moveSelectionToTrash:
             workspace.requestTrash(stackIDs: workspace.targetStackIDs(), fromEvent: eventID)
         default:
