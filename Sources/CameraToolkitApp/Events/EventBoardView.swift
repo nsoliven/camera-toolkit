@@ -39,14 +39,18 @@ struct EventBoardView: View {
             .overlay {
                 if previewStackID != nil {
                     StackPreviewOverlay(
+                        workspace: workspace,
                         stacks: ordered,
                         stackID: $previewStackID,
-                        quickEvents: workspace.quickEvents.filter { $0.id != eventID },
+                        excludedEventID: eventID,
+                        assignVerb: "Move to",
                         eventForStack: { _ in event },
                         onAssign: { stack, target in
                             workspace.moveStacks([stack.id], fromEvent: eventID, toEvent: target.id)
                         },
-                        isPrivate: { workspace.resolvedPolicy(for: $0) == .archiveOnly }
+                        onNewEvent: { stack in
+                            workspace.requestNewEvent(stackIDs: [stack.id], movingFromEvent: eventID, suggestedDate: stack.captureDate)
+                        }
                     )
                 }
             }
@@ -215,11 +219,11 @@ struct EventBoardView: View {
     private func handleKey(_ press: KeyPress) -> KeyPress.Result {
         guard press.modifiers.isEmpty,
               let digit = press.characters.first?.wholeNumberValue,
-              (1...9).contains(digit) else { return .ignored }
-        let quick = workspace.quickEvents.filter { $0.id != eventID }
+              (1...3).contains(digit) else { return .ignored }
+        let recents = workspace.assignableRecents(excluding: eventID)
         let targets = workspace.targetStackIDs()
-        guard digit <= quick.count, !targets.isEmpty else { return .handled }
-        workspace.moveStacks(targets, fromEvent: eventID, toEvent: quick[digit - 1].id)
+        guard digit <= recents.count, !targets.isEmpty else { return .handled }
+        workspace.moveStacks(targets, fromEvent: eventID, toEvent: recents[digit - 1].id)
         return .handled
     }
 

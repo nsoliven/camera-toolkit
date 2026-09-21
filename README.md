@@ -15,7 +15,7 @@ The safety rule is simple: sorting only records assignments, moves on the same d
 New here? Press **Start Guided Setup** on the welcome screen, or **Guide** in the sidebar. It checks the Buffer, private folder, and NAS, finds unsorted photo folders on connected drives, adds event folders already on the drive, and walks through sorting and applying a first burst.
 
 1. Add a card or an unsorted folder. The app groups bursts and splits the shots by day using each camera's own clock.
-2. Select photos and press 1–9, drag them onto an event, or press N to make a new event.
+2. Select photos and press 1–3 for a recent event, drag them onto an event, or press N to make a new event. **Event…** searches every event by name.
 3. Mark an event **Private · NAS only** when it should never sit in the shared Buffer.
 4. Press **Apply**. Files already on the working drive move into their event folders instantly; files on a card are copied and verified.
 5. Open an event and use its storage strip: **Archive to NAS**, **Take Off Drive**, **Free Up Source**, and **Upload** to Immich.
@@ -128,7 +128,7 @@ Photo Library/Originals/<year>/<yyyy-MM-dd event>/<camera>/
 
 | Shortcut | Action |
 | --- | --- |
-| 1–9 | Sort the selection into that event |
+| 1–3 | Sort the selection into that recent event |
 | N | New event from the selection |
 | Delete | Unsort the selection |
 | Arrow keys | Move between items; hold Shift to extend the selection |
