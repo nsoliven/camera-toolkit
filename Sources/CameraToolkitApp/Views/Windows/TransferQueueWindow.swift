@@ -70,6 +70,9 @@ private struct TransferQueueView: View {
         VStack(spacing: 0) {
             summary(queue)
 
+            Divider()
+            routeDiagram(queue)
+
             if let message = queue.message {
                 Divider()
                 messageBanner(message, queue: queue)
@@ -281,10 +284,16 @@ private struct TransferQueueView: View {
                 Text(batch.eventName.isEmpty ? "Queued Transfer" : batch.eventName)
                     .font(.subheadline.weight(.medium))
                     .lineLimit(1)
-                Text(URL(fileURLWithPath: batch.sourcePath).lastPathComponent)
-                    .font(.caption.monospaced())
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+                HStack(spacing: 4) {
+                    Text(OrganizeRouteLabel.breadcrumb(for: batch.sourcePath))
+                        .truncationMode(.middle)
+                    Image(systemName: "arrow.right")
+                    Text(OrganizeRouteLabel.breadcrumb(for: batch.destinationPath))
+                        .truncationMode(.middle)
+                }
+                .font(.caption.monospaced())
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
@@ -380,6 +389,68 @@ private struct TransferQueueView: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 14)
         .background(.bar)
+    }
+
+    /// "This source folder → this destination" — the same readable route the
+    /// apply sheet draws, so a running transfer is obvious at a glance.
+    private func routeDiagram(_ queue: TransferQueueSnapshot) -> some View {
+        let photos = queue.items.count { fileKind($0.relativePath) == .photo || fileKind($0.relativePath) == .raw }
+        let videos = queue.items.count { fileKind($0.relativePath) == .video }
+        return HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("FROM")
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(.secondary)
+                routeEndpoint(path: queue.sourcePath, symbol: "sdcard")
+            }
+            Image(systemName: "arrow.right.circle.fill")
+                .font(.title3)
+                .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("TO")
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(.secondary)
+                routeEndpoint(path: queue.destinationPath, symbol: "externaldrive")
+            }
+            Spacer(minLength: 8)
+            VStack(alignment: .trailing, spacing: 2) {
+                Text("\(queue.items.count) file\(queue.items.count == 1 ? "" : "s") · \(queue.totalBytes.formattedBytes)")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                if photos > 0 || videos > 0 {
+                    HStack(spacing: 6) {
+                        if photos > 0 {
+                            Label("\(photos)", systemImage: "photo")
+                        }
+                        if videos > 0 {
+                            Label("\(videos)", systemImage: "video.fill")
+                                .foregroundStyle(.blue)
+                        }
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 9)
+        .background(Color(nsColor: .textBackgroundColor))
+    }
+
+    private func routeEndpoint(path: String, symbol: String) -> some View {
+        HStack(spacing: 5) {
+            Image(systemName: symbol)
+                .foregroundStyle(.secondary)
+            Text(OrganizeRouteLabel.breadcrumb(for: path))
+                .font(.caption.weight(.medium))
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+        .help(path)
+    }
+
+    private func fileKind(_ path: String) -> OrganizeMediaKind {
+        OrganizeFileClassifier.kind(forExtension: (path as NSString).pathExtension)
     }
 
     private func messageBanner(_ message: String, queue: TransferQueueSnapshot) -> some View {

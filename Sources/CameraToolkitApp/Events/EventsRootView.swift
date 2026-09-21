@@ -596,27 +596,12 @@ struct ApplyPlanSheet: View {
                 .font(.title2.bold())
             Text(summary)
                 .foregroundStyle(.secondary)
-            List(plan.groups) { group in
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack {
-                        EventChip(event: group.event, isPrivate: group.isPrivate)
-                        Text(group.event.eventDate.formatted(date: .abbreviated, time: .omitted))
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        Spacer()
-                        Text(group.byteCount.formattedBytes)
-                            .font(.callout.monospacedDigit())
-                            .foregroundStyle(.secondary)
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 10) {
+                    ForEach(plan.groups) { group in
+                        ApplyEventGroupCard(group: group)
                     }
-                    Text(line(for: group))
-                        .font(.callout)
-                    Text(group.destinationFolder)
-                        .font(.caption.monospaced())
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
                 }
-                .padding(.vertical, 4)
             }
             .frame(minHeight: 220)
             Label(
@@ -636,7 +621,7 @@ struct ApplyPlanSheet: View {
             }
         }
         .padding(20)
-        .frame(width: 640, height: 540)
+        .frame(width: 680, height: 560)
     }
 
     private var summary: String {
@@ -649,15 +634,6 @@ struct ApplyPlanSheet: View {
         }
         let events = plan.groups.count { !$0.moves.isEmpty || !$0.copies.isEmpty }
         return parts.joined(separator: " and ") + " · \(plan.byteCount.formattedBytes) into \(events) event\(events == 1 ? "" : "s")"
-    }
-
-    private func line(for group: OrganizeApplyPlan.EventGroup) -> String {
-        [
-            group.moves.isEmpty ? nil : "\(group.moves.count) move on this drive",
-            group.copyFileCount == 0 ? nil : "\(group.copyFileCount) copy from another drive",
-            group.alreadyThere == 0 ? nil : "\(group.alreadyThere) already there",
-            group.unavailable == 0 ? nil : "\(group.unavailable) on a disconnected drive",
-        ].compactMap { $0 }.joined(separator: " · ")
     }
 }
 

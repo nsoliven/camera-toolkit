@@ -94,6 +94,14 @@ struct OrganizeApplyPlan: Identifiable, Sendable {
     var isEmpty: Bool { moveCount == 0 && copyCount == 0 }
 }
 
+/// The plan behind the rename job an Apply kicked off, kept so the board can
+/// show the same source → destination diagram while files are moving.
+struct RunningApplyPlan: Sendable {
+    var jobID: UUID
+    var title: String
+    var groups: [OrganizeApplyPlan.EventGroup]
+}
+
 struct DeviceChoice: Identifiable, Hashable {
     let id: String
     let name: String
@@ -204,6 +212,13 @@ final class EventsWorkspace {
     var pendingApplyPlan: OrganizeApplyPlan?
     var pendingRemoval: RemovalRequest?
     var latestMoveJournalTitle: String?
+    /// Bursts currently expanded inline in the board.
+    var expandedStackIDs: Set<String> = []
+    /// Board groups (day/folder/kind/event sections) the user collapsed.
+    var collapsedGroupIDs: Set<String> = []
+    /// The apply plan whose rename job is running — boards keep showing its
+    /// source → destination diagram until the job finishes.
+    var runningApply: RunningApplyPlan?
     /// Bumped by `refreshConnectivity()`. `isConnected` reads it so views that
     /// ask about connectivity re-render after a mount, unmount, or manual
     /// refresh.
@@ -514,26 +529,65 @@ final class EventsWorkspace {
         stack.items.allSatisfy { assignment(for: $0.primary) != nil }
     }
 
-    /// The days a board should show: `hideSorted` drops fully assigned stacks
-    /// and a non-empty `query` keeps only stacks matching file name, burst
-    /// label, origin subfolder, or assigned event title. Days that lose every
-    /// stack drop out entirely.
-    func visibleDays(_ result: OrganizeScanResult, hideSorted: Bool, matching query: String = "") -> [OrganizeDay] {
+    /// The stacks a board should show: `hideSorted` drops fully assigned
+    /// stacks and a non-empty `query` keeps only stacks matching file name,
+    /// burst label, origin subfolder, or assigned event title.
+    func visibleStacks(_ result: OrganizeScanResult, hideSorted: Bool, matching query: String = "") -> [OrganizeStack] {
         let needle = OrganizeSearch.needle(query)
-        guard hideSorted || !needle.isEmpty else { return result.days }
-        return result.days.compactMap { day in
-            let stacks = day.stacks.filter { stack in
-                if hideSorted, isSorted(stack) { return false }
-                guard !needle.isEmpty else { return true }
-                return OrganizeSearch.matches(
-                    stack: stack,
-                    needle: needle,
-                    rootPath: result.rootPath,
-                    eventTitle: assignedEvent(for: stack).event.map { eventTitle($0) }
-                )
-            }
-            return stacks.isEmpty ? nil : OrganizeDay(id: day.id, date: day.date, stacks: stacks)
+        guard hideSorted || !needle.isEmpty else { return result.stacks }
+        return result.stacks.filter { stack in
+            if hideSorted, isSorted(stack) { return false }
+            guard !needle.isEmpty else { return true }
+            return OrganizeSearch.matches(
+                stack: stack,
+                needle: needle,
+                rootPath: result.rootPath,
+                eventTitle: assignedEvent(for: stack).event.map { eventTitle($0) }
+            )
         }
+    }
+
+    /// The days a board should show — `visibleStacks` re-grouped into days.
+    /// Days that lose every stack drop out entirely.
+    func visibleDays(_ result: OrganizeScanResult, hideSorted: Bool, matching query: String = "") -> [OrganizeDay] {
+        let stacks = visibleStacks(result, hideSorted: hideSorted, matching: query)
+        guard hideSorted || !OrganizeSearch.needle(query).isEmpty else { return result.days }
+        return OrganizeStacker.days(for: stacks)
+    }
+
+    /// Which event bucket a stack lands in when the board groups by event.
+    func eventBucket(for stack: OrganizeStack) -> OrganizeEventBucket? {
+        let assigned = assignedEvent(for: stack)
+        if let event = assigned.event {
+            return OrganizeEventBucket(key: event.id.uuidString, title: eventTitle(event), date: event.eventDate)
+        }
+        return assigned.mixed ? .mixed : nil
+    }
+
+    /// Inline burst expansion: which stacks currently show every frame in the
+    /// board itself (not just the full-screen preview).
+    func setExpanded(_ stackID: String, expanded: Bool) {
+        if expanded {
+            expandedStackIDs.insert(stackID)
+        } else {
+            expandedStackIDs.remove(stackID)
+        }
+    }
+
+    func toggleExpanded(_ stackID: String) {
+        setExpanded(stackID, expanded: !expandedStackIDs.contains(stackID))
+    }
+
+    func setGroupCollapsed(_ groupID: String, collapsed: Bool) {
+        if collapsed {
+            collapsedGroupIDs.insert(groupID)
+        } else {
+            collapsedGroupIDs.remove(groupID)
+        }
+    }
+
+    func setAllGroupsCollapsed(_ collapsed: Bool, groups: [OrganizeBoardGroup]) {
+        collapsedGroupIDs = collapsed ? Set(groups.map(\.id)) : []
     }
 
     func sortedFiles(in result: OrganizeScanResult) -> (files: Int, bytes: Int64) {
@@ -595,6 +649,8 @@ final class EventsWorkspace {
         selectedStackIDs = []
         focusedStackID = nil
         selectionAnchorID = nil
+        expandedStackIDs = []
+        collapsedGroupIDs = []
     }
 
     func select(stackID: String, orderedIDs: [String], extend: Bool, toggle: Bool) {
@@ -1367,6 +1423,7 @@ final class EventsWorkspace {
 
     func performApply(_ plan: OrganizeApplyPlan) {
         pendingApplyPlan = nil
+        runningApply = nil
         let moves = plan.groups.flatMap(\.moves)
         let copies = plan.groups.flatMap { group in group.copies.map { (group.event, $0) } }
         let journalFolder = self.journalFolder
@@ -1375,7 +1432,7 @@ final class EventsWorkspace {
         let affectedEvents = plan.groups.map(\.event.id)
 
         if !moves.isEmpty {
-            model.runBackgroundJob(
+            let jobID = model.runBackgroundJob(
                 action: .organize,
                 runningNote: "Moving \(moves.count) file(s) into their events",
                 logTitle: title,
@@ -1398,6 +1455,9 @@ final class EventsWorkspace {
                     return "Moved \(report.moved.count) file(s) (\(report.movedBytes.formattedBytes)) into their events.\(skippedNote)"
                 }
             )
+            if let jobID {
+                runningApply = RunningApplyPlan(jobID: jobID, title: plan.title, groups: plan.groups)
+            }
         }
         for (event, batch) in copies {
             model.enqueueTransfer(
@@ -1423,6 +1483,8 @@ final class EventsWorkspace {
         }
         selectedStackIDs.removeAll()
         focusedStackID = nil
+        expandedStackIDs.removeAll()
+        runningApply = nil
         refreshLatestJournal()
         for eventID in Set(events) {
             Task { await refreshEvent(eventID) }

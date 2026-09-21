@@ -1972,6 +1972,10 @@ extension DashboardModel {
         return "The transfer stopped safely: \(detail) Camera originals were untouched."
     }
 
+    /// Runs a job on a worker task and reports progress on `jobs`. Returns the
+    /// job's id so callers can correlate a running job with UI they show while
+    /// it is in flight; nil when another job already occupies the model.
+    @discardableResult
     func runBackgroundJob<Result: Sendable>(
         action: JobAction,
         runningNote: String,
@@ -1987,10 +1991,10 @@ extension DashboardModel {
         onSettled: (@MainActor @Sendable () -> Void)? = nil,
         operation: @escaping @Sendable (@escaping @Sendable (BackgroundJobUpdate) -> Void) throws -> Result,
         completion: @escaping (Result) throws -> String
-    ) {
+    ) -> UUID? {
         guard !isBusy, !isStorageBenchmarkRunning else {
             statusMessage = "Another file job is already running. Wait for it to finish, then try again."
-            return
+            return nil
         }
 
         isBusy = true
@@ -2075,6 +2079,7 @@ extension DashboardModel {
                 )
             }
         }
+        return jobID
     }
 
     func updateJob(id: UUID, update: BackgroundJobUpdate) {
