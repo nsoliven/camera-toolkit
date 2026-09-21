@@ -1981,6 +1981,10 @@ extension DashboardModel {
         sourcePath: String? = nil,
         destinationPath: String? = nil,
         tracksTransferQueue: Bool = false,
+        /// Runs after the job settles — done, failed, or cancelled — so
+        /// callers can clear bookkeeping the success-only `completion`
+        /// cannot cover.
+        onSettled: (@MainActor @Sendable () -> Void)? = nil,
         operation: @escaping @Sendable (@escaping @Sendable (BackgroundJobUpdate) -> Void) throws -> Result,
         completion: @escaping (Result) throws -> String
     ) {
@@ -2021,6 +2025,7 @@ extension DashboardModel {
         }
 
         Task { @MainActor [weak self] in
+            defer { onSettled?() }
             guard let self else {
                 return
             }

@@ -176,8 +176,14 @@ struct EventsSidebar: View {
                             })
                             .contextMenu {
                                 Button("Rescan") { workspace.scan(location, force: true) }
+                                    .disabled(workspace.sources[location.id]?.isScanning == true || model.isBusy)
+                                Button("Regroup Bursts") { workspace.regroupBursts(location) }
+                                    .disabled(workspace.sources[location.id]?.isScanning == true || model.isBusy || workspace.sources[location.id]?.result == nil)
+                                    .help("Re-run burst grouping on the scanned files with the current Settings sliders — files are not re-read.")
                                 Button("Scan for Faces…") { workspace.requestFaceScan(location) }
-                                    .help("Detect and match faces on this folder's photos and videos. Writes only to the catalog — media is read, never touched.")
+                                    .disabled(workspace.faceScanBlocker(for: location) != nil)
+                                    .help(workspace.faceScanBlocker(for: location)
+                                        ?? "Detect and match faces on a sample of each burst — not every frame. Writes only to the catalog — media is read, never touched.")
                                 Button("Reveal in Finder") {
                                     NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: DashboardModel.expandedPath(location.path))])
                                 }
@@ -356,10 +362,11 @@ struct EventsSidebar: View {
     private var footer: some View {
         VStack(spacing: 2) {
             footerButton(
-                "Transfers",
-                detail: model.transferQueue?.sidebarSummary.detail
+                "Jobs",
+                detail: model.activeJob?.note
+                    ?? model.transferQueue?.sidebarSummary.detail
                     ?? (model.pendingTransferFileCount > 0 ? "\(model.pendingTransferFileCount) waiting" : nil),
-                symbol: model.transferQueue?.state == .running ? "arrow.down.circle.fill" : "arrow.down.circle"
+                symbol: model.activeJob != nil ? "list.bullet.clipboard.fill" : "list.bullet.clipboard"
             ) {
                 TransferQueueWindowController.shared.show(model: model)
             }
