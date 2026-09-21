@@ -74,15 +74,24 @@ final class TileImageLoader: @unchecked Sendable {
         cache.object(forKey: key(url, Self.bucket(for: maximumPixelSize), orientation) as NSString)?.image
     }
 
+    /// Wall-clock bound on a single decode wait. A read stuck on a dead or
+    /// sleeping volume never resolves, so the waiter is released with nil
+    /// after this and the failure UI can replace the spinner. The decode
+    /// itself keeps running — a late finish still lands in the cache.
+    static let waitTimeout: Duration = .seconds(15)
+
     /// `priority` maps onto the decode operation's queue priority: the
     /// on-screen frame requests `.veryHigh`/`.high` so it never waits behind
     /// filmstrip tiles (`.normal`) or prefetch (`.low`) on a slow volume.
     /// Joining an already-queued decode boosts it to the higher priority.
+    /// `timeout` bounds the wait; the shared decode operation is not
+    /// cancelled — an uninterruptible filesystem read would ignore it anyway.
     func image(
         for url: URL,
         maximumPixelSize: Int,
         orientation: Int = 0,
-        priority: Operation.QueuePriority = .normal
+        priority: Operation.QueuePriority = .normal,
+        timeout: Duration = TileImageLoader.waitTimeout
     ) async -> CGImage? {
         let bucket = Self.bucket(for: maximumPixelSize)
         let cacheKey = key(url, bucket, orientation)
@@ -92,6 +101,12 @@ final class TileImageLoader: @unchecked Sendable {
 
         let group = joinGroup(cacheKey: cacheKey, url: url, bucket: bucket, orientation: orientation, priority: priority)
         let id = UUID()
+        let timeoutTask = Task.detached(priority: .utility) { [weak self] in
+            try? await Task.sleep(for: timeout)
+            guard !Task.isCancelled else { return }
+            self?.timeoutWaiter(id: id, url: url, bucket: bucket, in: group, after: timeout)
+        }
+        defer { timeoutTask.cancel() }
         return await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
                 park(continuation, id: id, in: group)
@@ -168,6 +183,31 @@ final class TileImageLoader: @unchecked Sendable {
         }
     }
 
+    /// Lock-guarded timeout: drops the waiter and resumes it with nil so a
+    /// decode parked in an uninterruptible read can't hold the caller — and
+    /// its spinner — forever. Unlike `cancelWaiter` the operation is left
+    /// alone: it may be slow rather than dead, and a late finish still fills
+    /// the cache for the next request.
+    private func timeoutWaiter(id: UUID, url: URL, bucket: Int, in group: WaiterGroup, after timeout: Duration) {
+        lock.lock()
+        guard let continuation = group.continuations.removeValue(forKey: id) else {
+            lock.unlock()
+            return
+        }
+        group.waiters -= 1
+        lock.unlock()
+        continuation.resume(returning: nil)
+        DebugLog.shared.log(
+            "decode.timeout",
+            subsystem: .tile,
+            level: .warning,
+            outcome: .timeout,
+            duration: timeout,
+            url: url,
+            detail: "waiter released; \(bucket) px decode still running"
+        )
+    }
+
     /// Runs once when the shared decode operation finishes: fills the cache,
     /// drops the in-flight slot, and resumes every waiter with the result
     /// (nil when the operation was cancelled).
@@ -223,9 +263,20 @@ final class TileImageLoader: @unchecked Sendable {
         let ext = url.pathExtension.lowercased()
         if OrganizeFileClassifier.rawExtensions.contains(ext) {
             let preference: EmbeddedJPEGPreviewPreference = maximumPixelSize > 1_700 ? .fullSize : .thumbnail
-            if let data = try? EmbeddedJPEGPreviewExtractor().jpegData(from: url, preference: preference),
-               let image = PreviewImageDecoder.cgImage(data: data, maximumPixelSize: maximumPixelSize) {
-                return image
+            do {
+                if let data = try EmbeddedJPEGPreviewExtractor().jpegData(from: url, preference: preference),
+                   let image = PreviewImageDecoder.cgImage(data: data, maximumPixelSize: maximumPixelSize) {
+                    return image
+                }
+            } catch {
+                DebugLog.shared.log(
+                    "extract.error",
+                    subsystem: .tile,
+                    level: .warning,
+                    outcome: .error,
+                    url: url,
+                    error: DebugLog.describe(error)
+                )
             }
             return PreviewImageDecoder.cgImage(url: url, maximumPixelSize: maximumPixelSize)
         }
@@ -244,7 +295,30 @@ final class TileImageLoader: @unchecked Sendable {
         generator.maximumSize = CGSize(width: maximumPixelSize, height: maximumPixelSize)
         generator.requestedTimeToleranceBefore = .positiveInfinity
         generator.requestedTimeToleranceAfter = .positiveInfinity
-        return try? generator.copyCGImage(at: CMTime(seconds: 1, preferredTimescale: 600), actualTime: nil)
+        DebugLog.shared.log("frame.start", subsystem: .video, url: url)
+        let start = ContinuousClock.now
+        do {
+            let frame = try generator.copyCGImage(at: CMTime(seconds: 1, preferredTimescale: 600), actualTime: nil)
+            DebugLog.shared.log(
+                "frame.finish",
+                subsystem: .video,
+                outcome: .ok,
+                duration: ContinuousClock.now - start,
+                url: url
+            )
+            return frame
+        } catch {
+            DebugLog.shared.log(
+                "frame.finish",
+                subsystem: .video,
+                level: .warning,
+                outcome: .error,
+                duration: ContinuousClock.now - start,
+                url: url,
+                error: DebugLog.describe(error)
+            )
+            return nil
+        }
     }
 }
 
@@ -262,8 +336,29 @@ private final class TileDecodeOperation: Operation, @unchecked Sendable {
 
     override func main() {
         guard !isCancelled else { return }
+        // Start is logged before any file I/O — including the size `stat` —
+        // so a decode stuck on a dead volume still leaves a "started, never
+        // finished" trail in debug.jsonl.
+        DebugLog.shared.log(
+            "decode.start",
+            subsystem: .tile,
+            url: url,
+            detail: "bucket \(maximumPixelSize)"
+        )
+        let start = ContinuousClock.now
+        let size = DebugLog.fileSize(of: url)
         result = autoreleasepool {
             TileImageLoader.decode(url: url, maximumPixelSize: maximumPixelSize, orientation: orientation)
         }
+        DebugLog.shared.log(
+            "decode.finish",
+            subsystem: .tile,
+            level: result == nil && !isCancelled ? .warning : .debug,
+            outcome: isCancelled ? .cancel : (result == nil ? .error : .ok),
+            duration: ContinuousClock.now - start,
+            url: url,
+            size: size,
+            error: result == nil && !isCancelled ? "decode produced no image" : nil
+        )
     }
 }
