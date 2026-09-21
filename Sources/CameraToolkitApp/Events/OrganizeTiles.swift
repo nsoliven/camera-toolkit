@@ -1,5 +1,5 @@
 import AppKit
-import AVKit
+import AVFoundation
 import CameraToolkitCore
 import SwiftUI
 
@@ -1235,8 +1235,11 @@ struct StackPreviewOverlay: View {
         }
     }
 
-    /// Real playback via AVKit — a playable clip gets the standard player
-    /// chrome; a codec AVFoundation can't open keeps its poster with a note.
+    /// Real playback via AVKit's `AVPlayerView` (wrapped by
+    /// `VideoPreviewPane` — SwiftUI's `VideoPlayer` aborts this binary in
+    /// `_AVKit_SwiftUI` metadata init). A playable clip gets the standard
+    /// player chrome; a clip the probe can't prove playable keeps its
+    /// poster with a note.
     private func videoPane(_ item: OrganizeItem) -> some View {
         ZStack {
             Color.black
@@ -1247,7 +1250,7 @@ struct StackPreviewOverlay: View {
                     .opacity(videoPlayer == nil ? 1 : 0)
             }
             if let videoPlayer {
-                VideoPlayer(player: videoPlayer)
+                VideoPreviewPane(player: videoPlayer)
             } else if videoPlayable == false {
                 VStack(spacing: 10) {
                     Image(systemName: "video.slash")
@@ -1472,19 +1475,6 @@ struct StackPreviewOverlay: View {
         videoPlayer?.pause()
         videoPlayer = nil
         videoPlayable = nil
-        if item.kind == .video {
-            // Check playability before handing AVPlayer the file so an
-            // unplayable codec keeps its poster instead of a dead spinner.
-            let asset = AVURLAsset(url: url)
-            let playable = (try? await asset.load(.isPlayable)) ?? false
-            guard !Task.isCancelled else { return }
-            videoPlayable = playable
-            if playable {
-                let player = AVPlayer(playerItem: AVPlayerItem(asset: asset))
-                videoPlayer = player
-                player.play()
-            }
-        }
         if let full = TileImageLoader.shared.cachedImage(for: url, maximumPixelSize: 2_400, orientation: orientation) {
             image = full
         } else {
@@ -1495,6 +1485,21 @@ struct StackPreviewOverlay: View {
             }
             if !Task.isCancelled, image == nil {
                 failed = true
+            }
+        }
+        if item.kind == .video {
+            // The poster is already up; now prove the clip can actually
+            // play before handing it to AVPlayer. The probe is bounded, so
+            // an unopenable codec or a stalled source ends on the
+            // can't-play affordances instead of a dead spinner.
+            let player = await VideoPreviewSupport.readyPlayer(for: url)
+            guard !Task.isCancelled else { return }
+            if let player {
+                videoPlayable = true
+                videoPlayer = player
+                player.play()
+            } else {
+                videoPlayable = false
             }
         }
         guard let stack, !Task.isCancelled else { return }
