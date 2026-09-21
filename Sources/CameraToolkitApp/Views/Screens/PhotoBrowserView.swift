@@ -347,7 +347,7 @@ struct PhotoBrowserView: View {
 
                 Section("Activity") {
                     sidebarActionButton(
-                        title: "Jobs",
+                        title: "Jobs…",
                         detail: jobsSidebarDetail,
                         symbol: jobsSidebarSymbol,
                         color: jobsSidebarColor,
@@ -360,7 +360,7 @@ struct PhotoBrowserView: View {
 
                 Section("Tools") {
                     sidebarActionButton(
-                        title: "Speed Tests",
+                        title: "Speed Tests…",
                         detail: model.isStorageBenchmarkRunning ? "Measuring connected storage" : "Find the slowest drive or USB link",
                         symbol: "gauge.with.dots.needle.50percent",
                         color: model.isStorageBenchmarkRunning ? .blue : .secondary,
@@ -370,7 +370,7 @@ struct PhotoBrowserView: View {
                     }
 
                     sidebarActionButton(
-                        title: "Events",
+                        title: "Events…",
                         detail: "Browse \(model.savedEvents.count) saved event\(model.savedEvents.count == 1 ? "" : "s")",
                         symbol: "calendar.badge.clock",
                         color: .blue,
@@ -380,7 +380,7 @@ struct PhotoBrowserView: View {
                     }
 
                     sidebarActionButton(
-                        title: "Photo Database",
+                        title: "Photo Database…",
                         detail: "Files, locations, and read-only SQL",
                         symbol: "cylinder.split.1x2",
                         color: .secondary,
@@ -390,7 +390,7 @@ struct PhotoBrowserView: View {
                     }
 
                     sidebarActionButton(
-                        title: "Keyboard Shortcuts",
+                        title: "Keyboard Shortcuts…",
                         detail: "See every app shortcut",
                         symbol: "keyboard",
                         color: .secondary,
@@ -471,7 +471,7 @@ struct PhotoBrowserView: View {
             Button {
                 showDriveInformation(location)
             } label: {
-                Label("Get Info", systemImage: "info.circle")
+                Label("Get Info…", systemImage: "info.circle")
             }
 
             Divider()
@@ -842,7 +842,7 @@ struct PhotoBrowserView: View {
             Button {
                 createFolder()
             } label: {
-                Label("New Folder", systemImage: "folder.badge.plus")
+                Label("New Folder…", systemImage: "folder.badge.plus")
             }
             .help("New Folder")
 
@@ -1458,7 +1458,7 @@ struct PhotoBrowserView: View {
             Button {
                 isCreatingEvent = true
             } label: {
-                Label("New Event", systemImage: "plus")
+                Label("New Event…", systemImage: "plus")
             }
 
             Button {

@@ -270,7 +270,7 @@ private struct PeopleView: View {
                     naming = NamingRequest(person: group, title: "Name \(group.name)", isGroup: true)
                 }
                 .help("Adds this person to the roster and re-matches every stored face")
-                Button("Junk", role: .destructive) {
+                Button("Junk…", role: .destructive) {
                     junkTarget = group
                 }
                 .help("Drop this cluster — statues, strangers, duplicates of nothing")
