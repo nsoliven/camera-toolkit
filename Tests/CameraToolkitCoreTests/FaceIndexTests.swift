@@ -1692,6 +1692,69 @@ final class FaceIndexTests: XCTestCase {
         }
     }
 
+    /// A tilted set of five points must land on the ArcFace template.
+    /// This is the rotate step: without it the eye dots stay on the diagonal.
+    func testAlignedImageRotatesTiltedLandmarksOntoTemplate() throws {
+        let side = 400
+        let context = try XCTUnwrap(FaceAligner.RGBContext(width: side, height: side))
+        context.setFillColor(CGColor(gray: 1, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: side, height: side))
+
+        // A real 40° roll, scaled up and shifted. These five points are a
+        // similarity of the ArcFace template, so alignment must put them back.
+        let angle = 40.0 * Double.pi / 180
+        let scale = 1.5
+        let cosA = cos(angle)
+        let sinA = sin(angle)
+        func rolled(_ point: CGPoint) -> CGPoint {
+            CGPoint(
+                x: scale * (cosA * point.x - sinA * point.y) + 80,
+                y: scale * (sinA * point.x + cosA * point.y) + 40
+            )
+        }
+        let placed = FaceAligner.template.map(rolled)
+        let landmarks = FaceLandmarkSet(
+            leftEye: placed[0],
+            rightEye: placed[1],
+            nose: placed[2],
+            leftMouth: placed[3],
+            rightMouth: placed[4]
+        )
+        context.setFillColor(CGColor(gray: 0, alpha: 1))
+        for point in landmarks.points {
+            let rect = CGRect(x: point.x - 2, y: Double(side) - point.y - 2, width: 5, height: 5)
+            context.fill(rect)
+        }
+        let image = try XCTUnwrap(context.makeImage())
+        let aligned = try XCTUnwrap(FaceAligner.alignedImage(image, landmarks: landmarks))
+        XCTAssertEqual(aligned.width, 112)
+        XCTAssertEqual(aligned.height, 112)
+
+        func darkness(atTopLeft point: CGPoint) -> UInt8 {
+            guard let readback = FaceAligner.RGBContext(width: 112, height: 112),
+                  let data = readback.data else { return 255 }
+            readback.draw(aligned, in: CGRect(x: 0, y: 0, width: 112, height: 112))
+            let bytes = data.bindMemory(to: UInt8.self, capacity: 112 * 112 * 4)
+            var best: UInt8 = 255
+            let cx = Int(point.x.rounded())
+            let cy = Int(point.y.rounded())
+            for dy in -1...1 {
+                for dx in -1...1 {
+                    let x = min(111, max(0, cx + dx))
+                    let y = min(111, max(0, cy + dy))
+                    let offset = (y * 112 + x) * 4
+                    best = min(best, bytes[offset], bytes[offset + 1], bytes[offset + 2])
+                }
+            }
+            return best
+        }
+
+        for point in FaceAligner.template {
+            XCTAssertLessThan(darkness(atTopLeft: point), 80, "template point \(point) stayed bright")
+        }
+        XCTAssertGreaterThan(darkness(atTopLeft: CGPoint(x: 4, y: 4)), 200)
+    }
+
     func testFlippedHorizontallyMirrorsPixels() throws {
         // A 2×1 image, red on the left and blue on the right, flips to
         // blue-left / red-right. Compared as whole pixel tuples so the
