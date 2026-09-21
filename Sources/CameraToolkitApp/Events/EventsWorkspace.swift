@@ -39,11 +39,21 @@ struct RenameEventRequest: Identifiable {
     var eventID: UUID
 }
 
-/// Pending "Scan for Faces" sheet — the location to scan; the sheet picks
-/// quality and whether Fast pins the Mac before the job starts.
+/// Pending "Scan for Faces" sheet — the unsorted location or event to
+/// scan; the sheet picks quality and whether Fast pins the Mac before the
+/// job starts.
 struct FaceScanRequest: Identifiable {
-    var id: UUID { locationID }
-    var locationID: UUID
+    enum Subject: Sendable {
+        case location(UUID)
+        case event(UUID)
+    }
+
+    var subject: Subject
+    var id: UUID {
+        switch subject {
+        case .location(let id), .event(let id): id
+        }
+    }
 }
 
 struct RemovalRequest: Identifiable {
@@ -601,6 +611,25 @@ final class EventsWorkspace {
                 search: scoped,
                 rootPath: nil,
                 facts: stackFacts($0, peopleByStackID: peopleByStackID)
+            )
+        }
+    }
+
+    /// The stacks an event board shows after its search field filters —
+    /// the same match rules as the unsorted board, minus the origin
+    /// subfolder (an event's files can sit under several roots).
+    func visibleEventStacks(_ eventID: UUID, matching query: String) -> [OrganizeStack] {
+        let stacks = eventStacks[eventID] ?? []
+        let needle = OrganizeSearch.needle(query)
+        guard !needle.isEmpty else { return stacks }
+        let title = event(eventID).map { eventTitle($0) }
+        return stacks.filter {
+            OrganizeSearch.matches(
+                stack: $0,
+                needle: needle,
+                rootPath: nil,
+                eventTitle: title,
+                personNames: personNames(on: $0)
             )
         }
     }
@@ -2522,7 +2551,13 @@ final class EventsWorkspace {
     /// Opens the "Scan for Faces" sheet for a location — quality and the
     /// Fast (pin the Mac) are picked there before any job starts.
     func requestFaceScan(_ location: ConfiguredLocation) {
-        faceScanRequest = FaceScanRequest(locationID: location.id)
+        faceScanRequest = FaceScanRequest(subject: .location(location.id))
+    }
+
+    /// Same sheet for an event — the scan runs on the stacks its board
+    /// shows (each assigned file's best local copy).
+    func requestFaceScan(_ event: SavedCameraEvent) {
+        faceScanRequest = FaceScanRequest(subject: .event(event.id))
     }
 
     /// Test seam: supplies the embedder so a face scan can run without the
@@ -2538,6 +2573,30 @@ final class EventsWorkspace {
         }
         if sources[location.id]?.result == nil {
             return "Face Scan runs after burst grouping — scan \(location.name) first."
+        }
+        if model.isBusy || model.isStorageBenchmarkRunning {
+            return "Another job is already running. Wait for it to finish, then scan."
+        }
+        return nil
+    }
+
+    /// Why Face Scan cannot start on this event right now, or nil when it
+    /// can. The scan runs over the event board's stacks — the reachable
+    /// copies — so an event that has never been opened warms its presence
+    /// data first, and an event whose files are all offline has nothing to
+    /// scan until a drive or the NAS mounts.
+    func faceScanBlocker(for event: SavedCameraEvent) -> String? {
+        guard assignmentCount(for: event.id) > 0 else {
+            return "Sort photos into \(event.name) first — there is nothing to scan."
+        }
+        guard let stacks = eventStacks[event.id] else {
+            if refreshGenerations[event.id] == nil {
+                Task { await refreshEvent(event.id) }
+            }
+            return "Still checking where \(event.name)'s files are — the scan unlocks when that finishes."
+        }
+        guard !stacks.isEmpty else {
+            return "No reachable copies of \(event.name)'s files — connect the drive or NAS that holds them, then scan."
         }
         if model.isBusy || model.isStorageBenchmarkRunning {
             return "Another job is already running. Wait for it to finish, then scan."
@@ -2635,6 +2694,31 @@ final class EventsWorkspace {
             model.statusMessage = blocker
             return
         }
+        // The grouping gate above guarantees a scan result; the stacks it
+        // holds drive the face scan's burst sampling.
+        guard let stacks = sources[location.id]?.result?.stacks else { return }
+        runFaceScanJob(title: location.name, stacks: stacks, options: options)
+    }
+
+    /// "Scan for Faces" on an event board: the same burst-sampled pass as
+    /// Unsorted, run over the event's reachable files — the stacks its
+    /// board built from each assignment's best local copy (Buffer, private
+    /// staging, card, or NAS mount). Writes only to the catalog — media
+    /// files are only read — and faces attach to the event by file
+    /// identity, so photos scanned here or in Unsorted share one index.
+    func faceScan(_ event: SavedCameraEvent, options: FaceScanOptions = FaceScanOptions()) {
+        if let blocker = faceScanBlocker(for: event) {
+            model.statusMessage = blocker
+            return
+        }
+        guard let stacks = eventStacks[event.id], !stacks.isEmpty else { return }
+        runFaceScanJob(title: eventTitle(event), stacks: stacks, options: options)
+    }
+
+    /// The shared face-scan job: loads the embedder (and the SCRFD detector
+    /// for MED and above), runs `FaceIndexService` over the given stacks,
+    /// and reports progress and the summary line to the Jobs window.
+    private func runFaceScanJob(title: String, stacks: [OrganizeStack], options: FaceScanOptions) {
         let embedderProvider = faceEmbedderProvider
         guard faceModelInstalled || embedderProvider != nil else {
             model.statusMessage = "The face model is not installed yet. Run scripts/convert-arcface.sh once on this Mac, then scan again."
@@ -2644,17 +2728,14 @@ final class EventsWorkspace {
             model.statusMessage = "The face detector is not installed yet. Run scripts/convert-scrfd.sh once on this Mac, then scan again."
             return
         }
-        // The grouping gate above guarantees a scan result; the stacks it
-        // holds drive the face scan's burst sampling.
-        guard let stacks = sources[location.id]?.result?.stacks else { return }
         let support = DashboardModel.defaultApplicationSupportURL
         let catalogURL = catalogDatabaseURL
         let configuration = model.configuration
         let burstScope = options.mode < .high ? "a sample of each burst" : "every burst frame"
         model.runAsyncJob(
             action: .faceScan,
-            runningNote: "Scanning \(location.name) for faces",
-            logTitle: "Face scan: \(location.name)",
+            runningNote: "Scanning \(title) for faces",
+            logTitle: "Face scan: \(title)",
             logDetail: "Quality \(options.mode.rawValue). Detected faces on \(burstScope), single stills, and — at MED and above — video frames; embedded them on-device, matched named people, and grouped the rest. Files were only read — nothing was written or moved.",
             operation: { progress in
                 // Bootstrap is idempotent: it guarantees the face tables
@@ -2680,9 +2761,9 @@ final class EventsWorkspace {
                     }
                     detector = loaded
                 }
-                // The scan result's burst stacks drive sampling — a burst
-                // decodes its first/middle/last stills instead of every
-                // frame (all stills at HIGH and above).
+                // The board's burst stacks drive sampling — a burst decodes
+                // its first/middle/last stills instead of every frame (all
+                // stills at HIGH and above).
                 return try FaceIndexService(catalogURL: catalogURL, options: options).scan(
                     stacks: stacks,
                     embedder: embedder,

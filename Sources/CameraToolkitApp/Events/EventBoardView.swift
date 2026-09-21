@@ -221,6 +221,13 @@ struct EventBoardView: View {
                     reveal(url.appendingPathComponent(layout.eventFolder, isDirectory: true))
                 }
                 Divider()
+                Button("Scan for Faces…") {
+                    workspace.requestFaceScan(event)
+                }
+                .disabled(workspace.faceScanBlocker(for: event) != nil)
+                .help(workspace.faceScanBlocker(for: event)
+                    ?? "Detect and match faces on a sample of each burst — not every frame — plus single stills and, at MED and above, video frames. Writes only to the catalog — media is read, never touched.")
+                Divider()
                 Button("Undo Last Move") { workspace.undoLastMove() }
                     .disabled(workspace.latestMoveJournalTitle == nil || model.isBusy)
                 Button("Delete Empty Event", role: .destructive) { workspace.deleteEmptyEvent(eventID) }
