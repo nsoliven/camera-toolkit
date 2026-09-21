@@ -2757,6 +2757,21 @@ final class EventsWorkspace {
         model.statusMessage = "Pinned as a match reference for future scans."
     }
 
+    /// Sets the person's cover — the thumbnail the People list shows. The
+    /// choice lives on the person row in the catalog; a face that leaves
+    /// the person stops being the cover automatically. Catalog only —
+    /// no photo is written to.
+    func setCoverFace(_ faceID: UUID, for personID: UUID) {
+        guard (try? faceStore.setCoverFace(personID: personID, faceID: faceID)) == true else { return }
+        facesRevision &+= 1
+        model.statusMessage = "Cover updated."
+    }
+
+    /// The current catalog row for a person — refreshed cover pick included.
+    func person(_ id: UUID) -> FacePerson? {
+        try? faceStore.person(id)
+    }
+
     /// Cheap CPU-only pass after roster changes: re-match stored vectors to
     /// the gallery without re-reading a single photo.
     func rematchFaces() {

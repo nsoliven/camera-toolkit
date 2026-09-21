@@ -199,12 +199,16 @@ public struct FacePerson: Identifiable, Equatable, Sendable {
     public var name: String
     public var isRoster: Bool
     public var faceCount: Int
+    /// The face the user pinned as this person's cover thumbnail. Nil means
+    /// the highest-confidence detection stands in.
+    public var coverFaceID: UUID?
 
-    public init(id: UUID = UUID(), name: String, isRoster: Bool, faceCount: Int = 0) {
+    public init(id: UUID = UUID(), name: String, isRoster: Bool, faceCount: Int = 0, coverFaceID: UUID? = nil) {
         self.id = id
         self.name = name
         self.isRoster = isRoster
         self.faceCount = faceCount
+        self.coverFaceID = coverFaceID
     }
 }
 
