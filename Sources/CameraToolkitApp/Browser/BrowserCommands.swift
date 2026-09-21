@@ -1,7 +1,7 @@
 import AppKit
 import SwiftUI
 
-enum BrowserCommand: String, Sendable {
+enum BrowserCommand: String, Sendable, CaseIterable {
     case copySelection
     case moveSelectionToTrash
     case selectAll
@@ -21,6 +21,12 @@ enum BrowserCommand: String, Sendable {
     /// Focus the search field of whichever board supports it (the organize
     /// board today). Boards without a search field ignore it.
     case find
+
+    /// Commands that may still run while a text field owns typing. Menu and
+    /// monitor posts are gated before they reach a board; `.reload` is
+    /// posted by the app itself after a job finishes and is never a
+    /// keyboard shortcut.
+    var isAllowedWhileTyping: Bool { self == .reload }
 
     static let notification = Notification.Name("CameraToolkit.BrowserCommand")
 

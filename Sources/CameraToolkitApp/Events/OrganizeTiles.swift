@@ -792,6 +792,9 @@ struct OrganizeGrid<MenuContent: View>: View {
         orderedIDs: [String],
         proxy: ScrollViewProxy
     ) -> KeyPress.Result {
+        // Never board keys while a text field owns typing — Delete edits
+        // the search text, it does not unsort the selection.
+        guard !KeyboardTextFocus.isTypingInTextField() else { return .ignored }
         let current = workspace.focusedStackID.flatMap { orderedIDs.firstIndex(of: $0) }
         func move(_ delta: Int) -> KeyPress.Result {
             guard !orderedIDs.isEmpty else { return .handled }
@@ -1364,6 +1367,9 @@ struct StackPreviewOverlay: View {
     }
 
     private func handle(_ press: KeyPress) -> KeyPress.Result {
+        // Never overlay keys while a text field owns typing — Delete edits
+        // the field, it does not trash filmstrip frames.
+        guard !KeyboardTextFocus.isTypingInTextField() else { return .ignored }
         // Close always works, even if the stack vanished under us.
         if press.key == .escape {
             stackID = nil

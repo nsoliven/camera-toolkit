@@ -243,6 +243,8 @@ final class EventsWorkspaceTests: XCTestCase {
             workspace.selectStacks([burst.id])
 
             workspace.trash(stackIDs: [burst.id], from: location.id)
+            // Trash now confirms first — the test stands in for the owner
+            // pressing "Move to Trash" on the sheet.
             workspace.confirmTrash(try XCTUnwrap(workspace.pendingTrash))
             try await waitUntil { !model.isBusy && workspace.sources[location.id]?.result?.items.count == 1 }
 
