@@ -1,4 +1,5 @@
 import AppKit
+import AVKit
 import CameraToolkitCore
 import SwiftUI
 
@@ -176,6 +177,12 @@ struct StackTileView: View {
     /// Subfolder the stack lives in, relative to the scan root — shown as a
     /// tooltip. Nil when the stack sits directly in the scanned folder.
     var originFolder: String? = nil
+    /// Toggles the inline expansion of a burst. Nil falls back to `onOpen`.
+    var onExpand: (() -> Void)? = nil
+    /// Opens playback for a video tile. Nil falls back to `onOpen`… callers
+    /// pass it so the badge does something sensible everywhere.
+    var onPlay: (() -> Void)? = nil
+    var onOpen: (() -> Void)? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
@@ -194,18 +201,30 @@ struct StackTileView: View {
                         }
                         Spacer(minLength: 0)
                         if stack.isBurst {
-                            Label("\(stack.items.count)", systemImage: "square.stack.3d.down.right.fill")
-                                .font(.caption.weight(.bold).monospacedDigit())
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 2)
-                                .background(.black.opacity(0.6), in: Capsule())
-                                .foregroundStyle(.white)
+                            Button {
+                                (onExpand ?? onOpen)?()
+                            } label: {
+                                Label("\(stack.items.count)", systemImage: "square.stack.3d.down.right.fill")
+                                    .font(.caption.weight(.bold).monospacedDigit())
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 2)
+                                    .background(.black.opacity(0.6), in: Capsule())
+                                    .foregroundStyle(.white)
+                            }
+                            .buttonStyle(.plain)
+                            .help("Show every frame of this burst in the board")
                         } else if stack.kind == .video {
-                            Image(systemName: "video.fill")
-                                .font(.caption)
-                                .padding(5)
-                                .background(.black.opacity(0.6), in: Circle())
-                                .foregroundStyle(.white)
+                            Button {
+                                (onPlay ?? onOpen)?()
+                            } label: {
+                                Image(systemName: "play.fill")
+                                    .font(.caption)
+                                    .padding(5)
+                                    .background(.black.opacity(0.6), in: Circle())
+                                    .foregroundStyle(.white)
+                            }
+                            .buttonStyle(.plain)
+                            .help("Play this video")
                         }
                     }
                     Spacer(minLength: 0)
@@ -268,22 +287,39 @@ struct StackTileView: View {
     }
 }
 
-struct DayHeader: View {
-    let day: OrganizeDay
-    let subtitle: String
+/// Header of one board section — a day, folder, kind, or event group. The
+/// chevron collapses the whole group so hundreds of bursts stay scannable.
+struct BoardGroupHeader: View {
+    let group: OrganizeBoardGroup
+    let isCollapsed: Bool
+    let onToggleCollapse: () -> Void
     let onSelect: () -> Void
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 10) {
-            Text(day.date.formatted(.dateTime.weekday(.wide).month(.wide).day().year()))
+            Button(action: onToggleCollapse) {
+                Image(systemName: isCollapsed ? "chevron.right" : "chevron.down")
+                    .font(.callout.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 14)
+            }
+            .buttonStyle(.plain)
+            .help(isCollapsed ? "Expand this group" : "Collapse this group")
+            if let symbol = group.symbol {
+                Image(systemName: symbol)
+                    .foregroundStyle(.secondary)
+            }
+            Text(group.title)
                 .font(.title3.weight(.semibold))
-            Text(subtitle)
+            Text(group.subtitle)
                 .font(.callout)
                 .foregroundStyle(.secondary)
             Spacer()
-            Button("Select Day", action: onSelect)
+            Button("Select", action: onSelect)
                 .buttonStyle(.borderless)
                 .font(.callout)
+                .disabled(group.stacks.isEmpty || isCollapsed)
+                .help("Select everything in this group")
         }
         .padding(.vertical, 8)
         .padding(.horizontal, 6)
@@ -292,85 +328,270 @@ struct DayHeader: View {
     }
 }
 
-struct OrganizeStatusLine: View {
-    @Bindable var model: DashboardModel
+/// One row of the board's list mode — the same stack as a tile, compressed
+/// into a single line so hundreds of bursts fit on screen.
+struct StackRowView: View {
+    let stack: OrganizeStack
+    let isSelected: Bool
+    let isFocused: Bool
+    let isExpanded: Bool
+    let event: SavedCameraEvent?
+    var isPrivate: Bool? = nil
+    let isMixed: Bool
+    let isDimmed: Bool
+    let badge: TileLocationBadge?
+    var originFolder: String? = nil
+    var onExpand: (() -> Void)? = nil
+    var onPlay: (() -> Void)? = nil
+    var onOpen: (() -> Void)? = nil
 
     var body: some View {
-        HStack(spacing: 8) {
-            if let job = model.activeJob {
-                ProgressView(value: job.progress)
-                    .frame(width: 120)
-                Text(job.note)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-            } else {
-                Text(model.statusMessage)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
+        HStack(spacing: 10) {
+            TileThumbnail(url: stack.coverItem.primary.url, kind: stack.kind, pixelSize: 176)
+                .frame(width: 88, height: 56)
+                .clipped()
+                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .strokeBorder(Color.primary.opacity(0.1), lineWidth: 0.5)
+                }
+
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    if stack.isBurst {
+                        Image(systemName: "square.stack.3d.down.right.fill")
+                            .foregroundStyle(.secondary)
+                    }
+                    Text(title)
+                        .font(.callout.weight(.medium))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    if isMixed {
+                        Label("Mixed", systemImage: "square.split.2x1")
+                            .font(.caption2.weight(.semibold))
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 1)
+                            .background(.orange, in: Capsule())
+                            .foregroundStyle(.white)
+                    }
+                    if let badge {
+                        Label(badge.label, systemImage: badge.symbol)
+                            .font(.caption2.weight(.semibold))
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 1)
+                            .background(.quaternary, in: Capsule())
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                HStack(spacing: 5) {
+                    Text(stack.captureDate.formatted(date: .abbreviated, time: .shortened))
+                    if let originFolder {
+                        Text("·")
+                        Text(originFolder)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                    Text("·")
+                    Text(stack.byteCount.formattedBytes)
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
             }
-            Spacer()
+
+            Spacer(minLength: 6)
+
+            if let event {
+                EventChip(event: event, isPrivate: isPrivate)
+            }
+            if stack.isBurst {
+                Button {
+                    (onExpand ?? onOpen)?()
+                } label: {
+                    Label("\(stack.items.count)", systemImage: isExpanded ? "chevron.down" : "chevron.right")
+                        .font(.caption.weight(.bold).monospacedDigit())
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 3)
+                        .background(.quaternary, in: Capsule())
+                }
+                .buttonStyle(.plain)
+                .help(isExpanded ? "Collapse this burst" : "Show every frame in the board")
+            } else if stack.kind == .video {
+                Button {
+                    (onPlay ?? onOpen)?()
+                } label: {
+                    Image(systemName: "play.fill")
+                        .font(.caption)
+                        .padding(6)
+                        .background(.quaternary, in: Circle())
+                }
+                .buttonStyle(.plain)
+                .help("Play this video")
+            }
         }
-        .font(.caption)
-        .foregroundStyle(.secondary)
-        .padding(.horizontal, 16)
-        .padding(.vertical, 6)
-        .background(.bar)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 5)
+        .background(isSelected ? Color.accentColor.opacity(0.18) : (isFocused ? Color.accentColor.opacity(0.07) : Color.clear))
+        .opacity(isDimmed ? 0.45 : 1)
+        .contentShape(Rectangle())
+        .help(originFolder.map { "In \($0)" } ?? stack.coverItem.primary.name)
+    }
+
+    private var title: String {
+        if let label = stack.burstLabel, stack.isBurst {
+            return "\(label) · \(stack.items.count) frames"
+        }
+        if stack.isBurst {
+            return "Burst · \(stack.items.count) frames"
+        }
+        return stack.coverItem.primary.name
     }
 }
 
-/// The shared burst grid: capture days as pinned sections, keyboard focus,
-/// click and Shift/Command selection, drag to an event, and a context menu.
+/// Every frame of a burst laid out inside the board — what the count badge
+/// expands into. Tapping a frame opens the full preview at that frame.
+struct BurstExpansionView: View {
+    let stack: OrganizeStack
+    /// Edge length of the small frame thumbnails.
+    var frameSize: CGFloat = 104
+    var onOpenFrame: ((Int) -> Void)? = nil
+    var onCollapse: (() -> Void)? = nil
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Image(systemName: "square.stack.3d.down.right.fill")
+                    .foregroundStyle(.secondary)
+                Text(stack.burstLabel.map { "\($0) · \(stack.items.count) frames" } ?? "\(stack.items.count) frames")
+                    .font(.callout.weight(.semibold))
+                Text("\(stack.captureDate.formatted(date: .omitted, time: .shortened)) – \(stack.endDate.formatted(date: .omitted, time: .shortened))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 6)
+                Button {
+                    onCollapse?()
+                } label: {
+                    Label("Collapse", systemImage: "chevron.up")
+                        .font(.caption)
+                }
+                .buttonStyle(.borderless)
+            }
+            LazyVGrid(
+                columns: [GridItem(.adaptive(minimum: frameSize, maximum: frameSize * 1.4), spacing: 6)],
+                alignment: .leading,
+                spacing: 6
+            ) {
+                ForEach(Array(stack.items.enumerated()), id: \.element.id) { index, frame in
+                    TileThumbnail(url: frame.primary.url, kind: frame.kind, pixelSize: Int(frameSize * 2))
+                        .frame(width: frameSize, height: frameSize * 2 / 3)
+                        .clipped()
+                        .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
+                        .overlay(alignment: .bottomTrailing) {
+                            if frame.kind == .video {
+                                Image(systemName: "video.fill")
+                                    .font(.system(size: 9))
+                                    .padding(3)
+                                    .background(.black.opacity(0.6), in: Circle())
+                                    .foregroundStyle(.white)
+                                    .padding(3)
+                            }
+                        }
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 5, style: .continuous)
+                                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5)
+                        }
+                        .onTapGesture { onOpenFrame?(index) }
+                        .help(frame.primary.name)
+                }
+            }
+        }
+        .padding(10)
+        .background(Color.accentColor.opacity(0.06), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(Color.accentColor.opacity(0.25), lineWidth: 1)
+        }
+    }
+}
+
+struct OrganizeStatusLine: View {
+    @Bindable var model: DashboardModel
+    /// Boards pass the workspace so the source → destination diagram of a
+    /// running Apply stays visible above the status line.
+    var workspace: EventsWorkspace? = nil
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if let running = workspace?.runningApply,
+               model.jobs.contains(where: { $0.id == running.jobID && $0.state == .running }) {
+                ApplyProgressBanner(running: running)
+                Divider()
+            }
+            HStack(spacing: 8) {
+                if let job = model.activeJob {
+                    ProgressView(value: job.progress)
+                        .frame(width: 120)
+                    Text(job.note)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                } else {
+                    Text(model.statusMessage)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+                Spacer()
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 6)
+            .background(.bar)
+        }
+    }
+}
+
+/// The shared burst board: collapsible groups (day, folder, kind, or event)
+/// as pinned sections, either as tiles or a dense list. Keyboard focus,
+/// click and Shift/Command selection, drag to an event, a context menu, and
+/// inline burst expansion via the count badge or `E`.
 struct OrganizeGrid<MenuContent: View>: View {
     @Bindable var workspace: EventsWorkspace
-    let days: [OrganizeDay]
+    let groups: [OrganizeBoardGroup]
+    let mode: OrganizeBoardMode
     let tileWidth: CGFloat
     let origin: OrganizeDragPayload.Origin
     let containerID: UUID
     /// Scan root used to label each tile's origin subfolder; nil hides the
     /// label (event boards have no single scan root).
     var rootPath: String? = nil
-    let daySubtitle: (OrganizeDay) -> String
     let eventForStack: (OrganizeStack) -> (event: SavedCameraEvent?, mixed: Bool)
     let isDimmed: (OrganizeStack) -> Bool
     let badge: (OrganizeStack) -> TileLocationBadge?
-    let onOpen: (OrganizeStack) -> Void
+    /// Opens the full preview at a specific frame of the stack (0 for the
+    /// usual double-click/Space path).
+    let onOpen: (OrganizeStack, Int) -> Void
     let onKey: (KeyPress, [String]) -> KeyPress.Result
     @ViewBuilder let menu: (OrganizeStack) -> MenuContent
 
     @FocusState private var isFocused: Bool
     @State private var columns = 1
 
+    /// Stacks the board is actually showing — collapsed groups hide theirs.
+    private var visibleGroups: [OrganizeBoardGroup] {
+        groups.map { group in
+            guard workspace.collapsedGroupIDs.contains(group.id) else { return group }
+            return OrganizeBoardGroup(id: group.id, title: group.title, symbol: group.symbol, stacks: [])
+        }
+    }
+
     var body: some View {
-        let ordered = days.flatMap(\.stacks)
+        let ordered = visibleGroups.flatMap(\.stacks)
         let orderedIDs = ordered.map(\.id)
         ScrollViewReader { proxy in
             ScrollView {
-                LazyVGrid(
-                    columns: [GridItem(.adaptive(minimum: tileWidth, maximum: tileWidth * 1.3), spacing: 12, alignment: .top)],
-                    alignment: .leading,
-                    spacing: 14,
-                    pinnedViews: [.sectionHeaders]
-                ) {
-                    ForEach(days) { day in
-                        Section {
-                            ForEach(day.stacks) { stack in
-                                tile(stack, orderedIDs: orderedIDs)
-                            }
-                        } header: {
-                            DayHeader(day: day, subtitle: daySubtitle(day)) {
-                                workspace.selectStacks(day.stacks.map(\.id))
-                                isFocused = true
-                            }
-                        }
-                    }
-                }
-                .padding(16)
-                .background {
-                    GeometryReader { geometry in
-                        Color.clear
-                            .onAppear { updateColumns(geometry.size.width) }
-                            .onChange(of: geometry.size.width) { _, width in updateColumns(width) }
-                    }
+                if mode == .tiles {
+                    tileBoard(orderedIDs: orderedIDs)
+                } else {
+                    listBoard(orderedIDs: orderedIDs)
                 }
             }
             .focusable()
@@ -389,6 +610,89 @@ struct OrganizeGrid<MenuContent: View>: View {
         }
     }
 
+    private func tileBoard(orderedIDs: [String]) -> some View {
+        LazyVGrid(
+            columns: [GridItem(.adaptive(minimum: tileWidth, maximum: tileWidth * 1.3), spacing: 12, alignment: .top)],
+            alignment: .leading,
+            spacing: 14,
+            pinnedViews: [.sectionHeaders]
+        ) {
+            ForEach(visibleGroups) { group in
+                Section {
+                    ForEach(group.stacks) { stack in
+                        if workspace.expandedStackIDs.contains(stack.id), stack.isBurst {
+                            expansion(stack)
+                                .gridCellColumns(max(columns, 1))
+                        } else {
+                            tile(stack, orderedIDs: orderedIDs)
+                        }
+                    }
+                } header: {
+                    BoardGroupHeader(
+                        group: group,
+                        isCollapsed: workspace.collapsedGroupIDs.contains(group.id),
+                        onToggleCollapse: {
+                            workspace.setGroupCollapsed(group.id, collapsed: !workspace.collapsedGroupIDs.contains(group.id))
+                        },
+                        onSelect: {
+                            workspace.selectStacks(group.stacks.map(\.id))
+                            isFocused = true
+                        }
+                    )
+                }
+            }
+        }
+        .padding(16)
+        .background {
+            GeometryReader { geometry in
+                Color.clear
+                    .onAppear { updateColumns(geometry.size.width) }
+                    .onChange(of: geometry.size.width) { _, width in updateColumns(width) }
+            }
+        }
+    }
+
+    private func listBoard(orderedIDs: [String]) -> some View {
+        LazyVStack(spacing: 0, pinnedViews: [.sectionHeaders]) {
+            ForEach(visibleGroups) { group in
+                Section {
+                    ForEach(group.stacks) { stack in
+                        row(stack, orderedIDs: orderedIDs)
+                        if workspace.expandedStackIDs.contains(stack.id), stack.isBurst {
+                            expansion(stack, compact: true)
+                                .padding(.horizontal, 10)
+                                .padding(.bottom, 8)
+                        }
+                        Divider().padding(.leading, 108)
+                    }
+                } header: {
+                    BoardGroupHeader(
+                        group: group,
+                        isCollapsed: workspace.collapsedGroupIDs.contains(group.id),
+                        onToggleCollapse: {
+                            workspace.setGroupCollapsed(group.id, collapsed: !workspace.collapsedGroupIDs.contains(group.id))
+                        },
+                        onSelect: {
+                            workspace.selectStacks(group.stacks.map(\.id))
+                            isFocused = true
+                        }
+                    )
+                }
+            }
+        }
+        .padding(.vertical, 8)
+    }
+
+    private func expansion(_ stack: OrganizeStack, compact: Bool = false) -> some View {
+        BurstExpansionView(
+            stack: stack,
+            frameSize: compact ? 96 : min(max(tileWidth * 0.5, 84), 132),
+            onOpenFrame: { onOpen(stack, $0) },
+            onCollapse: { workspace.setExpanded(stack.id, expanded: false) }
+        )
+        .id("\(stack.id)-expansion")
+    }
+
     private func tile(_ stack: OrganizeStack, orderedIDs: [String]) -> some View {
         let assigned = eventForStack(stack)
         return StackTileView(
@@ -404,27 +708,69 @@ struct OrganizeGrid<MenuContent: View>: View {
             originFolder: OrganizeFolderLabel.subfolder(
                 forFolderPath: stack.coverItem.primary.folderPath,
                 rootPath: rootPath
-            )
+            ),
+            onExpand: { workspace.setExpanded(stack.id, expanded: true) },
+            onPlay: { onOpen(stack, 0) },
+            onOpen: { onOpen(stack, 0) }
         )
         .id(stack.id)
         .onTapGesture {
-            isFocused = true
-            let flags = NSEvent.modifierFlags
-            workspace.select(
-                stackID: stack.id,
-                orderedIDs: orderedIDs,
-                extend: flags.contains(.shift),
-                toggle: flags.contains(.command)
-            )
+            select(stack, orderedIDs: orderedIDs)
         }
-        .simultaneousGesture(TapGesture(count: 2).onEnded { onOpen(stack) })
+        .simultaneousGesture(TapGesture(count: 2).onEnded { onOpen(stack, 0) })
         .draggable(workspace.dragPayload(for: stack.id, origin: origin, containerID: containerID)) {
-            let count = workspace.selectedStackIDs.contains(stack.id) ? workspace.selectedStackIDs.count : 1
-            Label("\(count) item\(count == 1 ? "" : "s")", systemImage: "photo.on.rectangle.angled")
-                .padding(8)
-                .background(.regularMaterial, in: Capsule())
+            dragPreview(for: stack)
         }
         .contextMenu { menu(stack) }
+    }
+
+    private func row(_ stack: OrganizeStack, orderedIDs: [String]) -> some View {
+        let assigned = eventForStack(stack)
+        return StackRowView(
+            stack: stack,
+            isSelected: workspace.selectedStackIDs.contains(stack.id),
+            isFocused: workspace.focusedStackID == stack.id,
+            isExpanded: workspace.expandedStackIDs.contains(stack.id),
+            event: assigned.event,
+            isPrivate: assigned.event.map { workspace.resolvedPolicy(for: $0) == .archiveOnly },
+            isMixed: assigned.mixed,
+            isDimmed: isDimmed(stack),
+            badge: badge(stack),
+            originFolder: OrganizeFolderLabel.title(
+                forFolderPath: stack.coverItem.primary.folderPath,
+                rootPath: rootPath
+            ),
+            onExpand: { workspace.toggleExpanded(stack.id) },
+            onPlay: { onOpen(stack, 0) },
+            onOpen: { onOpen(stack, 0) }
+        )
+        .id(stack.id)
+        .onTapGesture {
+            select(stack, orderedIDs: orderedIDs)
+        }
+        .simultaneousGesture(TapGesture(count: 2).onEnded { onOpen(stack, 0) })
+        .draggable(workspace.dragPayload(for: stack.id, origin: origin, containerID: containerID)) {
+            dragPreview(for: stack)
+        }
+        .contextMenu { menu(stack) }
+    }
+
+    private func select(_ stack: OrganizeStack, orderedIDs: [String]) {
+        isFocused = true
+        let flags = NSEvent.modifierFlags
+        workspace.select(
+            stackID: stack.id,
+            orderedIDs: orderedIDs,
+            extend: flags.contains(.shift),
+            toggle: flags.contains(.command)
+        )
+    }
+
+    private func dragPreview(for stack: OrganizeStack) -> some View {
+        let count = workspace.selectedStackIDs.contains(stack.id) ? workspace.selectedStackIDs.count : 1
+        return Label("\(count) item\(count == 1 ? "" : "s")", systemImage: "photo.on.rectangle.angled")
+            .padding(8)
+            .background(.regularMaterial, in: Capsule())
     }
 
     private func updateColumns(_ width: CGFloat) {
@@ -448,21 +794,41 @@ struct OrganizeGrid<MenuContent: View>: View {
             }
             return .handled
         }
+        let focusedStack = workspace.focusedStackID.flatMap { id in ordered.first { $0.id == id } }
         switch press.key {
-        case .leftArrow: return move(-1)
-        case .rightArrow: return move(1)
-        case .upArrow: return move(-columns)
-        case .downArrow: return move(columns)
+        case .leftArrow:
+            if mode == .list {
+                if let stack = focusedStack, workspace.expandedStackIDs.contains(stack.id) {
+                    workspace.setExpanded(stack.id, expanded: false)
+                }
+                return .handled
+            }
+            return move(-1)
+        case .rightArrow:
+            if mode == .list {
+                if let stack = focusedStack, stack.isBurst, !workspace.expandedStackIDs.contains(stack.id) {
+                    workspace.setExpanded(stack.id, expanded: true)
+                }
+                return .handled
+            }
+            return move(1)
+        case .upArrow: return mode == .list ? move(-1) : move(-columns)
+        case .downArrow: return mode == .list ? move(1) : move(columns)
         case .space:
-            if let id = workspace.focusedStackID ?? workspace.selectedStackIDs.first,
-               let stack = ordered.first(where: { $0.id == id }) {
-                onOpen(stack)
+            if let stack = focusedStack ?? workspace.selectedStackIDs.first.flatMap({ id in ordered.first { $0.id == id } }) {
+                onOpen(stack, 0)
             }
             return .handled
         case .escape:
             workspace.selectedStackIDs.removeAll()
             return .handled
         default:
+            // E toggles the focused burst's inline expansion.
+            if press.modifiers.isEmpty, press.characters.lowercased() == "e",
+               let stack = focusedStack, stack.isBurst {
+                workspace.toggleExpanded(stack.id)
+                return .handled
+            }
             return onKey(press, orderedIDs)
         }
     }
@@ -532,8 +898,14 @@ struct StackPreviewOverlay: View {
     /// Enables the right-click "Move to Trash" item on the frame and on each
     /// filmstrip thumbnail. Nil hides the menu entirely.
     var onTrashItems: (([OrganizeItem]) -> Void)? = nil
+    /// Frame the overlay opens on — inline expansions deep-link into a tap.
+    var initialFrameIndex: Int = 0
 
-    @State private var frameIndex = 0
+    @State private var frameIndex: Int
+    @State private var videoPlayer: AVPlayer?
+    /// nil = still checking, true = an AVPlayer is running, false = the codec
+    /// can't play in-app and the poster stays on screen.
+    @State private var videoPlayable: Bool?
     @State private var image: CGImage?
     /// Path of the frame a high-resolution decode was requested for — set the
     /// moment zoom passes fit so a stale frame never triggers a fetch.
@@ -543,6 +915,29 @@ struct StackPreviewOverlay: View {
     @State private var failed = false
     @State private var zoomCommand: PreviewZoomCommand?
     @FocusState private var isFocused: Bool
+
+    init(
+        stacks: [OrganizeStack],
+        stackID: Binding<String?>,
+        quickEvents: [SavedCameraEvent],
+        rootPath: String? = nil,
+        initialFrameIndex: Int = 0,
+        eventForStack: @escaping (OrganizeStack) -> SavedCameraEvent?,
+        onAssign: @escaping (OrganizeStack, SavedCameraEvent) -> Void,
+        isPrivate: @escaping (SavedCameraEvent) -> Bool = { $0.resolvedStoragePolicy == .archiveOnly },
+        onTrashItems: (([OrganizeItem]) -> Void)? = nil
+    ) {
+        self.stacks = stacks
+        _stackID = stackID
+        self.quickEvents = quickEvents
+        self.rootPath = rootPath
+        self.initialFrameIndex = initialFrameIndex
+        self.eventForStack = eventForStack
+        self.onAssign = onAssign
+        self.isPrivate = isPrivate
+        self.onTrashItems = onTrashItems
+        _frameIndex = State(initialValue: initialFrameIndex)
+    }
 
     private var stackIndex: Int? { stacks.firstIndex { $0.id == stackID } }
     private var stack: OrganizeStack? { stackIndex.map { stacks[$0] } }
@@ -563,6 +958,11 @@ struct StackPreviewOverlay: View {
     }
 
     private var hintText: String {
+        if item?.kind == .video {
+            var text = "Space play/pause · ↑ ↓ items · 1–9 sort · O open"
+            if onTrashItems != nil { text += " · right-click trash" }
+            return text + " · Esc close"
+        }
         var text = "← → frames · ↑ ↓ items · click zoom · drag pan · + − 0 zoom · 1–9 sort · O open"
         if onTrashItems != nil { text += " · right-click trash" }
         return text + " · Esc close"
@@ -574,22 +974,28 @@ struct StackPreviewOverlay: View {
             if let stack, let item {
                 VStack(spacing: 10) {
                     header(stack: stack, item: item)
-                    InteractivePreviewCanvas(
-                        image: displayImage?.image,
-                        isLoading: !failed,
-                        imageScale: displayImage?.scale ?? 1,
-                        unavailableTitle: "No Preview",
-                        unavailableDescription: "Camera Toolkit could not decode a preview for this file.",
-                        zoomCommand: $zoomCommand,
-                        onZoomChange: { zoom in
-                            if zoom > 1.5 {
-                                hiResRequestPath = item.primary.path
-                            }
+                    Group {
+                        if item.kind == .video {
+                            videoPane(item)
+                        } else {
+                            InteractivePreviewCanvas(
+                                image: displayImage?.image,
+                                isLoading: !failed,
+                                imageScale: displayImage?.scale ?? 1,
+                                unavailableTitle: "No Preview",
+                                unavailableDescription: "Camera Toolkit could not decode a preview for this file.",
+                                zoomCommand: $zoomCommand,
+                                onZoomChange: { zoom in
+                                    if zoom > 1.5 {
+                                        hiResRequestPath = item.primary.path
+                                    }
+                                }
+                            )
+                            .contextMenu { frameContextMenu(item) }
                         }
-                    )
+                    }
                     .id(item.primary.path)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .contextMenu { frameContextMenu(item) }
                     if stack.items.count > 1 {
                         filmstrip(stack)
                     }
@@ -665,6 +1071,49 @@ struct StackPreviewOverlay: View {
         }
     }
 
+    /// Real playback via AVKit — a playable clip gets the standard player
+    /// chrome; a codec AVFoundation can't open keeps its poster with a note.
+    private func videoPane(_ item: OrganizeItem) -> some View {
+        ZStack {
+            Color.black
+            if let image {
+                Image(decorative: image, scale: 1)
+                    .resizable()
+                    .scaledToFit()
+                    .opacity(videoPlayer == nil ? 1 : 0)
+            }
+            if let videoPlayer {
+                VideoPlayer(player: videoPlayer)
+            } else if videoPlayable == false {
+                VStack(spacing: 10) {
+                    Image(systemName: "video.slash")
+                        .font(.system(size: 30))
+                        .foregroundStyle(.white.opacity(0.7))
+                    Text("This clip can't play in-app.")
+                        .foregroundStyle(.white.opacity(0.8))
+                    HStack(spacing: 12) {
+                        Button("Reveal in Finder") {
+                            NSWorkspace.shared.activateFileViewerSelecting([item.primary.url])
+                        }
+                        Button("Open") {
+                            PhotomatorLauncher.open(item.files.map(\.url))
+                        }
+                    }
+                    .foregroundStyle(.white)
+                }
+                .padding(24)
+                .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            } else {
+                ProgressView()
+                    .tint(.white)
+            }
+        }
+        .contextMenu { frameContextMenu(item) }
+        .onDisappear {
+            videoPlayer?.pause()
+        }
+    }
+
     private func filmstrip(_ stack: OrganizeStack) -> some View {
         ScrollViewReader { proxy in
             ScrollView(.horizontal, showsIndicators: false) {
@@ -701,8 +1150,23 @@ struct StackPreviewOverlay: View {
 
     private func handle(_ press: KeyPress) -> KeyPress.Result {
         // Close always works, even if the stack vanished under us.
-        if press.key == .escape || press.key == .space {
+        if press.key == .escape {
             stackID = nil
+            return .handled
+        }
+        if press.key == .space {
+            if item?.kind == .video {
+                // Space plays/pauses instead of closing the video preview.
+                if let videoPlayer {
+                    if videoPlayer.timeControlStatus == .playing {
+                        videoPlayer.pause()
+                    } else {
+                        videoPlayer.play()
+                    }
+                }
+            } else {
+                stackID = nil
+            }
             return .handled
         }
         guard let stack, let index = stackIndex else { return .ignored }
@@ -757,6 +1221,22 @@ struct StackPreviewOverlay: View {
     private func load() async {
         guard let url = item?.primary.url else { return }
         failed = false
+        videoPlayer?.pause()
+        videoPlayer = nil
+        videoPlayable = nil
+        if item?.kind == .video {
+            // Check playability before handing AVPlayer the file so an
+            // unplayable codec keeps its poster instead of a dead spinner.
+            let asset = AVURLAsset(url: url)
+            let playable = (try? await asset.load(.isPlayable)) ?? false
+            guard !Task.isCancelled else { return }
+            videoPlayable = playable
+            if playable {
+                let player = AVPlayer(playerItem: AVPlayerItem(asset: asset))
+                videoPlayer = player
+                player.play()
+            }
+        }
         if let full = TileImageLoader.shared.cachedImage(for: url, maximumPixelSize: 2_400) {
             image = full
         } else {

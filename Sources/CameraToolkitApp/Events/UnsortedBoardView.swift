@@ -10,7 +10,11 @@ struct UnsortedBoardView: View {
 
     @AppStorage("CameraToolkit.organize.tileWidth") private var tileWidth: Double = 220
     @AppStorage("CameraToolkit.organize.hideSorted") private var hideSorted = false
+    @AppStorage("CameraToolkit.organize.mode") private var boardMode: OrganizeBoardMode = .tiles
+    @AppStorage("CameraToolkit.organize.grouping") private var grouping: OrganizeBoardGrouping = .day
+    @AppStorage("CameraToolkit.organize.order") private var sortOrder: OrganizeBoardOrder = .oldestFirst
     @State private var previewStackID: String?
+    @State private var previewFrameIndex = 0
     @State private var searchQuery = ""
     @FocusState private var searchFocused: Bool
 
@@ -18,10 +22,29 @@ struct UnsortedBoardView: View {
         workspace.sources[location.id] ?? UnsortedSourceState()
     }
 
+    private var groups: [OrganizeBoardGroup] {
+        guard let result = state.result else { return [] }
+        return OrganizeBoardPlan.groups(
+            for: workspace.visibleStacks(result, hideSorted: hideSorted, matching: searchQuery),
+            grouping: grouping,
+            order: sortOrder,
+            rootPath: result.rootPath,
+            eventBucket: { workspace.eventBucket(for: $0) }
+        )
+    }
+
+    /// Stacks in display order — collapsed groups contribute nothing, so
+    /// selection ranges, keyboard focus, and the preview follow what the
+    /// owner actually sees.
+    private var orderedStacks: [OrganizeStack] {
+        groups
+            .filter { !workspace.collapsedGroupIDs.contains($0.id) }
+            .flatMap(\.stacks)
+    }
+
     var body: some View {
         let result = state.result
-        let days = result.map { workspace.visibleDays($0, hideSorted: hideSorted, matching: searchQuery) } ?? []
-        let ordered = days.flatMap(\.stacks)
+        let ordered = orderedStacks
         let searching = !OrganizeSearch.needle(searchQuery).isEmpty
 
         VStack(spacing: 0) {
@@ -31,7 +54,7 @@ struct UnsortedBoardView: View {
                 assignBar(orderedIDs: ordered.map(\.id))
                     .guideHighlight(.assignBar, in: workspace)
                 Divider()
-                if days.isEmpty {
+                if groups.isEmpty {
                     ContentUnavailableView(
                         searching ? "No Matches" : (hideSorted ? "Everything here is sorted" : "No photos or videos"),
                         systemImage: searching ? "magnifyingglass" : (hideSorted ? "checkmark.circle" : "photo"),
@@ -43,7 +66,7 @@ struct UnsortedBoardView: View {
                     )
                     .frame(maxHeight: .infinity)
                 } else {
-                    grid(days)
+                    board()
                         .guideHighlight(.grid, in: workspace)
                 }
                 Divider()
@@ -63,7 +86,7 @@ struct UnsortedBoardView: View {
                 ProgressView()
                     .frame(maxHeight: .infinity)
             }
-            OrganizeStatusLine(model: model)
+            OrganizeStatusLine(model: model, workspace: workspace)
         }
         .overlay {
             if previewStackID != nil {
@@ -72,6 +95,7 @@ struct UnsortedBoardView: View {
                     stackID: $previewStackID,
                     quickEvents: workspace.quickEvents,
                     rootPath: result?.rootPath,
+                    initialFrameIndex: previewFrameIndex,
                     eventForStack: { workspace.assignedEvent(for: $0).event },
                     onAssign: { stack, event in
                         workspace.assign(stackIDs: [stack.id], from: location.id, to: event.id)
@@ -144,9 +168,48 @@ struct UnsortedBoardView: View {
             Toggle("Hide Sorted", isOn: $hideSorted)
                 .toggleStyle(.switch)
                 .controlSize(.small)
-            Slider(value: $tileWidth, in: 140...460)
-                .frame(width: 120)
-                .help("Tile size")
+            Picker("View", selection: $boardMode) {
+                ForEach(OrganizeBoardMode.allCases) { mode in
+                    Image(systemName: mode.symbol).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(width: 64)
+            .help("Tiles or a dense list")
+            Menu {
+                Section("Group By") {
+                    ForEach(OrganizeBoardGrouping.allCases) { option in
+                        Toggle(option.title, isOn: Binding(
+                            get: { grouping == option },
+                            set: { _ in grouping = option }
+                        ))
+                    }
+                }
+                Section("Order") {
+                    ForEach(OrganizeBoardOrder.allCases) { option in
+                        Toggle(option.title, isOn: Binding(
+                            get: { sortOrder == option },
+                            set: { _ in sortOrder = option }
+                        ))
+                    }
+                }
+                Divider()
+                let anyCollapsed = groups.contains { workspace.collapsedGroupIDs.contains($0.id) }
+                Button(anyCollapsed ? "Expand All Groups" : "Collapse All Groups") {
+                    workspace.setAllGroupsCollapsed(!anyCollapsed, groups: groups)
+                }
+            } label: {
+                Image(systemName: "arrow.up.arrow.down.square")
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .help("Group, sort, and collapse the board")
+            if boardMode == .tiles {
+                Slider(value: $tileWidth, in: 88...460)
+                    .frame(width: 110)
+                    .help("Tile size — smaller fits more bursts on screen")
+            }
             Button {
                 workspace.scan(location, force: true)
             } label: {
@@ -244,27 +307,31 @@ struct UnsortedBoardView: View {
         }
     }
 
-    private func grid(_ days: [OrganizeDay]) -> some View {
+    private func board() -> some View {
         OrganizeGrid(
             workspace: workspace,
-            days: days,
+            groups: groups,
+            mode: boardMode,
             tileWidth: tileWidth,
             origin: .unsorted,
             containerID: location.id,
             rootPath: state.result?.rootPath,
-            daySubtitle: { day in
-                "\(day.stacks.count) items · \(day.frameCount) frames · \(day.byteCount.formattedBytes)"
-            },
             eventForStack: { workspace.assignedEvent(for: $0) },
             isDimmed: { !hideSorted && workspace.isSorted($0) && !workspace.selectedStackIDs.contains($0.id) },
             badge: { _ in nil },
-            onOpen: { stack in
+            onOpen: { stack, frame in
                 workspace.select(stackID: stack.id, orderedIDs: [], extend: false, toggle: false)
+                previewFrameIndex = frame
                 previewStackID = stack.id
             },
             onKey: { press, orderedIDs in handleKey(press, orderedIDs: orderedIDs) },
             menu: { stack in contextMenu(stack) }
         )
+    }
+
+    private func openPreview(_ stackID: String, frame: Int = 0) {
+        previewFrameIndex = frame
+        previewStackID = stackID
     }
 
     @ViewBuilder
@@ -287,7 +354,7 @@ struct UnsortedBoardView: View {
             workspace.unassign(stackIDs: targets, from: location.id)
         }
         Divider()
-        Button("Preview") { previewStackID = stack.id }
+        Button("Preview") { openPreview(stack.id) }
         Button("Open in Photomator") {
             PhotomatorLauncher.open(urls(for: targets))
         }
@@ -312,7 +379,7 @@ struct UnsortedBoardView: View {
                 .foregroundStyle(sorted.files > 0 ? Color.accentColor : .secondary)
             Text(sorted.files > 0
                 ? "\(sorted.files) sorted file\(sorted.files == 1 ? "" : "s") (\(sorted.bytes.formattedBytes)) still in \(location.name). Nothing moves until you press Apply."
-                : "Select items, then press 1–9, drag onto an event, or press N for a new event. Space previews a burst.")
+                : "Select items, then press 1–9, drag onto an event, or press N for a new event. Space previews a burst, E or the count badge expands it in place.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .lineLimit(2)
@@ -377,7 +444,9 @@ struct UnsortedBoardView: View {
         case .selectAll:
             workspace.selectStacks(ordered.map(\.id))
         case .previewSelection:
-            previewStackID = workspace.focusedStackID ?? workspace.selectedStackIDs.first
+            if let id = workspace.focusedStackID ?? workspace.selectedStackIDs.first {
+                openPreview(id)
+            }
         case .openSelection:
             PhotomatorLauncher.open(urls(for: workspace.targetStackIDs()))
         case .revealSelection:
