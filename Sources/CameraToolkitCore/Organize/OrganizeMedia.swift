@@ -265,6 +265,24 @@ public struct OrganizeDay: Identifiable, Hashable, Sendable {
     public var byteCount: Int64 { stacks.reduce(Int64(0)) { $0 + $1.byteCount } }
 }
 
+/// A manual burst split: frames the user pulled out of an automatically
+/// grouped burst into a stack of their own. Persisted in `AppConfiguration`
+/// so a rescan keeps the frames apart instead of letting the grouper join
+/// them again. Member paths that no longer appear in a scan are ignored, so
+/// a split goes stale harmlessly once its files move away for good.
+public struct BurstSplit: Codable, Equatable, Hashable, Sendable {
+    public var id: UUID
+    public var createdAt: Date
+    /// `OrganizeFile.pathKey` of each member frame's primary file.
+    public var memberPathKeys: [String]
+
+    public init(id: UUID = UUID(), createdAt: Date = Date(), memberPathKeys: [String]) {
+        self.id = id
+        self.createdAt = createdAt
+        self.memberPathKeys = memberPathKeys
+    }
+}
+
 public enum OrganizeStacker {
     /// Groups items into bursts and singles.
     ///
@@ -276,10 +294,15 @@ public enum OrganizeStacker {
     /// `BurstVisualLinker`) cleared the pair; longer gaps never link. Chains
     /// smaller than `minimumGroupSize` split back into singles. Video never
     /// stacks.
+    ///
+    /// `splits` are manual overrides applied after grouping: each one pulls
+    /// its member frames out of whatever group they landed in — prefix-
+    /// trusted bursts included — and pins them into their own stack.
     public static func stacks(
         for items: [OrganizeItem],
         configuration: BurstGroupingConfiguration = BurstGroupingConfiguration(),
-        visualLinks: Set<BurstVisualLink> = []
+        visualLinks: Set<BurstVisualLink> = [],
+        splits: [BurstSplit] = []
     ) -> [OrganizeStack] {
         var groups: [[OrganizeItem]] = []
         for sorted in sortedItemsByFolder(items) {
@@ -307,12 +330,39 @@ public enum OrganizeStacker {
             }
         }
 
-        return groups
+        return applyingSplits(splits, to: groups)
             .map { OrganizeStack(items: $0.sorted(by: capturedBefore)) }
             .sorted { lhs, rhs in
                 if lhs.captureDate != rhs.captureDate { return lhs.captureDate < rhs.captureDate }
                 return lhs.id < rhs.id
             }
+    }
+
+    /// Pulls each split's member frames out of their computed group and pins
+    /// them into a new group, in the order the splits were made — a pinned
+    /// group re-enters `rest`, so a later split can carve frames out of an
+    /// earlier split's burst. Members absent from `groups` are ignored and
+    /// emptied groups drop out. Pinned groups ignore `minimumGroupSize` on
+    /// purpose: the user asked for exactly these frames together.
+    static func applyingSplits(_ splits: [BurstSplit], to groups: [[OrganizeItem]]) -> [[OrganizeItem]] {
+        guard !splits.isEmpty else { return groups }
+        var rest = groups
+        for split in splits {
+            let keys = Set(split.memberPathKeys)
+            guard !keys.isEmpty else { continue }
+            var pulled: [OrganizeItem] = []
+            for index in rest.indices {
+                let group = rest[index]
+                guard group.contains(where: { keys.contains($0.primary.pathKey) }) else { continue }
+                pulled.append(contentsOf: group.filter { keys.contains($0.primary.pathKey) })
+                rest[index] = group.filter { !keys.contains($0.primary.pathKey) }
+            }
+            rest.removeAll { $0.isEmpty }
+            if !pulled.isEmpty {
+                rest.append(pulled.sorted(by: capturedBefore))
+            }
+        }
+        return rest
     }
 
     public static func days(for stacks: [OrganizeStack], calendar: Calendar = .current) -> [OrganizeDay] {

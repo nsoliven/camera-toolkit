@@ -82,6 +82,9 @@ struct UnsortedBoardView: View {
                     },
                     onTrashItems: { items in
                         workspace.trashItems(items, from: location.id)
+                    },
+                    onSplitItems: { items in
+                        workspace.splitItems(items)
                     }
                 )
             }

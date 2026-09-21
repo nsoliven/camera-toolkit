@@ -28,6 +28,9 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
     /// before and while they are archived. Empty means a hidden
     /// `.Camera Toolkit/Private` folder beside the Buffer on the same drive.
     public var privateStagingPath: String
+    /// Manual burst splits made on the organize boards. Restacking honors
+    /// them so a rescan never glues separated frames back together.
+    public var burstSplits: [BurstSplit]
 
     public init(
         demoRootPath: String,
@@ -53,7 +56,8 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         savedEvents: [SavedCameraEvent] = [],
         selectedEventID: UUID? = nil,
         photoEventAssignments: [PhotoEventAssignment] = [],
-        privateStagingPath: String = ""
+        privateStagingPath: String = "",
+        burstSplits: [BurstSplit] = []
     ) {
         self.demoRootPath = demoRootPath
         self.importSourcePath = importSourcePath
@@ -79,6 +83,7 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         self.selectedEventID = selectedEventID
         self.photoEventAssignments = photoEventAssignments
         self.privateStagingPath = privateStagingPath
+        self.burstSplits = burstSplits
         self.normalizeLocationSelections()
         self.normalizeEventSelection()
     }
@@ -108,6 +113,7 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         case selectedEventID
         case photoEventAssignments
         case privateStagingPath
+        case burstSplits
     }
 
     public init(from decoder: Decoder) throws {
@@ -143,6 +149,7 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         selectedEventID = try values.decodeIfPresent(UUID.self, forKey: .selectedEventID)
         photoEventAssignments = try values.decodeIfPresent([PhotoEventAssignment].self, forKey: .photoEventAssignments) ?? []
         privateStagingPath = try values.decodeIfPresent(String.self, forKey: .privateStagingPath) ?? ""
+        burstSplits = try values.decodeIfPresent([BurstSplit].self, forKey: .burstSplits) ?? []
         normalizeLocationSelections()
         normalizeEventSelection()
     }
