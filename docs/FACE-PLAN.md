@@ -17,7 +17,7 @@ Hardware: **M4 Max**. Library scale: ~**20k photos** first, grows. People they c
 - ArcFace is fine. Frozen. Never fine-tune on 20 people.
 - Unnamed people should still be **grouped** (Immich-style) so they can grab a whole cluster and name/merge it.
 - Confirmed labels are **trusted**. Do not reclassify them. Ever.
-- Default must **not** pin the GPU. FAST is a throttle, not a quality tier.
+- FAST **on** pins the Mac. FAST **off** is the quiet pass. Not a quality tier.
 - First ingest can be rough. After they name people, cheap passes should get good because the gallery exists.
 - They will review when they want: roster, new groups, unsure. Don’t mark unreviewed work as “accepted quality.”
 - Keep the writeup short in product. No model names in the UI.
@@ -41,9 +41,9 @@ Old files are not touched unless the user hits **Rescan**.
 
 How hard we search for **real, reasonably large faces**, and how many extra views we harvest. Same identity model every time.
 
-### 2. Throttle — `FAST` on/off
+### 2. Speed — `FAST` on/off
 
-Caps GPU / batch / concurrency. Same models. Default **ON** for auto-ingest. User can put FAST on HIGH or XHIGH if they want overnight-but-quiet. FAST is not a fifth quality.
+**ON** pins the Mac (max workers, runs hot). **OFF** is the quiet 2-wide pass. Same models. Default **ON**. FAST is not a fifth quality. Quiet overnight = High with FAST off.
 
 Auto ingest = **LOW + FAST**.
 
@@ -162,7 +162,7 @@ Unplug = pause. Replug = resume hashes.
 2. LOW: Vision → R50 → SQLite. Match roster if templates exist, else cluster all (including Others). Event chips for named only.
 3. Name/merge UI + confirmed lock. This is what makes LOW good.
 4. MED: SCRFD-10G, min-size ~40px, process new + lower-grade + unreviewed proposed.
-5. FAST throttle on the runner (batch/concurrency cap).
+5. FAST on = pin the runner; off = 2-wide quiet pass.
 6. HIGH / XHIGH: extra scale, video fps, TTA, template mining. Same R50.
 7. Rescan + before/after.
 

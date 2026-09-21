@@ -502,9 +502,9 @@ final class FaceIndexTests: XCTestCase {
         XCTAssertEqual(high.videoFrameStride, 1)
         XCTAssertTrue(high.scansVideo)
 
-        // FAST caps concurrency without changing the models.
-        XCTAssertEqual(FaceScanOptions(mode: .med, fast: true).concurrency, 2)
-        XCTAssertGreaterThan(FaceScanOptions(mode: .med, fast: false).concurrency, 2)
+        // FAST pins the Mac; off is the quiet two-wide pass.
+        XCTAssertGreaterThan(FaceScanOptions(mode: .med, fast: true).concurrency, 2)
+        XCTAssertEqual(FaceScanOptions(mode: .med, fast: false).concurrency, 2)
 
         // XHIGH runs the HIGH pipeline and stamps high — not itself.
         XCTAssertEqual(FaceScanOptions.implementedGrade, .high)

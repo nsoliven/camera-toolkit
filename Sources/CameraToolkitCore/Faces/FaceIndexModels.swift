@@ -217,10 +217,10 @@ public enum FaceDetectorKind: String, Codable, Sendable {
 }
 
 /// Options for one face scan pass. `mode` is the quality knob; `fast`
-/// is the throttle — it only caps concurrency, never changes the models.
+/// pins the Mac (max workers). Off keeps a quiet 2-wide pass. Same models.
 public struct FaceScanOptions: Equatable, Sendable {
     public var mode: FaceScanGrade
-    /// FAST: caps worker concurrency. Default ON per the plan.
+    /// FAST: use as many workers as the machine has. Default ON.
     public var fast: Bool
     /// Minimum face size in the photo's own pixels. LOW keeps large, clear
     /// faces only; MED ~40px; HIGH ~30px — still a real face, not tourists.
@@ -329,8 +329,11 @@ public struct FaceScanOptions: Equatable, Sendable {
     }
 
     /// Worker width for the decode/detect/embed stage.
+    /// Fast = pin the machine. Off = two workers so the Mac stays cool.
     public var concurrency: Int {
-        fast ? 2 : min(6, ProcessInfo.processInfo.activeProcessorCount)
+        fast
+            ? max(2, ProcessInfo.processInfo.activeProcessorCount)
+            : 2
     }
 }
 
