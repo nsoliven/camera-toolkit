@@ -206,6 +206,7 @@ final class FaceIndexTests: XCTestCase {
 
         // HIGH and above still walk every frame.
         XCTAssertEqual(FaceIndexService.scanTargets(for: [burst], mode: .high).count, 80)
+        XCTAssertEqual(FaceIndexService.scanTargets(for: [burst], mode: .xhigh).count, 80)
     }
 
     func testScanTargetsSinglesVideosAndCorruptFrames() {
@@ -501,13 +502,28 @@ final class FaceIndexTests: XCTestCase {
         XCTAssertEqual(high.detectorScales, [640, 960])
         XCTAssertEqual(high.videoFrameStride, 1)
         XCTAssertTrue(high.scansVideo)
+        XCTAssertFalse(high.flipTTA)
+        XCTAssertFalse(high.rebuildTemplates)
+
+        let xhigh = FaceScanOptions(mode: .xhigh)
+        XCTAssertEqual(xhigh.detectorKind, .scrfd)
+        XCTAssertEqual(xhigh.minimumFacePixels, 30)
+        XCTAssertEqual(xhigh.detectorScales, [640, 960, 1024])
+        XCTAssertEqual(xhigh.videoFrameStride, 0.5)
+        XCTAssertTrue(xhigh.scansVideo)
+        XCTAssertTrue(xhigh.flipTTA)
+        XCTAssertTrue(xhigh.rebuildTemplates)
+        XCTAssertEqual(xhigh.templateCap, 15)
+        // The larger detector package stays opt-in.
+        XCTAssertFalse(xhigh.usesLargeDetector)
 
         // FAST pins the Mac; off is the quiet two-wide pass.
         XCTAssertGreaterThan(FaceScanOptions(mode: .med, fast: true).concurrency, 2)
         XCTAssertEqual(FaceScanOptions(mode: .med, fast: false).concurrency, 2)
 
-        // XHIGH runs the HIGH pipeline and stamps high — not itself.
-        XCTAssertEqual(FaceScanOptions.implementedGrade, .high)
+        // Every pipeline through XHIGH is implemented — a request stamps
+        // itself so a repeat pass skips the photo.
+        XCTAssertEqual(FaceScanOptions.implementedGrade, .xhigh)
     }
 
     func testScanSkipsByRecordedGrade() throws {
@@ -553,13 +569,17 @@ final class FaceIndexTests: XCTestCase {
             report = try service.scan(items: [item], embedder: StubEmbedder(), detector: detector)
             XCTAssertEqual(report.photosSkipped, 1)
 
-            // An XHIGH request runs the HIGH pipeline and stamps .high — so
-            // it is not skipped on the next XHIGH request, and never marks
-            // the photo as scanned at a grade nothing implemented.
+            // XHIGH re-runs (high does not cover xhigh) and stamps .xhigh.
             service = FaceIndexService(catalogURL: catalog, options: FaceScanOptions(mode: .xhigh))
             report = try service.scan(items: [item], embedder: StubEmbedder(), detector: detector)
-            XCTAssertEqual(report.photosSkipped, 0)
-            XCTAssertEqual(try store.photos(pathKeys: [item.primary.pathKey])[item.primary.pathKey]?.scanGrade, .high)
+            XCTAssertEqual(report.photosProcessed, 1)
+            XCTAssertEqual(try store.photos(pathKeys: [item.primary.pathKey])[item.primary.pathKey]?.scanGrade, .xhigh)
+
+            // A repeat XHIGH request is covered and skipped — nothing
+            // outranks xhigh, so the photo is done.
+            report = try service.scan(items: [item], embedder: StubEmbedder(), detector: detector)
+            XCTAssertEqual(report.photosSkipped, 1)
+            XCTAssertEqual(report.photosProcessed, 0)
         }
     }
 
@@ -649,6 +669,23 @@ final class FaceIndexTests: XCTestCase {
                 try store.photos(pathKeys: [item.primary.pathKey])[item.primary.pathKey]?.scanGrade,
                 .high
             )
+
+            // XHIGH re-runs one more time — the confirmed face is still
+            // frozen, its overlap is still deduplicated, and the photo now
+            // stamps xhigh so every later mode skips it.
+            let xhighService = FaceIndexService(catalogURL: catalog, options: FaceScanOptions(mode: .xhigh))
+            report = try xhighService.scan(items: [item], embedder: StubEmbedder(), detector: detector)
+            XCTAssertEqual(report.photosProcessed, 1)
+            XCTAssertEqual(try store.face(id: detected.id)?.state, .confirmed)
+            XCTAssertEqual(try store.face(id: detected.id)?.personID, dad.id)
+            XCTAssertEqual(try store.faces(photoID: item.primary.pathKey).count, 2)
+            XCTAssertEqual(
+                try store.photos(pathKeys: [item.primary.pathKey])[item.primary.pathKey]?.scanGrade,
+                .xhigh
+            )
+            report = try xhighService.scan(items: [item], embedder: StubEmbedder(), detector: detector)
+            XCTAssertEqual(report.photosSkipped, 1)
+            XCTAssertEqual(report.photosProcessed, 0)
         }
     }
 
@@ -768,7 +805,7 @@ final class FaceIndexTests: XCTestCase {
 
         var scores8 = [Float](repeating: 0.01, count: anchors8)
         var boxes8 = [Float](repeating: 0, count: anchors8 * 4)
-        var kpss8 = [Float](repeating: 0, count: anchors8 * 10)
+        let kpss8 = [Float](repeating: 0, count: anchors8 * 10)
         // One hot anchor at cell (row 10, col 20), k = 0.
         let anchor = (10 * 80 + 20) * 2
         scores8[anchor] = 0.9
@@ -839,6 +876,11 @@ final class FaceIndexTests: XCTestCase {
             FaceVideoSampler.sampleTimes(duration: 5.5, stride: 1, maxFrames: .max),
             [0.5, 1.5, 2.5, 3.5, 4.5]
         )
+        // XHIGH: ~2 fps.
+        XCTAssertEqual(
+            FaceVideoSampler.sampleTimes(duration: 2.4, stride: 0.5, maxFrames: .max),
+            [0.25, 0.75, 1.25, 1.75, 2.25]
+        )
         // A clip shorter than the stride still contributes one mid frame.
         XCTAssertEqual(
             FaceVideoSampler.sampleTimes(duration: 10, stride: 30, maxFrames: 12),
@@ -847,6 +889,234 @@ final class FaceIndexTests: XCTestCase {
         // The cap is respected on long clips.
         XCTAssertEqual(FaceVideoSampler.sampleTimes(duration: 600, stride: 30, maxFrames: 12).count, 12)
         XCTAssertTrue(FaceVideoSampler.sampleTimes(duration: 0, stride: 30, maxFrames: 12).isEmpty)
+    }
+
+    // MARK: - XHIGH extras
+
+    func testXHighScansEveryBurstMember() throws {
+        try withTemporaryDirectory { root in
+            let catalog = root.appendingPathComponent("catalog.sqlite")
+            _ = try CatalogStore(url: catalog).bootstrap(
+                configuration: faceTestConfiguration(root: root, catalog: catalog),
+                createBackup: false,
+                createLibraryFolders: false
+            )
+            var items: [OrganizeItem] = []
+            for index in 1...4 {
+                let url = root.appendingPathComponent("card/B0002_DSC000\(index).JPG")
+                try writeJPEG(url, seed: UInt8(index))
+                items.append(try organizeItem(forFileAt: url))
+            }
+            let stacks = [OrganizeStack(items: items)]
+            let store = FaceIndexStore(url: catalog)
+            let detector = StubDetector(detections: [])
+
+            // MED samples first/middle/last and covers the rest…
+            let medService = FaceIndexService(catalogURL: catalog, options: FaceScanOptions(mode: .med))
+            var report = try medService.scan(
+                items: items, embedder: StubEmbedder(), detector: detector, stacks: stacks
+            )
+            XCTAssertEqual(report.photosProcessed, 3)
+            XCTAssertEqual(report.photosBurstCovered, 1)
+
+            // …but XHIGH walks every burst still — no covered members.
+            let xhighService = FaceIndexService(catalogURL: catalog, options: FaceScanOptions(mode: .xhigh))
+            report = try xhighService.scan(
+                items: items, embedder: StubEmbedder(), detector: detector, stacks: stacks
+            )
+            XCTAssertEqual(report.photosProcessed, 4)
+            XCTAssertEqual(report.photosBurstCovered, 0)
+            for item in items {
+                XCTAssertEqual(
+                    try store.photos(pathKeys: [item.primary.pathKey])[item.primary.pathKey]?.scanGrade,
+                    .xhigh
+                )
+            }
+        }
+    }
+
+    func testXHighFlipTTAEmbedsMirroredSecondView() throws {
+        try withTemporaryDirectory { root in
+            let catalog = root.appendingPathComponent("catalog.sqlite")
+            _ = try CatalogStore(url: catalog).bootstrap(
+                configuration: faceTestConfiguration(root: root, catalog: catalog),
+                createBackup: false,
+                createLibraryFolders: false
+            )
+            let jpegURL = root.appendingPathComponent("card/DSC00021.JPG")
+            try writeJPEG(jpegURL, seed: 6)
+            let item = try organizeItem(forFileAt: jpegURL)
+            let detector = StubDetector(detections: [
+                DetectedFace(
+                    boundingBox: CGRect(x: 0.2, y: 0.2, width: 0.3, height: 0.3),
+                    confidence: 0.9,
+                    landmarks: nil
+                ),
+            ])
+
+            // HIGH embeds the aligned crop once per face.
+            let plainEmbedder = CountingEmbedder()
+            var service = FaceIndexService(catalogURL: catalog, options: FaceScanOptions(mode: .high))
+            var report = try service.scan(items: [item], embedder: plainEmbedder, detector: detector)
+            XCTAssertEqual(report.facesDetected, 1)
+            XCTAssertEqual(plainEmbedder.calls, 1)
+
+            // XHIGH embeds the crop and its mirror; the stored vector is
+            // the L2-normalized mean of the two views.
+            let first = testEmbedding(seed: 5)
+            let second = testEmbedding(seed: 6)
+            let flipEmbedder = AlternatingEmbedder(vectors: [first, second])
+            service = FaceIndexService(catalogURL: catalog, options: FaceScanOptions(mode: .xhigh))
+            report = try service.scan(items: [item], embedder: flipEmbedder, detector: detector)
+            XCTAssertEqual(report.facesDetected, 1)
+            XCTAssertEqual(flipEmbedder.calls, 2)
+
+            let stored = try XCTUnwrap(
+                FaceIndexStore(url: catalog).faces(photoID: item.primary.pathKey).first
+            )
+            let expected = try XCTUnwrap(FaceEmbeddingMath.centroid([first, second]))
+            XCTAssertGreaterThan(
+                FaceEmbeddingMath.cosine(try XCTUnwrap(stored.embedding), expected),
+                0.999
+            )
+            // And the photo now carries the real grade — xhigh itself.
+            XCTAssertEqual(
+                try FaceIndexStore(url: catalog)
+                    .photos(pathKeys: [item.primary.pathKey])[item.primary.pathKey]?.scanGrade,
+                .xhigh
+            )
+        }
+    }
+
+    func testXHighRebuildsRosterTemplatesFromConfirmedFaces() throws {
+        try withFaceStore { store, catalog in
+            let dad = try store.createPerson(name: "Dad", isRoster: true)
+            // Confirmed faces across photos split between two
+            // near-orthogonal "views". One photo holds two confirmed faces
+            // — only its best may become a template.
+            let viewA = testEmbedding(seed: 1)
+            let viewB = testEmbedding(seed: 2)
+            var expectedPhotos: Set<String> = []
+            for index in 0..<3 {
+                let photo = photoRecord("VA_\(index).JPG")
+                var faces = [
+                    faceRecord(
+                        photo,
+                        detScore: 0.9 - Double(index) * 0.05,
+                        embedding: testEmbedding(seed: 1, noise: Float(index) * 0.03),
+                        state: .confirmed,
+                        personID: dad.id
+                    ),
+                ]
+                if index == 0 {
+                    // A second confirmed face on the same photo — a valid
+                    // face but never a second template for that photo.
+                    faces.append(faceRecord(
+                        photo,
+                        box: NormalizedFaceBox(x: 0.5, y: 0.5, width: 0.2, height: 0.2),
+                        detScore: 0.5,
+                        embedding: testEmbedding(seed: 1, noise: 0.5),
+                        state: .confirmed,
+                        personID: dad.id
+                    ))
+                }
+                try store.replaceFaces(photo: photo, faces: faces)
+                expectedPhotos.insert(photo.pathKey)
+            }
+            for index in 0..<6 {
+                let photo = photoRecord("VB_\(index).JPG")
+                try store.replaceFaces(photo: photo, faces: [
+                    faceRecord(
+                        photo,
+                        detScore: 0.7,
+                        embedding: testEmbedding(seed: 2, noise: Float(index) * 0.03),
+                        state: .confirmed,
+                        personID: dad.id
+                    ),
+                ])
+                expectedPhotos.insert(photo.pathKey)
+            }
+            // An unconfirmed face and another person's confirmed face must
+            // never seed Dad's templates.
+            let uncleared = photoRecord("U1.JPG")
+            try store.replaceFaces(photo: uncleared, faces: [
+                faceRecord(uncleared, embedding: testEmbedding(seed: 3), personID: dad.id),
+            ])
+            let mom = try store.createPerson(name: "Mom", isRoster: true)
+            let momPhoto = photoRecord("M1.JPG")
+            try store.replaceFaces(photo: momPhoto, faces: [
+                faceRecord(momPhoto, embedding: testEmbedding(seed: 4), state: .confirmed, personID: mom.id),
+            ])
+
+            // A stale pin from before — the rebuild replaces the set.
+            let stale = try XCTUnwrap(store.faces(personID: dad.id).first)
+            try store.addTemplate(personID: dad.id, faceID: stale.id)
+            XCTAssertEqual(try store.rosterTemplates().count, 1)
+
+            // An empty XHIGH pass still runs the rebuild.
+            let service = FaceIndexService(
+                catalogURL: catalog,
+                options: FaceScanOptions(mode: .xhigh)
+            )
+            _ = try service.scan(items: [], embedder: StubEmbedder(), detector: StubDetector(detections: []))
+
+            // The rebuild runs for every roster person — Mom's single
+            // confirmed face becomes her one template — so scope the
+            // assertions to Dad's set.
+            let templates = try store.rosterTemplates().filter { $0.personID == dad.id }
+            // 9 eligible photos → 9 templates (under the 15 cap): every
+            // view-B face plus the view-A spread.
+            XCTAssertEqual(templates.count, 9)
+            let viewBPicks = templates.filter {
+                FaceEmbeddingMath.cosine($0.embedding, viewB)
+                    > FaceEmbeddingMath.cosine($0.embedding, viewA)
+            }
+            XCTAssertEqual(viewBPicks.count, 6)
+
+            // One template per photo, and only confirmed faces are picked.
+            let ids = scalarRows(
+                "SELECT face_id FROM face_templates WHERE person_id = '\(dad.id.uuidString)'",
+                database: catalog
+            ).compactMap { $0.first ?? nil }
+            let photoIDs = ids.compactMap {
+                scalarString("SELECT photo_id FROM faces WHERE id = '\($0)'", database: catalog)
+            }
+            XCTAssertEqual(Set(photoIDs), expectedPhotos)
+            let states = ids.compactMap {
+                scalarString("SELECT state FROM faces WHERE id = '\($0)'", database: catalog)
+            }
+            XCTAssertTrue(states.allSatisfy { $0 == "confirmed" })
+        }
+    }
+
+    func testFlippedHorizontallyMirrorsPixels() throws {
+        // A 2×1 image, red on the left and blue on the right, flips to
+        // blue-left / red-right. Compared as whole pixel tuples so the
+        // channel order of the bitmap never matters.
+        let context = try XCTUnwrap(FaceAligner.RGBContext(width: 2, height: 1))
+        context.setFillColor(CGColor(red: 1, green: 0, blue: 0, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: 1, height: 1))
+        context.setFillColor(CGColor(red: 0, green: 0, blue: 1, alpha: 1))
+        context.fill(CGRect(x: 1, y: 0, width: 1, height: 1))
+        let image = try XCTUnwrap(context.makeImage())
+
+        func pixelBytes(_ image: CGImage) -> [UInt8] {
+            guard let readback = FaceAligner.RGBContext(width: 2, height: 1) else { return [] }
+            readback.draw(image, in: CGRect(x: 0, y: 0, width: 2, height: 1))
+            guard let data = readback.data else { return [] }
+            return Array(UnsafeBufferPointer(
+                start: data.bindMemory(to: UInt8.self, capacity: 8),
+                count: 8
+            ))
+        }
+
+        let original = pixelBytes(image)
+        let flipped = try XCTUnwrap(FaceAligner.flippedHorizontally(image))
+        let mirrored = pixelBytes(flipped)
+        XCTAssertEqual(Array(mirrored[0..<4]), Array(original[4..<8]))
+        XCTAssertEqual(Array(mirrored[4..<8]), Array(original[0..<4]))
+        // A one-row image rules out a vertical flip passing by accident.
+        XCTAssertNotEqual(mirrored, original)
     }
 
     // MARK: - CoreML round-trip (skipped when the model is not installed)
@@ -921,6 +1191,39 @@ final class FaceIndexTests: XCTestCase {
                 try FaceIndexStore(url: catalog).photos(pathKeys: [item.primary.pathKey])[item.primary.pathKey]?.scanGrade,
                 .med
             )
+        }
+    }
+
+    /// XHIGH's optional SCRFD-34G pass — exercised end to end only when a
+    /// `det_34g*` sibling was converted next to the 10G packages via
+    /// `scripts/convert-scrfd.sh --34g`. Absent siblings must never block
+    /// or fail anything, so this skips rather than fails.
+    func testLargeDetectorIsAnOptionalSibling() async throws {
+        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        guard FaceModelCatalog.isDetectorInstalled(applicationSupport: support),
+              FaceModelCatalog.isLargeDetectorInstalled(applicationSupport: support) else {
+            throw XCTSkip("Large detector not installed — optional, via scripts/convert-scrfd.sh --34g")
+        }
+
+        let loaded = try await FaceModelCatalog.loadDetector(applicationSupport: support)
+        let detector = try XCTUnwrap(loaded)
+        XCTAssertFalse(detector.heavyInputSizes.isEmpty)
+
+        // Opted in, the Jobs summary names the large family; by default a
+        // pass still runs the standard detector even when 34G exists.
+        let opted = FaceScanOptions(mode: .xhigh, usesLargeDetector: true)
+        XCTAssertTrue(detector.packageSummary(for: opted).hasPrefix("det_34g"))
+        XCTAssertTrue(detector.packageSummary(for: FaceScanOptions(mode: .xhigh)).hasPrefix("det_10g"))
+
+        let image = try makeFaceTestImage(seed: 9)
+        let detections = detector.detect(
+            in: image,
+            imagePixelSize: CGSize(width: image.width, height: image.height),
+            options: opted
+        )
+        for detection in detections {
+            XCTAssertGreaterThanOrEqual(detection.confidence, 0.5)
         }
     }
 
@@ -1154,5 +1457,37 @@ private struct StubDetector: FaceDetecting {
 
     func detect(in image: CGImage, imagePixelSize: CGSize, options: FaceScanOptions) -> [DetectedFace] {
         detections
+    }
+}
+
+/// Counts embed calls — XHIGH's flip TTA must call once per view.
+private final class CountingEmbedder: FaceEmbeddingProviding, @unchecked Sendable {
+    private let lock = NSLock()
+    private(set) var calls = 0
+
+    func embed(_ image: CGImage) throws -> [Float] {
+        lock.lock()
+        defer { lock.unlock() }
+        calls += 1
+        return FaceEmbeddingMath.l2Normalized([Float](repeating: 1, count: 512))
+    }
+}
+
+/// Returns each vector in turn — the flip-TTA test reads back the
+/// normalized mean of the first two calls.
+private final class AlternatingEmbedder: FaceEmbeddingProviding, @unchecked Sendable {
+    private let lock = NSLock()
+    private(set) var calls = 0
+    let vectors: [[Float]]
+
+    init(vectors: [[Float]]) {
+        self.vectors = vectors
+    }
+
+    func embed(_ image: CGImage) throws -> [Float] {
+        lock.lock()
+        defer { lock.unlock() }
+        defer { calls += 1 }
+        return vectors[calls % vectors.count]
     }
 }

@@ -140,6 +140,17 @@ public enum FaceAligner {
         return context.makeImage()
     }
 
+    /// A left-right mirror of `image` at the same size — XHIGH's flip TTA
+    /// embeds this second view of the aligned crop alongside the original.
+    public static func flippedHorizontally(_ image: CGImage) -> CGImage? {
+        guard let context = RGBContext(width: image.width, height: image.height) else { return nil }
+        context.interpolationQuality = .high
+        context.translateBy(x: CGFloat(image.width), y: 0)
+        context.scaleBy(x: -1, y: 1)
+        context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+        return context.makeImage()
+    }
+
     /// JPEG bytes of an aligned crop for review surfaces.
     public static func jpegData(_ image: CGImage, quality: Double = 0.82) -> Data? {
         let data = NSMutableData()
