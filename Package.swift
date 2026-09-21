@@ -35,7 +35,10 @@ let package = Package(
         ),
         .testTarget(
             name: "CameraToolkitCoreTests",
-            dependencies: ["CameraToolkitCore"],
+            dependencies: [
+                "CameraToolkitCore",
+                .product(name: "GRDB", package: "GRDB.swift")
+            ],
             linkerSettings: [
                 .linkedLibrary("sqlite3")
             ]
