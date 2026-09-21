@@ -913,6 +913,48 @@ final class EventsWorkspaceTests: XCTestCase {
         }
     }
 
+    /// Rotate Selection on the board turns every targeted burst the same
+    /// direction in one pass — the multi-select version of Rotate Burst —
+    /// and still writes nothing to disk.
+    func testRotateSelectionTurnsEverySelectedBurstTogether() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let unsorted = root.appendingPathComponent("Drive/Unsorted A7V", isDirectory: true)
+            try writeOrganizerARW(unsorted.appendingPathComponent("Transfer 1/B0001_DSC00001.ARW"), "2026:08:26 10:00:00", "100")
+            try writeOrganizerARW(unsorted.appendingPathComponent("Transfer 1/B0001_DSC00002.ARW"), "2026:08:26 10:00:00", "400")
+            try writeOrganizerARW(unsorted.appendingPathComponent("Transfer 1/B0002_DSC00001.ARW"), "2026:08:26 10:00:05", "100")
+            try writeOrganizerARW(unsorted.appendingPathComponent("Transfer 1/B0002_DSC00002.ARW"), "2026:08:26 10:00:05", "400")
+            try organizerWrite(unsorted.appendingPathComponent("Transfer 1/B0002_DSC00001.xmp"), "<xmp/>")
+            let location = addUnsorted(unsorted, to: model)
+
+            workspace.scan(location)
+            try await waitUntil { workspace.sources[location.id]?.result != nil }
+            let bursts = try XCTUnwrap(workspace.sources[location.id]?.result?.stacks.filter { $0.isBurst })
+            XCTAssertEqual(bursts.count, 2)
+
+            let folder = unsorted.appendingPathComponent("Transfer 1")
+            let beforeListing = try FileManager.default.contentsOfDirectory(atPath: folder.path).sorted()
+            let beforeBytes = try beforeListing.map { try Data(contentsOf: folder.appendingPathComponent($0)) }
+
+            workspace.rotateStacks(bursts, quarterTurnsCW: -1)
+
+            for burst in bursts {
+                for file in burst.files {
+                    let expected = DisplayRotation.isRotatable(file) ? 3 : 0
+                    XCTAssertEqual(workspace.displayTurns(for: file), expected, file.name)
+                }
+            }
+            XCTAssertNil(model.configuration.displayOrientations[DisplayRotation.fileKey(for: try XCTUnwrap(bursts.flatMap(\.files).first { $0.name == "B0002_DSC00001.xmp" }))])
+
+            // One more turn applies to every burst again; nothing lands on disk.
+            workspace.rotateStacks(bursts, quarterTurnsCW: -1)
+            for burst in bursts {
+                XCTAssertEqual(workspace.displayTurns(for: burst.coverItem.primary), 2)
+            }
+            XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: folder.path).sorted(), beforeListing)
+            XCTAssertEqual(try beforeListing.map { try Data(contentsOf: folder.appendingPathComponent($0)) }, beforeBytes)
+        }
+    }
+
     // MARK: - Helpers
 
     private func withOrganizerSandbox(
