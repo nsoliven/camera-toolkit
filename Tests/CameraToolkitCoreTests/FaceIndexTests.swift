@@ -578,6 +578,45 @@ final class FaceIndexTests: XCTestCase {
         }
     }
 
+    /// Two faces can each resemble a third and not resemble each other.
+    /// They must not share a group. That is the Person 418 pile: every
+    /// member was close to one face, and many pairs were not.
+    func testFacesAroundOneCenterDoNotShareAGroup() throws {
+        try withFaceStore { store, catalog in
+            func unit(_ x: Float, _ y: Float) -> [Float] {
+                var vector = [Float](repeating: 0, count: 8)
+                vector[0] = x
+                vector[1] = y
+                return FaceEmbeddingMath.l2Normalized(vector)
+            }
+            let photo = photoRecord("STAR.JPG")
+            let center = faceRecord(
+                photo,
+                box: NormalizedFaceBox(x: 0.1, y: 0.1, width: 0.1, height: 0.1),
+                detScore: 0.99,
+                embedding: unit(1, 0)
+            )
+            let left = faceRecord(
+                photo,
+                box: NormalizedFaceBox(x: 0.4, y: 0.1, width: 0.1, height: 0.1),
+                detScore: 0.9,
+                embedding: unit(0.6, 0.8)
+            )
+            let right = faceRecord(
+                photo,
+                box: NormalizedFaceBox(x: 0.7, y: 0.1, width: 0.1, height: 0.1),
+                detScore: 0.8,
+                embedding: unit(0.6, -0.8)
+            )
+            try store.replaceFaces(photo: photo, faces: [center, left, right])
+            try FaceIndexService(catalogURL: catalog).rematchRoster()
+
+            let centerGroup = try XCTUnwrap(store.face(id: center.id)?.personID)
+            XCTAssertEqual(try store.face(id: left.id)?.personID, centerGroup)
+            XCTAssertNotEqual(try store.face(id: right.id)?.personID, centerGroup)
+        }
+    }
+
     func testPromoteGroupConfirmsFacesAndBuildsTemplates() throws {
         try withFaceStore { store, catalog in
             // Two faces of the same cluster on different photos.
