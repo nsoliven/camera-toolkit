@@ -16,6 +16,14 @@ public final class FaceIndexStore: @unchecked Sendable {
         self.url = url
     }
 
+    /// A store over a prebuilt queue — the test seam for a trace hook
+    /// counting BEGINs or a busy handler that refuses the first attempts,
+    /// instead of the configuration `database()` builds.
+    init(url: URL, queue: DatabaseQueue) {
+        self.url = url
+        self.queue = queue
+    }
+
     private func database() throws -> DatabaseQueue {
         queueLock.lock()
         defer { queueLock.unlock() }
@@ -26,6 +34,47 @@ public final class FaceIndexStore: @unchecked Sendable {
         let queue = try DatabaseQueue(path: url.path, configuration: configuration)
         self.queue = queue
         return queue
+    }
+
+    /// Every read goes through the shared transient retry — a stuttering
+    /// volume can refuse even a deferred open.
+    private func read<T>(_ body: (Database) throws -> T) throws -> T {
+        try CatalogTransactionRetry.run { try database().read(body) }
+    }
+
+    /// Every single-statement write: one transaction, retried on a
+    /// transient busy/IO refusal. Passes that mutate many rows use
+    /// `inWriteTransaction` so their writes share one transaction instead.
+    private func write<T>(_ body: (Database) throws -> T) throws -> T {
+        try CatalogTransactionRetry.run { try database().write(body) }
+    }
+
+    /// Runs `body` inside a single write transaction — one BEGIN
+    /// IMMEDIATE, retried like every write — for the batch passes
+    /// (re-match, rebundle, reject-and-regroup) whose thousands of row
+    /// updates must commit or roll back together. A failed attempt never
+    /// leaves a half-applied pass behind.
+    ///
+    /// Inside `body`, only the `database:`-parameterized calls may run —
+    /// the public methods each open their own transaction and GRDB
+    /// queues are not reentrant.
+    func inWriteTransaction<T>(_ body: (Database) throws -> T) throws -> T {
+        try write(body)
+    }
+
+    /// True once `CatalogStore.bootstrap` has created every face table —
+    /// the gate a Re-match checks so it can skip bootstrap's second
+    /// writer when the schema is already there. A pure `sqlite_master`
+    /// lookup; it creates nothing.
+    public func faceSchemaExists() throws -> Bool {
+        try read { database in
+            let names = try String.fetchAll(
+                database,
+                sql: "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+            return ["face_photos", "people", "faces", "face_templates", "face_rejections"]
+                .allSatisfy { names.contains($0) }
+        }
     }
 
     private static func formatter() -> ISO8601DateFormatter {
@@ -53,7 +102,7 @@ public final class FaceIndexStore: @unchecked Sendable {
     /// rule and the changed-file (same path, new size/mtime) rule.
     public func photos(pathKeys: [String]) throws -> [String: FacePhotoRecord] {
         guard !pathKeys.isEmpty else { return [:] }
-        return try database().read { database in
+        return try read { database in
             var result: [String: FacePhotoRecord] = [:]
             // Chunked IN lookups stay well under SQLite's bound-variable
             // limit while keeping one round trip per ~400 keys.
@@ -84,7 +133,7 @@ public final class FaceIndexStore: @unchecked Sendable {
     ) throws {
         let formatter = Self.formatter()
         let now = formatter.string(from: Date())
-        try database().write { database in
+        try write { database in
             let confirmed = try Row.fetchAll(
                 database,
                 sql: "SELECT box_x, box_y, box_w, box_h FROM faces WHERE photo_id = ? AND state = 'confirmed'",
@@ -153,7 +202,7 @@ public final class FaceIndexStore: @unchecked Sendable {
     public func markCovered(photo: FacePhotoRecord) throws {
         let formatter = Self.formatter()
         let now = formatter.string(from: Date())
-        try database().write { database in
+        try write { database in
             let stale = try Row.fetchOne(
                 database,
                 sql: "SELECT byte_count, modified_at FROM face_photos WHERE path_key = ?",
@@ -217,7 +266,7 @@ public final class FaceIndexStore: @unchecked Sendable {
 
     /// Faces on a photo that may still move — everything but confirmed.
     public func faces(photoID: String) throws -> [FaceRecord] {
-        try database().read { database in
+        try read { database in
             try faces(photoID: photoID, database: database)
         }
     }
@@ -235,7 +284,7 @@ public final class FaceIndexStore: @unchecked Sendable {
     /// file sits now. This is the lookup that keeps faces attached when a
     /// file moves between the unsorted folder and an event folder.
     public func photos(fileName: String, byteCount: Int64, modifiedAt: Date) throws -> [FacePhotoRecord] {
-        try database().read { database in
+        try read { database in
             try Row.fetchAll(
                 database,
                 sql: "SELECT * FROM face_photos WHERE file_name = ? AND byte_count = ?",
@@ -305,7 +354,7 @@ public final class FaceIndexStore: @unchecked Sendable {
     ) throws -> FaceRecord {
         let formatter = Self.formatter()
         let now = formatter.string(from: Date())
-        return try database().write { database -> FaceRecord in
+        return try write { database -> FaceRecord in
             let stale = try Row.fetchOne(
                 database,
                 sql: "SELECT byte_count, modified_at FROM face_photos WHERE path_key = ?",
@@ -412,37 +461,43 @@ public final class FaceIndexStore: @unchecked Sendable {
     // MARK: - Roster, groups, and review queues
 
     public func rosterPeople() throws -> [FacePerson] {
-        try database().read { database in
-            try Row.fetchAll(
-                database,
-                sql: "SELECT * FROM people WHERE is_roster = 1 ORDER BY name COLLATE NOCASE"
-            ).map(Self.person)
-        }
+        try read { database in try rosterPeople(database: database) }
+    }
+
+    func rosterPeople(database: Database) throws -> [FacePerson] {
+        try Row.fetchAll(
+            database,
+            sql: "SELECT * FROM people WHERE is_roster = 1 ORDER BY name COLLATE NOCASE"
+        ).map(Self.person)
     }
 
     public func otherGroups() throws -> [FacePerson] {
-        try database().read { database in
-            try Row.fetchAll(
-                database,
-                sql: "SELECT * FROM people WHERE is_roster = 0 ORDER BY face_count DESC, name COLLATE NOCASE"
-            ).map(Self.person)
-        }
+        try read { database in try otherGroups(database: database) }
+    }
+
+    func otherGroups(database: Database) throws -> [FacePerson] {
+        try Row.fetchAll(
+            database,
+            sql: "SELECT * FROM people WHERE is_roster = 0 ORDER BY face_count DESC, name COLLATE NOCASE"
+        ).map(Self.person)
     }
 
     public func person(_ id: UUID) throws -> FacePerson? {
-        try database().read { database in
-            try Row.fetchOne(
-                database,
-                sql: "SELECT * FROM people WHERE id = ?",
-                arguments: [id.uuidString]
-            ).map(Self.person)
-        }
+        try read { database in try person(id, database: database) }
+    }
+
+    func person(_ id: UUID, database: Database) throws -> FacePerson? {
+        try Row.fetchOne(
+            database,
+            sql: "SELECT * FROM people WHERE id = ?",
+            arguments: [id.uuidString]
+        ).map(Self.person)
     }
 
     /// Faces awaiting review: machine-proposed matches, lowest confidence
     /// first so the least certain decisions surface first.
     public func unsureFaces() throws -> [FaceRecord] {
-        try database().read { database in
+        try read { database in
             try Row.fetchAll(
                 database,
                 sql: """
@@ -455,30 +510,34 @@ public final class FaceIndexStore: @unchecked Sendable {
     }
 
     public func face(id: UUID) throws -> FaceRecord? {
-        try database().read { database in
-            try Row.fetchOne(
-                database,
-                sql: "\(Self.faceSelect) WHERE f.id = ?",
-                arguments: [id.uuidString]
-            ).map { Self.faceRecord($0) }
-        }
+        try read { database in try face(id: id, database: database) }
+    }
+
+    func face(id: UUID, database: Database) throws -> FaceRecord? {
+        try Row.fetchOne(
+            database,
+            sql: "\(Self.faceSelect) WHERE f.id = ?",
+            arguments: [id.uuidString]
+        ).map { Self.faceRecord($0) }
     }
 
     public func faces(personID: UUID) throws -> [FaceRecord] {
-        try database().read { database in
-            try Row.fetchAll(
-                database,
-                sql: "\(Self.faceSelect) WHERE f.person_id = ? ORDER BY f.det_score DESC",
-                arguments: [personID.uuidString]
-            ).map { Self.faceRecord($0) }
-        }
+        try read { database in try faces(personID: personID, database: database) }
+    }
+
+    func faces(personID: UUID, database: Database) throws -> [FaceRecord] {
+        try Row.fetchAll(
+            database,
+            sql: "\(Self.faceSelect) WHERE f.person_id = ? ORDER BY f.det_score DESC",
+            arguments: [personID.uuidString]
+        ).map { Self.faceRecord($0) }
     }
 
     /// One face to represent a person in review lists — the face the user
     /// pinned as cover when it still belongs to the person, else the most
     /// confident detection, which is usually the clearest portrait.
     public func coverFace(personID: UUID) throws -> FaceRecord? {
-        try database().read { database in
+        try read { database in
             try Row.fetchOne(
                 database,
                 sql: """
@@ -499,7 +558,7 @@ public final class FaceIndexStore: @unchecked Sendable {
     /// borrow another person's detection. Returns whether the row updated.
     @discardableResult
     public func setCoverFace(personID: UUID, faceID: UUID) throws -> Bool {
-        try database().write { database in
+        try write { database in
             try database.execute(
                 sql: """
                 UPDATE people SET cover_face_id = ?, updated_at = ?
@@ -521,21 +580,23 @@ public final class FaceIndexStore: @unchecked Sendable {
     /// Template embeddings per roster person — the gallery LOW matches
     /// against.
     public func rosterTemplates() throws -> [(personID: UUID, embedding: [Float])] {
-        try database().read { database in
-            let rows = try Row.fetchAll(
-                database,
-                sql: """
-                SELECT t.person_id, f.embedding FROM face_templates t
-                JOIN faces f ON f.id = t.face_id
-                JOIN people p ON p.id = t.person_id
-                WHERE p.is_roster = 1 AND f.embedding IS NOT NULL
-                """
-            )
-            return rows.compactMap { row in
-                guard let personID = UUID(uuidString: row["person_id"] as String? ?? ""),
-                      let data: Data = row["embedding"] else { return nil }
-                return (personID, FaceRecord.embedding(from: data))
-            }
+        try read { database in try rosterTemplates(database: database) }
+    }
+
+    func rosterTemplates(database: Database) throws -> [(personID: UUID, embedding: [Float])] {
+        let rows = try Row.fetchAll(
+            database,
+            sql: """
+            SELECT t.person_id, f.embedding FROM face_templates t
+            JOIN faces f ON f.id = t.face_id
+            JOIN people p ON p.id = t.person_id
+            WHERE p.is_roster = 1 AND f.embedding IS NOT NULL
+            """
+        )
+        return rows.compactMap { row in
+            guard let personID = UUID(uuidString: row["person_id"] as String? ?? ""),
+                  let data: Data = row["embedding"] else { return nil }
+            return (personID, FaceRecord.embedding(from: data))
         }
     }
 
@@ -543,39 +604,43 @@ public final class FaceIndexStore: @unchecked Sendable {
     /// roster re-match or cluster pass. No photo is re-decoded; this reads
     /// stored vectors only.
     public func matchableFaces() throws -> [FaceRecord] {
-        try database().read { database in
-            try Row.fetchAll(
-                database,
-                sql: """
-                \(Self.faceSelect)
-                WHERE f.state IN ('cached', 'proposed', 'other')
-                  AND f.embedding IS NOT NULL
-                ORDER BY f.det_score DESC
-                """
-            ).map { Self.faceRecord($0) }
-        }
+        try read { database in try matchableFaces(database: database) }
+    }
+
+    func matchableFaces(database: Database) throws -> [FaceRecord] {
+        try Row.fetchAll(
+            database,
+            sql: """
+            \(Self.faceSelect)
+            WHERE f.state IN ('cached', 'proposed', 'other')
+              AND f.embedding IS NOT NULL
+            ORDER BY f.det_score DESC
+            """
+        ).map { Self.faceRecord($0) }
     }
 
     /// Member embeddings of each non-roster group, for clustering new faces
     /// into existing groups.
     public func groupEmbeddings() throws -> [UUID: [[Float]]] {
-        try database().read { database in
-            let rows = try Row.fetchAll(
-                database,
-                sql: """
-                SELECT f.person_id, f.embedding FROM faces f
-                JOIN people p ON p.id = f.person_id
-                WHERE p.is_roster = 0 AND f.embedding IS NOT NULL
-                """
-            )
-            var groups: [UUID: [[Float]]] = [:]
-            for row in rows {
-                guard let id = UUID(uuidString: row["person_id"] as String? ?? ""),
-                      let data: Data = row["embedding"] else { continue }
-                groups[id, default: []].append(FaceRecord.embedding(from: data))
-            }
-            return groups
+        try read { database in try groupEmbeddings(database: database) }
+    }
+
+    func groupEmbeddings(database: Database) throws -> [UUID: [[Float]]] {
+        let rows = try Row.fetchAll(
+            database,
+            sql: """
+            SELECT f.person_id, f.embedding FROM faces f
+            JOIN people p ON p.id = f.person_id
+            WHERE p.is_roster = 0 AND f.embedding IS NOT NULL
+            """
+        )
+        var groups: [UUID: [[Float]]] = [:]
+        for row in rows {
+            guard let id = UUID(uuidString: row["person_id"] as String? ?? ""),
+                  let data: Data = row["embedding"] else { continue }
+            groups[id, default: []].append(FaceRecord.embedding(from: data))
         }
+        return groups
     }
 
     /// Every persisted "not this person" verdict, indexed for the match
@@ -584,69 +649,76 @@ public final class FaceIndexStore: @unchecked Sendable {
     /// rejection whose face row is gone keeps the id-level ban but adds
     /// no vector.
     public func faceRejections() throws -> FaceRejectionIndex {
-        try database().read { database in
-            let rows = try Row.fetchAll(
-                database,
-                sql: """
-                SELECT r.person_id, r.face_id, f.embedding
-                FROM face_rejections r
-                LEFT JOIN faces f ON f.id = r.face_id
-                """
-            )
-            var index = FaceRejectionIndex()
-            for row in rows {
-                guard let personID = UUID(uuidString: row["person_id"] as String? ?? ""),
-                      let faceID = UUID(uuidString: row["face_id"] as String? ?? "")
-                else { continue }
-                index.personIDsByFaceID[faceID, default: []].insert(personID)
-                if let embedding: Data = row["embedding"] {
-                    index.embeddingsByPersonID[personID, default: []]
-                        .append(FaceRecord.embedding(from: embedding))
-                }
+        try read { database in try faceRejections(database: database) }
+    }
+
+    func faceRejections(database: Database) throws -> FaceRejectionIndex {
+        let rows = try Row.fetchAll(
+            database,
+            sql: """
+            SELECT r.person_id, r.face_id, f.embedding
+            FROM face_rejections r
+            LEFT JOIN faces f ON f.id = r.face_id
+            """
+        )
+        var index = FaceRejectionIndex()
+        for row in rows {
+            guard let personID = UUID(uuidString: row["person_id"] as String? ?? ""),
+                  let faceID = UUID(uuidString: row["face_id"] as String? ?? "")
+            else { continue }
+            index.personIDsByFaceID[faceID, default: []].insert(personID)
+            if let embedding: Data = row["embedding"] {
+                index.embeddingsByPersonID[personID, default: []]
+                    .append(FaceRecord.embedding(from: embedding))
             }
-            return index
         }
+        return index
     }
 
     // MARK: - Mutations (review actions)
 
     @discardableResult
     public func createPerson(name: String, isRoster: Bool) throws -> FacePerson {
+        try write { database in try createPerson(name: name, isRoster: isRoster, database: database) }
+    }
+
+    @discardableResult
+    func createPerson(name: String, isRoster: Bool, database: Database) throws -> FacePerson {
         let person = FacePerson(name: name, isRoster: isRoster)
         let now = Self.formatter().string(from: Date())
-        try database().write { database in
-            try database.execute(
-                sql: """
-                INSERT INTO people(id, name, is_roster, face_count, created_at, updated_at)
-                VALUES (?, ?, ?, 0, ?, ?)
-                """,
-                arguments: [person.id.uuidString, name, isRoster ? 1 : 0, now, now]
-            )
-        }
+        try database.execute(
+            sql: """
+            INSERT INTO people(id, name, is_roster, face_count, created_at, updated_at)
+            VALUES (?, ?, ?, 0, ?, ?)
+            """,
+            arguments: [person.id.uuidString, name, isRoster ? 1 : 0, now, now]
+        )
         return person
     }
 
     /// The next display name for a new Other group: "Person N" with N one
     /// past the highest existing auto label.
     public func nextGroupName() throws -> String {
-        try database().read { database in
-            let rows = try Row.fetchAll(
-                database,
-                sql: "SELECT name FROM people WHERE is_roster = 0 AND name LIKE 'Person %'"
-            )
-            var highest = 0
-            for row in rows {
-                if let name: String = row["name"],
-                   let number = Int(name.dropFirst("Person ".count)) {
-                    highest = max(highest, number)
-                }
+        try read { database in try nextGroupName(database: database) }
+    }
+
+    func nextGroupName(database: Database) throws -> String {
+        let rows = try Row.fetchAll(
+            database,
+            sql: "SELECT name FROM people WHERE is_roster = 0 AND name LIKE 'Person %'"
+        )
+        var highest = 0
+        for row in rows {
+            if let name: String = row["name"],
+               let number = Int(name.dropFirst("Person ".count)) {
+                highest = max(highest, number)
             }
-            return "Person \(highest + 1)"
         }
+        return "Person \(highest + 1)"
     }
 
     public func renamePerson(_ id: UUID, name: String) throws {
-        try database().write { database in
+        try write { database in
             try database.execute(
                 sql: "UPDATE people SET name = ?, updated_at = ? WHERE id = ?",
                 arguments: [name, Self.formatter().string(from: Date()), id.uuidString]
@@ -657,51 +729,63 @@ public final class FaceIndexStore: @unchecked Sendable {
     /// Confirms or proposes a face for a person, never touching a confirmed
     /// face that belongs to someone else.
     public func assignFace(_ faceID: UUID, to personID: UUID, state: FaceState, score: Double?) throws {
-        try database().write { database in
-            try database.execute(
-                sql: """
-                UPDATE faces SET person_id = ?, state = ?, match_score = ?, updated_at = ?
-                WHERE id = ? AND state != 'confirmed'
-                """,
-                arguments: [
-                    personID.uuidString,
-                    state.rawValue,
-                    score,
-                    Self.formatter().string(from: Date()),
-                    faceID.uuidString,
-                ]
-            )
+        try write { database in
+            try assignFace(faceID, to: personID, state: state, score: score, database: database)
         }
+    }
+
+    func assignFace(
+        _ faceID: UUID,
+        to personID: UUID,
+        state: FaceState,
+        score: Double?,
+        database: Database
+    ) throws {
+        try database.execute(
+            sql: """
+            UPDATE faces SET person_id = ?, state = ?, match_score = ?, updated_at = ?
+            WHERE id = ? AND state != 'confirmed'
+            """,
+            arguments: [
+                personID.uuidString,
+                state.rawValue,
+                score,
+                Self.formatter().string(from: Date()),
+                faceID.uuidString,
+            ]
+        )
     }
 
     /// Returns a face to the unmatched pool: it keeps its embedding and is
     /// re-grouped by the next cluster pass instead of being re-detected.
     public func unassignFace(_ faceID: UUID) throws {
-        try database().write { database in
-            try database.execute(
-                sql: """
-                UPDATE faces SET person_id = NULL, state = 'cached', match_score = NULL, updated_at = ?
-                WHERE id = ? AND state != 'confirmed'
-                """,
-                arguments: [Self.formatter().string(from: Date()), faceID.uuidString]
-            )
-            try database.execute(
-                sql: "DELETE FROM face_templates WHERE face_id = ?",
-                arguments: [faceID.uuidString]
-            )
-            // A cover only makes sense while the face still belongs to the
-            // person — drop the pin so the row falls back to auto-pick.
-            try database.execute(
-                sql: "UPDATE people SET cover_face_id = NULL WHERE cover_face_id = ?",
-                arguments: [faceID.uuidString]
-            )
-        }
+        try write { database in try unassignFace(faceID, database: database) }
+    }
+
+    func unassignFace(_ faceID: UUID, database: Database) throws {
+        try database.execute(
+            sql: """
+            UPDATE faces SET person_id = NULL, state = 'cached', match_score = NULL, updated_at = ?
+            WHERE id = ? AND state != 'confirmed'
+            """,
+            arguments: [Self.formatter().string(from: Date()), faceID.uuidString]
+        )
+        try database.execute(
+            sql: "DELETE FROM face_templates WHERE face_id = ?",
+            arguments: [faceID.uuidString]
+        )
+        // A cover only makes sense while the face still belongs to the
+        // person — drop the pin so the row falls back to auto-pick.
+        try database.execute(
+            sql: "UPDATE people SET cover_face_id = NULL WHERE cover_face_id = ?",
+            arguments: [faceID.uuidString]
+        )
     }
 
     /// Marks a proposed face confirmed — frozen from here on. Also pins it
     /// as a template so the gallery gains a reviewed view.
     public func confirmFace(_ faceID: UUID) throws {
-        try database().write { database in
+        try write { database in
             try database.execute(
                 sql: """
                 UPDATE faces SET state = 'confirmed', updated_at = ?
@@ -713,24 +797,30 @@ public final class FaceIndexStore: @unchecked Sendable {
     }
 
     public func addTemplate(personID: UUID, faceID: UUID) throws {
-        try database().write { database in
-            try database.execute(
-                sql: """
-                INSERT OR IGNORE INTO face_templates(person_id, face_id, created_at)
-                VALUES (?, ?, ?)
-                """,
-                arguments: [personID.uuidString, faceID.uuidString, Self.formatter().string(from: Date())]
-            )
+        try write { database in
+            try addTemplate(personID: personID, faceID: faceID, database: database)
         }
     }
 
+    func addTemplate(personID: UUID, faceID: UUID, database: Database) throws {
+        try database.execute(
+            sql: """
+            INSERT OR IGNORE INTO face_templates(person_id, face_id, created_at)
+            VALUES (?, ?, ?)
+            """,
+            arguments: [personID.uuidString, faceID.uuidString, Self.formatter().string(from: Date())]
+        )
+    }
+
     public func clearTemplates(personID: UUID) throws {
-        try database().write { database in
-            try database.execute(
-                sql: "DELETE FROM face_templates WHERE person_id = ?",
-                arguments: [personID.uuidString]
-            )
-        }
+        try write { database in try clearTemplates(personID: personID, database: database) }
+    }
+
+    func clearTemplates(personID: UUID, database: Database) throws {
+        try database.execute(
+            sql: "DELETE FROM face_templates WHERE person_id = ?",
+            arguments: [personID.uuidString]
+        )
     }
 
     /// Promotes a non-roster group to a named roster person. Member faces
@@ -739,7 +829,7 @@ public final class FaceIndexStore: @unchecked Sendable {
     public func promoteGroup(_ personID: UUID, name: String, templateCap: Int) throws {
         let formatter = Self.formatter()
         let now = formatter.string(from: Date())
-        try database().write { database in
+        try write { database in
             try database.execute(
                 sql: "UPDATE people SET name = ?, is_roster = 1, updated_at = ? WHERE id = ?",
                 arguments: [name, now, personID.uuidString]
@@ -784,7 +874,7 @@ public final class FaceIndexStore: @unchecked Sendable {
     /// stay attached and reviewable — a merge is a claim, not a confirmation.
     public func mergePerson(_ sourceID: UUID, into targetID: UUID) throws {
         let now = Self.formatter().string(from: Date())
-        try database().write { database in
+        try write { database in
             let targetRoster = try Int64.fetchOne(
                 database,
                 sql: "SELECT is_roster FROM people WHERE id = ?",
@@ -818,31 +908,37 @@ public final class FaceIndexStore: @unchecked Sendable {
     /// closer-to-rejected check. The row lives until the face or person is
     /// deleted, or Clear Face Scan wipes the table.
     public func recordRejection(personID: UUID, faceID: UUID) throws {
-        try database().write { database in
-            try database.execute(
-                sql: """
-                INSERT OR IGNORE INTO face_rejections(person_id, face_id, created_at)
-                VALUES (?, ?, ?)
-                """,
-                arguments: [
-                    personID.uuidString,
-                    faceID.uuidString,
-                    Self.formatter().string(from: Date()),
-                ]
-            )
+        try write { database in
+            try recordRejection(personID: personID, faceID: faceID, database: database)
         }
+    }
+
+    func recordRejection(personID: UUID, faceID: UUID, database: Database) throws {
+        try database.execute(
+            sql: """
+            INSERT OR IGNORE INTO face_rejections(person_id, face_id, created_at)
+            VALUES (?, ?, ?)
+            """,
+            arguments: [
+                personID.uuidString,
+                faceID.uuidString,
+                Self.formatter().string(from: Date()),
+            ]
+        )
     }
 
     /// True when no face rows point at the person — the rebundle's signal
     /// that an emptied auto row can be recycled or dropped.
     public func isPersonEmpty(_ personID: UUID) throws -> Bool {
-        try database().read { database in
-            try Int.fetchOne(
-                database,
-                sql: "SELECT COUNT(*) FROM faces WHERE person_id = ?",
-                arguments: [personID.uuidString]
-            ) == 0
-        }
+        try read { database in try isPersonEmpty(personID, database: database) }
+    }
+
+    func isPersonEmpty(_ personID: UUID, database: Database) throws -> Bool {
+        try Int.fetchOne(
+            database,
+            sql: "SELECT COUNT(*) FROM faces WHERE person_id = ?",
+            arguments: [personID.uuidString]
+        ) == 0
     }
 
     /// Removes an unnamed group left with no faces — the rebundle's
@@ -850,16 +946,19 @@ public final class FaceIndexStore: @unchecked Sendable {
     /// Returns whether the row went away.
     @discardableResult
     public func deleteEmptyGroup(_ personID: UUID) throws -> Bool {
-        try database().write { database in
-            try database.execute(
-                sql: """
-                DELETE FROM people WHERE id = ? AND is_roster = 0
-                  AND NOT EXISTS(SELECT 1 FROM faces WHERE faces.person_id = people.id)
-                """,
-                arguments: [personID.uuidString]
-            )
-            return database.changesCount > 0
-        }
+        try write { database in try deleteEmptyGroup(personID, database: database) }
+    }
+
+    @discardableResult
+    func deleteEmptyGroup(_ personID: UUID, database: Database) throws -> Bool {
+        try database.execute(
+            sql: """
+            DELETE FROM people WHERE id = ? AND is_roster = 0
+              AND NOT EXISTS(SELECT 1 FROM faces WHERE faces.person_id = people.id)
+            """,
+            arguments: [personID.uuidString]
+        )
+        return database.changesCount > 0
     }
 
     /// Removes a non-roster group and its faces — the junk action. The
@@ -867,7 +966,7 @@ public final class FaceIndexStore: @unchecked Sendable {
     /// same mode. Roster people are refused: junking must never delete a
     /// named person's confirmed faces.
     public func deletePersonAndFaces(_ personID: UUID) throws {
-        try database().write { database in
+        try write { database in
             let roster = try Int64.fetchOne(
                 database,
                 sql: "SELECT is_roster FROM people WHERE id = ?",
@@ -889,7 +988,7 @@ public final class FaceIndexStore: @unchecked Sendable {
     /// group again instead of disappearing.
     public func demoteFromRoster(_ personID: UUID) throws {
         let now = Self.formatter().string(from: Date())
-        try database().write { database in
+        try write { database in
             try database.execute(
                 sql: "UPDATE people SET is_roster = 0, updated_at = ? WHERE id = ?",
                 arguments: [now, personID.uuidString]
@@ -910,15 +1009,17 @@ public final class FaceIndexStore: @unchecked Sendable {
 
     /// Recomputes `people.face_count` after mutations.
     public func refreshFaceCounts() throws {
-        try database().write { database in
-            try database.execute(
-                sql: """
-                UPDATE people SET face_count = (
-                    SELECT COUNT(*) FROM faces WHERE faces.person_id = people.id
-                )
-                """
+        try write { database in try refreshFaceCounts(database: database) }
+    }
+
+    func refreshFaceCounts(database: Database) throws {
+        try database.execute(
+            sql: """
+            UPDATE people SET face_count = (
+                SELECT COUNT(*) FROM faces WHERE faces.person_id = people.id
             )
-        }
+            """
+        )
     }
 
     // MARK: - Index summary and wipe
@@ -927,7 +1028,7 @@ public final class FaceIndexStore: @unchecked Sendable {
     /// detections, named people, and unnamed groups. The Clear Face Scan
     /// sheet shows exactly these numbers before wiping.
     public func faceIndexCounts() throws -> FaceIndexCounts {
-        try database().read { database in
+        try read { database in
             FaceIndexCounts(
                 scannedPhotos: try Int.fetchOne(database, sql: "SELECT COUNT(*) FROM face_photos") ?? 0,
                 faces: try Int.fetchOne(database, sql: "SELECT COUNT(*) FROM faces") ?? 0,
@@ -941,7 +1042,7 @@ public final class FaceIndexStore: @unchecked Sendable {
     /// the People window footer's quality list. `none` rows are manual
     /// tags on never-scanned files, not a scan grade, so they stay out.
     public func storedScanGrades() throws -> [FaceScanGrade] {
-        try database().read { database in
+        try read { database in
             try Row.fetchAll(
                 database,
                 sql: "SELECT DISTINCT scan_grade FROM face_photos"
@@ -960,7 +1061,7 @@ public final class FaceIndexStore: @unchecked Sendable {
     /// read, moved, or deleted; the next scan simply treats every file as
     /// new instead of skipping it on `scan_grade`.
     public func clearFaceIndex() throws {
-        try database().write { database in
+        try write { database in
             try database.execute(sql: "DELETE FROM face_rejections")
             try database.execute(sql: "DELETE FROM face_templates")
             try database.execute(sql: "DELETE FROM faces")
@@ -976,7 +1077,7 @@ public final class FaceIndexStore: @unchecked Sendable {
     /// File identity is name + size + mtime so a face found on an unsorted
     /// copy still attaches after the file moves into an event folder.
     private func rosterFaceFiles() throws -> [(personID: UUID, name: String, fileKey: String)] {
-        try database().read { database in
+        try read { database in
             let rows = try Row.fetchAll(
                 database,
                 sql: """
@@ -1010,7 +1111,7 @@ public final class FaceIndexStore: @unchecked Sendable {
     /// person. Search uses this to join stacks to people from catalog data
     /// alone; it never walks the filesystem.
     public func personNamesByFileKey() throws -> [String: Set<String>] {
-        try database().read { database in
+        try read { database in
             let rows = try Row.fetchAll(
                 database,
                 sql: """
@@ -1044,7 +1145,7 @@ public final class FaceIndexStore: @unchecked Sendable {
     /// person's matching-face total across `fileKeys`.
     public func peopleByFileKey(fileKeys: Set<String>) throws -> [String: [FacePerson]] {
         guard !fileKeys.isEmpty else { return [:] }
-        return try database().read { database in
+        return try read { database in
             let rows = try Row.fetchAll(
                 database,
                 sql: """
