@@ -44,6 +44,27 @@ struct EventChip: View {
     }
 }
 
+/// A named person detected on an event's photos. Shares the event-chip
+/// capsule look; the color is stable per person.
+struct PersonChip: View {
+    let person: FacePerson
+
+    var body: some View {
+        HStack(spacing: 3) {
+            Image(systemName: "person.fill")
+                .font(.caption2)
+            Text(person.name)
+                .lineLimit(1)
+        }
+        .font(.caption.weight(.semibold))
+        .foregroundStyle(.white)
+        .padding(.horizontal, 7)
+        .padding(.vertical, 3)
+        .background(EventPalette.color(for: person.id), in: Capsule())
+        .help("\(person.faceCount) face\(person.faceCount == 1 ? "" : "s") in this event")
+    }
+}
+
 enum TileLocationBadge {
     case onSource
     case inBuffer

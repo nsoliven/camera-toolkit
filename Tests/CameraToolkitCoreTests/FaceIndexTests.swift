@@ -1,0 +1,631 @@
+import CameraToolkitCore
+import CoreGraphics
+import Foundation
+import SQLite3
+import XCTest
+
+final class FaceIndexTests: XCTestCase {
+
+    // MARK: - Schema
+
+    func testBootstrapCreatesFaceSchemaWithForeignKeys() throws {
+        try withTemporaryDirectory { root in
+            let catalog = root.appendingPathComponent("catalog.sqlite")
+            _ = try CatalogStore(url: catalog).bootstrap(
+                configuration: faceTestConfiguration(root: root, catalog: catalog),
+                createBackup: false,
+                createLibraryFolders: false
+            )
+
+            for table in ["face_photos", "people", "faces", "face_templates"] {
+                XCTAssertEqual(
+                    scalarInt("SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = '\(table)'", database: catalog),
+                    1,
+                    "missing table \(table)"
+                )
+            }
+            XCTAssertEqual(
+                scalarString("PRAGMA integrity_check", database: catalog),
+                "ok"
+            )
+
+            // faces must reference a scanned photo and a real person.
+            let faceKeys = scalarRows(
+                "PRAGMA foreign_key_list(faces)", database: catalog
+            ).flatMap { $0 }.compactMap { $0 }.joined(separator: ";")
+            XCTAssertTrue(faceKeys.contains("face_photos"))
+            XCTAssertTrue(faceKeys.contains("people"))
+
+            // Re-running bootstrap is a no-op.
+            _ = try CatalogStore(url: catalog).bootstrap(
+                configuration: faceTestConfiguration(root: root, catalog: catalog),
+                createBackup: false,
+                createLibraryFolders: false
+            )
+            XCTAssertEqual(scalarString("PRAGMA integrity_check", database: catalog), "ok")
+        }
+    }
+
+    // MARK: - Embedding math
+
+    func testCosineAndCentroidMath() throws {
+        let a = testEmbedding(seed: 1)
+        let sameA = testEmbedding(seed: 1)
+        let nearA = testEmbedding(seed: 1, noise: 0.2)
+        let other = testEmbedding(seed: 2)
+
+        XCTAssertEqual(FaceEmbeddingMath.cosine(a, sameA), 1, accuracy: 0.001)
+        XCTAssertGreaterThan(FaceEmbeddingMath.cosine(a, nearA), 0.9)
+        XCTAssertLessThan(FaceEmbeddingMath.cosine(a, other), 0.2)
+        XCTAssertEqual(FaceEmbeddingMath.cosine(a, []), -1)
+
+        let normalized = FaceEmbeddingMath.l2Normalized([3, 4])
+        XCTAssertEqual(sqrt(normalized[0] * normalized[0] + normalized[1] * normalized[1]), 1, accuracy: 0.0001)
+
+        let centroid = FaceEmbeddingMath.centroid([a, nearA])!
+        XCTAssertEqual(centroid.count, 512)
+        XCTAssertGreaterThan(FaceEmbeddingMath.cosine(centroid, a), 0.95)
+        XCTAssertNil(FaceEmbeddingMath.centroid([]))
+
+        // The SQLite BLOB round-trip preserves the vector bit-for-bit.
+        let record = FaceRecord(
+            photoID: "p",
+            box: NormalizedFaceBox(x: 0, y: 0, width: 1, height: 1),
+            detScore: 1,
+            embedding: a
+        )
+        XCTAssertEqual(FaceRecord.embedding(from: try XCTUnwrap(record.embeddingData)), a)
+    }
+
+    // MARK: - Confirmed faces are frozen
+
+    func testConfirmedFacesAreFrozen() throws {
+        try withFaceStore { store, _ in
+            let dad = try store.createPerson(name: "Dad", isRoster: true)
+            let photo = photoRecord("DSC00001.ARW")
+            let confirmed = faceRecord(
+                photo,
+                box: NormalizedFaceBox(x: 0.10, y: 0.10, width: 0.20, height: 0.20),
+                embedding: testEmbedding(seed: 7),
+                state: .confirmed,
+                personID: dad.id
+            )
+            try store.replaceFaces(photo: photo, faces: [confirmed])
+
+            // A rescan of the same photo detects the overlapping face again
+            // plus a disjoint new one. The confirmed face must survive
+            // untouched and the overlapping re-detection must not duplicate it.
+            let redetected = faceRecord(
+                photo,
+                box: NormalizedFaceBox(x: 0.11, y: 0.11, width: 0.20, height: 0.20),
+                embedding: testEmbedding(seed: 8)
+            )
+            let fresh = faceRecord(
+                photo,
+                box: NormalizedFaceBox(x: 0.60, y: 0.60, width: 0.15, height: 0.15),
+                embedding: testEmbedding(seed: 9)
+            )
+            try store.replaceFaces(photo: photo, faces: [redetected, fresh])
+
+            let stored = try store.faces(photoID: photo.pathKey)
+            XCTAssertEqual(stored.count, 2)
+            XCTAssertTrue(stored.contains { $0.id == confirmed.id && $0.state == .confirmed && $0.personID == dad.id })
+            XCTAssertTrue(stored.contains { $0.id == fresh.id && $0.state == .cached })
+            XCTAssertFalse(stored.contains { $0.id == redetected.id })
+            XCTAssertEqual(try store.photos(pathKeys: [photo.pathKey])[photo.pathKey]?.faceCount, 2)
+
+            // Confirmed faces cannot be reassigned or unassigned.
+            let mom = try store.createPerson(name: "Mom", isRoster: true)
+            try store.assignFace(confirmed.id, to: mom.id, state: .proposed, score: 0.9)
+            try store.unassignFace(confirmed.id)
+            let after = try store.face(id: confirmed.id)
+            XCTAssertEqual(after?.state, .confirmed)
+            XCTAssertEqual(after?.personID, dad.id)
+
+            // Junk never removes a roster person or their confirmed faces.
+            try store.deletePersonAndFaces(dad.id)
+            XCTAssertNotNil(try store.person(dad.id))
+            XCTAssertEqual(try store.face(id: confirmed.id)?.state, .confirmed)
+        }
+    }
+
+    // MARK: - Scan skip rules
+
+    func testScanGradeOrderingAndFileIdentity() throws {
+        XCTAssertTrue(FaceScanGrade.low.covers(.low))
+        XCTAssertTrue(FaceScanGrade.high.covers(.med))
+        XCTAssertFalse(FaceScanGrade.low.covers(.med))
+        XCTAssertFalse(FaceScanGrade.none.covers(.low))
+
+        let modified = Date(timeIntervalSince1970: 1_752_000_000)
+        let record = FacePhotoRecord(
+            pathKey: EventStorageLocations.pathKey("/card/DCIM/DSC1.ARW"),
+            path: "/card/DCIM/DSC1.ARW",
+            fileName: "DSC1.ARW",
+            byteCount: 100,
+            modifiedAt: modified
+        )
+        XCTAssertTrue(record.describes(path: "/card/DCIM/DSC1.ARW", size: 100, modifiedAt: modified))
+        XCTAssertFalse(record.describes(path: "/card/DCIM/DSC1.ARW", size: 101, modifiedAt: modified))
+        XCTAssertFalse(record.describes(path: "/card/DCIM/DSC1.ARW", size: 100, modifiedAt: modified.addingTimeInterval(120)))
+        XCTAssertFalse(record.describes(path: "/other/DSC1.ARW", size: 100, modifiedAt: modified))
+    }
+
+    func testScanProcessesNewPhotosAndSkipsKnownOnes() throws {
+        try withTemporaryDirectory { root in
+            let catalog = root.appendingPathComponent("catalog.sqlite")
+            _ = try CatalogStore(url: catalog).bootstrap(
+                configuration: faceTestConfiguration(root: root, catalog: catalog),
+                createBackup: false,
+                createLibraryFolders: false
+            )
+
+            // A flat-gradient JPEG is decodable but contains no faces — the
+            // photo is still recorded so a replug never rescans it.
+            let jpegURL = root.appendingPathComponent("card/DSC00001.JPG")
+            try writeJPEG(jpegURL, seed: 1)
+            let item = try organizeItem(forFileAt: jpegURL)
+            let service = FaceIndexService(catalogURL: catalog)
+
+            var report = try service.scan(items: [item], embedder: StubEmbedder())
+            XCTAssertEqual(report.photosProcessed, 1)
+            XCTAssertEqual(report.photosSkipped, 0)
+            XCTAssertEqual(report.facesDetected, 0)
+
+            // Same file identity + grade covers the mode → skipped.
+            report = try service.scan(items: [try organizeItem(forFileAt: jpegURL)], embedder: StubEmbedder())
+            XCTAssertEqual(report.photosProcessed, 0)
+            XCTAssertEqual(report.photosSkipped, 1)
+
+            // A changed file (new bytes, new mtime) is not "already scanned".
+            try writeJPEG(jpegURL, seed: 2)
+            try FileManager.default.setAttributes(
+                [.modificationDate: Date().addingTimeInterval(3_600)],
+                ofItemAtPath: jpegURL.path
+            )
+            report = try service.scan(items: [try organizeItem(forFileAt: jpegURL)], embedder: StubEmbedder())
+            XCTAssertEqual(report.photosProcessed, 1)
+            XCTAssertEqual(report.photosSkipped, 0)
+
+            // Missing embedder → the scan refuses rather than guessing.
+            XCTAssertThrowsError(try service.scan(items: [item], embedder: nil)) { error in
+                XCTAssertEqual(error as? FaceIndexError, .modelNotInstalled(FaceModelCatalog.modelFileName))
+            }
+        }
+    }
+
+    // MARK: - Match, cluster, review
+
+    func testRosterMatchProposesAndGroupsLeftovers() throws {
+        try withFaceStore { store, catalog in
+            let dad = try store.createPerson(name: "Dad", isRoster: true)
+            let galleryPhoto = photoRecord("G1.JPG")
+            let galleryFace = faceRecord(
+                galleryPhoto,
+                embedding: testEmbedding(seed: 11),
+                state: .confirmed,
+                personID: dad.id
+            )
+            try store.replaceFaces(photo: galleryPhoto, faces: [galleryFace])
+            try store.addTemplate(personID: dad.id, faceID: galleryFace.id)
+
+            let newPhoto = photoRecord("N1.JPG")
+            let nearDad = faceRecord(newPhoto, embedding: testEmbedding(seed: 11, noise: 0.15))
+            let stranger = faceRecord(newPhoto, embedding: testEmbedding(seed: 99))
+            try store.replaceFaces(photo: newPhoto, faces: [nearDad, stranger])
+
+            try FaceIndexService(catalogURL: catalog).rematchRoster()
+
+            let proposed = try store.face(id: nearDad.id)
+            XCTAssertEqual(proposed?.state, .proposed)
+            XCTAssertEqual(proposed?.personID, dad.id)
+            XCTAssertGreaterThan(proposed?.matchScore ?? 0, 0.48)
+
+            let grouped = try store.face(id: stranger.id)
+            XCTAssertEqual(grouped?.state, .other)
+            XCTAssertNotNil(grouped?.personID)
+            let group = try store.person(grouped!.personID!)
+            XCTAssertEqual(group?.isRoster, false)
+
+            XCTAssertEqual(try store.unsureFaces().map(\.id), [nearDad.id])
+            XCTAssertEqual(try store.otherGroups().count, 1)
+        }
+    }
+
+    func testClusteringGroupsBySimilarity() throws {
+        try withFaceStore { store, catalog in
+            let photo = photoRecord("C1.JPG")
+            let a1 = faceRecord(photo, detScore: 0.95, embedding: testEmbedding(seed: 21))
+            let a2 = faceRecord(photo, detScore: 0.90, embedding: testEmbedding(seed: 21, noise: 0.1))
+            let b1 = faceRecord(photo, detScore: 0.85, embedding: testEmbedding(seed: 42))
+            let loner = faceRecord(photo, detScore: 0.80, embedding: testEmbedding(seed: 77))
+            try store.replaceFaces(photo: photo, faces: [a1, a2, b1, loner])
+
+            try FaceIndexService(catalogURL: catalog).rematchRoster()
+
+            let storedA1 = try store.face(id: a1.id)
+            let storedA2 = try store.face(id: a2.id)
+            let storedB1 = try store.face(id: b1.id)
+            let storedLoner = try store.face(id: loner.id)
+
+            XCTAssertEqual(storedA1?.state, .other)
+            XCTAssertEqual(storedA1?.personID, storedA2?.personID)
+            XCTAssertNotEqual(storedA1?.personID, storedB1?.personID)
+            XCTAssertNotEqual(storedA1?.personID, storedLoner?.personID)
+            XCTAssertNotEqual(storedB1?.personID, storedLoner?.personID)
+
+            // Groups get stable "Person N" labels.
+            let names = try store.otherGroups().map(\.name).sorted()
+            XCTAssertEqual(names, ["Person 1", "Person 2", "Person 3"])
+        }
+    }
+
+    func testPromoteGroupConfirmsFacesAndBuildsTemplates() throws {
+        try withFaceStore { store, catalog in
+            // Two faces of the same cluster on different photos.
+            let p1 = photoRecord("P1.JPG")
+            let p2 = photoRecord("P2.JPG")
+            let f1 = faceRecord(p1, embedding: testEmbedding(seed: 31))
+            let f2 = faceRecord(p2, detScore: 0.8, embedding: testEmbedding(seed: 31, noise: 0.1))
+            try store.replaceFaces(photo: p1, faces: [f1])
+            try store.replaceFaces(photo: p2, faces: [f2])
+            try FaceIndexService(catalogURL: catalog).rematchRoster()
+
+            let groupID = try XCTUnwrap(store.face(id: f1.id)?.personID)
+            try store.promoteGroup(groupID, name: "Alex", templateCap: 8)
+
+            let person = try XCTUnwrap(store.person(groupID))
+            XCTAssertTrue(person.isRoster)
+            XCTAssertEqual(person.name, "Alex")
+
+            // Naming the group is the review: members are confirmed, and
+            // distinct photos become match templates.
+            XCTAssertEqual(try store.face(id: f1.id)?.state, .confirmed)
+            XCTAssertEqual(try store.face(id: f2.id)?.state, .confirmed)
+            XCTAssertEqual(try store.rosterTemplates().count, 2)
+
+            // The new gallery immediately matches a similar cached face.
+            let p3 = photoRecord("P3.JPG")
+            let f3 = faceRecord(p3, embedding: testEmbedding(seed: 31, noise: 0.12))
+            try store.replaceFaces(photo: p3, faces: [f3])
+            try FaceIndexService(catalogURL: catalog).rematchRoster()
+            let matched = try store.face(id: f3.id)
+            XCTAssertEqual(matched?.state, .proposed)
+            XCTAssertEqual(matched?.personID, groupID)
+        }
+    }
+
+    func testMergeIntoRosterKeepsFacesAsProposed() throws {
+        try withFaceStore { store, _ in
+            let dad = try store.createPerson(name: "Dad", isRoster: true)
+            let mom = try store.createPerson(name: "Mom", isRoster: true)
+
+            let photo = photoRecord("M1.JPG")
+            let confirmedDad = faceRecord(photo, embedding: testEmbedding(seed: 51), state: .confirmed, personID: dad.id)
+            let looseDad = faceRecord(
+                photo,
+                box: NormalizedFaceBox(x: 0.5, y: 0.5, width: 0.2, height: 0.2),
+                embedding: testEmbedding(seed: 52),
+                state: .other,
+                personID: dad.id
+            )
+            try store.replaceFaces(photo: photo, faces: [confirmedDad, looseDad])
+
+            try store.mergePerson(dad.id, into: mom.id)
+
+            XCTAssertNil(try store.person(dad.id))
+            // Confirmed stays frozen; the unconfirmed face stays attached as
+            // a reviewable proposal on the roster target.
+            XCTAssertEqual(try store.face(id: confirmedDad.id)?.state, .confirmed)
+            let moved = try store.face(id: looseDad.id)
+            XCTAssertEqual(moved?.personID, mom.id)
+            XCTAssertEqual(moved?.state, .proposed)
+        }
+    }
+
+    func testRejectFaceRegroupsToOthers() throws {
+        try withFaceStore { store, catalog in
+            let dad = try store.createPerson(name: "Dad", isRoster: true)
+            let galleryPhoto = photoRecord("G9.JPG")
+            let galleryFace = faceRecord(galleryPhoto, embedding: testEmbedding(seed: 61), state: .confirmed, personID: dad.id)
+            try store.replaceFaces(photo: galleryPhoto, faces: [galleryFace])
+            try store.addTemplate(personID: dad.id, faceID: galleryFace.id)
+
+            let photo = photoRecord("N9.JPG")
+            let wrongMatch = faceRecord(photo, embedding: testEmbedding(seed: 61, noise: 0.15))
+            try store.replaceFaces(photo: photo, faces: [wrongMatch])
+            let service = FaceIndexService(catalogURL: catalog)
+            try service.rematchRoster()
+            XCTAssertEqual(try store.face(id: wrongMatch.id)?.state, .proposed)
+
+            // "Not this person" sends the face back to the Other groups.
+            try service.regroup([wrongMatch.id])
+            let regrouped = try store.face(id: wrongMatch.id)
+            XCTAssertEqual(regrouped?.state, .other)
+            let group = try XCTUnwrap(regrouped?.personID.flatMap { try? store.person($0) })
+            XCTAssertFalse(group.isRoster)
+        }
+    }
+
+    // MARK: - event.people
+
+    func testEventPeopleListsRosterOnly() throws {
+        try withFaceStore { store, _ in
+            let dad = try store.createPerson(name: "Dad", isRoster: true)
+            let mom = try store.createPerson(name: "Mom", isRoster: true)
+            let stranger = try store.createPerson(name: "Person 1", isRoster: false)
+
+            let modified = Date(timeIntervalSince1970: 1_752_000_000)
+            let photo = photoRecord("DSC00077.ARW", size: 4_096, modified: modified)
+            let faces = [
+                faceRecord(photo, embedding: testEmbedding(seed: 71), state: .confirmed, personID: dad.id),
+                faceRecord(
+                    photo,
+                    box: NormalizedFaceBox(x: 0.5, y: 0.1, width: 0.2, height: 0.2),
+                    embedding: testEmbedding(seed: 72),
+                    state: .proposed,
+                    personID: mom.id
+                ),
+                // A stranger grouped automatically — must not show on chips.
+                faceRecord(
+                    photo,
+                    box: NormalizedFaceBox(x: 0.5, y: 0.5, width: 0.2, height: 0.2),
+                    embedding: testEmbedding(seed: 73),
+                    state: .other,
+                    personID: stranger.id
+                ),
+                // An ungrouped cached face — must not show either.
+                faceRecord(
+                    photo,
+                    box: NormalizedFaceBox(x: 0.1, y: 0.5, width: 0.15, height: 0.15),
+                    embedding: testEmbedding(seed: 74)
+                ),
+            ]
+            try store.replaceFaces(photo: photo, faces: faces)
+
+            // The file moved into an event folder — the same name+size+mtime
+            // file key still links the faces to the event.
+            let movedKey = FaceIndexStore.fileKey(
+                fileName: "DSC00077.ARW",
+                byteCount: 4_096,
+                modifiedAt: modified
+            )
+            let people = try store.eventPeople(fileKeys: [movedKey])
+            XCTAssertEqual(people.map(\.name), ["Dad", "Mom"])
+            XCTAssertTrue(people.allSatisfy(\.isRoster))
+            XCTAssertEqual(people.first(where: { $0.name == "Dad" })?.faceCount, 1)
+
+            // No file-key match → no people.
+            XCTAssertEqual(
+                try store.eventPeople(fileKeys: [FaceIndexStore.fileKey(fileName: "OTHER.ARW", byteCount: 1, modifiedAt: modified)]),
+                []
+            )
+        }
+    }
+
+    // MARK: - CoreML round-trip (skipped when the model is not installed)
+
+    func testArcFaceEmbedderRoundTrip() async throws {
+        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        guard FaceModelCatalog.isModelInstalled(applicationSupport: support) else {
+            throw XCTSkip("Face model not installed — run scripts/convert-arcface.sh once")
+        }
+
+        let embedder = try await FaceModelCatalog.loadEmbedder(applicationSupport: support)
+        let embedder2 = try XCTUnwrap(embedder)
+        let imageA = try makeFaceTestImage(seed: 1)
+        let imageB = try makeFaceTestImage(seed: 2)
+
+        let first = try embedder2.embed(imageA)
+        let repeatA = try embedder2.embed(imageA)
+        let other = try embedder2.embed(imageB)
+
+        XCTAssertEqual(first.count, 512)
+        var norm: Float = 0
+        for value in first { norm += value * value }
+        XCTAssertEqual(norm, 1, accuracy: 0.01)
+        XCTAssertGreaterThan(FaceEmbeddingMath.cosine(first, repeatA), 0.999)
+        XCTAssertLessThan(FaceEmbeddingMath.cosine(first, other), 0.999)
+    }
+
+    // MARK: - Helpers
+
+    /// Opens a bootstrapped catalog + face store inside a temp folder.
+    private func withFaceStore(_ body: (FaceIndexStore, URL) throws -> Void) throws {
+        try withTemporaryDirectory { root in
+            let catalog = root.appendingPathComponent("catalog.sqlite")
+            _ = try CatalogStore(url: catalog).bootstrap(
+                configuration: faceTestConfiguration(root: root, catalog: catalog),
+                createBackup: false,
+                createLibraryFolders: false
+            )
+            try body(FaceIndexStore(url: catalog), catalog)
+        }
+    }
+
+    private func faceTestConfiguration(root: URL, catalog: URL) -> AppConfiguration {
+        var configuration = testConfiguration(root: root)
+        configuration.catalogDatabasePath = catalog.path
+        return configuration
+    }
+
+    private func photoRecord(
+        _ name: String,
+        size: Int64 = 1_024,
+        modified: Date = Date(timeIntervalSince1970: 1_752_000_000),
+        directory: String = "/tmp/faces"
+    ) -> FacePhotoRecord {
+        let path = "\(directory)/\(name)"
+        return FacePhotoRecord(
+            pathKey: EventStorageLocations.pathKey(path),
+            path: path,
+            fileName: name,
+            byteCount: size,
+            modifiedAt: modified
+        )
+    }
+
+    private func faceRecord(
+        _ photo: FacePhotoRecord,
+        box: NormalizedFaceBox = NormalizedFaceBox(x: 0.1, y: 0.1, width: 0.2, height: 0.2),
+        detScore: Double = 0.9,
+        embedding: [Float]? = nil,
+        state: FaceState = .cached,
+        personID: UUID? = nil
+    ) -> FaceRecord {
+        FaceRecord(
+            photoID: photo.pathKey,
+            personID: personID,
+            box: box,
+            detScore: detScore,
+            embedding: embedding,
+            state: state,
+            photoPath: photo.path
+        )
+    }
+
+    /// Builds a real OrganizeItem from a file on disk so size/mtime match the
+    /// bytes the scan pipeline will stat.
+    private func organizeItem(forFileAt url: URL) throws -> OrganizeItem {
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        let size = (attributes[.size] as? Int64) ?? 0
+        let modified = (attributes[.modificationDate] as? Date) ?? Date()
+        return OrganizeItem(
+            primary: OrganizeFile(path: url.path, size: size, modifiedAt: modified),
+            kind: .photo,
+            captureDate: modified,
+            hasCameraDate: false
+        )
+    }
+
+    /// A deterministic 512-d vector. Different seeds are near-orthogonal;
+    /// `noise` produces a slightly perturbed copy of the same seed's vector.
+    private func testEmbedding(seed: UInt64, noise: Float = 0) -> [Float] {
+        var generator = SplitMix64(seed: seed)
+        var vector = (0..<512).map { _ in
+            Float(generator.next() >> 40) / Float(1 << 24) * 2 - 1
+        }
+        if noise > 0 {
+            var noiseGenerator = SplitMix64(seed: seed ^ 0x9E3779B97F4A7C15)
+            for index in vector.indices {
+                vector[index] += noise * (Float(noiseGenerator.next() >> 40) / Float(1 << 24) * 2 - 1)
+            }
+        }
+        return FaceEmbeddingMath.l2Normalized(vector)
+    }
+
+    /// Writes a flat-gradient JPEG — decodable, and guaranteed to contain no
+    /// faces so the scan exercises the pipeline without needing real media.
+    private func writeJPEG(_ url: URL, seed: UInt8) throws {
+        let size = 640
+        guard let context = CGContext(
+            data: nil,
+            width: size,
+            height: size,
+            bitsPerComponent: 8,
+            bytesPerRow: size * 4,
+            space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else {
+            throw XCTSkip("Could not create a test bitmap")
+        }
+        // Paint a few flat bands so the output is a valid non-empty JPEG.
+        for band in 0..<8 {
+            let shade = CGFloat((Int(seed) + band * 31) % 255) / 255
+            context.setFillColor(CGColor(red: shade, green: shade, blue: 1 - shade, alpha: 1))
+            context.fill(CGRect(x: 0, y: band * size / 8, width: size, height: size / 8))
+        }
+        let painted = try XCTUnwrap(context.makeImage())
+        let data = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(data, "public.jpeg" as CFString, 1, nil) else {
+            throw XCTSkip("Could not create a JPEG destination")
+        }
+        CGImageDestinationAddImage(destination, painted, nil)
+        guard CGImageDestinationFinalize(destination) else {
+            throw XCTSkip("Could not finalize a JPEG")
+        }
+        try writeFile(url, data as Data)
+    }
+
+    /// A deterministic 112×112 bitmap for the CoreML round-trip test.
+    private func makeFaceTestImage(seed: UInt8) throws -> CGImage {
+        let size = FaceAligner.outputSize
+        guard let context = CGContext(
+            data: nil,
+            width: size,
+            height: size,
+            bitsPerComponent: 8,
+            bytesPerRow: size * 4,
+            space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else {
+            throw XCTSkip("Could not create a test bitmap")
+        }
+        for index in 0..<16 {
+            let shade = CGFloat((Int(seed) * 17 + index * 13) % 255) / 255
+            context.setFillColor(CGColor(red: shade, green: 1 - shade, blue: shade / 2, alpha: 1))
+            context.fill(CGRect(x: (index % 4) * size / 4, y: (index / 4) * size / 4, width: size / 4, height: size / 4))
+        }
+        return try XCTUnwrap(context.makeImage())
+    }
+
+    private func scalarInt(_ sql: String, database url: URL) -> Int {
+        var database: OpaquePointer?
+        guard sqlite3_open(url.path, &database) == SQLITE_OK, let database else { return -1 }
+        defer { sqlite3_close(database) }
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK, let statement else { return -1 }
+        defer { sqlite3_finalize(statement) }
+        return sqlite3_step(statement) == SQLITE_ROW ? Int(sqlite3_column_int(statement, 0)) : 0
+    }
+
+    private func scalarString(_ sql: String, database url: URL) -> String? {
+        scalarRows(sql, database: url).first?.first ?? nil
+    }
+
+    private func scalarRows(_ sql: String, database url: URL) -> [[String?]] {
+        var database: OpaquePointer?
+        guard sqlite3_open(url.path, &database) == SQLITE_OK, let database else { return [] }
+        defer { sqlite3_close(database) }
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK, let statement else { return [] }
+        defer { sqlite3_finalize(statement) }
+        var rows: [[String?]] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            var row: [String?] = []
+            let columns = sqlite3_column_count(statement)
+            for index in 0..<columns {
+                if sqlite3_column_type(statement, index) == SQLITE_NULL {
+                    row.append(nil)
+                } else if let text = sqlite3_column_text(statement, index) {
+                    row.append(String(cString: text))
+                } else {
+                    row.append(nil)
+                }
+            }
+            rows.append(row)
+        }
+        return rows
+    }
+}
+
+/// Deterministic PRNG for synthetic embeddings — no crypto needed.
+private struct SplitMix64: RandomNumberGenerator {
+    var state: UInt64
+    init(seed: UInt64) { state = seed }
+    mutating func next() -> UInt64 {
+        state &+= 0x9E3779B97F4A7C15
+        var z = state
+        z = (z ^ (z >> 30)) &* 0xBF58476D1CE4E5B9
+        z = (z ^ (z >> 27)) &* 0x94D049BB133111EB
+        return z ^ (z >> 31)
+    }
+}
+
+/// Never actually called — scans in these tests run on face-free images.
+private struct StubEmbedder: FaceEmbeddingProviding {
+    func embed(_ image: CGImage) throws -> [Float] {
+        FaceEmbeddingMath.l2Normalized([Float](repeating: 1, count: 512))
+    }
+}

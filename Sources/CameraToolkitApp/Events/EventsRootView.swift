@@ -133,7 +133,10 @@ struct EventsSidebar: View {
             .padding(.vertical, 10)
             Divider()
 
-            List(selection: $workspace.selection) {
+            List(selection: Binding(
+                get: { workspace.selection },
+                set: { workspace.selection = $0 }
+            )) {
                 let discovered = workspace.discoveredDriveEvents(matching: searchText)
                 if !discovered.isEmpty {
                     Section("Found on Your Drive") {
@@ -145,9 +148,13 @@ struct EventsSidebar: View {
                 Section("Unsorted Photos") {
                     ForEach(workspace.unsortedLocations(matching: searchText)) { location in
                         unsortedRow(location)
-                            .tag(Optional(EventsSidebarSelection.unsorted(location.id)))
+                            .tag(EventsSidebarSelection.unsorted(location.id) as EventsSidebarSelection?)
+                            .contentShape(Rectangle())
+                            .onTapGesture { workspace.selection = .unsorted(location.id) }
                             .contextMenu {
                                 Button("Rescan") { workspace.scan(location, force: true) }
+                                Button("Scan for Faces (Low · Fast)") { workspace.faceScan(location) }
+                                    .help("Detect and match faces on still photos. Writes only to the catalog — media is read, never touched.")
                                 Button("Reveal in Finder") {
                                     NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: DashboardModel.expandedPath(location.path))])
                                 }
@@ -172,17 +179,33 @@ struct EventsSidebar: View {
                     // Parents newest-first; each subevent sits indented under
                     // its parent — the flat row style stays the same.
                     ForEach(workspace.sidebarRows(matching: searchText), id: \.event.id) { row in
-                        eventRow(row.event)
-                            .padding(.leading, CGFloat(row.depth) * 16)
-                            .tag(Optional(EventsSidebarSelection.event(row.event.id)))
-                            .dropDestination(for: String.self) { items, _ in
-                                workspace.handleDrop(items, onto: row.event.id)
-                            } isTargeted: { targeted in
-                                if targeted {
-                                    targetedEventID = row.event.id
-                                } else if targetedEventID == row.event.id {
-                                    targetedEventID = nil
+                        eventRow(row.event, depth: row.depth)
+                            .tag(EventsSidebarSelection.event(row.event.id) as EventsSidebarSelection?)
+                            .contentShape(Rectangle())
+                            .onTapGesture { workspace.selection = .event(row.event.id) }
+                            .onDrop(of: [.text], isTargeted: Binding(
+                                get: { targetedEventID == row.event.id },
+                                set: { hovering in
+                                    if hovering {
+                                        targetedEventID = row.event.id
+                                    } else if targetedEventID == row.event.id {
+                                        targetedEventID = nil
+                                    }
                                 }
+                            )) { providers in
+                                Task { @MainActor in
+                                    var strings: [String] = []
+                                    for provider in providers {
+                                        if let str = try? await provider.loadItem(forTypeIdentifier: "public.utf8-plain-text") as? String {
+                                            strings.append(str)
+                                        } else if let data = try? await provider.loadItem(forTypeIdentifier: "public.utf8-plain-text") as? Data,
+                                                  let str = String(data: data, encoding: .utf8) {
+                                            strings.append(str)
+                                        }
+                                    }
+                                    _ = workspace.handleDrop(strings, onto: row.event.id)
+                                }
+                                return true
                             }
                             .contextMenu {
                                 Button("New Subevent…") {
@@ -213,11 +236,11 @@ struct EventsSidebar: View {
                 }
             }
             .listStyle(.sidebar)
-            .searchable(text: $searchText, placement: .sidebar, prompt: "Search")
 
             Divider()
             footer
         }
+        .searchable(text: $searchText, placement: .sidebar, prompt: "Search")
     }
 
     private func discoveryBanner(_ found: [DiscoveredDriveEvent]) -> some View {
@@ -276,9 +299,10 @@ struct EventsSidebar: View {
         .padding(.vertical, 2)
     }
 
-    private func eventRow(_ event: SavedCameraEvent) -> some View {
+    private func eventRow(_ event: SavedCameraEvent, depth: Int = 0) -> some View {
         let count = workspace.assignmentCount(for: event.id)
         let summary = workspace.presence[event.id]
+        let names = workspace.eventPeople(event.id).map(\.name).joined(separator: ", ")
         return HStack(spacing: 8) {
             Circle()
                 .fill(EventPalette.color(for: event.id))
@@ -286,9 +310,10 @@ struct EventsSidebar: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(event.name)
                     .lineLimit(1)
-                Text("\(event.eventDate.formatted(date: .abbreviated, time: .omitted)) · \(count) file\(count == 1 ? "" : "s")")
+                Text("\(event.eventDate.formatted(date: .abbreviated, time: .omitted)) · \(count) file\(count == 1 ? "" : "s")\(names.isEmpty ? "" : " · \(names)")")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .lineLimit(1)
             }
             Spacer(minLength: 0)
             if workspace.resolvedPolicy(for: event) == .archiveOnly {
@@ -310,10 +335,12 @@ struct EventsSidebar: View {
         }
         .padding(.vertical, 2)
         .padding(.horizontal, 4)
-        .background(
+        .padding(.leading, CGFloat(depth) * 16)
+        .background {
             RoundedRectangle(cornerRadius: 6)
                 .fill(targetedEventID == event.id ? Color.accentColor.opacity(0.25) : Color.clear)
-        )
+                .allowsHitTesting(false)
+        }
     }
 
     private var footer: some View {
@@ -325,6 +352,13 @@ struct EventsSidebar: View {
                 symbol: model.transferQueue?.state == .running ? "arrow.down.circle.fill" : "arrow.down.circle"
             ) {
                 TransferQueueWindowController.shared.show(model: model)
+            }
+            footerButton(
+                "People",
+                detail: workspace.faceModelInstalled ? nil : "model missing",
+                symbol: "person.2"
+            ) {
+                PeopleWindowController.shared.show(model: model, workspace: workspace)
             }
             footerButton("File Browser", detail: nil, symbol: "folder") {
                 AppShellMode.show(.files)

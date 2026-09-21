@@ -74,6 +74,20 @@ struct EventBoardView: View {
                 Text("\(event.eventDate.formatted(date: .complete, time: .omitted)) · \(workspace.assignmentCount(for: eventID)) files · \(workspace.assignmentBytes(for: eventID).formattedBytes)")
                     .font(.callout)
                     .foregroundStyle(.secondary)
+                let people = workspace.eventPeople(eventID)
+                if !people.isEmpty {
+                    HStack(spacing: 4) {
+                        ForEach(people.prefix(6)) { person in
+                            PersonChip(person: person)
+                        }
+                        if people.count > 6 {
+                            Text("+\(people.count - 6) more")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .padding(.top, 2)
+                }
             }
             Spacer()
             Picker("Keep on drive", selection: Binding(

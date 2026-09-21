@@ -24,6 +24,7 @@ Sources/
 └── CameraToolkitCore/
     ├── Catalog/        # GRDB schema, sync, inspection, and activity history
     ├── Configuration/  # persisted settings, event policy, and event-name policy
+    ├── Faces/          # on-device face detection, embeddings, match/group index
     ├── Import/         # scanning, planning, copy, and archive organization
     ├── Integrations/   # external service clients
     ├── Media/          # media parsing and streaming file hashes
@@ -71,6 +72,30 @@ Immich
 
 `EventsWorkspace` in the app target orchestrates these services and reuses `DashboardModel`'s single-job gate, transfer queue, and activity log.
 
+## Face index
+
+Faces exist to tag events: `event.people` is the unique set of named (roster) people detected on an event's photos, surfaced as chips on event headers and names in the sidebar. The pipeline is fully on-device and lives in `CameraToolkitCore/Faces/`:
+
+```text
+unsorted stills (video skipped at LOW)
+    │ VisionFaceDetector: Vision rectangles+landmarks on a bounded decode,
+    │   min-size floor ~64px, RAW files read their embedded JPEG
+    ▼
+FaceAligner: 5-point similarity warp to 112×112 (box-crop fallback)
+    │ ArcFaceEmbedder: single frozen identity model → 512-d L2-normalized vector
+    ▼
+FaceIndexService: cosine vs roster templates → proposed, else greedy
+    cosine clustering into unnamed "Other" groups
+    ▼
+FaceIndexStore: faces/people/face_templates/face_photos tables in the catalog
+```
+
+- The identity model is a fixed, generated `.mlpackage` under `Application Support/CameraToolkit/Models`, produced once per machine by `scripts/convert-arcface.sh` — the only Python anywhere; nothing ships or re-trains. Embedding vectors are keyed by a fixed model name and never mix spaces.
+- Scan grades are ordered (`none < low < med < high < xhigh`); a photo whose recorded grade covers the requested mode is skipped, keyed by file identity (name + size + mtime) so replugging a drive or moving a file never re-runs detection. Only the LOW pipeline exists; a higher request still runs it and stamps the grade that actually ran.
+- Confirmed faces are frozen: photo re-scans never delete or reclassify them, and overlapping fresh detections are dropped instead of duplicating.
+- The People window (View → People, ⌘⌥P) offers the three review queues — roster, new groups, unsure — with name/merge/junk/confirm actions. Naming a group promotes it to the roster, confirms its faces, and pins distinct-photo members as match templates; merges keep unconfirmed faces reviewable as proposals. Re-match re-evaluates stored vectors against the gallery on CPU only.
+- Face work runs inside `runAsyncJob` like other file jobs; FAST is the default throttle (2 workers). `EventBoardView` and the sidebar read `eventPeople` through `EventsWorkspace`, cached per faces-revision so rows share one catalog pass.
+
 Connectivity is refreshed explicitly instead of relying on Finder: `EventsWorkspace.refreshConnectivity()` re-checks each configured location with cheap mount-table and folder-stat probes, bumps `connectivityRevision` so views that call `isConnected` re-render, re-runs `DriveEventDiscovery` and the cached per-event presence summaries, and rescans only unsorted sources whose earlier scan failed — plus sources on a volume that just mounted. Healthy cached scan results are never rescanned by a connectivity refresh. `NSWorkspace` `didMount`/`didUnmount` observers (registered once via `observeVolumeChanges()`, called from `EventsWorkspace.start()` and `AppShell.onAppear`) drive it automatically through a ~0.75 s trailing debounce that remembers mounted volume URLs, so a flapping hub collapses into one refresh pass; sidebar rows, the setup guide's place cards, the Settings "Where Things Live" rows, and the event storage strip each offer a Refresh/Check Again control that calls it. Refresh never mounts shares itself — the configuration stores local paths and service URLs, not network share URLs, so there is no mount URL to retry. `PhotoBrowserView` listens for the same notifications to refresh capacity dots and reload the current folder when its drive comes back.
 
 ## Import flow
@@ -92,7 +117,7 @@ photo library originals
 
 ## Catalog and configuration
 
-`AppConfiguration` is JSON-encoded local state. It stores selected locations, events with their storage policy, file assignments, integration endpoints, and policy—not API keys. `DashboardModel.updateConfiguration` coalesces mutations into a trailing-debounced JSON write (~250 ms) and flushes synchronously on `applicationWillTerminate`, so bursts cost one write and the last state is always durable. `CatalogStore` mirrors those relationships into SQLite for fast cross-drive event browsing. Catalog writes are serialized through GRDB, and the in-app inspector accepts bounded read-only queries only.
+`AppConfiguration` is JSON-encoded local state. It stores selected locations, events with their storage policy, file assignments, integration endpoints, and policy—not API keys. `DashboardModel.updateConfiguration` coalesces mutations into a trailing-debounced JSON write (~250 ms) and flushes synchronously on `applicationWillTerminate`, so bursts cost one write and the last state is always durable. `CatalogStore` mirrors those relationships into SQLite for fast cross-drive event browsing — its bootstrap also owns the face-index tables (`face_photos`, `faces`, `people`, `face_templates`) that `FaceIndexStore` reads and writes. Catalog writes are serialized through GRDB, and the in-app inspector accepts bounded read-only queries only.
 
 Integration API keys are stored separately by `KeychainSecretStore`. `ImmichClient` performs connection checks, checksum-presence reads, streamed multipart uploads, and album creation. `TrueNASClient` uses the secure JSON-RPC WebSocket API, optionally pins a self-signed TLS certificate, resolves a mounted SMB share to its deepest matching dataset, and reads dataset/pool capacity without changing NAS state.
 

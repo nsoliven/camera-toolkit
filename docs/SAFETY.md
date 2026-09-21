@@ -27,6 +27,7 @@ Camera Toolkit treats source media as read-only during normal browsing and trans
 - **Free Up Source** re-hashes each card or unsorted-folder original against its drive copy and permanently removes the source originals only when the whole set matches, exactly like Free Up Camera. It is never offered for files whose only copy is the drive copy.
 - Adopting event folders already on the drive only records assignments. No file moves.
 - Immich upload sends only files in events marked **Send to Immich**, skips content Immich already has by SHA-1, and keeps the API key in Keychain.
+- Face scans are read-only on media: detection and embedding read photo bytes (or their embedded previews) and write only to the local catalog database. Naming, merging, and junking groups change catalog rows — a junked group's face rows are deleted from the index, but no photo, sidecar, or catalog event is ever touched. Confirmed faces are frozen and are never reclassified or removed by later scans.
 
 ## Failure behavior
 
