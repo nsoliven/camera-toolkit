@@ -117,6 +117,9 @@ struct TileThumbnail: View {
     let url: URL
     let kind: OrganizeMediaKind
     let pixelSize: Int
+    /// Display rotation in quarter-turns clockwise; part of the task id so a
+    /// "Rotate Burst" change re-decodes this tile without a rescan.
+    var orientation: Int = 0
 
     @State private var image: CGImage?
     @State private var failed = false
@@ -137,15 +140,15 @@ struct TileThumbnail: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .task(id: "\(url.path)#\(TileImageLoader.bucket(for: pixelSize))") {
-            if let cached = TileImageLoader.shared.cachedImage(for: url, maximumPixelSize: pixelSize) {
+        .task(id: "\(url.path)#\(TileImageLoader.bucket(for: pixelSize))#\(orientation)") {
+            if let cached = TileImageLoader.shared.cachedImage(for: url, maximumPixelSize: pixelSize, orientation: orientation) {
                 image = cached
                 failed = false
                 return
             }
             image = nil
             failed = false
-            let loaded = await TileImageLoader.shared.image(for: url, maximumPixelSize: pixelSize)
+            let loaded = await TileImageLoader.shared.image(for: url, maximumPixelSize: pixelSize, orientation: orientation)
             guard !Task.isCancelled else { return }
             image = loaded
             failed = loaded == nil
@@ -176,11 +179,13 @@ struct StackTileView: View {
     /// Subfolder the stack lives in, relative to the scan root — shown as a
     /// tooltip. Nil when the stack sits directly in the scanned folder.
     var originFolder: String? = nil
+    /// Display rotation of the cover frame in quarter-turns clockwise.
+    var orientation: Int = 0
 
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
             ZStack {
-                TileThumbnail(url: stack.coverItem.primary.url, kind: stack.kind, pixelSize: Int(width * 2))
+                TileThumbnail(url: stack.coverItem.primary.url, kind: stack.kind, pixelSize: Int(width * 2), orientation: orientation)
                     .frame(width: width, height: width * 2 / 3)
                     .clipped()
                 VStack {
@@ -333,6 +338,9 @@ struct OrganizeGrid<MenuContent: View>: View {
     let eventForStack: (OrganizeStack) -> (event: SavedCameraEvent?, mixed: Bool)
     let isDimmed: (OrganizeStack) -> Bool
     let badge: (OrganizeStack) -> TileLocationBadge?
+    /// Display rotation recorded for a file, in quarter-turns clockwise —
+    /// the cover frame's value drives the tile decode.
+    var orientationForFile: (OrganizeFile) -> Int = { _ in 0 }
     let onOpen: (OrganizeStack) -> Void
     let onKey: (KeyPress, [String]) -> KeyPress.Result
     @ViewBuilder let menu: (OrganizeStack) -> MenuContent
@@ -404,7 +412,8 @@ struct OrganizeGrid<MenuContent: View>: View {
             originFolder: OrganizeFolderLabel.subfolder(
                 forFolderPath: stack.coverItem.primary.folderPath,
                 rootPath: rootPath
-            )
+            ),
+            orientation: orientationForFile(stack.coverItem.primary)
         )
         .id(stack.id)
         .onTapGesture {
@@ -614,13 +623,21 @@ struct FilmstripSelection: Equatable {
     }
 }
 
+/// A high-resolution decode request: the frame's path plus the display
+/// rotation it should be decoded with.
+private struct HiResRequest: Equatable {
+    var path: String
+    var turns: Int
+}
+
 /// Full-size review of one burst at a time with a filmstrip of every frame.
 /// The image area is the shared interactive canvas: click toggles zoom at the
 /// pointer, drag pans while zoomed, `+`/`-`/`0`/`⌘1` step or reset zoom, and
-/// a deeper decode swaps in once zoom passes 1.5×. The filmstrip selects
-/// Finder-style — click, ⇧-click for a range, ⌘-click to toggle — and
-/// right-click offers "Move to Trash" and "Move to New Burst" for the whole
-/// selection when the board supports them.
+/// a deeper decode swaps in once zoom passes 1.5×. `[`/`]`/`R` rotate the
+/// whole stack at once. The filmstrip selects Finder-style — click,
+/// ⇧-click for a range, ⌘-click to toggle — and right-click offers "Move
+/// to Trash" and "Move to New Burst" for the whole selection when the
+/// board supports them.
 struct StackPreviewOverlay: View {
     let workspace: EventsWorkspace
     let stacks: [OrganizeStack]
@@ -646,15 +663,20 @@ struct StackPreviewOverlay: View {
     /// Enables "Move to New Burst" on the frame and thumbnail menus: the
     /// selected frames leave this stack and stay split on later rescans.
     var onSplitItems: (([OrganizeItem]) -> Void)? = nil
+    /// Display rotation recorded for a file, in quarter-turns clockwise.
+    var orientationForFile: (OrganizeFile) -> Int = { _ in 0 }
+    /// "Rotate Burst" — applies `delta` quarter-turns clockwise to every
+    /// frame of the stack. Nil hides the menu and disables the keys.
+    var onRotate: ((OrganizeStack, Int) -> Void)? = nil
 
     /// Frame selection state — `edge` is the frame the preview shows.
     @State private var selection = FilmstripSelection()
     @State private var image: CGImage?
-    /// Path of the frame a high-resolution decode was requested for — set the
-    /// moment zoom passes fit so a stale frame never triggers a fetch.
-    @State private var hiResRequestPath: String?
-    /// The decoded 4800 px frame paired with the path it belongs to.
-    @State private var hiResImage: (path: String, image: CGImage)?
+    /// The frame+rotation a high-resolution decode was requested for — set
+    /// the moment zoom passes fit so a stale frame never triggers a fetch.
+    @State private var hiResRequest: HiResRequest?
+    /// The decoded 4800 px frame paired with the request it belongs to.
+    @State private var hiResImage: (key: HiResRequest, image: CGImage)?
     @State private var failed = false
     @State private var zoomCommand: PreviewZoomCommand?
     @FocusState private var isFocused: Bool
@@ -667,12 +689,20 @@ struct StackPreviewOverlay: View {
     private var item: OrganizeItem? {
         stack.map { $0.items[min(max(frameIndex, 0), $0.items.count - 1)] }
     }
+    /// Quarter-turns recorded for the frame on screen right now.
+    private var itemRotation: Int {
+        item.map { orientationForFile($0.primary) } ?? 0
+    }
+    /// What the hi-res decode should be working on for the current frame.
+    private var currentHiResKey: HiResRequest? {
+        item.map { HiResRequest(path: $0.primary.path, turns: itemRotation) }
+    }
 
     /// The frame the canvas should draw: the hi-res decode once it exists for
     /// the current item, scaled so its layout matches the base image exactly.
     private var displayImage: (image: CGImage, scale: CGFloat)? {
         if let hiResImage,
-           hiResImage.path == item?.primary.path,
+           hiResImage.key == currentHiResKey,
            hiResImage.image.width > (image?.width ?? 0) {
             let scale = image.map { CGFloat(hiResImage.image.width) / CGFloat($0.width) } ?? 1
             return (hiResImage.image, scale)
@@ -681,7 +711,7 @@ struct StackPreviewOverlay: View {
     }
 
     private var hintText: String {
-        var text = "← → frames · ⇧← → select · ⇧/⌘-click frames · ↑ ↓ items · click zoom · drag pan · + − 0 zoom · 1–3 sort · O open"
+        var text = "← → frames · ⇧← → select · ⇧/⌘-click frames · ↑ ↓ items · click zoom · drag pan · + − 0 zoom · [ ] rotate · 1–3 sort · O open"
         if onTrashItems != nil { text += " · ⌫/right-click trash" }
         return text + " · Esc close"
     }
@@ -701,7 +731,7 @@ struct StackPreviewOverlay: View {
                         zoomCommand: $zoomCommand,
                         onZoomChange: { zoom in
                             if zoom > 1.5 {
-                                hiResRequestPath = item.primary.path
+                                hiResRequest = currentHiResKey
                             }
                         }
                     )
@@ -741,7 +771,13 @@ struct StackPreviewOverlay: View {
             // New frame: release the previous hi-res decode (the NSCache still
             // has it if the user zooms back) and stop any in-flight request.
             hiResImage = nil
-            hiResRequestPath = nil
+            hiResRequest = nil
+        }
+        .onChange(of: itemRotation) { _, _ in
+            // Rotate Burst turned the stack: drop the old hi-res decode and
+            // re-request it at the new orientation if still zoomed in.
+            hiResImage = nil
+            if hiResRequest != nil { hiResRequest = currentHiResKey }
         }
         .onChange(of: stackIndex) { old, new in
             // The current stack vanished — e.g. its remaining frames were
@@ -754,8 +790,8 @@ struct StackPreviewOverlay: View {
                 stackID = stacks[min(max(old ?? 0, 0), stacks.count - 1)].id
             }
         }
-        .task(id: item?.primary.path) { await load() }
-        .task(id: hiResRequestPath) { await loadHiRes() }
+        .task(id: "\(item?.primary.path ?? "")#\(itemRotation)") { await load() }
+        .task(id: hiResRequest) { await loadHiRes() }
     }
 
     private func header(stack: OrganizeStack, item: OrganizeItem) -> some View {
@@ -780,6 +816,25 @@ struct StackPreviewOverlay: View {
                 onAssign: { assign(stack, to: $0) },
                 onNewEvent: { onNewEvent(stack) }
             )
+            if onRotate != nil {
+                Menu {
+                    Button { rotate(by: -1) } label: {
+                        Label("Rotate All 90° Left", systemImage: "rotate.left")
+                    }
+                    Button { rotate(by: 2) } label: {
+                        Label("Rotate All 180°", systemImage: "arrow.triangle.2.circlepath")
+                    }
+                    Button { rotate(by: 1) } label: {
+                        Label("Rotate All 90° Right", systemImage: "rotate.right")
+                    }
+                } label: {
+                    Label("Rotate Burst", systemImage: "rotate.right")
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .disabled(DisplayRotation.rotatableFiles(in: stack).isEmpty)
+                .help("Rotate every frame in this burst together ( [ ] or R / Shift-R ). Display-only — originals are never rewritten.")
+            }
             Button {
                 PhotomatorLauncher.open(item.files.map(\.url))
             } label: {
@@ -804,7 +859,7 @@ struct StackPreviewOverlay: View {
                     ForEach(Array(stack.items.enumerated()), id: \.element.id) { index, frame in
                         let isSelected = selectedIndexes.contains(index)
                         let isCurrent = index == frameIndex
-                        TileThumbnail(url: frame.primary.url, kind: frame.kind, pixelSize: 256)
+                        TileThumbnail(url: frame.primary.url, kind: frame.kind, pixelSize: 256, orientation: orientationForFile(frame.primary))
                             .frame(width: 96, height: 64)
                             .clipShape(RoundedRectangle(cornerRadius: 5))
                             .overlay {
@@ -851,6 +906,14 @@ struct StackPreviewOverlay: View {
     private func frameContextMenu(_ stack: OrganizeStack, index: Int) -> some View {
         let item = stack.items[index]
         let targets = selection.selectedIDs.contains(item.id) ? selection.selectedItems(in: stack.items) : [item]
+        if onRotate != nil {
+            Menu("Rotate Burst") {
+                Button("Rotate All 90° Left") { rotate(by: -1) }
+                Button("Rotate All 180°") { rotate(by: 2) }
+                Button("Rotate All 90° Right") { rotate(by: 1) }
+            }
+            .disabled(DisplayRotation.rotatableFiles(in: stack).isEmpty)
+        }
         if let onSplitItems, targets.count < stack.items.count {
             Button(targets.count > 1 ? "Move \(targets.count) Frames to New Burst" : "Move Frame to New Burst") {
                 if !selection.selectedIDs.contains(item.id) { selection.select(index, in: stack.items) }
@@ -910,6 +973,18 @@ struct StackPreviewOverlay: View {
                 case "0":
                     zoomCommand = .fit
                     return .handled
+                case "]", "}":
+                    rotate(by: 1)
+                    return .handled
+                case "[", "{":
+                    rotate(by: -1)
+                    return .handled
+                case "r":
+                    rotate(by: 1)
+                    return .handled
+                case "R":
+                    rotate(by: -1)
+                    return .handled
                 default:
                     break
                 }
@@ -936,15 +1011,24 @@ struct StackPreviewOverlay: View {
         }
     }
 
+    /// One action turns the whole stack: every still plus JPEG companions,
+    /// via the board's `onRotate` callback.
+    private func rotate(by delta: Int) {
+        guard let stack, let onRotate else { return }
+        onRotate(stack, delta)
+    }
+
     private func load() async {
-        guard let url = item?.primary.url else { return }
+        guard let item else { return }
+        let url = item.primary.url
+        let orientation = itemRotation
         failed = false
-        if let full = TileImageLoader.shared.cachedImage(for: url, maximumPixelSize: 2_400) {
+        if let full = TileImageLoader.shared.cachedImage(for: url, maximumPixelSize: 2_400, orientation: orientation) {
             image = full
         } else {
-            image = TileImageLoader.shared.cachedImage(for: url, maximumPixelSize: 768)
-                ?? TileImageLoader.shared.cachedImage(for: url, maximumPixelSize: 384)
-            if let full = await TileImageLoader.shared.image(for: url, maximumPixelSize: 2_400), !Task.isCancelled {
+            image = TileImageLoader.shared.cachedImage(for: url, maximumPixelSize: 768, orientation: orientation)
+                ?? TileImageLoader.shared.cachedImage(for: url, maximumPixelSize: 384, orientation: orientation)
+            if let full = await TileImageLoader.shared.image(for: url, maximumPixelSize: 2_400, orientation: orientation), !Task.isCancelled {
                 image = full
             }
             if !Task.isCancelled, image == nil {
@@ -953,33 +1037,34 @@ struct StackPreviewOverlay: View {
         }
         guard let stack, !Task.isCancelled else { return }
         for offset in [1, 2] where frameIndex + offset < stack.items.count {
-            let next = stack.items[frameIndex + offset].primary.url
+            let next = stack.items[frameIndex + offset].primary
+            let nextOrientation = orientationForFile(next)
             Task.detached(priority: .utility) {
-                _ = await TileImageLoader.shared.image(for: next, maximumPixelSize: 2_400)
+                _ = await TileImageLoader.shared.image(for: next.url, maximumPixelSize: 2_400, orientation: nextOrientation)
             }
         }
     }
 
-    /// Zooming past fit asks for the 4800 px decode of the current frame. The
-    /// swap is invisible: `displayImage` scales the bigger image to the exact
-    /// point size the base decode was shown at.
+    /// Zooming past fit asks for the 4800 px decode of the current frame at
+    /// its current rotation. The swap is invisible: `displayImage` scales the
+    /// bigger image to the exact point size the base decode was shown at.
     private func loadHiRes() async {
-        guard let path = hiResRequestPath, path == item?.primary.path else { return }
-        let url = URL(fileURLWithPath: path)
-        if let cached = TileImageLoader.shared.cachedImage(for: url, maximumPixelSize: 4_800) {
+        guard let request = hiResRequest, request == currentHiResKey else { return }
+        let url = URL(fileURLWithPath: request.path)
+        if let cached = TileImageLoader.shared.cachedImage(for: url, maximumPixelSize: 4_800, orientation: request.turns) {
             guard !Task.isCancelled else { return }
-            storeHiRes(cached, path: path)
+            storeHiRes(cached, key: request)
             return
         }
-        if let loaded = await TileImageLoader.shared.image(for: url, maximumPixelSize: 4_800), !Task.isCancelled {
-            storeHiRes(loaded, path: path)
+        if let loaded = await TileImageLoader.shared.image(for: url, maximumPixelSize: 4_800, orientation: request.turns), !Task.isCancelled {
+            storeHiRes(loaded, key: request)
         }
     }
 
-    private func storeHiRes(_ loaded: CGImage, path: String) {
+    private func storeHiRes(_ loaded: CGImage, key: HiResRequest) {
         // A decode that isn't larger than what's on screen adds nothing — the
         // source was smaller than the bucket.
         if let image, loaded.width <= image.width { return }
-        hiResImage = (path, loaded)
+        hiResImage = (key, loaded)
     }
 }

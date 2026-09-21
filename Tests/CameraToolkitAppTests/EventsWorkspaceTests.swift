@@ -844,6 +844,54 @@ final class EventsWorkspaceTests: XCTestCase {
         }
     }
 
+    /// Rotate Burst applies the same quarter-turn to every still in the stack
+    /// — RAW primaries and the keep-JPEG companion alike — while the XMP
+    /// sidecar stays out of the map and no byte on disk changes.
+    func testRotateBurstTurnsEveryStillTogetherWithoutTouchingFiles() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let unsorted = root.appendingPathComponent("Drive/Unsorted A7V", isDirectory: true)
+            try writeOrganizerARW(unsorted.appendingPathComponent("Transfer 1/B0001_DSC00001.ARW"), "2026:08:26 10:00:00", "100")
+            try writeOrganizerARW(unsorted.appendingPathComponent("Transfer 1/B0001_DSC00002.ARW"), "2026:08:26 10:00:00", "400")
+            try organizerWrite(unsorted.appendingPathComponent("Transfer 1/B0001_DSC00002.JPG"), "<jpeg companion>")
+            try organizerWrite(unsorted.appendingPathComponent("Transfer 1/B0001_DSC00001.xmp"), "<xmp/>")
+            let location = addUnsorted(unsorted, to: model)
+
+            workspace.scan(location)
+            try await waitUntil { workspace.sources[location.id]?.result != nil }
+            let burst = try XCTUnwrap(workspace.sources[location.id]?.result?.stacks.first { $0.isBurst })
+            XCTAssertEqual(burst.items.count, 2)
+
+            let folder = unsorted.appendingPathComponent("Transfer 1")
+            let beforeListing = try FileManager.default.contentsOfDirectory(atPath: folder.path).sorted()
+            let beforeBytes = try beforeListing.map { try Data(contentsOf: folder.appendingPathComponent($0)) }
+
+            workspace.rotateStack(burst, quarterTurnsCW: 1)
+
+            for file in burst.files {
+                let expected = DisplayRotation.isRotatable(file) ? 1 : 0
+                XCTAssertEqual(workspace.displayTurns(for: file), expected, file.name)
+            }
+            // The JPEG companion shares the turn; the XMP never enters the map.
+            XCTAssertEqual(burst.items.flatMap(\.companions).map(\.name).sorted(), ["B0001_DSC00001.xmp", "B0001_DSC00002.JPG"])
+            XCTAssertEqual(workspace.displayTurns(for: try XCTUnwrap(burst.files.first { $0.name == "B0001_DSC00002.JPG" })), 1)
+            XCTAssertNil(model.configuration.displayOrientations[DisplayRotation.fileKey(for: try XCTUnwrap(burst.files.first { $0.name == "B0001_DSC00001.xmp" }))])
+
+            // Nothing was written, created, or deleted on disk.
+            XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: folder.path).sorted(), beforeListing)
+            XCTAssertEqual(try beforeListing.map { try Data(contentsOf: folder.appendingPathComponent($0)) }, beforeBytes)
+
+            // A second CW turn stacks to 2, and a half-turn back drops the keys.
+            workspace.rotateStack(burst, quarterTurnsCW: 1)
+            XCTAssertEqual(workspace.displayTurns(for: burst.coverItem.primary), 2)
+            workspace.rotateStack(burst, quarterTurnsCW: -2)
+            for file in burst.files {
+                XCTAssertEqual(workspace.displayTurns(for: file), 0, file.name)
+                XCTAssertNil(model.configuration.displayOrientations[DisplayRotation.fileKey(for: file)])
+            }
+            XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: folder.path).sorted(), beforeListing)
+        }
+    }
+
     // MARK: - Helpers
 
     private func withOrganizerSandbox(

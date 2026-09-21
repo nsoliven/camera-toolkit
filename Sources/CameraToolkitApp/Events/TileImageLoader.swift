@@ -25,8 +25,8 @@ final class TileImageLoader: @unchecked Sendable {
         var finished = false
         var result: CGImage?
 
-        init(url: URL, bucket: Int) {
-            operation = TileDecodeOperation(url: url, maximumPixelSize: bucket)
+        init(url: URL, bucket: Int, orientation: Int) {
+            operation = TileDecodeOperation(url: url, maximumPixelSize: bucket, orientation: orientation)
         }
     }
 
@@ -57,18 +57,21 @@ final class TileImageLoader: @unchecked Sendable {
         }
     }
 
-    func cachedImage(for url: URL, maximumPixelSize: Int) -> CGImage? {
-        cache.object(forKey: key(url, Self.bucket(for: maximumPixelSize)) as NSString)?.image
+    /// `orientation` is the display rotation in quarter-turns clockwise (see
+    /// `DisplayRotation`). It is part of the cache key so a rotated decode
+    /// never joins or reuses an unrotated one.
+    func cachedImage(for url: URL, maximumPixelSize: Int, orientation: Int = 0) -> CGImage? {
+        cache.object(forKey: key(url, Self.bucket(for: maximumPixelSize), orientation) as NSString)?.image
     }
 
-    func image(for url: URL, maximumPixelSize: Int) async -> CGImage? {
+    func image(for url: URL, maximumPixelSize: Int, orientation: Int = 0) async -> CGImage? {
         let bucket = Self.bucket(for: maximumPixelSize)
-        let cacheKey = key(url, bucket)
+        let cacheKey = key(url, bucket, orientation)
         if let cached = cache.object(forKey: cacheKey as NSString) {
             return cached.image
         }
 
-        let group = joinGroup(cacheKey: cacheKey, url: url, bucket: bucket)
+        let group = joinGroup(cacheKey: cacheKey, url: url, bucket: bucket, orientation: orientation)
         let id = UUID()
         return await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
@@ -81,14 +84,14 @@ final class TileImageLoader: @unchecked Sendable {
 
     /// Lock-guarded join: returns the in-flight decode for `cacheKey`,
     /// creating and queueing one when none exists.
-    private func joinGroup(cacheKey: String, url: URL, bucket: Int) -> WaiterGroup {
+    private func joinGroup(cacheKey: String, url: URL, bucket: Int, orientation: Int) -> WaiterGroup {
         lock.lock()
         defer { lock.unlock() }
         if let existing = inFlight[cacheKey] {
             existing.waiters += 1
             return existing
         }
-        let group = WaiterGroup(url: url, bucket: bucket)
+        let group = WaiterGroup(url: url, bucket: bucket, orientation: orientation)
         group.waiters = 1
         inFlight[cacheKey] = group
         group.operation.completionBlock = { [weak self] in
@@ -159,11 +162,28 @@ final class TileImageLoader: @unchecked Sendable {
         }
     }
 
-    private func key(_ url: URL, _ bucket: Int) -> String {
-        "\(url.path)#\(bucket)"
+    /// Drops every cached decode of `url` — all size buckets and all
+    /// orientations — so a display-rotation change frees its stale bitmaps
+    /// instead of waiting for the cost limit to evict them.
+    func invalidate(url: URL) {
+        for bucket in [384, 768, 1_280, 2_400, 4_800] {
+            for orientation in 0..<4 {
+                cache.removeObject(forKey: key(url, bucket, orientation) as NSString)
+            }
+        }
     }
 
-    static func decode(url: URL, maximumPixelSize: Int) -> CGImage? {
+    private func key(_ url: URL, _ bucket: Int, _ orientation: Int) -> String {
+        "\(url.path)#\(bucket)#\(DisplayRotation.normalized(orientation))"
+    }
+
+    static func decode(url: URL, maximumPixelSize: Int, orientation: Int = 0) -> CGImage? {
+        let image = decodeUnrotated(url: url, maximumPixelSize: maximumPixelSize)
+        guard let image, DisplayRotation.normalized(orientation) != 0 else { return image }
+        return DisplayRotation.rotate(image, quarterTurnsCW: orientation)
+    }
+
+    private static func decodeUnrotated(url: URL, maximumPixelSize: Int) -> CGImage? {
         let ext = url.pathExtension.lowercased()
         if OrganizeFileClassifier.rawExtensions.contains(ext) {
             let preference: EmbeddedJPEGPreviewPreference = maximumPixelSize > 1_700 ? .fullSize : .thumbnail
@@ -195,17 +215,19 @@ final class TileImageLoader: @unchecked Sendable {
 private final class TileDecodeOperation: Operation, @unchecked Sendable {
     let url: URL
     let maximumPixelSize: Int
+    let orientation: Int
     var result: CGImage?
 
-    init(url: URL, maximumPixelSize: Int) {
+    init(url: URL, maximumPixelSize: Int, orientation: Int) {
         self.url = url
         self.maximumPixelSize = maximumPixelSize
+        self.orientation = orientation
     }
 
     override func main() {
         guard !isCancelled else { return }
         result = autoreleasepool {
-            TileImageLoader.decode(url: url, maximumPixelSize: maximumPixelSize)
+            TileImageLoader.decode(url: url, maximumPixelSize: maximumPixelSize, orientation: orientation)
         }
     }
 }

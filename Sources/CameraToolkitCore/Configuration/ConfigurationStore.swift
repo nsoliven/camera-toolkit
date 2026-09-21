@@ -31,6 +31,10 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
     /// Manual burst splits made on the organize boards. Restacking honors
     /// them so a rescan never glues separated frames back together.
     public var burstSplits: [BurstSplit]
+    /// Display-time rotation per file identity key (see
+    /// `DisplayRotation.fileKey`), in quarter-turns clockwise. Applied while
+    /// decoding tiles and previews; media bytes are never rewritten.
+    public var displayOrientations: [String: Int]
 
     public init(
         demoRootPath: String,
@@ -57,7 +61,8 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         selectedEventID: UUID? = nil,
         photoEventAssignments: [PhotoEventAssignment] = [],
         privateStagingPath: String = "",
-        burstSplits: [BurstSplit] = []
+        burstSplits: [BurstSplit] = [],
+        displayOrientations: [String: Int] = [:]
     ) {
         self.demoRootPath = demoRootPath
         self.importSourcePath = importSourcePath
@@ -84,6 +89,7 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         self.photoEventAssignments = photoEventAssignments
         self.privateStagingPath = privateStagingPath
         self.burstSplits = burstSplits
+        self.displayOrientations = displayOrientations
         self.normalizeLocationSelections()
         self.normalizeEventSelection()
     }
@@ -114,6 +120,7 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         case photoEventAssignments
         case privateStagingPath
         case burstSplits
+        case displayOrientations
     }
 
     public init(from decoder: Decoder) throws {
@@ -150,6 +157,7 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         photoEventAssignments = try values.decodeIfPresent([PhotoEventAssignment].self, forKey: .photoEventAssignments) ?? []
         privateStagingPath = try values.decodeIfPresent(String.self, forKey: .privateStagingPath) ?? ""
         burstSplits = try values.decodeIfPresent([BurstSplit].self, forKey: .burstSplits) ?? []
+        displayOrientations = try values.decodeIfPresent([String: Int].self, forKey: .displayOrientations) ?? [:]
         normalizeLocationSelections()
         normalizeEventSelection()
     }

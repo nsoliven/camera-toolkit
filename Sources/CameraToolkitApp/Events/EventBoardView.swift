@@ -53,6 +53,10 @@ struct EventBoardView: View {
                         },
                         onSplitItems: { items in
                             workspace.splitItems(items)
+                        },
+                        orientationForFile: { workspace.displayTurns(for: $0) },
+                        onRotate: { stack, delta in
+                            workspace.rotateStack(stack, quarterTurnsCW: delta)
                         }
                     )
                 }
@@ -183,6 +187,7 @@ struct EventBoardView: View {
             eventForStack: { _ in (nil, false) },
             isDimmed: { _ in false },
             badge: { workspace.badge(for: $0, in: eventID) },
+            orientationForFile: { workspace.displayTurns(for: $0) },
             onOpen: { stack in
                 workspace.select(stackID: stack.id, orderedIDs: [], extend: false, toggle: false)
                 previewStackID = stack.id
