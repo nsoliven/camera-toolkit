@@ -319,13 +319,34 @@ public struct DriveMoveService {
         try encoder.encode(journal).write(to: url, options: .atomic)
     }
 
+    private static let stampClock = StampClock()
+
     private static func stamp(_ date: Date) -> String {
+        stampClock.stamp(date)
+    }
+}
+
+/// Microsecond journal ticks forced strictly increasing: back-to-back
+/// moves inside one millisecond can never tie, so Undo always reverses
+/// the most recent one.
+private final class StampClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var lastMicros: Int64 = 0
+
+    func stamp(_ date: Date) -> String {
+        lock.lock()
+        lastMicros = max(
+            Int64(date.timeIntervalSince1970 * 1_000_000),
+            lastMicros + 1
+        )
+        let micros = lastMicros
+        lock.unlock()
+
         let formatter = DateFormatter()
         formatter.calendar = Calendar(identifier: .gregorian)
         formatter.locale = Locale(identifier: "en_US_POSIX")
-        // Millisecond precision keeps back-to-back moves in order, so Undo
-        // always reverses the most recent one.
-        formatter.dateFormat = "yyyyMMdd-HHmmss-SSS"
-        return formatter.string(from: date)
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        let base = formatter.string(from: Date(timeIntervalSince1970: Double(micros) / 1_000_000))
+        return String(format: "%@-%06d", base, micros % 1_000_000)
     }
 }
