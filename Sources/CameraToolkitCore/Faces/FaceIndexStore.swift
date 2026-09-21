@@ -737,6 +737,62 @@ public final class FaceIndexStore: @unchecked Sendable {
         }
     }
 
+    /// The people attached to each queried file key — roster members and
+    /// unnamed groups alike, keyed by `fileKey(fileName:byteCount:
+    /// modifiedAt:)`. This is the board People filter's raw material:
+    /// unlike `eventPeople` it keeps per-file granularity so the board can
+    /// tell exactly which stacks a person is on, and it includes groups so
+    /// an unnamed cluster can still be filtered to. `faceCount` is the
+    /// person's matching-face total across `fileKeys`.
+    public func peopleByFileKey(fileKeys: Set<String>) throws -> [String: [FacePerson]] {
+        guard !fileKeys.isEmpty else { return [:] }
+        return try database().read { database in
+            let rows = try Row.fetchAll(
+                database,
+                sql: """
+                SELECT p.id, p.name, p.is_roster, ph.file_name, ph.byte_count, ph.modified_at
+                FROM people p
+                JOIN faces f ON f.person_id = p.id
+                JOIN face_photos ph ON ph.path_key = f.photo_id
+                WHERE f.state IN ('proposed', 'confirmed', 'other')
+                """
+            )
+            let formatter = Self.formatter()
+            var persons: [UUID: FacePerson] = [:]
+            var counts: [UUID: Int] = [:]
+            var idsByKey: [String: Set<UUID>] = [:]
+            for row in rows {
+                let fileName: String = row["file_name"]
+                let byteCount: Int64 = row["byte_count"]
+                let modifiedAt: String = row["modified_at"]
+                guard let personID = UUID(uuidString: row["id"] as String? ?? ""),
+                      let modified = formatter.date(from: modifiedAt)
+                else { continue }
+                let key = Self.fileKey(fileName: fileName, byteCount: byteCount, modifiedAt: modified)
+                guard fileKeys.contains(key) else { continue }
+                if persons[personID] == nil {
+                    persons[personID] = FacePerson(
+                        id: personID,
+                        name: row["name"],
+                        isRoster: (row["is_roster"] as Int64? ?? 0) != 0,
+                        faceCount: 0
+                    )
+                }
+                counts[personID, default: 0] += 1
+                idsByKey[key, default: []].insert(personID)
+            }
+            var result: [String: [FacePerson]] = [:]
+            for (key, ids) in idsByKey {
+                result[key] = ids.compactMap { persons[$0] }.map { person in
+                    var copy = person
+                    copy.faceCount = counts[person.id] ?? 0
+                    return copy
+                }.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+            }
+            return result
+        }
+    }
+
     // MARK: - Row mapping
 
     private func insertFace(
