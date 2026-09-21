@@ -26,10 +26,12 @@ public struct OrganizeScanResult: Sendable {
     /// Camera clock minus file modification time, rounded to 15 minutes.
     public var clockOffset: TimeInterval
     public var scannedAt: Date
-    /// Burst grouping settings and the visual links the scan resolved, kept
-    /// so `removingFiles` restacks with the same decisions.
+    /// Burst grouping settings, the visual links the scan resolved, and the
+    /// manual splits in effect — all kept so `removingFiles` and `restacked`
+    /// restack with the same decisions.
     public var burstGrouping: BurstGroupingConfiguration = BurstGroupingConfiguration()
     public var visualLinks: Set<BurstVisualLink> = []
+    public var burstSplits: [BurstSplit] = []
 
     public var fileCount: Int { items.reduce(0) { $0 + 1 + $1.companions.count } }
     public var byteCount: Int64 { items.reduce(Int64(0)) { $0 + $1.byteCount } }
@@ -48,7 +50,17 @@ public struct OrganizeScanResult: Sendable {
         let links = visualLinks.filter {
             surviving.contains($0.previousPath) && surviving.contains($0.nextPath)
         }
-        copy.stacks = OrganizeStacker.stacks(for: copy.items, configuration: burstGrouping, visualLinks: links)
+        copy.stacks = OrganizeStacker.stacks(for: copy.items, configuration: burstGrouping, visualLinks: links, splits: burstSplits)
+        copy.days = OrganizeStacker.days(for: copy.stacks)
+        return copy
+    }
+
+    /// Re-runs grouping with a different set of manual splits so a split edit
+    /// updates the board without touching the disk again.
+    public func restacked(withSplits splits: [BurstSplit]) -> OrganizeScanResult {
+        var copy = self
+        copy.burstSplits = splits
+        copy.stacks = OrganizeStacker.stacks(for: items, configuration: burstGrouping, visualLinks: visualLinks, splits: splits)
         copy.days = OrganizeStacker.days(for: copy.stacks)
         return copy
     }
@@ -66,6 +78,7 @@ public struct OrganizeScanner: Sendable {
         root: URL,
         cache: CaptureDateCache? = nil,
         burstGrouping: BurstGroupingConfiguration = BurstGroupingConfiguration(),
+        burstSplits: [BurstSplit] = [],
         progress: (@Sendable (OrganizeScanProgress) -> Void)? = nil
     ) throws -> OrganizeScanResult {
         let rootURL = root.standardizedFileURL
@@ -91,7 +104,7 @@ public struct OrganizeScanner: Sendable {
             progress: progress
         )
         progress?(OrganizeScanProgress(phase: "Grouping bursts", processed: 1, total: 1))
-        let stacks = OrganizeStacker.stacks(for: built.items, configuration: burstGrouping, visualLinks: visualLinks)
+        let stacks = OrganizeStacker.stacks(for: built.items, configuration: burstGrouping, visualLinks: visualLinks, splits: burstSplits)
         return OrganizeScanResult(
             rootPath: rootURL.path,
             items: built.items,
@@ -101,7 +114,8 @@ public struct OrganizeScanner: Sendable {
             clockOffset: built.clockOffset,
             scannedAt: Date(),
             burstGrouping: burstGrouping,
-            visualLinks: visualLinks
+            visualLinks: visualLinks,
+            burstSplits: burstSplits
         )
     }
 

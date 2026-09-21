@@ -46,7 +46,10 @@ struct EventBoardView: View {
                         onAssign: { stack, target in
                             workspace.moveStacks([stack.id], fromEvent: eventID, toEvent: target.id)
                         },
-                        isPrivate: { workspace.resolvedPolicy(for: $0) == .archiveOnly }
+                        isPrivate: { workspace.resolvedPolicy(for: $0) == .archiveOnly },
+                        onSplitItems: { items in
+                            workspace.splitItems(items)
+                        }
                     )
                 }
             }

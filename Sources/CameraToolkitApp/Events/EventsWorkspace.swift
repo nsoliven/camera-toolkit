@@ -641,6 +641,7 @@ final class EventsWorkspace {
         state.progress = nil
         sources[id] = state
         let cache = captureDateCache
+        let burstSplits = model.configuration.burstSplits
         let reportProgress: @Sendable (OrganizeScanProgress) -> Void = { [weak self] progress in
             Task { @MainActor in
                 guard let self else { return }
@@ -651,7 +652,7 @@ final class EventsWorkspace {
         Task { @MainActor [weak self] in
             let outcome: Result<OrganizeScanResult, any Error> = await Task.detached(priority: .userInitiated) {
                 Result {
-                    try OrganizeScanner().scan(root: root, cache: cache, burstGrouping: BurstGroupingConfiguration.resolved(), progress: reportProgress)
+                    try OrganizeScanner().scan(root: root, cache: cache, burstGrouping: BurstGroupingConfiguration.resolved(), burstSplits: burstSplits, progress: reportProgress)
                 }
             }.value
             guard let self else { return }
@@ -1094,6 +1095,7 @@ final class EventsWorkspace {
         let assignments = model.configuration.photoEventAssignments.filter { $0.eventID == eventID }
         let locations = self.locations
         let cache = captureDateCache
+        let burstSplits = model.configuration.burstSplits
         let catalogURL = URL(fileURLWithPath: DashboardModel.expandedPath(model.configuration.catalogDatabasePath))
 
         let output = await Task.detached(priority: .userInitiated) { () -> EventRefreshOutput in
@@ -1109,7 +1111,7 @@ final class EventsWorkspace {
             let immich = (try? CatalogInspector(url: catalogURL).immichStatuses(eventID: eventID)) ?? [:]
             return EventRefreshOutput(
                 summary: summary,
-                stacks: OrganizeStacker.stacks(for: items),
+                stacks: OrganizeStacker.stacks(for: items, splits: burstSplits),
                 assetsByPathKey: byPath,
                 immich: immich
             )
@@ -1878,6 +1880,40 @@ final class EventsWorkspace {
         return Set(result.stacks.filter { stack in
             stack.items.contains { itemIDs.contains($0.id) }
         }.map(\.id))
+    }
+
+    // MARK: - Burst splits
+
+    /// Pulls the given frames out of whatever burst they sit in and pins them
+    /// as a stack of their own. The split is recorded in
+    /// `AppConfiguration.burstSplits`, so a rescan or event refresh keeps the
+    /// frames apart instead of letting the grouper join them again. Nothing
+    /// on disk moves — this is a board-level regrouping only.
+    func splitItems(_ items: [OrganizeItem]) {
+        let keys = items.map(\.primary.pathKey)
+        guard !keys.isEmpty else { return }
+        model.updateConfiguration { $0.burstSplits.append(BurstSplit(memberPathKeys: keys)) }
+        let splits = model.configuration.burstSplits
+        for id in Array(sources.keys) {
+            if let result = sources[id]?.result {
+                sources[id]?.result = result.restacked(withSplits: splits)
+            }
+        }
+        for id in Array(eventStacks.keys) {
+            if let stacks = eventStacks[id] {
+                eventStacks[id] = OrganizeStacker.stacks(for: stacks.flatMap(\.items), splits: splits)
+            }
+        }
+        // Restacking changed some stack IDs; drop board selections that no
+        // longer point at anything so follow-up actions can't go stale.
+        let liveIDs = Set(sources.values.compactMap(\.result).flatMap { $0.stacks.map(\.id) })
+            .union(eventStacks.values.flatMap { $0.map(\.id) })
+        selectedStackIDs.formIntersection(liveIDs)
+        if let focusedStackID, !liveIDs.contains(focusedStackID) {
+            self.focusedStackID = nil
+            selectionAnchorID = nil
+        }
+        model.statusMessage = "Split \(items.count) frame\(items.count == 1 ? "" : "s") into a new burst. Rescans will keep them apart."
     }
 
     // MARK: - Immich
