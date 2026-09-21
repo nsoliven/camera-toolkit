@@ -43,9 +43,6 @@ struct EventBoardView: View {
                 header(event)
                 StorageStrip(model: model, workspace: workspace, event: event, summary: workspace.presence[eventID])
                     .guideHighlight(.storageStrip, in: workspace)
-                    .padding(.horizontal, 16)
-                    .padding(.bottom, 12)
-                Divider()
                 if stacks != nil {
                     if groups.isEmpty {
                         emptyState(event)
@@ -329,27 +326,134 @@ struct EventBoardView: View {
     }
 }
 
+/// One place the event's originals can live — card, drive, NAS, or Immich —
+/// as the numbers and actions both the compact strip pills and the full
+/// cards draw from.
+struct StorageSlot<Actions: View> {
+    let title: String
+    let symbol: String
+    let tint: Color
+    let value: String
+    let detail: String
+    let state: StorageSlotState
+    @ViewBuilder let actions: () -> Actions
+}
+
 /// Source, drive, NAS, and Immich: where this event's originals are and the
-/// one action that moves each place forward.
+/// one action that moves each place forward. Rests as a one-line summary
+/// bar so the photo board gets the window; the bottom edge drags open into
+/// the four full cards, and the size is remembered.
 struct StorageStrip: View {
     @Bindable var model: DashboardModel
     @Bindable var workspace: EventsWorkspace
     let event: SavedCameraEvent
     let summary: EventPresenceSummary?
 
+    @AppStorage(OrganizeChromeSizing.storageStripDefaultsKey)
+    private var stripHeight = OrganizeChromeSizing.collapsedStorageStripHeight
+
+    private var isCollapsed: Bool {
+        OrganizeChromeSizing.storageStripIsCollapsed(stripHeight)
+    }
+
     var body: some View {
+        VStack(spacing: 0) {
+            if isCollapsed {
+                compactBar
+                    .padding(.horizontal, 16)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: OrganizeChromeSizing.collapsedStorageStripHeight)
+            } else {
+                cardsRow
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 10)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: OrganizeChromeSizing.coercedStorageStripHeight(stripHeight))
+            }
+            ChromeResizeHandle(
+                orientation: .horizontal,
+                value: $stripHeight,
+                transform: OrganizeChromeSizing.coercedStorageStripHeight,
+                onDoubleClick: toggleCollapsed,
+                help: isCollapsed
+                    ? "Drag down for the full storage cards — double-click toggles"
+                    : "Drag to resize the storage cards — double-click collapses",
+                accessibilityLabel: "Resize Storage Summary"
+            )
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private func toggleCollapsed() {
+        withAnimation(.easeOut(duration: 0.15)) {
+            stripHeight = isCollapsed
+                ? OrganizeChromeSizing.defaultExpandedStorageStripHeight
+                : OrganizeChromeSizing.collapsedStorageStripHeight
+        }
+    }
+
+    /// The collapsed strip: one tinted count per place, each a menu holding
+    /// that place's actions, so Free Up, Put on Buffer, Check Again, and the
+    /// Immich send switch stay reachable without the tall cards.
+    private var compactBar: some View {
+        HStack(spacing: 8) {
+            compactSlot(sourceSlot)
+            compactSlot(driveSlot)
+            compactSlot(nasSlot)
+            compactSlot(immichSlot)
+            Spacer(minLength: 8)
+            Button {
+                withAnimation(.easeOut(duration: 0.15)) {
+                    stripHeight = OrganizeChromeSizing.defaultExpandedStorageStripHeight
+                }
+            } label: {
+                Image(systemName: "chevron.down")
+                    .font(.caption.weight(.semibold))
+            }
+            .buttonStyle(.borderless)
+            .foregroundStyle(.secondary)
+            .help("Show the full storage cards — or drag the bottom edge down")
+        }
+    }
+
+    private func compactSlot<Actions: View>(_ slot: StorageSlot<Actions>) -> some View {
+        Menu {
+            Text("\(slot.title) — \(slot.detail)")
+            Divider()
+            slot.actions()
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: slot.symbol)
+                    .foregroundStyle(slot.tint)
+                Text(slot.value)
+                    .font(.callout.monospacedDigit())
+                    .lineLimit(1)
+                StorageSlotStateIcon(state: slot.state)
+                    .font(.caption2)
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("\(slot.title) — \(slot.detail)")
+    }
+
+    private var cardsRow: some View {
         HStack(alignment: .top, spacing: 10) {
-            sourceCard
-            driveCard
-            nasCard
-            immichCard
+            StorageSlotCard(slot: sourceSlot)
+            StorageSlotCard(slot: driveSlot)
+            StorageSlotCard(slot: nasSlot)
+            StorageSlotCard(slot: immichSlot)
         }
     }
 
     private var assets: [EventAssetPresence] { summary?.assets ?? [] }
 
     /// Re-checks connections and re-probes where this event's files are. Used
-    /// on cards that are showing Offline.
+    /// on slots that are showing Offline.
     private var checkAgainButton: some View {
         Button("Check Again") {
             workspace.refreshConnectivity()
@@ -358,7 +462,7 @@ struct StorageStrip: View {
         .help("Re-check this connection right now")
     }
 
-    private var sourceCard: some View {
+    private var sourceSlot: StorageSlot<some View> {
         let separate = assets.filter { !$0.sourceIsDriveCopy }
         let onSource = separate.count { $0.source == .present }
         let offline = separate.count { $0.source == .unavailable }
@@ -377,7 +481,7 @@ struct StorageStrip: View {
                 ? "\(offline) on a disconnected card or drive"
                 : (onSource == 0 ? "Nothing left on the card or unsorted folder" : "Still on the card or unsorted folder")
         }
-        return StorageSlotCard(
+        return StorageSlot(
             title: "Card / Unsorted",
             symbol: "sdcard",
             tint: .orange,
@@ -396,7 +500,7 @@ struct StorageStrip: View {
         }
     }
 
-    private var driveCard: some View {
+    private var driveSlot: StorageSlot<some View> {
         let policy = workspace.resolvedPolicy(for: event)
         let total = assets.count
         let onDrive = assets.count { $0.drive == .present }
@@ -418,7 +522,7 @@ struct StorageStrip: View {
         } else {
             detail = "\(total - onDrive) not on the drive yet"
         }
-        return StorageSlotCard(
+        return StorageSlot(
             title: policy == .buffer ? "Shared Buffer" : "Private Staging",
             symbol: policy == .buffer ? "externaldrive.fill" : "lock.fill",
             tint: policy == .buffer ? .blue : .purple,
@@ -446,12 +550,12 @@ struct StorageStrip: View {
         }
     }
 
-    private var nasCard: some View {
+    private var nasSlot: StorageSlot<some View> {
         let total = assets.count
         let onNAS = assets.count { $0.archive == .present }
         let offline = summary?.archiveOffline ?? false
         let reachable = assets.count { $0.archive != .present && ($0.drive == .present || $0.otherDrive == .present || $0.source == .present) }
-        return StorageSlotCard(
+        return StorageSlot(
             title: "NAS",
             symbol: "server.rack",
             tint: .green,
@@ -472,7 +576,7 @@ struct StorageStrip: View {
         }
     }
 
-    private var immichCard: some View {
+    private var immichSlot: StorageSlot<some View> {
         let statuses = workspace.eventImmichStatuses[event.id] ?? [:]
         let present = statuses.values.count { $0.status == "present" && !$0.isTrashed }
         let albumText: String = switch event.resolvedImmichAlbumPolicy {
@@ -480,7 +584,7 @@ struct StorageStrip: View {
         case .event: "Album “\(event.name)”"
         case .custom: "Album “\(event.immichAlbumName ?? event.name)”"
         }
-        return StorageSlotCard(
+        return StorageSlot(
             title: "Immich",
             symbol: "cloud.fill",
             tint: .teal,
@@ -492,7 +596,6 @@ struct StorageStrip: View {
                 get: { event.sendsToImmich },
                 set: { model.setEventImmichUploadEnabled(event.id, enabled: $0) }
             ))
-            .toggleStyle(.switch)
             .controlSize(.mini)
             if event.sendsToImmich {
                 Menu("Album") {
@@ -515,53 +618,10 @@ enum StorageSlotState {
     case offline
 }
 
-struct StorageSlotCard<Actions: View>: View {
-    let title: String
-    let symbol: String
-    let tint: Color
-    let value: String
-    let detail: String
+struct StorageSlotStateIcon: View {
     let state: StorageSlotState
-    @ViewBuilder let actions: () -> Actions
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 6) {
-                Image(systemName: symbol)
-                    .foregroundStyle(tint)
-                Text(title)
-                    .font(.headline)
-                    .lineLimit(1)
-                Spacer(minLength: 0)
-                stateIcon
-            }
-            Text(value)
-                .font(.title3.weight(.semibold).monospacedDigit())
-            Text(detail)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .lineLimit(2)
-                .fixedSize(horizontal: false, vertical: true)
-            Spacer(minLength: 0)
-            HStack(spacing: 6) {
-                actions()
-            }
-            .controlSize(.small)
-        }
-        .padding(12)
-        .frame(maxWidth: .infinity, minHeight: 132, alignment: .topLeading)
-        .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(Color(nsColor: .controlBackgroundColor))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .strokeBorder(state == .complete ? tint.opacity(0.6) : Color.primary.opacity(0.08), lineWidth: state == .complete ? 1.5 : 1)
-        )
-    }
-
-    @ViewBuilder
-    private var stateIcon: some View {
         switch state {
         case .complete:
             Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
@@ -572,5 +632,45 @@ struct StorageSlotCard<Actions: View>: View {
         case .unknown:
             EmptyView()
         }
+    }
+}
+
+struct StorageSlotCard<Actions: View>: View {
+    let slot: StorageSlot<Actions>
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Image(systemName: slot.symbol)
+                    .foregroundStyle(slot.tint)
+                Text(slot.title)
+                    .font(.headline)
+                    .lineLimit(1)
+                Spacer(minLength: 0)
+                StorageSlotStateIcon(state: slot.state)
+            }
+            Text(slot.value)
+                .font(.title3.weight(.semibold).monospacedDigit())
+            Text(slot.detail)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+            HStack(spacing: 6) {
+                slot.actions()
+            }
+            .controlSize(.small)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Color(nsColor: .controlBackgroundColor))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(slot.state == .complete ? slot.tint.opacity(0.6) : Color.primary.opacity(0.08), lineWidth: slot.state == .complete ? 1.5 : 1)
+        )
     }
 }
