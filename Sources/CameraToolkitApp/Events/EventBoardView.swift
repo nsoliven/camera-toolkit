@@ -296,6 +296,9 @@ struct EventBoardView: View {
     }
 
     private func handleKey(_ press: KeyPress) -> KeyPress.Result {
+        // Never board keys while a text field owns typing — 1–3 edits the
+        // field, it does not move stacks between events.
+        guard !KeyboardTextFocus.isTypingInTextField() else { return .ignored }
         guard press.modifiers.isEmpty,
               let digit = press.characters.first?.wholeNumberValue,
               (1...3).contains(digit) else { return .ignored }
@@ -307,6 +310,7 @@ struct EventBoardView: View {
     }
 
     private func handle(_ command: BrowserCommand, ordered: [OrganizeStack]) {
+        guard command.isAllowedWhileTyping || !KeyboardTextFocus.isTypingInTextField() else { return }
         switch command {
         case .selectAll:
             workspace.selectStacks(ordered.map(\.id))

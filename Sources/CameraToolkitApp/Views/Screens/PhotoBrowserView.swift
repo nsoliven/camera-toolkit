@@ -1052,30 +1052,30 @@ struct PhotoBrowserView: View {
                     }
                 }
                 .onKeyPress(.space) {
-                    guard isFileTableFocused else { return .ignored }
+                    guard isFileTableFocused, !KeyboardTextFocus.isTypingInTextField() else { return .ignored }
                     previewSelection()
                     return .handled
                 }
                 .onKeyPress(.upArrow) {
-                    guard isFileTableFocused else { return .ignored }
+                    guard isFileTableFocused, !KeyboardTextFocus.isTypingInTextField() else { return .ignored }
                     selectAdjacentItem(offset: -1)
                     return .handled
                 }
                 .onKeyPress(.downArrow) {
-                    guard isFileTableFocused else { return .ignored }
+                    guard isFileTableFocused, !KeyboardTextFocus.isTypingInTextField() else { return .ignored }
                     selectAdjacentItem(offset: 1)
                     return .handled
                 }
                 .onKeyPress(.leftArrow) {
-                    guard isFileTableFocused else { return .ignored }
+                    guard isFileTableFocused, !KeyboardTextFocus.isTypingInTextField() else { return .ignored }
                     return collapseSelectionOrSelectParent()
                 }
                 .onKeyPress(.rightArrow) {
-                    guard isFileTableFocused else { return .ignored }
+                    guard isFileTableFocused, !KeyboardTextFocus.isTypingInTextField() else { return .ignored }
                     return expandSelectionOrSelectFirstChild()
                 }
                 .onKeyPress(.return) {
-                    guard isFileTableFocused else { return .ignored }
+                    guard isFileTableFocused, !KeyboardTextFocus.isTypingInTextField() else { return .ignored }
                     openSelection()
                     return .handled
                 }
@@ -2395,6 +2395,7 @@ struct PhotoBrowserView: View {
     }
 
     private func perform(_ command: BrowserCommand) {
+        guard command.isAllowedWhileTyping || !KeyboardTextFocus.isTypingInTextField() else { return }
         switch command {
         case .copySelection:
             FileClipboardWriter.copy(selectedURLs)

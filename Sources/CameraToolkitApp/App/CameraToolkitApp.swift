@@ -3,7 +3,7 @@ import SwiftUI
 
 @main
 @MainActor
-final class CameraToolkitApplication: NSObject, NSApplicationDelegate {
+final class CameraToolkitApplication: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private static var retainedDelegate: CameraToolkitApplication?
 
     private let model = CameraToolkitRuntime.model
@@ -58,10 +58,11 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate {
     private func installThumbnailShortcutMonitor() {
         guard thumbnailShortcutMonitor == nil else { return }
         thumbnailShortcutMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-            guard let command = BrowserThumbnailShortcut.command(
-                for: event.charactersIgnoringModifiers,
-                modifierFlags: event.modifierFlags
-            ) else {
+            guard !KeyboardTextFocus.isTypingInTextField(),
+                  let command = BrowserThumbnailShortcut.command(
+                      for: event.charactersIgnoringModifiers,
+                      modifierFlags: event.modifierFlags
+                  ) else {
                 return event
             }
 
@@ -407,6 +408,15 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate {
         menu.addItem(item)
     }
 
+    /// Every item targeted at the delegate is a board or app command, and
+    /// none may run while a text field owns typing — ⌘⌫ stays "delete to
+    /// here," not "Move to Trash." Commands the field handles itself (⌘C,
+    /// ⌘A, ⌘Z) are claimed by the field editor before menus are consulted;
+    /// disabling ours keeps them with the field either way.
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        !KeyboardTextFocus.isTypingInTextField()
+    }
+
     @objc private func openSettings() {
         CameraToolkitConfigWindow.shared.show(model: model)
     }
@@ -416,7 +426,8 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate {
     }
 
     @objc private func performBrowserCommand(_ sender: NSMenuItem) {
-        guard let rawValue = sender.representedObject as? String,
+        guard !KeyboardTextFocus.isTypingInTextField(),
+              let rawValue = sender.representedObject as? String,
               let command = BrowserCommand(rawValue: rawValue) else {
             return
         }
@@ -444,6 +455,7 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate {
     }
 
     @objc private func undoSort() {
+        guard !KeyboardTextFocus.isTypingInTextField() else { return }
         NotificationCenter.default.post(name: .cameraToolkitUndoSort, object: nil)
     }
 

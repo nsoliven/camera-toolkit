@@ -272,12 +272,12 @@ struct InteractivePreviewCanvas: View {
                 zoomCommand.wrappedValue = nil
             }
             .onKeyPress(.space) {
-                guard let onDismiss else { return .ignored }
+                guard let onDismiss, !KeyboardTextFocus.isTypingInTextField() else { return .ignored }
                 onDismiss()
                 return .handled
             }
             .onKeyPress(.escape) {
-                guard let onDismiss else { return .ignored }
+                guard let onDismiss, !KeyboardTextFocus.isTypingInTextField() else { return .ignored }
                 onDismiss()
                 return .handled
             }
@@ -285,7 +285,8 @@ struct InteractivePreviewCanvas: View {
                 // Only reachable while the canvas itself holds focus (the
                 // pop-out preview window); embedded use forwards commands
                 // through `zoomCommand` instead.
-                guard press.modifiers.isEmpty || press.modifiers == .shift else { return .ignored }
+                guard !KeyboardTextFocus.isTypingInTextField(),
+                      press.modifiers.isEmpty || press.modifiers == .shift else { return .ignored }
                 switch press.characters {
                 case "+", "=":
                     perform(.zoomIn, canvasSize: geometry.size)
