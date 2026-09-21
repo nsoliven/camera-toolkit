@@ -2287,24 +2287,38 @@ final class EventsWorkspace {
     /// and checksums stay untouched. Tiles, the filmstrip, and the preview
     /// re-decode with the new orientation; no rescan needed.
     func rotateStack(_ stack: OrganizeStack, quarterTurnsCW delta: Int) {
-        let rotated = DisplayRotation.rotatableFiles(in: stack)
+        rotateStacks([stack], quarterTurnsCW: delta)
+    }
+
+    /// The board's multi-select version of Rotate Burst: every targeted
+    /// stack turns the same direction in a single configuration update, so
+    /// ⌘- or ⇧-selected bursts all land at the new orientation together.
+    /// Same display-only guarantee — the map changes, the files never do.
+    func rotateStacks(_ stacks: [OrganizeStack], quarterTurnsCW delta: Int) {
+        let rotated = stacks.flatMap { DisplayRotation.rotatableFiles(in: $0) }
         guard !rotated.isEmpty else {
-            model.statusMessage = "Nothing to rotate in this stack."
+            model.statusMessage = stacks.count == 1
+                ? "Nothing to rotate in this stack."
+                : "Nothing to rotate in the selection."
             return
         }
         model.updateConfiguration { configuration in
-            configuration.displayOrientations = DisplayRotation.rotatedMap(
-                configuration.displayOrientations,
-                applying: delta,
-                to: stack
-            )
+            for stack in stacks {
+                configuration.displayOrientations = DisplayRotation.rotatedMap(
+                    configuration.displayOrientations,
+                    applying: delta,
+                    to: stack
+                )
+            }
         }
         for file in rotated {
             TileImageLoader.shared.invalidate(url: file.url)
         }
-        let frames = stack.items.count
+        let frames = stacks.reduce(0) { $0 + $1.items.count }
         let direction = abs(delta) == 2 ? "180°" : (delta > 0 ? "90° clockwise" : "90° counter-clockwise")
-        model.statusMessage = "Rotated \(frames) frame\(frames == 1 ? "" : "s") \(direction). Originals untouched — the turn is remembered, not written."
+        model.statusMessage = stacks.count == 1
+            ? "Rotated \(frames) frame\(frames == 1 ? "" : "s") \(direction). Originals untouched — the turn is remembered, not written."
+            : "Rotated \(stacks.count) bursts (\(frames) frames) \(direction). Originals untouched — the turn is remembered, not written."
     }
 
     // MARK: - Immich

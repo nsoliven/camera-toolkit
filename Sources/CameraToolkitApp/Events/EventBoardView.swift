@@ -276,6 +276,12 @@ struct EventBoardView: View {
         Button("Return to Unsorted") {
             workspace.returnToUnsorted(targets, eventID: eventID)
         }
+        Menu(targets.count > 1 ? "Rotate Selection" : "Rotate Burst") {
+            Button("Rotate All 90° Left") { rotate(targets, by: -1) }
+            Button("Rotate All 180°") { rotate(targets, by: 2) }
+            Button("Rotate All 90° Right") { rotate(targets, by: 1) }
+        }
+        .disabled(!stacks(for: targets).contains { !DisplayRotation.rotatableFiles(in: $0).isEmpty })
         Divider()
         Button("Preview") { openPreview(stack.id) }
         Button("Open in Photomator") {
@@ -292,15 +298,41 @@ struct EventBoardView: View {
     }
 
     private func urls(for ids: Set<String>) -> [URL] {
-        (workspace.eventStacks[eventID] ?? []).filter { ids.contains($0.id) }.flatMap { $0.items.map(\.primary.url) }
+        stacks(for: ids).flatMap { $0.items.map(\.primary.url) }
+    }
+
+    private func stacks(for ids: Set<String>) -> [OrganizeStack] {
+        (workspace.eventStacks[eventID] ?? []).filter { ids.contains($0.id) }
+    }
+
+    /// One Rotate Selection action turns every targeted burst the same way.
+    private func rotate(_ ids: Set<String>, by delta: Int) {
+        workspace.rotateStacks(stacks(for: ids), quarterTurnsCW: delta)
+    }
+
+    private func rotateTargets(_ ids: Set<String>, by delta: Int) -> KeyPress.Result {
+        let stacks = stacks(for: ids)
+        guard !stacks.isEmpty else { return .ignored }
+        workspace.rotateStacks(stacks, quarterTurnsCW: delta)
+        return .handled
     }
 
     private func handleKey(_ press: KeyPress) -> KeyPress.Result {
+        let targets = workspace.targetStackIDs()
+        if press.modifiers.isEmpty || press.modifiers == .shift {
+            switch press.characters {
+            case "]", "}", "r":
+                return rotateTargets(targets, by: 1)
+            case "[", "{", "R":
+                return rotateTargets(targets, by: -1)
+            default:
+                break
+            }
+        }
         guard press.modifiers.isEmpty,
               let digit = press.characters.first?.wholeNumberValue,
               (1...3).contains(digit) else { return .ignored }
         let recents = workspace.assignableRecents(excluding: eventID)
-        let targets = workspace.targetStackIDs()
         guard digit <= recents.count, !targets.isEmpty else { return .handled }
         workspace.moveStacks(targets, fromEvent: eventID, toEvent: recents[digit - 1].id)
         return .handled
