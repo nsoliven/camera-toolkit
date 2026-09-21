@@ -10,6 +10,32 @@ final class PreviewImageMemoryTests: XCTestCase {
         XCTAssertTrue(CameraPreviewSupport.canDecode(URL(fileURLWithPath: "/card/photo.JPG")))
     }
 
+    /// The spinner names the file's actual format — a PNG never reads as
+    /// "embedded JPEG", a RAW always reads as the embed it carries.
+    func testLoadingMessageMatchesFileKind() {
+        XCTAssertEqual(
+            PreviewLoadMessage.title(for: URL(fileURLWithPath: "/card/photo.ARW")),
+            "Reading embedded JPEG…"
+        )
+        XCTAssertEqual(
+            PreviewLoadMessage.title(for: URL(fileURLWithPath: "/card/photo.DNG")),
+            "Reading embedded JPEG…"
+        )
+        XCTAssertEqual(
+            PreviewLoadMessage.title(for: URL(fileURLWithPath: "/card/photo.JPG")),
+            "Reading JPEG…"
+        )
+        XCTAssertEqual(
+            PreviewLoadMessage.title(for: URL(fileURLWithPath: "/card/photo.png")),
+            "Reading PNG…"
+        )
+        XCTAssertEqual(
+            PreviewLoadMessage.title(for: URL(fileURLWithPath: "/card/clip.MP4")),
+            "Reading video frame…"
+        )
+        XCTAssertEqual(PreviewLoadMessage.title(for: nil), "Reading preview…")
+    }
+
     func testThumbnailDecoderCapsDecodedPixelDimensions() throws {
         let width = 1_200
         let height = 800
