@@ -75,6 +75,49 @@ enum PreviewZoomMath {
         )
     }
 
+    /// The image's displayed rect in canvas coordinates: the aspect-fit
+    /// rect centered in the canvas, scaled by `zoom` about the center and
+    /// shifted by the pan `offset`. A parent aligns overlays — face boxes —
+    /// to the photo with it.
+    static func displayedImageRect(
+        imageSize: CGSize,
+        canvasSize: CGSize,
+        zoom: CGFloat,
+        offset: CGSize
+    ) -> CGRect {
+        guard imageSize.width > 0, imageSize.height > 0 else { return .zero }
+        let fit = fitScale(imageSize: imageSize, canvasSize: canvasSize)
+        let width = imageSize.width * fit * zoom
+        let height = imageSize.height * fit * zoom
+        return CGRect(
+            x: (canvasSize.width - width) / 2 + offset.width,
+            y: (canvasSize.height - height) / 2 + offset.height,
+            width: width,
+            height: height
+        )
+    }
+
+    /// A canvas-space rect (a drag marquee) as a top-left-origin normalized
+    /// image rect — clamped to the photo's displayed rect. `nil` when the
+    /// rect stayed click-sized or never overlapped the image.
+    static func normalizedMarkupRect(
+        canvasRect: CGRect,
+        imageFrame: CGRect,
+        minimumPoints: CGFloat = 8
+    ) -> CGRect? {
+        let drawn = canvasRect.standardized
+        guard drawn.width >= minimumPoints, drawn.height >= minimumPoints,
+              imageFrame.width > 0, imageFrame.height > 0 else { return nil }
+        let clipped = drawn.intersection(imageFrame)
+        guard !clipped.isNull, clipped.width >= 2, clipped.height >= 2 else { return nil }
+        return CGRect(
+            x: (clipped.minX - imageFrame.minX) / imageFrame.width,
+            y: (clipped.minY - imageFrame.minY) / imageFrame.height,
+            width: clipped.width / imageFrame.width,
+            height: clipped.height / imageFrame.height
+        )
+    }
+
     private static func usableSize(_ canvasSize: CGSize) -> CGSize {
         CGSize(
             width: max(1, canvasSize.width - padding * 2),
@@ -110,12 +153,26 @@ struct InteractivePreviewCanvas: View {
     /// Reports the effective zoom whenever it changes, including mid-pinch,
     /// so the parent can upgrade the decode for deep zooming.
     var onZoomChange: ((CGFloat) -> Void)?
+    /// While bound-true, drags draw a marquee over the image instead of
+    /// panning and clicks stop toggling zoom — the burst overlay's
+    /// draw-a-face-box mode.
+    var markupActive: Binding<Bool> = .constant(false)
+    /// Called with the drawn rect in normalized image coordinates
+    /// (top-left origin, clamped to the photo) when a markup drag ends.
+    var onMarkupRect: ((CGRect) -> Void)? = nil
+    /// Reports the photo's displayed rect in canvas coordinates whenever
+    /// zoom, pan, layout, or the image itself moves it — a parent aligns
+    /// overlays to the photo with it.
+    var onImageFrameChange: ((CGRect) -> Void)? = nil
 
     @State private var zoom: CGFloat = 1
     @State private var panOffset: CGSize = .zero
     @State private var loadingTimedOut = false
+    @State private var hoverInside = false
+    @State private var markupCursorPushed = false
     @GestureState private var dragTranslation: CGSize = .zero
     @GestureState private var magnification: CGFloat = 1
+    @GestureState private var markupRect: CGRect?
     @FocusState private var hasKeyboardFocus: Bool
 
     /// True while the canvas is waiting on a first decode — the state that
@@ -148,6 +205,12 @@ struct InteractivePreviewCanvas: View {
                 canvasSize: geometry.size,
                 zoom: effectiveZoom
             )
+            let imageFrame: CGRect = image == nil ? .zero : PreviewZoomMath.displayedImageRect(
+                imageSize: imagePointSize,
+                canvasSize: geometry.size,
+                zoom: effectiveZoom,
+                offset: displayOffset
+            )
 
             ZStack {
                 Color.black
@@ -169,6 +232,18 @@ struct InteractivePreviewCanvas: View {
                         description: Text(unavailableDescription)
                     )
                     .foregroundStyle(.white)
+                }
+
+                if let markupRect, markupRect.width > 0, markupRect.height > 0 {
+                    RoundedRectangle(cornerRadius: 3)
+                        .fill(Color.accentColor.opacity(0.15))
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 3)
+                                .strokeBorder(Color.accentColor, lineWidth: 1.5)
+                        }
+                        .frame(width: markupRect.width, height: markupRect.height)
+                        .position(x: markupRect.midX, y: markupRect.midY)
+                        .allowsHitTesting(false)
                 }
 
                 if image != nil {
@@ -228,9 +303,43 @@ struct InteractivePreviewCanvas: View {
             .simultaneousGesture(
                 DragGesture(minimumDistance: 0)
                     .updating($dragTranslation) { value, state, _ in
-                        state = value.translation
+                        if !markupActive.wrappedValue {
+                            state = value.translation
+                        }
+                    }
+                    .updating($markupRect) { value, state, _ in
+                        guard markupActive.wrappedValue, image != nil else { return }
+                        state = CGRect(
+                            x: min(value.startLocation.x, value.location.x),
+                            y: min(value.startLocation.y, value.location.y),
+                            width: abs(value.location.x - value.startLocation.x),
+                            height: abs(value.location.y - value.startLocation.y)
+                        )
                     }
                     .onEnded { value in
+                        if markupActive.wrappedValue {
+                            // Markup mode: the drag drew a box, not a pan,
+                            // and a click stops toggling zoom.
+                            let rect = CGRect(
+                                x: min(value.startLocation.x, value.location.x),
+                                y: min(value.startLocation.y, value.location.y),
+                                width: abs(value.location.x - value.startLocation.x),
+                                height: abs(value.location.y - value.startLocation.y)
+                            )
+                            let frame = PreviewZoomMath.displayedImageRect(
+                                imageSize: imagePointSize,
+                                canvasSize: geometry.size,
+                                zoom: PreviewZoomMath.clampedZoom(zoom * magnification),
+                                offset: panOffset
+                            )
+                            if let normalized = PreviewZoomMath.normalizedMarkupRect(
+                                canvasRect: rect,
+                                imageFrame: frame
+                            ) {
+                                onMarkupRect?(normalized)
+                            }
+                            return
+                        }
                         let translation = value.translation
                         if abs(translation.width) < 4, abs(translation.height) < 4 {
                             // A drag that never moved is a click: toggle zoom
@@ -270,6 +379,17 @@ struct InteractivePreviewCanvas: View {
                 // never fire onChange — drop it so it can't wedge; the fresh
                 // canvas is already at fit.
                 zoomCommand.wrappedValue = nil
+                onImageFrameChange?(imageFrame)
+            }
+            .onDisappear {
+                if markupCursorPushed {
+                    NSCursor.pop()
+                    markupCursorPushed = false
+                }
+            }
+            .onHover { inside in
+                hoverInside = inside
+                updateMarkupCursor()
             }
             .onKeyPress(.space) {
                 guard let onDismiss else { return .ignored }
@@ -301,6 +421,15 @@ struct InteractivePreviewCanvas: View {
             .onChange(of: effectiveZoom) { _, newZoom in
                 onZoomChange?(newZoom)
             }
+            .onChange(of: imageFrame) { _, frame in
+                onImageFrameChange?(frame)
+            }
+            .onChange(of: markupActive.wrappedValue) { _, _ in
+                updateMarkupCursor()
+            }
+            .onChange(of: image != nil) { _, _ in
+                updateMarkupCursor()
+            }
             .onChange(of: zoomCommand.wrappedValue) { _, command in
                 guard let command else { return }
                 perform(command, canvasSize: geometry.size)
@@ -328,6 +457,19 @@ struct InteractivePreviewCanvas: View {
             } else {
                 loadingTimedOut = false
             }
+        }
+    }
+
+    /// Crosshair while a markup drag is available — push/pop is paired
+    /// through `markupCursorPushed` so the cursor stack never unbalances.
+    private func updateMarkupCursor() {
+        let want = hoverInside && markupActive.wrappedValue && image != nil
+        if want && !markupCursorPushed {
+            NSCursor.crosshair.push()
+            markupCursorPushed = true
+        } else if !want && markupCursorPushed {
+            NSCursor.pop()
+            markupCursorPushed = false
         }
     }
 

@@ -2682,6 +2682,55 @@ final class EventsWorkspace {
         (try? faceStore.faces(personID: personID)) ?? []
     }
 
+    /// A new roster person created from the overlay's tag picker.
+    func createRosterPerson(named name: String) -> FacePerson? {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let person = try? faceStore.createPerson(name: trimmed, isRoster: true)
+        if person != nil {
+            facesRevision &+= 1
+            model.statusMessage = "Added \(trimmed) to the people list."
+        }
+        return person
+    }
+
+    /// Assigns an existing detection to a person and confirms it — the
+    /// owner's call, so the face becomes frozen and its embedding is pinned
+    /// as a match reference when one exists. Confirmed faces are untouched.
+    func tagFace(_ faceID: UUID, as personID: UUID) {
+        try? faceStore.assignFace(faceID, to: personID, state: .confirmed, score: nil)
+        try? faceStore.addTemplate(personID: personID, faceID: faceID)
+        try? faceStore.refreshFaceCounts()
+        facesRevision &+= 1
+        model.statusMessage = "Tagged. The photo file was not modified."
+    }
+
+    /// A face box the owner drew on the burst preview: stored confirmed so
+    /// a later scan never reclassifies it. The photo row is created at
+    /// grade `.none` when the file was never scanned, so it still gets its
+    /// real detection pass later. Catalog-only — nothing is written to the
+    /// photo file.
+    func tagDrawnFace(
+        on file: OrganizeFile,
+        box: NormalizedFaceBox,
+        personID: UUID,
+        takenAt: Date?,
+        crop: Data?
+    ) {
+        let photo = FacePhotoRecord(
+            pathKey: file.pathKey,
+            path: file.path,
+            fileName: file.name,
+            byteCount: file.size,
+            modifiedAt: file.modifiedAt,
+            takenAt: takenAt
+        )
+        _ = try? faceStore.addManualFace(photo: photo, box: box, personID: personID, crop: crop)
+        try? faceStore.refreshFaceCounts()
+        facesRevision &+= 1
+        model.statusMessage = "Tagged. The photo file was not modified."
+    }
+
     func renamePerson(_ personID: UUID, name: String) {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }

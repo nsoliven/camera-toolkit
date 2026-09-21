@@ -924,6 +924,200 @@ final class FaceIndexTests: XCTestCase {
         }
     }
 
+    // MARK: - File-identity face lookup (burst preview overlay)
+
+    func testFacesLookedUpByFileIdentitySurviveMoves() throws {
+        try withFaceStore { store, _ in
+            // Scanned in the unsorted folder at /card/DCIM.
+            let atScan = photoRecord("DSC00001.ARW", size: 4_096, directory: "/card/DCIM")
+            let face = faceRecord(
+                atScan,
+                box: NormalizedFaceBox(x: 0.2, y: 0.3, width: 0.15, height: 0.15),
+                embedding: testEmbedding(seed: 3)
+            )
+            try store.replaceFaces(photo: atScan, faces: [face])
+
+            // After the move the path key changed; the identity did not.
+            let moved = photoRecord("DSC00001.ARW", size: 4_096, directory: "/library/event")
+            let faces = try store.faces(
+                fileName: moved.fileName,
+                byteCount: moved.byteCount,
+                modifiedAt: moved.modifiedAt,
+                preferredPathKey: moved.pathKey
+            )
+            XCTAssertEqual(faces.map(\.id), [face.id])
+            XCTAssertEqual(faces.first?.photoPath, atScan.path)
+
+            // A same-named file of a different size is a different file.
+            let other = try store.faces(
+                fileName: "DSC00001.ARW",
+                byteCount: 9_999,
+                modifiedAt: moved.modifiedAt
+            )
+            XCTAssertTrue(other.isEmpty)
+
+            // And a file that was never scanned yields no boxes.
+            let unscanned = try store.faces(
+                fileName: "DSC99999.ARW",
+                byteCount: 4_096,
+                modifiedAt: moved.modifiedAt
+            )
+            XCTAssertTrue(unscanned.isEmpty)
+        }
+    }
+
+    func testFacesByFileIdentityDedupeAcrossPhotoRows() throws {
+        try withFaceStore { store, _ in
+            let dad = try store.createPerson(name: "Dad", isRoster: true)
+            // The same file scanned twice — before and after its move — has
+            // two photo rows with overlapping detections.
+            let before = photoRecord("DSC00002.ARW", size: 2_048, directory: "/card/DCIM")
+            let confirmed = faceRecord(
+                before,
+                box: NormalizedFaceBox(x: 0.2, y: 0.3, width: 0.15, height: 0.15),
+                embedding: testEmbedding(seed: 4),
+                state: .confirmed,
+                personID: dad.id
+            )
+            try store.replaceFaces(photo: before, faces: [confirmed])
+
+            let after = photoRecord("DSC00002.ARW", size: 2_048, directory: "/library/event")
+            let redetected = faceRecord(
+                after,
+                box: NormalizedFaceBox(x: 0.21, y: 0.31, width: 0.15, height: 0.15),
+                embedding: testEmbedding(seed: 5)
+            )
+            let fresh = faceRecord(
+                after,
+                box: NormalizedFaceBox(x: 0.7, y: 0.7, width: 0.1, height: 0.1),
+                embedding: testEmbedding(seed: 6)
+            )
+            try store.replaceFaces(photo: after, faces: [redetected, fresh])
+
+            // Confirmed wins the overlap regardless of which path it was
+            // scanned under — the bare re-detection is deduped away and the
+            // disjoint second face still shows.
+            let faces = try store.faces(
+                fileName: after.fileName,
+                byteCount: after.byteCount,
+                modifiedAt: after.modifiedAt,
+                preferredPathKey: after.pathKey
+            )
+            XCTAssertEqual(Set(faces.map(\.id)), [confirmed.id, fresh.id])
+        }
+    }
+
+    // MARK: - Manual face tagging (burst preview overlay)
+
+    func testAddManualFaceOnUnscannedFile() throws {
+        try withFaceStore { store, _ in
+            let mom = try store.createPerson(name: "Mom", isRoster: true)
+            let photo = photoRecord("DSC00010.ARW", size: 5_000, directory: "/card/DCIM")
+            let box = NormalizedFaceBox(x: 0.3, y: 0.3, width: 0.2, height: 0.2)
+
+            let face = try store.addManualFace(photo: photo, box: box, personID: mom.id)
+
+            XCTAssertEqual(face.state, .confirmed)
+            XCTAssertEqual(face.personID, mom.id)
+            XCTAssertEqual(face.photoID, photo.pathKey)
+
+            // The photo row exists now at grade .none — a real scan still
+            // runs on the file later.
+            let stored = try XCTUnwrap(try store.photos(pathKeys: [photo.pathKey])[photo.pathKey])
+            XCTAssertEqual(stored.scanGrade, .none)
+            XCTAssertEqual(stored.faceCount, 1)
+            XCTAssertEqual(try store.faces(photoID: photo.pathKey).first?.state, .confirmed)
+            XCTAssertEqual(try store.faces(personID: mom.id).count, 1)
+
+            // A rescan keeps the confirmed face frozen and does not insert
+            // an overlapping re-detection on top of it.
+            let redetected = faceRecord(
+                photo,
+                box: NormalizedFaceBox(x: 0.31, y: 0.31, width: 0.2, height: 0.2),
+                embedding: testEmbedding(seed: 8)
+            )
+            try store.replaceFaces(
+                photo: FacePhotoRecord(
+                    pathKey: photo.pathKey,
+                    path: photo.path,
+                    fileName: photo.fileName,
+                    byteCount: photo.byteCount,
+                    modifiedAt: photo.modifiedAt,
+                    scanGrade: .low
+                ),
+                faces: [redetected]
+            )
+            let after = try store.faces(photoID: photo.pathKey)
+            XCTAssertEqual(after.count, 1)
+            XCTAssertEqual(after.first?.id, face.id)
+            XCTAssertEqual(after.first?.state, .confirmed)
+            XCTAssertEqual(
+                try store.photos(pathKeys: [photo.pathKey])[photo.pathKey]?.scanGrade,
+                .low
+            )
+        }
+    }
+
+    func testAddManualFaceClaimsOverlappingDetection() throws {
+        try withFaceStore { store, _ in
+            let dad = try store.createPerson(name: "Dad", isRoster: true)
+            var photo = photoRecord("DSC00011.ARW", size: 5_000, directory: "/card/DCIM")
+            photo.scanGrade = .low
+            let detected = faceRecord(
+                photo,
+                box: NormalizedFaceBox(x: 0.3, y: 0.3, width: 0.2, height: 0.2),
+                embedding: testEmbedding(seed: 9),
+                state: .cached
+            )
+            try store.replaceFaces(photo: photo, faces: [detected])
+
+            // Drawing over the detected face claims it: same row id, now
+            // confirmed for the person, keeping its embedding.
+            let box = NormalizedFaceBox(x: 0.31, y: 0.29, width: 0.2, height: 0.2)
+            let claimed = try store.addManualFace(photo: photo, box: box, personID: dad.id)
+            XCTAssertEqual(claimed.id, detected.id)
+            XCTAssertEqual(claimed.state, .confirmed)
+            XCTAssertEqual(claimed.personID, dad.id)
+            XCTAssertEqual(try store.faces(photoID: photo.pathKey).count, 1)
+            XCTAssertEqual(try store.face(id: detected.id)?.embedding?.count, 512)
+
+            // The scan grade survives the manual tag — manual rows never
+            // stamp a grade.
+            XCTAssertEqual(
+                try store.photos(pathKeys: [photo.pathKey])[photo.pathKey]?.scanGrade,
+                .low
+            )
+
+            // A box over a confirmed face is a no-op — confirmed is frozen.
+            let other = try store.createPerson(name: "Mom", isRoster: true)
+            let frozen = try store.addManualFace(photo: photo, box: box, personID: other.id)
+            XCTAssertEqual(frozen.id, detected.id)
+            XCTAssertEqual(frozen.personID, dad.id)
+            XCTAssertEqual(try store.faces(personID: other.id).count, 0)
+        }
+    }
+
+    func testAddManualFaceDropsStaleUnconfirmedFaces() throws {
+        try withFaceStore { store, _ in
+            let person = try store.createPerson(name: "A", isRoster: true)
+            let scanned = photoRecord("DSC00012.ARW", size: 5_000, directory: "/card/DCIM")
+            let old = faceRecord(
+                scanned,
+                box: NormalizedFaceBox(x: 0.1, y: 0.1, width: 0.1, height: 0.1),
+                embedding: testEmbedding(seed: 11)
+            )
+            try store.replaceFaces(photo: scanned, faces: [old])
+
+            // The file changed on disk (new size): the old unconfirmed row
+            // described different bytes and is dropped; the new tag stays.
+            let changed = photoRecord("DSC00012.ARW", size: 6_000, directory: "/card/DCIM")
+            let drawn = NormalizedFaceBox(x: 0.5, y: 0.5, width: 0.15, height: 0.15)
+            let face = try store.addManualFace(photo: changed, box: drawn, personID: person.id)
+            let faces = try store.faces(photoID: changed.pathKey)
+            XCTAssertEqual(faces.map(\.id), [face.id])
+        }
+    }
+
     // MARK: - Helpers
 
     /// Opens a bootstrapped catalog + face store inside a temp folder.
