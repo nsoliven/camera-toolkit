@@ -15,6 +15,8 @@ struct EventBoardView: View {
     @AppStorage("CameraToolkit.organize.order") private var sortOrder: OrganizeBoardOrder = .oldestFirst
     @State private var previewStackID: String?
     @State private var previewFrameIndex = 0
+    @State private var searchQuery = ""
+    @FocusState private var searchFocused: Bool
 
     /// Grouping that makes sense inside one event — every stack belongs to
     /// it, so "by event" would be a single useless section.
@@ -26,7 +28,7 @@ struct EventBoardView: View {
 
     private var boardGroups: [OrganizeBoardGroup] {
         OrganizeBoardPlan.groups(
-            for: workspace.eventStacks[eventID] ?? [],
+            for: workspace.visibleEventStacks(eventID, matching: searchQuery),
             grouping: effectiveGrouping,
             order: sortOrder
         )
@@ -39,12 +41,20 @@ struct EventBoardView: View {
             let ordered = groups
                 .filter { !workspace.collapsedGroupIDs.contains($0.id) }
                 .flatMap(\.stacks)
+            let searching = !OrganizeSearch.needle(searchQuery).isEmpty
             VStack(spacing: 0) {
                 header(event)
                 StorageStrip(model: model, workspace: workspace, event: event, summary: workspace.presence[eventID])
                     .guideHighlight(.storageStrip, in: workspace)
                 if stacks != nil {
-                    if groups.isEmpty {
+                    if groups.isEmpty && searching {
+                        ContentUnavailableView(
+                            "No Matches",
+                            systemImage: "magnifyingglass",
+                            description: Text("Nothing in \(workspace.eventTitle(event)) matches “\(searchQuery)”. Try a file name, burst, event, or person.")
+                        )
+                        .frame(maxHeight: .infinity)
+                    } else if groups.isEmpty {
                         emptyState(event)
                     } else {
                         board(groups: groups)
@@ -124,6 +134,29 @@ struct EventBoardView: View {
                 }
             }
             Spacer()
+            HStack(spacing: 5) {
+                Image(systemName: "magnifyingglass")
+                    .foregroundStyle(.secondary)
+                TextField("Search", text: $searchQuery)
+                    .textFieldStyle(.plain)
+                    .frame(width: 140)
+                    .focused($searchFocused)
+                if !searchQuery.isEmpty {
+                    Button {
+                        searchQuery = ""
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Clear search")
+                }
+            }
+            .font(.callout)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 4)
+            .background(.quaternary, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+            .help("Filter by file name, burst, event, or person (⌘F)")
             Picker("Keep on drive", selection: Binding(
                 get: { workspace.resolvedPolicy(for: event) },
                 set: { workspace.setPolicy(eventID, $0) }
@@ -202,6 +235,13 @@ struct EventBoardView: View {
                     }
                     reveal(url.appendingPathComponent(layout.eventFolder, isDirectory: true))
                 }
+                Divider()
+                Button("Scan for Faces…") {
+                    workspace.requestFaceScan(event)
+                }
+                .disabled(workspace.faceScanBlocker(for: event) != nil)
+                .help(workspace.faceScanBlocker(for: event)
+                    ?? "Detect and match faces on a sample of each burst — not every frame — plus single stills and, at MED and above, video frames. Writes only to the catalog — media is read, never touched.")
                 Divider()
                 Button("Undo Last Move") { workspace.undoLastMove() }
                     .disabled(workspace.latestMoveJournalTitle == nil || model.isBusy)
@@ -320,6 +360,8 @@ struct EventBoardView: View {
             NSWorkspace.shared.activateFileViewerSelecting(urls(for: workspace.targetStackIDs()))
         case .reload:
             Task { await workspace.refreshEvent(eventID) }
+        case .find:
+            searchFocused = true
         case .moveSelectionToTrash:
             workspace.requestTrash(stackIDs: workspace.targetStackIDs(), fromEvent: eventID)
         default:
