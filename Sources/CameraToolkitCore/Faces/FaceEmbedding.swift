@@ -13,11 +13,19 @@ public enum FaceModelCatalog {
     public static let modelFileName = "w600k_r50.mlpackage"
     /// The detector for MED and above, produced by `convert-scrfd.sh`. One
     /// package per input size — `det_10g.mlpackage` is the 640 base and
-    /// `det_10g_960.mlpackage` adds HIGH's second scale.
+    /// `det_10g_960.mlpackage` / `det_10g_1024.mlpackage` add HIGH's and
+    /// XHIGH's extra scales.
     public static let detectorFileName = "det_10g.mlpackage"
+    /// The optional SCRFD-34G sibling XHIGH can opt into — converted from a
+    /// locally supplied ONNX via `convert-scrfd.sh --34g`, never required.
+    public static let largeDetectorFileName = "det_34g.mlpackage"
 
     public static func detectorFileName(size: Int) -> String {
         size == 640 ? detectorFileName : "det_10g_\(size).mlpackage"
+    }
+
+    public static func largeDetectorFileName(size: Int) -> String {
+        size == 640 ? largeDetectorFileName : "det_34g_\(size).mlpackage"
     }
 
     public static func modelsDirectory(applicationSupport: URL) -> URL {
@@ -42,6 +50,17 @@ public enum FaceModelCatalog {
         FileManager.default.fileExists(atPath: detectorURL(applicationSupport: applicationSupport).path)
     }
 
+    /// True when at least one `det_34g*` sibling package sits next to the
+    /// 10G packages — the precondition for XHIGH's optional large-detector
+    /// pass. Absent packages must never block a scan.
+    public static func isLargeDetectorInstalled(applicationSupport: URL) -> Bool {
+        let directory = modelsDirectory(applicationSupport: applicationSupport)
+        return (try? FileManager.default.contentsOfDirectory(atPath: directory.path))?
+            .contains { $0 == largeDetectorFileName
+                || ($0.hasPrefix("det_34g_") && $0.hasSuffix(".mlpackage")) }
+            ?? false
+    }
+
     /// The embedder, or nil with a clear next step when the model package is
     /// absent. The package is compiled once per process into a temporary
     /// `.mlmodelc` — CoreML does not load mlpackages directly.
@@ -51,21 +70,30 @@ public enum FaceModelCatalog {
         return try await ArcFaceEmbedder(modelURL: url)
     }
 
-    /// The SCRFD detector for MED/HIGH, or nil when it is not installed.
-    /// Loads every converted input size in the Models folder — the 640
-    /// base plus any extra scales like `det_10g_960.mlpackage`.
+    /// The SCRFD detector for MED and above, or nil when it is not
+    /// installed. Loads every converted input size in the Models folder —
+    /// the 640 base plus any extra scales like `det_10g_960.mlpackage` —
+    /// and any `det_34g*` siblings, which only run when a scan opts into
+    /// `usesLargeDetector`.
     public static func loadDetector(applicationSupport: URL) async throws -> SCRFDDetector? {
         let base = detectorURL(applicationSupport: applicationSupport)
         guard FileManager.default.fileExists(atPath: base.path) else { return nil }
         var modelURLs: [Int: URL] = [640: base]
+        var heavyModelURLs: [Int: URL] = [:]
         let directory = modelsDirectory(applicationSupport: applicationSupport)
         for entry in (try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? [] {
-            // det_10g_960.mlpackage → 960
-            guard entry.hasPrefix("det_10g_"), entry.hasSuffix(".mlpackage"),
-                  let size = Int(entry.dropFirst(8).dropLast(10)) else { continue }
-            modelURLs[size] = directory.appendingPathComponent(entry)
+            // det_10g_960.mlpackage → 960; the same convention for det_34g.
+            if entry.hasPrefix("det_10g_"), entry.hasSuffix(".mlpackage"),
+               let size = Int(entry.dropFirst(8).dropLast(10)) {
+                modelURLs[size] = directory.appendingPathComponent(entry)
+            } else if entry == largeDetectorFileName {
+                heavyModelURLs[640] = directory.appendingPathComponent(entry)
+            } else if entry.hasPrefix("det_34g_"), entry.hasSuffix(".mlpackage"),
+                      let size = Int(entry.dropFirst(8).dropLast(10)) {
+                heavyModelURLs[size] = directory.appendingPathComponent(entry)
+            }
         }
-        return try await SCRFDDetector(modelURLs: modelURLs)
+        return try await SCRFDDetector(modelURLs: modelURLs, heavyModelURLs: heavyModelURLs)
     }
 }
 

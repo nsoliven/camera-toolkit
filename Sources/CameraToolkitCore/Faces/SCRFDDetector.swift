@@ -38,11 +38,17 @@ public struct VisionDetector: FaceDetecting {
 /// The SCRFD-10G detector converted to CoreML by `scripts/convert-scrfd.sh`.
 /// Each converted package is a fixed square input (the ONNX trace bakes
 /// per-shape constants), so the detector holds one model per input size —
-/// 640 always, 960 when installed for HIGH's second scale. Every pass
-/// letterboxes the image into the requested canvas, resamples to the
-/// tensor side when no native model exists, runs one prediction, and
-/// decodes the three FPN strides (8/16/32, 2 anchors per cell). Boxes and
-/// five-point landmarks come back in image pixels.
+/// 640 always, 960 and 1024 when installed for HIGH's and XHIGH's extra
+/// scales. Every pass letterboxes the image into the requested canvas,
+/// resamples to the tensor side when no native model exists, runs one
+/// prediction, and decodes the three FPN strides (8/16/32, 2 anchors per
+/// cell). Boxes and five-point landmarks come back in image pixels.
+///
+/// `heavyModelURLs` loads the optional SCRFD-34G siblings
+/// (`det_34g*.mlpackage`) — XHIGH's per-scan opt-in for group-shot faces
+/// the 10G pass still misses. When `FaceScanOptions.usesLargeDetector` is
+/// on and a heavy package exists, every canvas runs the large family;
+/// otherwise the standard models run.
 ///
 /// One detector instance is shared across scan workers — `MLModel`
 /// predictions are safe to run concurrently.
@@ -56,10 +62,31 @@ public final class SCRFDDetector: FaceDetecting, @unchecked Sendable {
 
     /// Tensor side → loaded model + its input name.
     private let models: [Int: (model: MLModel, inputName: String)]
+    /// Tensor side → loaded 34G model + its input name. Empty unless the
+    /// optional `det_34g*` siblings were installed and loaded.
+    private let heavyModels: [Int: (model: MLModel, inputName: String)]
     /// Input sizes with a native model installed, ascending.
     public let nativeInputSizes: [Int]
+    /// Input sizes with a native 34G package installed, ascending.
+    public let heavyInputSizes: [Int]
 
-    public init(modelURLs: [Int: URL]) async throws {
+    public init(modelURLs: [Int: URL], heavyModelURLs: [Int: URL] = [:]) async throws {
+        let models = try await Self.compile(modelURLs)
+        guard !models.isEmpty else {
+            throw ToolkitError.commandFailed("The face detector has no usable model packages.")
+        }
+        self.models = models
+        self.nativeInputSizes = models.keys.sorted()
+        // The large family is optional — a bad sibling must not take down
+        // the installed 10G detector, so a failed compile just drops it.
+        self.heavyModels = (try? await Self.compile(heavyModelURLs)) ?? [:]
+        self.heavyInputSizes = heavyModels.keys.sorted()
+    }
+
+    /// Compiles and loads each package, returning tensor side → model.
+    private static func compile(
+        _ modelURLs: [Int: URL]
+    ) async throws -> [Int: (model: MLModel, inputName: String)] {
         var models: [Int: (model: MLModel, inputName: String)] = [:]
         for (size, url) in modelURLs {
             // A .mlpackage must be compiled before CoreML loads it; the
@@ -71,22 +98,29 @@ public final class SCRFDDetector: FaceDetecting, @unchecked Sendable {
             }
             models[size] = (model, inputName)
         }
-        guard !models.isEmpty else {
-            throw ToolkitError.commandFailed("The face detector has no usable model packages.")
-        }
-        self.models = models
-        self.nativeInputSizes = models.keys.sorted()
+        return models
     }
 
     /// The model and tensor side for a requested canvas: the native model
     /// when one exists for that size, else the largest installed — the
     /// canvas render is resampled to fit.
-    private func modelEntry(for canvasSize: Int) -> (model: MLModel, inputName: String, tensorSide: Int)? {
-        if let exact = models[canvasSize] {
+    private func modelEntry(
+        for canvasSize: Int,
+        in table: [Int: (model: MLModel, inputName: String)]
+    ) -> (model: MLModel, inputName: String, tensorSide: Int)? {
+        if let exact = table[canvasSize] {
             return (exact.model, exact.inputName, canvasSize)
         }
-        guard let side = nativeInputSizes.max(), let entry = models[side] else { return nil }
+        guard let side = table.keys.max(), let entry = table[side] else { return nil }
         return (entry.model, entry.inputName, side)
+    }
+
+    /// The package family and canvas scales a pass with these options
+    /// runs — for the Jobs log, the one place package names may appear.
+    public func packageSummary(for options: FaceScanOptions) -> String {
+        let family = (options.usesLargeDetector && !heavyModels.isEmpty) ? "det_34g" : "det_10g"
+        let scales = options.detectorScales.sorted().map(String.init).joined(separator: "/")
+        return "\(family) \(scales)"
     }
 
     public func detect(
@@ -98,9 +132,12 @@ public final class SCRFDDetector: FaceDetecting, @unchecked Sendable {
         let imageHeight = image.height
         guard imageWidth > 0, imageHeight > 0 else { return [] }
 
+        // XHIGH's optional 34G family: engaged only when the pass asks for
+        // it *and* a sibling package is installed — never a silent upgrade.
+        let family = (options.usesLargeDetector && !heavyModels.isEmpty) ? heavyModels : models
         var candidates: [Candidate] = []
         for canvasSize in options.detectorScales.sorted() {
-            guard let entry = modelEntry(for: canvasSize) else { continue }
+            guard let entry = modelEntry(for: canvasSize, in: family) else { continue }
             guard let tensor = try? Self.letterboxTensor(
                 image,
                 canvasSize: canvasSize,

@@ -808,6 +808,7 @@ struct FaceScanSheet: View {
                     Text("Low").tag(FaceScanGrade.low)
                     Text("Medium").tag(FaceScanGrade.med)
                     Text("High").tag(FaceScanGrade.high)
+                    Text("Extra High").tag(FaceScanGrade.xhigh)
                 }
                 .pickerStyle(.segmented)
                 Toggle("Fast — pin the Mac", isOn: $fast)
@@ -820,7 +821,7 @@ struct FaceScanSheet: View {
                 .fixedSize(horizontal: false, vertical: true)
             if needsDetector && !detectorInstalled {
                 Label(
-                    "Medium and High need the face detector installed — run scripts/convert-scrfd.sh once on this Mac.",
+                    "Medium and above need the face detector installed — run scripts/convert-scrfd.sh once on this Mac.",
                     systemImage: "exclamationmark.triangle.fill"
                 )
                 .font(.caption)
@@ -850,6 +851,8 @@ struct FaceScanSheet: View {
             "A more careful pass: stills plus a light sample of video frames, and it finds smaller faces down to about 40 px."
         case .high:
             "The deep pass: stills at two scales, faces down to about 30 px, and roughly one frame per second of video. Takes a while on big libraries."
+        case .xhigh:
+            "The everything pass: every burst frame, stills at three scales, faces down to about 30 px, about two video frames per second, and a second look at each face that sharpens your named people's templates. Best overnight, after naming people."
         default:
             "The quick pass: still photos only, faces large enough to matter. Videos are skipped."
         }
