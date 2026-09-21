@@ -4,11 +4,14 @@ import SwiftUI
 /// Face boxes drawn over the photo in `StackPreviewOverlay`, aligned to the
 /// canvas's reported image frame so zoom and pan keep them attached.
 ///
-/// Confirmed faces get a solid named box; proposed matches get a weaker
-/// dashed box with a "?" and a one-click confirm; unnamed detections stay
-/// faint until hovered, where a "+" opens the tag picker. Clicking a box
-/// body is intentionally transparent — the click falls through to the
-/// canvas's zoom; only the chips' buttons consume events.
+/// The chrome stays hidden until the pointer comes near a face: each stored
+/// face owns invisible proximity targets — its displayed box grown by
+/// `FaceHoverRegion.margin`, plus the chip strip — that reveal a solid
+/// named box (confirmed), a dashed "?" box with a one-click confirm
+/// (proposed), or a faint dashed box with a "+" tag button (unnamed). One
+/// face shows at a time; leaving the neighborhood hides it again. The
+/// targets never hit-test, so clicks still fall through to the canvas's
+/// zoom and pan — only the chips' buttons consume events.
 struct FaceBoxesOverlay: View {
     let faces: [FaceRecord]
     var personNames: [UUID: String] = [:]
@@ -21,16 +24,44 @@ struct FaceBoxesOverlay: View {
     /// A face plus its box rect in this view's space, to anchor the picker.
     var onTag: (FaceRecord, CGRect) -> Void = { _, _ in }
 
-    @State private var hovered: UUID?
+    /// One proximity tracker firing — a face's expanded box or its chip
+    /// strip. The regions overlap, so inside-ness is tracked per part: a
+    /// face counts as near while any of its parts holds the pointer, and
+    /// one part exiting can't drop the chrome while another still holds.
+    private struct InsidePart: Hashable {
+        let face: UUID
+        let part: Int
+    }
+
+    /// Parts currently holding the pointer, in entry order — the last
+    /// entry's face is the one whose chrome is up, and leaving it falls
+    /// back to whatever the pointer is still inside.
+    @State private var insideParts: [InsidePart] = []
+
+    /// The face to reveal — nil keeps the photo clean.
+    private var hovered: UUID? { insideParts.last?.face }
 
     var body: some View {
-        if !imageFrame.isEmpty {
-            ZStack {
+        ZStack {
+            if !imageFrame.isEmpty {
                 ForEach(faces) { face in
                     faceGroup(face)
                 }
             }
         }
+        .onChange(of: faces.map(\.id)) { _, ids in
+            // A removed face's target dies without an exit event — drop it
+            // so a stale winner can't mask the face now under the pointer.
+            insideParts.removeAll { !ids.contains($0.face) }
+        }
+        .onChange(of: imageFrame.isEmpty) { _, empty in
+            if empty { insideParts.removeAll() }
+        }
+    }
+
+    private func setHovered(_ part: InsidePart, _ inside: Bool) {
+        insideParts.removeAll { $0 == part }
+        if inside { insideParts.append(part) }
     }
 
     /// The face's box in this overlay's coordinate space: stored
@@ -58,8 +89,9 @@ struct FaceBoxesOverlay: View {
         let boxRect = displayRect(for: face)
         let isHovered = hovered == face.id
         // The chip strip rides just under the box — or just over it near
-        // the photo's bottom edge — and the hover region covers both, so
-        // the pointer can travel from box to chip without dropping.
+        // the photo's bottom edge — and its rect stays a hover target of
+        // its own, so the pointer can travel from box to chip without
+        // dropping even when the strip sits wider than a narrow face.
         let chipHeight: CGFloat = 22
         let chipBelow = boxRect.maxY + chipHeight + 6 <= imageFrame.maxY
         let strip = CGRect(
@@ -68,40 +100,57 @@ struct FaceBoxesOverlay: View {
             width: 140,
             height: chipHeight + 6
         )
-        let groupRect = boxRect.union(strip)
+        let regions = FaceHoverRegion.rects(boxRect: boxRect, chipStrip: strip)
+        let groupRect = regions.box.union(regions.strip)
 
         ZStack {
-            boxShape(face, hovered: isHovered)
-                .frame(width: boxRect.width, height: boxRect.height)
-                .position(
-                    x: boxRect.midX - groupRect.minX,
-                    y: boxRect.midY - groupRect.minY
-                )
-                .allowsHitTesting(false)
-            if showsChip(face, hovered: isHovered) {
-                chip(for: face, boxRect: boxRect, hovered: isHovered)
-                    .fixedSize()
-                    .position(
-                        x: boxRect.midX - groupRect.minX,
-                        y: (chipBelow
-                            ? boxRect.maxY + chipHeight / 2 + 3
-                            : boxRect.minY - chipHeight / 2 - 3) - groupRect.minY
-                    )
+            // The invisible targets exist while the chrome is hidden, so
+            // approaching the face can reveal it — and they never
+            // hit-test, so zoom/pan clicks still reach the canvas.
+            proximityTarget(regions.box, in: groupRect, part: InsidePart(face: face.id, part: 0))
+            proximityTarget(regions.strip, in: groupRect, part: InsidePart(face: face.id, part: 1))
+            if isHovered {
+                Group {
+                    boxShape(face)
+                        .frame(width: boxRect.width, height: boxRect.height)
+                        .position(
+                            x: boxRect.midX - groupRect.minX,
+                            y: boxRect.midY - groupRect.minY
+                        )
+                        .allowsHitTesting(false)
+                    chip(for: face, boxRect: boxRect)
+                        .fixedSize()
+                        .position(
+                            x: boxRect.midX - groupRect.minX,
+                            y: (chipBelow
+                                ? boxRect.maxY + chipHeight / 2 + 3
+                                : boxRect.minY - chipHeight / 2 - 3) - groupRect.minY
+                        )
+                }
+                .transition(.opacity)
             }
         }
         .frame(width: groupRect.width, height: groupRect.height)
         .position(x: groupRect.midX, y: groupRect.midY)
-        .onHover { inside in
-            hovered = inside ? face.id : (hovered == face.id ? nil : hovered)
-        }
+        .animation(.easeInOut(duration: 0.12), value: isHovered)
         .accessibilityElement(children: .combine)
         .accessibilityLabel(accessibilityLabel(for: face))
     }
 
-    /// Box fill/stroke per state: solid+bright for confirmed, dashed for
-    /// proposed, faint dashed for anything unnamed.
+    /// A hover-only region: rendered just barely on-screen so SwiftUI
+    /// keeps its tracking area alive, but transparent to clicks.
+    private func proximityTarget(_ rect: CGRect, in groupRect: CGRect, part: InsidePart) -> some View {
+        Color.white.opacity(0.001)
+            .frame(width: rect.width, height: rect.height)
+            .position(x: rect.midX - groupRect.minX, y: rect.midY - groupRect.minY)
+            .onHover { inside in setHovered(part, inside) }
+            .allowsHitTesting(false)
+    }
+
+    /// Box fill/stroke per state, drawn only while revealed: solid+bright
+    /// for confirmed, dashed for proposed, faint dashed for unnamed.
     @ViewBuilder
-    private func boxShape(_ face: FaceRecord, hovered: Bool) -> some View {
+    private func boxShape(_ face: FaceRecord) -> some View {
         let color = color(for: face)
         switch face.state {
         case .confirmed:
@@ -109,37 +158,28 @@ struct FaceBoxesOverlay: View {
                 .strokeBorder(color, lineWidth: 2)
                 .background(
                     RoundedRectangle(cornerRadius: 4)
-                        .fill(color.opacity(hovered ? 0.22 : 0.12))
+                        .fill(color.opacity(0.22))
                 )
         case .proposed:
             RoundedRectangle(cornerRadius: 4)
                 .strokeBorder(color, style: StrokeStyle(lineWidth: 1.5, dash: [6, 4]))
                 .background(
                     RoundedRectangle(cornerRadius: 4)
-                        .fill(color.opacity(hovered ? 0.18 : 0.08))
+                        .fill(color.opacity(0.18))
                 )
         case .cached, .other:
             RoundedRectangle(cornerRadius: 4)
                 .strokeBorder(
-                    color.opacity(hovered ? 0.95 : 0.5),
+                    color.opacity(0.95),
                     style: StrokeStyle(lineWidth: 1.25, dash: [4, 3])
                 )
-        }
-    }
-
-    private func showsChip(_ face: FaceRecord, hovered: Bool) -> Bool {
-        switch face.state {
-        case .confirmed, .proposed:
-            return true
-        case .cached, .other:
-            return hovered
         }
     }
 
     /// The name chip below the box: solid color for confirmed people, a
     /// dark capsule with confirm/tag buttons for everything still movable.
     @ViewBuilder
-    private func chip(for face: FaceRecord, boxRect: CGRect, hovered: Bool) -> some View {
+    private func chip(for face: FaceRecord, boxRect: CGRect) -> some View {
         let name = face.personID.flatMap { personNames[$0] }
         switch face.state {
         case .confirmed:
