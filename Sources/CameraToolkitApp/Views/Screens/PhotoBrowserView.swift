@@ -178,7 +178,7 @@ struct PhotoBrowserView: View {
     @State private var isCollectingEventFiles = false
     @State private var collectedEventFiles: [String: EventFileSelection] = [:]
     @State private var isShowingCollectedFiles = false
-    @State private var previewPaneWidth: CGFloat = 390
+    @AppStorage("CameraToolkit.browser.previewPaneWidth") private var previewPaneWidth: Double = 390
     @State private var browserOperationLabel: String?
     @State private var storageCapacities: [String: StorageCapacitySnapshot] = [:]
     @State private var copyAvailabilityRefreshRevision = 0
@@ -207,14 +207,14 @@ struct PhotoBrowserView: View {
                             .frame(minWidth: 420, maxWidth: .infinity, minHeight: 320, maxHeight: .infinity)
                         if let selectedPreviewURL {
                         let maximumPreviewWidth = max(260, geometry.size.width - 420 - PreviewPaneResizeHandle.width)
-                        let renderedPreviewWidth = min(max(previewPaneWidth, 260), maximumPreviewWidth)
+                        let renderedPreviewWidth = min(max(previewPaneWidth, 260), Double(maximumPreviewWidth))
                             PreviewPaneResizeHandle(
                                 previewWidth: $previewPaneWidth,
                                 renderedPreviewWidth: renderedPreviewWidth,
-                                maximumPreviewWidth: maximumPreviewWidth
+                                maximumPreviewWidth: Double(maximumPreviewWidth)
                             )
                             CameraSelectionPreview(url: selectedPreviewURL)
-                                .frame(width: renderedPreviewWidth)
+                                .frame(width: CGFloat(renderedPreviewWidth))
                         }
                     }
                 }
@@ -2822,11 +2822,11 @@ struct PhotoBrowserView: View {
 private struct PreviewPaneResizeHandle: View {
     static let width: CGFloat = 10
 
-    @Binding var previewWidth: CGFloat
-    let renderedPreviewWidth: CGFloat
-    let maximumPreviewWidth: CGFloat
+    @Binding var previewWidth: Double
+    let renderedPreviewWidth: Double
+    let maximumPreviewWidth: Double
 
-    @State private var dragOriginWidth: CGFloat?
+    @State private var dragOriginWidth: Double?
     @State private var isHovering = false
 
     var body: some View {
