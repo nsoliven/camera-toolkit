@@ -120,6 +120,9 @@ public struct FileOperationProgress: Sendable {
     public var processedBytes: Int64
     public var totalBytes: Int64
     public var bytesPerSecond: Double
+    /// Live detail for the Jobs activity pane — pipeline step, in-flight
+    /// files, counters, models. Nil on jobs that have nothing to add.
+    public var telemetry: JobTelemetry?
 
     public init(
         phase: String,
@@ -128,7 +131,8 @@ public struct FileOperationProgress: Sendable {
         totalFiles: Int = 0,
         processedBytes: Int64 = 0,
         totalBytes: Int64 = 0,
-        bytesPerSecond: Double = 0
+        bytesPerSecond: Double = 0,
+        telemetry: JobTelemetry? = nil
     ) {
         self.phase = phase
         self.currentPath = currentPath
@@ -137,6 +141,7 @@ public struct FileOperationProgress: Sendable {
         self.processedBytes = processedBytes
         self.totalBytes = totalBytes
         self.bytesPerSecond = bytesPerSecond
+        self.telemetry = telemetry
     }
 
     public var fractionComplete: Double {
@@ -155,7 +160,8 @@ public struct FileOperationProgress: Sendable {
             totalFiles: totalFiles,
             processedBytes: processedBytes,
             totalBytes: totalBytes,
-            bytesPerSecond: bytesPerSecond
+            bytesPerSecond: bytesPerSecond,
+            telemetry: telemetry
         )
     }
 }

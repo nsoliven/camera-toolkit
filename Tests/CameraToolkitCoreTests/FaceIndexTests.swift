@@ -269,6 +269,92 @@ final class FaceIndexTests: XCTestCase {
         }
     }
 
+    // MARK: - Jobs telemetry
+
+    /// The scan reports live detail for the Jobs window on the existing
+    /// progress channel: the pipeline step, real counters, byte totals,
+    /// and — in the debug pane — the concrete engine/embedder names.
+    func testScanReportsTelemetryOnProgressUpdates() throws {
+        try withTemporaryDirectory { root in
+            let catalog = root.appendingPathComponent("catalog.sqlite")
+            _ = try CatalogStore(url: catalog).bootstrap(
+                configuration: faceTestConfiguration(root: root, catalog: catalog),
+                createBackup: false,
+                createLibraryFolders: false
+            )
+
+            let urlA = root.appendingPathComponent("card/DSC_A.JPG")
+            let urlB = root.appendingPathComponent("card/DSC_B.JPG")
+            try writeJPEG(urlA, seed: 1)
+            try writeJPEG(urlB, seed: 2)
+            let itemA = try organizeItem(forFileAt: urlA)
+            let itemB = try organizeItem(forFileAt: urlB)
+            let totalBytes = itemA.primary.size + itemB.primary.size
+
+            // One canned face per photo, so the counter is predictable.
+            let detection = DetectedFace(
+                boundingBox: CGRect(x: 0.4, y: 0.4, width: 0.2, height: 0.2),
+                confidence: 0.9,
+                landmarks: nil
+            )
+            let recorder = ProgressRecorder()
+            let service = FaceIndexService(catalogURL: catalog)
+            let report = try service.scan(
+                // One item per stack — a multi-item stack is a burst and
+                // LOW samples it instead of scanning every frame.
+                stacks: [OrganizeStack(items: [itemA]), OrganizeStack(items: [itemB])],
+                embedder: StubEmbedder(),
+                detector: StubDetector(detections: [detection]),
+                progress: recorder.handler
+            )
+            XCTAssertEqual(report.photosProcessed, 2)
+            XCTAssertEqual(report.facesDetected, 2)
+
+            let updates = recorder.updates
+            XCTAssertFalse(updates.isEmpty)
+            // Every emission during the scan carries telemetry — the pane
+            // never shows a bare "Detecting faces" with nothing behind it.
+            let telemetryUpdates = updates.compactMap(\.telemetry)
+            XCTAssertEqual(telemetryUpdates.count, updates.count)
+
+            let last = try XCTUnwrap(telemetryUpdates.last)
+            // Test doubles name themselves; real runs list package files.
+            XCTAssertEqual(last.models, ["StubDetector", "StubEmbedder"])
+            XCTAssertTrue(last.facts.contains { $0.contains("LOW") })
+            XCTAssertEqual(last.counter("Faces"), 2)
+            // The scan ended in the match/group stage with nothing in flight.
+            XCTAssertTrue(last.activeItems.isEmpty)
+
+            // Byte counters cover every scanned file — the graph's input.
+            // (The trailing Match/Group updates count faces, not bytes.)
+            let lastScanUpdate = try XCTUnwrap(updates.last { $0.phase == "Detecting faces" })
+            XCTAssertEqual(lastScanUpdate.totalBytes, totalBytes)
+            XCTAssertEqual(lastScanUpdate.processedBytes, totalBytes)
+            XCTAssertEqual(lastScanUpdate.processedFiles, 2)
+        }
+    }
+
+    /// The vectors-only rematch still describes itself — "Match"/"Group"
+    /// stage, no fake decode work.
+    func testRematchRosterReportsMatchGroupTelemetry() throws {
+        try withFaceStore { store, catalog in
+            let photo = photoRecord("R1.JPG")
+            let face = faceRecord(photo, embedding: testEmbedding(seed: 71))
+            try store.replaceFaces(photo: photo, faces: [face])
+
+            let recorder = ProgressRecorder()
+            try FaceIndexService(catalogURL: catalog).rematchRoster(progress: recorder.handler)
+
+            let telemetryUpdates = recorder.updates.compactMap(\.telemetry)
+            XCTAssertFalse(telemetryUpdates.isEmpty)
+            XCTAssertTrue(telemetryUpdates.contains { $0.step == "Match" })
+            XCTAssertEqual(telemetryUpdates.last?.step, "Group")
+            XCTAssertTrue(
+                telemetryUpdates.allSatisfy { $0.facts.contains("Vectors only — no decode, no ML") }
+            )
+        }
+    }
+
     // MARK: - Match, cluster, review
 
     func testRosterMatchProposesAndGroupsLeftovers() throws {
