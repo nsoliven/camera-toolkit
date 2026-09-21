@@ -544,6 +544,40 @@ final class FaceIndexTests: XCTestCase {
         }
     }
 
+    /// Neighbors are similar enough to join a walking average, but the
+    /// first and last face are different people. They must not land in
+    /// one Person N drawer.
+    func testSimilarChainDoesNotCollapseIntoOneGroup() throws {
+        try withFaceStore { store, catalog in
+            let photo = photoRecord("CHAIN.JPG")
+            let step = Float.pi / 180 * 50
+            var faces: [FaceRecord] = []
+            for index in 0..<6 {
+                let angle = step * Float(index)
+                var vector = [Float](repeating: 0, count: 8)
+                vector[0] = cos(angle)
+                vector[1] = sin(angle)
+                let box = NormalizedFaceBox(x: 0.05 + Double(index) * 0.12, y: 0.1, width: 0.1, height: 0.1)
+                faces.append(faceRecord(
+                    photo,
+                    box: box,
+                    detScore: 0.95 - Double(index) * 0.02,
+                    embedding: FaceEmbeddingMath.l2Normalized(vector)
+                ))
+            }
+            try store.replaceFaces(photo: photo, faces: faces)
+            try FaceIndexService(catalogURL: catalog).rematchRoster()
+
+            let personIDs = Set(try faces.compactMap { try store.face(id: $0.id)?.personID })
+            XCTAssertGreaterThan(personIDs.count, 1)
+            let first = try XCTUnwrap(store.face(id: faces[0].id)?.personID)
+            let last = try XCTUnwrap(store.face(id: faces[5].id)?.personID)
+            XCTAssertNotEqual(first, last)
+            // The immediate neighbor still belongs with the first face.
+            XCTAssertEqual(try store.face(id: faces[1].id)?.personID, first)
+        }
+    }
+
     func testPromoteGroupConfirmsFacesAndBuildsTemplates() throws {
         try withFaceStore { store, catalog in
             // Two faces of the same cluster on different photos.

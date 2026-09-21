@@ -927,12 +927,28 @@ public struct FaceIndexService: Sendable {
         return nil
     }
 
+    /// One automatic cluster while a grouping pass is running.
+    ///
+    /// `seed` is the first face and never moves. The centroid is a running
+    /// mean, which on its own walks from person to person: each new face
+    /// only has to resemble the average, so a drawer like Person 308
+    /// absorbs hundreds of strangers. A face may join only when it still
+    /// resembles that first face. A group loaded from the catalog whose
+    /// members have already drifted apart accepts nobody new.
+    private struct OpenCluster {
+        var personID: UUID
+        var centroid: [Float]
+        var seed: [Float]
+        var members: Int
+        var acceptsNewMembers: Bool
+    }
+
     /// Greedy cosine grouping: faces in detection-confidence order join the
-    /// nearest existing group at or above `clusterThreshold`, else seed a
-    /// cluster — reusing an emptied "Person N" row when the rebundle left
-    /// one, else minting a new group — whose centroid updates as members
-    /// join. Rejections bar the people a face was refused from and veto
-    /// any group whose rejected faces beat its centroid.
+    /// nearest existing group at or above `clusterThreshold` and still close
+    /// to that group's first face, else seed a cluster — reusing an emptied
+    /// "Person N" row when the rebundle left one, else minting a new group.
+    /// Rejections bar the people a face was refused from and veto any group
+    /// whose rejected faces beat its centroid.
     private func assignToGroups(
         _ faces: [FaceRecord],
         options: FaceScanOptions,
@@ -942,12 +958,23 @@ public struct FaceIndexService: Sendable {
     ) throws -> (assigned: Int, created: Int) {
         let store = self.store
         let groupEmbeddings = try store.groupEmbeddings(database: database)
-        var centroids: [(personID: UUID, centroid: [Float], members: Int)] = []
-        centroids.reserveCapacity(groupEmbeddings.count)
+        var clusters: [OpenCluster] = []
+        clusters.reserveCapacity(groupEmbeddings.count)
         for (personID, embeddings) in groupEmbeddings.sorted(by: { $0.key.uuidString < $1.key.uuidString }) {
-            if let centroid = FaceEmbeddingMath.centroid(embeddings) {
-                centroids.append((personID, centroid, embeddings.count))
+            guard let centroid = FaceEmbeddingMath.centroid(embeddings) else { continue }
+            let seed = embeddings.max { lhs, rhs in
+                FaceEmbeddingMath.cosine(lhs, centroid) < FaceEmbeddingMath.cosine(rhs, centroid)
+            } ?? centroid
+            let cohesive = embeddings.allSatisfy {
+                FaceEmbeddingMath.cosine($0, centroid) >= options.clusterThreshold
             }
+            clusters.append(OpenCluster(
+                personID: personID,
+                centroid: centroid,
+                seed: seed,
+                members: embeddings.count,
+                acceptsNewMembers: cohesive
+            ))
         }
 
         var reusable = reusableGroups
@@ -958,11 +985,16 @@ public struct FaceIndexService: Sendable {
             guard let embedding = face.embedding else { continue }
             var bestIndex: Int?
             var bestScore: Float = options.clusterThreshold
-            for (index, entry) in centroids.enumerated() {
+            for (index, entry) in clusters.enumerated() {
+                // A drifted drawer stays frozen. New faces start their own groups.
+                if !entry.acceptsNewMembers { continue }
                 // Never back to a person this face was rejected from.
                 if rejections.blocks(faceID: face.id, personID: entry.personID) { continue }
                 let score = FaceEmbeddingMath.cosine(embedding, entry.centroid)
-                if score >= bestScore {
+                // Must still look like the face that started the group, not
+                // only like the average the group has walked toward.
+                let seedScore = FaceEmbeddingMath.cosine(embedding, entry.seed)
+                if score >= bestScore, seedScore >= options.clusterThreshold {
                     // The group's rejected faces must not describe this
                     // face better than the group itself does.
                     if rejections.vetoes(embedding, personID: entry.personID, score: score) { continue }
@@ -972,20 +1004,24 @@ public struct FaceIndexService: Sendable {
             }
             let personID: UUID
             if let bestIndex {
-                personID = centroids[bestIndex].personID
-                // Running-mean update keeps the centroid honest as the group
-                // grows within this pass.
-                var updated = centroids[bestIndex].centroid.map { $0 * Float(centroids[bestIndex].members) }
+                personID = clusters[bestIndex].personID
+                var updated = clusters[bestIndex].centroid.map { $0 * Float(clusters[bestIndex].members) }
                 for i in updated.indices { updated[i] += embedding[i] }
-                centroids[bestIndex].members += 1
-                centroids[bestIndex].centroid = FaceEmbeddingMath.l2Normalized(updated)
+                clusters[bestIndex].members += 1
+                clusters[bestIndex].centroid = FaceEmbeddingMath.l2Normalized(updated)
             } else if let reuseIndex = reusable.firstIndex(where: {
                 !rejections.blocks(faceID: face.id, personID: $0)
             }) {
                 // Recycle an emptied "Person N" row before minting a new
                 // one — but never a row this face was rejected from.
                 personID = reusable.remove(at: reuseIndex)
-                centroids.append((personID, embedding, 1))
+                clusters.append(OpenCluster(
+                    personID: personID,
+                    centroid: embedding,
+                    seed: embedding,
+                    members: 1,
+                    acceptsNewMembers: true
+                ))
                 created += 1
             } else {
                 let group = try store.createPerson(
@@ -994,7 +1030,13 @@ public struct FaceIndexService: Sendable {
                     database: database
                 )
                 personID = group.id
-                centroids.append((personID, embedding, 1))
+                clusters.append(OpenCluster(
+                    personID: personID,
+                    centroid: embedding,
+                    seed: embedding,
+                    members: 1,
+                    acceptsNewMembers: true
+                ))
                 created += 1
             }
             try store.assignFace(
