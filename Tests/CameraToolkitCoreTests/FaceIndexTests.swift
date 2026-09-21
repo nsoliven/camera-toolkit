@@ -478,6 +478,49 @@ final class FaceIndexTests: XCTestCase {
         }
     }
 
+    func testPeopleByFileKeyMapsRosterAndGroupsPerPhoto() throws {
+        try withFaceStore { store, _ in
+            let dad = try store.createPerson(name: "Dad", isRoster: true)
+            let group = try store.createPerson(name: "Person 1", isRoster: false)
+
+            let modified = Date(timeIntervalSince1970: 1_752_000_000)
+            let first = photoRecord("A1.JPG", modified: modified)
+            let second = photoRecord("A2.JPG", modified: modified)
+            try store.replaceFaces(photo: first, faces: [
+                faceRecord(first, embedding: testEmbedding(seed: 81), state: .confirmed, personID: dad.id),
+                faceRecord(
+                    first,
+                    box: NormalizedFaceBox(x: 0.5, y: 0.5, width: 0.2, height: 0.2),
+                    embedding: testEmbedding(seed: 82),
+                    state: .proposed,
+                    personID: dad.id
+                ),
+                // An ungrouped cached face contributes no person.
+                faceRecord(
+                    first,
+                    box: NormalizedFaceBox(x: 0.5, y: 0.1, width: 0.15, height: 0.15),
+                    embedding: testEmbedding(seed: 83)
+                ),
+            ])
+            try store.replaceFaces(photo: second, faces: [
+                faceRecord(second, embedding: testEmbedding(seed: 84), state: .other, personID: group.id),
+            ])
+
+            let key1 = FaceIndexStore.fileKey(fileName: "A1.JPG", byteCount: first.byteCount, modifiedAt: modified)
+            let key2 = FaceIndexStore.fileKey(fileName: "A2.JPG", byteCount: second.byteCount, modifiedAt: modified)
+            let byKey = try store.peopleByFileKey(fileKeys: [key1, key2])
+            XCTAssertEqual(byKey[key1]?.map(\.id), [dad.id])
+            XCTAssertEqual(byKey[key1]?.first?.faceCount, 2)
+            XCTAssertEqual(byKey[key2]?.map(\.id), [group.id])
+            XCTAssertEqual(byKey[key2]?.first?.isRoster, false)
+
+            // Unqueried and unmatched keys return nothing.
+            XCTAssertNil(byKey[FaceIndexStore.fileKey(fileName: "OTHER.JPG", byteCount: 1, modifiedAt: modified)])
+            XCTAssertNil(try store.peopleByFileKey(fileKeys: [key1])[key2])
+            XCTAssertTrue(try store.peopleByFileKey(fileKeys: []).isEmpty)
+        }
+    }
+
     // MARK: - Quality modes (MED / HIGH)
 
     func testModeDefaultsMatchThePlan() throws {
