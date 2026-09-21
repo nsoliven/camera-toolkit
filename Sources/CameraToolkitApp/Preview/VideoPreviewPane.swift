@@ -1,5 +1,6 @@
 import AVFoundation
 import AVKit
+import CameraToolkitCore
 import SwiftUI
 
 /// Bounded playability probing for the burst overlay's video pane. Every
@@ -25,9 +26,39 @@ enum VideoPreviewSupport {
         readinessTimeout: Duration = readinessTimeout
     ) async -> AVPlayer? {
         let asset = AVURLAsset(url: url)
-        guard await isPlayable(asset, timeout: playableTimeout) else { return nil }
+        let start = ContinuousClock.now
+        guard await isPlayable(asset, timeout: playableTimeout) else {
+            DebugLog.shared.log(
+                "probe.finish",
+                subsystem: .video,
+                level: .warning,
+                outcome: .error,
+                duration: ContinuousClock.now - start,
+                url: url,
+                error: "not proven playable"
+            )
+            return nil
+        }
         let player = AVPlayer(playerItem: AVPlayerItem(asset: asset))
-        guard await waitUntilReady(player, timeout: readinessTimeout) else { return nil }
+        guard await waitUntilReady(player, timeout: readinessTimeout) else {
+            DebugLog.shared.log(
+                "probe.finish",
+                subsystem: .video,
+                level: .warning,
+                outcome: .timeout,
+                duration: ContinuousClock.now - start,
+                url: url,
+                error: "player never reached readyToPlay"
+            )
+            return nil
+        }
+        DebugLog.shared.log(
+            "probe.finish",
+            subsystem: .video,
+            outcome: .ok,
+            duration: ContinuousClock.now - start,
+            url: url
+        )
         return player
     }
 
@@ -38,22 +69,55 @@ enum VideoPreviewSupport {
         let asset: AVAsset
     }
 
+    /// Which probe task answered first — the asset verdict or the clock —
+    /// so the log can tell a dead codec from a stalled source.
+    private enum ProbeResult: Sendable {
+        case answered(Bool)
+        case timedOut
+    }
+
     /// `asset.load(.isPlayable)` under a deadline. On timeout the
     /// underlying load is cancelled so the task group isn't kept alive by
     /// it; a false result always means "not proven playable", whether the
-    /// codec failed or the clock ran out.
+    /// codec failed or the clock ran out — the log records which one won.
     static func isPlayable(_ asset: AVAsset, timeout: Duration) async -> Bool {
         let box = AssetBox(asset: asset)
-        return await withTaskGroup(of: Bool.self) { group in
-            group.addTask { (try? await box.asset.load(.isPlayable)) ?? false }
+        let url = (asset as? AVURLAsset)?.url
+        let start = ContinuousClock.now
+        let result = await withTaskGroup(of: ProbeResult.self) { group in
+            group.addTask { .answered((try? await box.asset.load(.isPlayable)) ?? false) }
             group.addTask {
                 try? await Task.sleep(for: timeout)
-                return false
+                return .timedOut
             }
-            let result = await group.next() ?? false
+            let first = await group.next() ?? .timedOut
             group.cancelAll()
             asset.cancelLoading()
-            return result
+            return first
+        }
+        switch result {
+        case .answered(let playable):
+            DebugLog.shared.log(
+                "playable.finish",
+                subsystem: .video,
+                level: playable ? .debug : .warning,
+                outcome: playable ? .ok : .error,
+                duration: ContinuousClock.now - start,
+                url: url,
+                error: playable ? nil : "asset not playable"
+            )
+            return playable
+        case .timedOut:
+            DebugLog.shared.log(
+                "playable.finish",
+                subsystem: .video,
+                level: .warning,
+                outcome: .timeout,
+                duration: ContinuousClock.now - start,
+                url: url,
+                error: "isPlayable probe timed out"
+            )
+            return false
         }
     }
 

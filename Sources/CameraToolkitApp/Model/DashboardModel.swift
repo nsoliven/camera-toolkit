@@ -2144,6 +2144,15 @@ extension DashboardModel {
             summary: summary,
             detail: detail
         )
+        // Mirror the terminal state into the debug stream — action and
+        // outcome only; user-facing strings stay in the activity log.
+        DebugLog.shared.log(
+            "job.finish",
+            subsystem: .apply,
+            level: state == .failed ? .error : .info,
+            outcome: state == .done ? .ok : (state == .cancelled ? .cancel : .error),
+            detail: "\(action.rawValue) \(state.rawValue)"
+        )
         activityLog.insert(entry, at: 0)
         do {
             try ActivityLogStore(url: URL(fileURLWithPath: Self.expandedPath(configuration.activityLogPath))).append(entry)

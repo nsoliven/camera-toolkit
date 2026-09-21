@@ -1,4 +1,5 @@
 import AppKit
+import CameraToolkitCore
 import SwiftUI
 
 /// A zoom action a parent pushes into the canvas — used for keyboard
@@ -92,6 +93,14 @@ struct InteractivePreviewCanvas: View {
     /// under an existing layout uses e.g. 2, so zoom level and pan offset are
     /// preserved exactly.
     var imageScale: CGFloat = 1
+    /// The file being read — drives the spinner text ("Reading PNG…" vs
+    /// "Reading embedded JPEG…") and the bounded-wait debug event.
+    var file: URL? = nil
+    /// Longest the spinner may run before the failure UI replaces it. A read
+    /// stuck on a dead or sleeping volume would otherwise spin forever; the
+    /// load itself is never cancelled here — a late image still paints over
+    /// the failure UI.
+    var loadingTimeout: Duration = .seconds(20)
     var unavailableTitle = "No Preview"
     var unavailableDescription = "No embedded JPEG was found."
     var onDismiss: (() -> Void)?
@@ -104,9 +113,20 @@ struct InteractivePreviewCanvas: View {
 
     @State private var zoom: CGFloat = 1
     @State private var panOffset: CGSize = .zero
+    @State private var loadingTimedOut = false
     @GestureState private var dragTranslation: CGSize = .zero
     @GestureState private var magnification: CGFloat = 1
     @FocusState private var hasKeyboardFocus: Bool
+
+    /// True while the canvas is waiting on a first decode — the state that
+    /// must not be allowed to spin forever.
+    private var waitingForImage: Bool {
+        image == nil && isLoading
+    }
+
+    private var loadingTitle: String {
+        PreviewLoadMessage.title(for: file)
+    }
 
     /// The image's size in screen points.
     private var imagePointSize: CGSize {
@@ -138,8 +158,8 @@ struct InteractivePreviewCanvas: View {
                         .scaleEffect(effectiveZoom)
                         .offset(displayOffset)
                         .padding(PreviewZoomMath.padding)
-                } else if isLoading {
-                    ProgressView("Reading embedded JPEG…")
+                } else if isLoading && !loadingTimedOut {
+                    ProgressView { Text(loadingTitle) }
                         .tint(.white)
                         .foregroundStyle(.white)
                 } else {
@@ -290,6 +310,25 @@ struct InteractivePreviewCanvas: View {
         .clipped()
         .accessibilityLabel("Interactive Photo Preview")
         .accessibilityHint("Click or pinch to zoom, then drag to pan the photo")
+        .task(id: "\(waitingForImage)#\(file?.path ?? "")") {
+            if waitingForImage {
+                loadingTimedOut = false
+                try? await Task.sleep(for: loadingTimeout)
+                guard !Task.isCancelled else { return }
+                loadingTimedOut = true
+                DebugLog.shared.log(
+                    "wait.timeout",
+                    subsystem: .preview,
+                    level: .warning,
+                    outcome: .timeout,
+                    duration: loadingTimeout,
+                    url: file,
+                    detail: "spinner replaced by failure UI"
+                )
+            } else {
+                loadingTimedOut = false
+            }
+        }
     }
 
     private func toggleZoom(at location: CGPoint, canvasSize: CGSize) {

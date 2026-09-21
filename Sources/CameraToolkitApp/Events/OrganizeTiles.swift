@@ -1107,6 +1107,7 @@ struct StackPreviewOverlay: View {
                                 image: displayImage?.image,
                                 isLoading: !failed,
                                 imageScale: displayImage?.scale ?? 1,
+                                file: item.primary.url,
                                 unavailableTitle: "No Preview",
                                 unavailableDescription: "Camera Toolkit could not decode a preview for this file.",
                                 zoomCommand: $zoomCommand,
