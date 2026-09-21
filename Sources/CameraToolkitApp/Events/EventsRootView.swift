@@ -94,6 +94,19 @@ struct EventsRootView: View {
                 onApply: { workspace.performApply(plan) }
             )
         }
+        .alert("Move to Trash?", isPresented: Binding(
+            get: { workspace.pendingTrash != nil },
+            set: { if !$0 { workspace.pendingTrash = nil } }
+        )) {
+            Button("Cancel", role: .cancel) { workspace.pendingTrash = nil }
+            Button("Move to Trash", role: .destructive) {
+                if let request = workspace.pendingTrash {
+                    workspace.confirmTrash(request)
+                }
+            }
+        } message: {
+            Text(workspace.pendingTrash?.alertMessage ?? "")
+        }
         .sheet(item: $workspace.pendingRemoval) { request in
             RemovalConfirmSheet(
                 request: request,

@@ -287,4 +287,23 @@ final class MediaTrashServiceTests: XCTestCase {
             XCTAssertEqual(try Data(contentsOf: legacy), Data("precious".utf8))
         }
     }
+
+    func testPreviewDestinationsGroupsByVolumeWithoutMoving() throws {
+        try withTemporaryDirectory { root in
+            let volume = root.appendingPathComponent("NAS", isDirectory: true)
+            let photo = try writeFile(volume.appendingPathComponent("Unparsed/DSC00001.ARW"), "raw")
+            let files = [file(photo)]
+            let fallback = root.appendingPathComponent("Fallback/_Trash", isDirectory: true)
+            let preview = MediaTrashService.previewDestinations(
+                files: files,
+                removedFilesRoot: fallback,
+                volumeRoot: { _ in volume }
+            )
+            XCTAssertEqual(preview.count, 1)
+            XCTAssertEqual(preview[0].volumeLabel, "NAS")
+            XCTAssertTrue(preview[0].trashFolderPath.hasSuffix(".Camera Toolkit/_Trash"))
+            XCTAssertEqual(preview[0].fileCount, 1)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: photo.path))
+        }
+    }
 }

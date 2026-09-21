@@ -59,6 +59,41 @@ struct RemovalRequest: Identifiable {
     var byteCount: Int64
 }
 
+/// Confirmation before organizer Trash. Files are not moved until the user
+/// confirms. Destinations are the volume-local `_Trash` folders, never Finder.
+struct PendingTrashRequest: Identifiable {
+    let id = UUID()
+    var items: [OrganizeItem]
+    var locationID: UUID?
+    var eventID: UUID?
+    var locationName: String
+    var fileCount: Int
+    var byteCount: Int64
+    var sampleNames: [String]
+    var destinations: [MediaTrashDestinationPreview]
+
+    var alertMessage: String {
+        var lines: [String] = []
+        let count = "\(fileCount) file\(fileCount == 1 ? "" : "s") (\(byteCount.formattedBytes)) from \(locationName)."
+        lines.append(count)
+        if !sampleNames.isEmpty {
+            let listed = sampleNames.joined(separator: ", ")
+            let extra = fileCount > sampleNames.count ? " and \(fileCount - sampleNames.count) more" : ""
+            lines.append("Including \(listed)\(extra).")
+        }
+        if destinations.isEmpty {
+            lines.append("No reachable files to move.")
+        } else {
+            lines.append("They will be renamed into:")
+            for dest in destinations {
+                lines.append("• \(dest.trashFolderPath) (\(dest.volumeLabel))")
+            }
+        }
+        lines.append("Not Finder Trash. Restore from Settings → Trash. Nothing is permanently deleted until you empty Trash.")
+        return lines.joined(separator: "\n")
+    }
+}
+
 struct OrganizeApplyPlan: Identifiable, Sendable {
     struct CopyBatch: Sendable {
         var sourceRoot: String
@@ -211,6 +246,7 @@ final class EventsWorkspace {
     var faceScanRequest: FaceScanRequest?
     var pendingApplyPlan: OrganizeApplyPlan?
     var pendingRemoval: RemovalRequest?
+    var pendingTrash: PendingTrashRequest?
     var latestMoveJournalTitle: String?
     /// Bursts currently expanded inline in the board.
     var expandedStackIDs: Set<String> = []
@@ -1952,7 +1988,53 @@ final class EventsWorkspace {
     func trash(stackIDs: Set<String>, from locationID: UUID) {
         guard let result = sources[locationID]?.result else { return }
         let items = result.stacks.filter { stackIDs.contains($0.id) }.flatMap(\.items)
-        trashItems(items, from: locationID)
+        requestTrash(items, from: locationID)
+    }
+
+    func requestTrash(_ items: [OrganizeItem], from locationID: UUID) {
+        guard let location = location(locationID) else { return }
+        presentTrash(items: items, locationID: locationID, eventID: nil, locationName: location.name)
+    }
+
+    func requestTrash(_ items: [OrganizeItem], fromEvent eventID: UUID) {
+        let name = event(eventID).map { eventTitle($0) } ?? "this event"
+        presentTrash(items: items, locationID: nil, eventID: eventID, locationName: name)
+    }
+
+    func requestTrash(stackIDs: Set<String>, fromEvent eventID: UUID) {
+        let items = (eventStacks[eventID] ?? []).filter { stackIDs.contains($0.id) }.flatMap(\.items)
+        requestTrash(items, fromEvent: eventID)
+    }
+
+    func confirmTrash(_ request: PendingTrashRequest) {
+        pendingTrash = nil
+        if let locationID = request.locationID {
+            trashItems(request.items, from: locationID)
+        } else if let eventID = request.eventID {
+            trashItems(request.items, fromEvent: eventID)
+        }
+    }
+
+    private func presentTrash(items: [OrganizeItem], locationID: UUID?, eventID: UUID?, locationName: String) {
+        let files = items.flatMap(\.files)
+        guard !files.isEmpty else {
+            model.statusMessage = "Select photos first, then move them to Trash."
+            return
+        }
+        let destinations = MediaTrashService.previewDestinations(
+            files: files,
+            removedFilesRoot: locations.removedFilesRoot
+        )
+        pendingTrash = PendingTrashRequest(
+            items: items,
+            locationID: locationID,
+            eventID: eventID,
+            locationName: locationName,
+            fileCount: files.count,
+            byteCount: files.reduce(Int64(0)) { $0 + $1.size },
+            sampleNames: files.prefix(3).map { $0.url.lastPathComponent },
+            destinations: destinations
+        )
     }
 
     /// Moves individual frames — each item's primary plus its sidecars and
@@ -2023,6 +2105,89 @@ final class EventsWorkspace {
                     self.focusedStackID = nil
                     selectionAnchorID = nil
                 }
+                let skippedNote = batch.skipped.isEmpty
+                    ? ""
+                    : " \(batch.skipped.count) stayed in place: \(batch.skipped[0].reason)"
+                return batch.entries.isEmpty
+                    ? "Nothing moved to Trash.\(skippedNote)"
+                    : "Moved \(batch.entries.count) files to Trash — restorable from Settings.\(skippedNote)"
+            }
+        )
+    }
+
+    /// Event-board trash: the files at each item's current path (event folder
+    /// after Apply, or still-unsorted if only tagged). Same `_Trash` rename.
+    func trashItems(_ items: [OrganizeItem], fromEvent eventID: UUID) {
+        guard let event = event(eventID) else { return }
+        let files = items.flatMap(\.files)
+        guard !files.isEmpty else {
+            model.statusMessage = "Select photos first, then move them to Trash."
+            return
+        }
+        guard !model.isBusy, !model.isStorageBenchmarkRunning else {
+            model.statusMessage = "Another file job is already running. Wait for it to finish, then try again."
+            return
+        }
+
+        refreshIndexIfNeeded()
+        var eventIDs: [String: UUID] = [:]
+        var removedAssignments: [PhotoEventAssignment] = []
+        for file in files {
+            let key = file.pathKey
+            if let assignment = assignmentsByPathKey[key] {
+                eventIDs[key] = assignment.eventID
+                removedAssignments.append(assignment)
+            }
+        }
+        if !removedAssignments.isEmpty {
+            applyAssignmentChange(AssignmentChange(title: "Move to Trash", removed: removedAssignments, added: []), touching: nil)
+        }
+
+        let itemIDs = Set(items.map(\.id))
+        let trashedStackIDs = Set((eventStacks[eventID] ?? []).filter { stack in
+            stack.items.contains { itemIDs.contains($0.id) }
+        }.map(\.id))
+        let context = TrashContext(
+            locationName: eventTitle(event),
+            deviceID: nil,
+            eventIDsByPathKey: eventIDs
+        )
+        let originRoot = locations.eventFolder(for: event, policy: resolvedPolicy(for: event))
+        let fallbackTrashRoot = locations.removedFilesRoot
+        model.runBackgroundJob(
+            action: .organize,
+            runningNote: "Moving \(files.count) file(s) to Trash",
+            logTitle: "Moved files to Trash",
+            logDetail: "Renamed files from the event folder into the drive-local .Camera Toolkit/_Trash folder. Nothing was deleted; batches are restorable from Settings.",
+            operation: { progress in
+                try MediaTrashService(removedFilesRoot: fallbackTrashRoot).trash(
+                    files: files,
+                    originRoot: originRoot,
+                    context: context
+                ) { update in
+                    progress(DashboardModel.jobUpdate(from: update, notePrefix: "Moving to Trash", command: ""))
+                }
+            },
+            completion: { [weak self] batch in
+                guard let self else { return "" }
+                let movedKeys = Set(batch.entries.map { EventStorageLocations.pathKey($0.originalAbsolutePath) })
+                if let stacks = eventStacks[eventID] {
+                    let remaining = stacks.flatMap(\.items).filter { item in
+                        !item.files.contains { movedKeys.contains($0.pathKey) }
+                    }
+                    eventStacks[eventID] = OrganizeStacker.stacks(for: remaining, splits: model.configuration.burstSplits)
+                }
+                for (id, state) in sources {
+                    if let result = state.result {
+                        sources[id]?.result = result.removingFiles(withPathKeys: movedKeys)
+                    }
+                }
+                selectedStackIDs.subtract(trashedStackIDs)
+                if let focusedStackID, trashedStackIDs.contains(focusedStackID) {
+                    self.focusedStackID = nil
+                    selectionAnchorID = nil
+                }
+                Task { await self.refreshEvent(eventID) }
                 let skippedNote = batch.skipped.isEmpty
                     ? ""
                     : " \(batch.skipped.count) stayed in place: \(batch.skipped[0].reason)"

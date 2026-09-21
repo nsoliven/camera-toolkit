@@ -63,6 +63,21 @@ public struct MediaTrashManifest: Codable, Sendable {
 }
 
 /// A file `trash` left in place, with the reason.
+/// Where a trash confirmation should say files will go, grouped by volume.
+public struct MediaTrashDestinationPreview: Hashable, Sendable {
+    public var volumeLabel: String
+    public var trashFolderPath: String
+    public var fileCount: Int
+    public var byteCount: Int64
+
+    public init(volumeLabel: String, trashFolderPath: String, fileCount: Int, byteCount: Int64) {
+        self.volumeLabel = volumeLabel
+        self.trashFolderPath = trashFolderPath
+        self.fileCount = fileCount
+        self.byteCount = byteCount
+    }
+}
+
 public struct MediaTrashSkip: Hashable, Sendable {
     public var path: String
     public var reason: String
@@ -179,6 +194,39 @@ public struct MediaTrashService {
         self.fileManager = fileManager
         self.volumeRoot = volumeRoot
         self.now = now
+    }
+
+    /// Groups files by the `_Trash` folder they would land in. Does not move
+    /// anything — confirmation UI uses this to name the destination volume.
+    public static func previewDestinations(
+        files: [OrganizeFile],
+        removedFilesRoot: URL,
+        volumeRoot: @escaping @Sendable (URL) -> URL? = VolumeInfo.volumeRoot(for:)
+    ) -> [MediaTrashDestinationPreview] {
+        var seen: Set<String> = []
+        var buckets: [String: (label: String, path: String, count: Int, bytes: Int64)] = [:]
+        for file in files where seen.insert(file.pathKey).inserted {
+            let source = file.url.standardizedFileURL
+            let root: URL
+            let label: String
+            if let volume = volumeRoot(source) {
+                root = volume
+                    .appendingPathComponent(EventStorageLocations.toolkitFolderName, isDirectory: true)
+                    .appendingPathComponent(Self.trashFolderName, isDirectory: true)
+                label = volume.lastPathComponent
+            } else {
+                root = removedFilesRoot.standardizedFileURL
+                label = "This Mac"
+            }
+            let key = root.path
+            var bucket = buckets[key] ?? (label, key, 0, 0)
+            bucket.count += 1
+            bucket.bytes += file.size
+            buckets[key] = bucket
+        }
+        return buckets.values
+            .map { MediaTrashDestinationPreview(volumeLabel: $0.label, trashFolderPath: $0.path, fileCount: $0.count, byteCount: $0.bytes) }
+            .sorted { $0.volumeLabel.localizedCaseInsensitiveCompare($1.volumeLabel) == .orderedAscending }
     }
 
     /// Moves each file into `<its volume>/.Camera Toolkit/_Trash/<batch>`,
