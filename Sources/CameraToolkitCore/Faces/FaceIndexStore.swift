@@ -145,6 +145,69 @@ public final class FaceIndexStore: @unchecked Sendable {
         }
     }
 
+    /// Marks a file covered at a grade without scanning it — used for burst
+    /// members whose siblings were sampled. Existing face rows stay while
+    /// the file identity still matches; a changed file's unconfirmed rows
+    /// describe other bytes and are dropped. Confirmed faces are never
+    /// touched, and the stamped grade keeps the file out of later scans.
+    public func markCovered(photo: FacePhotoRecord) throws {
+        let formatter = Self.formatter()
+        let now = formatter.string(from: Date())
+        try database().write { database in
+            let stale = try Row.fetchOne(
+                database,
+                sql: "SELECT byte_count, modified_at FROM face_photos WHERE path_key = ?",
+                arguments: [photo.pathKey]
+            ).map { row -> Bool in
+                let size: Int64 = row["byte_count"]
+                let stamp: String = row["modified_at"]
+                return size != photo.byteCount
+                    || abs((formatter.date(from: stamp) ?? .distantPast).timeIntervalSince(photo.modifiedAt)) >= 1
+            } ?? false
+            if stale {
+                try database.execute(
+                    sql: "DELETE FROM faces WHERE photo_id = ? AND state != 'confirmed'",
+                    arguments: [photo.pathKey]
+                )
+            }
+            try database.execute(
+                sql: """
+                INSERT INTO face_photos(
+                    path_key, path, file_name, byte_count, modified_at,
+                    taken_at, scan_grade, face_count, indexed_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+                ON CONFLICT(path_key) DO UPDATE SET
+                    path = excluded.path,
+                    file_name = excluded.file_name,
+                    byte_count = excluded.byte_count,
+                    modified_at = excluded.modified_at,
+                    taken_at = excluded.taken_at,
+                    scan_grade = excluded.scan_grade,
+                    updated_at = excluded.updated_at
+                """,
+                arguments: [
+                    photo.pathKey,
+                    photo.path,
+                    photo.fileName,
+                    photo.byteCount,
+                    Self.timestamp(photo.modifiedAt, formatter),
+                    photo.takenAt.map { Self.timestamp($0, formatter) },
+                    photo.scanGrade.rawValue,
+                    now,
+                    now,
+                ]
+            )
+            try database.execute(
+                sql: """
+                UPDATE face_photos SET face_count = (
+                    SELECT COUNT(*) FROM faces WHERE faces.photo_id = face_photos.path_key
+                ) WHERE path_key = ?
+                """,
+                arguments: [photo.pathKey]
+            )
+        }
+    }
+
     /// The face select shared by every read: joins `face_photos` so each
     /// record carries its photo's last-known path for display.
     private static let faceSelect = """

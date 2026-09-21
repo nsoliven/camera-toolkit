@@ -34,10 +34,17 @@ public struct FaceIndexService: Sendable {
     /// video primaries of an `OrganizeScanner` result). `detector` is the
     /// engine for the mode: nil resolves to Vision for LOW and throws for
     /// MED+, where the SCRFD package must be installed.
+    ///
+    /// `stacks` is the scanner's burst grouping. When present, a burst of
+    /// stills is sampled — at most three spread frames are decoded and the
+    /// rest are stamped covered by the sibling sample — because near-
+    /// identical frames repeat the same faces. Without it (no scan result)
+    /// every still is scanned.
     public func scan(
         items: [OrganizeItem],
         embedder: FaceEmbeddingProviding?,
         detector: FaceDetecting? = nil,
+        stacks: [OrganizeStack]? = nil,
         progress: FileOperationProgressHandler? = nil
     ) throws -> FaceScanReport {
         guard let embedder else {
@@ -59,16 +66,35 @@ public struct FaceIndexService: Sendable {
         }
         report.photosConsidered = eligible.count
 
+        // Burst-aware selection: which items are sampled frames and which
+        // are burst members covered by a sibling sample. Video never stacks.
+        var sampledIDs: Set<String> = []
+        var burstMemberIDs: Set<String> = []
+        if let stacks {
+            let eligibleIDs = Set(eligible.map(\.id))
+            for stack in stacks where stack.isBurst {
+                // The stacker never stacks video; keep that invariant here
+                // so a clip always runs its own frame sampling.
+                let members = stack.items.filter { eligibleIDs.contains($0.id) && $0.kind != .video }
+                guard members.count > 1 else { continue }
+                for item in members { burstMemberIDs.insert(item.id) }
+                for item in Self.burstSample(members) { sampledIDs.insert(item.id) }
+            }
+        }
+
         // New-files-only rule: a photo whose recorded grade covers this mode
         // — and whose size/mtime still match — is skipped without decoding.
         let existing = try store.photos(pathKeys: eligible.map(\.primary.pathKey))
         var pending: [OrganizeItem] = []
+        var covered: [OrganizeItem] = []
         for item in eligible {
             let file = item.primary
             if let known = existing[file.pathKey],
                known.scanGrade.covers(options.mode),
                known.describes(path: file.path, size: file.size, modifiedAt: file.modifiedAt) {
                 report.photosSkipped += 1
+            } else if burstMemberIDs.contains(item.id), !sampledIDs.contains(item.id) {
+                covered.append(item)
             } else {
                 pending.append(item)
             }
@@ -116,8 +142,34 @@ public struct FaceIndexService: Sendable {
             }
         }
 
+        // Un-sampled burst members are covered by their siblings' pass:
+        // stamp the same executed grade so they stay out of later scans.
+        // Faces a lower grade already found on them are kept.
+        let grade = Self.executedGrade(for: options.mode)
+        for item in covered {
+            let file = item.primary
+            try? store.markCovered(photo: FacePhotoRecord(
+                pathKey: file.pathKey,
+                path: file.path,
+                fileName: file.name,
+                byteCount: file.size,
+                modifiedAt: file.modifiedAt,
+                takenAt: item.captureDate,
+                scanGrade: grade
+            ))
+            report.photosBurstCovered += 1
+        }
+
         try matchAndGroup(report: &report, progress: progress)
         return report
+    }
+
+    /// The frames a burst actually scans: every frame of a small burst,
+    /// else first, middle, and last — near-identical frames repeat the
+    /// same faces, so the middle and edges cover the whole stack.
+    static func burstSample(_ members: [OrganizeItem]) -> [OrganizeItem] {
+        guard members.count > 3 else { return members }
+        return [members[0], members[members.count / 2], members[members.count - 1]]
     }
 
     /// Re-matches every stored, unconfirmed embedding against the current

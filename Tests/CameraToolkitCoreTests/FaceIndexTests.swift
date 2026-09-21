@@ -577,6 +577,112 @@ final class FaceIndexTests: XCTestCase {
         }
     }
 
+    func testBurstStacksSampleAndCoverTheRest() throws {
+        try withTemporaryDirectory { root in
+            let catalog = root.appendingPathComponent("catalog.sqlite")
+            _ = try CatalogStore(url: catalog).bootstrap(
+                configuration: faceTestConfiguration(root: root, catalog: catalog),
+                createBackup: false,
+                createLibraryFolders: false
+            )
+            // A six-frame burst plus a single still — the burst decodes
+            // three spread frames and the rest are covered by the sample.
+            var items: [OrganizeItem] = []
+            for index in 1...6 {
+                let url = root.appendingPathComponent("card/B0001_DSC000\(index).JPG")
+                try writeJPEG(url, seed: UInt8(index))
+                items.append(try organizeItem(forFileAt: url))
+            }
+            let singleURL = root.appendingPathComponent("card/DSC00099.JPG")
+            try writeJPEG(singleURL, seed: 9)
+            items.append(try organizeItem(forFileAt: singleURL))
+
+            let stacks = [
+                OrganizeStack(items: Array(items.prefix(6))),
+                OrganizeStack(items: [items[6]]),
+            ]
+            let store = FaceIndexStore(url: catalog)
+            let detector = StubDetector(detections: [
+                DetectedFace(boundingBox: CGRect(x: 0.2, y: 0.2, width: 0.2, height: 0.2), confidence: 0.9, landmarks: nil),
+            ])
+            let service = FaceIndexService(catalogURL: catalog, options: FaceScanOptions(mode: .med))
+
+            var report = try service.scan(
+                items: items, embedder: StubEmbedder(), detector: detector, stacks: stacks
+            )
+            XCTAssertEqual(report.photosConsidered, 7)
+            XCTAssertEqual(report.photosProcessed, 4)   // 3 sampled burst frames + the single
+            XCTAssertEqual(report.photosBurstCovered, 3)
+            // Every file — scanned or covered — carries the executed grade.
+            for item in items {
+                XCTAssertEqual(
+                    try store.photos(pathKeys: [item.primary.pathKey])[item.primary.pathKey]?.scanGrade,
+                    .med
+                )
+            }
+            // Covered frames got no face rows of their own — six frames
+            // sample to {0, 3, 5}, leaving {1, 2, 4} covered.
+            let coveredKeys = Set([items[1], items[2], items[4]].map(\.primary.pathKey))
+            for key in coveredKeys {
+                XCTAssertTrue(try store.faces(photoID: key).isEmpty)
+            }
+
+            // A repeat pass skips everything — covered frames never rescan.
+            report = try service.scan(
+                items: items, embedder: StubEmbedder(), detector: detector, stacks: stacks
+            )
+            XCTAssertEqual(report.photosProcessed, 0)
+            XCTAssertEqual(report.photosBurstCovered, 0)
+            XCTAssertEqual(report.photosSkipped, 7)
+        }
+    }
+
+    func testBurstCoverageKeepsEarlierFacesAndGateNeedsStacks() throws {
+        try withTemporaryDirectory { root in
+            let catalog = root.appendingPathComponent("catalog.sqlite")
+            _ = try CatalogStore(url: catalog).bootstrap(
+                configuration: faceTestConfiguration(root: root, catalog: catalog),
+                createBackup: false,
+                createLibraryFolders: false
+            )
+            var items: [OrganizeItem] = []
+            for index in 1...4 {
+                let url = root.appendingPathComponent("card/B0007_DSC000\(index).JPG")
+                try writeJPEG(url, seed: UInt8(index))
+                items.append(try organizeItem(forFileAt: url))
+            }
+            let store = FaceIndexStore(url: catalog)
+            let detector = StubDetector(detections: [
+                DetectedFace(boundingBox: CGRect(x: 0.3, y: 0.3, width: 0.2, height: 0.2), confidence: 0.9, landmarks: nil),
+            ])
+
+            // Without a scan result's stacks every still is scanned — the
+            // Phase 1 behavior bare item lists keep.
+            let lowService = FaceIndexService(catalogURL: catalog, options: FaceScanOptions(mode: .low))
+            var report = try lowService.scan(items: items, embedder: StubEmbedder(), detector: detector)
+            XCTAssertEqual(report.photosProcessed, 4)
+            XCTAssertEqual(report.photosBurstCovered, 0)
+            for item in items {
+                XCTAssertEqual(try store.faces(photoID: item.primary.pathKey).count, 1)
+            }
+
+            // MED with burst grouping: 4 frames sample to {0, 2, 3}; index 1
+            // is covered and keeps the face LOW found on it.
+            let stacks = [OrganizeStack(items: items)]
+            let medService = FaceIndexService(catalogURL: catalog, options: FaceScanOptions(mode: .med))
+            report = try medService.scan(items: items, embedder: StubEmbedder(), detector: detector, stacks: stacks)
+            XCTAssertEqual(report.photosProcessed, 3)
+            XCTAssertEqual(report.photosBurstCovered, 1)
+
+            let covered = items[1]
+            XCTAssertEqual(try store.faces(photoID: covered.primary.pathKey).count, 1)
+            XCTAssertEqual(
+                try store.photos(pathKeys: [covered.primary.pathKey])[covered.primary.pathKey]?.scanGrade,
+                .med
+            )
+        }
+    }
+
     // MARK: - SCRFD decode math
 
     func testSCRFDDecodeAnchorsAndNMS() throws {
