@@ -629,6 +629,147 @@ final class EventsWorkspaceTests: XCTestCase {
         }
     }
 
+    func testRecentEventsCapAtThreeAndKeepPositionsStable() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let unsorted = root.appendingPathComponent("Drive/Unsorted A7V", isDirectory: true)
+            try writeOrganizerARW(unsorted.appendingPathComponent("DSC00001.ARW"), "2026:08:26 10:00:00", "000")
+            let location = addUnsorted(unsorted, to: model)
+            workspace.scan(location)
+            try await waitUntil { workspace.sources[location.id]?.result != nil }
+            let stack = try XCTUnwrap(workspace.sources[location.id]?.result?.stacks.first)
+
+            let alpha = try XCTUnwrap(workspace.createEvent(name: "Alpha", date: organizerDay("2026-08-26"), policy: .buffer))
+            let bravo = try XCTUnwrap(workspace.createEvent(name: "Bravo", date: organizerDay("2026-08-26"), policy: .buffer))
+            let charlie = try XCTUnwrap(workspace.createEvent(name: "Charlie", date: organizerDay("2026-08-26"), policy: .buffer))
+            XCTAssertEqual(workspace.recentEvents.map(\.id), [alpha, bravo, charlie])
+            XCTAssertLessThanOrEqual(workspace.recentEvents.count, EventsWorkspace.recentLimit)
+
+            // Reusing a listed event must not move it: the digit keys keep
+            // meaning the same event for the rest of the sort session.
+            workspace.assign(stackIDs: [stack.id], from: location.id, to: bravo)
+            XCTAssertEqual(workspace.recentEvents.map(\.id), [alpha, bravo, charlie])
+
+            // A target that isn't listed enters at the front; the tail drops.
+            let delta = try XCTUnwrap(workspace.createEvent(name: "Delta", date: organizerDay("2026-08-26"), policy: .buffer))
+            XCTAssertEqual(workspace.recentEvents.map(\.id), [delta, alpha, bravo])
+            XCTAssertLessThanOrEqual(workspace.recentEvents.count, EventsWorkspace.recentLimit)
+
+            // An excluded event (the board being viewed) is not a target.
+            XCTAssertEqual(workspace.assignableRecents(excluding: alpha).map(\.id), [delta, bravo])
+            XCTAssertEqual(workspace.assignableRecents().map(\.id), [delta, alpha, bravo])
+        }
+    }
+
+    func testEventPickerSectionsPinMatchingRecentsAndFilterByBreadcrumb() async throws {
+        try await withOrganizerSandbox { _, model, workspace in
+            let phil = try XCTUnwrap(workspace.createEvent(name: "PHIL2026", date: organizerDay("2026-08-26"), policy: .buffer))
+            let matcha = try XCTUnwrap(workspace.createEvent(name: "Matcha", date: organizerDay("2026-08-26"), policy: .buffer, parentEventID: phil))
+            let beach = try XCTUnwrap(workspace.createEvent(name: "Beach Day", date: organizerDay("2026-08-26"), policy: .buffer))
+            let hotel = try XCTUnwrap(workspace.createEvent(name: "Hotel Night", date: organizerDay("2026-08-26"), policy: .buffer))
+            let matchaEvent = try XCTUnwrap(workspace.event(matcha))
+            XCTAssertEqual(workspace.eventTitle(matchaEvent), "PHIL2026 / Matcha")
+
+            // Hotel entering evicted Beach, so the unfiltered picker shows
+            // the three recents up top and only Beach below.
+            let all = workspace.eventPickerSections(matching: "")
+            XCTAssertEqual(all.recent.map(\.id), [hotel, phil, matcha])
+            XCTAssertEqual(all.other.map(\.event.id), [beach])
+
+            // A matching recent pins to the Recent section, not the list.
+            let matchaHit = workspace.eventPickerSections(matching: "matcha")
+            XCTAssertEqual(matchaHit.recent.map(\.id), [matcha])
+            XCTAssertTrue(matchaHit.other.isEmpty)
+
+            // A non-recent match still appears, under its breadcrumb title.
+            let beachHit = workspace.eventPickerSections(matching: "beach")
+            XCTAssertTrue(beachHit.recent.isEmpty)
+            XCTAssertEqual(beachHit.other.map(\.event.id), [beach])
+
+            // Parent names match subevents through the breadcrumb title.
+            let philHit = workspace.eventPickerSections(matching: "phil")
+            XCTAssertEqual(philHit.recent.map(\.id), [phil, matcha])
+            XCTAssertTrue(philHit.other.isEmpty)
+
+            let none = workspace.eventPickerSections(matching: "zzz")
+            XCTAssertTrue(none.recent.isEmpty && none.other.isEmpty)
+
+            // The board's own event is dropped from both sections.
+            let moving = workspace.eventPickerSections(matching: "", excluding: hotel)
+            XCTAssertEqual(moving.recent.map(\.id), [phil, matcha])
+            XCTAssertEqual(moving.other.map(\.event.id), [beach])
+        }
+    }
+
+    func testNewEventRequestAssignsPreviewedStackToCreatedEvent() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let unsorted = root.appendingPathComponent("Drive/Unsorted A7V", isDirectory: true)
+            try writeOrganizerARW(unsorted.appendingPathComponent("B0009_DSC00001.ARW"), "2026:08:26 10:00:00", "000")
+            try writeOrganizerARW(unsorted.appendingPathComponent("B0009_DSC00002.ARW"), "2026:08:26 10:00:00", "200")
+            let location = addUnsorted(unsorted, to: model)
+            workspace.scan(location)
+            try await waitUntil { workspace.sources[location.id]?.result != nil }
+            let burst = try XCTUnwrap(workspace.sources[location.id]?.result?.stacks.first)
+
+            // The overlay's "New Event…" requests the previewed stack
+            // explicitly, independent of the board's selection.
+            workspace.requestNewEvent(stackIDs: [burst.id], from: location.id, suggestedDate: burst.captureDate)
+            let request = try XCTUnwrap(workspace.newEventRequest)
+            XCTAssertEqual(request.sourceLocationID, location.id)
+            XCTAssertEqual(request.stackIDs, [burst.id])
+            XCTAssertNil(request.moveFromEventID)
+
+            workspace.completeNewEvent(request, name: "New Gig", date: organizerDay("2026-08-26"), policy: .buffer, parentEventID: nil)
+            XCTAssertNil(workspace.newEventRequest)
+
+            let created = try XCTUnwrap(model.configuration.savedEvents.first { $0.name == "New Gig" })
+            XCTAssertEqual(workspace.assignedEvent(for: burst).event?.id, created.id)
+            XCTAssertTrue(workspace.recentEvents.contains { $0.id == created.id })
+        }
+    }
+
+    func testNewEventRequestMovesEventBoardStackIntoCreatedEvent() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let unsorted = root.appendingPathComponent("Drive/Unsorted A7V", isDirectory: true)
+            try writeOrganizerARW(unsorted.appendingPathComponent("B0007_DSC00001.ARW"), "2026:08:27 09:00:00", "000")
+            try writeOrganizerARW(unsorted.appendingPathComponent("B0007_DSC00002.ARW"), "2026:08:27 09:00:00", "300")
+            let location = addUnsorted(unsorted, to: model)
+            workspace.scan(location)
+            try await waitUntil { workspace.sources[location.id]?.result != nil }
+            let burst = try XCTUnwrap(workspace.sources[location.id]?.result?.stacks.first)
+
+            let shared = try XCTUnwrap(workspace.createEvent(name: "City Walk", date: organizerDay("2026-08-27"), policy: .buffer))
+            workspace.assign(stackIDs: [burst.id], from: location.id, to: shared)
+            workspace.performApply(EventsWorkspace.buildApplyPlan(
+                events: [try XCTUnwrap(workspace.event(shared))],
+                configuration: model.configuration,
+                locations: workspace.locations,
+                onlyUnder: nil,
+                title: "Apply",
+                unsortedRoots: [unsorted]
+            ))
+            try await waitUntil { !model.isBusy && workspace.latestMoveJournalTitle != nil }
+            await workspace.refreshEvent(shared)
+            let appliedStack = try XCTUnwrap(workspace.eventStacks[shared]?.first)
+
+            // "New Event…" on an event board records the event the stack is
+            // leaving, so completion moves rather than assigns.
+            workspace.requestNewEvent(stackIDs: [appliedStack.id], movingFromEvent: shared, suggestedDate: appliedStack.captureDate)
+            let request = try XCTUnwrap(workspace.newEventRequest)
+            XCTAssertEqual(request.moveFromEventID, shared)
+            XCTAssertEqual(request.stackIDs, [appliedStack.id])
+            XCTAssertNil(request.sourceLocationID)
+
+            workspace.completeNewEvent(request, name: "After Party", date: organizerDay("2026-08-27"), policy: .buffer, parentEventID: nil)
+            XCTAssertNil(workspace.newEventRequest)
+
+            let created = try XCTUnwrap(model.configuration.savedEvents.first { $0.name == "After Party" })
+            try await waitUntil { !model.isBusy && workspace.latestMoveJournalTitle == "Move to After Party" }
+            XCTAssertEqual(model.configuration.photoEventAssignments.filter { $0.eventID == created.id }.count, 2)
+            XCTAssertTrue(model.configuration.photoEventAssignments.filter { $0.eventID == shared }.isEmpty)
+            XCTAssertTrue(workspace.recentEvents.contains { $0.id == created.id })
+        }
+    }
+
     // MARK: - Helpers
 
     private func withOrganizerSandbox(

@@ -29,6 +29,9 @@ struct NewEventRequest: Identifiable {
     var stackIDs: Set<String>
     /// Preselected parent for "New Subevent…"; nil means a top-level event.
     var parentEventID: UUID?
+    /// Set when the stacks live on an event board: completing the request
+    /// moves them into the new event instead of assigning from a source.
+    var moveFromEventID: UUID?
 }
 
 struct RenameEventRequest: Identifiable {
@@ -354,11 +357,66 @@ final class EventsWorkspace {
         return candidate
     }
 
-    /// Up to nine recently created events in date order. The order stays put
-    /// while sorting, so each number key keeps meaning the same event.
-    var quickEvents: [SavedCameraEvent] {
-        Array(model.configuration.savedEvents.sorted { $0.createdAt > $1.createdAt }.prefix(9))
-            .sorted { $0.eventDate == $1.eventDate ? $0.name < $1.name : $0.eventDate < $1.eventDate }
+    /// The events behind the 1–3 chips and the picker's Recent section: up
+    /// to three events, most recently assigned to or created first.
+    /// Positions stay put for the session — reusing a listed event keeps
+    /// its number, so a digit key never jumps to a different event
+    /// mid-sort. Until three distinct events are used this session the
+    /// list fills from `lastUsedAt` order.
+    var recentEvents: [SavedCameraEvent] {
+        let all = model.configuration.savedEvents
+        var ids = sessionRecentIDs.filter { id in all.contains { $0.id == id } }
+        if ids.count < Self.recentLimit {
+            for event in all.sorted(by: Self.recentOrder) where !ids.contains(event.id) {
+                ids.append(event.id)
+                if ids.count == Self.recentLimit { break }
+            }
+        }
+        return ids.compactMap { id in all.first { $0.id == id } }
+    }
+
+    /// `recentEvents` minus a non-target — an event board's own event can't
+    /// receive its stacks, so its overlay drops it from chips and keys.
+    func assignableRecents(excluding excludedID: UUID? = nil) -> [SavedCameraEvent] {
+        recentEvents.filter { $0.id != excludedID }
+    }
+
+    /// The "Event…" picker's sections: matching recents pinned on top,
+    /// then every other query match in sidebar order. `excludedID` drops a
+    /// non-target (the board's own event when moving between events).
+    func eventPickerSections(
+        matching query: String,
+        excluding excludedID: UUID? = nil
+    ) -> (recent: [SavedCameraEvent], other: [(event: SavedCameraEvent, depth: Int)]) {
+        let rows = sidebarRows(matching: query).filter { $0.event.id != excludedID }
+        let matchingIDs = Set(rows.map(\.event.id))
+        let recent = recentEvents.filter { $0.id != excludedID && matchingIDs.contains($0.id) }
+        let recentIDs = Set(recent.map(\.id))
+        return (recent, rows.filter { !recentIDs.contains($0.event.id) })
+    }
+
+    static let recentLimit = 3
+    /// Session ordering for `recentEvents` — the visible list as the user
+    /// last saw it, so positions only shift when a new event enters.
+    private var sessionRecentIDs: [UUID] = []
+
+    /// Records `eventID` as a recent target when stacks are assigned or
+    /// moved to it or it is created. An event already listed keeps its
+    /// slot — digit keys stay stable — while a new one enters at the front
+    /// and drops the tail.
+    private func noteRecent(_ eventID: UUID) {
+        var ids = recentEvents.map(\.id)
+        if !ids.contains(eventID) {
+            ids.insert(eventID, at: 0)
+            ids = Array(ids.prefix(Self.recentLimit))
+        }
+        sessionRecentIDs = ids
+    }
+
+    private static func recentOrder(_ a: SavedCameraEvent, _ b: SavedCameraEvent) -> Bool {
+        if a.lastUsedAt != b.lastUsedAt { return a.lastUsedAt > b.lastUsedAt }
+        if a.createdAt != b.createdAt { return a.createdAt > b.createdAt }
+        return a.name < b.name
     }
 
     var canUndoSort: Bool { !assignmentUndoStack.isEmpty }
@@ -824,6 +882,7 @@ final class EventsWorkspace {
 
         let change = AssignmentChange(title: "Sort into \(eventTitle(event))", removed: removed, added: added)
         applyAssignmentChange(change, touching: eventID)
+        noteRecent(eventID)
         pushUndo(change)
         let skipped = files.count - eligible.count
         model.statusMessage = "Sorted \(stacks.count) item\(stacks.count == 1 ? "" : "s") (\(eligible.count) file\(eligible.count == 1 ? "" : "s")) into \(eventTitle(event)). Nothing moves until you press Apply."
@@ -908,6 +967,28 @@ final class EventsWorkspace {
         )
     }
 
+    /// New Event for explicit stacks on an unsorted board — the burst
+    /// preview's stack may not be the board's current selection.
+    func requestNewEvent(stackIDs: Set<String>, from locationID: UUID, suggestedDate: Date? = nil) {
+        let stacks = sources[locationID]?.result?.stacks.filter { stackIDs.contains($0.id) } ?? []
+        newEventRequest = NewEventRequest(
+            suggestedDate: suggestedDate ?? stacks.map(\.captureDate).min() ?? Date(),
+            sourceLocationID: locationID,
+            stackIDs: stackIDs
+        )
+    }
+
+    /// New Event for stacks on an event board — completion moves them into
+    /// the created event instead of assigning from an unsorted source.
+    func requestNewEvent(stackIDs: Set<String>, movingFromEvent eventID: UUID, suggestedDate: Date? = nil) {
+        let stacks = eventStacks[eventID]?.filter { stackIDs.contains($0.id) } ?? []
+        newEventRequest = NewEventRequest(
+            suggestedDate: suggestedDate ?? stacks.map(\.captureDate).min() ?? Date(),
+            stackIDs: stackIDs,
+            moveFromEventID: eventID
+        )
+    }
+
     @discardableResult
     func createEvent(name rawName: String, date: Date, policy: EventStoragePolicy?, parentEventID: UUID? = nil) -> UUID? {
         let validation = EventNamePolicy.validate(rawName)
@@ -924,6 +1005,7 @@ final class EventsWorkspace {
                 && Calendar.current.isDate($0.eventDate, inSameDayAs: day)
                 && $0.parentEventID == parentID
         }) {
+            noteRecent(existing.id)
             return existing.id
         }
         let event = SavedCameraEvent(
@@ -933,6 +1015,7 @@ final class EventsWorkspace {
             parentEventID: parentID
         )
         model.updateConfiguration { $0.savedEvents.append(event) }
+        noteRecent(event.id)
         model.statusMessage = "Created \(eventTitle(event)). Sort photos into it, then press Apply."
         return event.id
     }
@@ -942,6 +1025,8 @@ final class EventsWorkspace {
         newEventRequest = nil
         if let locationID = request.sourceLocationID, !request.stackIDs.isEmpty {
             assign(stackIDs: request.stackIDs, from: locationID, to: eventID)
+        } else if let fromEvent = request.moveFromEventID, !request.stackIDs.isEmpty {
+            moveStacks(request.stackIDs, fromEvent: fromEvent, toEvent: eventID)
         } else if request.sourceLocationID == nil {
             selection = .event(eventID)
         }
@@ -1430,6 +1515,7 @@ final class EventsWorkspace {
             model.statusMessage = "\(eventTitle(to)) already has files with those names. Nothing moved."
             return
         }
+        noteRecent(targetEventID)
 
         let moves = plans.compactMap { plan -> DriveMove? in
             guard let source = plan.moveSourcePath,

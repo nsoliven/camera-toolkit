@@ -69,15 +69,17 @@ struct UnsortedBoardView: View {
         .overlay {
             if previewStackID != nil {
                 StackPreviewOverlay(
+                    workspace: workspace,
                     stacks: ordered,
                     stackID: $previewStackID,
-                    quickEvents: workspace.quickEvents,
                     rootPath: result?.rootPath,
                     eventForStack: { workspace.assignedEvent(for: $0).event },
                     onAssign: { stack, event in
                         workspace.assign(stackIDs: [stack.id], from: location.id, to: event.id)
                     },
-                    isPrivate: { workspace.resolvedPolicy(for: $0) == .archiveOnly },
+                    onNewEvent: { stack in
+                        workspace.requestNewEvent(stackIDs: [stack.id], from: location.id, suggestedDate: stack.captureDate)
+                    },
                     onTrashItems: { items in
                         workspace.trashItems(items, from: location.id)
                     }
@@ -204,58 +206,35 @@ struct UnsortedBoardView: View {
 
     private func assignBar(orderedIDs: [String]) -> some View {
         let targets = workspace.targetStackIDs()
-        return ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 8) {
-                Text(targets.isEmpty ? "Select items to sort" : "\(targets.count) selected")
-                    .font(.callout.weight(.semibold))
-                    .frame(minWidth: 120, alignment: .leading)
-                ForEach(Array(workspace.quickEvents.enumerated()), id: \.element.id) { index, event in
-                    Button {
-                        workspace.assign(stackIDs: targets, from: location.id, to: event.id, orderedIDs: orderedIDs)
-                    } label: {
-                        EventChip(event: event, number: index + 1, isPrivate: workspace.resolvedPolicy(for: event) == .archiveOnly)
-                    }
-                    .buttonStyle(.plain)
-                    .opacity(targets.isEmpty ? 0.5 : 1)
-                    .disabled(targets.isEmpty)
-                    .help("Sort into \(workspace.eventTitle(event)) (press \(index + 1))")
-                }
-                Menu {
-                    ForEach(workspace.sidebarEvents, id: \.event.id) { row in
-                        Button(workspace.eventTitle(row.event)) {
-                            workspace.assign(stackIDs: targets, from: location.id, to: row.event.id, orderedIDs: orderedIDs)
-                        }
-                    }
-                } label: {
-                    Label("All Events", systemImage: "calendar")
-                }
-                .menuStyle(.borderlessButton)
-                .fixedSize()
-                .disabled(targets.isEmpty || workspace.events.isEmpty)
-                Button {
-                    workspace.requestNewEvent(from: location.id)
-                } label: {
-                    Label("New Event…", systemImage: "plus")
-                }
-                .help("Create an event from the selection (N)")
-                Button {
-                    workspace.unassign(stackIDs: targets, from: location.id)
-                } label: {
-                    Label("Unsort", systemImage: "arrow.uturn.backward")
-                }
-                .disabled(targets.isEmpty)
-                .help("Remove the selection from its event (Delete)")
-                Button {
-                    workspace.undoLastSort()
-                } label: {
-                    Label("Undo", systemImage: "arrow.uturn.left")
-                }
-                .disabled(!workspace.canUndoSort)
-                .help("Undo the last sort (Command-Z)")
+        return HStack(spacing: 8) {
+            Text(targets.isEmpty ? "Select items to sort" : "\(targets.count) selected")
+                .font(.callout.weight(.semibold))
+                .frame(minWidth: 120, alignment: .leading)
+            EventAssignControls(
+                workspace: workspace,
+                verb: "Sort into",
+                canAssign: !targets.isEmpty,
+                onAssign: { workspace.assign(stackIDs: targets, from: location.id, to: $0.id, orderedIDs: orderedIDs) },
+                onNewEvent: { workspace.requestNewEvent(from: location.id) }
+            )
+            Spacer(minLength: 0)
+            Button {
+                workspace.unassign(stackIDs: targets, from: location.id)
+            } label: {
+                Label("Unsort", systemImage: "arrow.uturn.backward")
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 8)
+            .disabled(targets.isEmpty)
+            .help("Remove the selection from its event (Delete)")
+            Button {
+                workspace.undoLastSort()
+            } label: {
+                Label("Undo", systemImage: "arrow.uturn.left")
+            }
+            .disabled(!workspace.canUndoSort)
+            .help("Undo the last sort (Command-Z)")
         }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
     }
 
     private func grid(_ days: [OrganizeDay]) -> some View {
@@ -326,7 +305,7 @@ struct UnsortedBoardView: View {
                 .foregroundStyle(sorted.files > 0 ? Color.accentColor : .secondary)
             Text(sorted.files > 0
                 ? "\(sorted.files) sorted file\(sorted.files == 1 ? "" : "s") (\(sorted.bytes.formattedBytes)) still in \(location.name). Nothing moves until you press Apply."
-                : "Select items, then press 1–9, drag onto an event, or press N for a new event. Space previews a burst.")
+                : "Select items, then press 1–3, drag onto an event, or press N for a new event. Space previews a burst.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .lineLimit(2)
@@ -377,10 +356,10 @@ struct UnsortedBoardView: View {
             workspace.requestNewEvent(from: location.id)
             return .handled
         }
-        if let digit = press.characters.first?.wholeNumberValue, (1...9).contains(digit) {
-            let quick = workspace.quickEvents
-            guard digit <= quick.count, !targets.isEmpty else { return .handled }
-            workspace.assign(stackIDs: targets, from: location.id, to: quick[digit - 1].id, orderedIDs: orderedIDs)
+        if let digit = press.characters.first?.wholeNumberValue, (1...3).contains(digit) {
+            let recents = workspace.assignableRecents()
+            guard digit <= recents.count, !targets.isEmpty else { return .handled }
+            workspace.assign(stackIDs: targets, from: location.id, to: recents[digit - 1].id, orderedIDs: orderedIDs)
             return .handled
         }
         return .ignored

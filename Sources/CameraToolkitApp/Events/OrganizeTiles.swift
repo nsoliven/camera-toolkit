@@ -518,17 +518,23 @@ enum OrganizeFolderLabel {
 /// a deeper decode swaps in once zoom passes 1.5×. Right-click offers
 /// "Move to Trash" when the board supports it.
 struct StackPreviewOverlay: View {
+    let workspace: EventsWorkspace
     let stacks: [OrganizeStack]
     @Binding var stackID: String?
-    let quickEvents: [SavedCameraEvent]
     /// Scan root used to show where each item lives ("Card/DCIM"); nil shows
     /// just the folder name (event boards have no single scan root).
     var rootPath: String? = nil
+    /// The board's own event when the overlay moves stacks between events —
+    /// not a valid target, so the chips, digit keys, and picker drop it.
+    var excludedEventID: UUID? = nil
+    /// Verb for the assign chips and picker — "Sort into" on an unsorted
+    /// board, "Move to" on an event board.
+    var assignVerb = "Sort into"
     let eventForStack: (OrganizeStack) -> SavedCameraEvent?
     let onAssign: (OrganizeStack, SavedCameraEvent) -> Void
-    /// Resolved private flag for chip locks — a subevent can inherit it from
-    /// a private parent, so the caller resolves it.
-    var isPrivate: (SavedCameraEvent) -> Bool = { $0.resolvedStoragePolicy == .archiveOnly }
+    /// "New Event…" inside the picker: creates the event, then puts the
+    /// previewed stack in it — the same target the chips assign.
+    let onNewEvent: (OrganizeStack) -> Void
     /// Enables the right-click "Move to Trash" item on the frame and on each
     /// filmstrip thumbnail. Nil hides the menu entirely.
     var onTrashItems: (([OrganizeItem]) -> Void)? = nil
@@ -563,7 +569,7 @@ struct StackPreviewOverlay: View {
     }
 
     private var hintText: String {
-        var text = "← → frames · ↑ ↓ items · click zoom · drag pan · + − 0 zoom · 1–9 sort · O open"
+        var text = "← → frames · ↑ ↓ items · click zoom · drag pan · + − 0 zoom · 1–3 sort · O open"
         if onTrashItems != nil { text += " · right-click trash" }
         return text + " · Esc close"
     }
@@ -638,17 +644,16 @@ struct StackPreviewOverlay: View {
                     .foregroundStyle(.white.opacity(0.7))
             }
             if let event = eventForStack(stack) {
-                EventChip(event: event, isPrivate: isPrivate(event))
+                EventChip(event: event, isPrivate: workspace.resolvedPolicy(for: event) == .archiveOnly)
             }
             Spacer()
-            ForEach(Array(quickEvents.enumerated()), id: \.element.id) { index, event in
-                Button {
-                    assign(stack, to: event)
-                } label: {
-                    EventChip(event: event, number: index + 1, isPrivate: isPrivate(event))
-                }
-                .buttonStyle(.plain)
-            }
+            EventAssignControls(
+                workspace: workspace,
+                verb: assignVerb,
+                excludedEventID: excludedEventID,
+                onAssign: { assign(stack, to: $0) },
+                onNewEvent: { onNewEvent(stack) }
+            )
             Button {
                 PhotomatorLauncher.open(item.files.map(\.url))
             } label: {
@@ -739,9 +744,10 @@ struct StackPreviewOverlay: View {
             }
             guard press.modifiers.isEmpty,
                   let digit = press.characters.first?.wholeNumberValue,
-                  (1...9).contains(digit),
-                  digit <= quickEvents.count else { return .ignored }
-            assign(stack, to: quickEvents[digit - 1])
+                  (1...3).contains(digit) else { return .ignored }
+            let recents = workspace.assignableRecents(excluding: excludedEventID)
+            guard digit <= recents.count else { return .ignored }
+            assign(stack, to: recents[digit - 1])
         }
         return .handled
     }
