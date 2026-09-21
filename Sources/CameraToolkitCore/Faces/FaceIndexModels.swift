@@ -30,6 +30,39 @@ public enum FaceScanGrade: String, Codable, CaseIterable, Sendable, Comparable {
     public func covers(_ other: FaceScanGrade) -> Bool {
         rank >= other.rank
     }
+
+    /// The word the scan sheet uses for this tier — Low, Medium, High,
+    /// Extra High. `none` is not a scan grade (it marks a manually tagged
+    /// file that was never scanned) and has no label.
+    public var displayName: String? {
+        switch self {
+        case .none: nil
+        case .low: "Low"
+        case .med: "Medium"
+        case .high: "High"
+        case .xhigh: "Extra High"
+        }
+    }
+}
+
+/// Live counts of what the face index holds — the Clear Face Scan sheet's
+/// "what will be removed" list.
+public struct FaceIndexCounts: Equatable, Sendable {
+    /// `face_photos` rows — files a scan (or a manual tag) has covered.
+    public var scannedPhotos: Int
+    /// `faces` rows — stored detections.
+    public var faces: Int
+    /// Roster `people` rows — named people.
+    public var namedPeople: Int
+    /// Non-roster `people` rows — auto-formed clusters.
+    public var unnamedGroups: Int
+
+    public init(scannedPhotos: Int = 0, faces: Int = 0, namedPeople: Int = 0, unnamedGroups: Int = 0) {
+        self.scannedPhotos = scannedPhotos
+        self.faces = faces
+        self.namedPeople = namedPeople
+        self.unnamedGroups = unnamedGroups
+    }
 }
 
 /// What the index currently believes about one detected face.

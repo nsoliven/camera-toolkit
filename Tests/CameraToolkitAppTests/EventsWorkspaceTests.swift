@@ -993,6 +993,54 @@ final class EventsWorkspaceTests: XCTestCase {
         }
     }
 
+    /// Clear Face Scan drops every face row and bumps `facesRevision` so
+    /// the People window and chips re-read — the event in the same
+    /// database is untouched.
+    func testClearFaceIndexEmptiesIndexAndBumpsFacesRevision() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let catalog = root.appendingPathComponent("catalog.sqlite")
+            _ = try CatalogStore(url: catalog).bootstrap(
+                configuration: model.configuration,
+                createBackup: false,
+                createLibraryFolders: false
+            )
+            let store = workspace.faceStore
+            let dad = try store.createPerson(name: "Dad", isRoster: true)
+            let photo = FacePhotoRecord(
+                pathKey: EventStorageLocations.pathKey("/Card/DCIM/DSC00001.ARW"),
+                path: "/Card/DCIM/DSC00001.ARW",
+                fileName: "DSC00001.ARW",
+                byteCount: 4_096,
+                modifiedAt: Date(timeIntervalSince1970: 1_752_000_000),
+                scanGrade: .med
+            )
+            try store.replaceFaces(photo: photo, faces: [
+                FaceRecord(photoID: photo.pathKey, personID: dad.id, box: NormalizedFaceBox(x: 0.1, y: 0.1, width: 0.2, height: 0.2), detScore: 0.9, embedding: [0.5, 0.5], state: .confirmed),
+            ])
+            // An event row lives in the same database.
+            let beach = try XCTUnwrap(workspace.createEvent(name: "Beach Day", date: organizerDay("2026-08-26"), policy: .buffer))
+            _ = try CatalogStore(url: catalog).bootstrap(
+                configuration: model.configuration,
+                createBackup: false,
+                createLibraryFolders: false
+            )
+
+            XCTAssertEqual(workspace.faceIndexCounts().scannedPhotos, 1)
+            XCTAssertEqual(workspace.storedFaceScanGrades(), [.med])
+            XCTAssertEqual(workspace.facesRevision, 0)
+
+            workspace.clearFaceIndex()
+
+            XCTAssertEqual(workspace.faceIndexCounts(), FaceIndexCounts())
+            XCTAssertEqual(workspace.storedFaceScanGrades(), [])
+            XCTAssertEqual(workspace.facesRevision, 1)
+            XCTAssertTrue(model.statusMessage.contains("Face index cleared"))
+            // Events are untouched (the row-level proof lives in the core
+            // tests — here the workspace simply still resolves it).
+            XCTAssertNotNil(workspace.event(beach))
+        }
+    }
+
     func testBoardSearchMatchesRosterPersonNames() async throws {
         try await withOrganizerSandbox { root, model, workspace in
             let unsorted = root.appendingPathComponent("Card", isDirectory: true)

@@ -842,6 +842,53 @@ public final class FaceIndexStore: @unchecked Sendable {
         }
     }
 
+    // MARK: - Index summary and wipe
+
+    /// Live counts of what the face index holds — scanned photos,
+    /// detections, named people, and unnamed groups. The Clear Face Scan
+    /// sheet shows exactly these numbers before wiping.
+    public func faceIndexCounts() throws -> FaceIndexCounts {
+        try database().read { database in
+            FaceIndexCounts(
+                scannedPhotos: try Int.fetchOne(database, sql: "SELECT COUNT(*) FROM face_photos") ?? 0,
+                faces: try Int.fetchOne(database, sql: "SELECT COUNT(*) FROM faces") ?? 0,
+                namedPeople: try Int.fetchOne(database, sql: "SELECT COUNT(*) FROM people WHERE is_roster = 1") ?? 0,
+                unnamedGroups: try Int.fetchOne(database, sql: "SELECT COUNT(*) FROM people WHERE is_roster = 0") ?? 0
+            )
+        }
+    }
+
+    /// The distinct scan grades stored on `face_photos`, lowest first —
+    /// the People window footer's quality list. `none` rows are manual
+    /// tags on never-scanned files, not a scan grade, so they stay out.
+    public func storedScanGrades() throws -> [FaceScanGrade] {
+        try database().read { database in
+            try Row.fetchAll(
+                database,
+                sql: "SELECT DISTINCT scan_grade FROM face_photos"
+            )
+            .compactMap { FaceScanGrade(rawValue: $0["scan_grade"] as String? ?? "") }
+            .filter { $0 != .none }
+            .sorted()
+        }
+    }
+
+    /// Deletes the entire face index — `face_templates`, `faces`,
+    /// `people`, then `face_photos` — in one transaction, child tables
+    /// first so the order respects the foreign keys even without relying
+    /// on cascades. No other catalog table is touched: `events`,
+    /// `event_assets`, and every non-face row survive. Nothing on disk is
+    /// read, moved, or deleted; the next scan simply treats every file as
+    /// new instead of skipping it on `scan_grade`.
+    public func clearFaceIndex() throws {
+        try database().write { database in
+            try database.execute(sql: "DELETE FROM face_templates")
+            try database.execute(sql: "DELETE FROM faces")
+            try database.execute(sql: "DELETE FROM people")
+            try database.execute(sql: "DELETE FROM face_photos")
+        }
+    }
+
     // MARK: - Event people
 
     /// Every (roster person, photo file identity) pair that counts toward
