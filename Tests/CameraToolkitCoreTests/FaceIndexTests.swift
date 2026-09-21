@@ -1714,6 +1714,95 @@ final class FaceIndexTests: XCTestCase {
         }
     }
 
+    // MARK: - Clear face index
+
+    /// The wipe empties exactly the four face tables — an `events` row in
+    /// the same database survives untouched.
+    func testClearFaceIndexWipesOnlyTheFaceTables() throws {
+        try withTemporaryDirectory { root in
+            let catalog = root.appendingPathComponent("catalog.sqlite")
+            var configuration = faceTestConfiguration(root: root, catalog: catalog)
+            configuration.savedEvents = [
+                SavedCameraEvent(name: "Beach Day", eventDate: Date(timeIntervalSince1970: 1_752_000_000)),
+            ]
+            _ = try CatalogStore(url: catalog).bootstrap(
+                configuration: configuration,
+                createBackup: false,
+                createLibraryFolders: false
+            )
+            let store = FaceIndexStore(url: catalog)
+
+            // Seed every face table: a named person with a confirmed face
+            // and a template, plus an unnamed group on a second photo.
+            let dad = try store.createPerson(name: "Dad", isRoster: true)
+            let group = try store.createPerson(name: "Person 1", isRoster: false)
+            var photoA = photoRecord("CLR0001.ARW")
+            photoA.scanGrade = .med
+            var photoB = photoRecord("CLR0002.ARW")
+            photoB.scanGrade = .med
+            let dadFace = faceRecord(photoA, embedding: testEmbedding(seed: 5), state: .confirmed, personID: dad.id)
+            let groupFace = faceRecord(
+                photoB,
+                box: NormalizedFaceBox(x: 0.6, y: 0.6, width: 0.15, height: 0.15),
+                embedding: testEmbedding(seed: 6),
+                state: .other,
+                personID: group.id
+            )
+            try store.replaceFaces(photo: photoA, faces: [dadFace])
+            try store.replaceFaces(photo: photoB, faces: [groupFace])
+            try store.addTemplate(personID: dad.id, faceID: dadFace.id)
+
+            XCTAssertEqual(
+                try store.faceIndexCounts(),
+                FaceIndexCounts(scannedPhotos: 2, faces: 2, namedPeople: 1, unnamedGroups: 1)
+            )
+            XCTAssertEqual(try store.storedScanGrades(), [.med])
+            XCTAssertEqual(scalarInt("SELECT COUNT(*) FROM events", database: catalog), 1)
+
+            try store.clearFaceIndex()
+
+            for table in ["face_photos", "faces", "people", "face_templates"] {
+                XCTAssertEqual(
+                    scalarInt("SELECT COUNT(*) FROM \(table)", database: catalog),
+                    0,
+                    "\(table) still has rows"
+                )
+            }
+            XCTAssertEqual(scalarInt("SELECT COUNT(*) FROM events", database: catalog), 1)
+            XCTAssertEqual(scalarString("SELECT name FROM events", database: catalog), "Beach Day")
+            XCTAssertEqual(scalarString("PRAGMA integrity_check", database: catalog), "ok")
+            XCTAssertEqual(try store.faceIndexCounts(), FaceIndexCounts())
+            XCTAssertEqual(try store.storedScanGrades(), [])
+        }
+    }
+
+    /// The footer's grade list comes from `face_photos.scan_grade`:
+    /// distinct values, lowest first, and the `none` marker manual tags
+    /// leave on never-scanned files stays out — it is not a scan grade.
+    func testStoredScanGradesListsDistinctGradesLowestFirst() throws {
+        try withFaceStore { store, _ in
+            var medium = photoRecord("GRD0001.ARW")
+            medium.scanGrade = .med
+            var low = photoRecord("GRD0002.ARW")
+            low.scanGrade = .low
+            var extraHigh = photoRecord("GRD0003.ARW")
+            extraHigh.scanGrade = .xhigh
+            try store.replaceFaces(photo: medium, faces: [])
+            try store.replaceFaces(photo: low, faces: [])
+            try store.replaceFaces(photo: extraHigh, faces: [])
+
+            // A manual tag stamps 'none' on a never-scanned file.
+            let person = try store.createPerson(name: "Dad", isRoster: true)
+            _ = try store.addManualFace(
+                photo: photoRecord("GRD0004.ARW"),
+                box: NormalizedFaceBox(x: 0.3, y: 0.3, width: 0.2, height: 0.2),
+                personID: person.id
+            )
+
+            XCTAssertEqual(try store.storedScanGrades(), [.low, .med, .xhigh])
+        }
+    }
+
     // MARK: - Helpers
 
     /// Opens a bootstrapped catalog + face store inside a temp folder.

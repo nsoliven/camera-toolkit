@@ -2917,6 +2917,33 @@ final class EventsWorkspace {
         return (roster, groups, unsure)
     }
 
+    /// The live counts the Clear Face Scan sheet lists — scanned photos,
+    /// detections, named people, unnamed groups.
+    func faceIndexCounts() -> FaceIndexCounts {
+        (try? faceStore.faceIndexCounts()) ?? FaceIndexCounts()
+    }
+
+    /// The scan grades actually stored on `face_photos` — the People
+    /// window footer's quality list. Empty when no scan has run.
+    func storedFaceScanGrades() -> [FaceScanGrade] {
+        (try? faceStore.storedScanGrades()) ?? []
+    }
+
+    /// Throws away the whole face index — `face_photos`, `faces`,
+    /// `people`, and `face_templates` rows only, in one transaction.
+    /// Nothing on disk is touched and every other catalog table —
+    /// events and assignments included — survives. The next scan treats
+    /// all files as new instead of skipping them on `scan_grade`.
+    func clearFaceIndex() {
+        do {
+            try faceStore.clearFaceIndex()
+            facesRevision &+= 1
+            model.statusMessage = "Face index cleared — catalog rows only, nothing on disk was touched. The next scan will not skip those files."
+        } catch {
+            model.statusMessage = "Could not clear the face index: \(error.localizedDescription)"
+        }
+    }
+
     func faces(for personID: UUID) -> [FaceRecord] {
         (try? faceStore.faces(personID: personID)) ?? []
     }

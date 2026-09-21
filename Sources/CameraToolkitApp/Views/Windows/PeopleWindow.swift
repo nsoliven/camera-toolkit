@@ -51,6 +51,10 @@ private struct PeopleView: View {
     @State private var expanded: Set<UUID> = []
     @State private var naming: NamingRequest?
     @State private var junkTarget: FacePerson?
+    /// Shows the Clear Face Scan confirmation sheet.
+    @State private var clearingFaceIndex = false
+    /// The scan grades stored on `face_photos` — the footer's quality list.
+    @State private var scanGrades: [FaceScanGrade] = []
     /// The person opened into the full detection grid.
     @State private var detail: FacePerson?
     /// The face whose source photo fills the preview overlay.
@@ -118,6 +122,16 @@ private struct PeopleView: View {
         .background(Color(nsColor: .controlBackgroundColor))
         .onAppear(perform: reload)
         .onChange(of: workspace.facesRevision) { reload() }
+        .sheet(isPresented: $clearingFaceIndex) {
+            ClearFaceScanSheet(
+                counts: workspace.faceIndexCounts(),
+                onCancel: { clearingFaceIndex = false },
+                onClear: {
+                    clearingFaceIndex = false
+                    workspace.clearFaceIndex()
+                }
+            )
+        }
         .sheet(item: $naming) { request in
             NamePersonSheet(
                 title: request.title,
@@ -170,6 +184,13 @@ private struct PeopleView: View {
             }
             .disabled(roster.isEmpty || model.isBusy)
             .help("Compare every stored face against the current roster. No photos are re-read.")
+            Button {
+                clearingFaceIndex = true
+            } label: {
+                Label("Clear Face Scan…", systemImage: "trash")
+            }
+            .disabled(model.isBusy)
+            .help("Throw away the face index so a scan can start over. Catalog rows only — no file is touched.")
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
@@ -485,7 +506,7 @@ private struct PeopleView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
             Spacer()
-            Text("LOW quality · faces only read photos; nothing is written to media")
+            Text("\(FaceScanSummaryText.quality(scanGrades)) · faces only read photos; nothing is written to media")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -558,6 +579,66 @@ private struct PeopleView: View {
         roster = snapshot.roster
         groups = snapshot.groups
         unsure = snapshot.unsure
+        scanGrades = workspace.storedFaceScanGrades()
+    }
+}
+
+/// The People window footer's index-grade text: the scan qualities the
+/// catalog actually stores, in the scan sheet's words — or a plain
+/// "nothing scanned" note when the index is empty. Pure so tests pin the
+/// wording without opening a window.
+enum FaceScanSummaryText {
+    /// "Medium quality" for one grade, "Low, Medium quality" when the
+    /// index mixes passes, "No face scan stored" when it holds nothing.
+    static func quality(_ grades: [FaceScanGrade]) -> String {
+        let names = grades.compactMap(\.displayName)
+        guard !names.isEmpty else { return "No face scan stored" }
+        return "\(names.joined(separator: ", ")) quality"
+    }
+}
+
+/// Confirmation for throwing away the face index: leads with the live
+/// counts of what will be removed and states plainly that only the four
+/// face tables' catalog rows go — nothing on disk is touched. A sheet,
+/// not a typed-token gate: this is not media trash.
+private struct ClearFaceScanSheet: View {
+    let counts: FaceIndexCounts
+    let onCancel: () -> Void
+    let onClear: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Clear Face Scan")
+                .font(.title3.bold())
+            VStack(alignment: .leading, spacing: 5) {
+                Text("This removes the face index stored in the local catalog:")
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("· \(counts.scannedPhotos) scanned photo\(counts.scannedPhotos == 1 ? "" : "s")")
+                    Text("· \(counts.faces) detected face\(counts.faces == 1 ? "" : "s")")
+                    Text("· \(counts.namedPeople) named \(counts.namedPeople == 1 ? "person" : "people")")
+                    Text("· \(counts.unnamedGroups) unnamed group\(counts.unnamedGroups == 1 ? "" : "s")")
+                }
+                .font(.callout.weight(.semibold))
+                .padding(.leading, 8)
+            }
+            Text("Only catalog rows are deleted — face_photos, faces, people, and face_templates. Photos, RAW, video, XMP sidecars, event assignments, events, and .Camera Toolkit/_Trash are not touched. Nothing is moved or deleted on disk.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Text("Afterward the next face scan will not skip those files.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack {
+                Spacer()
+                Button("Cancel", action: onCancel)
+                    .keyboardShortcut(.cancelAction)
+                Button("Clear Face Scan", role: .destructive, action: onClear)
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20)
+        .frame(width: 460)
     }
 }
 
