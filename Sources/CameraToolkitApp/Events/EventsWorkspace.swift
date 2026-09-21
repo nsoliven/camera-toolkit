@@ -3170,12 +3170,20 @@ final class EventsWorkspace {
             logTitle: "Re-matched faces",
             logDetail: "Stored face vectors were matched to named people and the unnamed groups were rebundled — a drifted cluster can split into real groups. No photos were re-read, no ML ran, and no files or events moved.",
             operation: { progress in
-                _ = try CatalogStore(url: catalogURL).bootstrap(
-                    configuration: configuration,
-                    createBackup: false,
-                    createLibraryFolders: false
-                )
-                return try FaceIndexService(catalogURL: catalogURL).rematchRoster { update in
+                let service = FaceIndexService(catalogURL: catalogURL)
+                // Bootstrap stays the path that creates the face tables,
+                // but on a catalog that already has them it would only
+                // open a second writer against a possibly-locked
+                // database — the transient-failure retry inside the
+                // store covers the BEGIN IMMEDIATE stutter instead.
+                if try !service.faceSchemaExists() {
+                    _ = try CatalogStore(url: catalogURL).bootstrap(
+                        configuration: configuration,
+                        createBackup: false,
+                        createLibraryFolders: false
+                    )
+                }
+                return try service.rematchRoster { update in
                     progress(DashboardModel.jobUpdate(from: update, notePrefix: "Matching", command: ""))
                 }
             },
