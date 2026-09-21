@@ -189,7 +189,7 @@ struct ConfigView: View {
             } header: {
                 Text("Burst Grouping")
             } footer: {
-                Text("Consecutive frames up to a second apart always chain into a burst. With recovery on, consecutive frames up to the gap limit are compared with Apple Vision and merged when they look alike. Lower distance limits are stricter.")
+                Text("Consecutive frames up to a second apart always chain into a burst. With recovery on, consecutive frames up to the gap limit are compared with Apple Vision and merged when they look alike. Lower distance limits are stricter. These sliders apply on the next regroup — press Regroup Bursts on an Unsorted board to re-run grouping without re-reading files.")
             }
 
             Section("Import Defaults") {

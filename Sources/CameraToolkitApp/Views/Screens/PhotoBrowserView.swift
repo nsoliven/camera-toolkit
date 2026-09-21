@@ -347,12 +347,12 @@ struct PhotoBrowserView: View {
 
                 Section("Activity") {
                     sidebarActionButton(
-                        title: "Transfers",
-                        detail: transferSidebarDetail,
-                        symbol: transferSidebarSymbol,
-                        color: transferSidebarColor,
-                        badge: transferSidebarBadge,
-                        help: "Open the separate Transfer Queue window and see copy or checksum progress"
+                        title: "Jobs",
+                        detail: jobsSidebarDetail,
+                        symbol: jobsSidebarSymbol,
+                        color: jobsSidebarColor,
+                        badge: jobsSidebarBadge,
+                        help: "Open the Jobs window — transfers, burst regrouping, face scans, and other background work with progress"
                     ) {
                         TransferQueueWindowController.shared.show(model: model)
                     }
@@ -713,37 +713,42 @@ struct PhotoBrowserView: View {
         .accessibilityLabel("\(title), \(detail)")
     }
 
-    private var transferSidebarDetail: String {
+    private var jobsSidebarDetail: String {
+        if let job = model.activeJob {
+            return job.note
+        }
         if model.pendingTransferFileCount > 0 {
-            if let active = model.transferQueue, active.state == .running {
-                return "\(active.sidebarSummary.detail) · \(model.pendingTransferFileCount) next"
-            }
             return "\(model.pendingTransferFileCount) file\(model.pendingTransferFileCount == 1 ? "" : "s") waiting"
         }
         return model.transferQueue?.sidebarSummary.detail ?? "Nothing running"
     }
 
-    private var transferSidebarBadge: String? {
-        model.transferQueue?.sidebarSummary.badge ?? (model.pendingTransferFileCount > 0 ? "\(model.pendingTransferFileCount)" : nil)
+    private var jobsSidebarBadge: String? {
+        if let job = model.activeJob {
+            return job.progress.formatted(.percent.precision(.fractionLength(0)))
+        }
+        return model.transferQueue?.sidebarSummary.badge ?? (model.pendingTransferFileCount > 0 ? "\(model.pendingTransferFileCount)" : nil)
     }
 
-    private var transferSidebarSymbol: String {
+    private var jobsSidebarSymbol: String {
+        if model.activeJob != nil { return "list.bullet.clipboard.fill" }
         switch model.transferQueue?.state {
-        case .running: "arrow.down.circle.fill"
-        case .completed: "checkmark.circle.fill"
-        case .failed: "exclamationmark.circle.fill"
-        case .cancelled: "xmark.circle.fill"
-        case nil: model.pendingTransferFileCount > 0 ? "clock.arrow.circlepath" : "arrow.down.circle"
+        case .completed: return "checkmark.circle"
+        case .failed: return "exclamationmark.circle"
+        case .cancelled: return "xmark.circle"
+        case .running, nil:
+            return model.pendingTransferFileCount > 0 ? "clock.arrow.circlepath" : "list.bullet.clipboard"
         }
     }
 
-    private var transferSidebarColor: Color {
+    private var jobsSidebarColor: Color {
+        if model.activeJob != nil { return .blue }
         switch model.transferQueue?.state {
-        case .running: .blue
-        case .completed: .green
-        case .failed: .red
-        case .cancelled: .secondary
-        case nil: model.pendingTransferFileCount > 0 ? .blue : .secondary
+        case .completed: return .green
+        case .failed: return .red
+        case .cancelled: return .secondary
+        case .running, nil:
+            return model.pendingTransferFileCount > 0 ? .blue : .secondary
         }
     }
 

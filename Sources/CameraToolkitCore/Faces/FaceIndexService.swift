@@ -27,10 +27,62 @@ public struct FaceIndexService: Sendable {
 
     // MARK: - Scan
 
-    /// Scans a location's stills (the photo and RAW primaries of an
-    /// `OrganizeScanner` result). Video is skipped entirely in LOW mode.
+    /// Camera files below this size cannot hold a decodable preview at all —
+    /// the cheapest possible "don't waste a sample slot on a corrupt frame"
+    /// check, done on the stat the scan already recorded.
+    public static let minimumSampleBytes: Int64 = 65_536
+
+    /// The items a scan decodes. Singles contribute their one still or the
+    /// video itself; a burst contributes its first, middle, and last stills
+    /// — the same scene and the same people most of the time, so decoding
+    /// all eighty frames is waste — plus each video in the stack (its poster
+    /// can show faces the stills miss). At HIGH and above every still is a
+    /// target. Faces land on the sampled files only; the burst's other
+    /// frames keep no `face_photos` row, so a later regroup that splits the
+    /// burst can scan them on their own.
+    public static func scanTargets(for stacks: [OrganizeStack], mode: FaceScanGrade) -> [OrganizeItem] {
+        let scannable: Set<OrganizeMediaKind> = [.raw, .photo, .video]
+        var targets: [OrganizeItem] = []
+        for stack in stacks {
+            if stack.isBurst, mode < .high {
+                targets.append(contentsOf: burstSample(stack))
+            } else {
+                targets.append(contentsOf: stack.items.filter { scannable.contains($0.kind) })
+            }
+        }
+        return targets
+    }
+
+    /// First/middle/last stills of a burst — chosen from frames large
+    /// enough to hold a decodable preview, so a corrupt/tiny candidate is
+    /// replaced by the next healthy frame rather than wasting a sample —
+    /// plus every video in the stack (its poster can show faces the stills
+    /// miss). A burst of all-tiny files still keeps its first still so
+    /// something represents it. Blur gets no special check — no cheap
+    /// signal beats the first/mid/last spread.
+    private static func burstSample(_ stack: OrganizeStack) -> [OrganizeItem] {
+        let stills = stack.items.filter { $0.kind == .raw || $0.kind == .photo }
+        var picked: [OrganizeItem] = []
+        if !stills.isEmpty {
+            let healthy = stills.filter { $0.primary.size >= minimumSampleBytes }
+            if healthy.isEmpty {
+                picked = [stills[0]]
+            } else {
+                var seen = Set<Int>()
+                picked = [0, healthy.count / 2, healthy.count - 1]
+                    .filter { seen.insert($0).inserted }
+                    .map { healthy[$0] }
+            }
+        }
+        picked.append(contentsOf: stack.items.filter { $0.kind == .video })
+        return picked
+    }
+
+    /// Scans a location's burst stacks — the `OrganizeScanner` grouping a
+    /// board already produced. Stills decode through the bounded preview
+    /// path; videos decode one poster frame.
     public func scan(
-        items: [OrganizeItem],
+        stacks: [OrganizeStack],
         embedder: FaceEmbeddingProviding?,
         progress: FileOperationProgressHandler? = nil
     ) throws -> FaceScanReport {
@@ -39,14 +91,14 @@ public struct FaceIndexService: Sendable {
         }
 
         var report = FaceScanReport()
-        let stills = items.filter { $0.kind == .raw || $0.kind == .photo }
-        report.photosConsidered = stills.count
+        let targets = Self.scanTargets(for: stacks, mode: options.mode)
+        report.photosConsidered = targets.count
 
         // New-files-only rule: a photo whose recorded grade covers this mode
         // — and whose size/mtime still match — is skipped without decoding.
-        let existing = try store.photos(pathKeys: stills.map(\.primary.pathKey))
+        let existing = try store.photos(pathKeys: targets.map(\.primary.pathKey))
         var pending: [OrganizeItem] = []
-        for item in stills {
+        for item in targets {
             let file = item.primary
             if let known = existing[file.pathKey],
                known.scanGrade.covers(options.mode),
@@ -143,7 +195,10 @@ public struct FaceIndexService: Sendable {
     ) -> PhotoOutcome {
         let file = item.primary
         let url = file.url
-        guard let image = FaceImageDecoder.detectionImage(for: url, maximumPixelSize: options.detectPixels) else {
+        let decoded = item.kind == .video
+            ? FaceImageDecoder.posterImage(for: url, maximumPixelSize: options.detectPixels)
+            : FaceImageDecoder.detectionImage(for: url, maximumPixelSize: options.detectPixels)
+        guard let image = decoded else {
             return .failed
         }
         let fullSize = FaceImageDecoder.pixelSize(of: url)

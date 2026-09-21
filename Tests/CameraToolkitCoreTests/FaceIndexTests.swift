@@ -167,13 +167,13 @@ final class FaceIndexTests: XCTestCase {
             let item = try organizeItem(forFileAt: jpegURL)
             let service = FaceIndexService(catalogURL: catalog)
 
-            var report = try service.scan(items: [item], embedder: StubEmbedder())
+            var report = try service.scan(stacks: [OrganizeStack(items: [item])], embedder: StubEmbedder())
             XCTAssertEqual(report.photosProcessed, 1)
             XCTAssertEqual(report.photosSkipped, 0)
             XCTAssertEqual(report.facesDetected, 0)
 
             // Same file identity + grade covers the mode → skipped.
-            report = try service.scan(items: [try organizeItem(forFileAt: jpegURL)], embedder: StubEmbedder())
+            report = try service.scan(stacks: [OrganizeStack(items: [try organizeItem(forFileAt: jpegURL)])], embedder: StubEmbedder())
             XCTAssertEqual(report.photosProcessed, 0)
             XCTAssertEqual(report.photosSkipped, 1)
 
@@ -183,14 +183,89 @@ final class FaceIndexTests: XCTestCase {
                 [.modificationDate: Date().addingTimeInterval(3_600)],
                 ofItemAtPath: jpegURL.path
             )
-            report = try service.scan(items: [try organizeItem(forFileAt: jpegURL)], embedder: StubEmbedder())
+            report = try service.scan(stacks: [OrganizeStack(items: [try organizeItem(forFileAt: jpegURL)])], embedder: StubEmbedder())
             XCTAssertEqual(report.photosProcessed, 1)
             XCTAssertEqual(report.photosSkipped, 0)
 
             // Missing embedder → the scan refuses rather than guessing.
-            XCTAssertThrowsError(try service.scan(items: [item], embedder: nil)) { error in
+            XCTAssertThrowsError(try service.scan(stacks: [OrganizeStack(items: [item])], embedder: nil)) { error in
                 XCTAssertEqual(error as? FaceIndexError, .modelNotInstalled(FaceModelCatalog.modelFileName))
             }
+        }
+    }
+
+    // MARK: - Burst sampling
+
+    func testScanTargetsSampleFirstMiddleLastOfABurst() {
+        // Same burst, same scene: LOW/MED decode a first/middle/last sample,
+        // never all eighty frames.
+        let burst = OrganizeStack(items: (0..<80).map { stubItem("B0001_DSC\($0).ARW") })
+        let targets = FaceIndexService.scanTargets(for: [burst], mode: .low)
+        XCTAssertEqual(targets.map(\.primary.name), ["B0001_DSC0.ARW", "B0001_DSC40.ARW", "B0001_DSC79.ARW"])
+        XCTAssertEqual(FaceIndexService.scanTargets(for: [burst], mode: .med).count, 3)
+
+        // HIGH and above still walk every frame.
+        XCTAssertEqual(FaceIndexService.scanTargets(for: [burst], mode: .high).count, 80)
+    }
+
+    func testScanTargetsSinglesVideosAndCorruptFrames() {
+        let single = OrganizeStack(items: [stubItem("DSC00001.JPG", kind: .photo)])
+        let video = OrganizeStack(items: [stubItem("C0001.MP4", kind: .video)])
+        let sidecar = OrganizeStack(items: [stubItem("DSC00001.XMP", kind: .other)])
+        var targets = FaceIndexService.scanTargets(for: [single, video, sidecar], mode: .low)
+        XCTAssertEqual(targets.map(\.primary.name), ["DSC00001.JPG", "C0001.MP4"])
+
+        // Tiny sample frames drop out — but the burst keeps at least one.
+        let burst = OrganizeStack(items: [
+            stubItem("B0001_DSC1.ARW", size: 1_000),       // corrupt/tiny
+            stubItem("B0001_DSC2.ARW"),
+            stubItem("B0001_DSC3.ARW"),
+            stubItem("B0001_DSC4.ARW", size: 1_000),       // corrupt/tiny
+        ])
+        targets = FaceIndexService.scanTargets(for: [burst], mode: .low)
+        XCTAssertEqual(targets.map(\.primary.name), ["B0001_DSC2.ARW", "B0001_DSC3.ARW"])
+
+        let allTiny = OrganizeStack(items: [
+            stubItem("B0001_DSC1.ARW", size: 1_000),
+            stubItem("B0001_DSC2.ARW", size: 1_000),
+        ])
+        XCTAssertEqual(FaceIndexService.scanTargets(for: [allTiny], mode: .low).count, 1)
+    }
+
+    func testScanProcessesSampledBurstFramesOnly() throws {
+        try withTemporaryDirectory { root in
+            let catalog = root.appendingPathComponent("catalog.sqlite")
+            _ = try CatalogStore(url: catalog).bootstrap(
+                configuration: faceTestConfiguration(root: root, catalog: catalog),
+                createBackup: false,
+                createLibraryFolders: false
+            )
+
+            // Six-frame burst + one single. Sampling touches frames 0, 3, 5
+            // and the single — frames 1, 2, 4 are never decoded or recorded.
+            var burstItems: [OrganizeItem] = []
+            for index in 0..<6 {
+                let url = root.appendingPathComponent("card/B0001_DSC0000\(index).JPG")
+                try writeJPEG(url, seed: UInt8(index + 1), padToBytes: 70_000)
+                burstItems.append(try organizeItem(forFileAt: url))
+            }
+            let singleURL = root.appendingPathComponent("card/DSC00050.JPG")
+            try writeJPEG(singleURL, seed: 9)
+            let single = try organizeItem(forFileAt: singleURL)
+
+            let service = FaceIndexService(catalogURL: catalog)
+            let report = try service.scan(
+                stacks: [OrganizeStack(items: burstItems), OrganizeStack(items: [single])],
+                embedder: StubEmbedder()
+            )
+            XCTAssertEqual(report.photosConsidered, 4)
+            XCTAssertEqual(report.photosProcessed, 4)
+
+            let recorded = try FaceIndexStore(url: catalog).photos(pathKeys: burstItems.map(\.primary.pathKey))
+            XCTAssertEqual(
+                Set(recorded.keys),
+                Set([burstItems[0], burstItems[3], burstItems[5]].map(\.primary.pathKey))
+            )
         }
     }
 
@@ -485,6 +560,22 @@ final class FaceIndexTests: XCTestCase {
         )
     }
 
+    /// Builds an OrganizeItem without touching disk — for scan-target
+    /// sampling tests where only name, size, and kind matter.
+    private func stubItem(
+        _ name: String,
+        size: Int64 = 10_000_000,
+        kind: OrganizeMediaKind = .photo
+    ) -> OrganizeItem {
+        let modified = Date(timeIntervalSince1970: 1_752_000_000)
+        return OrganizeItem(
+            primary: OrganizeFile(path: "/card/DCIM/\(name)", size: size, modifiedAt: modified),
+            kind: kind,
+            captureDate: modified,
+            hasCameraDate: true
+        )
+    }
+
     /// Builds a real OrganizeItem from a file on disk so size/mtime match the
     /// bytes the scan pipeline will stat.
     private func organizeItem(forFileAt url: URL) throws -> OrganizeItem {
@@ -517,7 +608,9 @@ final class FaceIndexTests: XCTestCase {
 
     /// Writes a flat-gradient JPEG — decodable, and guaranteed to contain no
     /// faces so the scan exercises the pipeline without needing real media.
-    private func writeJPEG(_ url: URL, seed: UInt8) throws {
+    /// `padToBytes` pads the tail (harmless to decoders) so a file clears the
+    /// scan's tiny-sample size floor.
+    private func writeJPEG(_ url: URL, seed: UInt8, padToBytes: Int = 0) throws {
         let size = 640
         guard let context = CGContext(
             data: nil,
@@ -545,7 +638,11 @@ final class FaceIndexTests: XCTestCase {
         guard CGImageDestinationFinalize(destination) else {
             throw XCTSkip("Could not finalize a JPEG")
         }
-        try writeFile(url, data as Data)
+        var bytes = data as Data
+        if bytes.count < padToBytes {
+            bytes.append(Data(repeating: 0, count: padToBytes - bytes.count))
+        }
+        try writeFile(url, bytes)
     }
 
     /// A deterministic 112×112 bitmap for the CoreML round-trip test.

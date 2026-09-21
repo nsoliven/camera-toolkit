@@ -346,7 +346,7 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate {
         windowMenu.addItem(mainWindowItem)
 
         let transferQueueItem = NSMenuItem(
-            title: "Transfer Queue…",
+            title: "Jobs…",
             action: #selector(openTransferQueue),
             keyEquivalent: "t"
         )
