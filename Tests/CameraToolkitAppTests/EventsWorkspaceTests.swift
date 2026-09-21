@@ -286,6 +286,80 @@ final class EventsWorkspaceTests: XCTestCase {
         }
     }
 
+    /// What the filmstrip's Delete key and context menu hand over: a range of
+    /// selected frames — every item's primary and companions move together.
+    func testTrashItemsMovesEverySelectedFrameToTrash() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let unsorted = root.appendingPathComponent("Drive/Unsorted A7V", isDirectory: true)
+            let frame1 = try writeOrganizerARW(unsorted.appendingPathComponent("Transfer 1/B0001_DSC00001.ARW"), "2026:08:26 10:00:00", "100")
+            let frame2 = try writeOrganizerARW(unsorted.appendingPathComponent("Transfer 1/B0001_DSC00002.ARW"), "2026:08:26 10:00:00", "400")
+            let frame3 = try writeOrganizerARW(unsorted.appendingPathComponent("Transfer 1/B0001_DSC00003.ARW"), "2026:08:26 10:00:00", "700")
+            let sidecar = try organizerWrite(unsorted.appendingPathComponent("Transfer 1/B0001_DSC00002.xmp"), "<xmp/>")
+            let kept = try writeOrganizerARW(unsorted.appendingPathComponent("Transfer 1/DSC00010.ARW"), "2026:08:26 11:00:00", "000")
+            let location = addUnsorted(unsorted, to: model)
+            workspace.scan(location)
+            try await waitUntil { workspace.sources[location.id]?.result != nil }
+            let burst = try XCTUnwrap(workspace.sources[location.id]?.result?.stacks.first { $0.items.count == 3 })
+
+            workspace.trashItems(Array(burst.items.prefix(2)), from: location.id)
+            try await waitUntil { !model.isBusy && workspace.sources[location.id]?.result?.items.count == 2 }
+
+            let trash = root.appendingPathComponent("Drive/.Camera Toolkit/_Trash", isDirectory: true)
+            let batches = try FileManager.default.contentsOfDirectory(at: trash, includingPropertiesForKeys: [.isDirectoryKey])
+            let batch = try XCTUnwrap(batches.first { $0.lastPathComponent != ".DS_Store" })
+            for url in [frame1, frame2, sidecar] {
+                XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+                XCTAssertTrue(FileManager.default.fileExists(atPath: batch.appendingPathComponent("Transfer 1/\(url.lastPathComponent)").path))
+            }
+            // The unselected frame and the unrelated single stay on the board.
+            XCTAssertTrue(FileManager.default.fileExists(atPath: frame3.path))
+            XCTAssertTrue(FileManager.default.fileExists(atPath: kept.path))
+            XCTAssertEqual(
+                Set(workspace.sources[location.id]?.result?.items.map(\.primary.name) ?? []),
+                ["B0001_DSC00003.ARW", "DSC00010.ARW"]
+            )
+        }
+    }
+
+    /// "Move to New Burst" records a BurstSplit in the configuration and
+    /// restacks the board; a forced rescan must not glue the frames back
+    /// together.
+    func testSplittingFramesOffABurstPersistsAcrossRescan() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let unsorted = root.appendingPathComponent("Drive/Unsorted A7V", isDirectory: true)
+            for index in 1...4 {
+                try writeOrganizerARW(unsorted.appendingPathComponent("Transfer 1/B0001_DSC0000\(index).ARW"), "2026:08:26 10:00:00", "\(index)00")
+            }
+            try writeOrganizerARW(unsorted.appendingPathComponent("Transfer 1/DSC00010.ARW"), "2026:08:26 11:00:00", "000")
+            let location = addUnsorted(unsorted, to: model)
+            workspace.scan(location)
+            try await waitUntil { workspace.sources[location.id]?.result != nil }
+            let burst = try XCTUnwrap(workspace.sources[location.id]?.result?.stacks.first { $0.items.count == 4 })
+
+            workspace.splitItems(Array(burst.items.suffix(2)))
+
+            XCTAssertEqual(model.configuration.burstSplits.count, 1)
+            XCTAssertEqual(
+                model.configuration.burstSplits[0].memberPathKeys,
+                ["B0001_DSC00003.ARW", "B0001_DSC00004.ARW"].map {
+                    EventStorageLocations.pathKey(unsorted.appendingPathComponent("Transfer 1/\($0)").path)
+                }
+            )
+            var stacks = try XCTUnwrap(workspace.sources[location.id]?.result?.stacks)
+            XCTAssertEqual(stacks.map(\.items.count).sorted(), [1, 2, 2])
+            let split = try XCTUnwrap(stacks.first { $0.items.map(\.primary.name) == ["B0001_DSC00003.ARW", "B0001_DSC00004.ARW"] })
+            XCTAssertTrue(split.isBurst)
+            // The files themselves never moved.
+            XCTAssertTrue(burst.items.allSatisfy { FileManager.default.fileExists(atPath: $0.primary.path) })
+
+            workspace.scan(location, force: true)
+            try await waitUntil { workspace.sources[location.id]?.isScanning == false }
+            stacks = try XCTUnwrap(workspace.sources[location.id]?.result?.stacks)
+            XCTAssertEqual(stacks.map(\.items.count).sorted(), [1, 2, 2])
+            XCTAssertNotNil(stacks.first { $0.items.map(\.primary.name) == ["B0001_DSC00003.ARW", "B0001_DSC00004.ARW"] })
+        }
+    }
+
     func testSubeventCreationDedupAndSidebarNesting() async throws {
         try await withOrganizerSandbox { root, model, workspace in
             _ = root
