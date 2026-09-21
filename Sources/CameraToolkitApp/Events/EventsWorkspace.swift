@@ -148,6 +148,12 @@ private struct ImmichCandidate: Sendable {
     var modifiedAt: Date
 }
 
+private struct BurstRegroupOutcome: Sendable {
+    var stacks: [OrganizeStack]
+    var links: Set<BurstVisualLink>
+    var grouping: BurstGroupingConfiguration
+}
+
 private struct ImmichUploadOutcome: Sendable {
     var uploaded = 0
     var duplicates = 0
@@ -2040,16 +2046,117 @@ final class EventsWorkspace {
         faceScanRequest = FaceScanRequest(locationID: location.id)
     }
 
-    /// "Scan for Faces" on a connected unsorted source: detect faces with
-    /// the mode's engine, embed them with the on-device model, match named
-    /// people, and group the rest. MED and above also sample video frames.
-    /// Writes only to the catalog — media files are only read.
+    /// Test seam: supplies the embedder so a face scan can run without the
+    /// on-disk CoreML package. Nil in production — the model loads per scan.
+    @ObservationIgnored var faceEmbedderProvider: (@Sendable () async throws -> FaceEmbeddingProviding?)?
+
+    /// Why Face Scan cannot start on this location right now, or nil when it
+    /// can. Faces are detected per burst stack, so a location must finish
+    /// grouping first; the board disables its button with this reason.
+    func faceScanBlocker(for location: ConfiguredLocation) -> String? {
+        if sources[location.id]?.isScanning == true {
+            return "Burst grouping is still running on \(location.name). Face Scan unlocks when it finishes."
+        }
+        if sources[location.id]?.result == nil {
+            return "Face Scan runs after burst grouping — scan \(location.name) first."
+        }
+        if model.isBusy || model.isStorageBenchmarkRunning {
+            return "Another job is already running. Wait for it to finish, then scan."
+        }
+        return nil
+    }
+
+    /// "Regroup Bursts" on the Unsorted board: re-runs the stacker and the
+    /// Vision recovery pass on the already-scanned items using the current
+    /// Settings sliders — no capture times are re-read and nothing moves.
+    /// Runs as an `.organize` job so it shows in the Jobs window.
+    func regroupBursts(_ location: ConfiguredLocation) {
+        let id = location.id
+        guard let result = sources[id]?.result else {
+            model.statusMessage = "Scan \(location.name) first — there is nothing to regroup yet."
+            return
+        }
+        guard sources[id]?.isScanning != true else {
+            model.statusMessage = "\(location.name) is already scanning or regrouping."
+            return
+        }
+        guard !model.isBusy, !model.isStorageBenchmarkRunning else {
+            model.statusMessage = "Another job is already running. Regroup Bursts starts when it finishes."
+            return
+        }
+        let items = result.items
+        let grouping = BurstGroupingConfiguration.resolved()
+        var state = sources[id] ?? UnsortedSourceState()
+        state.isScanning = true
+        state.error = nil
+        state.progress = OrganizeScanProgress(phase: "Regrouping bursts", processed: 0, total: 0)
+        sources[id] = state
+        let reportProgress: @Sendable (OrganizeScanProgress) -> Void = { [weak self] update in
+            Task { @MainActor in
+                self?.sources[id]?.progress = update
+            }
+        }
+        model.runBackgroundJob(
+            action: .organize,
+            runningNote: "Regrouping bursts on \(location.name)",
+            logTitle: "Regrouped bursts on \(location.name)",
+            logDetail: "Re-ran burst grouping on the already-scanned files using the current Settings thresholds, including the Vision similarity check. File contents were not re-read and nothing was moved.",
+            onSettled: { [weak self] in
+                self?.sources[id]?.isScanning = false
+                self?.sources[id]?.progress = nil
+            },
+            operation: { progress in
+                let links = BurstVisualLinker.links(for: items, configuration: grouping) { update in
+                    reportProgress(update)
+                    progress(DashboardModel.jobUpdate(
+                        from: FileOperationProgress(
+                            phase: update.phase,
+                            processedFiles: update.processed,
+                            totalFiles: update.total
+                        ),
+                        lowerBound: 0.05,
+                        upperBound: 0.9,
+                        notePrefix: "Regrouping bursts",
+                        command: ""
+                    ))
+                }
+                reportProgress(OrganizeScanProgress(phase: "Grouping bursts", processed: 0, total: 0))
+                return BurstRegroupOutcome(
+                    stacks: OrganizeStacker.stacks(for: items, configuration: grouping, visualLinks: links),
+                    links: links,
+                    grouping: grouping
+                )
+            },
+            completion: { [weak self] outcome in
+                guard let self else { return "" }
+                var updated = result
+                updated.stacks = outcome.stacks
+                updated.days = OrganizeStacker.days(for: outcome.stacks)
+                updated.burstGrouping = outcome.grouping
+                updated.visualLinks = outcome.links
+                sources[id]?.result = updated
+                let bursts = outcome.stacks.count { $0.isBurst }
+                return "Regrouped \(location.name): \(outcome.stacks.count) item(s), \(bursts) burst(s). Nothing moved."
+            }
+        )
+    }
+
+    /// "Scan for Faces" on a connected, grouped unsorted source: detect
+    /// faces with the mode's engine on a sample of each burst plus single
+    /// stills, embed them with the on-device model, match named people, and
+    /// group the rest. MED and above also sample video frames. Writes only
+    /// to the catalog — media files are only read.
     func faceScan(_ location: ConfiguredLocation, options: FaceScanOptions = FaceScanOptions()) {
         guard isConnected(location) else {
             model.statusMessage = "\(location.name) is not connected. Plug it in, then scan again."
             return
         }
-        guard faceModelInstalled else {
+        if let blocker = faceScanBlocker(for: location) {
+            model.statusMessage = blocker
+            return
+        }
+        let embedderProvider = faceEmbedderProvider
+        guard faceModelInstalled || embedderProvider != nil else {
             model.statusMessage = "The face model is not installed yet. Run scripts/convert-arcface.sh once on this Mac, then scan again."
             return
         }
@@ -2057,9 +2164,9 @@ final class EventsWorkspace {
             model.statusMessage = "The face detector is not installed yet. Run scripts/convert-scrfd.sh once on this Mac, then scan again."
             return
         }
-        let root = URL(fileURLWithPath: DashboardModel.expandedPath(location.path), isDirectory: true)
-        let existing = sources[location.id]?.result
-        let cache = captureDateCache
+        // The grouping gate above guarantees a scan result; the stacks it
+        // holds drive the face scan's burst sampling.
+        guard let stacks = sources[location.id]?.result?.stacks else { return }
         let support = DashboardModel.defaultApplicationSupportURL
         let catalogURL = catalogDatabaseURL
         let configuration = model.configuration
@@ -2067,7 +2174,7 @@ final class EventsWorkspace {
             action: .faceScan,
             runningNote: "Scanning \(location.name) for faces",
             logTitle: "Face scan: \(location.name)",
-            logDetail: "Detected faces, embedded them on-device, matched named people, and grouped the rest. Files were only read — nothing was written or moved.",
+            logDetail: "Detected faces on a sample of each burst, single stills, and — at MED and above — video frames; embedded them on-device, matched named people, and grouped the rest. Files were only read — nothing was written or moved.",
             operation: { progress in
                 // Bootstrap is idempotent: it guarantees the face tables
                 // exist even if no catalog sync has run since the upgrade.
@@ -2076,7 +2183,13 @@ final class EventsWorkspace {
                     createBackup: false,
                     createLibraryFolders: false
                 )
-                guard let embedder = try await FaceModelCatalog.loadEmbedder(applicationSupport: support) else {
+                let embedder: FaceEmbeddingProviding?
+                if let embedderProvider {
+                    embedder = try await embedderProvider()
+                } else {
+                    embedder = try await FaceModelCatalog.loadEmbedder(applicationSupport: support)
+                }
+                guard let embedder else {
                     throw FaceIndexError.modelNotInstalled(FaceModelCatalog.modelURL(applicationSupport: support).path)
                 }
                 var detector: FaceDetecting?
@@ -2086,38 +2199,17 @@ final class EventsWorkspace {
                     }
                     detector = loaded
                 }
-                var scanResult = existing
-                if scanResult == nil {
-                    scanResult = try OrganizeScanner().scan(
-                        root: root,
-                        cache: cache,
-                        burstGrouping: BurstGroupingConfiguration.resolved()
-                    ) { update in
-                        progress(DashboardModel.jobUpdate(
-                            from: FileOperationProgress(
-                                phase: update.phase,
-                                processedFiles: update.processed,
-                                totalFiles: update.total
-                            ),
-                            lowerBound: 0.02,
-                            upperBound: 0.25,
-                            notePrefix: "Reading",
-                            command: ""
-                        ))
-                    }
-                }
-                let lowerBound = existing == nil ? 0.25 : 0.02
                 // The scan result's burst stacks drive sampling — a burst
-                // decodes a few spread frames instead of every still.
+                // decodes its first/middle/last stills instead of every
+                // frame (all stills at HIGH and above).
                 return try FaceIndexService(catalogURL: catalogURL, options: options).scan(
-                    items: scanResult?.items ?? [],
+                    stacks: stacks,
                     embedder: embedder,
-                    detector: detector,
-                    stacks: scanResult?.stacks
+                    detector: detector
                 ) { update in
                     progress(DashboardModel.jobUpdate(
                         from: update,
-                        lowerBound: lowerBound,
+                        lowerBound: 0.02,
                         upperBound: 0.98,
                         notePrefix: "Face scan",
                         command: ""
@@ -2128,7 +2220,7 @@ final class EventsWorkspace {
                 self?.facesRevision &+= 1
                 let video = report.videoFramesRead > 0 ? "; \(report.videoFramesRead) video frames read" : ""
                 let burst = report.photosBurstCovered > 0 ? "; \(report.photosBurstCovered) burst frames covered by sampled siblings" : ""
-                return "Face scan done — \(report.facesDetected) face\(report.facesDetected == 1 ? "" : "s") on \(report.photosProcessed) new photo(s); \(report.photosSkipped) already scanned\(burst); \(report.facesProposed) matched to people, \(report.facesGrouped) grouped\(video)."
+                return "Face scan done — \(report.facesDetected) face\(report.facesDetected == 1 ? "" : "s") on \(report.photosProcessed) sampled photo(s); \(report.photosSkipped) already scanned\(burst); \(report.facesProposed) matched to people, \(report.facesGrouped) grouped\(video)."
             }
         )
     }

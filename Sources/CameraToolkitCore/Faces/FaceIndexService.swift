@@ -30,6 +30,109 @@ public struct FaceIndexService: Sendable {
 
     // MARK: - Scan
 
+    /// Camera files below this size cannot hold a decodable preview at all —
+    /// the cheapest possible "don't waste a sample slot on a corrupt frame"
+    /// check, done on the stat the scan already recorded.
+    public static let minimumSampleBytes: Int64 = 65_536
+
+    /// The items a scan decodes. Singles contribute their one still or the
+    /// video itself; a burst contributes its first, middle, and last stills
+    /// — the same scene and the same people most of the time, so decoding
+    /// all eighty frames is waste — plus each video in the stack (its poster
+    /// can show faces the stills miss). At HIGH and above every still is a
+    /// target. Faces land on the sampled files only; the burst's other
+    /// frames keep no `face_photos` row, so a later regroup that splits the
+    /// burst can scan them on their own.
+    public static func scanTargets(for stacks: [OrganizeStack], mode: FaceScanGrade) -> [OrganizeItem] {
+        let scannable: Set<OrganizeMediaKind> = [.raw, .photo, .video]
+        var targets: [OrganizeItem] = []
+        for stack in stacks {
+            if stack.isBurst, mode < .high {
+                targets.append(contentsOf: burstSample(stack))
+            } else {
+                targets.append(contentsOf: stack.items.filter { scannable.contains($0.kind) })
+            }
+        }
+        return targets
+    }
+
+    /// First/middle/last stills of a burst — chosen from frames large
+    /// enough to hold a decodable preview, so a corrupt/tiny candidate is
+    /// replaced by the next healthy frame rather than wasting a sample —
+    /// plus every video in the stack (its poster can show faces the stills
+    /// miss). A burst of all-tiny files still keeps its first still so
+    /// something represents it. Blur gets no special check — no cheap
+    /// signal beats the first/mid/last spread.
+    private static func burstSample(_ stack: OrganizeStack) -> [OrganizeItem] {
+        let stills = stack.items.filter { $0.kind == .raw || $0.kind == .photo }
+        var picked: [OrganizeItem] = []
+        if !stills.isEmpty {
+            let healthy = stills.filter { $0.primary.size >= minimumSampleBytes }
+            if healthy.isEmpty {
+                picked = [stills[0]]
+            } else {
+                var seen = Set<Int>()
+                picked = [0, healthy.count / 2, healthy.count - 1]
+                    .filter { seen.insert($0).inserted }
+                    .map { healthy[$0] }
+            }
+        }
+        picked.append(contentsOf: stack.items.filter { $0.kind == .video })
+        return picked
+    }
+
+    /// Scans a location's burst stacks — the `OrganizeScanner` grouping a
+    /// board already produced. This is the grouping gate: the scan runs
+    /// against the current burst structure, sampling each burst per
+    /// `scanTargets` (first/middle/last stills at LOW and MED, every still
+    /// at HIGH and above). `detector` is the engine for the mode: nil
+    /// resolves to Vision for LOW and throws for MED+, where the SCRFD
+    /// package must be installed. Modes that do not read video frames
+    /// skip video targets entirely.
+    public func scan(
+        stacks: [OrganizeStack],
+        embedder: FaceEmbeddingProviding?,
+        detector: FaceDetecting? = nil,
+        progress: FileOperationProgressHandler? = nil
+    ) throws -> FaceScanReport {
+        guard let embedder else {
+            throw FaceIndexError.modelNotInstalled(FaceModelCatalog.modelFileName)
+        }
+        let engine = try resolveEngine(detector)
+
+        var report = FaceScanReport()
+        var targets = Self.scanTargets(for: stacks, mode: options.mode)
+        if !options.scansVideo {
+            targets = targets.filter { $0.kind != .video }
+        }
+        report.photosConsidered = targets.count
+
+        // New-files-only rule: a photo whose recorded grade covers this mode
+        // — and whose size/mtime still match — is skipped without decoding.
+        let existing = try store.photos(pathKeys: targets.map(\.primary.pathKey))
+        var pending: [OrganizeItem] = []
+        for item in targets {
+            let file = item.primary
+            if let known = existing[file.pathKey],
+               known.scanGrade.covers(options.mode),
+               known.describes(path: file.path, size: file.size, modifiedAt: file.modifiedAt) {
+                report.photosSkipped += 1
+            } else {
+                pending.append(item)
+            }
+        }
+
+        try executeScan(
+            pending: pending,
+            covered: [],
+            embedder: embedder,
+            engine: engine,
+            report: &report,
+            progress: progress
+        )
+        return report
+    }
+
     /// Scans a location's media (the photo, RAW, and — at MED and above —
     /// video primaries of an `OrganizeScanner` result). `detector` is the
     /// engine for the mode: nil resolves to Vision for LOW and throws for
@@ -50,15 +153,7 @@ public struct FaceIndexService: Sendable {
         guard let embedder else {
             throw FaceIndexError.modelNotInstalled(FaceModelCatalog.modelFileName)
         }
-        let options = self.options
-        let engine: FaceDetecting
-        if let detector {
-            engine = detector
-        } else if options.detectorKind == .vision {
-            engine = VisionDetector()
-        } else {
-            throw FaceIndexError.detectorNotInstalled(FaceModelCatalog.detectorFileName)
-        }
+        let engine = try resolveEngine(detector)
 
         var report = FaceScanReport()
         let eligible = items.filter {
@@ -100,6 +195,38 @@ public struct FaceIndexService: Sendable {
             }
         }
 
+        try executeScan(
+            pending: pending,
+            covered: covered,
+            embedder: embedder,
+            engine: engine,
+            report: &report,
+            progress: progress
+        )
+        return report
+    }
+
+    /// The detector for this pass: an explicit engine if the caller built
+    /// one (a stub in tests, SCRFD for MED+), else Vision for LOW and an
+    /// install error for MED+.
+    private func resolveEngine(_ detector: FaceDetecting?) throws -> FaceDetecting {
+        if let detector { return detector }
+        if options.detectorKind == .vision { return VisionDetector() }
+        throw FaceIndexError.detectorNotInstalled(FaceModelCatalog.detectorFileName)
+    }
+
+    /// Runs the decode/detect/embed pass over `pending`, stamps covered
+    /// burst members with the executed grade, then re-matches and re-groups
+    /// the stored faces.
+    private func executeScan(
+        pending: [OrganizeItem],
+        covered: [OrganizeItem],
+        embedder: FaceEmbeddingProviding,
+        engine: FaceDetecting,
+        report: inout FaceScanReport,
+        progress: FileOperationProgressHandler?
+    ) throws {
+        let options = self.options
         let total = pending.count
         progress?(FileOperationProgress(phase: "Detecting faces", processedFiles: 0, totalFiles: total))
         let store = self.store
@@ -161,7 +288,6 @@ public struct FaceIndexService: Sendable {
         }
 
         try matchAndGroup(report: &report, progress: progress)
-        return report
     }
 
     /// The frames a burst actually scans: every frame of a small burst,
