@@ -61,4 +61,37 @@ final class OrganizeSearchTests: XCTestCase {
         XCTAssertTrue(OrganizeSearch.matches(stack: stack, needle: "matcha", rootPath: "/Card", eventTitle: "PHIL2026 / Matcha"))
         XCTAssertFalse(OrganizeSearch.matches(stack: stack, needle: "phil", rootPath: "/Card", eventTitle: nil))
     }
+
+    func testMatchesPersonNameOnTheStacksFiles() {
+        let stack = OrganizeStack(items: [item("/Card/DSC00001.ARW")])
+        XCTAssertTrue(OrganizeSearch.matches(
+            stack: stack,
+            needle: "eileen",
+            rootPath: "/Card",
+            eventTitle: nil,
+            personNames: ["Eileen", "Person 1"]
+        ))
+        // Unnamed group labels hit too — "person" finds the Person 1 burst.
+        XCTAssertTrue(OrganizeSearch.matches(
+            stack: stack,
+            needle: "person",
+            rootPath: "/Card",
+            eventTitle: nil,
+            personNames: ["Eileen", "Person 1"]
+        ))
+        XCTAssertFalse(OrganizeSearch.matches(
+            stack: stack,
+            needle: "dad",
+            rootPath: "/Card",
+            eventTitle: nil,
+            personNames: ["Eileen", "Person 1"]
+        ))
+        XCTAssertFalse(OrganizeSearch.matches(
+            stack: stack,
+            needle: "eileen",
+            rootPath: "/Card",
+            eventTitle: nil,
+            personNames: []
+        ))
+    }
 }

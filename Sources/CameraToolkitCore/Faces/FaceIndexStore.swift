@@ -706,6 +706,37 @@ public final class FaceIndexStore: @unchecked Sendable {
         }
     }
 
+    /// Display names of every person and unnamed group keyed by the file
+    /// key (name|bytes|mtime) of each photo carrying one of their faces —
+    /// any assigned state counts, so a proposed match still finds its
+    /// person. Search uses this to join stacks to people from catalog data
+    /// alone; it never walks the filesystem.
+    public func personNamesByFileKey() throws -> [String: Set<String>] {
+        try database().read { database in
+            let rows = try Row.fetchAll(
+                database,
+                sql: """
+                SELECT p.name, ph.file_name, ph.byte_count, ph.modified_at
+                FROM faces f
+                JOIN people p ON p.id = f.person_id
+                JOIN face_photos ph ON ph.path_key = f.photo_id
+                """
+            )
+            let formatter = Self.formatter()
+            var names: [String: Set<String>] = [:]
+            for row in rows {
+                let fileName: String = row["file_name"]
+                let byteCount: Int64 = row["byte_count"]
+                let modifiedAt: String = row["modified_at"]
+                let name: String = row["name"]
+                guard let modified = formatter.date(from: modifiedAt) else { continue }
+                names[Self.fileKey(fileName: fileName, byteCount: byteCount, modifiedAt: modified), default: []]
+                    .insert(name)
+            }
+            return names
+        }
+    }
+
     // MARK: - Row mapping
 
     private func insertFace(

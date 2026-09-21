@@ -600,6 +600,48 @@ final class FaceIndexTests: XCTestCase {
         }
     }
 
+    func testPersonNamesByFileKeyCoversRosterAndGroups() throws {
+        try withFaceStore { store, _ in
+            let eileen = try store.createPerson(name: "Eileen", isRoster: true)
+            let group = try store.createPerson(name: "Person 1", isRoster: false)
+
+            let modified = Date(timeIntervalSince1970: 1_752_000_000)
+            let photoA = photoRecord("DSC00001.ARW", size: 4_096, modified: modified)
+            let photoB = photoRecord("DSC00002.ARW", size: 8_192, modified: modified)
+            let photoC = photoRecord("DSC00003.ARW", size: 2_048, modified: modified)
+
+            try store.replaceFaces(photo: photoA, faces: [
+                faceRecord(photoA, embedding: testEmbedding(seed: 81), state: .confirmed, personID: eileen.id),
+                faceRecord(
+                    photoA,
+                    box: NormalizedFaceBox(x: 0.6, y: 0.1, width: 0.2, height: 0.2),
+                    embedding: testEmbedding(seed: 82),
+                    state: .proposed,
+                    personID: eileen.id
+                ),
+            ])
+            try store.replaceFaces(photo: photoB, faces: [
+                faceRecord(photoB, embedding: testEmbedding(seed: 83), state: .other, personID: group.id),
+            ])
+            // A cached face with no person contributes no name.
+            try store.replaceFaces(photo: photoC, faces: [
+                faceRecord(photoC, embedding: testEmbedding(seed: 84)),
+            ])
+
+            let names = try store.personNamesByFileKey()
+            let keyA = FaceIndexStore.fileKey(fileName: "DSC00001.ARW", byteCount: 4_096, modifiedAt: modified)
+            let keyB = FaceIndexStore.fileKey(fileName: "DSC00002.ARW", byteCount: 8_192, modifiedAt: modified)
+            let keyC = FaceIndexStore.fileKey(fileName: "DSC00003.ARW", byteCount: 2_048, modifiedAt: modified)
+
+            // Roster and unnamed-group names both land on their photo keys —
+            // the board search can keep a burst for either kind of person.
+            XCTAssertEqual(names[keyA], ["Eileen"])
+            XCTAssertEqual(names[keyB], ["Person 1"])
+            XCTAssertNil(names[keyC])
+            XCTAssertNil(names[FaceIndexStore.fileKey(fileName: "OTHER.ARW", byteCount: 1, modifiedAt: modified)])
+        }
+    }
+
     // MARK: - Quality modes (MED / HIGH)
 
     func testModeDefaultsMatchThePlan() throws {

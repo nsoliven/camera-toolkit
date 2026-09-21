@@ -55,6 +55,11 @@ private struct PeopleView: View {
     @State private var detail: FacePerson?
     /// The face whose source photo fills the preview overlay.
     @State private var previewFace: FaceRecord?
+    /// Filters the people/group/unsure lists.
+    @State private var searchText = ""
+    /// Filters the open detail grid — separate state so a list query does
+    /// not hide detections when a person opens.
+    @State private var gridSearchText = ""
 
     private enum Tab: String, CaseIterable, Identifiable {
         case people = "People"
@@ -78,6 +83,7 @@ private struct PeopleView: View {
                 PersonFacesGrid(
                     workspace: workspace,
                     person: detail,
+                    needle: OrganizeSearch.needle(gridSearchText),
                     onBack: { self.detail = nil },
                     onOpenPhoto: { previewFace = $0 }
                 )
@@ -156,6 +162,7 @@ private struct PeopleView: View {
                     .lineLimit(1)
             }
             Spacer()
+            searchField
             Button {
                 workspace.rematchFaces()
             } label: {
@@ -166,6 +173,87 @@ private struct PeopleView: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
+    }
+
+    /// One field serves both contexts: in the lists it edits `searchText`,
+    /// inside a person's grid it edits `gridSearchText` — so a list query
+    /// never hides detections after the grid opens.
+    private var searchField: some View {
+        HStack(spacing: 5) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(.secondary)
+            TextField(
+                detail == nil ? "Search people" : "Search photos",
+                text: detail == nil ? $searchText : $gridSearchText
+            )
+            .textFieldStyle(.plain)
+            .frame(width: 150)
+            if !activeQuery.isEmpty {
+                Button {
+                    activeQuery = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Clear search")
+            }
+        }
+        .font(.callout)
+        .padding(.horizontal, 7)
+        .padding(.vertical, 4)
+        .background(.quaternary, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+        .help(detail == nil
+            ? "Filter people, groups, and matches by name or photo file name"
+            : "Filter this grid by photo file name")
+    }
+
+    private var activeQuery: String {
+        get { detail == nil ? searchText : gridSearchText }
+        nonmutating set {
+            if detail == nil {
+                searchText = newValue
+            } else {
+                gridSearchText = newValue
+            }
+        }
+    }
+
+    /// Normalized list query — empty means "show everything".
+    private var needle: String {
+        OrganizeSearch.needle(searchText)
+    }
+
+    /// A person or group matches when its name hits or when one of its
+    /// member detections sits on a photo whose file name hits — the owner's
+    /// "find every face of Eileen" path. Catalog data only.
+    private func personMatches(_ person: FacePerson) -> Bool {
+        OrganizeSearch.matches(person.name, needle: needle)
+            || workspace.faces(for: person.id).contains {
+                OrganizeSearch.matches(facePhotoName($0), needle: needle)
+            }
+    }
+
+    private var filteredRoster: [FacePerson] {
+        guard !needle.isEmpty else { return roster }
+        return roster.filter(personMatches)
+    }
+
+    private var filteredGroups: [FacePerson] {
+        guard !needle.isEmpty else { return groups }
+        return groups.filter(personMatches)
+    }
+
+    private var filteredUnsure: [FaceRecord] {
+        guard !needle.isEmpty else { return unsure }
+        return unsure.filter {
+            OrganizeSearch.matches(facePhotoName($0), needle: needle)
+                || OrganizeSearch.matches(personName(of: $0), needle: needle)
+        }
+    }
+
+    private func personName(of face: FaceRecord) -> String? {
+        face.personID.flatMap { try? workspace.faceStore.person($0) }?.name
     }
 
     private func tabCount(_ tab: Tab) -> String {
@@ -187,9 +275,16 @@ private struct PeopleView: View {
                 description: Text("Run a face scan on an Unsorted folder, then name a group in New Groups.")
             )
             .frame(maxHeight: .infinity)
+        } else if filteredRoster.isEmpty {
+            ContentUnavailableView(
+                "No Matches",
+                systemImage: "magnifyingglass",
+                description: Text("No people or photo names match “\(searchText)”.")
+            )
+            .frame(maxHeight: .infinity)
         } else {
             List {
-                ForEach(roster) { person in
+                ForEach(filteredRoster) { person in
                     personRow(person)
                 }
             }
@@ -257,9 +352,16 @@ private struct PeopleView: View {
                 description: Text("Unmatched faces cluster here after a face scan. Name the ones that matter.")
             )
             .frame(maxHeight: .infinity)
+        } else if filteredGroups.isEmpty {
+            ContentUnavailableView(
+                "No Matches",
+                systemImage: "magnifyingglass",
+                description: Text("No groups or photo names match “\(searchText)”.")
+            )
+            .frame(maxHeight: .infinity)
         } else {
             List {
-                ForEach(groups) { group in
+                ForEach(filteredGroups) { group in
                     groupRow(group)
                 }
             }
@@ -328,9 +430,16 @@ private struct PeopleView: View {
                 description: Text("Proposed matches land here after a face scan. Confirm the right ones and the model learns nothing extra — it just keeps them frozen.")
             )
             .frame(maxHeight: .infinity)
+        } else if filteredUnsure.isEmpty {
+            ContentUnavailableView(
+                "No Matches",
+                systemImage: "magnifyingglass",
+                description: Text("No proposed matches or photo names match “\(searchText)”.")
+            )
+            .frame(maxHeight: .infinity)
         } else {
             List {
-                ForEach(unsure) { face in
+                ForEach(filteredUnsure) { face in
                     unsureRow(face)
                 }
             }
@@ -339,7 +448,7 @@ private struct PeopleView: View {
     }
 
     private func unsureRow(_ face: FaceRecord) -> some View {
-        let personName = face.personID.flatMap { try? workspace.faceStore.person($0) }?.name ?? "this person"
+        let personName = personName(of: face) ?? "this person"
         return HStack(spacing: 10) {
             FaceCropView(face: face)
                 .frame(width: 44, height: 44)
@@ -587,6 +696,9 @@ private struct FaceContextMenu: View {
 /// opens the source photo, right-click offers cover and review actions.
 private struct PersonFacesGrid: View {
     let workspace: EventsWorkspace
+    /// Normalized query narrowing the grid by photo file name; empty shows
+    /// every detection.
+    let needle: String
     let onBack: () -> Void
     let onOpenPhoto: (FaceRecord) -> Void
 
@@ -597,10 +709,12 @@ private struct PersonFacesGrid: View {
     init(
         workspace: EventsWorkspace,
         person: FacePerson,
+        needle: String,
         onBack: @escaping () -> Void,
         onOpenPhoto: @escaping (FaceRecord) -> Void
     ) {
         self.workspace = workspace
+        self.needle = needle
         self.onBack = onBack
         self.onOpenPhoto = onOpenPhoto
         _person = State(initialValue: person)
@@ -610,6 +724,13 @@ private struct PersonFacesGrid: View {
     /// the same person can sit in one photo.
     private var photoCount: Int {
         Set(faces.map(\.photoID)).count
+    }
+
+    /// The detections surviving the photo-name query. Filtering happens on
+    /// the already-loaded face rows — no disk or catalog round-trips.
+    private var visibleFaces: [FaceRecord] {
+        guard !needle.isEmpty else { return faces }
+        return faces.filter { OrganizeSearch.matches(photoName($0), needle: needle) }
     }
 
     var body: some View {
@@ -623,13 +744,20 @@ private struct PersonFacesGrid: View {
                     description: Text("Every face counted here has been moved or removed.")
                 )
                 .frame(maxHeight: .infinity)
+            } else if visibleFaces.isEmpty {
+                ContentUnavailableView(
+                    "No Matches",
+                    systemImage: "magnifyingglass",
+                    description: Text("No detection's photo name matches the search.")
+                )
+                .frame(maxHeight: .infinity)
             } else {
                 ScrollView {
                     LazyVGrid(
                         columns: [GridItem(.adaptive(minimum: 84, maximum: 120), spacing: 8)],
                         spacing: 8
                     ) {
-                        ForEach(faces) { face in
+                        ForEach(visibleFaces) { face in
                             cell(face)
                         }
                     }
@@ -650,7 +778,9 @@ private struct PersonFacesGrid: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(person.name)
                     .font(.headline)
-                Text("\(faces.count) detection\(faces.count == 1 ? "" : "s") in \(photoCount) photo\(photoCount == 1 ? "" : "s")")
+                Text(needle.isEmpty
+                    ? "\(faces.count) detection\(faces.count == 1 ? "" : "s") in \(photoCount) photo\(photoCount == 1 ? "" : "s")"
+                    : "\(visibleFaces.count) of \(faces.count) detections")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

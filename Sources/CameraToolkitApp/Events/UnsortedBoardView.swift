@@ -59,7 +59,7 @@ struct UnsortedBoardView: View {
                         searching ? "No Matches" : (hideSorted ? "Everything here is sorted" : "No photos or videos"),
                         systemImage: searching ? "magnifyingglass" : (hideSorted ? "checkmark.circle" : "photo"),
                         description: Text(searching
-                            ? "Nothing in \(location.name) matches “\(searchQuery)”. Try a file name, burst, folder, or event."
+                            ? "Nothing in \(location.name) matches “\(searchQuery)”. Try a file name, burst, folder, event, or person."
                             : hideSorted
                                 ? "Turn off Hide Sorted to review, or press Apply to move the files into their events."
                                 : "This folder has no camera files.")
@@ -164,7 +164,7 @@ struct UnsortedBoardView: View {
             .padding(.horizontal, 7)
             .padding(.vertical, 4)
             .background(.quaternary, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
-            .help("Filter by file name, burst, folder, or event (⌘F)")
+            .help("Filter by file name, burst, folder, event, or person (⌘F)")
             Picker("Camera", selection: Binding(
                 get: { workspace.deviceID(for: location) },
                 set: { workspace.setDevice($0, for: location.id) }
