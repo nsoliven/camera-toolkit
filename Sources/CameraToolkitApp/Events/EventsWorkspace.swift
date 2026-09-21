@@ -2016,6 +2016,40 @@ final class EventsWorkspace {
         model.statusMessage = "Split \(items.count) frame\(items.count == 1 ? "" : "s") into a new burst. Rescans will keep them apart."
     }
 
+    // MARK: - Display rotation
+
+    /// Quarter-turns clockwise recorded for this file's identity — survives
+    /// the file moving between the card, the Buffer, and the NAS.
+    func displayTurns(for file: OrganizeFile) -> Int {
+        DisplayRotation.turns(for: file, in: model.configuration.displayOrientations)
+    }
+
+    /// Rotates every rotatable file in `stack` — all burst frames plus their
+    /// JPEG companions, and a video's poster — by `delta` quarter-turns
+    /// clockwise. Display-only: media bytes are never written, so RAW data
+    /// and checksums stay untouched. Tiles, the filmstrip, and the preview
+    /// re-decode with the new orientation; no rescan needed.
+    func rotateStack(_ stack: OrganizeStack, quarterTurnsCW delta: Int) {
+        let rotated = DisplayRotation.rotatableFiles(in: stack)
+        guard !rotated.isEmpty else {
+            model.statusMessage = "Nothing to rotate in this stack."
+            return
+        }
+        model.updateConfiguration { configuration in
+            configuration.displayOrientations = DisplayRotation.rotatedMap(
+                configuration.displayOrientations,
+                applying: delta,
+                to: stack
+            )
+        }
+        for file in rotated {
+            TileImageLoader.shared.invalidate(url: file.url)
+        }
+        let frames = stack.items.count
+        let direction = abs(delta) == 2 ? "180°" : (delta > 0 ? "90° clockwise" : "90° counter-clockwise")
+        model.statusMessage = "Rotated \(frames) frame\(frames == 1 ? "" : "s") \(direction). Originals untouched — the turn is remembered, not written."
+    }
+
     // MARK: - Immich
 
     func uploadToImmich(_ eventID: UUID) {
