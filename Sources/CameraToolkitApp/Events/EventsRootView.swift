@@ -94,18 +94,12 @@ struct EventsRootView: View {
                 onApply: { workspace.performApply(plan) }
             )
         }
-        .alert("Move to Trash?", isPresented: Binding(
-            get: { workspace.pendingTrash != nil },
-            set: { if !$0 { workspace.pendingTrash = nil } }
-        )) {
-            Button("Cancel", role: .cancel) { workspace.pendingTrash = nil }
-            Button("Move to Trash", role: .destructive) {
-                if let request = workspace.pendingTrash {
-                    workspace.confirmTrash(request)
-                }
-            }
-        } message: {
-            Text(workspace.pendingTrash?.alertMessage ?? "")
+        .sheet(item: $workspace.pendingTrash) { request in
+            TrashConfirmSheet(
+                request: request,
+                onCancel: { workspace.pendingTrash = nil },
+                onConfirm: { workspace.confirmTrash(request) }
+            )
         }
         .sheet(item: $workspace.pendingRemoval) { request in
             RemovalConfirmSheet(
@@ -780,6 +774,124 @@ struct RemovalConfirmSheet: View {
         case .source:
             "Camera Toolkit re-hashes every file on the card or unsorted folder against its drive copy. Only if all of them match, the source originals are permanently deleted. The drive copies stay."
         }
+    }
+}
+
+/// Organizer Trash confirmation. Count and source sit in the header, each
+/// volume's `_Trash` folder gets its own boxed row — the line the owner must
+/// not miss — and a note keeps it distinct from Finder Trash. Esc cancels;
+/// Move to Trash is the red default button.
+struct TrashConfirmSheet: View {
+    let request: PendingTrashRequest
+    let onCancel: () -> Void
+    let onConfirm: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: "trash.fill")
+                    .font(.title)
+                    .foregroundStyle(.orange)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Move \(request.fileCount) file\(request.fileCount == 1 ? "" : "s") to Trash?")
+                        .font(.title2.bold())
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text("\(request.byteCount.formattedBytes) · from \(request.locationName)")
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+
+            destinationCard
+
+            if !request.sampleNames.isEmpty {
+                Text(fileList)
+                    .font(.system(.callout, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(3)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Label {
+                Text("Not the Finder Trash. ")
+                    .fontWeight(.semibold)
+                    + Text("Restore from Settings → Trash — nothing is permanently deleted until you empty it.")
+            } icon: {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+            }
+            .font(.callout)
+            .fixedSize(horizontal: false, vertical: true)
+
+            HStack {
+                Spacer()
+                Button("Cancel", action: onCancel)
+                    .keyboardShortcut(.cancelAction)
+                Button("Move to Trash", role: .destructive, action: onConfirm)
+                    .buttonStyle(.borderedProminent)
+                    .tint(.red)
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20)
+        .frame(width: 520)
+    }
+
+    /// The "where they go" card: one row per volume's `_Trash` folder so the
+    /// destination reads as a destination, not a bullet inside a paragraph.
+    private var destinationCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Where they go")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+            if request.destinations.isEmpty {
+                Text("No reachable files to move.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(request.destinations, id: \.trashFolderPath) { destination in
+                    HStack(alignment: .top, spacing: 10) {
+                        Image(systemName: "externaldrive.fill")
+                            .font(.title3)
+                            .foregroundStyle(.orange)
+                        VStack(alignment: .leading, spacing: 2) {
+                            HStack(alignment: .firstTextBaseline) {
+                                Text(destination.volumeLabel)
+                                    .font(.headline)
+                                if request.destinations.count > 1 {
+                                    Spacer(minLength: 8)
+                                    Text("\(destination.fileCount) file\(destination.fileCount == 1 ? "" : "s") · \(destination.byteCount.formattedBytes)")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                            Text(destination.trashFolderPath)
+                                .font(.system(.callout, design: .monospaced))
+                                .textSelection(.enabled)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                }
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Color.orange.opacity(0.08))
+        }
+        .overlay {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(Color.orange.opacity(0.3), lineWidth: 1)
+        }
+    }
+
+    private var fileList: String {
+        var list = request.sampleNames.joined(separator: ", ")
+        if request.fileCount > request.sampleNames.count {
+            list += " and \(request.fileCount - request.sampleNames.count) more"
+        }
+        return list
     }
 }
 
