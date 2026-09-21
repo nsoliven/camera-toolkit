@@ -311,6 +311,114 @@ final class OrganizeMediaTests: XCTestCase {
             XCTAssertEqual(stacks.first?.items.map(\.primary.name), ["DSC00001.JPG", "DSC00002.JPG"])
         }
     }
+
+    // MARK: - Manual burst splits
+
+    /// The filmstrip's "Move to New Burst" records a `BurstSplit`; these pin
+    /// the named frames into their own stack on top of the normal grouping.
+    func testManualSplitCarvesFramesOutOfAChainedBurst() {
+        let t0 = Date(timeIntervalSince1970: 1_800_000_000)
+        let items = (1...5).map {
+            organizeItem("/s/DSC0000\($0).ARW", date: t0.addingTimeInterval(Double($0 - 1) * 0.3))
+        }
+        XCTAssertEqual(OrganizeStacker.stacks(for: items).map(\.items.count), [5])
+
+        let split = BurstSplit(memberPathKeys: [items[2].primary.pathKey, items[3].primary.pathKey])
+        let stacks = OrganizeStacker.stacks(for: items, splits: [split])
+        // The pulled frames form their own stack; the rest stay in the
+        // original burst even though they are no longer contiguous.
+        XCTAssertEqual(stacks.map { $0.items.map(\.primary.name) }, [
+            ["DSC00001.ARW", "DSC00002.ARW", "DSC00005.ARW"],
+            ["DSC00003.ARW", "DSC00004.ARW"],
+        ])
+    }
+
+    func testManualSplitCarvesPrefixedBurstsAndCanSplitASplit() {
+        let t0 = Date(timeIntervalSince1970: 1_800_000_000)
+        let items = (1...4).map {
+            organizeItem("/s/B0001_DSC0000\($0).ARW", date: t0.addingTimeInterval(Double($0 - 1) * 0.3))
+        }
+        // B-prefixed bursts stay trusted when nothing is split.
+        XCTAssertEqual(OrganizeStacker.stacks(for: items).map(\.items.count), [4])
+
+        let first = BurstSplit(memberPathKeys: [items[1].primary.pathKey, items[2].primary.pathKey])
+        var stacks = OrganizeStacker.stacks(for: items, splits: [first])
+        XCTAssertEqual(stacks.map { $0.items.map(\.primary.name) }, [
+            ["B0001_DSC00001.ARW", "B0001_DSC00004.ARW"],
+            ["B0001_DSC00002.ARW", "B0001_DSC00003.ARW"],
+        ])
+
+        // A second split carves a frame back out of the first split's burst.
+        let second = BurstSplit(memberPathKeys: [items[2].primary.pathKey])
+        stacks = OrganizeStacker.stacks(for: items, splits: [first, second])
+        XCTAssertEqual(stacks.map { $0.items.map(\.primary.name) }, [
+            ["B0001_DSC00001.ARW", "B0001_DSC00004.ARW"],
+            ["B0001_DSC00002.ARW"],
+            ["B0001_DSC00003.ARW"],
+        ])
+    }
+
+    func testManualSplitAcceptsNonContiguousMembersAndIgnoresStaleOnes() {
+        let t0 = Date(timeIntervalSince1970: 1_800_000_000)
+        let items = (1...4).map {
+            organizeItem("/s/DSC0000\($0).ARW", date: t0.addingTimeInterval(Double($0 - 1) * 0.3))
+        }
+        // ⌘-picked frames still form one burst — a split need not be a range.
+        let picked = BurstSplit(memberPathKeys: [items[0].primary.pathKey, items[2].primary.pathKey])
+        var stacks = OrganizeStacker.stacks(for: items, splits: [picked])
+        XCTAssertEqual(stacks.map { $0.items.map(\.primary.name) }, [
+            ["DSC00001.ARW", "DSC00003.ARW"],
+            ["DSC00002.ARW", "DSC00004.ARW"],
+        ])
+
+        // Members that left the scan are ignored; an all-stale split is a
+        // no-op rather than an empty stack.
+        let stale = BurstSplit(memberPathKeys: ["/gone/DSC00099.ARW"])
+        stacks = OrganizeStacker.stacks(for: items, splits: [stale])
+        XCTAssertEqual(stacks.map(\.items.count), [4])
+
+        // Splitting every frame leaves no empty remainder behind.
+        let all = BurstSplit(memberPathKeys: items.map(\.primary.pathKey))
+        stacks = OrganizeStacker.stacks(for: items, splits: [all])
+        XCTAssertEqual(stacks.map(\.items.count), [4])
+    }
+
+    func testScanAppliesSplitsAndRestackingKeepsThem() throws {
+        try withTemporaryDirectory { root in
+            // The capture-date cache lives beside the scanned root so the
+            // rescan doesn't pick it up as a media file.
+            let scanRoot = root.appendingPathComponent("Card", isDirectory: true)
+            let folder = scanRoot.appendingPathComponent("DCIM", isDirectory: true)
+            let subseconds = ["100", "400", "700", "000"]
+            for index in 0..<4 {
+                try writeFakeARW(
+                    folder.appendingPathComponent(String(format: "DSC%05d.ARW", index + 1)),
+                    captureTime: index == 3 ? "2026:08:27 05:27:54" : "2026:08:27 05:27:53",
+                    subseconds: subseconds[index]
+                )
+            }
+            let scanner = OrganizeScanner(concurrency: 4)
+            let cache = CaptureDateCache(url: root.appendingPathComponent("cache.json"))
+            let scanned = try scanner.scan(root: scanRoot, cache: cache)
+            XCTAssertEqual(scanned.stacks.map(\.items.count), [4])
+            XCTAssertEqual(scanned.burstSplits, [])
+
+            let split = BurstSplit(memberPathKeys: scanned.stacks[0].items.suffix(2).map(\.primary.pathKey))
+
+            // A fresh scan honoring the split keeps the frames apart.
+            let rescanned = try scanner.scan(root: scanRoot, cache: cache, burstSplits: [split])
+            XCTAssertEqual(rescanned.stacks.map(\.items.count), [2, 2])
+            XCTAssertEqual(rescanned.burstSplits, [split])
+
+            // In-memory restack does the same without touching the disk.
+            XCTAssertEqual(scanned.restacked(withSplits: [split]).stacks.map(\.items.count), [2, 2])
+
+            // Trashing the remainder leaves the pinned stack intact.
+            let removed = Set(scanned.stacks[0].items.prefix(2).map(\.primary.pathKey))
+            let afterRemoval = rescanned.removingFiles(withPathKeys: removed)
+            XCTAssertEqual(afterRemoval.stacks.map { $0.items.map(\.primary.name) }, [["DSC00003.ARW", "DSC00004.ARW"]])
+        }
+    }
 }
 
 /// Deterministic synthetic scenes for Vision feature prints. A seeded

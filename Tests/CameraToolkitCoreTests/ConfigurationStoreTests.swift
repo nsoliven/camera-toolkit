@@ -27,7 +27,8 @@ final class ConfigurationStoreTests: XCTestCase {
                 trueNASDataset: "vault/photos",
                 trueNASTLSPinnedCertificateSHA256: "AABBCCDD",
                 selectedDeviceID: "dji-nano",
-                eventName: "Test Trip"
+                eventName: "Test Trip",
+                burstSplits: [BurstSplit(memberPathKeys: ["/card/dcim/dsc00001.arw", "/card/dcim/dsc00002.arw"])]
             )
 
             try store.save(configuration)
@@ -68,6 +69,8 @@ final class ConfigurationStoreTests: XCTestCase {
             XCTAssertEqual(loaded.locations(role: .buffer).map(\.name), ["Buffer"])
             XCTAssertEqual(loaded.savedEvents.map(\.name), ["Old Trip"])
             XCTAssertEqual(loaded.selectedEventID, loaded.savedEvents.first?.id)
+            // Configs written before manual burst splits decode with none.
+            XCTAssertEqual(loaded.burstSplits, [])
         }
     }
 

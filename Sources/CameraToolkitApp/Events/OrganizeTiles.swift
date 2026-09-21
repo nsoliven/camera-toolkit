@@ -512,11 +512,115 @@ enum OrganizeFolderLabel {
     }
 }
 
+/// Finder-style frame selection for the burst filmstrip, kept as a pure
+/// value type so the range rules are unit-testable without a view.
+///
+/// A plain click selects one frame and anchors there. ⇧-click re-ranges from
+/// the anchor to the click. ⌘-click pins or unpins single frames — pins
+/// survive later range moves. ⇧←/⇧→ move the range's open `edge`, so backing
+/// the edge up shrinks the range again. The large preview always shows
+/// `edge`: the end of the selection the user touched last.
+struct FilmstripSelection: Equatable {
+    /// Index the next ⇧-range starts from — set by the last plain or ⌘ click.
+    private(set) var anchor = 0
+    /// Index the preview shows: the end of the selection last touched.
+    private(set) var edge = 0
+    /// IDs contributed by the live anchor→edge range. The next range move
+    /// replaces these wholesale, which is what lets a range shrink.
+    private var ranged: Set<String> = []
+    /// IDs ⌘-clicked in; they survive range moves until ⌘-clicked out.
+    private var pinned: Set<String> = []
+
+    /// `OrganizeItem.id` of every selected frame — `pinned ∪ ranged`.
+    var selectedIDs: Set<String> { pinned.union(ranged) }
+
+    /// Filmstrip positions of the selected frames inside `items`.
+    func indexes(in items: [OrganizeItem]) -> Set<Int> {
+        let ids = selectedIDs
+        guard !ids.isEmpty else { return [] }
+        return Set(items.indices.filter { ids.contains(items[$0].id) })
+    }
+
+    /// The selected frames in filmstrip order — the trash/split target.
+    func selectedItems(in items: [OrganizeItem]) -> [OrganizeItem] {
+        let ids = selectedIDs
+        return items.filter { ids.contains($0.id) }
+    }
+
+    /// Plain click or arrow move: select that one frame and re-anchor.
+    mutating func select(_ index: Int, in items: [OrganizeItem]) {
+        guard !items.isEmpty else { reset(); return }
+        let i = min(max(index, 0), items.count - 1)
+        anchor = i
+        edge = i
+        ranged = [items[i].id]
+        pinned = []
+    }
+
+    /// ⇧-click or ⇧-arrow: the anchor→index span becomes the range. Pinned
+    /// frames stay selected even when they sit outside it.
+    mutating func extendRange(to index: Int, in items: [OrganizeItem]) {
+        guard !items.isEmpty else { return }
+        let i = min(max(index, 0), items.count - 1)
+        edge = i
+        ranged = Set(items[min(anchor, i)...max(anchor, i)].map(\.id))
+    }
+
+    /// ⌘-click: pin an unselected frame or unpin a selected one. The current
+    /// range is promoted into pins first — like Finder, a selection that
+    /// existed before a ⌘-click survives the next ⇧-range instead of being
+    /// replaced by it. The clicked frame becomes the anchor either way.
+    mutating func toggle(_ index: Int, in items: [OrganizeItem]) {
+        guard items.indices.contains(index) else { return }
+        pinned.formUnion(ranged)
+        ranged = []
+        let id = items[index].id
+        if pinned.contains(id) {
+            pinned.remove(id)
+        } else {
+            pinned.insert(id)
+        }
+        anchor = index
+        edge = index
+    }
+
+    /// ⇧←/⇧→: slide the open edge one step. The range part regrows or shrinks
+    /// to the new edge; pinned frames are untouched.
+    mutating func moveEdge(by delta: Int, in items: [OrganizeItem]) {
+        extendRange(to: edge + delta, in: items)
+    }
+
+    /// The stack changed under the selection (trash, split, rescan): drop
+    /// the IDs that left. When nothing selected survives, re-anchor on the
+    /// frame that slid into the edge's slot so the preview keeps a footing.
+    mutating func sanitize(in items: [OrganizeItem]) {
+        guard !items.isEmpty else { reset(); return }
+        edge = min(max(edge, 0), items.count - 1)
+        anchor = min(max(anchor, 0), items.count - 1)
+        let alive = Set(items.map(\.id))
+        ranged.formIntersection(alive)
+        pinned.formIntersection(alive)
+        if selectedIDs.isEmpty {
+            ranged = [items[edge].id]
+        }
+    }
+
+    /// A different stack opened (or none did): start over at frame zero.
+    mutating func reset() {
+        anchor = 0
+        edge = 0
+        ranged = []
+        pinned = []
+    }
+}
+
 /// Full-size review of one burst at a time with a filmstrip of every frame.
 /// The image area is the shared interactive canvas: click toggles zoom at the
 /// pointer, drag pans while zoomed, `+`/`-`/`0`/`⌘1` step or reset zoom, and
-/// a deeper decode swaps in once zoom passes 1.5×. Right-click offers
-/// "Move to Trash" when the board supports it.
+/// a deeper decode swaps in once zoom passes 1.5×. The filmstrip selects
+/// Finder-style — click, ⇧-click for a range, ⌘-click to toggle — and
+/// right-click offers "Move to Trash" and "Move to New Burst" for the whole
+/// selection when the board supports them.
 struct StackPreviewOverlay: View {
     let workspace: EventsWorkspace
     let stacks: [OrganizeStack]
@@ -536,10 +640,15 @@ struct StackPreviewOverlay: View {
     /// previewed stack in it — the same target the chips assign.
     let onNewEvent: (OrganizeStack) -> Void
     /// Enables the right-click "Move to Trash" item on the frame and on each
-    /// filmstrip thumbnail. Nil hides the menu entirely.
+    /// filmstrip thumbnail. The selection is passed in filmstrip order. Nil
+    /// hides the item.
     var onTrashItems: (([OrganizeItem]) -> Void)? = nil
+    /// Enables "Move to New Burst" on the frame and thumbnail menus: the
+    /// selected frames leave this stack and stay split on later rescans.
+    var onSplitItems: (([OrganizeItem]) -> Void)? = nil
 
-    @State private var frameIndex = 0
+    /// Frame selection state — `edge` is the frame the preview shows.
+    @State private var selection = FilmstripSelection()
     @State private var image: CGImage?
     /// Path of the frame a high-resolution decode was requested for — set the
     /// moment zoom passes fit so a stale frame never triggers a fetch.
@@ -552,6 +661,9 @@ struct StackPreviewOverlay: View {
 
     private var stackIndex: Int? { stacks.firstIndex { $0.id == stackID } }
     private var stack: OrganizeStack? { stackIndex.map { stacks[$0] } }
+    /// The previewed frame is the selection's open edge — the end a click or
+    /// ⇧-arrow touched last.
+    private var frameIndex: Int { selection.edge }
     private var item: OrganizeItem? {
         stack.map { $0.items[min(max(frameIndex, 0), $0.items.count - 1)] }
     }
@@ -569,8 +681,8 @@ struct StackPreviewOverlay: View {
     }
 
     private var hintText: String {
-        var text = "← → frames · ↑ ↓ items · click zoom · drag pan · + − 0 zoom · 1–3 sort · O open"
-        if onTrashItems != nil { text += " · right-click trash" }
+        var text = "← → frames · ⇧← → select · ⇧/⌘-click frames · ↑ ↓ items · click zoom · drag pan · + − 0 zoom · 1–3 sort · O open"
+        if onTrashItems != nil { text += " · ⌫/right-click trash" }
         return text + " · Esc close"
     }
 
@@ -595,7 +707,9 @@ struct StackPreviewOverlay: View {
                     )
                     .id(item.primary.path)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .contextMenu { frameContextMenu(item) }
+                    .contextMenu {
+                        frameContextMenu(stack, index: min(max(frameIndex, 0), stack.items.count - 1))
+                    }
                     if stack.items.count > 1 {
                         filmstrip(stack)
                     }
@@ -609,9 +723,20 @@ struct StackPreviewOverlay: View {
         .focusable()
         .focused($isFocused)
         .focusEffectDisabled()
-        .onAppear { isFocused = true }
+        .onAppear {
+            isFocused = true
+            if let stack { selection.sanitize(in: stack.items) }
+        }
         .onKeyPress(phases: .down) { handle($0) }
-        .onChange(of: stackID) { _, _ in frameIndex = 0 }
+        .onChange(of: stackID) { _, _ in
+            selection.reset()
+            if let stack { selection.select(0, in: stack.items) }
+        }
+        .onChange(of: stack?.items) { _, items in
+            // Frames were trashed or split out: keep the selection to the
+            // frames still here.
+            selection.sanitize(in: items ?? [])
+        }
         .onChange(of: item?.primary.path) { _, _ in
             // New frame: release the previous hi-res decode (the NSCache still
             // has it if the user zooms back) and stop any in-flight request.
@@ -639,7 +764,8 @@ struct StackPreviewOverlay: View {
                 Text(item.primary.name)
                     .font(.headline)
                     .foregroundStyle(.white)
-                Text("\(item.captureDate.formatted(date: .abbreviated, time: .standard)) · frame \(min(frameIndex, stack.items.count - 1) + 1) of \(stack.items.count) · item \((stackIndex ?? 0) + 1) of \(stacks.count) · \(OrganizeFolderLabel.title(forFolderPath: item.primary.folderPath, rootPath: rootPath))")
+                let selectedCount = selection.selectedItems(in: stack.items).count
+                Text("\(item.captureDate.formatted(date: .abbreviated, time: .standard)) · frame \(min(frameIndex, stack.items.count - 1) + 1) of \(stack.items.count)\(selectedCount > 1 ? " · \(selectedCount) selected" : "") · item \((stackIndex ?? 0) + 1) of \(stacks.count) · \(OrganizeFolderLabel.title(forFolderPath: item.primary.folderPath, rootPath: rootPath))")
                     .font(.caption)
                     .foregroundStyle(.white.opacity(0.7))
             }
@@ -671,20 +797,30 @@ struct StackPreviewOverlay: View {
     }
 
     private func filmstrip(_ stack: OrganizeStack) -> some View {
-        ScrollViewReader { proxy in
+        let selectedIndexes = selection.indexes(in: stack.items)
+        return ScrollViewReader { proxy in
             ScrollView(.horizontal, showsIndicators: false) {
                 LazyHStack(spacing: 6) {
                     ForEach(Array(stack.items.enumerated()), id: \.element.id) { index, frame in
+                        let isSelected = selectedIndexes.contains(index)
+                        let isCurrent = index == frameIndex
                         TileThumbnail(url: frame.primary.url, kind: frame.kind, pixelSize: 256)
                             .frame(width: 96, height: 64)
                             .clipShape(RoundedRectangle(cornerRadius: 5))
                             .overlay {
                                 RoundedRectangle(cornerRadius: 5)
-                                    .strokeBorder(index == frameIndex ? Color.accentColor : .clear, lineWidth: 2)
+                                    .fill(isSelected ? Color.accentColor.opacity(0.3) : .clear)
+                            }
+                            .overlay {
+                                RoundedRectangle(cornerRadius: 5)
+                                    .strokeBorder(
+                                        isCurrent ? Color.accentColor : (isSelected ? Color.white.opacity(0.85) : .clear),
+                                        lineWidth: isCurrent ? 2 : 1.5
+                                    )
                             }
                             .id(index)
-                            .onTapGesture { frameIndex = index }
-                            .contextMenu { frameContextMenu(frame) }
+                            .onTapGesture { selectFrame(index, in: stack) }
+                            .contextMenu { frameContextMenu(stack, index: index) }
                     }
                 }
             }
@@ -695,11 +831,36 @@ struct StackPreviewOverlay: View {
         }
     }
 
+    /// Filmstrip click with Finder modifiers: ⇧ re-ranges from the anchor,
+    /// ⌘ toggles a pin, plain click selects the one frame and anchors there.
+    private func selectFrame(_ index: Int, in stack: OrganizeStack) {
+        isFocused = true
+        let flags = NSEvent.modifierFlags
+        if flags.contains(.command) {
+            selection.toggle(index, in: stack.items)
+        } else if flags.contains(.shift) {
+            selection.extendRange(to: index, in: stack.items)
+        } else {
+            selection.select(index, in: stack.items)
+        }
+    }
+
+    /// Right-click aims at the whole selection when the clicked frame is part
+    /// of it, otherwise at just that frame — Finder's rule.
     @ViewBuilder
-    private func frameContextMenu(_ item: OrganizeItem) -> some View {
+    private func frameContextMenu(_ stack: OrganizeStack, index: Int) -> some View {
+        let item = stack.items[index]
+        let targets = selection.selectedIDs.contains(item.id) ? selection.selectedItems(in: stack.items) : [item]
+        if let onSplitItems, targets.count < stack.items.count {
+            Button(targets.count > 1 ? "Move \(targets.count) Frames to New Burst" : "Move Frame to New Burst") {
+                if !selection.selectedIDs.contains(item.id) { selection.select(index, in: stack.items) }
+                onSplitItems(targets)
+            }
+        }
         if let onTrashItems {
-            Button("Move to Trash") {
-                onTrashItems([item])
+            Button(targets.count > 1 ? "Move \(targets.count) Frames to Trash" : "Move to Trash") {
+                if !selection.selectedIDs.contains(item.id) { selection.select(index, in: stack.items) }
+                onTrashItems(targets)
             }
         }
     }
@@ -713,9 +874,24 @@ struct StackPreviewOverlay: View {
         guard let stack, let index = stackIndex else { return .ignored }
         switch press.key {
         case .leftArrow:
-            frameIndex = max(0, frameIndex - 1)
+            // ⇧← shrinks or regrows the range from its open edge; a plain ←
+            // steps the current frame and collapses the selection to it.
+            if press.modifiers.contains(.shift) {
+                selection.moveEdge(by: -1, in: stack.items)
+            } else {
+                selection.select(frameIndex - 1, in: stack.items)
+            }
         case .rightArrow:
-            frameIndex = min(stack.items.count - 1, frameIndex + 1)
+            if press.modifiers.contains(.shift) {
+                selection.moveEdge(by: 1, in: stack.items)
+            } else {
+                selection.select(frameIndex + 1, in: stack.items)
+            }
+        case .delete, .deleteForward:
+            guard let onTrashItems else { return .ignored }
+            let targets = selection.selectedItems(in: stack.items)
+            guard !targets.isEmpty else { return .ignored }
+            onTrashItems(targets)
         case .upArrow:
             if index > 0 { stackID = stacks[index - 1].id }
         case .downArrow:

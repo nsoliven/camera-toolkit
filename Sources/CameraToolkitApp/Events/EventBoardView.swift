@@ -50,6 +50,9 @@ struct EventBoardView: View {
                         },
                         onNewEvent: { stack in
                             workspace.requestNewEvent(stackIDs: [stack.id], movingFromEvent: eventID, suggestedDate: stack.captureDate)
+                        },
+                        onSplitItems: { items in
+                            workspace.splitItems(items)
                         }
                     )
                 }
