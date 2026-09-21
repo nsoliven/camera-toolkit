@@ -79,6 +79,10 @@ struct UnsortedBoardView: View {
                     isPrivate: { workspace.resolvedPolicy(for: $0) == .archiveOnly },
                     onTrashItems: { items in
                         workspace.trashItems(items, from: location.id)
+                    },
+                    orientationForFile: { workspace.displayTurns(for: $0) },
+                    onRotate: { stack, delta in
+                        workspace.rotateStack(stack, quarterTurnsCW: delta)
                     }
                 )
             }
@@ -258,6 +262,7 @@ struct UnsortedBoardView: View {
             eventForStack: { workspace.assignedEvent(for: $0) },
             isDimmed: { !hideSorted && workspace.isSorted($0) && !workspace.selectedStackIDs.contains($0.id) },
             badge: { _ in nil },
+            orientationForFile: { workspace.displayTurns(for: $0) },
             onOpen: { stack in
                 workspace.select(stackID: stack.id, orderedIDs: [], extend: false, toggle: false)
                 previewStackID = stack.id

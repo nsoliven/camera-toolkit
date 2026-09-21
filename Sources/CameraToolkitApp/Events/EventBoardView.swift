@@ -46,7 +46,11 @@ struct EventBoardView: View {
                         onAssign: { stack, target in
                             workspace.moveStacks([stack.id], fromEvent: eventID, toEvent: target.id)
                         },
-                        isPrivate: { workspace.resolvedPolicy(for: $0) == .archiveOnly }
+                        isPrivate: { workspace.resolvedPolicy(for: $0) == .archiveOnly },
+                        orientationForFile: { workspace.displayTurns(for: $0) },
+                        onRotate: { stack, delta in
+                            workspace.rotateStack(stack, quarterTurnsCW: delta)
+                        }
                     )
                 }
             }
@@ -176,6 +180,7 @@ struct EventBoardView: View {
             eventForStack: { _ in (nil, false) },
             isDimmed: { _ in false },
             badge: { workspace.badge(for: $0, in: eventID) },
+            orientationForFile: { workspace.displayTurns(for: $0) },
             onOpen: { stack in
                 workspace.select(stackID: stack.id, orderedIDs: [], extend: false, toggle: false)
                 previewStackID = stack.id
