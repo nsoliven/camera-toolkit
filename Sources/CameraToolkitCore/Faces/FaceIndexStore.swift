@@ -661,12 +661,12 @@ public final class FaceIndexStore: @unchecked Sendable {
 
     // MARK: - Event people
 
-    /// Roster people with at least one proposed or confirmed face on a photo
-    /// whose file key is in `fileKeys`. This is `event.people`: named people
-    /// only — Other groups never clutter event chips.
-    public func eventPeople(fileKeys: Set<String>) throws -> [FacePerson] {
-        guard !fileKeys.isEmpty else { return [] }
-        return try database().read { database in
+    /// Every (roster person, photo file identity) pair that counts toward
+    /// `event.people` — proposed and confirmed faces on named people only.
+    /// File identity is name + size + mtime so a face found on an unsorted
+    /// copy still attaches after the file moves into an event folder.
+    private func rosterFaceFiles() throws -> [(personID: UUID, name: String, fileKey: String)] {
+        try database().read { database in
             let rows = try Row.fetchAll(
                 database,
                 sql: """
@@ -678,31 +678,19 @@ public final class FaceIndexStore: @unchecked Sendable {
                 """
             )
             let formatter = Self.formatter()
-            var seen: [UUID: FacePerson] = [:]
-            var counts: [UUID: Int] = [:]
-            for row in rows {
+            return rows.compactMap { row in
                 let fileName: String = row["file_name"]
                 let byteCount: Int64 = row["byte_count"]
                 let modifiedAt: String = row["modified_at"]
                 guard let personID = UUID(uuidString: row["id"] as String? ?? ""),
-                      let modified = formatter.date(from: modifiedAt),
-                      fileKeys.contains(Self.fileKey(fileName: fileName, byteCount: byteCount, modifiedAt: modified))
-                else { continue }
-                if seen[personID] == nil {
-                    seen[personID] = FacePerson(
-                        id: personID,
-                        name: row["name"],
-                        isRoster: true,
-                        faceCount: 0
-                    )
-                }
-                counts[personID, default: 0] += 1
+                      let modified = formatter.date(from: modifiedAt)
+                else { return nil }
+                return (
+                    personID,
+                    row["name"],
+                    Self.fileKey(fileName: fileName, byteCount: byteCount, modifiedAt: modified)
+                )
             }
-            return seen.values.map { person in
-                var copy = person
-                copy.faceCount = counts[person.id] ?? 0
-                return copy
-            }.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
         }
     }
 
@@ -791,6 +779,42 @@ public final class FaceIndexStore: @unchecked Sendable {
             }
             return result
         }
+    }
+
+    /// Roster people with at least one proposed or confirmed face on a photo
+    /// whose file key is in `fileKeys`. This is `event.people`: named people
+    /// only — Other groups never clutter event chips.
+    public func eventPeople(fileKeys: Set<String>) throws -> [FacePerson] {
+        guard !fileKeys.isEmpty else { return [] }
+        var seen: [UUID: FacePerson] = [:]
+        var counts: [UUID: Int] = [:]
+        for faceFile in try rosterFaceFiles() where fileKeys.contains(faceFile.fileKey) {
+            if seen[faceFile.personID] == nil {
+                seen[faceFile.personID] = FacePerson(
+                    id: faceFile.personID,
+                    name: faceFile.name,
+                    isRoster: true,
+                    faceCount: 0
+                )
+            }
+            counts[faceFile.personID, default: 0] += 1
+        }
+        return seen.values.map { person in
+            var copy = person
+            copy.faceCount = counts[person.id] ?? 0
+            return copy
+        }.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    /// Roster person names keyed by file identity — the same join
+    /// `eventPeople(fileKeys:)` filters, indexed so a board can match every
+    /// stack against one catalog pass instead of one query per stack.
+    public func rosterNamesByFileKey() throws -> [String: Set<String>] {
+        var map: [String: Set<String>] = [:]
+        for faceFile in try rosterFaceFiles() {
+            map[faceFile.fileKey, default: []].insert(faceFile.name)
+        }
+        return map
     }
 
     // MARK: - Row mapping
