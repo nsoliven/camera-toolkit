@@ -251,3 +251,39 @@ public enum FaceBoxProjection {
         rotatedTopLeftRect(rect, quarterTurnsCW: -turns)
     }
 }
+
+/// The pointer-proximity regions that reveal a stored face's overlay
+/// chrome: "near" is the displayed box grown by `margin`, plus the chip
+/// strip riding beside the box. The strip stays a separate rect — a chip
+/// can sit wider than a narrow face's expanded box, and a single bounding
+/// union would add dead corners that reveal the face from too far away.
+/// Pure geometry, so the preview's invisible hover targets and the reveal
+/// predicate share one definition.
+public enum FaceHoverRegion {
+    /// Points of slack around a displayed face box that still count as
+    /// near — wide enough that the pointer can travel from the box onto
+    /// its chip without the chrome vanishing.
+    public static let margin: CGFloat = 36
+
+    /// The rects that count as near: the box expanded by `margin` and the
+    /// chip strip, both in the overlay's coordinate space.
+    public static func rects(
+        boxRect: CGRect,
+        chipStrip: CGRect,
+        margin: CGFloat = Self.margin
+    ) -> (box: CGRect, strip: CGRect) {
+        (boxRect.insetBy(dx: -margin, dy: -margin), chipStrip)
+    }
+
+    /// The predicate the overlay's hover targets implement: inside the
+    /// expanded box or on the chip strip.
+    public static func contains(
+        _ point: CGPoint,
+        boxRect: CGRect,
+        chipStrip: CGRect,
+        margin: CGFloat = Self.margin
+    ) -> Bool {
+        let regions = rects(boxRect: boxRect, chipStrip: chipStrip, margin: margin)
+        return regions.box.contains(point) || regions.strip.contains(point)
+    }
+}
