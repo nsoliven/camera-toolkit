@@ -108,7 +108,7 @@ struct TransferSpeedGuideView: View {
                     Button {
                         StorageBenchmarkWindowController.shared.show(model: model)
                     } label: {
-                        Label("Run Storage Speed Tests", systemImage: "gauge.with.dots.needle.50percent")
+                        Label("Run Storage Speed Tests…", systemImage: "gauge.with.dots.needle.50percent")
                             .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.borderedProminent)

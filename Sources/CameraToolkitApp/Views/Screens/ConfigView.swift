@@ -120,19 +120,19 @@ struct ConfigView: View {
             LocationSettingsSection(
                 title: "Camera Sources",
                 role: .importSource,
-                addTitle: "Add Camera Source",
+                addTitle: "Add Camera Source…",
                 model: model
             )
             LocationSettingsSection(
                 title: "Library Targets",
                 role: .archive,
-                addTitle: "Add Library Target",
+                addTitle: "Add Library Target…",
                 model: model
             )
             LocationSettingsSection(
                 title: "Buffer Drives",
                 role: .buffer,
-                addTitle: "Add Buffer Drive",
+                addTitle: "Add Buffer Drive…",
                 model: model
             )
 

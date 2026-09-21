@@ -89,7 +89,7 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate {
         appMenu.addItem(.separator())
 
         let settingsItem = NSMenuItem(
-            title: "Settings...",
+            title: "Settings…",
             action: #selector(openSettings),
             keyEquivalent: ","
         )
@@ -112,7 +112,7 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate {
         fileMenuItem.submenu = fileMenu
         addBrowserCommand(
             to: fileMenu,
-            title: "Get Selected Location Info",
+            title: "Get Selected Location Info…",
             command: .showSelectedLocationInformation,
             keyEquivalent: "i"
         )
