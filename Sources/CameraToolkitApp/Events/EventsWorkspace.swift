@@ -36,6 +36,13 @@ struct RenameEventRequest: Identifiable {
     var eventID: UUID
 }
 
+/// Pending "Scan for Faces" sheet — the location to scan; the sheet picks
+/// quality and the FAST throttle before the job starts.
+struct FaceScanRequest: Identifiable {
+    var id: UUID { locationID }
+    var locationID: UUID
+}
+
 struct RemovalRequest: Identifiable {
     enum Kind: Sendable {
         case drive
@@ -184,6 +191,7 @@ final class EventsWorkspace {
     var discoveredDriveEvents: [DiscoveredDriveEvent] = []
     var newEventRequest: NewEventRequest?
     var renameRequest: RenameEventRequest?
+    var faceScanRequest: FaceScanRequest?
     var pendingApplyPlan: OrganizeApplyPlan?
     var pendingRemoval: RemovalRequest?
     var latestMoveJournalTitle: String?
@@ -2022,17 +2030,31 @@ final class EventsWorkspace {
         FaceModelCatalog.isModelInstalled(applicationSupport: DashboardModel.defaultApplicationSupportURL)
     }
 
-    /// "Face Scan (Low · Fast)" on a connected unsorted source: detect faces
-    /// on still photos, embed them with the on-device model, match named
-    /// people, and group the rest. Writes only to the catalog — media files
-    /// are only read.
-    func faceScan(_ location: ConfiguredLocation) {
+    var faceDetectorInstalled: Bool {
+        FaceModelCatalog.isDetectorInstalled(applicationSupport: DashboardModel.defaultApplicationSupportURL)
+    }
+
+    /// Opens the "Scan for Faces" sheet for a location — quality and the
+    /// FAST throttle are picked there before any job starts.
+    func requestFaceScan(_ location: ConfiguredLocation) {
+        faceScanRequest = FaceScanRequest(locationID: location.id)
+    }
+
+    /// "Scan for Faces" on a connected unsorted source: detect faces with
+    /// the mode's engine, embed them with the on-device model, match named
+    /// people, and group the rest. MED and above also sample video frames.
+    /// Writes only to the catalog — media files are only read.
+    func faceScan(_ location: ConfiguredLocation, options: FaceScanOptions = FaceScanOptions()) {
         guard isConnected(location) else {
             model.statusMessage = "\(location.name) is not connected. Plug it in, then scan again."
             return
         }
         guard faceModelInstalled else {
             model.statusMessage = "The face model is not installed yet. Run scripts/convert-arcface.sh once on this Mac, then scan again."
+            return
+        }
+        if options.detectorKind == .scrfd, !faceDetectorInstalled {
+            model.statusMessage = "The face detector is not installed yet. Run scripts/convert-scrfd.sh once on this Mac, then scan again."
             return
         }
         let root = URL(fileURLWithPath: DashboardModel.expandedPath(location.path), isDirectory: true)
@@ -2045,7 +2067,7 @@ final class EventsWorkspace {
             action: .faceScan,
             runningNote: "Scanning \(location.name) for faces",
             logTitle: "Face scan: \(location.name)",
-            logDetail: "Detected faces on still photos, embedded them on-device, matched named people, and grouped the rest. Files were only read — nothing was written or moved.",
+            logDetail: "Detected faces, embedded them on-device, matched named people, and grouped the rest. Files were only read — nothing was written or moved.",
             operation: { progress in
                 // Bootstrap is idempotent: it guarantees the face tables
                 // exist even if no catalog sync has run since the upgrade.
@@ -2056,6 +2078,13 @@ final class EventsWorkspace {
                 )
                 guard let embedder = try await FaceModelCatalog.loadEmbedder(applicationSupport: support) else {
                     throw FaceIndexError.modelNotInstalled(FaceModelCatalog.modelURL(applicationSupport: support).path)
+                }
+                var detector: FaceDetecting?
+                if options.detectorKind == .scrfd {
+                    guard let loaded = try await FaceModelCatalog.loadDetector(applicationSupport: support) else {
+                        throw FaceIndexError.detectorNotInstalled(FaceModelCatalog.detectorURL(applicationSupport: support).path)
+                    }
+                    detector = loaded
                 }
                 var items = existing?.items
                 if items == nil {
@@ -2074,7 +2103,11 @@ final class EventsWorkspace {
                     }.items
                 }
                 let lowerBound = existing == nil ? 0.25 : 0.02
-                return try FaceIndexService(catalogURL: catalogURL).scan(items: items ?? [], embedder: embedder) { update in
+                return try FaceIndexService(catalogURL: catalogURL, options: options).scan(
+                    items: items ?? [],
+                    embedder: embedder,
+                    detector: detector
+                ) { update in
                     progress(DashboardModel.jobUpdate(
                         from: update,
                         lowerBound: lowerBound,
@@ -2086,7 +2119,8 @@ final class EventsWorkspace {
             },
             completion: { [weak self] report in
                 self?.facesRevision &+= 1
-                return "Face scan done — \(report.facesDetected) face\(report.facesDetected == 1 ? "" : "s") on \(report.photosProcessed) new photo(s); \(report.photosSkipped) already scanned; \(report.facesProposed) matched to people, \(report.facesGrouped) grouped."
+                let video = report.videoFramesRead > 0 ? "; \(report.videoFramesRead) video frames read" : ""
+                return "Face scan done — \(report.facesDetected) face\(report.facesDetected == 1 ? "" : "s") on \(report.photosProcessed) new photo(s); \(report.photosSkipped) already scanned; \(report.facesProposed) matched to people, \(report.facesGrouped) grouped\(video)."
             }
         )
     }

@@ -11,6 +11,14 @@ public enum FaceModelCatalog {
     /// swapped, so the name is fixed.
     public static let modelName = "w600k_r50"
     public static let modelFileName = "w600k_r50.mlpackage"
+    /// The detector for MED and above, produced by `convert-scrfd.sh`. One
+    /// package per input size — `det_10g.mlpackage` is the 640 base and
+    /// `det_10g_960.mlpackage` adds HIGH's second scale.
+    public static let detectorFileName = "det_10g.mlpackage"
+
+    public static func detectorFileName(size: Int) -> String {
+        size == 640 ? detectorFileName : "det_10g_\(size).mlpackage"
+    }
 
     public static func modelsDirectory(applicationSupport: URL) -> URL {
         applicationSupport.appendingPathComponent("CameraToolkit/Models", isDirectory: true)
@@ -21,8 +29,17 @@ public enum FaceModelCatalog {
             .appendingPathComponent(modelFileName)
     }
 
+    public static func detectorURL(applicationSupport: URL, size: Int = 640) -> URL {
+        modelsDirectory(applicationSupport: applicationSupport)
+            .appendingPathComponent(detectorFileName(size: size))
+    }
+
     public static func isModelInstalled(applicationSupport: URL) -> Bool {
         FileManager.default.fileExists(atPath: modelURL(applicationSupport: applicationSupport).path)
+    }
+
+    public static func isDetectorInstalled(applicationSupport: URL) -> Bool {
+        FileManager.default.fileExists(atPath: detectorURL(applicationSupport: applicationSupport).path)
     }
 
     /// The embedder, or nil with a clear next step when the model package is
@@ -32,6 +49,23 @@ public enum FaceModelCatalog {
         let url = modelURL(applicationSupport: applicationSupport)
         guard FileManager.default.fileExists(atPath: url.path) else { return nil }
         return try await ArcFaceEmbedder(modelURL: url)
+    }
+
+    /// The SCRFD detector for MED/HIGH, or nil when it is not installed.
+    /// Loads every converted input size in the Models folder — the 640
+    /// base plus any extra scales like `det_10g_960.mlpackage`.
+    public static func loadDetector(applicationSupport: URL) async throws -> SCRFDDetector? {
+        let base = detectorURL(applicationSupport: applicationSupport)
+        guard FileManager.default.fileExists(atPath: base.path) else { return nil }
+        var modelURLs: [Int: URL] = [640: base]
+        let directory = modelsDirectory(applicationSupport: applicationSupport)
+        for entry in (try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? [] {
+            // det_10g_960.mlpackage → 960
+            guard entry.hasPrefix("det_10g_"), entry.hasSuffix(".mlpackage"),
+                  let size = Int(entry.dropFirst(8).dropLast(10)) else { continue }
+            modelURLs[size] = directory.appendingPathComponent(entry)
+        }
+        return try await SCRFDDetector(modelURLs: modelURLs)
     }
 }
 

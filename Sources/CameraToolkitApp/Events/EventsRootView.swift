@@ -85,6 +85,19 @@ struct EventsRootView: View {
                 onConfirm: { workspace.confirmRemoval(request, confirmation: $0) }
             )
         }
+        .sheet(item: $workspace.faceScanRequest) { request in
+            if let location = workspace.location(request.locationID) {
+                FaceScanSheet(
+                    location: location,
+                    detectorInstalled: workspace.faceDetectorInstalled,
+                    onCancel: { workspace.faceScanRequest = nil },
+                    onScan: { options in
+                        workspace.faceScanRequest = nil
+                        workspace.faceScan(location, options: options)
+                    }
+                )
+            }
+        }
     }
 
     @ViewBuilder
@@ -163,8 +176,8 @@ struct EventsSidebar: View {
                             })
                             .contextMenu {
                                 Button("Rescan") { workspace.scan(location, force: true) }
-                                Button("Scan for Faces (Low · Fast)") { workspace.faceScan(location) }
-                                    .help("Detect and match faces on still photos. Writes only to the catalog — media is read, never touched.")
+                                Button("Scan for Faces…") { workspace.requestFaceScan(location) }
+                                    .help("Detect and match faces on this folder's photos and videos. Writes only to the catalog — media is read, never touched.")
                                 Button("Reveal in Finder") {
                                     NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: DashboardModel.expandedPath(location.path))])
                                 }
@@ -680,6 +693,79 @@ struct RemovalConfirmSheet: View {
             "Camera Toolkit re-hashes every drive copy against its NAS copy. Only if all of them match, the drive copies move into the hidden _Trash folder on the same drive. They stay recoverable there until you empty it in Settings."
         case .source:
             "Camera Toolkit re-hashes every file on the card or unsorted folder against its drive copy. Only if all of them match, the source originals are permanently deleted. The drive copies stay."
+        }
+    }
+}
+
+/// The one compute sheet for face scans: quality tier plus the FAST
+/// throttle. No model names — the owner picks how hard to look, the models
+/// are fixed.
+struct FaceScanSheet: View {
+    let location: ConfiguredLocation
+    /// MED and above need the converted detector package; without it the
+    /// scan button stays off and the fix is spelled out inline.
+    let detectorInstalled: Bool
+    let onCancel: () -> Void
+    let onScan: (FaceScanOptions) -> Void
+
+    @State private var mode: FaceScanGrade = .low
+    @State private var fast = true
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Scan for Faces")
+                .font(.title2.bold())
+            Text(location.name)
+                .foregroundStyle(.secondary)
+            Form {
+                Picker("Quality", selection: $mode) {
+                    Text("Low").tag(FaceScanGrade.low)
+                    Text("Medium").tag(FaceScanGrade.med)
+                    Text("High").tag(FaceScanGrade.high)
+                }
+                .pickerStyle(.segmented)
+                Toggle("Fast — lighter on the Mac", isOn: $fast)
+                    .help("Caps how much of the machine the scan uses. Same quality, slower wall clock.")
+            }
+            .formStyle(.grouped)
+            Text(modeHelp)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if needsDetector && !detectorInstalled {
+                Label(
+                    "Medium and High need the face detector installed — run scripts/convert-scrfd.sh once on this Mac.",
+                    systemImage: "exclamationmark.triangle.fill"
+                )
+                .font(.caption)
+                .foregroundStyle(.orange)
+                .fixedSize(horizontal: false, vertical: true)
+            }
+            HStack {
+                Spacer()
+                Button("Cancel", action: onCancel)
+                    .keyboardShortcut(.cancelAction)
+                Button("Scan") {
+                    onScan(FaceScanOptions(mode: mode, fast: fast))
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(needsDetector && !detectorInstalled)
+            }
+        }
+        .padding(20)
+        .frame(width: 460)
+    }
+
+    private var needsDetector: Bool { mode != .low }
+
+    private var modeHelp: String {
+        switch mode {
+        case .med:
+            "A more careful pass: stills plus a light sample of video frames, and it finds smaller faces down to about 40 px."
+        case .high:
+            "The deep pass: stills at two scales, faces down to about 30 px, and roughly one frame per second of video. Takes a while on big libraries."
+        default:
+            "The quick pass: still photos only, faces large enough to matter. Videos are skipped."
         }
     }
 }
