@@ -8,17 +8,34 @@ import SwiftUI
 struct EventsRootView: View {
     @Bindable var model: DashboardModel
     @Bindable var workspace: EventsWorkspace
+    @AppStorage(OrganizeChromeSizing.sidebarWidthDefaultsKey)
+    private var sidebarWidth = OrganizeChromeSizing.defaultSidebarWidth
 
     var body: some View {
         let panelAlignment: Alignment = (workspace.guide?.step.prefersTop ?? false) ? .topTrailing : .bottomTrailing
-        NavigationSplitView {
-            EventsSidebar(model: model, workspace: workspace)
-                .navigationSplitViewColumnWidth(min: 260, ideal: 300, max: 400)
-        } detail: {
+        HStack(spacing: 0) {
+            if !model.isSidebarCollapsed {
+                EventsSidebar(model: model, workspace: workspace)
+                    .frame(width: OrganizeChromeSizing.clampedSidebarWidth(sidebarWidth))
+                    .frame(maxHeight: .infinity)
+                    .background(OrganizeSidebarMaterial())
+                ChromeResizeHandle(
+                    orientation: .vertical,
+                    value: $sidebarWidth,
+                    transform: OrganizeChromeSizing.clampedSidebarWidth,
+                    onDoubleClick: {
+                        withAnimation(.easeOut(duration: 0.15)) {
+                            sidebarWidth = OrganizeChromeSizing.defaultSidebarWidth
+                        }
+                    },
+                    help: "Drag to resize the sidebar — double-click resets",
+                    accessibilityLabel: "Resize Sidebar"
+                )
+            }
             detail
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .background(Color(nsColor: .windowBackgroundColor))
         }
-        .navigationSplitViewStyle(.balanced)
         .overlay(alignment: panelAlignment) {
             if let guide = workspace.guide {
                 SetupGuidePanel(guide: guide, workspace: workspace, model: model)
@@ -463,6 +480,21 @@ struct EventsWelcomeView: View {
             .frame(maxWidth: .infinity)
         }
     }
+}
+
+/// The translucent material NavigationSplitView used to paint behind the
+/// sidebar column — kept so the hand-sized sidebar still looks like a
+/// macOS sidebar.
+private struct OrganizeSidebarMaterial: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let view = NSVisualEffectView()
+        view.material = .sidebar
+        view.blendingMode = .behindWindow
+        view.state = .followsWindowActiveState
+        return view
+    }
+
+    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {}
 }
 
 struct EventDetailsSheet: View {
