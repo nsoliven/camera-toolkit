@@ -79,4 +79,66 @@ final class PreviewZoomMathTests: XCTestCase {
         )
         XCTAssertEqual(unscaled, 2, accuracy: 0.001)
     }
+
+    func testDisplayedImageRectCentersFitAndAppliesPan() {
+        // 800×600 pt image in a 1000×800 usable canvas → fit 1.25 → the
+        // displayed rect is 1000×750 centered in the 1020×820 canvas.
+        let imageSize = CGSize(width: 800, height: 600)
+        let rect = PreviewZoomMath.displayedImageRect(
+            imageSize: imageSize,
+            canvasSize: canvas,
+            zoom: 1,
+            offset: .zero
+        )
+        XCTAssertEqual(rect.width, 1_000, accuracy: 0.001)
+        XCTAssertEqual(rect.height, 750, accuracy: 0.001)
+        XCTAssertEqual(rect.midX, canvas.width / 2, accuracy: 0.001)
+        XCTAssertEqual(rect.midY, canvas.height / 2, accuracy: 0.001)
+
+        // At 2× with a pan the rect scales about the center and shifts.
+        let zoomed = PreviewZoomMath.displayedImageRect(
+            imageSize: imageSize,
+            canvasSize: canvas,
+            zoom: 2,
+            offset: CGSize(width: 30, height: -40)
+        )
+        XCTAssertEqual(zoomed.width, 2_000, accuracy: 0.001)
+        XCTAssertEqual(zoomed.midX, canvas.width / 2 + 30, accuracy: 0.001)
+        XCTAssertEqual(zoomed.midY, canvas.height / 2 - 40, accuracy: 0.001)
+    }
+
+    func testNormalizedMarkupRectClampsToImageFrame() {
+        let frame = CGRect(x: 110, y: 35, width: 800, height: 750)
+        // A quarter-frame box in the middle → 0.25–0.75 normalized.
+        let normalized = PreviewZoomMath.normalizedMarkupRect(
+            canvasRect: CGRect(x: 310, y: 222.5, width: 400, height: 375),
+            imageFrame: frame
+        )
+        XCTAssertEqual(normalized?.minX ?? -1, 0.25, accuracy: 0.001)
+        XCTAssertEqual(normalized?.minY ?? -1, 0.25, accuracy: 0.001)
+        XCTAssertEqual(normalized?.width ?? -1, 0.5, accuracy: 0.001)
+
+        // A rect drawn partly off the photo clamps to the image edge:
+        // 60...460 clamps to the frame's left edge 110 → 350/800 wide.
+        let offEdge = PreviewZoomMath.normalizedMarkupRect(
+            canvasRect: CGRect(x: 60, y: 35, width: 400, height: 300),
+            imageFrame: frame
+        )
+        XCTAssertEqual(offEdge?.minX ?? -1, 0, accuracy: 0.001)
+        XCTAssertEqual(offEdge?.width ?? -1, 0.4375, accuracy: 0.001)
+
+        // Click-sized rects and rects fully off the photo are dropped.
+        XCTAssertNil(PreviewZoomMath.normalizedMarkupRect(
+            canvasRect: CGRect(x: 300, y: 300, width: 4, height: 4),
+            imageFrame: frame
+        ))
+        XCTAssertNil(PreviewZoomMath.normalizedMarkupRect(
+            canvasRect: CGRect(x: 0, y: 0, width: 40, height: 20),
+            imageFrame: frame
+        ))
+        XCTAssertNil(PreviewZoomMath.normalizedMarkupRect(
+            canvasRect: CGRect(x: 300, y: 300, width: 40, height: 40),
+            imageFrame: .zero
+        ))
+    }
 }
