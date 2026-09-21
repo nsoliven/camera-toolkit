@@ -243,6 +243,7 @@ final class EventsWorkspaceTests: XCTestCase {
             workspace.selectStacks([burst.id])
 
             workspace.trash(stackIDs: [burst.id], from: location.id)
+            workspace.confirmTrash(try XCTUnwrap(workspace.pendingTrash))
             try await waitUntil { !model.isBusy && workspace.sources[location.id]?.result?.items.count == 1 }
 
             // Companions travel together: both RAWs and the XMP moved into the
@@ -335,7 +336,7 @@ final class EventsWorkspaceTests: XCTestCase {
             XCTAssertNotNil(workspace.pendingTrash)
             XCTAssertTrue(FileManager.default.fileExists(atPath: photo.path))
             XCTAssertEqual(workspace.pendingTrash?.fileCount, 1)
-            XCTAssertTrue(workspace.pendingTrash?.alertMessage.contains("_Trash") == true)
+            XCTAssertTrue(workspace.pendingTrash?.destinations.contains { $0.trashFolderPath.contains("_Trash") } == true)
 
             workspace.pendingTrash = nil
             XCTAssertTrue(FileManager.default.fileExists(atPath: photo.path))
