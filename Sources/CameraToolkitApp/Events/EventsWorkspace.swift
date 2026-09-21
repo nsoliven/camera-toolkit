@@ -566,29 +566,80 @@ final class EventsWorkspace {
     }
 
     /// The stacks a board should show: `hideSorted` drops fully assigned
-    /// stacks and a non-empty `query` keeps only stacks matching file name,
-    /// burst label, origin subfolder, or assigned event title.
-    func visibleStacks(_ result: OrganizeScanResult, hideSorted: Bool, matching query: String = "") -> [OrganizeStack] {
-        let needle = OrganizeSearch.needle(query)
-        guard hideSorted || !needle.isEmpty else { return result.stacks }
+    /// stacks and a non-empty `search` keeps only stacks matching the text
+    /// needle — file name, burst label, origin subfolder, or assigned
+    /// event title — and every selected filter facet.
+    func visibleStacks(
+        _ result: OrganizeScanResult,
+        hideSorted: Bool,
+        search: OrganizeSearchFilter = OrganizeSearchFilter()
+    ) -> [OrganizeStack] {
+        guard hideSorted || !search.isEmpty else { return result.stacks }
+        let peopleByStackID = search.peopleIDs.isEmpty ? [:] : boardPeople(for: result.stacks).byStackID
         return result.stacks.filter { stack in
             if hideSorted, isSorted(stack) { return false }
-            guard !needle.isEmpty else { return true }
+            guard !search.isEmpty else { return true }
             return OrganizeSearch.matches(
                 stack: stack,
-                needle: needle,
+                search: search,
                 rootPath: result.rootPath,
-                eventTitle: assignedEvent(for: stack).event.map { eventTitle($0) }
+                facts: stackFacts(stack, peopleByStackID: peopleByStackID)
             )
         }
     }
 
+    /// Text-only form of `visibleStacks(_:hideSorted:search:)`.
+    func visibleStacks(_ result: OrganizeScanResult, hideSorted: Bool, matching query: String) -> [OrganizeStack] {
+        visibleStacks(result, hideSorted: hideSorted, search: OrganizeSearchFilter(text: query))
+    }
+
+    /// The stacks an event board should show under the same search state.
+    /// Every facet applies except Event — the board is one event already.
+    func visibleEventStacks(_ eventID: UUID, search: OrganizeSearchFilter) -> [OrganizeStack] {
+        let stacks = eventStacks[eventID] ?? []
+        guard !search.isEmpty else { return stacks }
+        let peopleByStackID = search.peopleIDs.isEmpty ? [:] : boardPeople(for: stacks).byStackID
+        return stacks.filter {
+            OrganizeSearch.matches(
+                stack: $0,
+                search: search,
+                rootPath: nil,
+                facts: stackFacts($0, peopleByStackID: peopleByStackID)
+            )
+        }
+    }
+
+    /// Facts one stack needs for structured search — every event its items
+    /// are assigned to (mixed stacks match any of theirs) plus the
+    /// face-catalog people on its files. `eventTitle` stays the text
+    /// needle's single-event breadcrumb match.
+    private func stackFacts(_ stack: OrganizeStack, peopleByStackID: [String: Set<UUID>]) -> OrganizeStackFacts {
+        var eventIDs = Set<UUID>()
+        for item in stack.items {
+            if let assignment = assignment(for: item.primary) {
+                eventIDs.insert(assignment.eventID)
+            }
+        }
+        return OrganizeStackFacts(
+            eventIDs: eventIDs,
+            eventTitle: eventIDs.count == 1
+                ? eventIDs.first.flatMap { event($0) }.map { eventTitle($0) }
+                : nil,
+            personIDs: peopleByStackID[stack.id] ?? []
+        )
+    }
+
     /// The days a board should show — `visibleStacks` re-grouped into days.
     /// Days that lose every stack drop out entirely.
-    func visibleDays(_ result: OrganizeScanResult, hideSorted: Bool, matching query: String = "") -> [OrganizeDay] {
-        let stacks = visibleStacks(result, hideSorted: hideSorted, matching: query)
-        guard hideSorted || !OrganizeSearch.needle(query).isEmpty else { return result.days }
+    func visibleDays(_ result: OrganizeScanResult, hideSorted: Bool, search: OrganizeSearchFilter = OrganizeSearchFilter()) -> [OrganizeDay] {
+        let stacks = visibleStacks(result, hideSorted: hideSorted, search: search)
+        guard hideSorted || !search.isEmpty else { return result.days }
         return OrganizeStacker.days(for: stacks)
+    }
+
+    /// Text-only form of `visibleDays(_:hideSorted:search:)`.
+    func visibleDays(_ result: OrganizeScanResult, hideSorted: Bool, matching query: String) -> [OrganizeDay] {
+        visibleDays(result, hideSorted: hideSorted, search: OrganizeSearchFilter(text: query))
     }
 
     /// Which event bucket a stack lands in when the board groups by event.
@@ -2664,6 +2715,63 @@ final class EventsWorkspace {
         }
         eventPeopleCache = (facesRevision, model.configurationRevision, people)
         return people[eventID] ?? []
+    }
+
+    /// (facesRevision, stacks, people index) — the board People filter's
+    /// data, rebuilt only when the face catalog or the board's stacks
+    /// actually change so board renders share one catalog pass.
+    @ObservationIgnored private var boardPeopleCache: (
+        facesRevision: Int,
+        stacks: [OrganizeStack],
+        people: (options: [FacePerson], byStackID: [String: Set<UUID>])
+    )?
+
+    /// Which catalog people each stack's files carry, plus the filter
+    /// picker's options — roster members and unnamed groups actually seen
+    /// on these stacks, roster first. Stacks without indexed faces map to
+    /// an empty set; boards never scanned for faces return no options.
+    func boardPeople(for stacks: [OrganizeStack]) -> (options: [FacePerson], byStackID: [String: Set<UUID>]) {
+        if let cache = boardPeopleCache,
+           cache.facesRevision == facesRevision,
+           cache.stacks == stacks {
+            return cache.people
+        }
+        var keysByStack: [String: Set<String>] = [:]
+        var allKeys = Set<String>()
+        for stack in stacks {
+            var keys = Set<String>()
+            for item in stack.items {
+                keys.insert(FaceIndexStore.fileKey(
+                    fileName: item.primary.name,
+                    byteCount: item.primary.size,
+                    modifiedAt: item.primary.modifiedAt
+                ))
+            }
+            keysByStack[stack.id] = keys
+            allKeys.formUnion(keys)
+        }
+        let byKey = (try? faceStore.peopleByFileKey(fileKeys: allKeys)) ?? [:]
+        var byStackID: [String: Set<UUID>] = [:]
+        var seen: [UUID: FacePerson] = [:]
+        for (stackID, keys) in keysByStack {
+            var ids = Set<UUID>()
+            for key in keys {
+                for person in byKey[key] ?? [] {
+                    ids.insert(person.id)
+                    seen[person.id] = person
+                }
+            }
+            byStackID[stackID] = ids
+        }
+        let people = (
+            options: seen.values.sorted {
+                if $0.isRoster != $1.isRoster { return $0.isRoster }
+                return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+            },
+            byStackID: byStackID
+        )
+        boardPeopleCache = (facesRevision, stacks, people)
+        return people
     }
 
     // MARK: - Face review actions
