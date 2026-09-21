@@ -1356,7 +1356,7 @@ struct StackPreviewOverlay: View {
             }
         }
         if let onTrashItems {
-            Button(targets.count > 1 ? "Move \(targets.count) Frames to Trash" : "Move to Trash") {
+            Button(targets.count > 1 ? "Move \(targets.count) Frames to Trash…" : "Move to Trash…") {
                 if !selection.selectedIDs.contains(item.id) { selection.select(index, in: stack.items) }
                 onTrashItems(targets)
             }

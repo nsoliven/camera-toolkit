@@ -541,7 +541,7 @@ struct StorageStrip: View {
             state: summary == nil ? .unknown : (offline ? .offline : (total > 0 && onDrive == total && onOther == 0 ? .complete : .partial))
         ) {
             if needsDrive > 0 {
-                Button(policy == .buffer ? "Put on Buffer" : "Move to Private") {
+                Button(policy == .buffer ? "Put on Buffer…" : "Move to Private…") {
                     workspace.prepareApply(
                         eventIDs: [event.id],
                         title: policy == .buffer ? "Put \(event.name) on the Buffer" : "Move \(event.name) to Private staging"

@@ -340,7 +340,7 @@ private struct EventLibraryView: View {
             Button {
                 CatalogInspectorWindowController.shared.show(model: model)
             } label: {
-                Label("SQL Inspector", systemImage: "cylinder.split.1x2")
+                Label("SQL Inspector…", systemImage: "cylinder.split.1x2")
             }
             .buttonStyle(.borderless)
         }
