@@ -17,7 +17,7 @@ final class FaceIndexTests: XCTestCase {
                 createLibraryFolders: false
             )
 
-            for table in ["face_photos", "people", "faces", "face_templates"] {
+            for table in ["face_photos", "people", "faces", "face_templates", "face_rejections"] {
                 XCTAssertEqual(
                     scalarInt("SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = '\(table)'", database: catalog),
                     1,
@@ -628,6 +628,282 @@ final class FaceIndexTests: XCTestCase {
             XCTAssertEqual(regrouped?.state, .other)
             let group = try XCTUnwrap(regrouped?.personID.flatMap { try? store.person($0) })
             XCTAssertFalse(group.isRoster)
+        }
+    }
+
+    // MARK: - Rejections and rebundle
+
+    /// "Not this person" moves the face out immediately — and the
+    /// persisted verdict keeps it off that person through later re-matches.
+    func testRejectFaceLeavesAndStaysOffThePerson() throws {
+        try withFaceStore { store, catalog in
+            let dad = try store.createPerson(name: "Dad", isRoster: true)
+            let galleryPhoto = photoRecord("RJ1.JPG")
+            let galleryFace = faceRecord(
+                galleryPhoto,
+                embedding: testEmbedding(seed: 61),
+                state: .confirmed,
+                personID: dad.id
+            )
+            try store.replaceFaces(photo: galleryPhoto, faces: [galleryFace])
+            try store.addTemplate(personID: dad.id, faceID: galleryFace.id)
+
+            let photo = photoRecord("RJ2.JPG")
+            let wrongMatch = faceRecord(photo, embedding: testEmbedding(seed: 61, noise: 0.15))
+            try store.replaceFaces(photo: photo, faces: [wrongMatch])
+            let service = FaceIndexService(catalogURL: catalog)
+            try service.rematchRoster()
+            XCTAssertEqual(try store.face(id: wrongMatch.id)?.personID, dad.id)
+
+            try service.reject([wrongMatch.id])
+            let rejected = try XCTUnwrap(store.face(id: wrongMatch.id))
+            XCTAssertEqual(rejected.state, .other)
+            let group = try XCTUnwrap(rejected.personID.flatMap { try? store.person($0) })
+            XCTAssertFalse(group.isRoster)
+            XCTAssertNotEqual(group.id, dad.id)
+
+            // The verdict is persisted: no later pass can put it back.
+            XCTAssertTrue(try store.faceRejections().blocks(faceID: wrongMatch.id, personID: dad.id))
+            try service.rematchRoster()
+            let after = try XCTUnwrap(store.face(id: wrongMatch.id))
+            XCTAssertEqual(after.state, .other)
+            XCTAssertNotEqual(after.personID, dad.id)
+
+            // The frozen face refuses the same path — confirmed never
+            // moves, and no rejection row is written for it.
+            try service.reject([galleryFace.id])
+            XCTAssertEqual(try store.face(id: galleryFace.id)?.state, .confirmed)
+            XCTAssertEqual(try store.face(id: galleryFace.id)?.personID, dad.id)
+            XCTAssertFalse(try store.faceRejections().blocks(faceID: galleryFace.id, personID: dad.id))
+        }
+    }
+
+    /// A face closer to a person's rejected face than to that person's
+    /// templates is never proposed — the rejection is a negative example.
+    func testLookalikeOfRejectedFaceIsNotProposed() throws {
+        try withFaceStore { store, catalog in
+            let dad = try store.createPerson(name: "Dad", isRoster: true)
+            let galleryPhoto = photoRecord("NG1.JPG")
+            let galleryFace = faceRecord(
+                galleryPhoto,
+                embedding: testEmbedding(seed: 61),
+                state: .confirmed,
+                personID: dad.id
+            )
+            try store.replaceFaces(photo: galleryPhoto, faces: [galleryFace])
+            try store.addTemplate(personID: dad.id, faceID: galleryFace.id)
+
+            // This look clears the template bar on score alone — only the
+            // veto can keep it off Dad.
+            let look = testEmbedding(seed: 61, noise: 0.15)
+            XCTAssertGreaterThan(
+                FaceEmbeddingMath.cosine(look, testEmbedding(seed: 61)),
+                FaceScanOptions().matchThreshold
+            )
+
+            let service = FaceIndexService(catalogURL: catalog)
+            let rejectedPhoto = photoRecord("NG2.JPG")
+            let rejected = faceRecord(rejectedPhoto, embedding: look)
+            try store.replaceFaces(photo: rejectedPhoto, faces: [rejected])
+            try store.assignFace(rejected.id, to: dad.id, state: .proposed, score: 0.8)
+            try service.reject([rejected.id])
+
+            let twinPhoto = photoRecord("NG3.JPG")
+            let twin = faceRecord(twinPhoto, embedding: look)
+            try store.replaceFaces(photo: twinPhoto, faces: [twin])
+            try service.rematchRoster()
+
+            let stored = try XCTUnwrap(store.face(id: twin.id))
+            XCTAssertEqual(stored.state, .other)
+            XCTAssertNotEqual(stored.personID, dad.id)
+        }
+    }
+
+    /// The group-level veto: a group whose rejected face describes a
+    /// candidate better than its centroid refuses the join.
+    func testGroupJoinVetoedByRejectedMember() throws {
+        try withFaceStore { store, catalog in
+            let group = try store.createPerson(name: "Person 7", isRoster: false)
+            let photo = photoRecord("VJ1.JPG")
+            let member = faceRecord(photo, detScore: 0.95, embedding: testEmbedding(seed: 21))
+            let misfit = faceRecord(
+                photo,
+                box: NormalizedFaceBox(x: 0.5, y: 0.1, width: 0.2, height: 0.2),
+                detScore: 0.9,
+                embedding: testEmbedding(seed: 21, noise: 0.1)
+            )
+            try store.replaceFaces(photo: photo, faces: [member, misfit])
+            try store.assignFace(member.id, to: group.id, state: .other, score: 0.9)
+            try store.assignFace(misfit.id, to: group.id, state: .other, score: 0.9)
+
+            let service = FaceIndexService(catalogURL: catalog)
+            try service.reject([misfit.id])
+            XCTAssertNotEqual(try store.face(id: misfit.id)?.personID, group.id)
+
+            // A face identical to the rejected one clears the centroid bar
+            // on score alone — the veto keeps it out of the group.
+            let twinPhoto = photoRecord("VJ2.JPG")
+            let twin = faceRecord(twinPhoto, embedding: testEmbedding(seed: 21, noise: 0.1))
+            try store.replaceFaces(photo: twinPhoto, faces: [twin])
+            try service.rematchRoster()
+
+            let stored = try XCTUnwrap(store.face(id: twin.id))
+            XCTAssertEqual(stored.state, .other)
+            XCTAssertNotEqual(stored.personID, group.id)
+            // The group kept its real member, and the group row survived.
+            XCTAssertEqual(try store.face(id: member.id)?.personID, group.id)
+            XCTAssertNotNil(try store.person(group.id))
+        }
+    }
+
+    /// A drifted "Person N" drawer — two identities forced into one auto
+    /// group — splits back into real groups on re-match.
+    func testRematchRebundlesDriftedAutoGroup() throws {
+        try withFaceStore { store, catalog in
+            let drawer = try store.createPerson(name: "Person 27", isRoster: false)
+            let photo = photoRecord("RB1.JPG")
+            let a1 = faceRecord(photo, detScore: 0.95, embedding: testEmbedding(seed: 21))
+            let a2 = faceRecord(
+                photo,
+                box: NormalizedFaceBox(x: 0.4, y: 0.1, width: 0.2, height: 0.2),
+                detScore: 0.9,
+                embedding: testEmbedding(seed: 21, noise: 0.1)
+            )
+            let b1 = faceRecord(
+                photo,
+                box: NormalizedFaceBox(x: 0.1, y: 0.4, width: 0.2, height: 0.2),
+                detScore: 0.85,
+                embedding: testEmbedding(seed: 42)
+            )
+            let b2 = faceRecord(
+                photo,
+                box: NormalizedFaceBox(x: 0.4, y: 0.4, width: 0.2, height: 0.2),
+                detScore: 0.8,
+                embedding: testEmbedding(seed: 42, noise: 0.1)
+            )
+            try store.replaceFaces(photo: photo, faces: [a1, a2, b1, b2])
+            for face in [a1, a2, b1, b2] {
+                try store.assignFace(face.id, to: drawer.id, state: .other, score: 0.9)
+            }
+
+            try FaceIndexService(catalogURL: catalog).rematchRoster()
+
+            let storedA = try XCTUnwrap(store.face(id: a1.id)).personID
+            XCTAssertEqual(try store.face(id: a2.id)?.personID, storedA)
+            let storedB = try XCTUnwrap(store.face(id: b1.id)).personID
+            XCTAssertEqual(try store.face(id: b2.id)?.personID, storedB)
+            XCTAssertNotEqual(storedA, storedB)
+            // The bigger identity keeps the recycled "Person 27" row; the
+            // other lands on a fresh unnamed group.
+            XCTAssertEqual(storedA, drawer.id)
+            XCTAssertEqual(try store.faces(personID: drawer.id).count, 2)
+            let otherGroup = try XCTUnwrap(storedB.flatMap { try? store.person($0) })
+            XCTAssertFalse(otherGroup.isRoster)
+        }
+    }
+
+    /// A group the user named is never dissolved — a demoted roster person
+    /// keeps its name and its faces through a re-match, even when the
+    /// members are different identities.
+    func testRematchLeavesUserNamedGroupsIntact() throws {
+        try withFaceStore { store, catalog in
+            let named = try store.createPerson(name: "Eileen", isRoster: false)
+            let photo = photoRecord("RB2.JPG")
+            let m1 = faceRecord(photo, detScore: 0.95, embedding: testEmbedding(seed: 21))
+            let m2 = faceRecord(
+                photo,
+                box: NormalizedFaceBox(x: 0.5, y: 0.5, width: 0.2, height: 0.2),
+                detScore: 0.9,
+                embedding: testEmbedding(seed: 42)
+            )
+            try store.replaceFaces(photo: photo, faces: [m1, m2])
+            try store.assignFace(m1.id, to: named.id, state: .other, score: 0.9)
+            try store.assignFace(m2.id, to: named.id, state: .other, score: 0.9)
+
+            try FaceIndexService(catalogURL: catalog).rematchRoster()
+
+            XCTAssertEqual(try store.face(id: m1.id)?.personID, named.id)
+            XCTAssertEqual(try store.face(id: m2.id)?.personID, named.id)
+            XCTAssertNotNil(try store.person(named.id))
+        }
+    }
+
+    /// A second re-match on a settled catalog is a true no-op — recycled
+    /// rows keep their members, so the report can honestly say nothing
+    /// moved.
+    func testRematchOnASettledCatalogMovesNothing() throws {
+        try withFaceStore { store, catalog in
+            let photo = photoRecord("ST1.JPG")
+            let a1 = faceRecord(photo, detScore: 0.95, embedding: testEmbedding(seed: 21))
+            let a2 = faceRecord(
+                photo,
+                box: NormalizedFaceBox(x: 0.5, y: 0.1, width: 0.2, height: 0.2),
+                detScore: 0.9,
+                embedding: testEmbedding(seed: 21, noise: 0.1)
+            )
+            let b1 = faceRecord(
+                photo,
+                box: NormalizedFaceBox(x: 0.1, y: 0.5, width: 0.2, height: 0.2),
+                detScore: 0.85,
+                embedding: testEmbedding(seed: 42)
+            )
+            try store.replaceFaces(photo: photo, faces: [a1, a2, b1])
+            let service = FaceIndexService(catalogURL: catalog)
+
+            let first = try service.rematchRoster()
+            XCTAssertEqual(first.facesMoved, 3)
+            XCTAssertEqual(first.groupsCreated, 2)
+
+            let second = try service.rematchRoster()
+            XCTAssertEqual(second.facesMoved, 0)
+            XCTAssertEqual(second.groupsDissolved, 0)
+            XCTAssertEqual(try store.face(id: a1.id)?.personID, try store.face(id: a2.id)?.personID)
+            XCTAssertNotEqual(try store.face(id: a1.id)?.personID, try store.face(id: b1.id)?.personID)
+        }
+    }
+
+    /// Junk drops exactly the group the user confirmed — the other group,
+    /// its faces, the photos' scan grades, and the event row all stay.
+    func testJunkDeletesOneGroupAndLeavesTheRest() throws {
+        try withTemporaryDirectory { root in
+            let catalog = root.appendingPathComponent("catalog.sqlite")
+            var configuration = faceTestConfiguration(root: root, catalog: catalog)
+            configuration.savedEvents = [
+                SavedCameraEvent(name: "Beach Day", eventDate: Date(timeIntervalSince1970: 1_752_000_000)),
+            ]
+            _ = try CatalogStore(url: catalog).bootstrap(
+                configuration: configuration,
+                createBackup: false,
+                createLibraryFolders: false
+            )
+            let store = FaceIndexStore(url: catalog)
+
+            let junk = try store.createPerson(name: "Person 3", isRoster: false)
+            let keep = try store.createPerson(name: "Person 4", isRoster: false)
+            var photoA = photoRecord("JK1.JPG")
+            photoA.scanGrade = .med
+            var photoB = photoRecord("JK2.JPG")
+            photoB.scanGrade = .med
+            let junkFace = faceRecord(photoA, embedding: testEmbedding(seed: 5), state: .other, personID: junk.id)
+            let keepFace = faceRecord(photoB, embedding: testEmbedding(seed: 6), state: .other, personID: keep.id)
+            try store.replaceFaces(photo: photoA, faces: [junkFace])
+            try store.replaceFaces(photo: photoB, faces: [keepFace])
+
+            try store.deletePersonAndFaces(junk.id)
+
+            XCTAssertNil(try store.person(junk.id))
+            XCTAssertNil(try store.face(id: junkFace.id))
+            XCTAssertNotNil(try store.person(keep.id))
+            XCTAssertEqual(try store.face(id: keepFace.id)?.personID, keep.id)
+            XCTAssertEqual(try store.face(id: keepFace.id)?.state, .other)
+            // The event row and the photos' scan grades are untouched, and
+            // no Junk person was minted.
+            XCTAssertEqual(scalarInt("SELECT COUNT(*) FROM events", database: catalog), 1)
+            XCTAssertEqual(
+                try store.photos(pathKeys: [photoB.pathKey])[photoB.pathKey]?.scanGrade,
+                .med
+            )
+            XCTAssertEqual(try store.otherGroups().map(\.name), ["Person 4"])
         }
     }
 
@@ -1716,8 +1992,8 @@ final class FaceIndexTests: XCTestCase {
 
     // MARK: - Clear face index
 
-    /// The wipe empties exactly the four face tables — an `events` row in
-    /// the same database survives untouched.
+    /// The wipe empties exactly the face tables — an `events` row in the
+    /// same database survives untouched.
     func testClearFaceIndexWipesOnlyTheFaceTables() throws {
         try withTemporaryDirectory { root in
             let catalog = root.appendingPathComponent("catalog.sqlite")
@@ -1751,6 +2027,7 @@ final class FaceIndexTests: XCTestCase {
             try store.replaceFaces(photo: photoA, faces: [dadFace])
             try store.replaceFaces(photo: photoB, faces: [groupFace])
             try store.addTemplate(personID: dad.id, faceID: dadFace.id)
+            try store.recordRejection(personID: group.id, faceID: groupFace.id)
 
             XCTAssertEqual(
                 try store.faceIndexCounts(),
@@ -1758,10 +2035,11 @@ final class FaceIndexTests: XCTestCase {
             )
             XCTAssertEqual(try store.storedScanGrades(), [.med])
             XCTAssertEqual(scalarInt("SELECT COUNT(*) FROM events", database: catalog), 1)
+            XCTAssertEqual(scalarInt("SELECT COUNT(*) FROM face_rejections", database: catalog), 1)
 
             try store.clearFaceIndex()
 
-            for table in ["face_photos", "faces", "people", "face_templates"] {
+            for table in ["face_photos", "faces", "people", "face_templates", "face_rejections"] {
                 XCTAssertEqual(
                     scalarInt("SELECT COUNT(*) FROM \(table)", database: catalog),
                     0,
