@@ -291,15 +291,47 @@ public final class FaceIndexStore: @unchecked Sendable {
         }
     }
 
-    /// One face to represent a person in review lists — the most confident
-    /// detection, which is usually the clearest portrait.
+    /// One face to represent a person in review lists — the face the user
+    /// pinned as cover when it still belongs to the person, else the most
+    /// confident detection, which is usually the clearest portrait.
     public func coverFace(personID: UUID) throws -> FaceRecord? {
         try database().read { database in
             try Row.fetchOne(
                 database,
-                sql: "\(Self.faceSelect) WHERE f.person_id = ? ORDER BY f.det_score DESC LIMIT 1",
+                sql: """
+                \(Self.faceSelect)
+                WHERE f.person_id = ?
+                ORDER BY (f.id = (
+                    SELECT cover_face_id FROM people WHERE people.id = f.person_id
+                )) DESC, f.det_score DESC
+                LIMIT 1
+                """,
                 arguments: [personID.uuidString]
             ).map { Self.faceRecord($0) }
+        }
+    }
+
+    /// Pins a face as the person's cover thumbnail — the People-list image.
+    /// Refuses a face that belongs to someone else, so a stale id can never
+    /// borrow another person's detection. Returns whether the row updated.
+    @discardableResult
+    public func setCoverFace(personID: UUID, faceID: UUID) throws -> Bool {
+        try database().write { database in
+            try database.execute(
+                sql: """
+                UPDATE people SET cover_face_id = ?, updated_at = ?
+                WHERE id = ? AND EXISTS(
+                    SELECT 1 FROM faces WHERE faces.id = ? AND faces.person_id = people.id
+                )
+                """,
+                arguments: [
+                    faceID.uuidString,
+                    Self.formatter().string(from: Date()),
+                    personID.uuidString,
+                    faceID.uuidString,
+                ]
+            )
+            return database.changesCount > 0
         }
     }
 
@@ -442,6 +474,12 @@ public final class FaceIndexStore: @unchecked Sendable {
             )
             try database.execute(
                 sql: "DELETE FROM face_templates WHERE face_id = ?",
+                arguments: [faceID.uuidString]
+            )
+            // A cover only makes sense while the face still belongs to the
+            // person — drop the pin so the row falls back to auto-pick.
+            try database.execute(
+                sql: "UPDATE people SET cover_face_id = NULL WHERE cover_face_id = ?",
                 arguments: [faceID.uuidString]
             )
         }
@@ -668,6 +706,37 @@ public final class FaceIndexStore: @unchecked Sendable {
         }
     }
 
+    /// Display names of every person and unnamed group keyed by the file
+    /// key (name|bytes|mtime) of each photo carrying one of their faces —
+    /// any assigned state counts, so a proposed match still finds its
+    /// person. Search uses this to join stacks to people from catalog data
+    /// alone; it never walks the filesystem.
+    public func personNamesByFileKey() throws -> [String: Set<String>] {
+        try database().read { database in
+            let rows = try Row.fetchAll(
+                database,
+                sql: """
+                SELECT p.name, ph.file_name, ph.byte_count, ph.modified_at
+                FROM faces f
+                JOIN people p ON p.id = f.person_id
+                JOIN face_photos ph ON ph.path_key = f.photo_id
+                """
+            )
+            let formatter = Self.formatter()
+            var names: [String: Set<String>] = [:]
+            for row in rows {
+                let fileName: String = row["file_name"]
+                let byteCount: Int64 = row["byte_count"]
+                let modifiedAt: String = row["modified_at"]
+                let name: String = row["name"]
+                guard let modified = formatter.date(from: modifiedAt) else { continue }
+                names[Self.fileKey(fileName: fileName, byteCount: byteCount, modifiedAt: modified), default: []]
+                    .insert(name)
+            }
+            return names
+        }
+    }
+
     // MARK: - Row mapping
 
     private func insertFace(
@@ -755,7 +824,8 @@ public final class FaceIndexStore: @unchecked Sendable {
             id: UUID(uuidString: row["id"] as String? ?? "") ?? UUID(),
             name: row["name"],
             isRoster: (row["is_roster"] as Int64? ?? 0) != 0,
-            faceCount: Int(row["face_count"] as Int64? ?? 0)
+            faceCount: Int(row["face_count"] as Int64? ?? 0),
+            coverFaceID: (row["cover_face_id"] as String?).flatMap(UUID.init(uuidString:))
         )
     }
 }

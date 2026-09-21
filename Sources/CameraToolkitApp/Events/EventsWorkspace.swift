@@ -546,7 +546,8 @@ final class EventsWorkspace {
 
     /// The stacks a board should show: `hideSorted` drops fully assigned
     /// stacks and a non-empty `query` keeps only stacks matching file name,
-    /// burst label, origin subfolder, or assigned event title.
+    /// burst label, origin subfolder, assigned event title, or the name of
+    /// a person or group whose face sits on one of the stack's files.
     func visibleStacks(_ result: OrganizeScanResult, hideSorted: Bool, matching query: String = "") -> [OrganizeStack] {
         let needle = OrganizeSearch.needle(query)
         guard hideSorted || !needle.isEmpty else { return result.stacks }
@@ -557,7 +558,8 @@ final class EventsWorkspace {
                 stack: stack,
                 needle: needle,
                 rootPath: result.rootPath,
-                eventTitle: assignedEvent(for: stack).event.map { eventTitle($0) }
+                eventTitle: assignedEvent(for: stack).event.map { eventTitle($0) },
+                personNames: personNames(on: stack)
             )
         }
     }
@@ -2426,6 +2428,10 @@ final class EventsWorkspace {
     /// (facesRevision, configurationRevision, people by event) — rebuilt
     /// lazily so sidebar rows share one catalog pass.
     @ObservationIgnored private var eventPeopleCache: (Int, Int, [UUID: [FacePerson]])?
+    /// (facesRevision, file key → person/group names) — one catalog pass
+    /// feeds every stack the board filters, so person search never
+    /// re-queries per stack or touches the filesystem.
+    @ObservationIgnored private var faceNamesByFileKeyCache: (Int, [String: Set<String>])?
 
     var faceStore: FaceIndexStore {
         if let faceStoreInstance { return faceStoreInstance }
@@ -2663,6 +2669,37 @@ final class EventsWorkspace {
         return people[eventID] ?? []
     }
 
+    /// Person and unnamed-group names detected on the stack's files, joined
+    /// through the catalog's face rows by file key (name|bytes|mtime — it
+    /// survives the file moving between folders). Board search matches
+    /// these, so "Eileen" keeps every burst she appears in.
+    func personNames(on stack: OrganizeStack) -> Set<String> {
+        let names = faceNamesByFileKey()
+        guard !names.isEmpty else { return [] }
+        var found = Set<String>()
+        for file in stack.files {
+            found.formUnion(
+                names[FaceIndexStore.fileKey(
+                    fileName: file.name,
+                    byteCount: file.size,
+                    modifiedAt: file.modifiedAt
+                )] ?? []
+            )
+        }
+        return found
+    }
+
+    /// The shared file key → person names map, rebuilt lazily when faces
+    /// change and otherwise served from memory.
+    private func faceNamesByFileKey() -> [String: Set<String>] {
+        if let cache = faceNamesByFileKeyCache, cache.0 == facesRevision {
+            return cache.1
+        }
+        let names = (try? faceStore.personNamesByFileKey()) ?? [:]
+        faceNamesByFileKeyCache = (facesRevision, names)
+        return names
+    }
+
     // MARK: - Face review actions
 
     /// Review data for the People window: roster, unnamed groups, and the
@@ -2752,6 +2789,21 @@ final class EventsWorkspace {
         try? faceStore.addTemplate(personID: personID, faceID: faceID)
         facesRevision &+= 1
         model.statusMessage = "Pinned as a match reference for future scans."
+    }
+
+    /// Sets the person's cover — the thumbnail the People list shows. The
+    /// choice lives on the person row in the catalog; a face that leaves
+    /// the person stops being the cover automatically. Catalog only —
+    /// no photo is written to.
+    func setCoverFace(_ faceID: UUID, for personID: UUID) {
+        guard (try? faceStore.setCoverFace(personID: personID, faceID: faceID)) == true else { return }
+        facesRevision &+= 1
+        model.statusMessage = "Cover updated."
+    }
+
+    /// The current catalog row for a person — refreshed cover pick included.
+    func person(_ id: UUID) -> FacePerson? {
+        try? faceStore.person(id)
     }
 
     /// Cheap CPU-only pass after roster changes: re-match stored vectors to

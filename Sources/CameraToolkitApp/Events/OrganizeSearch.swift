@@ -16,13 +16,15 @@ enum OrganizeSearch {
     }
 
     /// A stack matches when the query hits any file name in it, its burst
-    /// label ("B0001"), its origin subfolder relative to the scan root, or
-    /// the breadcrumb title of the event it is sorted into.
+    /// label ("B0001"), its origin subfolder relative to the scan root, the
+    /// breadcrumb title of the event it is sorted into, or the name of a
+    /// person or group whose face sits on one of its files.
     static func matches(
         stack: OrganizeStack,
         needle: String,
         rootPath: String?,
-        eventTitle: String?
+        eventTitle: String?,
+        personNames: Set<String> = []
     ) -> Bool {
         guard !needle.isEmpty else { return true }
         if matches(stack.burstLabel, needle: needle) { return true }
@@ -33,6 +35,7 @@ enum OrganizeSearch {
                needle: needle
            ) { return true }
         if stack.files.contains(where: { matches($0.name, needle: needle) }) { return true }
-        return matches(eventTitle, needle: needle)
+        if matches(eventTitle, needle: needle) { return true }
+        return personNames.contains { matches($0, needle: needle) }
     }
 }

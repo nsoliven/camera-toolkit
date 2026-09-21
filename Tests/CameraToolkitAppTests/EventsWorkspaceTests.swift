@@ -636,6 +636,61 @@ final class EventsWorkspaceTests: XCTestCase {
         }
     }
 
+    func testBoardSearchMatchesStacksByPersonName() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let unsorted = root.appendingPathComponent("Drive/Unsorted A7V", isDirectory: true)
+            try writeOrganizerARW(unsorted.appendingPathComponent("Batch 1/DSC00001.ARW"), "2026:08:26 10:00:00", "100")
+            try writeOrganizerARW(unsorted.appendingPathComponent("Batch 2/DSC00002.ARW"), "2026:08:26 11:00:00", "400")
+            let location = addUnsorted(unsorted, to: model)
+            workspace.scan(location)
+            try await waitUntil { workspace.sources[location.id]?.result != nil }
+            let result = try XCTUnwrap(workspace.sources[location.id]?.result)
+            let eileenStack = try XCTUnwrap(result.stacks.first { $0.coverItem.primary.name == "DSC00001.ARW" })
+            let groupStack = try XCTUnwrap(result.stacks.first { $0.coverItem.primary.name == "DSC00002.ARW" })
+
+            // Seed the face index as if a scan ran: Eileen confirmed on the
+            // first photo, an unnamed group on the second.
+            let catalog = root.appendingPathComponent("catalog.sqlite")
+            _ = try CatalogStore(url: catalog).bootstrap(
+                configuration: model.configuration,
+                createBackup: false,
+                createLibraryFolders: false
+            )
+            let store = workspace.faceStore
+            let eileen = try store.createPerson(name: "Eileen", isRoster: true)
+            let group = try store.createPerson(name: "Person 1", isRoster: false)
+            let box = NormalizedFaceBox(x: 0.1, y: 0.1, width: 0.2, height: 0.2)
+            for (stack, person, state) in [
+                (eileenStack, eileen, FaceState.confirmed),
+                (groupStack, group, FaceState.other),
+            ] {
+                let file = stack.coverItem.primary
+                let photo = FacePhotoRecord(
+                    pathKey: file.pathKey,
+                    path: file.path,
+                    fileName: file.name,
+                    byteCount: file.size,
+                    modifiedAt: file.modifiedAt,
+                    scanGrade: .low
+                )
+                try store.replaceFaces(photo: photo, faces: [
+                    FaceRecord(photoID: photo.pathKey, personID: person.id, box: box, detScore: 0.9, state: state),
+                ])
+            }
+
+            // Typing a roster or group name keeps exactly the stacks whose
+            // files carry that person's face — the catalog join needs no
+            // filesystem reads.
+            XCTAssertEqual(workspace.visibleDays(result, hideSorted: false, matching: "eileen").flatMap(\.stacks).map(\.id), [eileenStack.id])
+            XCTAssertEqual(workspace.visibleDays(result, hideSorted: false, matching: "person 1").flatMap(\.stacks).map(\.id), [groupStack.id])
+            XCTAssertEqual(Set(workspace.visibleDays(result, hideSorted: false, matching: "").flatMap(\.stacks).map(\.id)), [eileenStack.id, groupStack.id])
+            XCTAssertTrue(workspace.visibleDays(result, hideSorted: false, matching: "zzz").isEmpty)
+
+            // File-name matching still works alongside person names.
+            XCTAssertEqual(workspace.visibleDays(result, hideSorted: false, matching: "dsc00001").flatMap(\.stacks).map(\.id), [eileenStack.id])
+        }
+    }
+
     func testFaceScanRefusesUntilBurstGroupingFinishes() async throws {
         try await withOrganizerSandbox { root, model, workspace in
             let unsorted = root.appendingPathComponent("Card", isDirectory: true)
