@@ -578,6 +578,36 @@ public final class FaceIndexStore: @unchecked Sendable {
         }
     }
 
+    /// Every persisted "not this person" verdict, indexed for the match
+    /// and group passes: face → banned persons (the hard veto) plus each
+    /// person's rejected member embeddings (the negative examples). A
+    /// rejection whose face row is gone keeps the id-level ban but adds
+    /// no vector.
+    public func faceRejections() throws -> FaceRejectionIndex {
+        try database().read { database in
+            let rows = try Row.fetchAll(
+                database,
+                sql: """
+                SELECT r.person_id, r.face_id, f.embedding
+                FROM face_rejections r
+                LEFT JOIN faces f ON f.id = r.face_id
+                """
+            )
+            var index = FaceRejectionIndex()
+            for row in rows {
+                guard let personID = UUID(uuidString: row["person_id"] as String? ?? ""),
+                      let faceID = UUID(uuidString: row["face_id"] as String? ?? "")
+                else { continue }
+                index.personIDsByFaceID[faceID, default: []].insert(personID)
+                if let embedding: Data = row["embedding"] {
+                    index.embeddingsByPersonID[personID, default: []]
+                        .append(FaceRecord.embedding(from: embedding))
+                }
+            }
+            return index
+        }
+    }
+
     // MARK: - Mutations (review actions)
 
     @discardableResult
@@ -783,6 +813,55 @@ public final class FaceIndexStore: @unchecked Sendable {
         }
     }
 
+    /// Persists "this face is not this person" — the hard veto automatic
+    /// matching always honors, plus a negative example for the cheap
+    /// closer-to-rejected check. The row lives until the face or person is
+    /// deleted, or Clear Face Scan wipes the table.
+    public func recordRejection(personID: UUID, faceID: UUID) throws {
+        try database().write { database in
+            try database.execute(
+                sql: """
+                INSERT OR IGNORE INTO face_rejections(person_id, face_id, created_at)
+                VALUES (?, ?, ?)
+                """,
+                arguments: [
+                    personID.uuidString,
+                    faceID.uuidString,
+                    Self.formatter().string(from: Date()),
+                ]
+            )
+        }
+    }
+
+    /// True when no face rows point at the person — the rebundle's signal
+    /// that an emptied auto row can be recycled or dropped.
+    public func isPersonEmpty(_ personID: UUID) throws -> Bool {
+        try database().read { database in
+            try Int.fetchOne(
+                database,
+                sql: "SELECT COUNT(*) FROM faces WHERE person_id = ?",
+                arguments: [personID.uuidString]
+            ) == 0
+        }
+    }
+
+    /// Removes an unnamed group left with no faces — the rebundle's
+    /// dissolve. Refuses roster people and rows that still hold faces.
+    /// Returns whether the row went away.
+    @discardableResult
+    public func deleteEmptyGroup(_ personID: UUID) throws -> Bool {
+        try database().write { database in
+            try database.execute(
+                sql: """
+                DELETE FROM people WHERE id = ? AND is_roster = 0
+                  AND NOT EXISTS(SELECT 1 FROM faces WHERE faces.person_id = people.id)
+                """,
+                arguments: [personID.uuidString]
+            )
+            return database.changesCount > 0
+        }
+    }
+
     /// Removes a non-roster group and its faces — the junk action. The
     /// photos keep their scan grade, so the faces are not re-detected by the
     /// same mode. Roster people are refused: junking must never delete a
@@ -873,15 +952,16 @@ public final class FaceIndexStore: @unchecked Sendable {
         }
     }
 
-    /// Deletes the entire face index — `face_templates`, `faces`,
-    /// `people`, then `face_photos` — in one transaction, child tables
-    /// first so the order respects the foreign keys even without relying
-    /// on cascades. No other catalog table is touched: `events`,
+    /// Deletes the entire face index — `face_rejections`, `face_templates`,
+    /// `faces`, `people`, then `face_photos` — in one transaction, child
+    /// tables first so the order respects the foreign keys even without
+    /// relying on cascades. No other catalog table is touched: `events`,
     /// `event_assets`, and every non-face row survive. Nothing on disk is
     /// read, moved, or deleted; the next scan simply treats every file as
     /// new instead of skipping it on `scan_grade`.
     public func clearFaceIndex() throws {
         try database().write { database in
+            try database.execute(sql: "DELETE FROM face_rejections")
             try database.execute(sql: "DELETE FROM face_templates")
             try database.execute(sql: "DELETE FROM faces")
             try database.execute(sql: "DELETE FROM people")

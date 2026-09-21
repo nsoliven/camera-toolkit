@@ -186,6 +186,15 @@ public struct CatalogStore {
             FOREIGN KEY(person_id) REFERENCES people(id) ON DELETE CASCADE,
             FOREIGN KEY(face_id) REFERENCES faces(id) ON DELETE CASCADE
         );
+        CREATE TABLE IF NOT EXISTS face_rejections (
+            person_id TEXT NOT NULL,
+            face_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(person_id, face_id),
+            FOREIGN KEY(person_id) REFERENCES people(id) ON DELETE CASCADE,
+            FOREIGN KEY(face_id) REFERENCES faces(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS face_rejections_face_id ON face_rejections(face_id);
         """, database: database)
 
         // `parent_event_id` was added after the first catalogs shipped, so

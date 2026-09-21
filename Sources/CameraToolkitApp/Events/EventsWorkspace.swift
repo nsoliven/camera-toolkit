@@ -3079,13 +3079,24 @@ final class EventsWorkspace {
         rematchFaces()
     }
 
-    /// Junks an unnamed group (statues, dogs, strangers) — the cluster and
-    /// its face rows are removed. Photos keep their scan grade, so a same
-    /// mode scan does not bring them back.
+    /// Junks the one unnamed group the user confirmed (statues, dogs,
+    /// strangers) — that cluster and its face rows are removed, nothing
+    /// else. Named people can never be junked, no Junk person is created,
+    /// and photos keep their scan grade so a same-mode scan does not
+    /// bring the faces back.
     func junkGroup(_ personID: UUID) {
-        try? faceStore.deletePersonAndFaces(personID)
-        facesRevision &+= 1
-        model.statusMessage = "Removed the group. Nothing on disk was touched."
+        do {
+            guard let person = try faceStore.person(personID) else { return }
+            guard !person.isRoster else {
+                model.statusMessage = "\(person.name) is a named person — only unnamed groups can be junked."
+                return
+            }
+            try faceStore.deletePersonAndFaces(personID)
+            facesRevision &+= 1
+            model.statusMessage = "Removed \(person.name). Nothing on disk was touched."
+        } catch {
+            model.statusMessage = "Could not remove the group: \(error.localizedDescription)"
+        }
     }
 
     /// Confirms a proposed face and pins it as a template — confirmed faces
@@ -3099,11 +3110,27 @@ final class EventsWorkspace {
         facesRevision &+= 1
     }
 
-    /// Rejects a proposed face: it leaves the person and re-groups with the
-    /// Other clusters.
+    /// "Not this person" / "not this group": the verdict is persisted — the
+    /// face can never be matched back to that person and its embedding
+    /// becomes a negative example that vetoes lookalikes — then the face
+    /// re-groups with the Other clusters. Confirmed faces are frozen and
+    /// never move; the detection and the photo stay untouched.
     func rejectFace(_ faceID: UUID) {
-        try? FaceIndexService(catalogURL: catalogDatabaseURL).regroup([faceID])
-        facesRevision &+= 1
+        do {
+            guard let face = try faceStore.face(id: faceID) else { return }
+            guard face.state != .confirmed else {
+                model.statusMessage = "Confirmed faces are frozen — this one stays where it is."
+                return
+            }
+            let personName = face.personID.flatMap { try? faceStore.person($0) }?.name
+            try FaceIndexService(catalogURL: catalogDatabaseURL).reject([faceID])
+            facesRevision &+= 1
+            model.statusMessage = personName.map {
+                "Removed from \($0) — it will not be matched back. The photo was not touched."
+            } ?? "Removed — the photo was not touched."
+        } catch {
+            model.statusMessage = "Could not remove the face: \(error.localizedDescription)"
+        }
     }
 
     /// Pins a face as a match reference — the reviewed views of a person
@@ -3129,29 +3156,45 @@ final class EventsWorkspace {
         try? faceStore.person(id)
     }
 
-    /// Cheap CPU-only pass after roster changes: re-match stored vectors to
-    /// the gallery without re-reading a single photo.
+    /// The Re-match button: re-matches every stored, unconfirmed face to
+    /// named people, then rebundles the unnamed "Person N" groups so a
+    /// drifted cluster can split into real ones — all on stored vectors,
+    /// so no photo is re-read, no ML runs, and nothing on disk moves.
+    /// Named groups keep their faces; confirmed faces never move.
     func rematchFaces() {
         let catalogURL = catalogDatabaseURL
         let configuration = model.configuration
         model.runAsyncJob(
             action: .faceScan,
-            runningNote: "Re-matching faces to named people",
+            runningNote: "Re-matching and regrouping stored faces",
             logTitle: "Re-matched faces",
-            logDetail: "Stored face vectors were compared to the current roster. No photos were re-read and no ML ran.",
+            logDetail: "Stored face vectors were matched to named people and the unnamed groups were rebundled — a drifted cluster can split into real groups. No photos were re-read, no ML ran, and no files or events moved.",
             operation: { progress in
                 _ = try CatalogStore(url: catalogURL).bootstrap(
                     configuration: configuration,
                     createBackup: false,
                     createLibraryFolders: false
                 )
-                try FaceIndexService(catalogURL: catalogURL).rematchRoster { update in
+                return try FaceIndexService(catalogURL: catalogURL).rematchRoster { update in
                     progress(DashboardModel.jobUpdate(from: update, notePrefix: "Matching", command: ""))
                 }
             },
-            completion: { [weak self] _ in
+            completion: { [weak self] report in
                 self?.facesRevision &+= 1
-                return "Re-matched faces against the updated roster."
+                guard report.facesMoved > 0 || report.groupsDissolved > 0 else {
+                    return "Re-match finished — nothing moved."
+                }
+                var parts = ["\(report.facesMoved) face\(report.facesMoved == 1 ? "" : "s") moved"]
+                if report.facesProposed > 0 {
+                    parts.append("\(report.facesProposed) matched to named people")
+                }
+                if report.groupsCreated > 0 {
+                    parts.append("\(report.groupsCreated) group\(report.groupsCreated == 1 ? "" : "s") formed")
+                }
+                if report.groupsDissolved > 0 {
+                    parts.append("\(report.groupsDissolved) dissolved")
+                }
+                return "Re-match done — \(parts.joined(separator: ", ")). Stored vectors only; nothing on disk moved."
             }
         )
     }

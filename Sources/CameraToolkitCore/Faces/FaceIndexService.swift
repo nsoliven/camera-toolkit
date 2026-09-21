@@ -385,23 +385,30 @@ public struct FaceIndexService: Sendable {
     }
 
     /// Re-matches every stored, unconfirmed embedding against the current
-    /// roster and re-groups the leftovers — the cheap pass that runs after
-    /// the roster changes. Reads vectors only; nothing is re-decoded and no
-    /// ML runs.
-    public func rematchRoster(progress: FileOperationProgressHandler? = nil) throws {
+    /// roster, then rebundles the unnamed groups: members of auto "Person
+    /// N" clusters re-pool so a drifted drawer can split into real groups.
+    /// Rejected faces never return to the person they were refused from,
+    /// and lookalikes closer to a rejected face than to the person's own
+    /// templates are vetoed. Groups the user named keep their faces, and
+    /// confirmed faces never move. Reads vectors only; nothing is
+    /// re-decoded and no ML runs. Returns the counts the status line shows.
+    @discardableResult
+    public func rematchRoster(progress: FileOperationProgressHandler? = nil) throws -> FaceScanReport {
         var report = FaceScanReport()
         try matchAndGroup(
             report: &report,
             progress: progress,
             telemetry: FaceScanTelemetry(),
-            facts: ["Vectors only — no decode, no ML"]
+            facts: ["Vectors only — no decode, no ML"],
+            rebundleGroups: true
         )
+        return report
     }
 
     /// Sends faces back through the grouping pass — used when a face is
-    /// rejected from a proposed match or pulled out of a group. Each face
-    /// joins the nearest existing group or seeds a new one. Confirmed faces
-    /// are never moved.
+    /// pulled out of a group without a verdict. Each face joins the
+    /// nearest group it may — rejections still bar the people it was
+    /// refused from — or seeds a new one. Confirmed faces are never moved.
     public func regroup(_ faceIDs: [UUID]) throws {
         var pool: [FaceRecord] = []
         for id in faceIDs {
@@ -409,7 +416,27 @@ public struct FaceIndexService: Sendable {
             try store.unassignFace(id)
             pool.append(face)
         }
-        _ = try assignToGroups(pool, options: options)
+        _ = try assignToGroups(pool, options: options, rejections: try store.faceRejections())
+        try store.refreshFaceCounts()
+    }
+
+    /// "Not this person" / "not this group": the verdict is persisted
+    /// first so the face can never be assigned back — and its embedding
+    /// becomes a negative example that vetoes lookalikes — then the face
+    /// goes through the same regrouping pass, landing in another group or
+    /// a new "Person N" cluster. Confirmed faces are frozen and never
+    /// move; the detection row and its photo stay untouched.
+    public func reject(_ faceIDs: [UUID]) throws {
+        var pool: [FaceRecord] = []
+        for id in faceIDs {
+            guard let face = try store.face(id: id), face.state != .confirmed else { continue }
+            if let personID = face.personID {
+                try store.recordRejection(personID: personID, faceID: id)
+            }
+            try store.unassignFace(id)
+            pool.append(face)
+        }
+        _ = try assignToGroups(pool, options: options, rejections: try store.faceRejections())
         try store.refreshFaceCounts()
     }
 
@@ -704,9 +731,20 @@ public struct FaceIndexService: Sendable {
         progress: FileOperationProgressHandler?,
         telemetry: FaceScanTelemetry? = nil,
         models: [String] = [],
-        facts: [String] = []
+        facts: [String] = [],
+        rebundleGroups: Bool = false
     ) throws {
         let faces = try store.matchableFaces()
+        let beforePersonIDs = Dictionary(uniqueKeysWithValues: faces.map { ($0.id, $0.personID) })
+        let rejections = try store.faceRejections()
+        // On a rebundle the automatic "Person N" clusters dissolve: their
+        // unconfirmed members re-pool so a drifted drawer can split into
+        // real groups. Groups the user named — a demoted roster person
+        // keeps its name — stay intact, and confirmed faces never move.
+        let autoGroups = rebundleGroups
+            ? try store.otherGroups().filter { Self.isAutoGroupName($0.name) }
+            : []
+        let dissolvingIDs = Set(autoGroups.map(\.id))
         let skipped = report.photosSkipped
         telemetry?.enterStage("Match")
         func matchProgress(_ processed: Int) -> FileOperationProgress {
@@ -726,22 +764,40 @@ public struct FaceIndexService: Sendable {
         var unmatched: [FaceRecord] = []
         for (index, face) in faces.enumerated() {
             guard let embedding = face.embedding else { continue }
-            if let match = Self.bestMatch(embedding, templates: templates, threshold: options.matchThreshold) {
+            if let match = Self.bestMatch(
+                embedding,
+                faceID: face.id,
+                templates: templates,
+                threshold: options.matchThreshold,
+                rejections: rejections
+            ) {
                 try store.assignFace(face.id, to: match.personID, state: .proposed, score: Double(match.score))
                 report.facesProposed += 1
                 telemetry?.noteMatch()
             } else if let personID = face.personID,
-                      let person = try store.person(personID), person.isRoster {
-                // A proposal that no longer holds returns to the pool.
+                      let person = try store.person(personID),
+                      person.isRoster || dissolvingIDs.contains(personID) {
+                // A proposal that no longer holds — or a member of a
+                // dissolving auto group — returns to the pool.
                 try store.unassignFace(face.id)
                 unmatched.append(face)
             } else if face.personID == nil {
                 unmatched.append(face)
             }
-            // Faces already in an Other group keep their grouping.
+            // Faces in groups left intact keep their grouping.
             if index % 200 == 0 {
                 progress?(matchProgress(index))
             }
+        }
+
+        // Emptied auto rows are recycled for the clusters this pass forms
+        // before any fresh "Person N" is minted — a cluster that reforms
+        // identically keeps its row, so a settled catalog reports no
+        // moves. Rows still holding faces (confirmed or embedding-less
+        // members that never enter the pool) stay as they are.
+        var reusable: [UUID] = []
+        for group in autoGroups where try store.isPersonEmpty(group.id) {
+            reusable.append(group.id)
         }
 
         telemetry?.enterStage("Group")
@@ -755,11 +811,24 @@ public struct FaceIndexService: Sendable {
                 facts: facts
             )
         ))
-        let grouped = try assignToGroups(unmatched, options: options)
+        let grouped = try assignToGroups(
+            unmatched,
+            options: options,
+            rejections: rejections,
+            reusableGroups: reusable
+        )
         telemetry?.noteGrouped(assigned: grouped.assigned, groupsCreated: grouped.created)
         report.facesGrouped = grouped.assigned
         report.groupsCreated = grouped.created
+        // Emptied rows the pass did not reuse are gone — the dissolve is
+        // real. Nothing user-named is ever deleted here.
+        for group in autoGroups where try store.deleteEmptyGroup(group.id) {
+            report.groupsDissolved += 1
+        }
         try store.refreshFaceCounts()
+        report.facesMoved = try store.matchableFaces()
+            .filter { beforePersonIDs[$0.id] != $0.personID }
+            .count
         progress?(FileOperationProgress(
             phase: "Grouping faces",
             processedFiles: unmatched.count,
@@ -772,28 +841,45 @@ public struct FaceIndexService: Sendable {
         ))
     }
 
-    /// Best roster template for an embedding, or nil below the threshold.
+    /// Best roster person for an embedding, or nil below the threshold.
+    /// Each person's score is its best template cosine; candidates are
+    /// tried strongest first. A face never returns to a person it was
+    /// rejected from, and a candidate closer to that person's rejected
+    /// faces than to its own templates is vetoed — the cheap negative
+    /// check, no second model.
     static func bestMatch(
         _ embedding: [Float],
+        faceID: UUID,
         templates: [(personID: UUID, embedding: [Float])],
-        threshold: Float
+        threshold: Float,
+        rejections: FaceRejectionIndex
     ) -> (personID: UUID, score: Float)? {
-        var best: (UUID, Float)?
+        var bestByPerson: [UUID: Float] = [:]
         for template in templates {
             let score = FaceEmbeddingMath.cosine(embedding, template.embedding)
-            if score >= threshold, score > (best?.1 ?? -.infinity) {
-                best = (template.personID, score)
+            if score >= threshold, score > (bestByPerson[template.personID] ?? -.infinity) {
+                bestByPerson[template.personID] = score
             }
         }
-        return best
+        for (personID, score) in bestByPerson.sorted(by: { $0.value > $1.value }) {
+            if rejections.blocks(faceID: faceID, personID: personID) { continue }
+            if rejections.vetoes(embedding, personID: personID, score: score) { continue }
+            return (personID, score)
+        }
+        return nil
     }
 
     /// Greedy cosine grouping: faces in detection-confidence order join the
     /// nearest existing group at or above `clusterThreshold`, else seed a
-    /// new "Person N" group whose centroid updates as members join.
+    /// cluster — reusing an emptied "Person N" row when the rebundle left
+    /// one, else minting a new group — whose centroid updates as members
+    /// join. Rejections bar the people a face was refused from and veto
+    /// any group whose rejected faces beat its centroid.
     private func assignToGroups(
         _ faces: [FaceRecord],
-        options: FaceScanOptions
+        options: FaceScanOptions,
+        rejections: FaceRejectionIndex,
+        reusableGroups: [UUID] = []
     ) throws -> (assigned: Int, created: Int) {
         let store = self.store
         let groupEmbeddings = try store.groupEmbeddings()
@@ -805,6 +891,7 @@ public struct FaceIndexService: Sendable {
             }
         }
 
+        var reusable = reusableGroups
         var assigned = 0
         var created = 0
         // Deterministic order: most confident detections form groups first.
@@ -813,8 +900,13 @@ public struct FaceIndexService: Sendable {
             var bestIndex: Int?
             var bestScore: Float = options.clusterThreshold
             for (index, entry) in centroids.enumerated() {
+                // Never back to a person this face was rejected from.
+                if rejections.blocks(faceID: face.id, personID: entry.personID) { continue }
                 let score = FaceEmbeddingMath.cosine(embedding, entry.centroid)
                 if score >= bestScore {
+                    // The group's rejected faces must not describe this
+                    // face better than the group itself does.
+                    if rejections.vetoes(embedding, personID: entry.personID, score: score) { continue }
                     bestScore = score
                     bestIndex = index
                 }
@@ -828,6 +920,14 @@ public struct FaceIndexService: Sendable {
                 for i in updated.indices { updated[i] += embedding[i] }
                 centroids[bestIndex].members += 1
                 centroids[bestIndex].centroid = FaceEmbeddingMath.l2Normalized(updated)
+            } else if let reuseIndex = reusable.firstIndex(where: {
+                !rejections.blocks(faceID: face.id, personID: $0)
+            }) {
+                // Recycle an emptied "Person N" row before minting a new
+                // one — but never a row this face was rejected from.
+                personID = reusable.remove(at: reuseIndex)
+                centroids.append((personID, embedding, 1))
+                created += 1
             } else {
                 let group = try store.createPerson(name: store.nextGroupName(), isRoster: false)
                 personID = group.id
@@ -838,5 +938,13 @@ public struct FaceIndexService: Sendable {
             assigned += 1
         }
         return (assigned, created)
+    }
+
+    /// True for the automatic "Person N" labels `nextGroupName` mints —
+    /// the clusters a re-match may dissolve and rebuild. Anything else
+    /// counts as user-named (a demoted roster person keeps its name) and
+    /// is left intact.
+    static func isAutoGroupName(_ name: String) -> Bool {
+        name.hasPrefix("Person ") && Int(name.dropFirst("Person ".count)) != nil
     }
 }

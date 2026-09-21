@@ -182,8 +182,8 @@ private struct PeopleView: View {
             } label: {
                 Label("Re-match", systemImage: "arrow.triangle.2.circlepath")
             }
-            .disabled(roster.isEmpty || model.isBusy)
-            .help("Compare every stored face against the current roster. No photos are re-read.")
+            .disabled(model.isBusy || (roster.isEmpty && groups.isEmpty && unsure.isEmpty))
+            .help("Match stored faces to named people and rebuild the unnamed groups — a group that collected different people can split. Reads the catalog's stored vectors only: no rescan, and no files or events move.")
             Button {
                 clearingFaceIndex = true
             } label: {
@@ -487,7 +487,7 @@ private struct PeopleView: View {
             Button("Not \(personName)") {
                 workspace.rejectFace(face.id)
             }
-            .help("Moves the face back into the unnamed groups")
+            .help("Removes the face — it lands in another group and can never be matched to \(personName) again")
             Button("Confirm") {
                 workspace.confirmFace(face.id)
             }
@@ -621,7 +621,7 @@ private struct ClearFaceScanSheet: View {
                 .font(.callout.weight(.semibold))
                 .padding(.leading, 8)
             }
-            Text("Only catalog rows are deleted — face_photos, faces, people, and face_templates. Photos, RAW, video, XMP sidecars, event assignments, events, and .Camera Toolkit/_Trash are not touched. Nothing is moved or deleted on disk.")
+            Text("Only catalog rows are deleted — face_photos, faces, people, face_templates, and face_rejections. Photos, RAW, video, XMP sidecars, event assignments, events, and .Camera Toolkit/_Trash are not touched. Nothing is moved or deleted on disk.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
