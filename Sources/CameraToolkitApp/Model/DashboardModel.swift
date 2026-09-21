@@ -37,6 +37,7 @@ struct BackgroundJobUpdate: Sendable {
     var processedBytes: Int64
     var totalBytes: Int64
     var bytesPerSecond: Double
+    var telemetry: JobTelemetry?
 
     init(
         progress: Double,
@@ -51,7 +52,8 @@ struct BackgroundJobUpdate: Sendable {
         totalFiles: Int = 0,
         processedBytes: Int64 = 0,
         totalBytes: Int64 = 0,
-        bytesPerSecond: Double = 0
+        bytesPerSecond: Double = 0,
+        telemetry: JobTelemetry? = nil
     ) {
         self.progress = progress
         self.note = note
@@ -66,6 +68,7 @@ struct BackgroundJobUpdate: Sendable {
         self.processedBytes = processedBytes
         self.totalBytes = totalBytes
         self.bytesPerSecond = bytesPerSecond
+        self.telemetry = telemetry
     }
 }
 
@@ -1719,7 +1722,8 @@ extension DashboardModel {
             totalFiles: update.totalFiles,
             processedBytes: update.processedBytes,
             totalBytes: update.totalBytes,
-            bytesPerSecond: update.bytesPerSecond
+            bytesPerSecond: update.bytesPerSecond,
+            telemetry: update.telemetry
         )
     }
 
@@ -2098,6 +2102,9 @@ extension DashboardModel {
         jobs[index].processedBytes = update.processedBytes
         jobs[index].totalBytes = update.totalBytes
         jobs[index].bytesPerSecond = update.bytesPerSecond
+        if let telemetry = update.telemetry {
+            jobs[index].telemetry = telemetry
+        }
 
         let phase = update.phase.lowercased()
         let changesStoredBytes = phase.contains("copying") || phase.contains("removing from camera")
