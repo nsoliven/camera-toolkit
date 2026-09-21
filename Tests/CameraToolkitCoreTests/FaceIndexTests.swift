@@ -36,6 +36,12 @@ final class FaceIndexTests: XCTestCase {
             XCTAssertTrue(faceKeys.contains("face_photos"))
             XCTAssertTrue(faceKeys.contains("people"))
 
+            // people carries the user-picked cover column.
+            XCTAssertTrue(
+                scalarRows("PRAGMA table_info(people)", database: catalog)
+                    .contains { $0.count > 1 && $0[1] == "cover_face_id" }
+            )
+
             // Re-running bootstrap is a no-op.
             _ = try CatalogStore(url: catalog).bootstrap(
                 configuration: faceTestConfiguration(root: root, catalog: catalog),
@@ -43,6 +49,122 @@ final class FaceIndexTests: XCTestCase {
                 createLibraryFolders: false
             )
             XCTAssertEqual(scalarString("PRAGMA integrity_check", database: catalog), "ok")
+        }
+    }
+
+    func testBootstrapGraftsCoverColumnOntoOlderCatalogs() throws {
+        try withTemporaryDirectory { root in
+            let catalog = root.appendingPathComponent("catalog.sqlite")
+            _ = try CatalogStore(url: catalog).bootstrap(
+                configuration: faceTestConfiguration(root: root, catalog: catalog),
+                createBackup: false,
+                createLibraryFolders: false
+            )
+
+            // Simulate a catalog from before the column existed.
+            var database: OpaquePointer?
+            XCTAssertEqual(sqlite3_open(catalog.path, &database), SQLITE_OK)
+            XCTAssertEqual(
+                sqlite3_exec(database, "ALTER TABLE people DROP COLUMN cover_face_id", nil, nil, nil),
+                SQLITE_OK
+            )
+            sqlite3_close(database)
+            XCTAssertFalse(
+                scalarRows("PRAGMA table_info(people)", database: catalog)
+                    .contains { $0.count > 1 && $0[1] == "cover_face_id" }
+            )
+
+            _ = try CatalogStore(url: catalog).bootstrap(
+                configuration: faceTestConfiguration(root: root, catalog: catalog),
+                createBackup: false,
+                createLibraryFolders: false
+            )
+            XCTAssertTrue(
+                scalarRows("PRAGMA table_info(people)", database: catalog)
+                    .contains { $0.count > 1 && $0[1] == "cover_face_id" }
+            )
+            XCTAssertEqual(scalarString("PRAGMA integrity_check", database: catalog), "ok")
+        }
+    }
+
+    // MARK: - Person cover
+
+    func testCoverFacePrefersPinnedChoice() throws {
+        try withFaceStore { store, _ in
+            let dad = try store.createPerson(name: "Dad", isRoster: true)
+            let photo = photoRecord("COV1.JPG")
+            let sharp = faceRecord(photo, detScore: 0.95, state: .confirmed, personID: dad.id)
+            let blurry = faceRecord(
+                photo,
+                box: NormalizedFaceBox(x: 0.5, y: 0.5, width: 0.2, height: 0.2),
+                detScore: 0.5,
+                state: .confirmed,
+                personID: dad.id
+            )
+            try store.replaceFaces(photo: photo, faces: [sharp, blurry])
+
+            // Auto-pick: the most confident detection.
+            XCTAssertEqual(try store.coverFace(personID: dad.id)?.id, sharp.id)
+            XCTAssertNil(try store.person(dad.id)?.coverFaceID)
+
+            // The pinned face wins over det_score and persists on the person.
+            XCTAssertTrue(try store.setCoverFace(personID: dad.id, faceID: blurry.id))
+            XCTAssertEqual(try store.coverFace(personID: dad.id)?.id, blurry.id)
+            XCTAssertEqual(try store.person(dad.id)?.coverFaceID, blurry.id)
+        }
+    }
+
+    func testCoverFaceFallsBackWhenPinnedFaceLeaves() throws {
+        try withFaceStore { store, _ in
+            let dad = try store.createPerson(name: "Dad", isRoster: true)
+            let photo = photoRecord("COV2.JPG")
+            let sharp = faceRecord(photo, detScore: 0.95, state: .confirmed, personID: dad.id)
+            let loose = faceRecord(
+                photo,
+                box: NormalizedFaceBox(x: 0.5, y: 0.5, width: 0.2, height: 0.2),
+                detScore: 0.5,
+                state: .proposed,
+                personID: dad.id
+            )
+            try store.replaceFaces(photo: photo, faces: [sharp, loose])
+            XCTAssertTrue(try store.setCoverFace(personID: dad.id, faceID: loose.id))
+            XCTAssertEqual(try store.coverFace(personID: dad.id)?.id, loose.id)
+
+            // Rejecting the cover face unpins it; the highest-score member
+            // stands in again.
+            try store.unassignFace(loose.id)
+            XCTAssertNil(try store.person(dad.id)?.coverFaceID)
+            XCTAssertEqual(try store.coverFace(personID: dad.id)?.id, sharp.id)
+
+            // A rescan that drops the pinned face falls back the same way —
+            // the stale id on the row matches nothing of this person.
+            let pinned = faceRecord(
+                photo,
+                box: NormalizedFaceBox(x: 0.5, y: 0.5, width: 0.2, height: 0.2),
+                detScore: 0.5,
+                state: .proposed,
+                personID: dad.id
+            )
+            try store.replaceFaces(photo: photo, faces: [pinned])
+            XCTAssertTrue(try store.setCoverFace(personID: dad.id, faceID: pinned.id))
+            try store.replaceFaces(photo: photo, faces: [])
+            XCTAssertEqual(try store.coverFace(personID: dad.id)?.id, sharp.id)
+        }
+    }
+
+    func testSetCoverFaceRefusesAFaceOwnedBySomeoneElse() throws {
+        try withFaceStore { store, _ in
+            let dad = try store.createPerson(name: "Dad", isRoster: true)
+            let mom = try store.createPerson(name: "Mom", isRoster: true)
+            let photo = photoRecord("COV3.JPG")
+            let momFace = faceRecord(photo, state: .confirmed, personID: mom.id)
+            try store.replaceFaces(photo: photo, faces: [momFace])
+
+            XCTAssertFalse(try store.setCoverFace(personID: dad.id, faceID: momFace.id))
+            XCTAssertNil(try store.person(dad.id)?.coverFaceID)
+            // Dad's cover stays on the automatic pick — which is nil here
+            // since Dad has no faces at all.
+            XCTAssertNil(try store.coverFace(personID: dad.id))
         }
     }
 

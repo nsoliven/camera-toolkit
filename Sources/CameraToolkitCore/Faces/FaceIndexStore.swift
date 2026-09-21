@@ -291,15 +291,47 @@ public final class FaceIndexStore: @unchecked Sendable {
         }
     }
 
-    /// One face to represent a person in review lists — the most confident
-    /// detection, which is usually the clearest portrait.
+    /// One face to represent a person in review lists — the face the user
+    /// pinned as cover when it still belongs to the person, else the most
+    /// confident detection, which is usually the clearest portrait.
     public func coverFace(personID: UUID) throws -> FaceRecord? {
         try database().read { database in
             try Row.fetchOne(
                 database,
-                sql: "\(Self.faceSelect) WHERE f.person_id = ? ORDER BY f.det_score DESC LIMIT 1",
+                sql: """
+                \(Self.faceSelect)
+                WHERE f.person_id = ?
+                ORDER BY (f.id = (
+                    SELECT cover_face_id FROM people WHERE people.id = f.person_id
+                )) DESC, f.det_score DESC
+                LIMIT 1
+                """,
                 arguments: [personID.uuidString]
             ).map { Self.faceRecord($0) }
+        }
+    }
+
+    /// Pins a face as the person's cover thumbnail — the People-list image.
+    /// Refuses a face that belongs to someone else, so a stale id can never
+    /// borrow another person's detection. Returns whether the row updated.
+    @discardableResult
+    public func setCoverFace(personID: UUID, faceID: UUID) throws -> Bool {
+        try database().write { database in
+            try database.execute(
+                sql: """
+                UPDATE people SET cover_face_id = ?, updated_at = ?
+                WHERE id = ? AND EXISTS(
+                    SELECT 1 FROM faces WHERE faces.id = ? AND faces.person_id = people.id
+                )
+                """,
+                arguments: [
+                    faceID.uuidString,
+                    Self.formatter().string(from: Date()),
+                    personID.uuidString,
+                    faceID.uuidString,
+                ]
+            )
+            return database.changesCount > 0
         }
     }
 
@@ -442,6 +474,12 @@ public final class FaceIndexStore: @unchecked Sendable {
             )
             try database.execute(
                 sql: "DELETE FROM face_templates WHERE face_id = ?",
+                arguments: [faceID.uuidString]
+            )
+            // A cover only makes sense while the face still belongs to the
+            // person — drop the pin so the row falls back to auto-pick.
+            try database.execute(
+                sql: "UPDATE people SET cover_face_id = NULL WHERE cover_face_id = ?",
                 arguments: [faceID.uuidString]
             )
         }
@@ -755,7 +793,8 @@ public final class FaceIndexStore: @unchecked Sendable {
             id: UUID(uuidString: row["id"] as String? ?? "") ?? UUID(),
             name: row["name"],
             isRoster: (row["is_roster"] as Int64? ?? 0) != 0,
-            faceCount: Int(row["face_count"] as Int64? ?? 0)
+            faceCount: Int(row["face_count"] as Int64? ?? 0),
+            coverFaceID: (row["cover_face_id"] as String?).flatMap(UUID.init(uuidString:))
         )
     }
 }

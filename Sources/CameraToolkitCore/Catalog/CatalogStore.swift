@@ -151,6 +151,7 @@ public struct CatalogStore {
             name TEXT NOT NULL,
             is_roster INTEGER NOT NULL DEFAULT 0,
             face_count INTEGER NOT NULL DEFAULT 0,
+            cover_face_id TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
@@ -190,6 +191,9 @@ public struct CatalogStore {
         // `parent_event_id` was added after the first catalogs shipped, so
         // databases that already have `events` need the column grafted on.
         try ensureColumn(table: "events", column: "parent_event_id", definition: "parent_event_id TEXT", database: database)
+        // `cover_face_id` is the user-picked People-list thumbnail; older
+        // catalogs get it grafted on the same way.
+        try ensureColumn(table: "people", column: "cover_face_id", definition: "cover_face_id TEXT", database: database)
 
         try execute("BEGIN IMMEDIATE;", database: database)
         do {
