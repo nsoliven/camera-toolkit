@@ -2086,9 +2086,13 @@ final class EventsWorkspace {
                     }
                     detector = loaded
                 }
-                var items = existing?.items
-                if items == nil {
-                    items = try OrganizeScanner().scan(root: root, cache: cache) { update in
+                var scanResult = existing
+                if scanResult == nil {
+                    scanResult = try OrganizeScanner().scan(
+                        root: root,
+                        cache: cache,
+                        burstGrouping: BurstGroupingConfiguration.resolved()
+                    ) { update in
                         progress(DashboardModel.jobUpdate(
                             from: FileOperationProgress(
                                 phase: update.phase,
@@ -2100,13 +2104,16 @@ final class EventsWorkspace {
                             notePrefix: "Reading",
                             command: ""
                         ))
-                    }.items
+                    }
                 }
                 let lowerBound = existing == nil ? 0.25 : 0.02
+                // The scan result's burst stacks drive sampling — a burst
+                // decodes a few spread frames instead of every still.
                 return try FaceIndexService(catalogURL: catalogURL, options: options).scan(
-                    items: items ?? [],
+                    items: scanResult?.items ?? [],
                     embedder: embedder,
-                    detector: detector
+                    detector: detector,
+                    stacks: scanResult?.stacks
                 ) { update in
                     progress(DashboardModel.jobUpdate(
                         from: update,
@@ -2120,7 +2127,8 @@ final class EventsWorkspace {
             completion: { [weak self] report in
                 self?.facesRevision &+= 1
                 let video = report.videoFramesRead > 0 ? "; \(report.videoFramesRead) video frames read" : ""
-                return "Face scan done — \(report.facesDetected) face\(report.facesDetected == 1 ? "" : "s") on \(report.photosProcessed) new photo(s); \(report.photosSkipped) already scanned; \(report.facesProposed) matched to people, \(report.facesGrouped) grouped\(video)."
+                let burst = report.photosBurstCovered > 0 ? "; \(report.photosBurstCovered) burst frames covered by sampled siblings" : ""
+                return "Face scan done — \(report.facesDetected) face\(report.facesDetected == 1 ? "" : "s") on \(report.photosProcessed) new photo(s); \(report.photosSkipped) already scanned\(burst); \(report.facesProposed) matched to people, \(report.facesGrouped) grouped\(video)."
             }
         )
     }

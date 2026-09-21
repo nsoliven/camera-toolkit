@@ -345,6 +345,9 @@ public struct FaceScanReport: Equatable, Sendable {
     public var groupsCreated: Int = 0
     /// Video frames sampled in MED/HIGH passes.
     public var videoFramesRead: Int = 0
+    /// Burst members covered by a sibling's sample — stamped at the
+    /// executed grade without being decoded.
+    public var photosBurstCovered: Int = 0
 
     public init() {}
 }
