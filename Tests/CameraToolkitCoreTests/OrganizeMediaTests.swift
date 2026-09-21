@@ -105,6 +105,41 @@ final class OrganizeMediaTests: XCTestCase {
         XCTAssertEqual(days.map(\.id), ["2026-08-26", "2026-08-27"])
     }
 
+    /// Days only exist where stacks exist — `days(for:)` must not fill the
+    /// calendar gap between two dated stacks with empty days.
+    func testDaysDoNotInventGapDaysBetweenDatedStacks() {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = .current
+        // Sunday the 23rd and Wednesday the 26th — the empty Monday and
+        // Tuesday between them must not appear.
+        let stacks = [
+            OrganizeStack(items: [organizeItem("/s/DSC00001.ARW", date: exifDate("2026:08:23 10:00:00"))]),
+            OrganizeStack(items: [organizeItem("/s/DSC00002.ARW", date: exifDate("2026:08:26 10:00:00"))]),
+        ]
+        let days = OrganizeStacker.days(for: stacks, calendar: calendar)
+        XCTAssertEqual(days.map(\.id), ["2026-08-23", "2026-08-26"])
+        XCTAssertTrue(days.allSatisfy { !$0.stacks.isEmpty })
+    }
+
+    /// Every stack on a day counts toward that day's frame and byte
+    /// totals — a day holding stacks can never total 0.
+    func testDayTotalsIncludeEveryStackOnTheDay() {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = .current
+        let burst = OrganizeStack(items: [
+            organizeItem("/s/B0001_DSC00001.ARW", date: exifDate("2026:08:26 09:00:00")),
+            organizeItem("/s/B0001_DSC00002.ARW", date: exifDate("2026:08:26 09:00:01")),
+            organizeItem("/s/B0001_DSC00003.ARW", date: exifDate("2026:08:26 09:00:02")),
+        ])
+        let single = OrganizeStack(items: [organizeItem("/s/DSC00004.ARW", date: exifDate("2026:08:26 12:00:00"))])
+        let days = OrganizeStacker.days(for: [single, burst], calendar: calendar)
+        let day = days.first { $0.id == "2026-08-26" }
+        XCTAssertEqual(day?.stacks.map(\.id), [single.id, burst.id])
+        XCTAssertEqual(day?.frameCount, 4)
+        // organizeItem fixtures are 10 bytes each.
+        XCTAssertEqual(day?.byteCount, 40)
+    }
+
     func testScannerReadsHeadersGroupsBurstsAndShiftsVideoClock() throws {
         try withTemporaryDirectory { root in
             // The camera clock runs 15 hours ahead of the files' real modification times.
