@@ -177,7 +177,7 @@ struct EventsSidebar: View {
                 Button {
                     workspace.startGuide()
                 } label: {
-                    Label("Guide", systemImage: "questionmark.circle")
+                    Label("Guide…", systemImage: "questionmark.circle")
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
@@ -273,7 +273,7 @@ struct EventsSidebar: View {
                         Button {
                             workspace.requestNewEvent(from: nil)
                         } label: {
-                            Label("New Event", systemImage: "plus")
+                            Label("New Event…", systemImage: "plus")
                                 .font(.caption)
                         }
                         .buttonStyle(.borderless)
@@ -392,7 +392,7 @@ struct EventsSidebar: View {
     private var footer: some View {
         VStack(spacing: 2) {
             footerButton(
-                "Jobs",
+                "Jobs…",
                 detail: model.activeJob?.note
                     ?? model.transferQueue?.sidebarSummary.detail
                     ?? (model.pendingTransferFileCount > 0 ? "\(model.pendingTransferFileCount) waiting" : nil),
@@ -401,7 +401,7 @@ struct EventsSidebar: View {
                 TransferQueueWindowController.shared.show(model: model)
             }
             footerButton(
-                "People",
+                "People…",
                 detail: workspace.faceModelInstalled ? nil : "model missing",
                 symbol: "person.2"
             ) {
@@ -458,7 +458,7 @@ struct EventsWelcomeView: View {
                 Button {
                     workspace.startGuide()
                 } label: {
-                    Label("Start Guided Setup", systemImage: "play.circle.fill")
+                    Label("Start Guided Setup…", systemImage: "play.circle.fill")
                         .font(.title3.weight(.semibold))
                         .padding(.horizontal, 20)
                         .padding(.vertical, 8)
@@ -485,7 +485,7 @@ struct EventsWelcomeView: View {
 
                 HStack {
                     Button("Add Folder or Card…") { workspace.addUnsortedFolder() }
-                    Button("New Event") { workspace.requestNewEvent(from: nil) }
+                    Button("New Event…") { workspace.requestNewEvent(from: nil) }
                 }
                 .padding(.bottom, 40)
             }

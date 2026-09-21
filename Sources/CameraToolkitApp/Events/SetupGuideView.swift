@@ -365,7 +365,7 @@ struct SetupGuidePanel: View {
             GuideBullet(symbol: "bolt.fill", text: "Files already on your travel drive move into the event folder instantly.")
             GuideBullet(symbol: "sdcard", text: "Files on a card are copied and checked. The card keeps its originals.")
             GuideBullet(symbol: "arrow.uturn.left", text: "Undo moves files back if you change your mind.")
-            Button(guide.pendingApplyCount > 0 ? "Show Me the Apply Plan for \(guide.pendingApplyCount) Files" : "Show Me the Apply Plan") {
+            Button(guide.pendingApplyCount > 0 ? "Show Me the Apply Plan for \(guide.pendingApplyCount) Files…" : "Show Me the Apply Plan…") {
                 guide.showApplyPlan()
             }
             .buttonStyle(.borderedProminent)
