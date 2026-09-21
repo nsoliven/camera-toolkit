@@ -774,7 +774,7 @@ final class EventsWorkspaceTests: XCTestCase {
         }
     }
 
-    func testNewEventRequestAssignsPreviewedStackToCreatedEvent() async throws {
+    func testNewEventRequestDoesNotAssignOnCreate() async throws {
         try await withOrganizerSandbox { root, model, workspace in
             let unsorted = root.appendingPathComponent("Drive/Unsorted A7V", isDirectory: true)
             try writeOrganizerARW(unsorted.appendingPathComponent("B0009_DSC00001.ARW"), "2026:08:26 10:00:00", "000")
@@ -796,12 +796,13 @@ final class EventsWorkspaceTests: XCTestCase {
             XCTAssertNil(workspace.newEventRequest)
 
             let created = try XCTUnwrap(model.configuration.savedEvents.first { $0.name == "New Gig" })
-            XCTAssertEqual(workspace.assignedEvent(for: burst).event?.id, created.id)
+            XCTAssertNil(workspace.assignedEvent(for: burst).event)
+            XCTAssertFalse(workspace.isSorted(burst))
             XCTAssertTrue(workspace.recentEvents.contains { $0.id == created.id })
         }
     }
 
-    func testNewEventRequestMovesEventBoardStackIntoCreatedEvent() async throws {
+    func testNewEventRequestDoesNotMoveEventBoardStackOnCreate() async throws {
         try await withOrganizerSandbox { root, model, workspace in
             let unsorted = root.appendingPathComponent("Drive/Unsorted A7V", isDirectory: true)
             try writeOrganizerARW(unsorted.appendingPathComponent("B0007_DSC00001.ARW"), "2026:08:27 09:00:00", "000")
@@ -837,9 +838,8 @@ final class EventsWorkspaceTests: XCTestCase {
             XCTAssertNil(workspace.newEventRequest)
 
             let created = try XCTUnwrap(model.configuration.savedEvents.first { $0.name == "After Party" })
-            try await waitUntil { !model.isBusy && workspace.latestMoveJournalTitle == "Move to After Party" }
-            XCTAssertEqual(model.configuration.photoEventAssignments.filter { $0.eventID == created.id }.count, 2)
-            XCTAssertTrue(model.configuration.photoEventAssignments.filter { $0.eventID == shared }.isEmpty)
+            XCTAssertEqual(model.configuration.photoEventAssignments.filter { $0.eventID == shared }.count, 2)
+            XCTAssertTrue(model.configuration.photoEventAssignments.filter { $0.eventID == created.id }.isEmpty)
             XCTAssertTrue(workspace.recentEvents.contains { $0.id == created.id })
         }
     }

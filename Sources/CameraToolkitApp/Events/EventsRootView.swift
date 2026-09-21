@@ -58,7 +58,7 @@ struct EventsRootView: View {
         .sheet(item: $workspace.newEventRequest) { request in
             EventDetailsSheet(
                 title: "New Event",
-                confirmTitle: request.stackIDs.isEmpty ? "Create Event" : "Create and Sort \(request.stackIDs.count)",
+                confirmTitle: "Create Event",
                 initialName: "",
                 initialDate: request.suggestedDate,
                 initialPolicy: request.parentEventID == nil ? .buffer : nil,
@@ -544,15 +544,18 @@ struct EventDetailsSheet: View {
         VStack(alignment: .leading, spacing: 16) {
             Text(title)
                 .font(.title2.bold())
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Name")
+                    .font(.headline)
+                EventNameField(text: $name, isFocused: $isNameFocused, onSubmit: save)
+                    .frame(height: 24)
+            }
+            if !name.isEmpty, let error = validation.errorMessage {
+                Label(error, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
             Form {
-                TextField("Name", text: $name, prompt: Text("Beach day, Birthday, Client shoot…"))
-                    .focused($isNameFocused)
-                    .onSubmit(save)
-                if !name.isEmpty, let error = validation.errorMessage {
-                    Label(error, systemImage: "exclamationmark.triangle.fill")
-                        .font(.caption)
-                        .foregroundStyle(.red)
-                }
                 DatePicker("Date", selection: $date, displayedComponents: .date)
                 Picker("Inside event", selection: $parentEventID) {
                     Text("None — top level").tag(UUID?.none)
@@ -614,6 +617,61 @@ struct EventDetailsSheet: View {
     private func save() {
         guard validation.isValid else { return }
         onSave(validation.normalizedName, date, policy, parentEventID)
+    }
+}
+
+/// AppKit field so a trailing space is visible immediately. SwiftUI's
+/// grouped Form TextField on macOS swallows that space until the next key.
+private struct EventNameField: NSViewRepresentable {
+    @Binding var text: String
+    var isFocused: FocusState<Bool>.Binding
+    var onSubmit: () -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    func makeNSView(context: Context) -> NSTextField {
+        let field = NSTextField(string: text)
+        field.placeholderString = "Beach day, Birthday, Client shoot…"
+        field.font = .systemFont(ofSize: NSFont.systemFontSize)
+        field.delegate = context.coordinator
+        field.isBordered = true
+        field.isBezeled = true
+        field.bezelStyle = .roundedBezel
+        field.focusRingType = .default
+        field.lineBreakMode = .byClipping
+        field.cell?.isScrollable = true
+        field.cell?.wraps = false
+        field.cell?.usesSingleLineMode = true
+        field.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        return field
+    }
+
+    func updateNSView(_ field: NSTextField, context: Context) {
+        context.coordinator.parent = self
+        if field.stringValue != text, field.currentEditor() == nil {
+            field.stringValue = text
+        }
+        if isFocused.wrappedValue, field.window?.firstResponder !== field.currentEditor() {
+            field.window?.makeFirstResponder(field)
+        }
+    }
+
+    final class Coordinator: NSObject, NSTextFieldDelegate {
+        var parent: EventNameField
+        init(_ parent: EventNameField) { self.parent = parent }
+
+        func controlTextDidChange(_ notification: Notification) {
+            guard let field = notification.object as? NSTextField else { return }
+            parent.text = field.stringValue
+        }
+
+        func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+            if commandSelector == #selector(NSResponder.insertNewline(_:)) {
+                parent.onSubmit()
+                return true
+            }
+            return false
+        }
     }
 }
 
