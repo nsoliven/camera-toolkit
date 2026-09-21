@@ -331,28 +331,48 @@ final class EventsWorkspace {
     // MARK: - Search
 
     /// The board filter popover's shared state — unsorted boards, event
-    /// boards, and the sidebar's Events list all respond to its People
-    /// picks; each board field also edits its text needle.
+    /// boards, and the sidebar's Events list all evaluate the same
+    /// condition rows; each board field also edits its text needle.
     var search = OrganizeSearchFilter()
 
-    /// Sidebar rows matching the search query. Matching runs on each event's
-    /// breadcrumb title, so a hit on a parent's name still reveals its
-    /// subevents ("phil" shows PHIL2026 / Matcha), and on the named people
-    /// detected in the event ("dad" keeps events where Dad was seen).
-    /// `peopleIDs` — the popover's People picks — keeps only events whose
-    /// `event.people` roster intersects them. Empty query and no picks
-    /// returns all.
-    func sidebarRows(matching query: String, peopleIDs: Set<UUID> = []) -> [(event: SavedCameraEvent, depth: Int)] {
+    /// Sidebar rows matching the search query and the filter builder's
+    /// condition rows — the same OR-of-AND-groups match the boards run,
+    /// evaluated per event. Matching runs on each event's breadcrumb
+    /// title, so a hit on a parent's name still reveals its subevents
+    /// ("phil" shows PHIL2026 / Matcha), and on the named people detected
+    /// in the event ("dad" keeps events where Dad was seen). Rows test
+    /// `sidebarSubject(for:)`: People rows read the event's roster, Event
+    /// rows its own id, Media rows its assigned files' kinds, Date rows
+    /// its date. Empty query and no active rows returns all.
+    func sidebarRows(
+        matching query: String,
+        applying filter: OrganizeSearchFilter = OrganizeSearchFilter()
+    ) -> [(event: SavedCameraEvent, depth: Int)] {
         let needle = OrganizeSearch.needle(query)
-        guard !needle.isEmpty || !peopleIDs.isEmpty else { return sidebarEvents }
+        guard !needle.isEmpty || filter.hasActiveConditions else { return sidebarEvents }
         return sidebarEvents.filter { row in
             let textHit = needle.isEmpty
                 || OrganizeSearch.matches(eventTitle(row.event), needle: needle)
                 || eventPeople(row.event.id).contains { OrganizeSearch.matches($0.name, needle: needle) }
-            let peopleHit = peopleIDs.isEmpty
-                || eventPeople(row.event.id).contains { peopleIDs.contains($0.id) }
-            return textHit && peopleHit
+            guard textHit else { return false }
+            return OrganizeSearch.matches(
+                subject: sidebarSubject(for: row.event),
+                search: filter
+            )
         }
+    }
+
+    /// An event as filter-builder facts — the same subject a board builds
+    /// per stack: its roster people (`event.people`, unnamed groups never
+    /// count here), its own id so Event rows can pin or drop it, the media
+    /// kinds its assigned files carry, and its date as the capture span.
+    private func sidebarSubject(for event: SavedCameraEvent) -> OrganizeFilterSubject {
+        OrganizeFilterSubject(
+            personIDs: Set(eventPeople(event.id).map(\.id)),
+            eventIDs: [event.id],
+            mediaKinds: eventMediaKinds(for: event.id),
+            daySpan: event.eventDate...event.eventDate
+        )
     }
 
     /// Unsorted sidebar locations matching the search query on name or path.
@@ -569,14 +589,14 @@ final class EventsWorkspace {
     /// stacks and a non-empty `search` keeps only stacks matching the text
     /// needle — file name, burst label, origin subfolder, assigned event
     /// title, or the name of a person or group whose face sits on one of
-    /// the stack's files — and every selected filter facet.
+    /// the stack's files — and the builder's OR-of-AND condition groups.
     func visibleStacks(
         _ result: OrganizeScanResult,
         hideSorted: Bool,
         search: OrganizeSearchFilter = OrganizeSearchFilter()
     ) -> [OrganizeStack] {
         guard hideSorted || !search.isEmpty else { return result.stacks }
-        let peopleByStackID = search.peopleIDs.isEmpty ? [:] : boardPeople(for: result.stacks).byStackID
+        let peopleByStackID = search.needsPeople ? boardPeople(for: result.stacks).byStackID : [:]
         return result.stacks.filter { stack in
             if hideSorted, isSorted(stack) { return false }
             guard !search.isEmpty else { return true }
@@ -595,16 +615,14 @@ final class EventsWorkspace {
     }
 
     /// The stacks an event board should show under the same search state.
-    /// Every facet applies except Event — the board is one event already,
-    /// so a pick carried over from another board's popover is dropped
-    /// rather than emptying this one.
+    /// Every condition row applies except Event rows — the board is one
+    /// event already, so a pick carried over from another board's panel is
+    /// dropped rather than emptying this one.
     func visibleEventStacks(_ eventID: UUID, search: OrganizeSearchFilter) -> [OrganizeStack] {
         let stacks = eventStacks[eventID] ?? []
-        var scoped = search
-        scoped.eventIDs = []
-        scoped.includeUnsorted = false
+        let scoped = search.droppingEventRows()
         guard !scoped.isEmpty else { return stacks }
-        let peopleByStackID = scoped.peopleIDs.isEmpty ? [:] : boardPeople(for: stacks).byStackID
+        let peopleByStackID = scoped.needsPeople ? boardPeople(for: stacks).byStackID : [:]
         return stacks.filter {
             OrganizeSearch.matches(
                 stack: $0,
@@ -2815,6 +2833,30 @@ final class EventsWorkspace {
         }
         eventPeopleCache = (facesRevision, model.configurationRevision, people)
         return people[eventID] ?? []
+    }
+
+    /// (configurationRevision, media kinds by event) — the sidebar's
+    /// Media-row facts, rebuilt lazily so a filter pass shares one walk
+    /// of the assignments.
+    @ObservationIgnored private var eventMediaKindsCache: (Int, [UUID: Set<OrganizeMediaKind>])?
+
+    /// The media kinds an event's assigned files carry, by extension —
+    /// the same "any file in it has that kind" fact a board reads off a
+    /// stack's items.
+    private func eventMediaKinds(for eventID: UUID) -> Set<OrganizeMediaKind> {
+        if let cache = eventMediaKindsCache, cache.0 == model.configurationRevision {
+            return cache.1[eventID] ?? []
+        }
+        var kinds: [UUID: Set<OrganizeMediaKind>] = [:]
+        for assignment in model.configuration.photoEventAssignments {
+            kinds[assignment.eventID, default: []].insert(
+                OrganizeFileClassifier.kind(
+                    forExtension: (assignment.relativePath as NSString).pathExtension
+                )
+            )
+        }
+        eventMediaKindsCache = (model.configurationRevision, kinds)
+        return kinds[eventID] ?? []
     }
 
     /// Person and unnamed-group names detected on the stack's files, joined

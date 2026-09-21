@@ -109,55 +109,85 @@ final class OrganizeSearchTests: XCTestCase {
 
     // MARK: - Structured filter
 
+    /// Builds a search whose groups each hold the given condition rows.
+    private func filter(_ groups: [[OrganizeFilterRow]], text: String = "") -> OrganizeSearchFilter {
+        var search = OrganizeSearchFilter()
+        search.text = text
+        search.groups = groups.map { OrganizeFilterGroup(rows: $0) }
+        return search
+    }
+
     func testEmptyFilterMatchesEverything() {
         let stack = OrganizeStack(items: [item("/Card/DSC00001.ARW")])
         let search = OrganizeSearchFilter()
         XCTAssertTrue(search.isEmpty)
-        XCTAssertEqual(search.activeFacetCount, 0)
+        XCTAssertTrue(search.isUntouched)
+        XCTAssertFalse(search.hasActiveConditions)
+        XCTAssertEqual(search.activeRowCount, 0)
         XCTAssertTrue(matches(stack, search: search))
     }
 
-    func testPeopleFilterMatchesAnySelectedPersonOnTheStack() {
+    func testPeopleRowIncludesAnyPickedPerson() {
         let stack = OrganizeStack(items: [item("/Card/DSC00001.ARW")])
         let dad = UUID()
         let mom = UUID()
         let stranger = UUID()
 
-        var search = OrganizeSearchFilter()
-        search.peopleIDs = [dad]
+        var search = filter([[.people([dad])]])
         XCTAssertTrue(matches(stack, search: search, facts: OrganizeStackFacts(personIDs: [dad])))
         XCTAssertFalse(matches(stack, search: search, facts: OrganizeStackFacts(personIDs: [stranger])))
         XCTAssertFalse(matches(stack, search: search, facts: OrganizeStackFacts()))
 
-        // OR within the facet: any selected person qualifies the stack.
-        search.peopleIDs = [dad, mom]
+        // Any of two people: either picked person qualifies the stack.
+        search = filter([[.people([dad, mom])]])
         XCTAssertTrue(matches(stack, search: search, facts: OrganizeStackFacts(personIDs: [mom])))
+        XCTAssertTrue(matches(stack, search: search, facts: OrganizeStackFacts(personIDs: [dad])))
     }
 
-    func testEventFilterMatchesAssignedEventsAndUnsorted() {
+    func testPeopleRowExcludesPickedPerson() {
+        let stack = OrganizeStack(items: [item("/Card/DSC00001.ARW")])
+        let dad = UUID()
+        let nuisance = UUID()
+
+        // "is none of" drops a stack when a picked person is on its files.
+        let search = filter([[.people([nuisance], exclude: true)]])
+        XCTAssertFalse(matches(stack, search: search, facts: OrganizeStackFacts(personIDs: [nuisance])))
+        XCTAssertTrue(matches(stack, search: search, facts: OrganizeStackFacts(personIDs: [dad])))
+        XCTAssertTrue(matches(stack, search: search, facts: OrganizeStackFacts()))
+
+        // A stack carrying the excluded person beside another still drops.
+        XCTAssertFalse(matches(stack, search: search, facts: OrganizeStackFacts(personIDs: [dad, nuisance])))
+    }
+
+    func testEventRowMatchesAssignedEventsAndUnsorted() {
         let stack = OrganizeStack(items: [item("/Card/DSC00001.ARW")])
         let eventA = UUID()
         let eventB = UUID()
 
-        var search = OrganizeSearchFilter()
-        search.eventIDs = [eventA]
+        var search = filter([[.events([eventA])]])
         XCTAssertTrue(matches(stack, search: search, facts: OrganizeStackFacts(eventIDs: [eventA])))
         XCTAssertFalse(matches(stack, search: search, facts: OrganizeStackFacts(eventIDs: [eventB])))
         XCTAssertFalse(matches(stack, search: search, facts: OrganizeStackFacts()))
 
-        // "Not Sorted Yet" ORs with the named events.
-        search.includeUnsorted = true
+        // "Not Sorted Yet" ORs with the named events inside the same row.
+        search = filter([[.events([eventA], unsorted: true)]])
         XCTAssertTrue(matches(stack, search: search, facts: OrganizeStackFacts(eventIDs: [eventA])))
         XCTAssertTrue(matches(stack, search: search, facts: OrganizeStackFacts()))
         XCTAssertFalse(matches(stack, search: search, facts: OrganizeStackFacts(eventIDs: [eventB])))
 
         // Unsorted alone hides everything assigned.
-        search.eventIDs = []
+        search = filter([[.events([], unsorted: true)]])
         XCTAssertTrue(matches(stack, search: search, facts: OrganizeStackFacts()))
         XCTAssertFalse(matches(stack, search: search, facts: OrganizeStackFacts(eventIDs: [eventA])))
+
+        // "is none of" drops stacks assigned to a picked event.
+        search = filter([[.events([eventA], exclude: true)]])
+        XCTAssertFalse(matches(stack, search: search, facts: OrganizeStackFacts(eventIDs: [eventA])))
+        XCTAssertTrue(matches(stack, search: search, facts: OrganizeStackFacts(eventIDs: [eventB])))
+        XCTAssertTrue(matches(stack, search: search, facts: OrganizeStackFacts()))
     }
 
-    func testMediaKindFilterMatchesAnyItemKind() {
+    func testMediaRowMatchesAnyItemKind() {
         let raw = OrganizeStack(items: [item("/Card/DSC00001.ARW", kind: .raw)])
         let video = OrganizeStack(items: [item("/Card/C0001.MP4", kind: .video)])
         let mixed = OrganizeStack(items: [
@@ -165,18 +195,23 @@ final class OrganizeSearchTests: XCTestCase {
             item("/Card/C0002.MP4", kind: .video),
         ])
 
-        var search = OrganizeSearchFilter()
-        search.mediaKinds = [.raw]
+        var search = filter([[.media([.raw])]])
         XCTAssertTrue(matches(raw, search: search))
         XCTAssertFalse(matches(video, search: search))
         XCTAssertTrue(matches(mixed, search: search))
 
-        search.mediaKinds = [.video, .photo]
+        search = filter([[.media([.video, .photo])]])
         XCTAssertFalse(matches(raw, search: search))
         XCTAssertTrue(matches(video, search: search))
+
+        // "is none of" drops a stack when any item in it is a picked kind.
+        search = filter([[.media([.video], exclude: true)]])
+        XCTAssertTrue(matches(raw, search: search))
+        XCTAssertFalse(matches(video, search: search))
+        XCTAssertFalse(matches(mixed, search: search))
     }
 
-    func testDayRangeOverlapsStackCaptureInterval() {
+    func testDateRowOverlapsStackCaptureInterval() {
         let calendar = Calendar.current
         func day(_ month: Int, _ day: Int, hour: Int = 0, minute: Int = 0) -> Date {
             calendar.date(from: DateComponents(year: 2026, month: month, day: day, hour: hour, minute: minute))!
@@ -188,44 +223,92 @@ final class OrganizeSearchTests: XCTestCase {
         ])
         let single = OrganizeStack(items: [item("/Card/DSC00009.ARW", capturedAt: day(8, 27, hour: 15))])
 
-        var search = OrganizeSearchFilter()
-        search.dayStart = day(8, 26)
-        search.dayEnd = day(8, 26)
+        var search = filter([[.days(from: day(8, 26), to: day(8, 26))]])
         XCTAssertTrue(matches(burst, search: search))   // starts inside Aug 26
         XCTAssertFalse(matches(single, search: search))
 
-        search.dayStart = day(8, 27)
-        search.dayEnd = day(8, 27)
+        search = filter([[.days(from: day(8, 27), to: day(8, 27))]])
         XCTAssertTrue(matches(burst, search: search))   // ends inside Aug 27
         XCTAssertTrue(matches(single, search: search))
 
         // Open-ended ranges.
-        search.dayStart = nil
-        search.dayEnd = day(8, 26)
+        search = filter([[.days(from: nil, to: day(8, 26))]])
         XCTAssertTrue(matches(burst, search: search))
         XCTAssertFalse(matches(single, search: search))
 
-        search.dayStart = day(8, 28)
-        search.dayEnd = nil
+        search = filter([[.days(from: day(8, 28), to: nil)]])
         XCTAssertFalse(matches(burst, search: search))
         XCTAssertFalse(matches(single, search: search))
     }
 
-    func testFacetsAndTextComposeAsAnd() {
+    func testRowsInAGroupAndTogether() {
+        let stack = OrganizeStack(items: [item("/Card/DCIM/DSC00001.ARW", kind: .raw)])
+        let eileen = UUID()
+        let search = filter([[.people([eileen]), .media([.raw])]])
+
+        // The "Eileen, stills only" shape: both rows must hold.
+        XCTAssertTrue(matches(stack, search: search, facts: OrganizeStackFacts(personIDs: [eileen])))
+        XCTAssertFalse(matches(stack, search: search, facts: OrganizeStackFacts()))
+
+        let video = OrganizeStack(items: [item("/Card/DCIM/C0001.MP4", kind: .video)])
+        XCTAssertFalse(matches(video, search: search, facts: OrganizeStackFacts(personIDs: [eileen])))
+    }
+
+    func testGroupsOrTogether() {
+        let calendar = Calendar.current
+        func day(_ month: Int, _ day: Int) -> Date {
+            calendar.date(from: DateComponents(year: 2026, month: month, day: day))!
+        }
+        let eileen = UUID()
+        // "(Eileen and stills) or (a date range)".
+        let search = filter([
+            [.people([eileen]), .media([.photo])],
+            [.days(from: day(8, 26), to: day(8, 27))],
+        ])
+
+        let eileenStill = OrganizeStack(items: [item("/Card/DSC00001.HEIC", kind: .photo, capturedAt: day(9, 1))])
+        let inRange = OrganizeStack(items: [item("/Card/DSC00002.ARW", kind: .raw, capturedAt: day(8, 26))])
+        let eileenVideo = OrganizeStack(items: [item("/Card/C0001.MP4", kind: .video, capturedAt: day(9, 2))])
+        let outsider = OrganizeStack(items: [item("/Card/DSC00003.ARW", kind: .raw, capturedAt: day(9, 3))])
+
+        XCTAssertTrue(matches(eileenStill, search: search, facts: OrganizeStackFacts(personIDs: [eileen])))
+        XCTAssertTrue(matches(inRange, search: search))                          // group 2 alone
+        // Eileen on a video stack fails group 1's media row and lands
+        // outside group 2's range — neither group keeps it.
+        XCTAssertFalse(matches(eileenVideo, search: search, facts: OrganizeStackFacts(personIDs: [eileen])))
+        XCTAssertFalse(matches(outsider, search: search, facts: OrganizeStackFacts(personIDs: [eileen])))
+    }
+
+    func testRowsWithNoValuesDoNotFilter() {
+        let stack = OrganizeStack(items: [item("/Card/DSC00001.ARW")])
+        let person = UUID()
+
+        // A valueless row passes; a group of them never widens an OR.
+        var search = filter([[.people([])]])
+        XCTAssertTrue(search.isEmpty)
+        XCTAssertFalse(search.isUntouched)
+        XCTAssertTrue(matches(stack, search: search, facts: OrganizeStackFacts(personIDs: [person])))
+
+        // An unfinished second group must not unfilter the board — a stack
+        // failing group 1 stays out even though group 2 has no values yet.
+        search = filter([[.media([.video])], [.people([])]])
+        let video = OrganizeStack(items: [item("/Card/C0001.MP4", kind: .video)])
+        XCTAssertTrue(matches(video, search: search, facts: OrganizeStackFacts(personIDs: [person])))
+        XCTAssertFalse(matches(stack, search: search, facts: OrganizeStackFacts(personIDs: [person])))
+    }
+
+    func testGroupsAndTextComposeAsAnd() {
         let stack = OrganizeStack(items: [item("/Card/DCIM/DSC00001.ARW", kind: .raw)])
         let person = UUID()
 
-        var search = OrganizeSearchFilter()
-        search.text = "dsc00001"
-        search.mediaKinds = [.video]
+        var search = filter([[.media([.video])]], text: "dsc00001")
         XCTAssertFalse(matches(stack, search: search, facts: OrganizeStackFacts(personIDs: [person])))
 
-        search.mediaKinds = [.raw]
-        search.peopleIDs = [person]
+        search = filter([[.people([person]), .media([.raw])]], text: "dsc00001")
         XCTAssertTrue(matches(stack, search: search, facts: OrganizeStackFacts(personIDs: [person])))
 
-        // Text still gates the result when every facet passes.
-        search.text = "zzz"
+        // Text still gates the result when every row passes.
+        search = filter([[.people([person]), .media([.raw])]], text: "zzz")
         XCTAssertFalse(matches(stack, search: search, facts: OrganizeStackFacts(personIDs: [person])))
     }
 }
