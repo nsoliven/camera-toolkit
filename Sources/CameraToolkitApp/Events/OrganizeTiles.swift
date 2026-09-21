@@ -1478,9 +1478,29 @@ struct StackPreviewOverlay: View {
         if let full = TileImageLoader.shared.cachedImage(for: url, maximumPixelSize: 2_400, orientation: orientation) {
             image = full
         } else {
-            image = TileImageLoader.shared.cachedImage(for: url, maximumPixelSize: 768, orientation: orientation)
+            image = TileImageLoader.shared.cachedImage(for: url, maximumPixelSize: 1_280, orientation: orientation)
+                ?? TileImageLoader.shared.cachedImage(for: url, maximumPixelSize: 768, orientation: orientation)
                 ?? TileImageLoader.shared.cachedImage(for: url, maximumPixelSize: 384, orientation: orientation)
-            if let full = await TileImageLoader.shared.image(for: url, maximumPixelSize: 2_400, orientation: orientation), !Task.isCancelled {
+            if image == nil {
+                // Cheap paint first: the filmstrip bucket reads only the
+                // embedded thumbnail on RAW, so it lands long before the
+                // full-size read on slow storage. Both run ahead of tile
+                // decodes; each result paints only over a smaller image.
+                await withTaskGroup(of: CGImage?.self) { group in
+                    group.addTask {
+                        await TileImageLoader.shared.image(for: url, maximumPixelSize: 384, orientation: orientation, priority: .veryHigh)
+                    }
+                    group.addTask {
+                        await TileImageLoader.shared.image(for: url, maximumPixelSize: 2_400, orientation: orientation, priority: .high)
+                    }
+                    for await decoded in group {
+                        guard !Task.isCancelled, let decoded else { continue }
+                        if decoded.width > (image?.width ?? 0) {
+                            image = decoded
+                        }
+                    }
+                }
+            } else if let full = await TileImageLoader.shared.image(for: url, maximumPixelSize: 2_400, orientation: orientation, priority: .high), !Task.isCancelled {
                 image = full
             }
             if !Task.isCancelled, image == nil {
@@ -1507,7 +1527,7 @@ struct StackPreviewOverlay: View {
             let next = stack.items[frameIndex + offset].primary
             let nextOrientation = orientationForFile(next)
             Task.detached(priority: .utility) {
-                _ = await TileImageLoader.shared.image(for: next.url, maximumPixelSize: 2_400, orientation: nextOrientation)
+                _ = await TileImageLoader.shared.image(for: next.url, maximumPixelSize: 2_400, orientation: nextOrientation, priority: .low)
             }
         }
     }
@@ -1523,7 +1543,7 @@ struct StackPreviewOverlay: View {
             storeHiRes(cached, key: request)
             return
         }
-        if let loaded = await TileImageLoader.shared.image(for: url, maximumPixelSize: 4_800, orientation: request.turns), !Task.isCancelled {
+        if let loaded = await TileImageLoader.shared.image(for: url, maximumPixelSize: 4_800, orientation: request.turns, priority: .high), !Task.isCancelled {
             storeHiRes(loaded, key: request)
         }
     }
