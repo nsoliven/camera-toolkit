@@ -70,6 +70,9 @@ struct EventBoardView: View {
                         onNewEvent: { stack in
                             workspace.requestNewEvent(stackIDs: [stack.id], movingFromEvent: eventID, suggestedDate: stack.captureDate)
                         },
+                        onTrashItems: { items in
+                            workspace.requestTrash(items, fromEvent: eventID)
+                        },
                         onSplitItems: { items in
                             workspace.splitItems(items)
                         },
@@ -281,6 +284,11 @@ struct EventBoardView: View {
         Button("Reveal in Finder") {
             NSWorkspace.shared.activateFileViewerSelecting(urls(for: targets))
         }
+        Divider()
+        Button("Move to Trash…", role: .destructive) {
+            workspace.requestTrash(stackIDs: targets, fromEvent: eventID)
+        }
+        .help("Move these event files to the drive's Trash folder. Restorable from Settings.")
     }
 
     private func urls(for ids: Set<String>) -> [URL] {
@@ -312,6 +320,8 @@ struct EventBoardView: View {
             NSWorkspace.shared.activateFileViewerSelecting(urls(for: workspace.targetStackIDs()))
         case .reload:
             Task { await workspace.refreshEvent(eventID) }
+        case .moveSelectionToTrash:
+            workspace.requestTrash(stackIDs: workspace.targetStackIDs(), fromEvent: eventID)
         default:
             break
         }

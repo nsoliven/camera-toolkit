@@ -104,7 +104,7 @@ struct UnsortedBoardView: View {
                         workspace.requestNewEvent(stackIDs: [stack.id], from: location.id, suggestedDate: stack.captureDate)
                     },
                     onTrashItems: { items in
-                        workspace.trashItems(items, from: location.id)
+                        workspace.requestTrash(items, from: location.id)
                     },
                     onSplitItems: { items in
                         workspace.splitItems(items)
@@ -456,6 +456,8 @@ struct UnsortedBoardView: View {
             workspace.scan(location, force: true)
         case .find:
             searchFocused = true
+        case .moveSelectionToTrash:
+            workspace.trash(stackIDs: workspace.targetStackIDs(), from: location.id)
         default:
             break
         }

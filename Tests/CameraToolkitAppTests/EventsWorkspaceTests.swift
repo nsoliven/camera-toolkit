@@ -322,6 +322,26 @@ final class EventsWorkspaceTests: XCTestCase {
         }
     }
 
+    func testRequestTrashDoesNotMoveUntilConfirmed() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let unsorted = root.appendingPathComponent("Drive/Unsorted A7V", isDirectory: true)
+            let photo = try writeOrganizerARW(unsorted.appendingPathComponent("DSC00001.ARW"), "2026:08:26 10:00:00", "100")
+            let location = addUnsorted(unsorted, to: model)
+            workspace.scan(location)
+            try await waitUntil { workspace.sources[location.id]?.result != nil }
+            let stack = try XCTUnwrap(workspace.sources[location.id]?.result?.stacks.first)
+
+            workspace.requestTrash(stack.items, from: location.id)
+            XCTAssertNotNil(workspace.pendingTrash)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: photo.path))
+            XCTAssertEqual(workspace.pendingTrash?.fileCount, 1)
+            XCTAssertTrue(workspace.pendingTrash?.alertMessage.contains("_Trash") == true)
+
+            workspace.pendingTrash = nil
+            XCTAssertTrue(FileManager.default.fileExists(atPath: photo.path))
+        }
+    }
+
     /// "Move to New Burst" records a BurstSplit in the configuration and
     /// restacks the board; a forced rescan must not glue the frames back
     /// together.
