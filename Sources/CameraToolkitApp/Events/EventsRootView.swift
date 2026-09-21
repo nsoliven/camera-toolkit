@@ -112,6 +112,17 @@ struct EventsSidebar: View {
     @State private var targetedEventID: UUID?
     @State private var searchText = ""
 
+    /// Explicit binding instead of `$workspace.selection`: AppKit-backed
+    /// `List(selection:)` does not reliably write through `@Bindable` into an
+    /// `@Observable` model, which left sidebar clicks dead. Rows also set the
+    /// selection on tap as a fallback.
+    private var sidebarSelection: Binding<EventsSidebarSelection?> {
+        Binding(
+            get: { workspace.selection },
+            set: { workspace.selection = $0 }
+        )
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 8) {
@@ -133,10 +144,7 @@ struct EventsSidebar: View {
             .padding(.vertical, 10)
             Divider()
 
-            List(selection: Binding(
-                get: { workspace.selection },
-                set: { workspace.selection = $0 }
-            )) {
+            List(selection: sidebarSelection) {
                 let discovered = workspace.discoveredDriveEvents(matching: searchText)
                 if !discovered.isEmpty {
                     Section("Found on Your Drive") {
@@ -150,7 +158,9 @@ struct EventsSidebar: View {
                         unsortedRow(location)
                             .tag(EventsSidebarSelection.unsorted(location.id) as EventsSidebarSelection?)
                             .contentShape(Rectangle())
-                            .onTapGesture { workspace.selection = .unsorted(location.id) }
+                            .simultaneousGesture(TapGesture().onEnded {
+                                workspace.selection = .unsorted(location.id)
+                            })
                             .contextMenu {
                                 Button("Rescan") { workspace.scan(location, force: true) }
                                 Button("Scan for Faces (Low · Fast)") { workspace.faceScan(location) }
@@ -182,30 +192,17 @@ struct EventsSidebar: View {
                         eventRow(row.event, depth: row.depth)
                             .tag(EventsSidebarSelection.event(row.event.id) as EventsSidebarSelection?)
                             .contentShape(Rectangle())
-                            .onTapGesture { workspace.selection = .event(row.event.id) }
-                            .onDrop(of: [.text], isTargeted: Binding(
-                                get: { targetedEventID == row.event.id },
-                                set: { hovering in
-                                    if hovering {
-                                        targetedEventID = row.event.id
-                                    } else if targetedEventID == row.event.id {
-                                        targetedEventID = nil
-                                    }
+                            .simultaneousGesture(TapGesture().onEnded {
+                                workspace.selection = .event(row.event.id)
+                            })
+                            .dropDestination(for: String.self) { items, _ in
+                                workspace.handleDrop(items, onto: row.event.id)
+                            } isTargeted: { targeted in
+                                if targeted {
+                                    targetedEventID = row.event.id
+                                } else if targetedEventID == row.event.id {
+                                    targetedEventID = nil
                                 }
-                            )) { providers in
-                                Task { @MainActor in
-                                    var strings: [String] = []
-                                    for provider in providers {
-                                        if let str = try? await provider.loadItem(forTypeIdentifier: "public.utf8-plain-text") as? String {
-                                            strings.append(str)
-                                        } else if let data = try? await provider.loadItem(forTypeIdentifier: "public.utf8-plain-text") as? Data,
-                                                  let str = String(data: data, encoding: .utf8) {
-                                            strings.append(str)
-                                        }
-                                    }
-                                    _ = workspace.handleDrop(strings, onto: row.event.id)
-                                }
-                                return true
                             }
                             .contextMenu {
                                 Button("New Subevent…") {
