@@ -4,9 +4,10 @@ import Foundation
 /// The face pass for every quality mode: detection on bounded decodes
 /// (Vision for LOW, SCRFD for MED+), ArcFace embeddings for every face
 /// that clears the mode's size floor, cosine matching against roster
-/// templates, and greedy grouping of the leftovers. MED/HIGH additionally
-/// sample video frames — stills plus a light frame pass at MED, ~1 fps at
-/// HIGH.
+/// templates, and greedy grouping of the leftovers. MED/HIGH/XHIGH
+/// additionally sample video frames — stills plus a light frame pass at
+/// MED, ~1 fps at HIGH, ~2 fps at XHIGH — and XHIGH adds a third detector
+/// scale, flip-TTA embeddings, and a roster-template rebuild.
 ///
 /// The service writes only to the catalog database — media files are never
 /// touched. Skip rules come from `face_photos.scan_grade` plus the
@@ -142,7 +143,8 @@ public struct FaceIndexService: Sendable {
     /// stills is sampled — at most three spread frames are decoded and the
     /// rest are stamped covered by the sibling sample — because near-
     /// identical frames repeat the same faces. Without it (no scan result)
-    /// every still is scanned.
+    /// every still is scanned, and at HIGH and above every still is a
+    /// target regardless of grouping.
     public func scan(
         items: [OrganizeItem],
         embedder: FaceEmbeddingProviding?,
@@ -162,10 +164,12 @@ public struct FaceIndexService: Sendable {
         report.photosConsidered = eligible.count
 
         // Burst-aware selection: which items are sampled frames and which
-        // are burst members covered by a sibling sample. Video never stacks.
+        // are burst members covered by a sibling sample. Video never
+        // stacks, and at HIGH and above every still is a target — the same
+        // gate `scanTargets` applies to the stacks-driven scan.
         var sampledIDs: Set<String> = []
         var burstMemberIDs: Set<String> = []
-        if let stacks {
+        if let stacks, options.mode < .high {
             let eligibleIDs = Set(eligible.map(\.id))
             for stack in stacks where stack.isBurst {
                 // The stacker never stacks video; keep that invariant here
@@ -313,6 +317,13 @@ public struct FaceIndexService: Sendable {
             report.photosBurstCovered += 1
         }
 
+        report.detectorSummary = (engine as? SCRFDDetector)?.packageSummary(for: options)
+
+        // XHIGH rebuilds the gallery first so the match below runs against
+        // the sharpened templates; the rebuild reads confirmed faces only.
+        if options.rebuildTemplates {
+            try rebuildRosterTemplates()
+        }
         try matchAndGroup(
             report: &report,
             progress: progress,
@@ -411,8 +422,8 @@ public struct FaceIndexService: Sendable {
     }
 
     /// The grade stamped on a photo: what actually ran, never higher than
-    /// the implemented pipeline. An XHIGH request runs the HIGH pipeline
-    /// and stamps `.high` so a later XHIGH pass still re-scans it.
+    /// the implemented pipeline. Every grade through XHIGH is implemented,
+    /// so a request stamps itself and a repeat pass skips the photo.
     private static func executedGrade(for mode: FaceScanGrade) -> FaceScanGrade {
         min(mode, FaceScanOptions.implementedGrade)
     }
@@ -463,7 +474,15 @@ public struct FaceIndexService: Sendable {
             }
             guard let aligned else { continue }
             telemetry?.step(token, .embed)
-            guard let embedding = try? embedder.embed(aligned) else { continue }
+            guard var embedding = try? embedder.embed(aligned) else { continue }
+            // XHIGH hflip TTA: embed the mirrored crop too and store the
+            // L2-normalized mean — the standard ArcFace second view.
+            if options.flipTTA,
+               let flipped = FaceAligner.flippedHorizontally(aligned),
+               let flippedEmbedding = try? embedder.embed(flipped),
+               let averaged = FaceEmbeddingMath.centroid([embedding, flippedEmbedding]) {
+                embedding = averaged
+            }
             faces.append(FaceRecord(
                 photoID: file.pathKey,
                 box: NormalizedFaceBox(
@@ -618,6 +637,67 @@ public struct FaceIndexService: Sendable {
     }
 
     // MARK: - Match and group
+
+    /// XHIGH's gallery rebuild: every roster person's template set is
+    /// re-picked from its confirmed faces — one face per photo, then a
+    /// farthest-first spread so the kept set covers different views
+    /// (front, side, glasses, years) rather than the top-N by score.
+    /// Confirmed faces are the only trusted pool; proposals and grouped
+    /// faces never seed templates.
+    private func rebuildRosterTemplates() throws {
+        for person in try store.rosterPeople() {
+            let confirmed = try store.faces(personID: person.id)
+                .filter { $0.state == .confirmed && $0.embedding != nil }
+            var perPhoto: [String: FaceRecord] = [:]
+            for face in confirmed {
+                // `faces(personID:)` arrives detScore-sorted, so the first
+                // sighting of a photo is its best face.
+                if perPhoto[face.photoID] == nil { perPhoto[face.photoID] = face }
+            }
+            let picks = Self.diverseTemplatePick(
+                perPhoto.values.sorted {
+                    $0.detScore != $1.detScore
+                        ? $0.detScore > $1.detScore
+                        : $0.id.uuidString < $1.id.uuidString
+                },
+                cap: options.templateCap
+            )
+            try store.clearTemplates(personID: person.id)
+            for pick in picks {
+                try store.addTemplate(personID: person.id, faceID: pick.id)
+            }
+        }
+    }
+
+    /// Farthest-first selection: seed with the most confident face, then
+    /// keep adding the candidate least similar to anything already picked.
+    /// The kept set spans the person's appearance range instead of
+    /// clustering around their clearest frontal shot.
+    static func diverseTemplatePick(_ candidates: [FaceRecord], cap: Int) -> [FaceRecord] {
+        guard cap > 0, !candidates.isEmpty else { return [] }
+        var picked: [FaceRecord] = [candidates[0]]
+        var remaining = Array(candidates.dropFirst())
+        while picked.count < cap, !remaining.isEmpty {
+            var bestIndex: Int?
+            var bestDistance = -Float.infinity
+            for (index, candidate) in remaining.enumerated() {
+                guard let embedding = candidate.embedding else { continue }
+                // Distance to the nearest already-picked template — the
+                // new template should add a view, not repeat one.
+                let nearest = picked.compactMap(\.embedding)
+                    .map { FaceEmbeddingMath.cosine(embedding, $0) }
+                    .max() ?? -1
+                let distance = 1 - nearest
+                if distance > bestDistance {
+                    bestDistance = distance
+                    bestIndex = index
+                }
+            }
+            guard let bestIndex else { break }
+            picked.append(remaining.remove(at: bestIndex))
+        }
+        return picked
+    }
 
     private func matchAndGroup(
         report: inout FaceScanReport,
