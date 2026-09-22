@@ -365,4 +365,95 @@ final class OrganizeSearchTests: XCTestCase {
         search = filter([[.people([person]), .media([.raw])]], text: "zzz")
         XCTAssertFalse(matches(stack, search: search, facts: OrganizeStackFacts(personIDs: [person])))
     }
+
+    // MARK: - Family scoping
+
+    func testScopingEventRowsToAFamilyDropsOutsidePicks() {
+        let parent = UUID()
+        let child = UUID()
+        let outside = UUID()
+        let family: Set<UUID> = [parent, child]
+
+        // An outside pick drops out of the row; an in-family pick stays,
+        // and "Not Sorted Yet" clears — a family board's stacks all belong.
+        var search = filter([[.events([child, outside], unsorted: true)]])
+        var scoped = search.scopingEventRows(to: family)
+        XCTAssertEqual(scoped.groups[0].rows[0].eventIDs, [child])
+        XCTAssertFalse(scoped.groups[0].rows[0].includesUnsorted)
+
+        // A fully-outside row goes empty and stops filtering instead of
+        // blanking the board.
+        search = filter([[.events([outside])]])
+        scoped = search.scopingEventRows(to: family)
+        XCTAssertTrue(scoped.groups[0].rows[0].isEmpty)
+        XCTAssertFalse(scoped.hasActiveConditions)
+        let stack = OrganizeStack(items: [item("/Card/DSC00001.ARW")])
+        XCTAssertTrue(matches(stack, search: scoped, facts: OrganizeStackFacts(eventIDs: [outside])))
+
+        // "Not Sorted Yet" alone never applies on a family board.
+        search = filter([[.events([], unsorted: true)]])
+        XCTAssertFalse(search.scopingEventRows(to: family).hasActiveConditions)
+
+        // Rows for other properties pass through untouched.
+        let person = UUID()
+        search = filter([[.people([person]), .events([outside])]])
+        scoped = search.scopingEventRows(to: family)
+        XCTAssertEqual(scoped.groups[0].rows[0].peopleIDs, [person])
+        XCTAssertTrue(scoped.hasActiveConditions)
+        XCTAssertTrue(matches(stack, search: scoped, facts: OrganizeStackFacts(personIDs: [person])))
+        XCTAssertFalse(matches(stack, search: scoped, facts: OrganizeStackFacts()))
+    }
+
+    func testToggleEventExclusionWritesNoneOfRows() {
+        let child = UUID()
+        let sibling = UUID()
+
+        // From an empty filter: one group holding an "is none of" row.
+        var search = OrganizeSearchFilter()
+        search.toggleEventExclusion(child)
+        XCTAssertEqual(search.excludedEventIDs, [child])
+        XCTAssertEqual(search.groups.count, 1)
+        XCTAssertEqual(search.groups[0].rows.count, 1)
+        XCTAssertEqual(search.groups[0].rows[0].property, .event)
+        XCTAssertEqual(search.groups[0].rows[0].operator, .noneOf)
+        XCTAssertEqual(search.groups[0].rows[0].eventIDs, [child])
+
+        // A second exclusion joins the same row; removing one keeps the
+        // other, and removing the last cleans the husk away entirely.
+        search.toggleEventExclusion(sibling)
+        XCTAssertEqual(search.excludedEventIDs, [child, sibling])
+        search.toggleEventExclusion(child)
+        XCTAssertEqual(search.excludedEventIDs, [sibling])
+        search.toggleEventExclusion(sibling)
+        XCTAssertTrue(search.groups.isEmpty)
+        XCTAssertTrue(search.isUntouched)
+    }
+
+    func testToggleEventExclusionAppliesAcrossEveryGroup() {
+        let child = UUID()
+        let person = UUID()
+
+        // Groups OR together, so the exclusion lands in each — a stack
+        // matching any group still drops the excluded event.
+        var search = OrganizeSearchFilter()
+        search.groups = [
+            OrganizeFilterGroup(rows: [.people([person])]),
+            OrganizeFilterGroup(rows: [.media([.video])]),
+        ]
+        search.toggleEventExclusion(child)
+        for group in search.groups {
+            XCTAssertTrue(group.rows.contains {
+                $0.property == .event && $0.operator == .noneOf && $0.eventIDs.contains(child)
+            })
+        }
+
+        // Toggling back off removes just that row; the groups' own rows
+        // survive untouched.
+        search.toggleEventExclusion(child)
+        XCTAssertEqual(search.groups.count, 2)
+        for group in search.groups {
+            XCTAssertEqual(group.rows.count, 1)
+            XCTAssertFalse(group.rows.contains { $0.property == .event })
+        }
+    }
 }

@@ -2,6 +2,7 @@ import AppKit
 import CameraToolkitCore
 import CoreGraphics
 import Foundation
+import SwiftUI
 @testable import CameraToolkitApp
 import XCTest
 
@@ -652,6 +653,94 @@ final class EventsWorkspaceTests: XCTestCase {
 
             await workspace.refreshEvent(grandchild)
             XCTAssertEqual(workspace.eventStacks[grandchild]?.map(\.id), [grandchildStack.id])
+        }
+    }
+
+    /// The parent board's Event rows scope to its family: an "is none of"
+    /// pick on a subevent hides that whole branch, "is any of" keeps only
+    /// it, and a pick outside the family — carried over from an unsorted
+    /// board's panel — is ignored instead of emptying the board.
+    func testEventBoardFiltersSubeventsAndTagsTheirStacks() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let unsorted = root.appendingPathComponent("Drive/Unsorted A7V", isDirectory: true)
+            // Separate folders keep the files from burst-grouping — each
+            // lands as its own stack.
+            try writeOrganizerARW(unsorted.appendingPathComponent("Roll A/DSC00001.ARW"), "2026:08:26 10:00:00", "000")
+            try writeOrganizerARW(unsorted.appendingPathComponent("Roll B/DSC00002.ARW"), "2026:08:26 10:01:00", "000")
+            try writeOrganizerARW(unsorted.appendingPathComponent("Roll C/DSC00003.ARW"), "2026:08:26 10:02:00", "000")
+            let location = addUnsorted(unsorted, to: model)
+            workspace.scan(location)
+            try await waitUntil { workspace.sources[location.id]?.result != nil }
+            let result = try XCTUnwrap(workspace.sources[location.id]?.result)
+            let byName = Dictionary(uniqueKeysWithValues: result.stacks.map { ($0.coverItem.primary.name, $0) })
+            let ownStack = try XCTUnwrap(byName["DSC00001.ARW"])
+            let childStack = try XCTUnwrap(byName["DSC00002.ARW"])
+            let grandchildStack = try XCTUnwrap(byName["DSC00003.ARW"])
+
+            let parent = try XCTUnwrap(workspace.createEvent(name: "TRIP2026", date: organizerDay("2026-08-21"), policy: .buffer))
+            let child = try XCTUnwrap(workspace.createEvent(name: "Matcha", date: organizerDay("2026-08-23"), policy: nil, parentEventID: parent))
+            let grandchild = try XCTUnwrap(workspace.createEvent(name: "Latte Art", date: organizerDay("2026-08-24"), policy: nil, parentEventID: child))
+            let other = try XCTUnwrap(workspace.createEvent(name: "Japan 2026", date: organizerDay("2026-08-27"), policy: .buffer))
+
+            workspace.assign(stackIDs: [ownStack.id], from: location.id, to: parent)
+            workspace.assign(stackIDs: [childStack.id], from: location.id, to: child)
+            workspace.assign(stackIDs: [grandchildStack.id], from: location.id, to: grandchild)
+            await workspace.refreshEvent(parent)
+
+            @MainActor func board(_ rows: [OrganizeFilterRow]) -> Set<String> {
+                var search = OrganizeSearchFilter()
+                search.groups = [OrganizeFilterGroup(rows: rows)]
+                return Set(workspace.visibleEventStacks(parent, search: search).map(\.id))
+            }
+
+            // "is none of" the child hides its whole branch — the
+            // grandchild goes with it — while the parent's own stack stays.
+            XCTAssertEqual(board([.events([child], exclude: true)]), [ownStack.id])
+            // "is any of" keeps only that branch.
+            XCTAssertEqual(board([.events([child])]), [childStack.id, grandchildStack.id])
+            // Excluding just the grandchild leaves the child's own stack.
+            XCTAssertEqual(board([.events([grandchild], exclude: true)]), [ownStack.id, childStack.id])
+
+            // A pick outside the family never filters this board — an
+            // Unsorted filter for another event cannot blank TRIP2026, and
+            // "Not Sorted Yet" is not a family member either.
+            let all: Set<String> = [ownStack.id, childStack.id, grandchildStack.id]
+            XCTAssertEqual(board([.events([other])]), all)
+            XCTAssertEqual(board([.events([other], exclude: true)]), all)
+            XCTAssertEqual(board([.events([], unsorted: true)]), all)
+            // Mixing a family pick with a foreign one still applies the
+            // family half.
+            XCTAssertEqual(board([.events([child, other], unsorted: true)]), [childStack.id, grandchildStack.id])
+
+            // The header chips write the same "is none of" rows: tapping
+            // the child's chip hides the branch, tapping again restores it.
+            workspace.search = OrganizeSearchFilter()
+            workspace.search.toggleEventExclusion(child)
+            XCTAssertEqual(workspace.search.excludedEventIDs, [child])
+            XCTAssertEqual(Set(workspace.visibleEventStacks(parent, search: workspace.search).map(\.id)), [ownStack.id])
+            workspace.search.toggleEventExclusion(child)
+            XCTAssertEqual(Set(workspace.visibleEventStacks(parent, search: workspace.search).map(\.id)), all)
+
+            // The header chips are the direct subevents only.
+            XCTAssertEqual(workspace.subevents(of: parent).map(\.id), [child])
+            XCTAssertEqual(workspace.subevents(of: child).map(\.id), [grandchild])
+
+            // The tag a stack wears is its owning event — a grandchild's
+            // photos wear the grandchild's tag, not the direct child's, and
+            // the palette color is stable for that id. Stacks owned by the
+            // board's own event wear none.
+            let boardByName = Dictionary(uniqueKeysWithValues: try XCTUnwrap(workspace.eventStacks[parent]).map {
+                ($0.coverItem.primary.name, $0)
+            })
+            XCTAssertEqual(workspace.subeventTag(for: try XCTUnwrap(boardByName["DSC00002.ARW"]), in: parent)?.id, child)
+            let grandchildTag = try XCTUnwrap(workspace.subeventTag(for: try XCTUnwrap(boardByName["DSC00003.ARW"]), in: parent))
+            XCTAssertEqual(grandchildTag.id, grandchild)
+            XCTAssertEqual(EventPalette.color(for: grandchildTag.id), EventPalette.color(for: grandchild))
+            XCTAssertNil(workspace.subeventTag(for: try XCTUnwrap(boardByName["DSC00001.ARW"]), in: parent))
+            // On the child's board the same stack is still a descendant;
+            // on the grandchild's own board it wears no tag.
+            XCTAssertEqual(workspace.subeventTag(for: try XCTUnwrap(boardByName["DSC00003.ARW"]), in: child)?.id, grandchild)
+            XCTAssertNil(workspace.subeventTag(for: try XCTUnwrap(boardByName["DSC00003.ARW"]), in: grandchild))
         }
     }
 

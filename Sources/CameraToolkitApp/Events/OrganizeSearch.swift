@@ -46,17 +46,68 @@ struct OrganizeSearchFilter: Equatable, Sendable {
         }
     }
 
-    /// The same filter minus every Event row. An event board is one event
-    /// already, so picks carried over from an unsorted board's panel are
-    /// dropped there rather than emptying the board.
-    func droppingEventRows() -> OrganizeSearchFilter {
+    /// The same filter with every Event pick outside `familyIDs` removed,
+    /// and "Not Sorted Yet" cleared — a family board's stacks all belong to
+    /// it, so only in-family picks can narrow it. An Event row left with no
+    /// in-family pick stops filtering instead of emptying the board, which
+    /// keeps an unsorted board's carried-over picks from blanking it.
+    func scopingEventRows(to familyIDs: Set<UUID>) -> OrganizeSearchFilter {
         var copy = self
         copy.groups = groups.map { group in
             var scoped = group
-            scoped.rows = scoped.rows.filter { $0.property != .event }
+            scoped.rows = scoped.rows.map { row in
+                guard row.property == .event else { return row }
+                var narrowed = row
+                narrowed.eventIDs.formIntersection(familyIDs)
+                narrowed.includesUnsorted = false
+                return narrowed
+            }
             return scoped
         }
         return copy
+    }
+
+    /// Event ids an "is none of" Event row excludes — a header chip's
+    /// outline state: the tag's photos are filtered out.
+    var excludedEventIDs: Set<UUID> {
+        groups.reduce(into: Set<UUID>()) { ids, group in
+            for row in group.rows where row.property == .event && row.operator == .noneOf {
+                ids.formUnion(row.eventIDs)
+            }
+        }
+    }
+
+    /// Toggles "is none of" for an event pick — the header chips' action.
+    /// Adding joins an "is none of" Event row in every group (creating the
+    /// rows, and a group when none exist) so the tag's photos drop no
+    /// matter which OR-group a stack matches; removing takes the id out of
+    /// every such row and drops the husk it leaves behind.
+    mutating func toggleEventExclusion(_ id: UUID) {
+        if excludedEventIDs.contains(id) {
+            for groupIndex in groups.indices {
+                for rowIndex in groups[groupIndex].rows.indices
+                where groups[groupIndex].rows[rowIndex].property == .event
+                    && groups[groupIndex].rows[rowIndex].operator == .noneOf {
+                    groups[groupIndex].rows[rowIndex].eventIDs.remove(id)
+                }
+                groups[groupIndex].rows.removeAll {
+                    $0.property == .event && $0.operator == .noneOf && $0.isEmpty
+                }
+            }
+            groups.removeAll { $0.rows.isEmpty }
+        } else if groups.isEmpty {
+            groups = [OrganizeFilterGroup(rows: [.events([id], operator: .noneOf)])]
+        } else {
+            for groupIndex in groups.indices {
+                if let rowIndex = groups[groupIndex].rows.firstIndex(where: {
+                    $0.property == .event && $0.operator == .noneOf
+                }) {
+                    groups[groupIndex].rows[rowIndex].eventIDs.insert(id)
+                } else {
+                    groups[groupIndex].rows.append(.events([id], operator: .noneOf))
+                }
+            }
+        }
     }
 }
 

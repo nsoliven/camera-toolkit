@@ -55,6 +55,57 @@ struct EventChip: View {
     }
 }
 
+/// The owning subevent's tag on an event-board tile or row — a plain
+/// colored label, never a button, so it can't steal the tile's click.
+struct EventTagCapsule: View {
+    let event: SavedCameraEvent
+
+    var body: some View {
+        Text(event.name)
+            .font(.caption2.weight(.semibold))
+            .lineLimit(1)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(EventPalette.color(for: event.id), in: Capsule())
+            .foregroundStyle(.white)
+            .help("Tagged \(event.name)")
+    }
+}
+
+/// A direct subevent's filter chip in the event header — solid while its
+/// photos show, an outline while an "is none of" row hides them. Tapping
+/// toggles the exclusion.
+struct SubeventChip: View {
+    let event: SavedCameraEvent
+    let isFiltering: Bool
+    let onToggle: () -> Void
+
+    var body: some View {
+        Button(action: onToggle) {
+            Text(event.name)
+                .lineLimit(1)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(isFiltering ? EventPalette.color(for: event.id) : .white)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background {
+                    if isFiltering {
+                        Capsule()
+                            .fill(EventPalette.color(for: event.id).opacity(0.15))
+                            .overlay(Capsule().strokeBorder(EventPalette.color(for: event.id), lineWidth: 1.5))
+                    } else {
+                        Capsule().fill(EventPalette.color(for: event.id))
+                    }
+                }
+                .fixedSize()
+        }
+        .buttonStyle(.plain)
+        .help(isFiltering
+            ? "\(event.name) is filtered out — tap to bring its photos back"
+            : "Hide \(event.name)'s photos")
+    }
+}
+
 /// A named person detected on an event's photos. Shares the event-chip
 /// capsule look; the color is stable per person.
 struct PersonChip: View {
@@ -185,6 +236,10 @@ struct StackTileView: View {
     /// Resolved private flag for `event` — a subevent can inherit the lock
     /// from a private parent, so the caller resolves it.
     var isPrivate: Bool? = nil
+    /// The owning subevent's tag, worn at the top right beside the burst
+    /// count on event boards. Nil hides it — unsorted boards already carry
+    /// the event chip below.
+    var tag: SavedCameraEvent? = nil
     let isMixed: Bool
     let isDimmed: Bool
     let badge: TileLocationBadge?
@@ -216,6 +271,9 @@ struct StackTileView: View {
                                 .background(.ultraThinMaterial, in: Capsule())
                         }
                         Spacer(minLength: 0)
+                        if let tag {
+                            EventTagCapsule(event: tag)
+                        }
                         if stack.isBurst {
                             Button {
                                 (onExpand ?? onOpen)?()
@@ -363,6 +421,9 @@ struct StackRowView: View {
     let isExpanded: Bool
     let event: SavedCameraEvent?
     var isPrivate: Bool? = nil
+    /// The owning subevent's tag after the burst label on event boards —
+    /// the same capsule the tile wears. Nil hides it.
+    var tag: SavedCameraEvent? = nil
     let isMixed: Bool
     let isDimmed: Bool
     let badge: TileLocationBadge?
@@ -392,6 +453,9 @@ struct StackRowView: View {
                         .font(.callout.weight(.medium))
                         .lineLimit(1)
                         .truncationMode(.middle)
+                    if let tag {
+                        EventTagCapsule(event: tag)
+                    }
                     if isMixed {
                         Label("Mixed", systemImage: "square.split.2x1")
                             .font(.caption2.weight(.semibold))
@@ -590,6 +654,9 @@ struct OrganizeGrid<MenuContent: View>: View {
     /// label (event boards have no single scan root).
     var rootPath: String? = nil
     let eventForStack: (OrganizeStack) -> (event: SavedCameraEvent?, mixed: Bool)
+    /// The subevent tag a tile or row wears — event boards resolve the
+    /// owning subevent here; nil keeps the tag off (unsorted boards).
+    var tagForStack: (OrganizeStack) -> SavedCameraEvent? = { _ in nil }
     let isDimmed: (OrganizeStack) -> Bool
     let badge: (OrganizeStack) -> TileLocationBadge?
     /// Display rotation recorded for a file, in quarter-turns clockwise —
@@ -730,6 +797,7 @@ struct OrganizeGrid<MenuContent: View>: View {
             isFocused: workspace.focusedStackID == stack.id,
             event: assigned.event,
             isPrivate: assigned.event.map { workspace.resolvedPolicy(for: $0) == .archiveOnly },
+            tag: tagForStack(stack),
             isMixed: assigned.mixed,
             isDimmed: isDimmed(stack),
             badge: badge(stack),
@@ -762,6 +830,7 @@ struct OrganizeGrid<MenuContent: View>: View {
             isExpanded: workspace.expandedStackIDs.contains(stack.id),
             event: assigned.event,
             isPrivate: assigned.event.map { workspace.resolvedPolicy(for: $0) == .archiveOnly },
+            tag: tagForStack(stack),
             isMixed: assigned.mixed,
             isDimmed: isDimmed(stack),
             badge: badge(stack),

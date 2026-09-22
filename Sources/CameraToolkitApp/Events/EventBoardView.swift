@@ -142,6 +142,7 @@ struct EventBoardView: View {
 
     private func header(_ event: SavedCameraEvent, groups: [OrganizeBoardGroup]) -> some View {
         let people = workspace.eventPeople(eventID)
+        let subevents = workspace.subevents(of: eventID)
         return VStack(alignment: .leading, spacing: 10) {
         HStack(alignment: .center, spacing: 12) {
             Circle()
@@ -159,7 +160,7 @@ struct EventBoardView: View {
             OrganizeSearchBar(
                 workspace: workspace,
                 stacks: workspace.eventStacks[eventID] ?? [],
-                showsEventFacet: false,
+                eventScope: workspace.scopeIDs(eventID),
                 search: $workspace.search,
                 focused: $searchFocused,
                 matchedCount: groups.reduce(0) { $0 + $1.stacks.count }
@@ -260,7 +261,7 @@ struct EventBoardView: View {
             .menuStyle(.borderlessButton)
             .fixedSize()
         }
-        if !people.isEmpty {
+        if !people.isEmpty || !subevents.isEmpty {
             let shown = showAllPeople ? people : Array(people.prefix(Self.collapsedPeopleCount))
             FlowLayout(horizontalSpacing: 8, verticalSpacing: 8) {
                 ForEach(shown) { person in
@@ -275,6 +276,13 @@ struct EventBoardView: View {
                     .foregroundStyle(.secondary)
                     .padding(.horizontal, 10)
                     .padding(.vertical, 5)
+                }
+                ForEach(subevents) { subevent in
+                    SubeventChip(
+                        event: subevent,
+                        isFiltering: workspace.search.excludedEventIDs.contains(subevent.id),
+                        onToggle: { workspace.search.toggleEventExclusion(subevent.id) }
+                    )
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -313,6 +321,7 @@ struct EventBoardView: View {
             origin: .event,
             containerID: eventID,
             eventForStack: { _ in (nil, false) },
+            tagForStack: { workspace.subeventTag(for: $0, in: eventID) },
             isDimmed: { _ in false },
             badge: { workspace.badge(for: $0, in: eventID) },
             orientationForFile: { workspace.displayTurns(for: $0) },
