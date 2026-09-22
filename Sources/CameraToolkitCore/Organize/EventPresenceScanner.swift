@@ -33,6 +33,13 @@ public struct EventPresenceSummary: Sendable {
     public var assets: [EventAssetPresence]
     public var checkedAt: Date
 
+    public init(eventID: UUID, policy: EventStoragePolicy, assets: [EventAssetPresence], checkedAt: Date) {
+        self.eventID = eventID
+        self.policy = policy
+        self.assets = assets
+        self.checkedAt = checkedAt
+    }
+
     public var total: Int { assets.count }
     public var totalBytes: Int64 { assets.reduce(Int64(0)) { $0 + $1.assignment.fileSize } }
     public var onSource: Int { assets.count { $0.isOnSeparateSource } }

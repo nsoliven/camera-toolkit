@@ -588,6 +588,32 @@ public enum EventHierarchy {
         }
     }
 
+    /// Direct subevents of `eventID` in the same sibling order `flattened`
+    /// uses — newest first, then by name.
+    public static func children(of eventID: UUID, in events: [SavedCameraEvent]) -> [SavedCameraEvent] {
+        events.filter { $0.parentEventID == eventID }
+            .sorted { $0.eventDate == $1.eventDate ? $0.name < $1.name : $0.eventDate > $1.eventDate }
+    }
+
+    /// The deepest a saved event may nest: depth 0 is a top-level event,
+    /// depth 1 its subevent, depth 2 a subevent of that subevent. An event
+    /// already deeper than this (adopted folders or pre-cap data) still
+    /// lists and opens — the cap only refuses new children under it.
+    public static let maxDepth = 2
+
+    /// How deep the event sits: 0 for a top-level event, plus one per
+    /// ancestor. A broken chain just ends the count, like `ancestors`.
+    public static func depth(of event: SavedCameraEvent, in events: [SavedCameraEvent]) -> Int {
+        ancestors(of: event, byID: index(events)).count
+    }
+
+    /// True when the event may take a new subevent — its own depth is below
+    /// `maxDepth`. A deeper event stays in the list but can't parent a new
+    /// level under it.
+    public static func canParent(_ event: SavedCameraEvent, in events: [SavedCameraEvent]) -> Bool {
+        ancestors(of: event, byID: index(events)).count < maxDepth
+    }
+
     /// "Parent / Child" title for menus and headers.
     public static func displayName(of event: SavedCameraEvent, in events: [SavedCameraEvent]) -> String {
         displayName(of: event, byID: index(events))

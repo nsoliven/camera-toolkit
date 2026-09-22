@@ -544,6 +544,117 @@ final class EventsWorkspaceTests: XCTestCase {
         }
     }
 
+    func testSubeventDepthCapRefusesAFourthLevel() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            _ = root
+            let parent = try XCTUnwrap(workspace.createEvent(name: "TRIP2026", date: organizerDay("2026-08-21"), policy: .buffer))
+            let child = try XCTUnwrap(workspace.createEvent(name: "Matcha", date: organizerDay("2026-08-23"), policy: nil, parentEventID: parent))
+            let grandchild = try XCTUnwrap(workspace.createEvent(name: "Latte Art", date: organizerDay("2026-08-24"), policy: nil, parentEventID: child))
+
+            // Depth 2 is the deepest: a fourth level refuses and says why.
+            XCTAssertNil(workspace.createEvent(name: "Too Deep", date: organizerDay("2026-08-25"), policy: nil, parentEventID: grandchild))
+            XCTAssertTrue(model.statusMessage.contains("two levels"), model.statusMessage)
+            XCTAssertNil(model.configuration.savedEvents.first { $0.name == "Too Deep" })
+
+            // The "New Subevent" shortcut on a depth-2 event refuses the
+            // same way instead of opening the sheet.
+            workspace.requestNewEvent(from: nil, parentEventID: grandchild)
+            XCTAssertNil(workspace.newEventRequest)
+            XCTAssertTrue(model.statusMessage.contains("two levels"), model.statusMessage)
+
+            // The file-browser path refuses through DashboardModel too.
+            XCTAssertFalse(model.createEvent(named: "Too Deep", on: organizerDay("2026-08-25"), parentEventID: grandchild))
+            XCTAssertTrue(model.statusMessage.contains("two levels"), model.statusMessage)
+
+            // The Inside-event picker never offers a depth-2 parent; the
+            // grandchild still lists and its own link survives a rename.
+            XCTAssertFalse(workspace.parentCandidates(excluding: nil).contains { $0.event.id == grandchild })
+            XCTAssertFalse(model.parentEventCandidates.contains { $0.event.id == grandchild })
+            XCTAssertEqual(workspace.sidebarEvents.map(\.event.id), [parent, child, grandchild])
+            XCTAssertNil(workspace.validParentEventID(grandchild, for: nil))
+            XCTAssertEqual(workspace.validParentEventID(child, for: grandchild), child)
+        }
+    }
+
+    func testFamilyScopeCountsFiltersAndBoardSections() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let unsorted = root.appendingPathComponent("Drive/Unsorted A7V", isDirectory: true)
+            // Separate folders keep the frames from burst-grouping — each
+            // lands as its own stack.
+            try writeOrganizerARW(unsorted.appendingPathComponent("Roll A/DSC00001.ARW"), "2026:08:26 10:00:00", "000")
+            try writeOrganizerARW(unsorted.appendingPathComponent("Roll B/DSC00002.ARW"), "2026:08:26 10:01:00", "000")
+            try writeOrganizerARW(unsorted.appendingPathComponent("Roll C/DSC00003.ARW"), "2026:08:26 10:02:00", "000")
+            let location = addUnsorted(unsorted, to: model)
+            workspace.scan(location)
+            try await waitUntil { workspace.sources[location.id]?.result != nil }
+            let result = try XCTUnwrap(workspace.sources[location.id]?.result)
+            let byName = Dictionary(uniqueKeysWithValues: result.stacks.map { ($0.coverItem.primary.name, $0) })
+            let ownStack = try XCTUnwrap(byName["DSC00001.ARW"])
+            let childStack = try XCTUnwrap(byName["DSC00002.ARW"])
+            let grandchildStack = try XCTUnwrap(byName["DSC00003.ARW"])
+
+            let parent = try XCTUnwrap(workspace.createEvent(name: "TRIP2026", date: organizerDay("2026-08-21"), policy: .buffer))
+            let child = try XCTUnwrap(workspace.createEvent(name: "Matcha", date: organizerDay("2026-08-23"), policy: nil, parentEventID: parent))
+            let grandchild = try XCTUnwrap(workspace.createEvent(name: "Latte Art", date: organizerDay("2026-08-24"), policy: nil, parentEventID: child))
+
+            workspace.assign(stackIDs: [ownStack.id], from: location.id, to: parent)
+            workspace.assign(stackIDs: [childStack.id], from: location.id, to: child)
+            workspace.assign(stackIDs: [grandchildStack.id], from: location.id, to: grandchild)
+
+            // Counts cover the family: the parent includes both
+            // descendants; a child never counts the parent's files.
+            XCTAssertEqual(workspace.assignmentCount(for: parent), 3)
+            XCTAssertEqual(workspace.assignmentCount(for: child), 2)
+            XCTAssertEqual(workspace.assignmentCount(for: grandchild), 1)
+
+            // An Event row for the parent keeps the stack sorted into the
+            // grandchild; the child's row does not keep the parent's stack.
+            @MainActor func board(_ rows: [OrganizeFilterRow]) -> Set<String> {
+                var search = OrganizeSearchFilter()
+                search.groups = [OrganizeFilterGroup(rows: rows)]
+                return Set(workspace.visibleStacks(result, hideSorted: false, search: search).map(\.id))
+            }
+            XCTAssertEqual(board([.events([parent])]), [ownStack.id, childStack.id, grandchildStack.id])
+            XCTAssertEqual(board([.events([child])]), [childStack.id, grandchildStack.id])
+            XCTAssertEqual(board([.events([grandchild])]), [grandchildStack.id])
+            // The sidebar rows scope the same way: a parent filter keeps
+            // the whole subtree, a child filter drops the parent's row.
+            @MainActor func rows(_ filterRows: [OrganizeFilterRow]) -> Set<UUID> {
+                var search = OrganizeSearchFilter()
+                search.groups = [OrganizeFilterGroup(rows: filterRows)]
+                return Set(workspace.sidebarRows(matching: "", applying: search).map(\.event.id))
+            }
+            XCTAssertEqual(rows([.events([parent])]), [parent, child, grandchild])
+            XCTAssertEqual(rows([.events([child])]), [child, grandchild])
+            XCTAssertEqual(rows([.events([grandchild])]), [grandchild])
+
+            // The parent's board shows its own stacks plus a "Matcha"
+            // section holding that subevent's whole subtree; the child
+            // board nests "Latte Art" the same way, and the grandchild
+            // board is just itself.
+            await workspace.refreshEvent(parent)
+            let parentStacks = try XCTUnwrap(workspace.eventStacks[parent])
+            XCTAssertEqual(Set(parentStacks.map(\.id)), [ownStack.id, childStack.id, grandchildStack.id])
+            let parentGroups = workspace.eventBoardGroups(parent, stacks: parentStacks, grouping: .day, order: .oldestFirst)
+            let matchaSection = try XCTUnwrap(parentGroups.last { $0.id == "subevent|\(child.uuidString)" })
+            XCTAssertEqual(matchaSection.title, "Matcha")
+            XCTAssertEqual(Set(matchaSection.stacks.map(\.id)), [childStack.id, grandchildStack.id])
+            XCTAssertEqual(Set(parentGroups.filter { $0.id != matchaSection.id }.flatMap(\.stacks).map(\.id)), [ownStack.id])
+
+            await workspace.refreshEvent(child)
+            let childStacks = try XCTUnwrap(workspace.eventStacks[child])
+            XCTAssertEqual(Set(childStacks.map(\.id)), [childStack.id, grandchildStack.id])
+            let childGroups = workspace.eventBoardGroups(child, stacks: childStacks, grouping: .day, order: .oldestFirst)
+            let latteSection = try XCTUnwrap(childGroups.last { $0.id == "subevent|\(grandchild.uuidString)" })
+            XCTAssertEqual(latteSection.title, "Latte Art")
+            XCTAssertEqual(latteSection.stacks.map(\.id), [grandchildStack.id])
+            XCTAssertFalse(childStacks.contains { $0.id == ownStack.id })
+
+            await workspace.refreshEvent(grandchild)
+            XCTAssertEqual(workspace.eventStacks[grandchild]?.map(\.id), [grandchildStack.id])
+        }
+    }
+
     func testApplySortsSubeventFilesIntoTheNestedFolder() async throws {
         try await withOrganizerSandbox { root, model, workspace in
             let unsorted = root.appendingPathComponent("Drive/Unsorted A7V", isDirectory: true)
