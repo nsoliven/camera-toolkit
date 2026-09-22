@@ -90,25 +90,45 @@ struct OrganizeFilterRow: Equatable, Sendable, Identifiable {
         }
     }
 
-    /// List-property operators. Date rows are always a from/to range and
+    /// List-property operators — the four cells of a row's truth table
+    /// over its picks. "any" keeps a subject sharing one pick, "all"
+    /// keeps only a subject carrying every pick, and the "none"/"not
+    /// all" pair negates them. Date rows are always a from/to range and
     /// ignore the operator.
     enum Operator: String, CaseIterable, Sendable {
-        /// "is any of" — the subject keeps any picked value.
-        case include
+        /// "is any of" — the subject shares a picked value.
+        case anyOf
+        /// "is all of" — the subject carries every picked value.
+        case allOf
         /// "is none of" — the subject drops when it has a picked value.
-        case exclude
+        case noneOf
+        /// "is not all of" — the subject is missing a picked value.
+        case notAllOf
 
         var title: String {
             switch self {
-            case .include: "is any of"
-            case .exclude: "is none of"
+            case .anyOf: "is any of"
+            case .allOf: "is all of"
+            case .noneOf: "is none of"
+            case .notAllOf: "is not all of"
+            }
+        }
+
+        /// The verdict from the subject's two set facts: whether it
+        /// carries any pick and whether it carries them all.
+        func matches(hasAny: Bool, hasAll: Bool) -> Bool {
+            switch self {
+            case .anyOf: hasAny
+            case .allOf: hasAll
+            case .noneOf: !hasAny
+            case .notAllOf: !hasAll
             }
         }
     }
 
     var id = UUID()
     var property: Property
-    var `operator`: Operator = .include
+    var `operator`: Operator = .anyOf
     /// Values for a People row — roster people or unnamed face groups.
     var peopleIDs: Set<UUID> = []
     /// Values for an Event row.
@@ -123,7 +143,7 @@ struct OrganizeFilterRow: Equatable, Sendable, Identifiable {
     var dayStart: Date?
     var dayEnd: Date?
 
-    init(id: UUID = UUID(), property: Property, operator: Operator = .include) {
+    init(id: UUID = UUID(), property: Property, operator: Operator = .anyOf) {
         self.id = id
         self.property = property
         self.operator = `operator`
@@ -131,14 +151,24 @@ struct OrganizeFilterRow: Equatable, Sendable, Identifiable {
 
     /// A People row; `exclude: true` makes it "is none of".
     static func people(_ ids: Set<UUID>, exclude: Bool = false) -> Self {
-        var row = Self(property: .people, operator: exclude ? .exclude : .include)
+        people(ids, operator: exclude ? .noneOf : .anyOf)
+    }
+
+    /// A People row with an explicit operator — the full truth table.
+    static func people(_ ids: Set<UUID>, operator op: Operator) -> Self {
+        var row = Self(property: .people, operator: op)
         row.peopleIDs = ids
         return row
     }
 
     /// An Event row; `unsorted` adds the "Not Sorted Yet" pseudo-value.
     static func events(_ ids: Set<UUID>, unsorted: Bool = false, exclude: Bool = false) -> Self {
-        var row = Self(property: .event, operator: exclude ? .exclude : .include)
+        events(ids, unsorted: unsorted, operator: exclude ? .noneOf : .anyOf)
+    }
+
+    /// An Event row with an explicit operator — the full truth table.
+    static func events(_ ids: Set<UUID>, unsorted: Bool = false, operator op: Operator) -> Self {
+        var row = Self(property: .event, operator: op)
         row.eventIDs = ids
         row.includesUnsorted = unsorted
         return row
@@ -146,7 +176,12 @@ struct OrganizeFilterRow: Equatable, Sendable, Identifiable {
 
     /// A Media row; `exclude: true` makes it "is none of".
     static func media(_ kinds: Set<OrganizeMediaKind>, exclude: Bool = false) -> Self {
-        var row = Self(property: .media, operator: exclude ? .exclude : .include)
+        media(kinds, operator: exclude ? .noneOf : .anyOf)
+    }
+
+    /// A Media row with an explicit operator — the full truth table.
+    static func media(_ kinds: Set<OrganizeMediaKind>, operator op: Operator) -> Self {
+        var row = Self(property: .media, operator: op)
         row.mediaKinds = kinds
         return row
     }
@@ -178,28 +213,34 @@ struct OrganizeFilterRow: Equatable, Sendable, Identifiable {
     }
 
     /// The row's test against one subject — boards pass a stack's facts,
-    /// the sidebar an event's. An empty row passes; an include row keeps
-    /// the subject when it has any picked value; an exclude row drops it
-    /// when any of its files carries a picked person, event, or kind.
+    /// the sidebar an event's. An empty row passes. "is any of" keeps a
+    /// subject sharing a pick, "is all of" keeps only a subject carrying
+    /// them all, "is none of" drops it on a shared pick, and "is not
+    /// all of" drops it only when it carries them all.
     func matches(subject: OrganizeFilterSubject, calendar: Calendar = .current) -> Bool {
         switch property {
         case .people:
             guard !peopleIDs.isEmpty else { return true }
-            return `operator` == .include
-                ? !subject.personIDs.isDisjoint(with: peopleIDs)
-                : subject.personIDs.isDisjoint(with: peopleIDs)
+            return `operator`.matches(
+                hasAny: !subject.personIDs.isDisjoint(with: peopleIDs),
+                hasAll: peopleIDs.isSubset(of: subject.personIDs)
+            )
         case .event:
             guard !eventIDs.isEmpty || includesUnsorted else { return true }
-            if `operator` == .include {
-                return !subject.eventIDs.isDisjoint(with: eventIDs)
-                    || (includesUnsorted && subject.eventIDs.isEmpty)
-            }
-            return subject.eventIDs.isDisjoint(with: eventIDs)
-                && !(includesUnsorted && subject.eventIDs.isEmpty)
+            // "Not Sorted Yet" counts as a picked value the subject
+            // carries only while it has no event at all.
+            return `operator`.matches(
+                hasAny: !subject.eventIDs.isDisjoint(with: eventIDs)
+                    || (includesUnsorted && subject.eventIDs.isEmpty),
+                hasAll: eventIDs.isSubset(of: subject.eventIDs)
+                    && (!includesUnsorted || subject.eventIDs.isEmpty)
+            )
         case .media:
             guard !mediaKinds.isEmpty else { return true }
-            let hasKind = !subject.mediaKinds.isDisjoint(with: mediaKinds)
-            return `operator` == .include ? hasKind : !hasKind
+            return `operator`.matches(
+                hasAny: !subject.mediaKinds.isDisjoint(with: mediaKinds),
+                hasAll: mediaKinds.isSubset(of: subject.mediaKinds)
+            )
         case .date:
             guard dayStart != nil || dayEnd != nil, let span = subject.daySpan else { return true }
             let lower = dayStart.map { calendar.startOfDay(for: $0) } ?? .distantPast

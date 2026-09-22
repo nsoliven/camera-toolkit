@@ -159,6 +159,60 @@ final class OrganizeSearchTests: XCTestCase {
         XCTAssertFalse(matches(stack, search: search, facts: OrganizeStackFacts(personIDs: [dad, nuisance])))
     }
 
+    func testPeopleRowCoversTheOperatorTruthTable() {
+        let stack = OrganizeStack(items: [item("/Card/DSC00001.ARW")])
+        let dad = UUID()
+        let mom = UUID()
+        let stranger = UUID()
+        func facts(_ ids: UUID...) -> OrganizeStackFacts {
+            OrganizeStackFacts(personIDs: Set(ids))
+        }
+
+        // "is any of" — sharing one pick is enough.
+        var search = filter([[.people([dad, mom], operator: .anyOf)]])
+        XCTAssertFalse(matches(stack, search: search, facts: facts()))
+        XCTAssertTrue(matches(stack, search: search, facts: facts(dad)))
+        XCTAssertTrue(matches(stack, search: search, facts: facts(mom)))
+        XCTAssertTrue(matches(stack, search: search, facts: facts(dad, mom)))
+
+        // "is all of" — the AND inside a row: only a stack carrying both
+        // picked people stays.
+        search = filter([[.people([dad, mom], operator: .allOf)]])
+        XCTAssertFalse(matches(stack, search: search, facts: facts()))
+        XCTAssertFalse(matches(stack, search: search, facts: facts(dad)))
+        XCTAssertFalse(matches(stack, search: search, facts: facts(mom)))
+        XCTAssertTrue(matches(stack, search: search, facts: facts(dad, mom)))
+        // A superset still satisfies "all of" — extras don't count against.
+        XCTAssertTrue(matches(stack, search: search, facts: facts(dad, mom, stranger)))
+
+        // "is none of" — a shared pick drops the stack.
+        search = filter([[.people([dad, mom], operator: .noneOf)]])
+        XCTAssertTrue(matches(stack, search: search, facts: facts()))
+        XCTAssertFalse(matches(stack, search: search, facts: facts(dad)))
+        XCTAssertFalse(matches(stack, search: search, facts: facts(mom)))
+        XCTAssertFalse(matches(stack, search: search, facts: facts(dad, mom)))
+
+        // "is not all of" — the stack stays while any pick is missing.
+        search = filter([[.people([dad, mom], operator: .notAllOf)]])
+        XCTAssertTrue(matches(stack, search: search, facts: facts()))
+        XCTAssertTrue(matches(stack, search: search, facts: facts(dad)))
+        XCTAssertTrue(matches(stack, search: search, facts: facts(mom)))
+        XCTAssertFalse(matches(stack, search: search, facts: facts(dad, mom)))
+    }
+
+    func testMediaRowAllOfRequiresEveryPickedKind() {
+        let stillOnly = OrganizeStack(items: [item("/Card/DSC00001.HEIC", kind: .photo)])
+        let stillAndVideo = OrganizeStack(items: [
+            item("/Card/DSC00002.HEIC", kind: .photo),
+            item("/Card/C0002.MP4", kind: .video),
+        ])
+        let search = filter([[.media([.photo, .video], operator: .allOf)]])
+
+        // A burst needs both halves of the AND — a lone still fails.
+        XCTAssertFalse(matches(stillOnly, search: search))
+        XCTAssertTrue(matches(stillAndVideo, search: search))
+    }
+
     func testEventRowMatchesAssignedEventsAndUnsorted() {
         let stack = OrganizeStack(items: [item("/Card/DSC00001.ARW")])
         let eventA = UUID()
