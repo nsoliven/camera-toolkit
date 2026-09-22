@@ -1342,6 +1342,63 @@ final class EventsWorkspaceTests: XCTestCase {
         }
     }
 
+    /// The deferred build's provisional grid puts every implied file on
+    /// the board before the dated pass spends a single header read: with
+    /// the first cache-miss read parked on the seam, the board already
+    /// holds the whole event, the "still loading" count is gone, and only
+    /// the outstanding capture-date reads remain. 2,000 files stand in
+    /// for the real 10,987-file events.
+    func testRefreshEventPublishesFullGridBeforeMissingCaptureDateReads() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let eventID = try XCTUnwrap(workspace.createEvent(name: "Big Trip", date: organizerDay("2026-08-26"), policy: .buffer))
+            let event = try XCTUnwrap(workspace.event(eventID))
+            let locations = workspace.locations
+            let cardCopy = locations.cardCopyRoot(for: event, deviceID: "sony-a7v", policy: .buffer)
+            let fileCount = 2_000
+            var assignments: [PhotoEventAssignment] = []
+            for index in 0..<fileCount {
+                let name = String(format: "DSC%05d.ARW", index * 10)
+                let url = try writeOrganizerARW(cardCopy.appendingPathComponent(name), "2026:08:26 10:00:00", "000")
+                assignments.append(PhotoEventAssignment(
+                    sourceRootPath: "/Volumes/MissingCard/DCIM",
+                    relativePath: name,
+                    fileSize: Int64(try XCTUnwrap(try url.resourceValues(forKeys: [.fileSizeKey]).fileSize)),
+                    modifiedAt: Date(timeIntervalSince1970: 1_752_000_000 + TimeInterval(index)),
+                    eventID: eventID,
+                    deviceID: "sony-a7v"
+                ))
+            }
+            model.updateConfiguration { $0.photoEventAssignments.append(contentsOf: assignments) }
+
+            // The dated pass's first cache-miss read parks until released —
+            // the stand-in for a slow header read on a cold cache.
+            let box = CaptureDateReadProbeBox()
+            let gate = DispatchSemaphore(value: 0)
+            defer { gate.signal() }
+            workspace.captureDateReadProbe = { url in
+                if box.noteReadCall() {
+                    _ = gate.wait(timeout: .now() + 30)
+                }
+                return CaptureDateReader.timestamp(of: url)
+            }
+
+            let refresh = Task { await workspace.refreshEvent(eventID) }
+            // Parked inside the dated pass's first cache-miss read: the
+            // provisional grid already put every implied file on the board.
+            try await waitUntil { box.readCalls > 0 }
+            XCTAssertEqual(workspace.eventStacks[eventID]?.flatMap(\.files).count, fileCount)
+            XCTAssertNil(workspace.eventBuildRemainders[eventID])
+            XCTAssertEqual(workspace.eventDateReadRemainders[eventID], fileCount - EventsWorkspace.firstScreenFileLimit)
+            XCTAssertFalse(box.onMainThread)
+
+            gate.signal()
+            await refresh.value
+            XCTAssertEqual(workspace.eventStacks[eventID]?.flatMap(\.files).count, fileCount)
+            XCTAssertNil(workspace.eventDateReadRemainders[eventID])
+            XCTAssertEqual(workspace.presence[eventID]?.onDrive, fileCount)
+        }
+    }
+
     func testEventFaceScanRunsAsTrackedJobOnReachableFiles() async throws {
         try await withOrganizerSandbox { root, model, workspace in
             let unsorted = root.appendingPathComponent("Card", isDirectory: true)
@@ -2694,6 +2751,28 @@ private final class EventPathProbeBox: @unchecked Sendable {
             _parkedCalls += 1
             _onMainThread = _onMainThread || Thread.isMainThread
             return _parkedCalls == 1
+        }
+    }
+}
+
+/// What the injected capture-date reader observed inside the deferred
+/// build: how many header reads ran and whether any ran on the main
+/// thread.
+private final class CaptureDateReadProbeBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _readCalls = 0
+    private var _onMainThread = false
+
+    var readCalls: Int { lock.withLock { _readCalls } }
+    var onMainThread: Bool { lock.withLock { _onMainThread } }
+
+    /// Returns true for the first read only — the one the test holds on
+    /// its gate while it inspects the provisional grid.
+    func noteReadCall() -> Bool {
+        lock.withLock {
+            _readCalls += 1
+            _onMainThread = _onMainThread || Thread.isMainThread
+            return _readCalls == 1
         }
     }
 }

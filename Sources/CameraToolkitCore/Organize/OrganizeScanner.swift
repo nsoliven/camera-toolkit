@@ -122,12 +122,18 @@ public struct OrganizeScanner: Sendable {
     /// Pairs sidecars, reads camera capture times in parallel, and shifts
     /// files without a camera timestamp (such as video) by the folder's
     /// camera-clock offset so they land on the same day as the photos.
+    ///
+    /// `readMissingCaptureDates: false` turns a cache miss into "no camera
+    /// date" — no header read, and the miss is not stored — so a caller can
+    /// publish a board before paying for the reads. `missingCaptureDates`
+    /// counts the cache misses either way.
     public static func items(
         for files: [OrganizeFile],
         cache: CaptureDateCache?,
         concurrency: Int = 8,
+        readMissingCaptureDates: Bool = true,
         progress: (@Sendable (OrganizeScanProgress) -> Void)? = nil
-    ) -> (items: [OrganizeItem], clockOffset: TimeInterval) {
+    ) -> (items: [OrganizeItem], clockOffset: TimeInterval, missingCaptureDates: Int) {
         let pairings = OrganizeFileClassifier.pair(files)
         let readable = pairings.indices.filter {
             let kind = pairings[$0].kind
@@ -136,7 +142,8 @@ public struct OrganizeScanner: Sendable {
         let total = readable.count
         progress?(OrganizeScanProgress(phase: "Reading capture times", processed: 0, total: total))
 
-        let timestamps: [CaptureTimestamp?] = parallelMap(
+        let timestampProbe = cache?.timestampProbe
+        let results: [(timestamp: CaptureTimestamp?, missed: Bool)] = parallelMap(
             count: total,
             width: concurrency,
             onCompleted: { completed in
@@ -147,18 +154,21 @@ public struct OrganizeScanner: Sendable {
             transform: { index in
                 let file = pairings[readable[index]].primary
                 if let cached = cache?.lookup(path: file.path, size: file.size, modifiedAt: file.modifiedAt) {
-                    return cached
+                    return (cached, false)
                 }
-                let timestamp = CaptureDateReader.timestamp(of: file.url)
+                guard readMissingCaptureDates else { return (nil, true) }
+                let timestamp = timestampProbe?(file.url) ?? CaptureDateReader.timestamp(of: file.url)
                 cache?.store(path: file.path, size: file.size, modifiedAt: file.modifiedAt, timestamp: timestamp)
-                return timestamp
+                return (timestamp, true)
             }
         )
         try? cache?.save()
 
         var cameraDates: [Int: Date] = [:]
+        var missingCaptureDates = 0
         for (position, pairingIndex) in readable.enumerated() {
-            if let date = timestamps[position]?.date {
+            if results[position].missed { missingCaptureDates += 1 }
+            if let date = results[position].timestamp?.date {
                 cameraDates[pairingIndex] = date
             }
         }
@@ -196,7 +206,7 @@ public struct OrganizeScanner: Sendable {
                 hasCameraDate: false
             )
         }
-        return (items, rootOffset)
+        return (items, rootOffset, missingCaptureDates)
     }
 
     static let skippedDirectoryNames: Set<String> = [

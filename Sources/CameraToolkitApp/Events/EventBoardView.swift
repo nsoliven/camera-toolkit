@@ -65,6 +65,19 @@ struct EventBoardView: View {
                     .padding(.vertical, 5)
                     .background(.bar)
                 }
+                if let pending = workspace.eventDateReadRemainders[eventID], pending > 0 {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Reading capture dates… \(pending.formatted()) left.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 5)
+                    .background(.bar)
+                }
                 if stacks != nil {
                     if groups.isEmpty {
                         if workspace.search.isEmpty {
