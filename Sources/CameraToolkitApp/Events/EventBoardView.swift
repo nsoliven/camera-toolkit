@@ -15,7 +15,12 @@ struct EventBoardView: View {
     @AppStorage("CameraToolkit.organize.order") private var sortOrder: OrganizeBoardOrder = .oldestFirst
     @State private var previewStackID: String?
     @State private var previewFrameIndex = 0
+    @State private var showAllPeople = false
     @FocusState private var searchFocused: Bool
+
+    /// People chips kept on the first row. The rest sit behind Show more,
+    /// ordered by how many confirmed faces each person has on this event.
+    private static let collapsedPeopleCount = 4
 
     /// Grouping that makes sense inside one event — every stack belongs to
     /// it, so "by event" would be a single useless section.
@@ -227,15 +232,27 @@ struct EventBoardView: View {
             .fixedSize()
         }
         if !people.isEmpty {
+            let shown = showAllPeople ? people : Array(people.prefix(Self.collapsedPeopleCount))
             FlowLayout(horizontalSpacing: 8, verticalSpacing: 8) {
-                ForEach(people) { person in
+                ForEach(shown) { person in
                     PersonChip(person: person)
+                }
+                if people.count > Self.collapsedPeopleCount {
+                    Button(showAllPeople ? "Show less" : "Show more") {
+                        showAllPeople.toggle()
+                    }
+                    .buttonStyle(.plain)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         }
         .padding(16)
+        .onChange(of: eventID) { _, _ in showAllPeople = false }
     }
 
     private func emptyState(_ event: SavedCameraEvent) -> some View {

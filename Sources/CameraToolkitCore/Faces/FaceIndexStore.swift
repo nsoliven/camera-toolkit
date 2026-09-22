@@ -1328,7 +1328,10 @@ public final class FaceIndexStore: @unchecked Sendable {
             var copy = person
             copy.faceCount = counts[person.id] ?? 0
             return copy
-        }.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        }.sorted {
+            if $0.faceCount != $1.faceCount { return $0.faceCount > $1.faceCount }
+            return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+        }
     }
 
     // MARK: - Row mapping
