@@ -9,15 +9,18 @@ import SwiftUI
 ///
 /// Rows only offer values the board actually has: People lists the roster
 /// members and unnamed groups the face index saw on these stacks, the date
-/// pickers default to the board's own day range, and the Event property is
-/// hidden on event boards where it would be a no-op.
+/// pickers default to the board's own day range, and on an event board the
+/// Event picker narrows to the board's family — the event plus its
+/// subevents — since picks outside it cannot match there.
 struct OrganizeSearchBar: View {
     let workspace: EventsWorkspace
     /// The unfiltered board's stacks — the People picker's options and the
     /// date picker's fallback bounds come from these.
     let stacks: [OrganizeStack]
-    /// Event boards hide the Event property — every stack there is in it.
-    var showsEventFacet = true
+    /// An event board's family scope — the Event picker offers just those
+    /// events and drops "Not Sorted Yet", which can never match there.
+    /// Nil on unsorted boards, where every event is a valid pick.
+    var eventScope: Set<UUID>? = nil
     @Binding var search: OrganizeSearchFilter
     /// The parent's ⌘F focus state — the field stays the find target, and
     /// gaining focus opens the panel.
@@ -29,19 +32,7 @@ struct OrganizeSearchBar: View {
 
     /// The properties a new or edited row can point at, in menu order.
     private var properties: [OrganizeFilterRow.Property] {
-        let all: [OrganizeFilterRow.Property] = [.people, .date, .event, .media]
-        return showsEventFacet ? all : all.filter { $0 != .event }
-    }
-
-    /// Rows filtering right now — the funnel's accent state. Counts only
-    /// what this board shows: an Event row carried over from an unsorted
-    /// board must not badge an event board's hidden property.
-    private var visibleRowCount: Int {
-        search.groups.reduce(0) { count, group in
-            count + group.rows.filter {
-                !$0.isEmpty && (showsEventFacet || $0.property != .event)
-            }.count
-        }
+        [.people, .date, .event, .media]
     }
 
     /// The people this board can offer a People row — roster members and
@@ -78,10 +69,10 @@ struct OrganizeSearchBar: View {
             Button {
                 showFilters.toggle()
             } label: {
-                Image(systemName: visibleRowCount > 0
+                Image(systemName: search.activeRowCount > 0
                     ? "line.3.horizontal.decrease.circle.fill"
                     : "line.3.horizontal.decrease.circle")
-                    .foregroundStyle(visibleRowCount > 0 ? Color.accentColor : Color.secondary)
+                    .foregroundStyle(search.activeRowCount > 0 ? Color.accentColor : Color.secondary)
             }
             .buttonStyle(.plain)
             .help("Filter by people, date, event, or media kind")
@@ -185,62 +176,56 @@ struct OrganizeSearchBar: View {
 
     /// One builder row: property and operator on top, the picked values as
     /// removable chips underneath, and a control removing the whole row.
-    /// An Event row carried to an event board stays in the filter but
-    /// renders nothing — it does not filter there.
     @ViewBuilder
     private func conditionRow(row: Binding<OrganizeFilterRow>, onRemove: @escaping () -> Void) -> some View {
-        if row.wrappedValue.property == .event, !showsEventFacet {
-            EmptyView()
-        } else {
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(spacing: 6) {
-                    Picker("Property", selection: Binding(
-                        get: { row.wrappedValue.property },
-                        set: { row.wrappedValue.setProperty($0) }
-                    )) {
-                        ForEach(properties, id: \.self) { property in
-                            Text(property.title).tag(property)
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Picker("Property", selection: Binding(
+                    get: { row.wrappedValue.property },
+                    set: { row.wrappedValue.setProperty($0) }
+                )) {
+                    ForEach(properties, id: \.self) { property in
+                        Text(property.title).tag(property)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .controlSize(.small)
+                .fixedSize()
+
+                if row.wrappedValue.property != .date {
+                    Picker("Operator", selection: row.operator) {
+                        ForEach(OrganizeFilterRow.Operator.allCases, id: \.self) { item in
+                            Text(item.title).tag(item)
                         }
                     }
                     .labelsHidden()
                     .pickerStyle(.menu)
                     .controlSize(.small)
                     .fixedSize()
-
-                    if row.wrappedValue.property != .date {
-                        Picker("Operator", selection: row.operator) {
-                            ForEach(OrganizeFilterRow.Operator.allCases, id: \.self) { item in
-                                Text(item.title).tag(item)
-                            }
-                        }
-                        .labelsHidden()
-                        .pickerStyle(.menu)
-                        .controlSize(.small)
-                        .fixedSize()
-                    }
-                    Spacer(minLength: 4)
-                    Button(action: onRemove) {
-                        Image(systemName: "xmark.circle.fill")
-                            .foregroundStyle(.secondary)
-                    }
-                    .buttonStyle(.plain)
-                    .help("Remove this row")
                 }
-
-                switch row.wrappedValue.property {
-                case .date:
-                    dateValues(row)
-                case .people:
-                    peopleValues(row)
-                case .event:
-                    eventValues(row)
-                case .media:
-                    mediaValues(row)
+                Spacer(minLength: 4)
+                Button(action: onRemove) {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
                 }
+                .buttonStyle(.plain)
+                .help("Remove this row")
             }
-            .padding(7)
-            .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+            switch row.wrappedValue.property {
+            case .date:
+                dateValues(row)
+            case .people:
+                peopleValues(row)
+            case .event:
+                eventValues(row)
+            case .media:
+                mediaValues(row)
+            }
         }
+        .padding(7)
+        .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 
     /// A removable picked value inside a row.
@@ -348,6 +333,11 @@ struct OrganizeSearchBar: View {
 
     private func eventValues(_ row: Binding<OrganizeFilterRow>) -> some View {
         let rows = workspace.sidebarEvents
+        // On an event board the picker narrows to the family — picks
+        // outside it can't match there. A carried-over pick still renders
+        // as a removable chip even though it is not offered again.
+        let options = rows.filter { eventScope?.contains($0.event.id) ?? true }
+        let offersUnsorted = eventScope == nil && !row.wrappedValue.includesUnsorted
         let picked = rows.filter { row.wrappedValue.eventIDs.contains($0.event.id) }
         let stale = row.wrappedValue.eventIDs
             .subtracting(rows.map(\.event.id))
@@ -371,14 +361,14 @@ struct OrganizeSearchBar: View {
                     row.wrappedValue.eventIDs.remove(id)
                 }
             }
-            if rows.isEmpty, !row.wrappedValue.includesUnsorted {
+            if options.isEmpty, !row.wrappedValue.includesUnsorted {
                 Text("No events yet — sort items into one first.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } else {
-                let unpicked = rows.filter { !row.wrappedValue.eventIDs.contains($0.event.id) }
+                let unpicked = options.filter { !row.wrappedValue.eventIDs.contains($0.event.id) }
                 Menu {
-                    if !row.wrappedValue.includesUnsorted {
+                    if offersUnsorted {
                         Button {
                             row.wrappedValue.includesUnsorted = true
                         } label: {
@@ -404,7 +394,7 @@ struct OrganizeSearchBar: View {
                 .menuIndicator(.hidden)
                 .menuStyle(.borderlessButton)
                 .fixedSize()
-                .disabled(unpicked.isEmpty && row.wrappedValue.includesUnsorted)
+                .disabled(unpicked.isEmpty && !offersUnsorted)
                 .help("Add an event to this row")
             }
         }

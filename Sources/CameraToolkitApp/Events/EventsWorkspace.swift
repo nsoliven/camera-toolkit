@@ -846,12 +846,13 @@ final class EventsWorkspace {
     }
 
     /// The stacks an event board should show under the same search state.
-    /// Every condition row applies except Event rows — the board is one
-    /// event already, so a pick carried over from another board's panel is
-    /// dropped rather than emptying this one.
+    /// Event rows apply scoped to the board's family — the event plus its
+    /// subevents — so an "is none of" pick on a subevent hides that branch
+    /// while picks carried over from another board's panel narrow to
+    /// nothing rather than emptying this one.
     func visibleEventStacks(_ eventID: UUID, search: OrganizeSearchFilter) -> [OrganizeStack] {
         let stacks = eventStacks[eventID] ?? []
-        let scoped = search.droppingEventRows()
+        let scoped = search.scopingEventRows(to: scopeIDs(eventID))
         guard !scoped.isEmpty else { return stacks }
         let peopleByStackID = scoped.needsPeople ? boardPeople(for: stacks).byStackID : [:]
         return stacks.filter {
@@ -862,6 +863,23 @@ final class EventsWorkspace {
                 facts: stackFacts($0, peopleByStackID: peopleByStackID)
             )
         }
+    }
+
+    /// The event's direct subevents, in sidebar sibling order — the header
+    /// chips and the board's subevent sections share this list.
+    func subevents(of eventID: UUID) -> [SavedCameraEvent] {
+        EventHierarchy.children(of: eventID, in: model.configuration.savedEvents)
+    }
+
+    /// The tag a stack wears on this event board: its owning event when
+    /// that is a subevent under `eventID` — a grandchild's photos wear the
+    /// grandchild's own tag, not the direct child's. Stacks owned by the
+    /// board's own event (or split across events) wear no tag.
+    func subeventTag(for stack: OrganizeStack, in eventID: UUID) -> SavedCameraEvent? {
+        guard let owner = assignedEvent(for: stack).event,
+              owner.id != eventID,
+              scopeIDs(eventID).contains(owner.id) else { return nil }
+        return owner
     }
 
     /// The board's collapsible sections: the event's own stacks under the
@@ -875,7 +893,7 @@ final class EventsWorkspace {
         grouping: OrganizeBoardGrouping,
         order: OrganizeBoardOrder
     ) -> [OrganizeBoardGroup] {
-        let children = EventHierarchy.children(of: eventID, in: model.configuration.savedEvents)
+        let children = subevents(of: eventID)
         guard !children.isEmpty else {
             return OrganizeBoardPlan.groups(for: stacks, grouping: grouping, order: order)
         }
