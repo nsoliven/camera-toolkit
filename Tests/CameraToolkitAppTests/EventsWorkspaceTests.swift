@@ -310,6 +310,12 @@ final class EventsWorkspaceTests: XCTestCase {
             XCTAssertEqual(model.configuration.photoEventAssignments.count, 3)
             workspace.selectStacks([burst.id])
 
+            let trashPosts = NotificationPostBox()
+            let observer = NotificationCenter.default.addObserver(
+                forName: .cameraToolkitMediaTrashChanged, object: nil, queue: nil
+            ) { _ in trashPosts.note() }
+            defer { NotificationCenter.default.removeObserver(observer) }
+
             workspace.trash(stackIDs: [burst.id], from: location.id)
             // Trash now confirms first — the test stands in for the owner
             // pressing "Move to Trash" on the sheet.
@@ -346,6 +352,9 @@ final class EventsWorkspaceTests: XCTestCase {
             XCTAssertTrue(model.configuration.photoEventAssignments.isEmpty)
             XCTAssertTrue(workspace.selectedStackIDs.isEmpty)
             XCTAssertTrue(model.statusMessage.contains("Moved 3 files to Trash"))
+            // An open Trash window reloads on this notification — the move
+            // must post it once so the new batch shows without a manual Reload.
+            XCTAssertEqual(trashPosts.count, 1)
 
             // The batch lists under the removed-files root and restores cleanly.
             let svc = MediaTrashService(removedFilesRoot: workspace.locations.removedFilesRoot)
@@ -411,6 +420,97 @@ final class EventsWorkspaceTests: XCTestCase {
             workspace.pendingTrash = nil
             XCTAssertTrue(FileManager.default.fileExists(atPath: photo.path))
         }
+    }
+
+    /// Regression: the event-board trash completion used to kick off a full
+    /// `refreshEvent` on top of its own board update — on a large event that
+    /// repaint replaced the "Moved N files to Trash" line with loading bars
+    /// and re-read every file. The completion already drops the moved files
+    /// from the boards it owns; the event grid must lose the trashed stacks
+    /// with no refresh at all.
+    func testEventTrashDropsStacksWithoutRefreshingTheBoard() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let unsorted = root.appendingPathComponent("Drive/Unsorted A7V", isDirectory: true)
+            try writeOrganizerARW(unsorted.appendingPathComponent("Transfer 1/B0001_DSC00001.ARW"), "2026:08:26 10:00:00", "100")
+            try writeOrganizerARW(unsorted.appendingPathComponent("Transfer 1/B0001_DSC00002.ARW"), "2026:08:26 10:00:00", "400")
+            try writeOrganizerARW(unsorted.appendingPathComponent("Transfer 1/DSC00010.ARW"), "2026:08:26 11:00:00", "000")
+            let location = addUnsorted(unsorted, to: model)
+            workspace.scan(location)
+            try await waitUntil { workspace.sources[location.id]?.result != nil }
+            let result = try XCTUnwrap(workspace.sources[location.id]?.result)
+
+            let eventID = try XCTUnwrap(workspace.createEvent(name: "Beach Day", date: organizerDay("2026-08-26"), policy: .buffer))
+            let burst = try XCTUnwrap(result.stacks.first { $0.isBurst })
+            let single = try XCTUnwrap(result.stacks.first { !$0.isBurst })
+            workspace.assign(stackIDs: [burst.id, single.id], from: location.id, to: eventID)
+
+            // Paint the board once — its stacks point at the real files.
+            await workspace.refreshEvent(eventID)
+            let painted = try XCTUnwrap(workspace.eventStacks[eventID])
+            XCTAssertEqual(painted.flatMap(\.files).count, 3)
+            let boardBurst = try XCTUnwrap(painted.first { $0.isBurst })
+
+            // Every board-path resolve runs inside refreshEvent, so this seam
+            // records any refresh the trash completion might still spawn.
+            let locations = workspace.locations
+            let event = try XCTUnwrap(workspace.event(eventID))
+            let box = EventPathProbeBox()
+            workspace.eventPathResolver = { assignment in
+                box.noteResolved(assignment.relativePath)
+                return locations.impliedDrivePath(for: assignment, event: event, policy: .buffer)
+            }
+
+            let trashPosts = NotificationPostBox()
+            let observer = NotificationCenter.default.addObserver(
+                forName: .cameraToolkitMediaTrashChanged, object: nil, queue: nil
+            ) { _ in trashPosts.note() }
+            defer { NotificationCenter.default.removeObserver(observer) }
+
+            workspace.requestTrash(stackIDs: [boardBurst.id], fromEvent: eventID)
+            workspace.confirmTrash(try XCTUnwrap(workspace.pendingTrash))
+            try await waitUntil { !model.isBusy && workspace.eventStacks[eventID]?.flatMap(\.files).count == 1 }
+
+            // The grid kept the untrashed single; the burst's files are gone
+            // from the event board, the unsorted board, and the assignments.
+            let remaining = try XCTUnwrap(workspace.eventStacks[eventID])
+            XCTAssertEqual(remaining.flatMap(\.files).map(\.name), ["DSC00010.ARW"])
+            XCTAssertEqual(workspace.sources[location.id]?.result?.items.count, 1)
+            XCTAssertEqual(model.configuration.photoEventAssignments.map(\.relativePath), ["DSC00010.ARW"])
+            XCTAssertTrue(model.statusMessage.contains("Moved 2 files to Trash"))
+            XCTAssertEqual(trashPosts.count, 1)
+
+            // Give a wrongly-spawned refresh every chance to run its first
+            // resolve — none may come.
+            try await Task.sleep(for: .milliseconds(300))
+            XCTAssertTrue(box.resolved.isEmpty)
+        }
+    }
+
+    /// The Trash window's reload gate: only the newest listing may publish.
+    /// A read that lands late — before or after the current one — is dropped,
+    /// and `reading` stays owned by the read still in flight.
+    func testTrashReloadGateDropsStaleListings() {
+        var gate = TrashReloadGate()
+        let first = gate.begin()
+        let second = gate.begin()
+        XCTAssertTrue(gate.reading)
+
+        // The newer read lands first and publishes.
+        XCTAssertTrue(gate.finish(second))
+        XCTAssertFalse(gate.reading)
+        // The older listing finishes late — dropped, and it must not clear a
+        // reading flag it never owned.
+        XCTAssertFalse(gate.finish(first))
+        XCTAssertFalse(gate.reading)
+
+        // Same rule when the stale read lands while the newer one is still
+        // in flight: the board keeps saying it is re-reading.
+        let third = gate.begin()
+        let fourth = gate.begin()
+        XCTAssertFalse(gate.finish(third))
+        XCTAssertTrue(gate.reading)
+        XCTAssertTrue(gate.finish(fourth))
+        XCTAssertFalse(gate.reading)
     }
 
     /// "Move to New Burst" records a BurstSplit in the configuration and
@@ -2697,6 +2797,19 @@ final class EventsWorkspaceTests: XCTestCase {
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         try Data(bytes).write(to: url)
         return url
+    }
+}
+
+/// Counts NotificationCenter posts — the observer block is `@Sendable`, so
+/// the tally lives behind a lock.
+private final class NotificationPostBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _count = 0
+
+    var count: Int { lock.withLock { _count } }
+
+    func note() {
+        lock.withLock { _count += 1 }
     }
 }
 
