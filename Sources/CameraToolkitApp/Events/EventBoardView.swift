@@ -60,7 +60,7 @@ struct EventBoardView: View {
                         board(groups: groups)
                     }
                 } else {
-                    ProgressView("Checking every copy of \(event.name)…")
+                    ProgressView("Loading \(event.name)…")
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
                 OrganizeStatusLine(model: model, workspace: workspace)

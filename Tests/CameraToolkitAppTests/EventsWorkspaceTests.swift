@@ -968,6 +968,127 @@ final class EventsWorkspaceTests: XCTestCase {
         }
     }
 
+    /// First paint is local: the board's stacks come from the catalog-implied
+    /// `Card Copy` path before the four-place sweep answers — even while an
+    /// archive stat is parked the way a NAS share stalls. 2,000 assignments
+    /// stand in for the real 2,251/10,987-file events: the parked stat is
+    /// what proves the ordering, the count keeps it honest. While parked,
+    /// the stacks already published stay published, and the finished sweep
+    /// still reports drive/source/archive truthfully.
+    func testRefreshEventPublishesLocalStacksWhileArchiveSweepIsParked() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let eventID = try XCTUnwrap(workspace.createEvent(name: "Big Trip", date: organizerDay("2026-08-26"), policy: .buffer))
+            let event = try XCTUnwrap(workspace.event(eventID))
+            let locations = workspace.locations
+            let cardCopy = locations.cardCopyRoot(for: event, deviceID: "sony-a7v", policy: .buffer)
+            let fileCount = 2_000
+            var assignments: [PhotoEventAssignment] = []
+            for index in 0..<fileCount {
+                let name = String(format: "DSC%05d.ARW", index)
+                let url = try writeOrganizerARW(cardCopy.appendingPathComponent(name), "2026:08:26 10:00:00", "000")
+                let size = Int64(try XCTUnwrap(try url.resourceValues(forKeys: [.fileSizeKey]).fileSize))
+                assignments.append(PhotoEventAssignment(
+                    sourceRootPath: "/Volumes/MissingCard/DCIM",
+                    relativePath: name,
+                    fileSize: size,
+                    modifiedAt: Date(),
+                    eventID: eventID,
+                    deviceID: "sony-a7v"
+                ))
+            }
+            model.updateConfiguration { $0.photoEventAssignments.append(contentsOf: assignments) }
+
+            // The first archive stat parks until released — the stand-in
+            // for a NAS share that takes seconds per lookup.
+            let box = PresenceProbeBox()
+            let gate = DispatchSemaphore(value: 0)
+            defer { gate.signal() }
+            let libraryPrefix = locations.libraryRoot.path
+            workspace.presenceProbe = { url, size, mounted in
+                box.noteCall()
+                if let url, url.path.hasPrefix(libraryPrefix), box.archiveCalls == 0 {
+                    box.noteArchiveCall()
+                    _ = gate.wait(timeout: .now() + 30)
+                }
+                return EventPresenceScanner.state(url, size: size, mounted: mounted)
+            }
+
+            let refresh = Task { await workspace.refreshEvent(eventID) }
+            // Parked inside the first archive stat: the sweep has begun,
+            // and the local stacks must already be on the board.
+            try await waitUntil { box.archiveCalls > 0 }
+            XCTAssertEqual(workspace.eventStacks[eventID]?.flatMap(\.files).count, fileCount)
+            XCTAssertNil(workspace.presence[eventID])
+            XCTAssertFalse(box.onMainThread)
+            XCTAssertEqual(box.priority, .utility)
+
+            gate.signal()
+            await refresh.value
+            let summary = try XCTUnwrap(workspace.presence[eventID])
+            XCTAssertEqual(summary.total, fileCount)
+            XCTAssertEqual(summary.onDrive, fileCount)
+            XCTAssertEqual(summary.onSource, 0)
+            XCTAssertEqual(summary.sourceOffline, fileCount)
+            XCTAssertEqual(summary.onArchive, 0)
+            // The sweep agreed with pass one's paths, so the grid the board
+            // drew first is the grid that stays.
+            XCTAssertEqual(workspace.eventStacks[eventID]?.flatMap(\.files).count, fileCount)
+            XCTAssertTrue(root.path.hasPrefix(FileManager.default.temporaryDirectory.path))
+        }
+    }
+
+    /// A second open cancels the parked sweep instead of letting it
+    /// publish over the newer generation: the stale pass is dropped and
+    /// the fresh one still lands truthfully.
+    func testRefreshEventReopenCancelsParkedSweep() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let eventID = try XCTUnwrap(workspace.createEvent(name: "Trip", date: organizerDay("2026-08-26"), policy: .buffer))
+            let event = try XCTUnwrap(workspace.event(eventID))
+            let locations = workspace.locations
+            let cardCopy = locations.cardCopyRoot(for: event, deviceID: "sony-a7v", policy: .buffer)
+            var assignments: [PhotoEventAssignment] = []
+            for index in 0..<3 {
+                let name = String(format: "DSC%05d.ARW", index)
+                let url = try writeOrganizerARW(cardCopy.appendingPathComponent(name), "2026:08:26 10:00:00", "000")
+                assignments.append(PhotoEventAssignment(
+                    sourceRootPath: "/Volumes/MissingCard/DCIM",
+                    relativePath: name,
+                    fileSize: Int64(try XCTUnwrap(try url.resourceValues(forKeys: [.fileSizeKey]).fileSize)),
+                    modifiedAt: Date(),
+                    eventID: eventID,
+                    deviceID: "sony-a7v"
+                ))
+            }
+            model.updateConfiguration { $0.photoEventAssignments.append(contentsOf: assignments) }
+
+            let box = PresenceProbeBox()
+            let gate = DispatchSemaphore(value: 0)
+            defer { gate.signal() }
+            let libraryPrefix = locations.libraryRoot.path
+            workspace.presenceProbe = { url, size, mounted in
+                box.noteCall()
+                if let url, url.path.hasPrefix(libraryPrefix), box.archiveCalls == 0 {
+                    box.noteArchiveCall()
+                    _ = gate.wait(timeout: .now() + 30)
+                }
+                return EventPresenceScanner.state(url, size: size, mounted: mounted)
+            }
+
+            // The parked first sweep is abandoned by the second open;
+            // releasing the gate lets its next cancellation check exit.
+            let first = Task { await workspace.refreshEvent(eventID) }
+            try await waitUntil { box.archiveCalls > 0 }
+            let second = Task { await workspace.refreshEvent(eventID) }
+            gate.signal()
+            await first.value
+            await second.value
+
+            let summary = try XCTUnwrap(workspace.presence[eventID])
+            XCTAssertEqual(summary.onDrive, 3)
+            XCTAssertEqual(workspace.eventStacks[eventID]?.flatMap(\.files).count, 3)
+        }
+    }
+
     func testEventFaceScanRunsAsTrackedJobOnReachableFiles() async throws {
         try await withOrganizerSandbox { root, model, workspace in
             let unsorted = root.appendingPathComponent("Card", isDirectory: true)
@@ -1876,6 +1997,30 @@ final class EventsWorkspaceTests: XCTestCase {
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         try Data(bytes).write(to: url)
         return url
+    }
+}
+
+/// What the injected presence probe observed inside the sweep: where the
+/// stat ran, at what priority, and how far it got before parking.
+private final class PresenceProbeBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _onMainThread = true
+    private var _priority: TaskPriority?
+    private var _archiveCalls = 0
+
+    var onMainThread: Bool { lock.withLock { _onMainThread } }
+    var priority: TaskPriority? { lock.withLock { _priority } }
+    var archiveCalls: Int { lock.withLock { _archiveCalls } }
+
+    func noteCall() {
+        lock.withLock {
+            _onMainThread = Thread.isMainThread
+            _priority = Task<Never, Never>.currentPriority
+        }
+    }
+
+    func noteArchiveCall() {
+        lock.withLock { _archiveCalls += 1 }
     }
 }
 

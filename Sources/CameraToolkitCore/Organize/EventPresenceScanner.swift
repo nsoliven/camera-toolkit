@@ -46,17 +46,33 @@ public struct EventPresenceSummary: Sendable {
 }
 
 public enum EventPresenceScanner {
+    /// One file-stat probe: mounted-volume check, then a regular-file and
+    /// size read. Injectable so the sweep can be observed — or stalled the
+    /// way a NAS share stalls — without a real filesystem.
+    public typealias PresenceProbe = @Sendable (URL?, Int64, Set<String>) -> CatalogPresenceState
+
+    /// The truthful four-place answer for one event. Probes each file's
+    /// source, policy drive, other drive, and NAS archive path in
+    /// assignment order — sequential, never fanned out, so a slow share is
+    /// poked once at a time rather than stampeded. Returns nil when the
+    /// surrounding task is cancelled mid-sweep so a stale pass can be
+    /// dropped instead of published.
     public static func scan(
         event: SavedCameraEvent,
         assignments: [PhotoEventAssignment],
         locations: EventStorageLocations,
-        mountedVolumes: Set<String>? = nil
-    ) -> EventPresenceSummary {
+        mountedVolumes: Set<String>? = nil,
+        probe: PresenceProbe? = nil
+    ) -> EventPresenceSummary? {
         let mounted = mountedVolumes ?? VolumeInfo.mountedVolumePaths()
         let policy = locations.resolvedPolicy(for: event)
         let otherPolicy: EventStoragePolicy = policy == .buffer ? .archiveOnly : .buffer
+        let probe = probe ?? { url, size, mounted in state(url, size: size, mounted: mounted) }
 
-        let assets = assignments.map { assignment -> EventAssetPresence in
+        var assets: [EventAssetPresence] = []
+        assets.reserveCapacity(assignments.count)
+        for assignment in assignments {
+            if Task<Never, Never>.isCancelled { return nil }
             let source = locations.sourceURL(for: assignment)
             let drive = locations.driveURL(for: assignment, event: event, policy: policy)
             let other = locations.driveURL(for: assignment, event: event, policy: otherPolicy)
@@ -65,19 +81,19 @@ public enum EventPresenceScanner {
                 guard let candidate, let source else { return false }
                 return EventStorageLocations.pathKey(candidate.path) == EventStorageLocations.pathKey(source.path)
             }
-            return EventAssetPresence(
+            assets.append(EventAssetPresence(
                 id: CatalogStore.eventAssetID(assignment),
                 assignment: assignment,
                 sourcePath: source?.path,
                 drivePath: drive?.path,
                 otherDrivePath: other?.path,
                 archivePath: archive?.path,
-                source: state(source, size: assignment.fileSize, mounted: mounted),
-                drive: state(drive, size: assignment.fileSize, mounted: mounted),
-                otherDrive: state(other, size: assignment.fileSize, mounted: mounted),
-                archive: state(archive, size: assignment.fileSize, mounted: mounted),
+                source: probe(source, assignment.fileSize, mounted),
+                drive: probe(drive, assignment.fileSize, mounted),
+                otherDrive: probe(other, assignment.fileSize, mounted),
+                archive: probe(archive, assignment.fileSize, mounted),
                 sourceIsDriveCopy: sourceIsDrive
-            )
+            ))
         }
         return EventPresenceSummary(eventID: event.id, policy: policy, assets: assets, checkedAt: Date())
     }
