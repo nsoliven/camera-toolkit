@@ -117,6 +117,41 @@ final class EventHierarchyTests: XCTestCase {
         }
     }
 
+    func testDepthCapStopsAtTwoLevels() throws {
+        let parent = event("TRIP2026", "2026-08-21")
+        let child = event("Matcha", "2026-08-23", parent: parent)
+        let grandchild = event("Latte Art", "2026-08-24", parent: child)
+        let events = [parent, child, grandchild]
+
+        XCTAssertEqual(EventHierarchy.depth(of: parent, in: events), 0)
+        XCTAssertEqual(EventHierarchy.depth(of: child, in: events), 1)
+        XCTAssertEqual(EventHierarchy.depth(of: grandchild, in: events), 2)
+        XCTAssertTrue(EventHierarchy.canParent(parent, in: events))
+        XCTAssertTrue(EventHierarchy.canParent(child, in: events))
+        XCTAssertFalse(EventHierarchy.canParent(grandchild, in: events))
+        XCTAssertEqual(EventHierarchy.children(of: parent.id, in: events).map(\.id), [child.id])
+        XCTAssertEqual(EventHierarchy.children(of: child.id, in: events).map(\.id), [grandchild.id])
+        XCTAssertTrue(EventHierarchy.children(of: grandchild.id, in: events).isEmpty)
+    }
+
+    func testDeeperExistingEventStillListsAndKeepsItsLink() throws {
+        // Depth-3 data (adopted folders, pre-cap configs) keeps its chain —
+        // the cap refuses new children under it but never rewrites or
+        // hides the existing level.
+        let a = event("A", "2026-08-21")
+        let b = event("B", "2026-08-22", parent: a)
+        let c = event("C", "2026-08-23", parent: b)
+        let d = event("D", "2026-08-24", parent: c)
+        let events = [a, b, c, d]
+
+        XCTAssertEqual(EventHierarchy.depth(of: d, in: events), 3)
+        XCTAssertFalse(EventHierarchy.canParent(d, in: events))
+        XCTAssertEqual(EventHierarchy.displayName(of: d, in: events), "A / B / C / D")
+        let rows = EventHierarchy.flattened(events)
+        XCTAssertEqual(rows.map(\.event.id), [a.id, b.id, c.id, d.id])
+        XCTAssertEqual(rows.last?.depth, 3)
+    }
+
     func testSubeventYearComesFromRootAncestor() throws {
         try withTemporaryDirectory { root in
             var configuration = testConfiguration(root: root)

@@ -31,8 +31,11 @@ struct EventBoardView: View {
     }
 
     private var boardGroups: [OrganizeBoardGroup] {
-        OrganizeBoardPlan.groups(
-            for: workspace.visibleEventStacks(eventID, search: workspace.search),
+        // The event's own stacks grouped as usual, then one section per
+        // direct subevent holding that subevent's subtree.
+        workspace.eventBoardGroups(
+            eventID,
+            stacks: workspace.visibleEventStacks(eventID, search: workspace.search),
             grouping: effectiveGrouping,
             order: sortOrder
         )
@@ -78,7 +81,7 @@ struct EventBoardView: View {
                         stackID: $previewStackID,
                         excludedEventID: eventID,
                         assignVerb: "Move to",
-                        eventForStack: { _ in event },
+                        eventForStack: { stack in workspace.assignedEvent(for: stack).event ?? event },
                         onAssign: { stack, target in
                             workspace.moveStacks([stack.id], fromEvent: eventID, toEvent: target.id)
                         },
@@ -619,8 +622,11 @@ struct StorageStrip: View {
         ) {
             if needsDrive > 0 {
                 Button(policy == .buffer ? "Put on Buffer…" : "Move to Private…") {
+                    // The strip's counts cover the whole family, so the
+                    // apply does too — each subevent's files land in its
+                    // own nested folder.
                     workspace.prepareApply(
-                        eventIDs: [event.id],
+                        eventIDs: workspace.eventFamily(event.id).map(\.id),
                         title: policy == .buffer ? "Put \(event.name) on the Buffer" : "Move \(event.name) to Private staging"
                     )
                 }

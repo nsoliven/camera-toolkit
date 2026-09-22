@@ -164,6 +164,11 @@ private struct EventFirstPaint: Sendable {
 /// it — the storage-strip summary, the badge index, and Immich statuses.
 private struct EventRefreshOutput: Sendable {
     var summary: EventPresenceSummary
+    /// One subtree-scoped summary per family member the sweep covered — a
+    /// parent's pass scans every descendant too, so the sidebar chips and
+    /// presence under it publish their own truthful scope in the same
+    /// landing instead of waiting for each board to be opened.
+    var memberSummaries: [UUID: EventPresenceSummary]
     var files: [OrganizeFile]
     var assetsByPathKey: [String: EventAssetPresence]
     var immich: [String: ImmichCatalogStatus]
@@ -176,6 +181,9 @@ private struct PlannedReassignment: Sendable {
 }
 
 private struct NASArchiveGroup: Sendable {
+    /// The event these files are assigned to — on a family board the
+    /// assets can belong to a subevent, whose layout nests deeper.
+    var owner: SavedCameraEvent
     var root: URL
     var deviceID: String?
     var files: [FileRecord]
@@ -192,6 +200,8 @@ private struct ImmichCandidate: Sendable {
     var path: String
     var size: Int64
     var modifiedAt: Date
+    /// The owning event's album pick — a family board can span several.
+    var albumName: String?
 }
 
 private struct BurstRegroupOutcome: Sendable {
@@ -294,6 +304,9 @@ final class EventsWorkspace {
     /// Mounted-volume set for `isConnected`, rebuilt once per connectivity
     /// revision instead of once per sidebar row.
     @ObservationIgnored private var mountedVolumesCache: (revision: Int, paths: Set<String>)?
+    /// (configurationRevision, event → itself + descendants) — the scope a
+    /// board, its sidebar count, its filters, and its people chips share.
+    @ObservationIgnored private var eventScopeCache: (Int, [UUID: Set<UUID>])?
     /// Storage-location resolver reused within one configuration revision so
     /// event hierarchy lookups share its index.
     @ObservationIgnored private var locationsCache: (revision: Int, locations: EventStorageLocations)?
@@ -391,15 +404,48 @@ final class EventsWorkspace {
 
     /// An event as filter-builder facts — the same subject a board builds
     /// per stack: its roster people (`event.people`, unnamed groups never
-    /// count here), its own id so Event rows can pin or drop it, the media
-    /// kinds its assigned files carry, and its date as the capture span.
+    /// count here), itself plus its ancestors so an Event row for a parent
+    /// keeps the subevent's row too, the media kinds its assigned files
+    /// carry, and its date as the capture span.
     private func sidebarSubject(for event: SavedCameraEvent) -> OrganizeFilterSubject {
         OrganizeFilterSubject(
             personIDs: Set(eventPeople(event.id).map(\.id)),
-            eventIDs: [event.id],
+            eventIDs: ancestorScope(of: event),
             mediaKinds: eventMediaKinds(for: event.id),
             daySpan: event.eventDate...event.eventDate
         )
+    }
+
+    /// The event plus its ancestors — the id set an Event row matches
+    /// against, so a parent filter keeps a stack sorted into a subevent
+    /// and a subevent filter keeps its own descendants' stacks.
+    private func ancestorScope(of event: SavedCameraEvent) -> Set<UUID> {
+        Set(locations.ancestors(of: event).map(\.id) + [event.id])
+    }
+
+    /// The event plus every descendant — the family scope a board, its
+    /// count, and its people chips cover. Cached per configuration
+    /// revision so the sidebar's per-row counts share one walk.
+    func scopeIDs(_ eventID: UUID) -> Set<UUID> {
+        if let cache = eventScopeCache, cache.0 == model.configurationRevision {
+            return cache.1[eventID] ?? [eventID]
+        }
+        let events = model.configuration.savedEvents
+        var scopes: [UUID: Set<UUID>] = [:]
+        for event in events {
+            var ids: Set<UUID> = [event.id]
+            ids.formUnion(EventHierarchy.descendants(of: event.id, in: events).map(\.id))
+            scopes[event.id] = ids
+        }
+        eventScopeCache = (model.configurationRevision, scopes)
+        return scopes[eventID] ?? [eventID]
+    }
+
+    /// The event plus its descendants in sidebar order — the family a
+    /// board's Apply or storage actions cover.
+    func eventFamily(_ eventID: UUID) -> [SavedCameraEvent] {
+        guard let event = event(eventID) else { return [] }
+        return [event] + EventHierarchy.descendants(of: eventID, in: model.configuration.savedEvents)
     }
 
     /// Unsorted sidebar locations matching the search query on name or path.
@@ -432,27 +478,51 @@ final class EventsWorkspace {
     }
 
     /// Events that may parent `eventID` — every event except it and its own
-    /// subevents, so the picker can never create a loop. Returned in
-    /// flattened sidebar order for the parent picker's indented menu.
+    /// subevents, so the picker can never create a loop, and never deeper
+    /// than the cap: a depth-2 event can't take another level. The event's
+    /// current parent stays listed even then, so the picker can still show
+    /// a grandfathered deeper link. Returned in flattened sidebar order
+    /// for the parent picker's indented menu.
     func parentCandidates(excluding eventID: UUID?) -> [(event: SavedCameraEvent, depth: Int)] {
-        sidebarEvents.filter { row in
+        let events = model.configuration.savedEvents
+        let currentParentID = eventID.flatMap { event($0)?.parentEventID }
+        return sidebarEvents.filter { row in
+            guard row.event.id == currentParentID
+                || EventHierarchy.canParent(row.event, in: events) else { return false }
             guard let eventID else { return true }
             return row.event.id != eventID
-                && !EventHierarchy.ancestors(of: row.event, in: model.configuration.savedEvents).contains { $0.id == eventID }
+                && !EventHierarchy.ancestors(of: row.event, in: events).contains { $0.id == eventID }
         }
     }
 
     /// `candidate` when it can parent `eventID` — it exists, is not the
-    /// event itself, and is not one of its subevents. Otherwise nil.
+    /// event itself or one of its subevents, and sits below the depth cap.
+    /// The parent an event already has always stays valid: an event deeper
+    /// than the cap keeps its link instead of flattening on a rename —
+    /// the cap only refuses new levels. Otherwise nil.
     func validParentEventID(_ candidate: UUID?, for eventID: UUID?) -> UUID? {
         guard let candidate,
               candidate != eventID,
               let parent = event(candidate) else { return nil }
-        if let eventID,
-           EventHierarchy.ancestors(of: parent, in: model.configuration.savedEvents).contains(where: { $0.id == eventID }) {
-            return nil
+        let events = model.configuration.savedEvents
+        if let eventID {
+            if event(eventID)?.parentEventID == candidate { return candidate }
+            if EventHierarchy.ancestors(of: parent, in: events).contains(where: { $0.id == eventID }) {
+                return nil
+            }
         }
+        guard EventHierarchy.canParent(parent, in: events) else { return nil }
         return candidate
+    }
+
+    /// Why a new subevent under `candidate` is refused, or nil when it is
+    /// allowed — the status sentence the refusal reports.
+    private func subeventRefusal(for candidate: UUID) -> String? {
+        guard let parent = event(candidate) else { return "That event no longer exists." }
+        guard EventHierarchy.canParent(parent, in: model.configuration.savedEvents) else {
+            return "\(eventTitle(parent)) is already at the deepest level — a subevent can only go two levels under a top-level event."
+        }
+        return nil
     }
 
     /// The events behind the 1–3 chips and the picker's Recent section: up
@@ -582,14 +652,17 @@ final class EventsWorkspace {
         return assignment
     }
 
+    /// Files in the event's family — itself plus every descendant. A
+    /// parent's count covers its subevents; a subevent never counts the
+    /// parent's files.
     func assignmentCount(for eventID: UUID) -> Int {
         refreshIndexIfNeeded()
-        return assignmentCounts[eventID] ?? 0
+        return scopeIDs(eventID).reduce(0) { $0 + (assignmentCounts[$1] ?? 0) }
     }
 
     func assignmentBytes(for eventID: UUID) -> Int64 {
         refreshIndexIfNeeded()
-        return assignmentBytes[eventID] ?? 0
+        return scopeIDs(eventID).reduce(Int64(0)) { $0 + (assignmentBytes[$1] ?? 0) }
     }
 
     func assignedEvent(for stack: OrganizeStack) -> (event: SavedCameraEvent?, mixed: Bool) {
@@ -660,6 +733,55 @@ final class EventsWorkspace {
         }
     }
 
+    /// The board's collapsible sections: the event's own stacks under the
+    /// chosen grouping, then one section per direct subevent holding that
+    /// subevent's whole subtree — titled with the subevent's name. A
+    /// depth-2 event has no subevents, so its board is just its own
+    /// stacks, the same as before.
+    func eventBoardGroups(
+        _ eventID: UUID,
+        stacks: [OrganizeStack],
+        grouping: OrganizeBoardGrouping,
+        order: OrganizeBoardOrder
+    ) -> [OrganizeBoardGroup] {
+        let children = EventHierarchy.children(of: eventID, in: model.configuration.savedEvents)
+        guard !children.isEmpty else {
+            return OrganizeBoardPlan.groups(for: stacks, grouping: grouping, order: order)
+        }
+        // Which direct child's section owns each descendant id.
+        var sectionByOwner: [UUID: UUID] = [:]
+        for child in children {
+            for id in scopeIDs(child.id) { sectionByOwner[id] = child.id }
+        }
+        var own: [OrganizeStack] = []
+        var byChild: [UUID: [OrganizeStack]] = [:]
+        for stack in stacks {
+            if let ownerID = assignedEvent(for: stack).event?.id,
+               let childID = sectionByOwner[ownerID] {
+                byChild[childID, default: []].append(stack)
+            } else {
+                own.append(stack)
+            }
+        }
+        var groups = OrganizeBoardPlan.groups(for: own, grouping: grouping, order: order)
+        let ascending = order == .oldestFirst
+        for child in children {
+            guard let childStacks = byChild[child.id], !childStacks.isEmpty else { continue }
+            groups.append(OrganizeBoardGroup(
+                id: "subevent|\(child.id.uuidString)",
+                title: child.name,
+                symbol: OrganizeBoardGrouping.event.symbol,
+                stacks: childStacks.sorted {
+                    if $0.captureDate != $1.captureDate {
+                        return ascending ? $0.captureDate < $1.captureDate : $0.captureDate > $1.captureDate
+                    }
+                    return $0.id < $1.id
+                }
+            ))
+        }
+        return groups
+    }
+
     /// The stacks an event board shows after its search field filters —
     /// the same match rules as the unsorted board, minus the origin
     /// subfolder (an event's files can sit under several roots).
@@ -680,20 +802,26 @@ final class EventsWorkspace {
     }
 
     /// Facts one stack needs for structured search — every event its items
-    /// are assigned to (mixed stacks match any of theirs) plus the
-    /// face-catalog people on its files. `eventTitle` stays the text
+    /// are assigned to plus those events' ancestors, so an Event row for a
+    /// parent keeps a stack sorted into its subevent (the reverse — a
+    /// subevent row against the parent's stack — does not match) — plus
+    /// the face-catalog people on its files. `eventTitle` stays the text
     /// needle's single-event breadcrumb match.
     private func stackFacts(_ stack: OrganizeStack, peopleByStackID: [String: Set<UUID>]) -> OrganizeStackFacts {
+        var assignedIDs = Set<UUID>()
         var eventIDs = Set<UUID>()
         for item in stack.items {
             if let assignment = assignment(for: item.primary) {
-                eventIDs.insert(assignment.eventID)
+                assignedIDs.insert(assignment.eventID)
+                if let owner = event(assignment.eventID) {
+                    eventIDs.formUnion(ancestorScope(of: owner))
+                }
             }
         }
         return OrganizeStackFacts(
             eventIDs: eventIDs,
-            eventTitle: eventIDs.count == 1
-                ? eventIDs.first.flatMap { event($0) }.map { eventTitle($0) }
+            eventTitle: assignedIDs.count == 1
+                ? assignedIDs.first.flatMap { event($0) }.map { eventTitle($0) }
                 : nil,
             personIDs: peopleByStackID[stack.id] ?? [],
             personNames: personNames(on: stack)
@@ -1171,6 +1299,12 @@ final class EventsWorkspace {
     // MARK: - Events
 
     func requestNewEvent(from locationID: UUID?, parentEventID: UUID? = nil) {
+        // New Subevent under an event already at the cap refuses here —
+        // the picker never offered it, but the menu shortcut can reach it.
+        if let parentEventID, let refusal = subeventRefusal(for: parentEventID) {
+            model.statusMessage = refusal
+            return
+        }
         let stacks = locationID.flatMap { id in
             sources[id]?.result?.stacks.filter { targetStackIDs().contains($0.id) }
         } ?? []
@@ -1212,7 +1346,14 @@ final class EventsWorkspace {
             return nil
         }
         let day = Calendar.current.startOfDay(for: date)
+        // A parent picked before the cap is validated reports why instead
+        // of silently creating a top-level event.
         let parentID = validParentEventID(parentEventID, for: nil)
+        if let parentEventID, parentID == nil {
+            model.statusMessage = subeventRefusal(for: parentEventID)
+                ?? "That parent can't take another subevent."
+            return nil
+        }
         // The dated folder name is unique per parent: the same name and date
         // under a different parent is a different folder, not a duplicate.
         if let existing = model.configuration.savedEvents.first(where: {
@@ -1454,26 +1595,62 @@ final class EventsWorkspace {
         }
         let firstPaintFiles = firstPaint?.files
 
+        // The sweep covers the whole family: the board shows each direct
+        // subevent as its own section, so every descendant's assignments
+        // scan with that descendant as their event — a subevent's files
+        // resolve inside its own nested folder, never the parent's.
+        let members = [event] + EventHierarchy.descendants(of: eventID, in: model.configuration.savedEvents)
+        let assignmentsByEvent = Dictionary(grouping: model.configuration.photoEventAssignments, by: \.eventID)
+        let memberIDs = Set(members.map(\.id))
+        // Each member's subtree within this family — the scope its own
+        // published summary and storage strip cover.
+        var memberSubtrees: [UUID: Set<UUID>] = [:]
+        for member in members {
+            memberSubtrees[member.id] = scopeIDs(member.id).intersection(memberIDs)
+        }
+
         // The sweep applies itself through `finishPresenceSweep` instead of
         // being awaited here — `await sweep.value` would escalate it to
         // this context's priority and put it right back on the hot tier.
         let sweep = Task.detached(priority: .utility) { [self] in
+            var memberSummaries: [UUID: EventPresenceSummary] = [:]
+            var cancelled = false
+            for member in members {
+                guard let memberSummary = EventPresenceScanner.scan(
+                    event: member,
+                    assignments: assignmentsByEvent[member.id] ?? [],
+                    locations: locations,
+                    probe: probe
+                ) else { cancelled = true; break }
+                memberSummaries[member.id] = memberSummary
+            }
             var output: EventRefreshOutput?
-            if let summary = EventPresenceScanner.scan(
-                event: event,
-                assignments: assignments,
-                locations: locations,
-                probe: probe
-            ) {
+            if !cancelled {
+                let assets = members.flatMap { memberSummaries[$0.id]?.assets ?? [] }
+                var scopedSummaries: [UUID: EventPresenceSummary] = [:]
+                for member in members {
+                    let subtree = memberSubtrees[member.id] ?? [member.id]
+                    scopedSummaries[member.id] = EventPresenceSummary(
+                        eventID: member.id,
+                        policy: memberSummaries[member.id]?.policy ?? locations.resolvedPolicy(for: member),
+                        assets: members.filter { subtree.contains($0.id) }.flatMap { memberSummaries[$0.id]?.assets ?? [] },
+                        checkedAt: Date()
+                    )
+                }
+                let summary = scopedSummaries[eventID] ?? EventPresenceSummary(eventID: eventID, policy: policy, assets: assets, checkedAt: Date())
                 var files: [OrganizeFile] = []
                 var byPath: [String: EventAssetPresence] = [:]
-                for asset in summary.assets {
+                for asset in assets {
                     guard let path = asset.bestLocalPath else { continue }
                     files.append(OrganizeFile(path: path, size: asset.assignment.fileSize, modifiedAt: asset.assignment.modifiedAt))
                     byPath[EventStorageLocations.pathKey(path)] = asset
                 }
-                let immich = (try? CatalogInspector(url: catalogURL).immichStatuses(eventID: eventID)) ?? [:]
-                output = EventRefreshOutput(summary: summary, files: files, assetsByPathKey: byPath, immich: immich)
+                var immich: [String: ImmichCatalogStatus] = [:]
+                let inspector = CatalogInspector(url: catalogURL)
+                for member in members {
+                    immich.merge((try? inspector.immichStatuses(eventID: member.id)) ?? [:]) { current, _ in current }
+                }
+                output = EventRefreshOutput(summary: summary, memberSummaries: scopedSummaries, files: files, assetsByPathKey: byPath, immich: immich)
             }
             await finishPresenceSweep(
                 eventID: eventID,
@@ -1506,6 +1683,9 @@ final class EventsWorkspace {
 
         eventAssetsByPathKey[eventID] = output.assetsByPathKey
         presence[eventID] = output.summary
+        for (memberID, memberSummary) in output.memberSummaries {
+            presence[memberID] = memberSummary
+        }
         eventImmichStatuses[eventID] = output.immich
         guard output.files != firstPaintFiles else { return }
 
@@ -1838,7 +2018,15 @@ final class EventsWorkspace {
 
         var plans: [PlannedReassignment] = []
         var collisions = 0
+        var alreadyThere = 0
         for asset in assets {
+            // A family board's stacks can already belong to the target —
+            // a subevent section on the parent's board dropped back onto
+            // that subevent moves nothing.
+            guard asset.assignment.eventID != targetEventID else {
+                alreadyThere += 1
+                continue
+            }
             var moved = asset.assignment
             moved.eventID = targetEventID
             guard targetNames.insert(moved.relativePath.lowercased()).inserted else {
@@ -1860,7 +2048,9 @@ final class EventsWorkspace {
             plans.append(PlannedReassignment(removed: asset.assignment, added: moved, moveSourcePath: moveSource))
         }
         guard !plans.isEmpty else {
-            model.statusMessage = "\(eventTitle(to)) already has files with those names. Nothing moved."
+            model.statusMessage = alreadyThere > 0 && collisions == 0
+                ? "Those files already belong to \(eventTitle(to)). Nothing moved."
+                : "\(eventTitle(to)) already has files with those names. Nothing moved."
             return
         }
         noteRecent(targetEventID)
@@ -2029,22 +2219,25 @@ final class EventsWorkspace {
             model.statusMessage = "The NAS library is not connected: \(locations.libraryRoot.path)"
             return
         }
-        let policy = locations.resolvedPolicy(for: event)
-        let otherPolicy: EventStoragePolicy = policy == .buffer ? .archiveOnly : .buffer
         var groups: [String: NASArchiveGroup] = [:]
         for asset in summary.assets where asset.archive != .present {
+            // Family scope: the asset's own event resolves the folders —
+            // a subevent's copies live in its nested Card Copy, and its
+            // archive layout nests under the parent's folders.
+            let owner = self.event(asset.assignment.eventID) ?? event
+            let ownerPolicy = locations.resolvedPolicy(for: owner)
             let root: URL
             if asset.drive == .present {
-                root = locations.cardCopyRoot(for: event, deviceID: asset.assignment.deviceID, policy: policy)
+                root = locations.cardCopyRoot(for: owner, deviceID: asset.assignment.deviceID, policy: ownerPolicy)
             } else if asset.otherDrive == .present {
-                root = locations.cardCopyRoot(for: event, deviceID: asset.assignment.deviceID, policy: otherPolicy)
+                root = locations.cardCopyRoot(for: owner, deviceID: asset.assignment.deviceID, policy: ownerPolicy == .buffer ? .archiveOnly : .buffer)
             } else if asset.source == .present {
                 root = URL(fileURLWithPath: DashboardModel.expandedPath(asset.assignment.sourceRootPath), isDirectory: true)
             } else {
                 continue
             }
             let key = root.standardizedFileURL.path + "\u{0}" + (asset.assignment.deviceID ?? "")
-            groups[key, default: NASArchiveGroup(root: root, deviceID: asset.assignment.deviceID, files: [])].files.append(
+            groups[key, default: NASArchiveGroup(owner: owner, root: root, deviceID: asset.assignment.deviceID, files: [])].files.append(
                 FileRecord(path: asset.assignment.relativePath, size: asset.assignment.fileSize, modifiedAt: asset.assignment.modifiedAt)
             )
         }
@@ -2067,7 +2260,7 @@ final class EventsWorkspace {
                 for (index, group) in archiveGroups.enumerated() {
                     let span = 1.0 / Double(archiveGroups.count)
                     let base = Double(index) * span
-                    let layout = locations.layout(for: event, deviceID: group.deviceID)
+                    let layout = locations.layout(for: group.owner, deviceID: group.deviceID)
                     let plan = try OrganizedArchivePlanner().plan(
                         source: group.root,
                         sourceFiles: group.files,
@@ -2133,12 +2326,15 @@ final class EventsWorkspace {
     private func removeFromDrive(_ eventID: UUID, confirmation: String) {
         guard let event = event(eventID), let summary = presence[eventID] else { return }
         let locations = self.locations
-        let policy = locations.resolvedPolicy(for: event)
-        let eventFolderPath = locations.layout(for: event, deviceID: nil).eventFolderPath
         var pairs: [VerifiedRemovalPair] = []
         for asset in summary.assets where asset.archive == .present {
             guard let archive = asset.archivePath else { continue }
-            let deviceFolder = locations.layout(for: event, deviceID: asset.assignment.deviceID).deviceFolder
+            // Family scope: each asset's folders resolve through its own
+            // event — a subevent's copies sit in its nested event folder.
+            let owner = self.event(asset.assignment.eventID) ?? event
+            let policy = locations.resolvedPolicy(for: owner)
+            let eventFolderPath = locations.layout(for: owner, deviceID: nil).eventFolderPath
+            let deviceFolder = locations.layout(for: owner, deviceID: asset.assignment.deviceID).deviceFolder
             let copies: [(CatalogPresenceState, String?, EventStoragePolicy)] = [
                 (asset.drive, asset.drivePath, policy),
                 (asset.otherDrive, asset.otherDrivePath, policy == .buffer ? .archiveOnly : .buffer),
@@ -2196,7 +2392,10 @@ final class EventsWorkspace {
         var groups: [String: SourceCleanupGroup] = [:]
         for asset in summary.assets where asset.isOnSeparateSource && asset.drive == .present {
             let sourceRoot = URL(fileURLWithPath: DashboardModel.expandedPath(asset.assignment.sourceRootPath), isDirectory: true)
-            let driveRoot = locations.cardCopyRoot(for: event, deviceID: asset.assignment.deviceID, policy: locations.resolvedPolicy(for: event))
+            // Family scope: the drive copy the source is checked against
+            // sits in the asset's own event's nested Card Copy folder.
+            let owner = self.event(asset.assignment.eventID) ?? event
+            let driveRoot = locations.cardCopyRoot(for: owner, deviceID: asset.assignment.deviceID, policy: locations.resolvedPolicy(for: owner))
             let key = sourceRoot.path + "\u{0}" + driveRoot.path
             groups[key, default: SourceCleanupGroup(sourceRoot: sourceRoot, driveRoot: driveRoot, files: [])].files.append(
                 FileRecord(path: asset.assignment.relativePath, size: asset.assignment.fileSize, modifiedAt: asset.assignment.modifiedAt)
@@ -2605,23 +2804,27 @@ final class EventsWorkspace {
         let uploadable = OrganizeFileClassifier.rawExtensions
             .union(OrganizeFileClassifier.photoExtensions)
             .union(OrganizeFileClassifier.videoExtensions)
+        // Family scope: each candidate follows the Send flag and album
+        // policy of the event that actually owns it — a subevent's files
+        // never upload under the parent's settings.
         let candidates = summary.assets.compactMap { asset -> ImmichCandidate? in
-            guard asset.assignment.immichUploadOverride ?? event.sendsToImmich,
+            let owner = self.event(asset.assignment.eventID) ?? event
+            guard asset.assignment.immichUploadOverride ?? owner.sendsToImmich,
                   uploadable.contains((asset.assignment.relativePath as NSString).pathExtension.lowercased()),
                   let path = asset.bestLocalPath else { return nil }
-            return ImmichCandidate(id: asset.id, path: path, size: asset.assignment.fileSize, modifiedAt: asset.assignment.modifiedAt)
+            let albumName: String? = switch owner.resolvedImmichAlbumPolicy {
+            case .none: nil
+            case .event: owner.name
+            case .custom:
+                owner.immichAlbumName.flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 } ?? owner.name
+            }
+            return ImmichCandidate(id: asset.id, path: path, size: asset.assignment.fileSize, modifiedAt: asset.assignment.modifiedAt, albumName: albumName)
         }
         guard !candidates.isEmpty else {
             model.statusMessage = event.sendsToImmich
                 ? "No reachable photos or videos to send. Connect the drive or NAS that has them."
                 : "Turn on Send to Immich for \(eventTitle(event)) first."
             return
-        }
-        let albumName: String? = switch event.resolvedImmichAlbumPolicy {
-        case .none: nil
-        case .event: event.name
-        case .custom:
-            event.immichAlbumName.flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 } ?? event.name
         }
         let catalogURL = URL(fileURLWithPath: DashboardModel.expandedPath(model.configuration.catalogDatabasePath))
         let configuration = model.configuration
@@ -2645,7 +2848,7 @@ final class EventsWorkspace {
                     ))
                 }
                 var remoteIDs: [String: String] = [:]
-                var outcome = ImmichUploadOutcome(albumName: albumName)
+                var outcome = ImmichUploadOutcome(albumName: nil)
                 for start in stride(from: 0, to: candidates.count, by: 100) {
                     let batch = candidates[start..<min(start + 100, candidates.count)]
                     let results = try await client.checkBulkUpload(batch.compactMap { candidate in
@@ -2683,10 +2886,18 @@ final class EventsWorkspace {
                         totalFiles: candidates.count
                     ))
                 }
-                if let albumName {
-                    let album = try await client.ensureAlbum(named: albumName)
-                    outcome.albumAdded = try await client.addAssets(Array(Set(remoteIDs.values)), toAlbum: album.id).added
+                // Each candidate's album is its owning event's pick —
+                // a family upload can fill several albums in one pass.
+                var albumAssetIDs: [String: Set<String>] = [:]
+                for candidate in candidates {
+                    guard let remote = remoteIDs[candidate.id], let album = candidate.albumName else { continue }
+                    albumAssetIDs[album, default: []].insert(remote)
                 }
+                for (name, ids) in albumAssetIDs {
+                    let album = try await client.ensureAlbum(named: name)
+                    outcome.albumAdded += try await client.addAssets(Array(ids), toAlbum: album.id).added
+                }
+                if albumAssetIDs.count == 1 { outcome.albumName = albumAssetIDs.keys.first }
                 _ = try? CatalogStore(url: catalogURL).bootstrap(configuration: configuration, createBackup: false, createLibraryFolders: false)
                 try? CatalogInspector(url: catalogURL).saveImmichStatuses(statuses)
                 return outcome
@@ -2979,6 +3190,16 @@ final class EventsWorkspace {
                     modifiedAt: assignment.modifiedAt
                 )
             )
+        }
+        // The chips share the board's family scope: a subevent's files
+        // count toward every ancestor's roster too, so a parent's chips
+        // cover people confirmed only on its subevents' photos.
+        let locations = self.locations
+        for saved in model.configuration.savedEvents {
+            guard let keys = keysByEvent[saved.id] else { continue }
+            for ancestor in locations.ancestors(of: saved) {
+                keysByEvent[ancestor.id, default: []].formUnion(keys)
+            }
         }
         var people: [UUID: [FacePerson]] = [:]
         for (id, keys) in keysByEvent {

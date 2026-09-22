@@ -289,7 +289,7 @@ struct PhotoBrowserView: View {
             }
         }
         .sheet(isPresented: $isCreatingEvent) {
-            NewCameraEventSheet(parents: model.displayEvents) { name, date, parentEventID in
+            NewCameraEventSheet(parents: model.parentEventCandidates) { name, date, parentEventID in
                 model.createEvent(named: name, on: date, parentEventID: parentEventID)
                 isCreatingEvent = false
             }

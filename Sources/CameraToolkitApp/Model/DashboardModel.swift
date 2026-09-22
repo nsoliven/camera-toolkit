@@ -277,6 +277,13 @@ extension DashboardModel {
         EventHierarchy.flattened(configuration.savedEvents)
     }
 
+    /// `displayEvents` minus the ones already at the depth cap — a depth-2
+    /// event can't take another level, so the "Inside event" picker never
+    /// offers it. Deeper existing events still list in `displayEvents`.
+    var parentEventCandidates: [(event: SavedCameraEvent, depth: Int)] {
+        displayEvents.filter { EventHierarchy.canParent($0.event, in: configuration.savedEvents) }
+    }
+
     /// "Parent / Child" breadcrumb title for menus and headers.
     func eventTitle(_ event: SavedCameraEvent) -> String {
         EventHierarchy.displayName(of: event, in: configuration.savedEvents)
@@ -410,6 +417,14 @@ extension DashboardModel {
         // A missing or self-referencing parent resolves to top-level.
         let parentID = parentEventID.flatMap { id in
             configuration.savedEvents.contains { $0.id == id } ? id : nil
+        }
+        // A parent already at the depth cap refuses — subevents nest at
+        // most two levels deep.
+        if let parentID,
+           let parent = configuration.savedEvents.first(where: { $0.id == parentID }),
+           !EventHierarchy.canParent(parent, in: configuration.savedEvents) {
+            statusMessage = "\(eventTitle(parent)) is already at the deepest level — a subevent can only go two levels under a top-level event."
+            return false
         }
 
         var selectedID: UUID?
