@@ -1757,8 +1757,8 @@ struct StackPreviewOverlay: View {
                 width: normalized.width,
                 height: normalized.height
             )
-            if let cropped = FaceAligner.boxCrop(decoded, box: displayedBox) {
-                crop = FaceAligner.jpegData(cropped)
+            if let cropped = FaceCropRenderer.boxCrop(decoded, box: displayedBox) {
+                crop = FaceImageEncoding.jpegData(cropped)
             }
         }
         let anchor = CGRect(

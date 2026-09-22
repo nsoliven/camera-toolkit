@@ -159,6 +159,7 @@ public struct CatalogStore {
             taken_at TEXT,
             scan_grade TEXT NOT NULL DEFAULT 'none',
             face_count INTEGER NOT NULL DEFAULT 0,
+            engine TEXT NOT NULL DEFAULT '',
             indexed_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
@@ -183,8 +184,10 @@ public struct CatalogStore {
             box_h REAL NOT NULL,
             det_score REAL NOT NULL,
             match_score REAL,
+            quality REAL,
+            face_px REAL,
             embedding BLOB,
-            model TEXT NOT NULL DEFAULT 'w600k_r50',
+            model TEXT NOT NULL DEFAULT 'insightface/buffalo_l',
             state TEXT NOT NULL DEFAULT 'cached',
             scan_grade TEXT NOT NULL DEFAULT 'low',
             crop BLOB,
@@ -214,6 +217,13 @@ public struct CatalogStore {
         );
         CREATE INDEX IF NOT EXISTS face_rejections_face_id ON face_rejections(face_id);
         """, database: database)
+
+        // Face columns added after the first face catalogs shipped: the
+        // engine stamp that drives the skip rule, and the engine's quality
+        // and size readings the grouping gate uses.
+        try ensureColumn(table: "face_photos", column: "engine", definition: "engine TEXT NOT NULL DEFAULT ''", database: database)
+        try ensureColumn(table: "faces", column: "quality", definition: "quality REAL", database: database)
+        try ensureColumn(table: "faces", column: "face_px", definition: "face_px REAL", database: database)
 
         // `parent_event_id` was added after the first catalogs shipped, so
         // databases that already have `events` need the column grafted on.

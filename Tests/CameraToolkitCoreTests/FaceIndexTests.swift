@@ -215,8 +215,8 @@ final class FaceIndexTests: XCTestCase {
             try store.replaceFaces(photo: photo, faces: [confirmed])
 
             // A rescan of the same photo detects the overlapping face again
-            // plus a disjoint new one. The confirmed face must survive
-            // untouched and the overlapping re-detection must not duplicate it.
+            // plus a disjoint new one. The confirmed row keeps its id and
+            // label — the overlap refreshes it in place, never duplicates it.
             let redetected = faceRecord(
                 photo,
                 box: NormalizedFaceBox(x: 0.11, y: 0.11, width: 0.20, height: 0.20),
@@ -248,6 +248,122 @@ final class FaceIndexTests: XCTestCase {
             try store.deletePersonAndFaces(dad.id)
             XCTAssertNotNil(try store.person(dad.id))
             XCTAssertEqual(try store.face(id: confirmed.id)?.state, .confirmed)
+        }
+    }
+
+    /// A rescan that finds a confirmed face again refreshes that row in
+    /// place: the id and label the owner reviewed stay, the measurement
+    /// (box, score, vector, quality, engine) becomes the new detection's.
+    /// This is how a named gallery migrates into a new engine's embedding
+    /// space without anyone re-tagging.
+    func testRescanRefreshesConfirmedFaceInPlace() throws {
+        try withFaceStore { store, _ in
+            let dad = try store.createPerson(name: "Dad", isRoster: true)
+            let photo = photoRecord("RF1.JPG")
+            // A row from the previous engine, confirmed by the owner.
+            let original = faceRecord(
+                photo,
+                box: NormalizedFaceBox(x: 0.10, y: 0.10, width: 0.20, height: 0.20),
+                detScore: 0.9,
+                embedding: testEmbedding(seed: 7),
+                quality: 12,
+                facePixels: 90,
+                model: "w600k_r50"
+            )
+            try store.replaceFaces(photo: photo, faces: [original])
+            try store.assignFace(original.id, to: dad.id, state: .confirmed, score: 0.9)
+            XCTAssertEqual(try store.face(id: original.id)?.state, .confirmed)
+
+            let refreshed = faceRecord(
+                photo,
+                box: NormalizedFaceBox(x: 0.12, y: 0.12, width: 0.20, height: 0.20),
+                detScore: 0.97,
+                embedding: testEmbedding(seed: 8),
+                quality: 21,
+                facePixels: 130
+            )
+            let elsewhere = faceRecord(
+                photo,
+                box: NormalizedFaceBox(x: 0.60, y: 0.60, width: 0.15, height: 0.15),
+                detScore: 0.8,
+                embedding: testEmbedding(seed: 9),
+                quality: 18,
+                facePixels: 96
+            )
+            try store.replaceFaces(photo: photo, faces: [refreshed, elsewhere])
+
+            let stored = try store.faces(photoID: photo.pathKey)
+            XCTAssertEqual(stored.count, 2)
+            XCTAssertEqual(stored.filter { $0.state == .confirmed }.count, 1)
+            let kept = try XCTUnwrap(store.face(id: original.id))
+            XCTAssertEqual(kept.state, .confirmed)
+            XCTAssertEqual(kept.personID, dad.id)
+            XCTAssertEqual(kept.embedding, testEmbedding(seed: 8))
+            XCTAssertEqual(kept.quality, 21)
+            XCTAssertEqual(kept.facePixels, 130)
+            XCTAssertEqual(kept.detScore, 0.97)
+            XCTAssertEqual(kept.box.x, 0.12, accuracy: 1e-9)
+            XCTAssertEqual(kept.model, FaceEngine.identifier)
+            // The overlapping detection was folded in, not inserted; the
+            // disjoint one is a fresh cached row.
+            XCTAssertNil(try store.face(id: refreshed.id))
+            let added = try XCTUnwrap(store.face(id: elsewhere.id))
+            XCTAssertEqual(added.state, .cached)
+            XCTAssertNil(added.personID)
+            XCTAssertEqual(try store.photos(pathKeys: [photo.pathKey])[photo.pathKey]?.faceCount, 2)
+        }
+    }
+
+    /// Rows from another engine live in a different embedding space:
+    /// matching, grouping, and the roster gallery read only the current
+    /// engine's vectors.
+    func testMatchingIgnoresRowsFromAnotherEngine() throws {
+        try withFaceStore { store, _ in
+            let photo = photoRecord("ENG1.JPG")
+            let stale = faceRecord(
+                photo,
+                box: NormalizedFaceBox(x: 0.1, y: 0.1, width: 0.2, height: 0.2),
+                embedding: testEmbedding(seed: 1),
+                model: "w600k_r50"
+            )
+            let current = faceRecord(
+                photo,
+                box: NormalizedFaceBox(x: 0.5, y: 0.5, width: 0.2, height: 0.2),
+                embedding: testEmbedding(seed: 2)
+            )
+            try store.replaceFaces(photo: photo, faces: [stale, current])
+            XCTAssertEqual(try store.matchableFaces().map(\.id), [current.id])
+
+            let group = try store.createPerson(name: "Person 1", isRoster: false)
+            try store.assignFace(stale.id, to: group.id, state: .other, score: 0.9)
+            try store.assignFace(current.id, to: group.id, state: .other, score: 0.9)
+            let embeddings = try store.groupEmbeddings()
+            XCTAssertEqual(embeddings[group.id]?.count, 1)
+            XCTAssertEqual(embeddings[group.id]?.first, testEmbedding(seed: 2))
+
+            let dad = try store.createPerson(name: "Dad", isRoster: true)
+            let gallery = photoRecord("ENG2.JPG")
+            let staleTemplate = faceRecord(
+                gallery,
+                box: NormalizedFaceBox(x: 0.1, y: 0.1, width: 0.2, height: 0.2),
+                embedding: testEmbedding(seed: 3),
+                state: .confirmed,
+                personID: dad.id,
+                model: "w600k_r50"
+            )
+            let currentTemplate = faceRecord(
+                gallery,
+                box: NormalizedFaceBox(x: 0.5, y: 0.5, width: 0.2, height: 0.2),
+                embedding: testEmbedding(seed: 4),
+                state: .confirmed,
+                personID: dad.id
+            )
+            try store.replaceFaces(photo: gallery, faces: [staleTemplate, currentTemplate])
+            try store.addTemplate(personID: dad.id, faceID: staleTemplate.id)
+            try store.addTemplate(personID: dad.id, faceID: currentTemplate.id)
+            let templates = try store.rosterTemplates()
+            XCTAssertEqual(templates.count, 1)
+            XCTAssertEqual(templates.first?.embedding, testEmbedding(seed: 4))
         }
     }
 
@@ -289,13 +405,13 @@ final class FaceIndexTests: XCTestCase {
             let item = try organizeItem(forFileAt: jpegURL)
             let service = FaceIndexService(catalogURL: catalog)
 
-            var report = try service.scan(stacks: [OrganizeStack(items: [item])], embedder: StubEmbedder())
+            var report = try service.scan(stacks: [OrganizeStack(items: [item])], analyzer: StubAnalyzer())
             XCTAssertEqual(report.photosProcessed, 1)
             XCTAssertEqual(report.photosSkipped, 0)
             XCTAssertEqual(report.facesDetected, 0)
 
             // Same file identity + grade covers the mode → skipped.
-            report = try service.scan(stacks: [OrganizeStack(items: [try organizeItem(forFileAt: jpegURL)])], embedder: StubEmbedder())
+            report = try service.scan(stacks: [OrganizeStack(items: [try organizeItem(forFileAt: jpegURL)])], analyzer: StubAnalyzer())
             XCTAssertEqual(report.photosProcessed, 0)
             XCTAssertEqual(report.photosSkipped, 1)
 
@@ -305,14 +421,155 @@ final class FaceIndexTests: XCTestCase {
                 [.modificationDate: Date().addingTimeInterval(3_600)],
                 ofItemAtPath: jpegURL.path
             )
-            report = try service.scan(stacks: [OrganizeStack(items: [try organizeItem(forFileAt: jpegURL)])], embedder: StubEmbedder())
+            report = try service.scan(stacks: [OrganizeStack(items: [try organizeItem(forFileAt: jpegURL)])], analyzer: StubAnalyzer())
             XCTAssertEqual(report.photosProcessed, 1)
             XCTAssertEqual(report.photosSkipped, 0)
+        }
+    }
 
-            // Missing embedder → the scan refuses rather than guessing.
-            XCTAssertThrowsError(try service.scan(stacks: [OrganizeStack(items: [item])], embedder: nil)) { error in
-                XCTAssertEqual(error as? FaceIndexError, .modelNotInstalled(FaceModelCatalog.modelFileName))
+    /// The skip rule is engine-aware: a photo stamped by another engine —
+    /// even at the top grade — is re-read, because its rows live in a
+    /// different embedding space. A current-engine stamp at that grade
+    /// skips as before.
+    func testScanRescansPhotosStampedByAnotherEngine() throws {
+        try withTemporaryDirectory { root in
+            let catalog = root.appendingPathComponent("catalog.sqlite")
+            _ = try CatalogStore(url: catalog).bootstrap(
+                configuration: faceTestConfiguration(root: root, catalog: catalog),
+                createBackup: false,
+                createLibraryFolders: false
+            )
+            let jpegURL = root.appendingPathComponent("card/DSC00031.JPG")
+            try writeJPEG(jpegURL, seed: 1)
+            let item = try organizeItem(forFileAt: jpegURL)
+            let file = item.primary
+            let store = FaceIndexStore(url: catalog)
+            func stamp(_ grade: FaceScanGrade, engine: String) throws {
+                try store.replaceFaces(
+                    photo: FacePhotoRecord(
+                        pathKey: file.pathKey,
+                        path: file.path,
+                        fileName: file.name,
+                        byteCount: file.size,
+                        modifiedAt: file.modifiedAt,
+                        scanGrade: grade,
+                        engine: engine
+                    ),
+                    faces: []
+                )
             }
+
+            // XHIGH from the old engine does not cover a LOW request.
+            try stamp(.xhigh, engine: "")
+            let analyzer = StubAnalyzer()
+            let service = FaceIndexService(catalogURL: catalog, options: FaceScanOptions(mode: .low))
+            var report = try service.scan(items: [item], analyzer: analyzer)
+            XCTAssertEqual(report.photosSkipped, 0)
+            XCTAssertEqual(report.photosProcessed, 1)
+            XCTAssertEqual(analyzer.calls, 1)
+            let restamped = try XCTUnwrap(store.photos(pathKeys: [file.pathKey])[file.pathKey])
+            XCTAssertEqual(restamped.engine, FaceEngine.identifier)
+            XCTAssertEqual(restamped.scanGrade, .low)
+
+            // The same grade from the current engine is covered and skipped
+            // — the engine is never called.
+            try stamp(.xhigh, engine: FaceEngine.identifier)
+            report = try service.scan(items: [item], analyzer: analyzer)
+            XCTAssertEqual(report.photosSkipped, 1)
+            XCTAssertEqual(report.photosProcessed, 0)
+            XCTAssertEqual(analyzer.calls, 1)
+        }
+    }
+
+    /// An engine failure counts the photo failed and leaves no
+    /// `face_photos` row behind — the next pass must pick it up again
+    /// instead of treating a crash as "scanned, no faces".
+    func testEngineFailureLeavesThePhotoUnstamped() throws {
+        try withTemporaryDirectory { root in
+            let catalog = root.appendingPathComponent("catalog.sqlite")
+            _ = try CatalogStore(url: catalog).bootstrap(
+                configuration: faceTestConfiguration(root: root, catalog: catalog),
+                createBackup: false,
+                createLibraryFolders: false
+            )
+            let jpegURL = root.appendingPathComponent("card/DSC00032.JPG")
+            try writeJPEG(jpegURL, seed: 2)
+            let item = try organizeItem(forFileAt: jpegURL)
+            let store = FaceIndexStore(url: catalog)
+            let service = FaceIndexService(catalogURL: catalog)
+
+            let failing = StubAnalyzer(error: FaceIndexError.engineFailed("The face sidecar exited."))
+            var report = try service.scan(items: [item], analyzer: failing)
+            XCTAssertEqual(report.photosFailed, 1)
+            XCTAssertEqual(report.photosProcessed, 0)
+            XCTAssertEqual(report.photosSkipped, 0)
+            XCTAssertEqual(failing.calls, 1)
+            XCTAssertNil(try store.photos(pathKeys: [item.primary.pathKey])[item.primary.pathKey])
+
+            // A working engine on the next pass reads the photo.
+            let working = StubAnalyzer(faces: [analyzedFace()])
+            report = try service.scan(items: [item], analyzer: working)
+            XCTAssertEqual(report.photosSkipped, 0)
+            XCTAssertEqual(report.photosProcessed, 1)
+            XCTAssertEqual(report.facesDetected, 1)
+            XCTAssertEqual(working.calls, 1)
+            XCTAssertEqual(
+                try store.photos(pathKeys: [item.primary.pathKey])[item.primary.pathKey]?.scanGrade,
+                .low
+            )
+        }
+    }
+
+    /// The mode's size floor is measured on the native image: a face the
+    /// engine returns below it is dropped before storage; one above it is
+    /// stored with the engine's quality and pixel size readable back.
+    func testScanAppliesTheSizeFloorAndStoresQuality() throws {
+        try withTemporaryDirectory { root in
+            let catalog = root.appendingPathComponent("catalog.sqlite")
+            _ = try CatalogStore(url: catalog).bootstrap(
+                configuration: faceTestConfiguration(root: root, catalog: catalog),
+                createBackup: false,
+                createLibraryFolders: false
+            )
+            // writeJPEG paints 640 px, so 0.02 of it is 12.8 px — under
+            // LOW's 64 px floor.
+            let jpegURL = root.appendingPathComponent("card/DSC00033.JPG")
+            try writeJPEG(jpegURL, seed: 3)
+            let item = try organizeItem(forFileAt: jpegURL)
+            let store = FaceIndexStore(url: catalog)
+
+            let tiny = analyzedFace(
+                box: NormalizedFaceBox(x: 0.4, y: 0.4, width: 0.02, height: 0.02),
+                facePixels: 12.8
+            )
+            var service = FaceIndexService(catalogURL: catalog, options: FaceScanOptions(mode: .low))
+            var report = try service.scan(items: [item], analyzer: StubAnalyzer(faces: [tiny]))
+            XCTAssertEqual(report.photosProcessed, 1)
+            XCTAssertEqual(report.facesDetected, 0)
+            XCTAssertTrue(try store.faces(photoID: item.primary.pathKey).isEmpty)
+            let stamped = try XCTUnwrap(store.photos(pathKeys: [item.primary.pathKey])[item.primary.pathKey])
+            XCTAssertEqual(stamped.scanGrade, .low)
+            XCTAssertEqual(stamped.faceCount, 0)
+
+            // 0.25 of 640 px is 160 px — comfortably over MED's 40 px floor.
+            // MED re-reads the photo (LOW does not cover it).
+            let big = analyzedFace(
+                box: NormalizedFaceBox(x: 0.3, y: 0.3, width: 0.25, height: 0.25),
+                detScore: 0.93,
+                quality: 23.5,
+                facePixels: 160
+            )
+            service = FaceIndexService(catalogURL: catalog, options: FaceScanOptions(mode: .med))
+            report = try service.scan(items: [item], analyzer: StubAnalyzer(faces: [big]))
+            XCTAssertEqual(report.facesDetected, 1)
+            let stored = try XCTUnwrap(store.faces(photoID: item.primary.pathKey).first)
+            XCTAssertEqual(stored.detScore, 0.93)
+            XCTAssertEqual(stored.quality, 23.5)
+            XCTAssertEqual(stored.facePixels, 160)
+            XCTAssertEqual(stored.embedding?.count, 512)
+            XCTAssertEqual(stored.model, FaceEngine.identifier)
+            XCTAssertEqual(stored.scanGrade, .med)
+            XCTAssertEqual(stored.state, .cached)
         }
     }
 
@@ -379,7 +636,7 @@ final class FaceIndexTests: XCTestCase {
             let service = FaceIndexService(catalogURL: catalog)
             let report = try service.scan(
                 stacks: [OrganizeStack(items: burstItems), OrganizeStack(items: [single])],
-                embedder: StubEmbedder()
+                analyzer: StubAnalyzer()
             )
             XCTAssertEqual(report.photosConsidered, 4)
             XCTAssertEqual(report.photosProcessed, 4)
@@ -396,7 +653,7 @@ final class FaceIndexTests: XCTestCase {
 
     /// The scan reports live detail for the Jobs window on the existing
     /// progress channel: the pipeline step, real counters, byte totals,
-    /// and — in the debug pane — the concrete engine/embedder names.
+    /// and — in the debug pane — the engine that ran.
     func testScanReportsTelemetryOnProgressUpdates() throws {
         try withTemporaryDirectory { root in
             let catalog = root.appendingPathComponent("catalog.sqlite")
@@ -415,10 +672,9 @@ final class FaceIndexTests: XCTestCase {
             let totalBytes = itemA.primary.size + itemB.primary.size
 
             // One canned face per photo, so the counter is predictable.
-            let detection = DetectedFace(
-                boundingBox: CGRect(x: 0.4, y: 0.4, width: 0.2, height: 0.2),
-                confidence: 0.9,
-                landmarks: nil
+            let detection = analyzedFace(
+                box: NormalizedFaceBox(x: 0.4, y: 0.4, width: 0.2, height: 0.2),
+                detScore: 0.9
             )
             let recorder = ProgressRecorder()
             let service = FaceIndexService(catalogURL: catalog)
@@ -426,8 +682,7 @@ final class FaceIndexTests: XCTestCase {
                 // One item per stack — a multi-item stack is a burst and
                 // LOW samples it instead of scanning every frame.
                 stacks: [OrganizeStack(items: [itemA]), OrganizeStack(items: [itemB])],
-                embedder: StubEmbedder(),
-                detector: StubDetector(detections: [detection]),
+                analyzer: StubAnalyzer(faces: [detection]),
                 progress: recorder.handler
             )
             XCTAssertEqual(report.photosProcessed, 2)
@@ -441,8 +696,8 @@ final class FaceIndexTests: XCTestCase {
             XCTAssertEqual(telemetryUpdates.count, updates.count)
 
             let last = try XCTUnwrap(telemetryUpdates.last)
-            // Test doubles name themselves; real runs list package files.
-            XCTAssertEqual(last.models, ["StubDetector", "StubEmbedder"])
+            // Test doubles name themselves; a real run lists the sidecar.
+            XCTAssertEqual(last.models, ["StubAnalyzer"])
             XCTAssertTrue(last.facts.contains { $0.contains("LOW") })
             XCTAssertEqual(last.counter("Faces"), 2)
             // The scan ended in the match/group stage with nothing in flight.
@@ -498,7 +753,12 @@ final class FaceIndexTests: XCTestCase {
             let stranger = faceRecord(newPhoto, embedding: testEmbedding(seed: 99))
             try store.replaceFaces(photo: newPhoto, faces: [nearDad, stranger])
 
-            try FaceIndexService(catalogURL: catalog).rematchRoster()
+            // One stranger is a cluster of one; the roster match is the
+            // point here, so let a singleton become a group.
+            try FaceIndexService(
+                catalogURL: catalog,
+                options: FaceScanOptions(minimumGroupFaces: 1)
+            ).rematchRoster()
 
             let proposed = try store.face(id: nearDad.id)
             XCTAssertEqual(proposed?.state, .proposed)
@@ -525,7 +785,11 @@ final class FaceIndexTests: XCTestCase {
             let loner = faceRecord(photo, detScore: 0.80, embedding: testEmbedding(seed: 77))
             try store.replaceFaces(photo: photo, faces: [a1, a2, b1, loner])
 
-            try FaceIndexService(catalogURL: catalog).rematchRoster()
+            // Similarity is under test, not the group-size floor.
+            try FaceIndexService(
+                catalogURL: catalog,
+                options: FaceScanOptions(minimumGroupFaces: 1)
+            ).rematchRoster()
 
             let storedA1 = try store.face(id: a1.id)
             let storedA2 = try store.face(id: a2.id)
@@ -546,7 +810,8 @@ final class FaceIndexTests: XCTestCase {
 
     /// Neighbors are similar enough to join a walking average, but the
     /// first and last face are different people. They must not land in
-    /// one Person N drawer.
+    /// one Person N drawer. Average linkage splits a 50° chain into
+    /// pairs, so the floor is lowered to let pairs persist.
     func testSimilarChainDoesNotCollapseIntoOneGroup() throws {
         try withFaceStore { store, catalog in
             let photo = photoRecord("CHAIN.JPG")
@@ -566,7 +831,10 @@ final class FaceIndexTests: XCTestCase {
                 ))
             }
             try store.replaceFaces(photo: photo, faces: faces)
-            try FaceIndexService(catalogURL: catalog).rematchRoster()
+            try FaceIndexService(
+                catalogURL: catalog,
+                options: FaceScanOptions(minimumGroupFaces: 1)
+            ).rematchRoster()
 
             let personIDs = Set(try faces.compactMap { try store.face(id: $0.id)?.personID })
             XCTAssertGreaterThan(personIDs.count, 1)
@@ -609,11 +877,259 @@ final class FaceIndexTests: XCTestCase {
                 embedding: unit(0.6, -0.8)
             )
             try store.replaceFaces(photo: photo, faces: [center, left, right])
-            try FaceIndexService(catalogURL: catalog).rematchRoster()
+            try FaceIndexService(
+                catalogURL: catalog,
+                options: FaceScanOptions(minimumGroupFaces: 1)
+            ).rematchRoster()
 
             let centerGroup = try XCTUnwrap(store.face(id: center.id)?.personID)
             XCTAssertEqual(try store.face(id: left.id)?.personID, centerGroup)
             XCTAssertNotEqual(try store.face(id: right.id)?.personID, centerGroup)
+        }
+    }
+
+    // MARK: - Average-linkage grouping
+
+    /// A unit vector in a small space — cosines are exact and easy to
+    /// reason about by hand.
+    private func unit8(_ x: Float, _ y: Float) -> [Float] {
+        var vector = [Float](repeating: 0, count: 8)
+        vector[0] = x
+        vector[1] = y
+        return FaceEmbeddingMath.l2Normalized(vector)
+    }
+
+    /// Average linkage: the join score is the mean cosine to every member.
+    /// Two strangers who each resemble a hub (0.6) but not each other
+    /// (−0.28) never share a group — the mean for the second is 0.16. A
+    /// face close to both the hub and the first joiner still gets in,
+    /// because the rule admits real matches, not just the first look.
+    func testAverageLinkageKeepsHubResemblersApart() throws {
+        try withFaceStore { store, catalog in
+            let photo = photoRecord("HUB.JPG")
+            let hub = faceRecord(photo, detScore: 0.99, embedding: unit8(1, 0))
+            let first = faceRecord(photo, detScore: 0.9, embedding: unit8(0.6, 0.8))
+            let stranger = faceRecord(photo, detScore: 0.8, embedding: unit8(0.6, -0.8))
+            // 0.8 to the hub, 0.96 to `first`: mean 0.88 clears the bar.
+            let kin = faceRecord(photo, detScore: 0.75, embedding: unit8(0.8, 0.6))
+            try store.replaceFaces(photo: photo, faces: [hub, first, stranger, kin])
+
+            let report = try FaceIndexService(
+                catalogURL: catalog,
+                options: FaceScanOptions(minimumGroupFaces: 1)
+            ).rematchRoster()
+
+            let hubGroup = try XCTUnwrap(store.face(id: hub.id)?.personID)
+            XCTAssertEqual(try store.face(id: first.id)?.personID, hubGroup)
+            XCTAssertEqual(try store.face(id: kin.id)?.personID, hubGroup)
+            let strangerGroup = try XCTUnwrap(store.face(id: stranger.id)?.personID)
+            XCTAssertNotEqual(strangerGroup, hubGroup)
+            XCTAssertEqual(report.groupsCreated, 2)
+            XCTAssertEqual(try store.faces(personID: hubGroup).count, 3)
+            XCTAssertEqual(try store.faces(personID: strangerGroup).count, 1)
+        }
+    }
+
+    /// A chain stepping 50° apart: each neighbor clears the bar alone
+    /// (cos 50° ≈ 0.64) but the mean to a two-member cluster does not
+    /// (≈ 0.23), so the chain breaks into pairs instead of one drawer.
+    func testChainOfNeighborsSplitsIntoPairs() throws {
+        try withFaceStore { store, catalog in
+            let photo = photoRecord("CHAIN2.JPG")
+            let step = Float.pi / 180 * 50
+            var faces: [FaceRecord] = []
+            for index in 0..<6 {
+                let angle = step * Float(index)
+                faces.append(faceRecord(
+                    photo,
+                    box: NormalizedFaceBox(x: 0.05 + Double(index) * 0.12, y: 0.1, width: 0.1, height: 0.1),
+                    detScore: 0.95 - Double(index) * 0.02,
+                    embedding: unit8(cos(angle), sin(angle))
+                ))
+            }
+            try store.replaceFaces(photo: photo, faces: faces)
+
+            let report = try FaceIndexService(
+                catalogURL: catalog,
+                options: FaceScanOptions(minimumGroupFaces: 1)
+            ).rematchRoster()
+
+            let groups = try faces.map { try XCTUnwrap(store.face(id: $0.id)?.personID) }
+            XCTAssertEqual(report.groupsCreated, 3)
+            XCTAssertEqual(Set(groups).count, 3)
+            // Exactly {0,1}, {2,3}, {4,5}: the neighbor of the first face
+            // stays with it, and the first and last never meet.
+            XCTAssertEqual(groups[0], groups[1])
+            XCTAssertEqual(groups[2], groups[3])
+            XCTAssertEqual(groups[4], groups[5])
+            XCTAssertNotEqual(groups[0], groups[2])
+            XCTAssertNotEqual(groups[2], groups[4])
+            XCTAssertNotEqual(groups[0], groups[5])
+        }
+    }
+
+    /// Under the shipped defaults one identity with mild noise across
+    /// several photos forms exactly one group, and a near-orthogonal seed
+    /// forms its own.
+    func testSameIdentityWithNoiseFormsOneGroupUnderDefaults() throws {
+        try withFaceStore { store, catalog in
+            // Distinct noise levels give distinct vectors of the same seed;
+            // 0.2 still sits above cosine 0.9 to the clean vector.
+            let alex = try (0..<4).map { index in
+                let photo = photoRecord("ALEX_\(index).JPG")
+                let face = faceRecord(
+                    photo,
+                    detScore: 0.95 - Double(index) * 0.01,
+                    embedding: testEmbedding(seed: 21, noise: Float(index) * 0.05 + 0.05)
+                )
+                try store.replaceFaces(photo: photo, faces: [face])
+                return face
+            }
+            let sam = try (0..<3).map { index in
+                let photo = photoRecord("SAM_\(index).JPG")
+                let face = faceRecord(
+                    photo,
+                    detScore: 0.9 - Double(index) * 0.01,
+                    embedding: testEmbedding(seed: 42, noise: Float(index) * 0.05 + 0.05)
+                )
+                try store.replaceFaces(photo: photo, faces: [face])
+                return face
+            }
+
+            let report = try FaceIndexService(catalogURL: catalog).rematchRoster()
+
+            let alexGroup = try XCTUnwrap(store.face(id: alex[0].id)?.personID)
+            let samGroup = try XCTUnwrap(store.face(id: sam[0].id)?.personID)
+            XCTAssertNotEqual(alexGroup, samGroup)
+            for face in alex {
+                XCTAssertEqual(try store.face(id: face.id)?.personID, alexGroup)
+                XCTAssertEqual(try store.face(id: face.id)?.state, .other)
+            }
+            for face in sam {
+                XCTAssertEqual(try store.face(id: face.id)?.personID, samGroup)
+            }
+            XCTAssertEqual(report.groupsCreated, 2)
+            XCTAssertEqual(report.facesGrouped, 7)
+            XCTAssertEqual(try store.otherGroups().map(\.name).sorted(), ["Person 1", "Person 2"])
+        }
+    }
+
+    /// The group-size floor: a matching pair stays unassigned — no "Person
+    /// N" row, nothing grouped — until a third face makes it a cluster
+    /// worth showing.
+    func testSmallClustersStayUnassignedUntilTheMinimum() throws {
+        try withFaceStore { store, catalog in
+            let p1 = photoRecord("MIN1.JPG")
+            let p2 = photoRecord("MIN2.JPG")
+            let f1 = faceRecord(p1, embedding: testEmbedding(seed: 31))
+            let f2 = faceRecord(p2, detScore: 0.85, embedding: testEmbedding(seed: 31, noise: 0.1))
+            try store.replaceFaces(photo: p1, faces: [f1])
+            try store.replaceFaces(photo: p2, faces: [f2])
+            let service = FaceIndexService(catalogURL: catalog)
+
+            var report = try service.rematchRoster()
+            XCTAssertEqual(report.groupsCreated, 0)
+            XCTAssertEqual(report.facesGrouped, 0)
+            for face in [f1, f2] {
+                let stored = try XCTUnwrap(store.face(id: face.id))
+                XCTAssertNil(stored.personID)
+                XCTAssertEqual(stored.state, .cached)
+            }
+            XCTAssertTrue(try store.otherGroups().isEmpty)
+            XCTAssertEqual(try store.faceIndexCounts().unnamedGroups, 0)
+
+            // The third sighting tips the cluster over the floor.
+            let p3 = photoRecord("MIN3.JPG")
+            let f3 = faceRecord(p3, detScore: 0.8, embedding: testEmbedding(seed: 31, noise: 0.15))
+            try store.replaceFaces(photo: p3, faces: [f3])
+            report = try service.rematchRoster()
+            XCTAssertEqual(report.groupsCreated, 1)
+            XCTAssertEqual(report.facesGrouped, 3)
+            let group = try XCTUnwrap(store.face(id: f1.id)?.personID)
+            for face in [f1, f2, f3] {
+                XCTAssertEqual(try store.face(id: face.id)?.personID, group)
+                XCTAssertEqual(try store.face(id: face.id)?.state, .other)
+            }
+            XCTAssertEqual(try store.otherGroups().map(\.name), ["Person 1"])
+        }
+    }
+
+    /// The grouping quality gate: a weak detection or a tiny face is never
+    /// grouped, even as an exact copy of a member. A face of unknown size
+    /// (older rows, manual tags) passes the pixel check.
+    func testGroupingQualityGateSkipsWeakOrTinyFaces() throws {
+        let options = FaceScanOptions()
+        func probe(detScore: Double, facePixels: Double?) -> Bool {
+            FaceIndexService.qualifiesForGrouping(
+                FaceRecord(
+                    photoID: "p",
+                    box: NormalizedFaceBox(x: 0, y: 0, width: 0.1, height: 0.1),
+                    detScore: detScore,
+                    facePixels: facePixels
+                ),
+                options: options
+            )
+        }
+        XCTAssertTrue(probe(detScore: 0.9, facePixels: 200))
+        XCTAssertTrue(probe(detScore: 0.7, facePixels: 48))
+        XCTAssertTrue(probe(detScore: 0.9, facePixels: nil))
+        XCTAssertFalse(probe(detScore: 0.65, facePixels: 200))
+        XCTAssertFalse(probe(detScore: 0.9, facePixels: 30))
+
+        try withFaceStore { store, catalog in
+            // Three clean sightings make a real group first.
+            let members = try (0..<3).map { index in
+                let photo = photoRecord("GATE_\(index).JPG")
+                let face = faceRecord(
+                    photo,
+                    detScore: 0.95,
+                    embedding: testEmbedding(seed: 21, noise: Float(index) * 0.05),
+                    quality: 20,
+                    facePixels: 120
+                )
+                try store.replaceFaces(photo: photo, faces: [face])
+                return face
+            }
+            let service = FaceIndexService(catalogURL: catalog)
+            try service.rematchRoster()
+            let group = try XCTUnwrap(store.face(id: members[0].id)?.personID)
+
+            // Exact copies of a member that fail one gate each, plus one of
+            // unknown size.
+            let photo = photoRecord("GATE_X.JPG")
+            let weak = faceRecord(
+                photo,
+                box: NormalizedFaceBox(x: 0.1, y: 0.1, width: 0.2, height: 0.2),
+                detScore: 0.65,
+                embedding: testEmbedding(seed: 21),
+                facePixels: 120
+            )
+            let tiny = faceRecord(
+                photo,
+                box: NormalizedFaceBox(x: 0.4, y: 0.1, width: 0.2, height: 0.2),
+                detScore: 0.9,
+                embedding: testEmbedding(seed: 21),
+                facePixels: 30
+            )
+            let unknownSize = faceRecord(
+                photo,
+                box: NormalizedFaceBox(x: 0.7, y: 0.1, width: 0.2, height: 0.2),
+                detScore: 0.9,
+                embedding: testEmbedding(seed: 21)
+            )
+            try store.replaceFaces(photo: photo, faces: [weak, tiny, unknownSize])
+            try service.rematchRoster()
+
+            for face in [weak, tiny] {
+                let stored = try XCTUnwrap(store.face(id: face.id))
+                XCTAssertNil(stored.personID, "a gated face must never be grouped")
+                XCTAssertEqual(stored.state, .cached)
+            }
+            XCTAssertEqual(try store.face(id: unknownSize.id)?.personID, group)
+            XCTAssertEqual(try store.face(id: unknownSize.id)?.state, .other)
+            for face in members {
+                XCTAssertEqual(try store.face(id: face.id)?.personID, group)
+            }
         }
     }
 
@@ -626,7 +1142,13 @@ final class FaceIndexTests: XCTestCase {
             let f2 = faceRecord(p2, detScore: 0.8, embedding: testEmbedding(seed: 31, noise: 0.1))
             try store.replaceFaces(photo: p1, faces: [f1])
             try store.replaceFaces(photo: p2, faces: [f2])
-            try FaceIndexService(catalogURL: catalog).rematchRoster()
+            // Two faces are under the default group-size floor; promotion
+            // is the subject, so let the pair form a group.
+            let service = FaceIndexService(
+                catalogURL: catalog,
+                options: FaceScanOptions(minimumGroupFaces: 1)
+            )
+            try service.rematchRoster()
 
             let groupID = try XCTUnwrap(store.face(id: f1.id)?.personID)
             try store.promoteGroup(groupID, name: "Alex", templateCap: 8)
@@ -645,7 +1167,7 @@ final class FaceIndexTests: XCTestCase {
             let p3 = photoRecord("P3.JPG")
             let f3 = faceRecord(p3, embedding: testEmbedding(seed: 31, noise: 0.12))
             try store.replaceFaces(photo: p3, faces: [f3])
-            try FaceIndexService(catalogURL: catalog).rematchRoster()
+            try service.rematchRoster()
             let matched = try store.face(id: f3.id)
             XCTAssertEqual(matched?.state, .proposed)
             XCTAssertEqual(matched?.personID, groupID)
@@ -680,7 +1202,11 @@ final class FaceIndexTests: XCTestCase {
         }
     }
 
-    func testRejectFaceRegroupsToOthers() throws {
+    /// Pulling a proposal off a person sends the face back through the
+    /// grouping pass. Alone, it is a cluster of one — under the group-size
+    /// floor — so it returns to the unassigned pool rather than minting a
+    /// "Person N" of its own.
+    func testRegroupReturnsALoneFaceToTheUnassignedPool() throws {
         try withFaceStore { store, catalog in
             let dad = try store.createPerson(name: "Dad", isRoster: true)
             let galleryPhoto = photoRecord("G9.JPG")
@@ -695,12 +1221,11 @@ final class FaceIndexTests: XCTestCase {
             try service.rematchRoster()
             XCTAssertEqual(try store.face(id: wrongMatch.id)?.state, .proposed)
 
-            // "Not this person" sends the face back to the Other groups.
             try service.regroup([wrongMatch.id])
-            let regrouped = try store.face(id: wrongMatch.id)
-            XCTAssertEqual(regrouped?.state, .other)
-            let group = try XCTUnwrap(regrouped?.personID.flatMap { try? store.person($0) })
-            XCTAssertFalse(group.isRoster)
+            let regrouped = try XCTUnwrap(store.face(id: wrongMatch.id))
+            XCTAssertEqual(regrouped.state, .cached)
+            XCTAssertNil(regrouped.personID)
+            XCTAssertTrue(try store.otherGroups().isEmpty)
         }
     }
 
@@ -728,18 +1253,19 @@ final class FaceIndexTests: XCTestCase {
             try service.rematchRoster()
             XCTAssertEqual(try store.face(id: wrongMatch.id)?.personID, dad.id)
 
+            // The face leaves Dad at once. Alone it is under the group-size
+            // floor, so it waits unassigned rather than minting a group.
             try service.reject([wrongMatch.id])
             let rejected = try XCTUnwrap(store.face(id: wrongMatch.id))
-            XCTAssertEqual(rejected.state, .other)
-            let group = try XCTUnwrap(rejected.personID.flatMap { try? store.person($0) })
-            XCTAssertFalse(group.isRoster)
-            XCTAssertNotEqual(group.id, dad.id)
+            XCTAssertEqual(rejected.state, .cached)
+            XCTAssertNil(rejected.personID)
+            XCTAssertTrue(try store.otherGroups().isEmpty)
 
             // The verdict is persisted: no later pass can put it back.
             XCTAssertTrue(try store.faceRejections().blocks(faceID: wrongMatch.id, personID: dad.id))
             try service.rematchRoster()
             let after = try XCTUnwrap(store.face(id: wrongMatch.id))
-            XCTAssertEqual(after.state, .other)
+            XCTAssertNotEqual(after.state, .proposed)
             XCTAssertNotEqual(after.personID, dad.id)
 
             // The frozen face refuses the same path — confirmed never
@@ -786,17 +1312,23 @@ final class FaceIndexTests: XCTestCase {
             try store.replaceFaces(photo: twinPhoto, faces: [twin])
             try service.rematchRoster()
 
+            // Vetoed off Dad; with only the rejected face for company it is
+            // a pair, under the group-size floor, so it stays unassigned.
             let stored = try XCTUnwrap(store.face(id: twin.id))
-            XCTAssertEqual(stored.state, .other)
+            XCTAssertNotEqual(stored.state, .proposed)
             XCTAssertNotEqual(stored.personID, dad.id)
+            XCTAssertNil(stored.personID)
         }
     }
 
     /// The group-level veto: a group whose rejected face describes a
-    /// candidate better than its centroid refuses the join.
+    /// candidate better than its members refuses the join. The group is
+    /// user-named so the re-match leaves it standing — auto "Person N"
+    /// rows dissolve and re-form on every pass, and a cluster formed
+    /// within a pass has no row yet for a verdict to attach to.
     func testGroupJoinVetoedByRejectedMember() throws {
         try withFaceStore { store, catalog in
-            let group = try store.createPerson(name: "Person 7", isRoster: false)
+            let group = try store.createPerson(name: "Book club", isRoster: false)
             let photo = photoRecord("VJ1.JPG")
             let member = faceRecord(photo, detScore: 0.95, embedding: testEmbedding(seed: 21))
             let misfit = faceRecord(
@@ -809,12 +1341,17 @@ final class FaceIndexTests: XCTestCase {
             try store.assignFace(member.id, to: group.id, state: .other, score: 0.9)
             try store.assignFace(misfit.id, to: group.id, state: .other, score: 0.9)
 
-            let service = FaceIndexService(catalogURL: catalog)
+            // The pair the veto pushes away must be allowed to form a group
+            // of its own, so the size floor is lowered.
+            let service = FaceIndexService(
+                catalogURL: catalog,
+                options: FaceScanOptions(minimumGroupFaces: 1)
+            )
             try service.reject([misfit.id])
             XCTAssertNotEqual(try store.face(id: misfit.id)?.personID, group.id)
 
-            // A face identical to the rejected one clears the centroid bar
-            // on score alone — the veto keeps it out of the group.
+            // A face identical to the rejected one clears the mean-cosine
+            // bar on score alone — the veto keeps it out of the group.
             let twinPhoto = photoRecord("VJ2.JPG")
             let twin = faceRecord(twinPhoto, embedding: testEmbedding(seed: 21, noise: 0.1))
             try store.replaceFaces(photo: twinPhoto, faces: [twin])
@@ -829,47 +1366,112 @@ final class FaceIndexTests: XCTestCase {
         }
     }
 
+    /// "Not this person" on an automatic group must outlive Re-match. The
+    /// rebundle dissolves "Person N" and its members re-cluster from
+    /// scratch; the rejected face — and any lookalike of it — stays out of
+    /// the cluster its former group-mates form, and that cluster keeps the
+    /// original row so the verdict rows recorded against it survive.
+    func testRejectionFromAutoGroupSurvivesRematch() throws {
+        try withFaceStore { store, catalog in
+            // One identity with distinct noise per sighting, plus a misfit
+            // that resembles them less than they resemble each other.
+            let base = testEmbedding(seed: 21)
+            func sighting(_ seed: UInt64, spread: Float) -> [Float] {
+                let noise = testEmbedding(seed: seed)
+                return FaceEmbeddingMath.l2Normalized(zip(base, noise).map { $0 + spread * $1 })
+            }
+            let group = try store.createPerson(name: "Person 7", isRoster: false)
+            let photo = photoRecord("RJ1.JPG")
+            let members = (0..<3).map { index in
+                faceRecord(
+                    photo,
+                    box: NormalizedFaceBox(x: 0.05 + Double(index) * 0.2, y: 0.1, width: 0.1, height: 0.1),
+                    detScore: 0.95 - Double(index) * 0.01,
+                    embedding: sighting(UInt64(100 + index), spread: 0.1)
+                )
+            }
+            let misfit = faceRecord(
+                photo,
+                box: NormalizedFaceBox(x: 0.7, y: 0.1, width: 0.1, height: 0.1),
+                detScore: 0.9,
+                embedding: sighting(200, spread: 0.3)
+            )
+            try store.replaceFaces(photo: photo, faces: members + [misfit])
+            for face in members + [misfit] {
+                try store.assignFace(face.id, to: group.id, state: .other, score: 0.9)
+            }
+
+            let service = FaceIndexService(catalogURL: catalog)
+            try service.reject([misfit.id])
+            XCTAssertNil(try store.face(id: misfit.id)?.personID)
+
+            let report = try service.rematchRoster()
+            XCTAssertEqual(report.groupsDissolved, 0, "the rebuilt cluster reuses its own row")
+            let rebuilt = try XCTUnwrap(store.face(id: members[0].id)?.personID)
+            XCTAssertEqual(rebuilt, group.id)
+            for face in members {
+                XCTAssertEqual(try store.face(id: face.id)?.personID, group.id)
+            }
+            XCTAssertNil(try store.face(id: misfit.id)?.personID, "the rejected face must not rejoin its former group-mates")
+            XCTAssertNotNil(try store.person(group.id))
+
+            // A near-copy of the rejected face arrives later: closer to the
+            // rejected example than to the group, so the veto keeps it out.
+            let twinPhoto = photoRecord("RJ2.JPG")
+            let twin = faceRecord(twinPhoto, embedding: sighting(200, spread: 0.31))
+            try store.replaceFaces(photo: twinPhoto, faces: [twin])
+            try service.rematchRoster()
+            XCTAssertNotEqual(try store.face(id: twin.id)?.personID, group.id)
+            XCTAssertNil(try store.face(id: misfit.id)?.personID)
+            XCTAssertEqual(try store.faces(personID: group.id).count, 3)
+        }
+    }
+
     /// A drifted "Person N" drawer — two identities forced into one auto
     /// group — splits back into real groups on re-match.
     func testRematchRebundlesDriftedAutoGroup() throws {
         try withFaceStore { store, catalog in
             let drawer = try store.createPerson(name: "Person 27", isRoster: false)
             let photo = photoRecord("RB1.JPG")
-            let a1 = faceRecord(photo, detScore: 0.95, embedding: testEmbedding(seed: 21))
-            let a2 = faceRecord(
-                photo,
-                box: NormalizedFaceBox(x: 0.4, y: 0.1, width: 0.2, height: 0.2),
-                detScore: 0.9,
-                embedding: testEmbedding(seed: 21, noise: 0.1)
-            )
-            let b1 = faceRecord(
-                photo,
-                box: NormalizedFaceBox(x: 0.1, y: 0.4, width: 0.2, height: 0.2),
-                detScore: 0.85,
-                embedding: testEmbedding(seed: 42)
-            )
-            let b2 = faceRecord(
-                photo,
-                box: NormalizedFaceBox(x: 0.4, y: 0.4, width: 0.2, height: 0.2),
-                detScore: 0.8,
-                embedding: testEmbedding(seed: 42, noise: 0.1)
-            )
-            try store.replaceFaces(photo: photo, faces: [a1, a2, b1, b2])
-            for face in [a1, a2, b1, b2] {
+            // Three sightings of each identity — enough for both to clear
+            // the group-size floor once they split.
+            let alex = (0..<3).map { index in
+                faceRecord(
+                    photo,
+                    box: NormalizedFaceBox(x: 0.1 + Double(index) * 0.3, y: 0.1, width: 0.2, height: 0.2),
+                    detScore: 0.95 - Double(index) * 0.02,
+                    embedding: testEmbedding(seed: 21, noise: Float(index) * 0.05)
+                )
+            }
+            let sam = (0..<3).map { index in
+                faceRecord(
+                    photo,
+                    box: NormalizedFaceBox(x: 0.1 + Double(index) * 0.3, y: 0.5, width: 0.2, height: 0.2),
+                    detScore: 0.85 - Double(index) * 0.02,
+                    embedding: testEmbedding(seed: 42, noise: Float(index) * 0.05)
+                )
+            }
+            try store.replaceFaces(photo: photo, faces: alex + sam)
+            for face in alex + sam {
                 try store.assignFace(face.id, to: drawer.id, state: .other, score: 0.9)
             }
 
             try FaceIndexService(catalogURL: catalog).rematchRoster()
 
-            let storedA = try XCTUnwrap(store.face(id: a1.id)).personID
-            XCTAssertEqual(try store.face(id: a2.id)?.personID, storedA)
-            let storedB = try XCTUnwrap(store.face(id: b1.id)).personID
-            XCTAssertEqual(try store.face(id: b2.id)?.personID, storedB)
+            let storedA = try XCTUnwrap(store.face(id: alex[0].id)).personID
+            let storedB = try XCTUnwrap(store.face(id: sam[0].id)).personID
+            for face in alex {
+                XCTAssertEqual(try store.face(id: face.id)?.personID, storedA)
+            }
+            for face in sam {
+                XCTAssertEqual(try store.face(id: face.id)?.personID, storedB)
+            }
             XCTAssertNotEqual(storedA, storedB)
-            // The bigger identity keeps the recycled "Person 27" row; the
-            // other lands on a fresh unnamed group.
+            // The identity that re-forms first — led by the most confident
+            // face — keeps the recycled "Person 27" row; the other lands on
+            // a fresh unnamed group.
             XCTAssertEqual(storedA, drawer.id)
-            XCTAssertEqual(try store.faces(personID: drawer.id).count, 2)
+            XCTAssertEqual(try store.faces(personID: drawer.id).count, 3)
             let otherGroup = try XCTUnwrap(storedB.flatMap { try? store.person($0) })
             XCTAssertFalse(otherGroup.isRoster)
         }
@@ -907,31 +1509,37 @@ final class FaceIndexTests: XCTestCase {
     func testRematchOnASettledCatalogMovesNothing() throws {
         try withFaceStore { store, catalog in
             let photo = photoRecord("ST1.JPG")
-            let a1 = faceRecord(photo, detScore: 0.95, embedding: testEmbedding(seed: 21))
-            let a2 = faceRecord(
-                photo,
-                box: NormalizedFaceBox(x: 0.5, y: 0.1, width: 0.2, height: 0.2),
-                detScore: 0.9,
-                embedding: testEmbedding(seed: 21, noise: 0.1)
-            )
-            let b1 = faceRecord(
-                photo,
-                box: NormalizedFaceBox(x: 0.1, y: 0.5, width: 0.2, height: 0.2),
-                detScore: 0.85,
-                embedding: testEmbedding(seed: 42)
-            )
-            try store.replaceFaces(photo: photo, faces: [a1, a2, b1])
+            // Two identities, three sightings each — real groups under the
+            // default floor.
+            let alex = (0..<3).map { index in
+                faceRecord(
+                    photo,
+                    box: NormalizedFaceBox(x: 0.1 + Double(index) * 0.3, y: 0.1, width: 0.2, height: 0.2),
+                    detScore: 0.95 - Double(index) * 0.02,
+                    embedding: testEmbedding(seed: 21, noise: Float(index) * 0.05)
+                )
+            }
+            let sam = (0..<3).map { index in
+                faceRecord(
+                    photo,
+                    box: NormalizedFaceBox(x: 0.1 + Double(index) * 0.3, y: 0.5, width: 0.2, height: 0.2),
+                    detScore: 0.85 - Double(index) * 0.02,
+                    embedding: testEmbedding(seed: 42, noise: Float(index) * 0.05)
+                )
+            }
+            try store.replaceFaces(photo: photo, faces: alex + sam)
             let service = FaceIndexService(catalogURL: catalog)
 
             let first = try service.rematchRoster()
-            XCTAssertEqual(first.facesMoved, 3)
+            XCTAssertEqual(first.facesMoved, 6)
             XCTAssertEqual(first.groupsCreated, 2)
 
             let second = try service.rematchRoster()
             XCTAssertEqual(second.facesMoved, 0)
             XCTAssertEqual(second.groupsDissolved, 0)
-            XCTAssertEqual(try store.face(id: a1.id)?.personID, try store.face(id: a2.id)?.personID)
-            XCTAssertNotEqual(try store.face(id: a1.id)?.personID, try store.face(id: b1.id)?.personID)
+            XCTAssertEqual(try store.face(id: alex[0].id)?.personID, try store.face(id: alex[2].id)?.personID)
+            XCTAssertEqual(try store.face(id: sam[0].id)?.personID, try store.face(id: sam[2].id)?.personID)
+            XCTAssertNotEqual(try store.face(id: alex[0].id)?.personID, try store.face(id: sam[0].id)?.personID)
         }
     }
 
@@ -1125,21 +1733,18 @@ final class FaceIndexTests: XCTestCase {
 
     func testModeDefaultsMatchThePlan() throws {
         let low = FaceScanOptions(mode: .low)
-        XCTAssertEqual(low.detectorKind, .vision)
         XCTAssertEqual(low.minimumFacePixels, 64)
         XCTAssertEqual(low.detectorScales, [640])
         XCTAssertNil(low.videoFrameStride)
         XCTAssertFalse(low.scansVideo)
 
         let med = FaceScanOptions(mode: .med)
-        XCTAssertEqual(med.detectorKind, .scrfd)
         XCTAssertEqual(med.minimumFacePixels, 40)
         XCTAssertEqual(med.detectorScales, [640])
         XCTAssertEqual(med.videoFrameStride, 30)
         XCTAssertTrue(med.scansVideo)
 
         let high = FaceScanOptions(mode: .high)
-        XCTAssertEqual(high.detectorKind, .scrfd)
         XCTAssertEqual(high.minimumFacePixels, 30)
         XCTAssertEqual(high.detectorScales, [640, 960])
         XCTAssertEqual(high.videoFrameStride, 1)
@@ -1148,7 +1753,6 @@ final class FaceIndexTests: XCTestCase {
         XCTAssertFalse(high.rebuildTemplates)
 
         let xhigh = FaceScanOptions(mode: .xhigh)
-        XCTAssertEqual(xhigh.detectorKind, .scrfd)
         XCTAssertEqual(xhigh.minimumFacePixels, 30)
         XCTAssertEqual(xhigh.detectorScales, [640, 960, 1024])
         XCTAssertEqual(xhigh.videoFrameStride, 0.5)
@@ -1156,8 +1760,16 @@ final class FaceIndexTests: XCTestCase {
         XCTAssertTrue(xhigh.flipTTA)
         XCTAssertTrue(xhigh.rebuildTemplates)
         XCTAssertEqual(xhigh.templateCap, 15)
-        // The larger detector package stays opt-in.
-        XCTAssertFalse(xhigh.usesLargeDetector)
+
+        // The matching and grouping knobs are the same at every grade.
+        for options in [low, med, high, xhigh] {
+            XCTAssertEqual(options.matchThreshold, 0.45)
+            XCTAssertEqual(options.clusterThreshold, 0.40)
+            XCTAssertEqual(options.detScoreThreshold, 0.6)
+            XCTAssertEqual(options.groupingMinDetScore, 0.7)
+            XCTAssertEqual(options.groupingMinFacePixels, 48)
+            XCTAssertEqual(options.minimumGroupFaces, 3)
+        }
 
         // FAST pins the Mac; off is the quiet two-wide pass.
         XCTAssertGreaterThan(FaceScanOptions(mode: .med, fast: true).concurrency, 2)
@@ -1180,46 +1792,46 @@ final class FaceIndexTests: XCTestCase {
             try writeJPEG(jpegURL, seed: 3)
             let item = try organizeItem(forFileAt: jpegURL)
             let store = FaceIndexStore(url: catalog)
-            let detector = StubDetector(detections: [])
+            let analyzer = StubAnalyzer()
 
             // LOW stamps low; a repeat LOW pass skips.
             var service = FaceIndexService(catalogURL: catalog, options: FaceScanOptions(mode: .low))
-            var report = try service.scan(items: [item], embedder: StubEmbedder(), detector: detector)
+            var report = try service.scan(items: [item], analyzer: analyzer)
             XCTAssertEqual(report.photosProcessed, 1)
             XCTAssertEqual(try store.photos(pathKeys: [item.primary.pathKey])[item.primary.pathKey]?.scanGrade, .low)
 
-            report = try service.scan(items: [item], embedder: StubEmbedder(), detector: detector)
+            report = try service.scan(items: [item], analyzer: analyzer)
             XCTAssertEqual(report.photosSkipped, 1)
             XCTAssertEqual(report.photosProcessed, 0)
 
             // MED re-runs (low does not cover med), then stamps med.
             service = FaceIndexService(catalogURL: catalog, options: FaceScanOptions(mode: .med))
-            report = try service.scan(items: [item], embedder: StubEmbedder(), detector: detector)
+            report = try service.scan(items: [item], analyzer: analyzer)
             XCTAssertEqual(report.photosProcessed, 1)
             XCTAssertEqual(try store.photos(pathKeys: [item.primary.pathKey])[item.primary.pathKey]?.scanGrade, .med)
 
-            report = try service.scan(items: [item], embedder: StubEmbedder(), detector: detector)
+            report = try service.scan(items: [item], analyzer: analyzer)
             XCTAssertEqual(report.photosSkipped, 1)
 
             // HIGH re-runs; afterwards a MED request is covered and skipped.
             service = FaceIndexService(catalogURL: catalog, options: FaceScanOptions(mode: .high))
-            report = try service.scan(items: [item], embedder: StubEmbedder(), detector: detector)
+            report = try service.scan(items: [item], analyzer: analyzer)
             XCTAssertEqual(report.photosProcessed, 1)
             XCTAssertEqual(try store.photos(pathKeys: [item.primary.pathKey])[item.primary.pathKey]?.scanGrade, .high)
 
             service = FaceIndexService(catalogURL: catalog, options: FaceScanOptions(mode: .med))
-            report = try service.scan(items: [item], embedder: StubEmbedder(), detector: detector)
+            report = try service.scan(items: [item], analyzer: analyzer)
             XCTAssertEqual(report.photosSkipped, 1)
 
             // XHIGH re-runs (high does not cover xhigh) and stamps .xhigh.
             service = FaceIndexService(catalogURL: catalog, options: FaceScanOptions(mode: .xhigh))
-            report = try service.scan(items: [item], embedder: StubEmbedder(), detector: detector)
+            report = try service.scan(items: [item], analyzer: analyzer)
             XCTAssertEqual(report.photosProcessed, 1)
             XCTAssertEqual(try store.photos(pathKeys: [item.primary.pathKey])[item.primary.pathKey]?.scanGrade, .xhigh)
 
             // A repeat XHIGH request is covered and skipped — nothing
             // outranks xhigh, so the photo is done.
-            report = try service.scan(items: [item], embedder: StubEmbedder(), detector: detector)
+            report = try service.scan(items: [item], analyzer: analyzer)
             XCTAssertEqual(report.photosSkipped, 1)
             XCTAssertEqual(report.photosProcessed, 0)
         }
@@ -1249,7 +1861,7 @@ final class FaceIndexTests: XCTestCase {
             )
 
             let service = FaceIndexService(catalogURL: catalog, options: FaceScanOptions(mode: .low))
-            let report = try service.scan(items: [photoItem, videoItem], embedder: StubEmbedder())
+            let report = try service.scan(items: [photoItem, videoItem], analyzer: StubAnalyzer())
             XCTAssertEqual(report.photosConsidered, 1)
             XCTAssertEqual(report.photosProcessed, 1)
             XCTAssertEqual(report.videoFramesRead, 0)
@@ -1257,7 +1869,11 @@ final class FaceIndexTests: XCTestCase {
         }
     }
 
-    func testMedModeRequiresDetectorAndFreezesConfirmed() throws {
+    /// Higher grades re-detect a photo the owner already reviewed: the
+    /// confirmed face keeps its id and label while the overlapping
+    /// detection refreshes its measurement, a new face elsewhere is
+    /// added, and the photo restamps at the grade that ran.
+    func testHigherGradesRefreshConfirmedFacesAndRestamp() throws {
         try withTemporaryDirectory { root in
             let catalog = root.appendingPathComponent("catalog.sqlite")
             _ = try CatalogStore(url: catalog).bootstrap(
@@ -1270,19 +1886,13 @@ final class FaceIndexTests: XCTestCase {
             let item = try organizeItem(forFileAt: jpegURL)
             let store = FaceIndexStore(url: catalog)
 
-            // MED without a detector refuses — it must not silently fall
-            // back to the LOW Vision path.
-            let medService = FaceIndexService(catalogURL: catalog, options: FaceScanOptions(mode: .med))
-            XCTAssertThrowsError(try medService.scan(items: [item], embedder: StubEmbedder())) { error in
-                XCTAssertEqual(error as? FaceIndexError, .detectorNotInstalled(FaceModelCatalog.detectorFileName))
-            }
-
             // First pass finds one face; the owner confirms it as Dad.
-            let box = CGRect(x: 0.1, y: 0.6, width: 0.2, height: 0.2)
-            var detector = StubDetector(detections: [
-                DetectedFace(boundingBox: box, confidence: 0.95, landmarks: nil),
-            ])
-            var report = try medService.scan(items: [item], embedder: StubEmbedder(), detector: detector)
+            let box = NormalizedFaceBox(x: 0.1, y: 0.6, width: 0.2, height: 0.2)
+            let medService = FaceIndexService(catalogURL: catalog, options: FaceScanOptions(mode: .med))
+            var report = try medService.scan(
+                items: [item],
+                analyzer: StubAnalyzer(faces: [analyzedFace(box: box, detScore: 0.95, quality: 15)])
+            )
             XCTAssertEqual(report.facesDetected, 1)
 
             let dad = try store.createPerson(name: "Dad", isRoster: true)
@@ -1291,14 +1901,18 @@ final class FaceIndexTests: XCTestCase {
             try store.confirmFace(detected.id)
 
             // HIGH re-detects the same spot (overlapping box) plus a new
-            // face elsewhere. The confirmed face is untouched, the overlap
-            // is deduplicated, and the photo is now stamped high.
-            detector = StubDetector(detections: [
-                DetectedFace(boundingBox: box.offsetBy(dx: 0.01, dy: 0.01), confidence: 0.9, landmarks: nil),
-                DetectedFace(boundingBox: CGRect(x: 0.6, y: 0.6, width: 0.15, height: 0.15), confidence: 0.8, landmarks: nil),
+            // face elsewhere. The confirmed row is refreshed in place — no
+            // duplicate — and the photo is now stamped high.
+            let analyzer = StubAnalyzer(faces: [
+                analyzedFace(
+                    box: NormalizedFaceBox(x: 0.11, y: 0.61, width: 0.2, height: 0.2),
+                    detScore: 0.9,
+                    quality: 25
+                ),
+                analyzedFace(box: NormalizedFaceBox(x: 0.6, y: 0.6, width: 0.15, height: 0.15), detScore: 0.8),
             ])
             let highService = FaceIndexService(catalogURL: catalog, options: FaceScanOptions(mode: .high))
-            report = try highService.scan(items: [item], embedder: StubEmbedder(), detector: detector)
+            report = try highService.scan(items: [item], analyzer: analyzer)
             XCTAssertEqual(report.photosProcessed, 1)
 
             let faces = try store.faces(photoID: item.primary.pathKey)
@@ -1306,6 +1920,9 @@ final class FaceIndexTests: XCTestCase {
             let confirmed = try XCTUnwrap(store.face(id: detected.id))
             XCTAssertEqual(confirmed.state, .confirmed)
             XCTAssertEqual(confirmed.personID, dad.id)
+            XCTAssertEqual(confirmed.box.x, 0.11, accuracy: 1e-9)
+            XCTAssertEqual(confirmed.quality, 25)
+            XCTAssertEqual(confirmed.scanGrade, .high)
             XCTAssertEqual(faces.filter { $0.state != .confirmed }.count, 1)
             XCTAssertEqual(
                 try store.photos(pathKeys: [item.primary.pathKey])[item.primary.pathKey]?.scanGrade,
@@ -1313,10 +1930,10 @@ final class FaceIndexTests: XCTestCase {
             )
 
             // XHIGH re-runs one more time — the confirmed face is still
-            // frozen, its overlap is still deduplicated, and the photo now
-            // stamps xhigh so every later mode skips it.
+            // frozen, its overlap still folds in, and the photo now stamps
+            // xhigh so every later mode skips it.
             let xhighService = FaceIndexService(catalogURL: catalog, options: FaceScanOptions(mode: .xhigh))
-            report = try xhighService.scan(items: [item], embedder: StubEmbedder(), detector: detector)
+            report = try xhighService.scan(items: [item], analyzer: analyzer)
             XCTAssertEqual(report.photosProcessed, 1)
             XCTAssertEqual(try store.face(id: detected.id)?.state, .confirmed)
             XCTAssertEqual(try store.face(id: detected.id)?.personID, dad.id)
@@ -1325,7 +1942,7 @@ final class FaceIndexTests: XCTestCase {
                 try store.photos(pathKeys: [item.primary.pathKey])[item.primary.pathKey]?.scanGrade,
                 .xhigh
             )
-            report = try xhighService.scan(items: [item], embedder: StubEmbedder(), detector: detector)
+            report = try xhighService.scan(items: [item], analyzer: analyzer)
             XCTAssertEqual(report.photosSkipped, 1)
             XCTAssertEqual(report.photosProcessed, 0)
         }
@@ -1356,14 +1973,12 @@ final class FaceIndexTests: XCTestCase {
                 OrganizeStack(items: [items[6]]),
             ]
             let store = FaceIndexStore(url: catalog)
-            let detector = StubDetector(detections: [
-                DetectedFace(boundingBox: CGRect(x: 0.2, y: 0.2, width: 0.2, height: 0.2), confidence: 0.9, landmarks: nil),
+            let analyzer = StubAnalyzer(faces: [
+                analyzedFace(box: NormalizedFaceBox(x: 0.2, y: 0.2, width: 0.2, height: 0.2)),
             ])
             let service = FaceIndexService(catalogURL: catalog, options: FaceScanOptions(mode: .med))
 
-            var report = try service.scan(
-                items: items, embedder: StubEmbedder(), detector: detector, stacks: stacks
-            )
+            var report = try service.scan(items: items, analyzer: analyzer, stacks: stacks)
             XCTAssertEqual(report.photosConsidered, 7)
             XCTAssertEqual(report.photosProcessed, 4)   // 3 sampled burst frames + the single
             XCTAssertEqual(report.photosBurstCovered, 3)
@@ -1382,9 +1997,7 @@ final class FaceIndexTests: XCTestCase {
             }
 
             // A repeat pass skips everything — covered frames never rescan.
-            report = try service.scan(
-                items: items, embedder: StubEmbedder(), detector: detector, stacks: stacks
-            )
+            report = try service.scan(items: items, analyzer: analyzer, stacks: stacks)
             XCTAssertEqual(report.photosProcessed, 0)
             XCTAssertEqual(report.photosBurstCovered, 0)
             XCTAssertEqual(report.photosSkipped, 7)
@@ -1406,14 +2019,14 @@ final class FaceIndexTests: XCTestCase {
                 items.append(try organizeItem(forFileAt: url))
             }
             let store = FaceIndexStore(url: catalog)
-            let detector = StubDetector(detections: [
-                DetectedFace(boundingBox: CGRect(x: 0.3, y: 0.3, width: 0.2, height: 0.2), confidence: 0.9, landmarks: nil),
+            let analyzer = StubAnalyzer(faces: [
+                analyzedFace(box: NormalizedFaceBox(x: 0.3, y: 0.3, width: 0.2, height: 0.2)),
             ])
 
             // Without a scan result's stacks every still is scanned — the
             // Phase 1 behavior bare item lists keep.
             let lowService = FaceIndexService(catalogURL: catalog, options: FaceScanOptions(mode: .low))
-            var report = try lowService.scan(items: items, embedder: StubEmbedder(), detector: detector)
+            var report = try lowService.scan(items: items, analyzer: analyzer)
             XCTAssertEqual(report.photosProcessed, 4)
             XCTAssertEqual(report.photosBurstCovered, 0)
             for item in items {
@@ -1424,7 +2037,7 @@ final class FaceIndexTests: XCTestCase {
             // is covered and keeps the face LOW found on it.
             let stacks = [OrganizeStack(items: items)]
             let medService = FaceIndexService(catalogURL: catalog, options: FaceScanOptions(mode: .med))
-            report = try medService.scan(items: items, embedder: StubEmbedder(), detector: detector, stacks: stacks)
+            report = try medService.scan(items: items, analyzer: analyzer, stacks: stacks)
             XCTAssertEqual(report.photosProcessed, 3)
             XCTAssertEqual(report.photosBurstCovered, 1)
 
@@ -1435,74 +2048,6 @@ final class FaceIndexTests: XCTestCase {
                 .med
             )
         }
-    }
-
-    // MARK: - SCRFD decode math
-
-    func testSCRFDDecodeAnchorsAndNMS() throws {
-        // A 640 tensor: stride 8 → 80²·2 anchors, 16 → 3200, 32 → 800.
-        let anchors8 = 80 * 80 * 2
-        let anchors16 = 40 * 40 * 2
-        let anchors32 = 20 * 20 * 2
-
-        var scores8 = [Float](repeating: 0.01, count: anchors8)
-        var boxes8 = [Float](repeating: 0, count: anchors8 * 4)
-        let kpss8 = [Float](repeating: 0, count: anchors8 * 10)
-        // One hot anchor at cell (row 10, col 20), k = 0.
-        let anchor = (10 * 80 + 20) * 2
-        scores8[anchor] = 0.9
-        // Distances l=t=r=b=5 → box centered on (20.5·8, 10.5·8) = (164,84).
-        for offset in 0..<4 { boxes8[anchor * 4 + offset] = 5 }
-
-        let candidates = SCRFDDetector.decodeArrays(
-            scores: [scores8, [Float](repeating: 0.01, count: anchors16), [Float](repeating: 0.01, count: anchors32)],
-            boxes: [boxes8, [Float](repeating: 0, count: anchors16 * 4), [Float](repeating: 0, count: anchors32 * 4)],
-            kpss: [kpss8, [Float](repeating: 0, count: anchors16 * 10), [Float](repeating: 0, count: anchors32 * 10)],
-            tensorSide: 640,
-            scoreThreshold: 0.5
-        )
-        XCTAssertEqual(candidates.count, 1)
-        let hit = try XCTUnwrap(candidates.first)
-        XCTAssertEqual(Double(hit.box.midX), 164, accuracy: 0.01)
-        XCTAssertEqual(Double(hit.box.midY), 84, accuracy: 0.01)
-        XCTAssertEqual(Double(hit.box.width), 80, accuracy: 0.01)
-        // Zero kps offsets land the five landmarks on the anchor center.
-        XCTAssertEqual(hit.landmarks.count, 5)
-        XCTAssertEqual(Double(hit.landmarks[0].x), 164, accuracy: 0.01)
-
-        // Wrong anchor counts → the outputs are ignored, not misdecoded.
-        XCTAssertEqual(
-            SCRFDDetector.decodeArrays(
-                scores: [[Float](repeating: 0.9, count: 7)],
-                boxes: [[Float](repeating: 0, count: 28)],
-                kpss: [],
-                tensorSide: 640,
-                scoreThreshold: 0.5
-            ).count,
-            0
-        )
-
-        // NMS keeps the higher score of two overlapping candidates and all
-        // disjoint ones.
-        let overlapping = SCRFDDetector.Candidate(
-            score: 0.9,
-            box: CGRect(x: 100, y: 100, width: 80, height: 80),
-            landmarks: []
-        )
-        let weaker = SCRFDDetector.Candidate(
-            score: 0.7,
-            box: CGRect(x: 105, y: 105, width: 80, height: 80),
-            landmarks: []
-        )
-        let apart = SCRFDDetector.Candidate(
-            score: 0.6,
-            box: CGRect(x: 400, y: 400, width: 60, height: 60),
-            landmarks: []
-        )
-        let kept = SCRFDDetector.nonMaxSuppressed([weaker, apart, overlapping], iouThreshold: 0.4)
-        XCTAssertEqual(kept.count, 2)
-        XCTAssertTrue(kept.contains { $0.score == 0.9 })
-        XCTAssertTrue(kept.contains { $0.score == 0.6 })
     }
 
     // MARK: - Video sampling
@@ -1551,21 +2096,17 @@ final class FaceIndexTests: XCTestCase {
             }
             let stacks = [OrganizeStack(items: items)]
             let store = FaceIndexStore(url: catalog)
-            let detector = StubDetector(detections: [])
+            let analyzer = StubAnalyzer()
 
             // MED samples first/middle/last and covers the rest…
             let medService = FaceIndexService(catalogURL: catalog, options: FaceScanOptions(mode: .med))
-            var report = try medService.scan(
-                items: items, embedder: StubEmbedder(), detector: detector, stacks: stacks
-            )
+            var report = try medService.scan(items: items, analyzer: analyzer, stacks: stacks)
             XCTAssertEqual(report.photosProcessed, 3)
             XCTAssertEqual(report.photosBurstCovered, 1)
 
             // …but XHIGH walks every burst still — no covered members.
             let xhighService = FaceIndexService(catalogURL: catalog, options: FaceScanOptions(mode: .xhigh))
-            report = try xhighService.scan(
-                items: items, embedder: StubEmbedder(), detector: detector, stacks: stacks
-            )
+            report = try xhighService.scan(items: items, analyzer: analyzer, stacks: stacks)
             XCTAssertEqual(report.photosProcessed, 4)
             XCTAssertEqual(report.photosBurstCovered, 0)
             for item in items {
@@ -1577,7 +2118,11 @@ final class FaceIndexTests: XCTestCase {
         }
     }
 
-    func testXHighFlipTTAEmbedsMirroredSecondView() throws {
+    /// Flip TTA runs inside the engine; the pass only forwards the switch
+    /// and the detector scales for the grade. HIGH asks for neither the
+    /// mirror nor the 1024 scale, XHIGH asks for both, and the photo
+    /// carries the grade that ran.
+    func testXHighForwardsFlipTTAAndScalesToTheEngine() throws {
         try withTemporaryDirectory { root in
             let catalog = root.appendingPathComponent("catalog.sqlite")
             _ = try CatalogStore(url: catalog).bootstrap(
@@ -1588,39 +2133,25 @@ final class FaceIndexTests: XCTestCase {
             let jpegURL = root.appendingPathComponent("card/DSC00021.JPG")
             try writeJPEG(jpegURL, seed: 6)
             let item = try organizeItem(forFileAt: jpegURL)
-            let detector = StubDetector(detections: [
-                DetectedFace(
-                    boundingBox: CGRect(x: 0.2, y: 0.2, width: 0.3, height: 0.3),
-                    confidence: 0.9,
-                    landmarks: nil
-                ),
+            let analyzer = StubAnalyzer(faces: [
+                analyzedFace(box: NormalizedFaceBox(x: 0.2, y: 0.2, width: 0.3, height: 0.3)),
             ])
 
-            // HIGH embeds the aligned crop once per face.
-            let plainEmbedder = CountingEmbedder()
             var service = FaceIndexService(catalogURL: catalog, options: FaceScanOptions(mode: .high))
-            var report = try service.scan(items: [item], embedder: plainEmbedder, detector: detector)
+            var report = try service.scan(items: [item], analyzer: analyzer)
             XCTAssertEqual(report.facesDetected, 1)
-            XCTAssertEqual(plainEmbedder.calls, 1)
+            XCTAssertEqual(analyzer.calls, 1)
+            XCTAssertEqual(analyzer.lastOptions?.flipTTA, false)
+            XCTAssertEqual(analyzer.lastOptions?.detectorScales, [640, 960])
+            XCTAssertEqual(report.detectorSummary, "\(FaceEngine.identifier) scales 640/960")
 
-            // XHIGH embeds the crop and its mirror; the stored vector is
-            // the L2-normalized mean of the two views.
-            let first = testEmbedding(seed: 5)
-            let second = testEmbedding(seed: 6)
-            let flipEmbedder = AlternatingEmbedder(vectors: [first, second])
             service = FaceIndexService(catalogURL: catalog, options: FaceScanOptions(mode: .xhigh))
-            report = try service.scan(items: [item], embedder: flipEmbedder, detector: detector)
+            report = try service.scan(items: [item], analyzer: analyzer)
             XCTAssertEqual(report.facesDetected, 1)
-            XCTAssertEqual(flipEmbedder.calls, 2)
-
-            let stored = try XCTUnwrap(
-                FaceIndexStore(url: catalog).faces(photoID: item.primary.pathKey).first
-            )
-            let expected = try XCTUnwrap(FaceEmbeddingMath.centroid([first, second]))
-            XCTAssertGreaterThan(
-                FaceEmbeddingMath.cosine(try XCTUnwrap(stored.embedding), expected),
-                0.999
-            )
+            XCTAssertEqual(analyzer.calls, 2)
+            XCTAssertEqual(analyzer.lastOptions?.flipTTA, true)
+            XCTAssertEqual(analyzer.lastOptions?.detectorScales, [640, 960, 1024])
+            XCTAssertEqual(report.detectorSummary, "insightface/buffalo_l scales 640/960/1024")
             // And the photo now carries the real grade — xhigh itself.
             XCTAssertEqual(
                 try FaceIndexStore(url: catalog)
@@ -1700,7 +2231,7 @@ final class FaceIndexTests: XCTestCase {
                 catalogURL: catalog,
                 options: FaceScanOptions(mode: .xhigh)
             )
-            _ = try service.scan(items: [], embedder: StubEmbedder(), detector: StubDetector(detections: []))
+            _ = try service.scan(items: [], analyzer: StubAnalyzer())
 
             // The rebuild runs for every roster person — Mom's single
             // confirmed face becomes her one template — so scope the
@@ -1728,207 +2259,6 @@ final class FaceIndexTests: XCTestCase {
                 scalarString("SELECT state FROM faces WHERE id = '\($0)'", database: catalog)
             }
             XCTAssertTrue(states.allSatisfy { $0 == "confirmed" })
-        }
-    }
-
-    /// A tilted set of five points must land on the ArcFace template.
-    /// This is the rotate step: without it the eye dots stay on the diagonal.
-    func testAlignedImageRotatesTiltedLandmarksOntoTemplate() throws {
-        let side = 400
-        let context = try XCTUnwrap(FaceAligner.RGBContext(width: side, height: side))
-        context.setFillColor(CGColor(gray: 1, alpha: 1))
-        context.fill(CGRect(x: 0, y: 0, width: side, height: side))
-
-        // A real 40° roll, scaled up and shifted. These five points are a
-        // similarity of the ArcFace template, so alignment must put them back.
-        let angle = 40.0 * Double.pi / 180
-        let scale = 1.5
-        let cosA = cos(angle)
-        let sinA = sin(angle)
-        func rolled(_ point: CGPoint) -> CGPoint {
-            CGPoint(
-                x: scale * (cosA * point.x - sinA * point.y) + 80,
-                y: scale * (sinA * point.x + cosA * point.y) + 40
-            )
-        }
-        let placed = FaceAligner.template.map(rolled)
-        let landmarks = FaceLandmarkSet(
-            leftEye: placed[0],
-            rightEye: placed[1],
-            nose: placed[2],
-            leftMouth: placed[3],
-            rightMouth: placed[4]
-        )
-        context.setFillColor(CGColor(gray: 0, alpha: 1))
-        for point in landmarks.points {
-            let rect = CGRect(x: point.x - 2, y: Double(side) - point.y - 2, width: 5, height: 5)
-            context.fill(rect)
-        }
-        let image = try XCTUnwrap(context.makeImage())
-        let aligned = try XCTUnwrap(FaceAligner.alignedImage(image, landmarks: landmarks))
-        XCTAssertEqual(aligned.width, 112)
-        XCTAssertEqual(aligned.height, 112)
-
-        func darkness(atTopLeft point: CGPoint) -> UInt8 {
-            guard let readback = FaceAligner.RGBContext(width: 112, height: 112),
-                  let data = readback.data else { return 255 }
-            readback.draw(aligned, in: CGRect(x: 0, y: 0, width: 112, height: 112))
-            let bytes = data.bindMemory(to: UInt8.self, capacity: 112 * 112 * 4)
-            var best: UInt8 = 255
-            let cx = Int(point.x.rounded())
-            let cy = Int(point.y.rounded())
-            for dy in -1...1 {
-                for dx in -1...1 {
-                    let x = min(111, max(0, cx + dx))
-                    let y = min(111, max(0, cy + dy))
-                    let offset = (y * 112 + x) * 4
-                    best = min(best, bytes[offset], bytes[offset + 1], bytes[offset + 2])
-                }
-            }
-            return best
-        }
-
-        for point in FaceAligner.template {
-            XCTAssertLessThan(darkness(atTopLeft: point), 80, "template point \(point) stayed bright")
-        }
-        XCTAssertGreaterThan(darkness(atTopLeft: CGPoint(x: 4, y: 4)), 200)
-    }
-
-    func testFlippedHorizontallyMirrorsPixels() throws {
-        // A 2×1 image, red on the left and blue on the right, flips to
-        // blue-left / red-right. Compared as whole pixel tuples so the
-        // channel order of the bitmap never matters.
-        let context = try XCTUnwrap(FaceAligner.RGBContext(width: 2, height: 1))
-        context.setFillColor(CGColor(red: 1, green: 0, blue: 0, alpha: 1))
-        context.fill(CGRect(x: 0, y: 0, width: 1, height: 1))
-        context.setFillColor(CGColor(red: 0, green: 0, blue: 1, alpha: 1))
-        context.fill(CGRect(x: 1, y: 0, width: 1, height: 1))
-        let image = try XCTUnwrap(context.makeImage())
-
-        func pixelBytes(_ image: CGImage) -> [UInt8] {
-            guard let readback = FaceAligner.RGBContext(width: 2, height: 1) else { return [] }
-            readback.draw(image, in: CGRect(x: 0, y: 0, width: 2, height: 1))
-            guard let data = readback.data else { return [] }
-            return Array(UnsafeBufferPointer(
-                start: data.bindMemory(to: UInt8.self, capacity: 8),
-                count: 8
-            ))
-        }
-
-        let original = pixelBytes(image)
-        let flipped = try XCTUnwrap(FaceAligner.flippedHorizontally(image))
-        let mirrored = pixelBytes(flipped)
-        XCTAssertEqual(Array(mirrored[0..<4]), Array(original[4..<8]))
-        XCTAssertEqual(Array(mirrored[4..<8]), Array(original[0..<4]))
-        // A one-row image rules out a vertical flip passing by accident.
-        XCTAssertNotEqual(mirrored, original)
-    }
-
-    // MARK: - CoreML round-trip (skipped when the model is not installed)
-
-    func testArcFaceEmbedderRoundTrip() async throws {
-        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-            ?? FileManager.default.temporaryDirectory
-        guard FaceModelCatalog.isModelInstalled(applicationSupport: support) else {
-            throw XCTSkip("Face model not installed — run scripts/convert-arcface.sh once")
-        }
-
-        let embedder = try await FaceModelCatalog.loadEmbedder(applicationSupport: support)
-        let embedder2 = try XCTUnwrap(embedder)
-        let imageA = try makeFaceTestImage(seed: 1)
-        let imageB = try makeFaceTestImage(seed: 2)
-
-        let first = try embedder2.embed(imageA)
-        let repeatA = try embedder2.embed(imageA)
-        let other = try embedder2.embed(imageB)
-
-        XCTAssertEqual(first.count, 512)
-        var norm: Float = 0
-        for value in first { norm += value * value }
-        XCTAssertEqual(norm, 1, accuracy: 0.01)
-        XCTAssertGreaterThan(FaceEmbeddingMath.cosine(first, repeatA), 0.999)
-        XCTAssertLessThan(FaceEmbeddingMath.cosine(first, other), 0.999)
-    }
-
-    /// The MED/HIGH detector, exercised end to end when the package is
-    /// installed: loads, accepts the letterbox input, and decodes a real
-    /// prediction. A synthetic gradient likely yields zero faces — a valid
-    /// run — so the assertions are about the plumbing, not recall.
-    func testSCRFDDetectorLoadsAndRuns() async throws {
-        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-            ?? FileManager.default.temporaryDirectory
-        guard FaceModelCatalog.isDetectorInstalled(applicationSupport: support) else {
-            throw XCTSkip("Face detector not installed — run scripts/convert-scrfd.sh once")
-        }
-
-        let loaded = try await FaceModelCatalog.loadDetector(applicationSupport: support)
-        let detector = try XCTUnwrap(loaded)
-        XCTAssertTrue(detector.nativeInputSizes.contains(640))
-
-        let image = try makeFaceTestImage(seed: 9)
-        let detections = detector.detect(
-            in: image,
-            imagePixelSize: CGSize(width: image.width, height: image.height),
-            options: FaceScanOptions(mode: .med)
-        )
-        for detection in detections {
-            XCTAssertGreaterThanOrEqual(detection.confidence, 0.5)
-            XCTAssertEqual(detection.landmarks?.points.count ?? 5, 5)
-        }
-
-        // The full service path with the real detector on a face-free image.
-        try withTemporaryDirectory { root in
-            let catalog = root.appendingPathComponent("catalog.sqlite")
-            _ = try CatalogStore(url: catalog).bootstrap(
-                configuration: faceTestConfiguration(root: root, catalog: catalog),
-                createBackup: false,
-                createLibraryFolders: false
-            )
-            let jpegURL = root.appendingPathComponent("card/DSC00099.JPG")
-            try writeJPEG(jpegURL, seed: 8)
-            let item = try organizeItem(forFileAt: jpegURL)
-            let report = try FaceIndexService(
-                catalogURL: catalog,
-                options: FaceScanOptions(mode: .med)
-            ).scan(items: [item], embedder: StubEmbedder(), detector: detector)
-            XCTAssertEqual(report.photosProcessed, 1)
-            XCTAssertEqual(
-                try FaceIndexStore(url: catalog).photos(pathKeys: [item.primary.pathKey])[item.primary.pathKey]?.scanGrade,
-                .med
-            )
-        }
-    }
-
-    /// XHIGH's optional SCRFD-34G pass — exercised end to end only when a
-    /// `det_34g*` sibling was converted next to the 10G packages via
-    /// `scripts/convert-scrfd.sh --34g`. Absent siblings must never block
-    /// or fail anything, so this skips rather than fails.
-    func testLargeDetectorIsAnOptionalSibling() async throws {
-        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-            ?? FileManager.default.temporaryDirectory
-        guard FaceModelCatalog.isDetectorInstalled(applicationSupport: support),
-              FaceModelCatalog.isLargeDetectorInstalled(applicationSupport: support) else {
-            throw XCTSkip("Large detector not installed — optional, via scripts/convert-scrfd.sh --34g")
-        }
-
-        let loaded = try await FaceModelCatalog.loadDetector(applicationSupport: support)
-        let detector = try XCTUnwrap(loaded)
-        XCTAssertFalse(detector.heavyInputSizes.isEmpty)
-
-        // Opted in, the Jobs summary names the large family; by default a
-        // pass still runs the standard detector even when 34G exists.
-        let opted = FaceScanOptions(mode: .xhigh, usesLargeDetector: true)
-        XCTAssertTrue(detector.packageSummary(for: opted).hasPrefix("det_34g"))
-        XCTAssertTrue(detector.packageSummary(for: FaceScanOptions(mode: .xhigh)).hasPrefix("det_10g"))
-
-        let image = try makeFaceTestImage(seed: 9)
-        let detections = detector.detect(
-            in: image,
-            imagePixelSize: CGSize(width: image.width, height: image.height),
-            options: opted
-        )
-        for detection in detections {
-            XCTAssertGreaterThanOrEqual(detection.confidence, 0.5)
         }
     }
 
@@ -2260,16 +2590,41 @@ final class FaceIndexTests: XCTestCase {
         detScore: Double = 0.9,
         embedding: [Float]? = nil,
         state: FaceState = .cached,
-        personID: UUID? = nil
+        personID: UUID? = nil,
+        quality: Double? = nil,
+        facePixels: Double? = nil,
+        model: String = FaceEngine.identifier
     ) -> FaceRecord {
         FaceRecord(
             photoID: photo.pathKey,
             personID: personID,
             box: box,
             detScore: detScore,
+            quality: quality,
+            facePixels: facePixels,
             embedding: embedding,
+            model: model,
             state: state,
             photoPath: photo.path
+        )
+    }
+
+    /// One canned engine result. The defaults describe a clean, large
+    /// face — unit embedding, healthy quality, well above every size gate
+    /// — so a test about a gate sets only the field it is probing.
+    private func analyzedFace(
+        box: NormalizedFaceBox = NormalizedFaceBox(x: 0.4, y: 0.4, width: 0.2, height: 0.2),
+        detScore: Double = 0.9,
+        embedding: [Float]? = nil,
+        quality: Double = 20,
+        facePixels: Double = 200
+    ) -> AnalyzedFace {
+        AnalyzedFace(
+            box: box,
+            detScore: detScore,
+            embedding: embedding ?? FaceEmbeddingMath.l2Normalized([Float](repeating: 1, count: 512)),
+            quality: quality,
+            facePixels: facePixels
         )
     }
 
@@ -2358,28 +2713,6 @@ final class FaceIndexTests: XCTestCase {
         try writeFile(url, bytes)
     }
 
-    /// A deterministic 112×112 bitmap for the CoreML round-trip test.
-    private func makeFaceTestImage(seed: UInt8) throws -> CGImage {
-        let size = FaceAligner.outputSize
-        guard let context = CGContext(
-            data: nil,
-            width: size,
-            height: size,
-            bitsPerComponent: 8,
-            bytesPerRow: size * 4,
-            space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        ) else {
-            throw XCTSkip("Could not create a test bitmap")
-        }
-        for index in 0..<16 {
-            let shade = CGFloat((Int(seed) * 17 + index * 13) % 255) / 255
-            context.setFillColor(CGColor(red: shade, green: 1 - shade, blue: shade / 2, alpha: 1))
-            context.fill(CGRect(x: (index % 4) * size / 4, y: (index / 4) * size / 4, width: size / 4, height: size / 4))
-        }
-        return try XCTUnwrap(context.makeImage())
-    }
-
     private func scalarInt(_ sql: String, database url: URL) -> Int {
         var database: OpaquePointer?
         guard sqlite3_open(url.path, &database) == SQLITE_OK, let database else { return -1 }
@@ -2433,51 +2766,40 @@ private struct SplitMix64: RandomNumberGenerator {
     }
 }
 
-/// Never actually called — scans in these tests run on face-free images.
-private struct StubEmbedder: FaceEmbeddingProviding {
-    func embed(_ image: CGImage) throws -> [Float] {
-        FaceEmbeddingMath.l2Normalized([Float](repeating: 1, count: 512))
-    }
-}
-
-/// Canned detections so service tests exercise the real scan path without
-/// a detector model on disk.
-private struct StubDetector: FaceDetecting {
-    var detections: [DetectedFace]
-
-    func detect(in image: CGImage, imagePixelSize: CGSize, options: FaceScanOptions) -> [DetectedFace] {
-        detections
-    }
-}
-
-/// Counts embed calls — XHIGH's flip TTA must call once per view.
-private final class CountingEmbedder: FaceEmbeddingProviding, @unchecked Sendable {
+/// Canned engine results so service tests exercise the real scan path
+/// without the sidecar. `error` makes every call throw — the engine
+/// failure path. Records each call so a test can prove a skipped photo
+/// never reached the engine and see what the pass asked for.
+private final class StubAnalyzer: FaceAnalyzing, @unchecked Sendable {
+    let displayName = "StubAnalyzer"
+    var faces: [AnalyzedFace]
+    var error: Error?
     private let lock = NSLock()
-    private(set) var calls = 0
+    private var seen: [FaceScanOptions] = []
 
-    func embed(_ image: CGImage) throws -> [Float] {
+    init(faces: [AnalyzedFace] = [], error: Error? = nil) {
+        self.faces = faces
+        self.error = error
+    }
+
+    var calls: Int {
         lock.lock()
         defer { lock.unlock() }
-        calls += 1
-        return FaceEmbeddingMath.l2Normalized([Float](repeating: 1, count: 512))
-    }
-}
-
-/// Returns each vector in turn — the flip-TTA test reads back the
-/// normalized mean of the first two calls.
-private final class AlternatingEmbedder: FaceEmbeddingProviding, @unchecked Sendable {
-    private let lock = NSLock()
-    private(set) var calls = 0
-    let vectors: [[Float]]
-
-    init(vectors: [[Float]]) {
-        self.vectors = vectors
+        return seen.count
     }
 
-    func embed(_ image: CGImage) throws -> [Float] {
+    /// The options the most recent call carried.
+    var lastOptions: FaceScanOptions? {
         lock.lock()
         defer { lock.unlock() }
-        defer { calls += 1 }
-        return vectors[calls % vectors.count]
+        return seen.last
+    }
+
+    func analyze(_ image: CGImage, options: FaceScanOptions) throws -> [AnalyzedFace] {
+        lock.lock()
+        seen.append(options)
+        lock.unlock()
+        if let error { throw error }
+        return faces
     }
 }

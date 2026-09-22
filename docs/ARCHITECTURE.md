@@ -75,32 +75,30 @@ Immich
 
 ## Face index
 
-Faces exist to tag events: `event.people` is the unique set of named (roster) people detected on an event's photos, surfaced as chips on event headers and names in the sidebar. The pipeline is fully on-device and lives in `CameraToolkitCore/Faces/`:
+Faces exist to tag events: `event.people` is the unique set of named (roster) people detected on an event's photos, surfaced as chips on event headers and names in the sidebar. The pipeline is fully on-device and lives in `CameraToolkitCore/Faces/`; the ML itself is the reference `insightface` package in a Python sidecar, never re-implemented in Swift (`docs/FACE-PIPELINE.md` is the contract):
 
 ```text
 unsorted media (LOW scans stills only; MED/HIGH also sample video frames)
-    │ LOW:  VisionFaceDetector — Vision rectangles+landmarks on a bounded
-    │        decode, min-size floor ~64px
-    │ MED:  SCRFDDetector — SCRFD CoreML letterboxed to 640, ~40px floor,
-    │        stills + sparse video keyframes (one frame per ~30s, capped)
-    │ HIGH: SCRFDDetector at 640 and 960 canvas scales, ~30px floor,
-    │        stills + ~1fps video frames
+    │ FaceImageDecoder: bounded, orientation-applied decode (embedded JPEG for RAW)
     ▼
-FaceAligner: 5-point similarity warp to 112×112 (box-crop fallback)
-    │ ArcFaceEmbedder: single frozen identity model → 512-d L2-normalized vector
+FaceSidecarPool → face_sidecar.py (insightface buffalo_l, onnxruntime CoreML)
+    │ SCRFD-10G detect + 5 landmarks at 640 (HIGH +960, XHIGH +1024)
+    │ norm_crop 5-point warp to 112×112 → ArcFace w600k_r50 → 512-d unit vector
+    │ returns box, det_score, embedding, quality (pre-norm), aligned crop
     ▼
-FaceIndexService: cosine vs roster templates → proposed, else greedy
-    cosine clustering into unnamed "Other" groups; video faces dedup by
-    embedding cosine so a clip records distinct appearances, not seconds
+FaceIndexService: native min-size floor per grade; cosine vs roster templates
+    → proposed; leftovers grouped by average linkage (mean cosine ≥ 0.40)
+    behind a quality gate (det ≥ 0.7, ≥ 48 decoded px) and a minimum of 3
+    faces per new "Person N"; video faces dedup by embedding cosine
     ▼
-FaceIndexStore: faces/people/face_templates/face_photos tables in the catalog
+FaceIndexStore: faces/people/face_templates/face_rejections/face_photos in the catalog
 ```
 
-- The identity model is a fixed, generated `.mlpackage` under `Application Support/CameraToolkit/Models`, produced once per machine by `scripts/convert-arcface.sh` — the only Python anywhere; nothing ships or re-trains. Embedding vectors are keyed by a fixed model name and never mix spaces. The MED/HIGH detector comes from the same model pack via `scripts/convert-scrfd.sh`: one fixed-shape package per input size (`det_10g.mlpackage` at 640, `det_10g_960.mlpackage` at 960), decoded in-app by anchors at strides 8/16/32 with cross-scale NMS.
+- The engine is installed once per Mac by `scripts/setup-face-sidecar.sh` into `Application Support/CameraToolkit/face-sidecar` (pinned `insightface` + `onnxruntime` in a private Python 3.12, the `buffalo_l` pack, a warm CoreML cache). Every face row and scanned photo carries `FaceEngine.identifier`; rows from another engine are ignored and re-scanned, so embedding spaces never mix.
 - Scan grades are ordered (`none < low < med < high < xhigh`); a photo whose recorded grade covers the requested mode is skipped, keyed by file identity (name + size + mtime) so replugging a drive or moving a file never re-runs detection. The stamped grade is what actually ran — an XHIGH request runs the HIGH pipeline and stamps `.high` so a later XHIGH implementation still re-scans.
 - Detection follows the scanner's burst grouping: a burst of stills decodes up to three spread frames (all of a small burst; first/middle/last beyond that) and stamps the un-sampled members covered at the same grade — near-identical frames repeat the same faces, and covered frames keep any faces a lower grade already found. Bare item lists without an `OrganizeScanResult` scan every still.
-- MED/HIGH refuse to run without the detector package installed rather than silently falling back to LOW detection; the scan sheet gates Medium/High on its presence.
-- Confirmed faces are frozen: photo re-scans never delete or reclassify them, and overlapping fresh detections are dropped instead of duplicating.
+- Every grade refuses to run without the sidecar installed; the scan sheet and People window say which script to run.
+- Confirmed faces keep their label through re-scans: a fresh detection overlapping one refreshes its box, vector, quality, and crop in place (this is also how a named gallery migrates to a new engine) — it is never deleted, reclassified, or duplicated.
 - The People window (View → People, ⌘⌥P) offers the three review queues — roster, new groups, unsure — with name/merge/junk/confirm actions. Naming a group promotes it to the roster, confirms its faces, and pins distinct-photo members as match templates; merges keep unconfirmed faces reviewable as proposals. Re-match re-evaluates stored vectors against the gallery on CPU only.
 - Face work runs inside `runAsyncJob` like other file jobs; FAST on uses every core, FAST off is two workers — never changes models or floors. Quality is the mode, Fast is how hard the Mac works. The same `FaceScanSheet` opens from an unsorted location or an event board (or its sidebar row's menu): an event scan runs `FaceIndexService` on the event board's own stacks — the reachable `bestLocalPath` copies — against the same catalog, so faces found there or in Unsorted share one index and one set of skip rules. `EventBoardView` and the sidebar read `eventPeople` through `EventsWorkspace`, cached per faces-revision so rows share one catalog pass; board search matches a roster person name against a stack's files through `rosterNamesByFileKey`, so typing a person keeps both the event and the bursts they appear in.
 

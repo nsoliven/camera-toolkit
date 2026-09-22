@@ -115,7 +115,7 @@ struct EventsRootView: View {
                 if let location = workspace.location(locationID) {
                     FaceScanSheet(
                         name: location.name,
-                        detectorInstalled: workspace.faceDetectorInstalled,
+                        engineInstalled: workspace.faceEngineInstalled,
                         onCancel: { workspace.faceScanRequest = nil },
                         onScan: { options in
                             workspace.faceScanRequest = nil
@@ -127,7 +127,7 @@ struct EventsRootView: View {
                 if let event = workspace.event(eventID) {
                     FaceScanSheet(
                         name: workspace.eventTitle(event),
-                        detectorInstalled: workspace.faceDetectorInstalled,
+                        engineInstalled: workspace.faceEngineInstalled,
                         onCancel: { workspace.faceScanRequest = nil },
                         onScan: { options in
                             workspace.faceScanRequest = nil
@@ -428,7 +428,7 @@ struct EventsSidebar: View {
             }
             footerButton(
                 "People…",
-                detail: workspace.faceModelInstalled ? nil : "model missing",
+                detail: workspace.faceEngineInstalled ? nil : "engine missing",
                 symbol: "person.2"
             ) {
                 PeopleWindowController.shared.show(model: model, workspace: workspace)
@@ -936,7 +936,7 @@ struct FaceScanSheet: View {
     let name: String
     /// MED and above need the converted detector package; without it the
     /// scan button stays off and the fix is spelled out inline.
-    let detectorInstalled: Bool
+    let engineInstalled: Bool
     let onCancel: () -> Void
     let onScan: (FaceScanOptions) -> Void
 
@@ -965,9 +965,9 @@ struct FaceScanSheet: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-            if needsDetector && !detectorInstalled {
+            if !engineInstalled {
                 Label(
-                    "Medium and above need the face detector installed — run scripts/convert-scrfd.sh once on this Mac.",
+                    "Face scans need the face engine installed — run \(FaceSidecarInstallation.setupCommand) once on this Mac.",
                     systemImage: "exclamationmark.triangle.fill"
                 )
                 .font(.caption)
@@ -982,14 +982,13 @@ struct FaceScanSheet: View {
                     onScan(FaceScanOptions(mode: mode, fast: fast))
                 }
                 .keyboardShortcut(.defaultAction)
-                .disabled(needsDetector && !detectorInstalled)
+                .disabled(!engineInstalled)
             }
         }
         .padding(20)
         .frame(width: 460)
     }
 
-    private var needsDetector: Bool { mode != .low }
 
     private var modeHelp: String {
         switch mode {

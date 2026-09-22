@@ -22,6 +22,12 @@ swift build -c release --product CameraToolkit
 rm -rf "$app"
 mkdir -p "$macos" "$resources"
 cp ".build/release/CameraToolkit" "$macos/CameraToolkit"
+# SwiftPM resource bundles (the face sidecar script lives in the Core one)
+# sit next to the executable in .build; Bundle.module finds them again in
+# Contents/Resources.
+for bundle in .build/release/CameraToolkit_*.bundle; do
+  [[ -d "$bundle" ]] && ditto "$bundle" "$resources/$(basename "$bundle")"
+done
 "$repo_root/scripts/make-app-icon.swift" "$repo_root/Assets/AppIcon.png" "$resources/AppIcon.icns"
 
 cat > "$contents/Info.plist" <<'PLIST'
