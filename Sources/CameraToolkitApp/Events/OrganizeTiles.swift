@@ -303,8 +303,9 @@ struct StackTileView: View {
     }
 }
 
-/// Header of one board section — a day, folder, kind, or event group. The
-/// chevron collapses the whole group so hundreds of bursts stay scannable.
+/// Header of one board section — a day, folder, kind, or event group.
+/// The whole bar opens and closes the group. Select stays its own button
+/// so it does not toggle the section.
 struct BoardGroupHeader: View {
     let group: OrganizeBoardGroup
     let isCollapsed: Bool
@@ -312,33 +313,42 @@ struct BoardGroupHeader: View {
     let onSelect: () -> Void
 
     var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 10) {
-            Button(action: onToggleCollapse) {
-                Image(systemName: isCollapsed ? "chevron.right" : "chevron.down")
-                    .font(.callout.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                    .frame(width: 14)
+        HStack(alignment: .firstTextBaseline, spacing: 0) {
+            Button {
+                withAnimation(.easeOut(duration: 0.15)) {
+                    onToggleCollapse()
+                }
+            } label: {
+                HStack(alignment: .firstTextBaseline, spacing: 10) {
+                    Image(systemName: isCollapsed ? "chevron.right" : "chevron.down")
+                        .font(.callout.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 14)
+                    if let symbol = group.symbol {
+                        Image(systemName: symbol)
+                            .foregroundStyle(.secondary)
+                    }
+                    Text(group.title)
+                        .font(.title3.weight(.semibold))
+                    Text(group.subtitle)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                    Spacer(minLength: 8)
+                }
+                .padding(.vertical, 8)
+                .padding(.leading, 6)
+                .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .help(isCollapsed ? "Expand this group" : "Collapse this group")
-            if let symbol = group.symbol {
-                Image(systemName: symbol)
-                    .foregroundStyle(.secondary)
-            }
-            Text(group.title)
-                .font(.title3.weight(.semibold))
-            Text(group.subtitle)
-                .font(.callout)
-                .foregroundStyle(.secondary)
-            Spacer()
             Button("Select", action: onSelect)
                 .buttonStyle(.borderless)
                 .font(.callout)
                 .disabled(group.stacks.isEmpty)
                 .help("Select everything in this group")
+                .padding(.vertical, 8)
+                .padding(.trailing, 6)
         }
-        .padding(.vertical, 8)
-        .padding(.horizontal, 6)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(.bar)
     }
