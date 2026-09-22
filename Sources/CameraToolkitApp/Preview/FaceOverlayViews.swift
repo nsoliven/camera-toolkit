@@ -137,14 +137,15 @@ struct FaceBoxesOverlay: View {
         .accessibilityLabel(accessibilityLabel(for: face))
     }
 
-    /// A hover-only region: rendered just barely on-screen so SwiftUI
-    /// keeps its tracking area alive, but transparent to clicks.
+    /// A hover-only region: an AppKit tracking view reports pointer
+    /// enter/exit while never hit-testing, so the same rect stays
+    /// transparent to the clicks that drive zoom and pan. A SwiftUI
+    /// target can't do both — `allowsHitTesting(false)` would silence the
+    /// hover together with the clicks.
     private func proximityTarget(_ rect: CGRect, in groupRect: CGRect, part: InsidePart) -> some View {
-        Color.white.opacity(0.001)
+        HoverTrackingView { inside in setHovered(part, inside) }
             .frame(width: rect.width, height: rect.height)
             .position(x: rect.midX - groupRect.minX, y: rect.midY - groupRect.minY)
-            .onHover { inside in setHovered(part, inside) }
-            .allowsHitTesting(false)
     }
 
     /// Box fill/stroke per state, drawn only while revealed: solid+bright

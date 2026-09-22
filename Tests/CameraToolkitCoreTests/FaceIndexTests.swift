@@ -2474,6 +2474,38 @@ final class FaceIndexTests: XCTestCase {
         }
     }
 
+    /// The preview's "was this file scanned" read is by identity, not
+    /// path: the photo row must come back when only the path key changed.
+    func testPhotoRowsLookedUpByFileIdentitySurviveMoves() throws {
+        try withFaceStore { store, _ in
+            let atScan = photoRecord("DSC00003.ARW", size: 6_144, directory: "/card/DCIM")
+            try store.replaceFaces(photo: atScan, faces: [])
+
+            // Same name + bytes + mtime under a different path key still
+            // finds the row — and reports it under the scanned path key,
+            // which is also the photoID its faces hang off.
+            let moved = photoRecord("DSC00003.ARW", size: 6_144, directory: "/library/event")
+            let records = try store.photos(
+                fileName: moved.fileName,
+                byteCount: moved.byteCount,
+                modifiedAt: moved.modifiedAt
+            )
+            XCTAssertEqual(records.map(\.pathKey), [atScan.pathKey])
+
+            // A different size or mtime is a different file.
+            XCTAssertTrue(try store.photos(
+                fileName: moved.fileName,
+                byteCount: moved.byteCount + 1,
+                modifiedAt: moved.modifiedAt
+            ).isEmpty)
+            XCTAssertTrue(try store.photos(
+                fileName: moved.fileName,
+                byteCount: moved.byteCount,
+                modifiedAt: moved.modifiedAt.addingTimeInterval(30)
+            ).isEmpty)
+        }
+    }
+
     // MARK: - Manual face tagging (burst preview overlay)
 
     func testAddManualFaceOnUnscannedFile() throws {
