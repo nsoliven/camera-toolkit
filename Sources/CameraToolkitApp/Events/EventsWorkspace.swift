@@ -16,7 +16,18 @@ enum EventsSidebarSelection: Hashable, Sendable {
 }
 
 struct UnsortedSourceState {
-    var result: OrganizeScanResult?
+    var result: OrganizeScanResult? {
+        didSet {
+            stacksByID = Dictionary(
+                (result?.stacks ?? []).map { ($0.id, $0) },
+                uniquingKeysWith: { first, _ in first }
+            )
+        }
+    }
+    /// `OrganizeStack.id` → stack, kept in step with `result` so a menu or
+    /// key handler resolves its targets by lookup instead of scanning the
+    /// whole board on every right-click.
+    private(set) var stacksByID: [String: OrganizeStack] = [:]
     var isScanning = false
     var progress: OrganizeScanProgress?
     var error: String?
@@ -175,6 +186,52 @@ private struct PlannedReassignment: Sendable {
     var moveSourcePath: String?
 }
 
+/// The slice of `EventAssetPresence` a move or return needs, in a form the
+/// app can also synthesize from the catalog alone when the presence sweep
+/// has not landed yet — the scanner's own value type is read-only outside
+/// `CameraToolkitCore`.
+private struct MoveCandidate: Sendable {
+    var assignment: PhotoEventAssignment
+    var sourcePath: String?
+    var drivePath: String?
+    var otherDrivePath: String?
+    var source: CatalogPresenceState
+    var drive: CatalogPresenceState
+    var otherDrive: CatalogPresenceState
+    var sourceIsDriveCopy: Bool
+
+    init(_ asset: EventAssetPresence) {
+        assignment = asset.assignment
+        sourcePath = asset.sourcePath
+        drivePath = asset.drivePath
+        otherDrivePath = asset.otherDrivePath
+        source = asset.source
+        drive = asset.drive
+        otherDrive = asset.otherDrive
+        sourceIsDriveCopy = asset.sourceIsDriveCopy
+    }
+
+    init(
+        assignment: PhotoEventAssignment,
+        sourcePath: String?,
+        drivePath: String?,
+        otherDrivePath: String?,
+        source: CatalogPresenceState,
+        drive: CatalogPresenceState,
+        otherDrive: CatalogPresenceState,
+        sourceIsDriveCopy: Bool
+    ) {
+        self.assignment = assignment
+        self.sourcePath = sourcePath
+        self.drivePath = drivePath
+        self.otherDrivePath = otherDrivePath
+        self.source = source
+        self.drive = drive
+        self.otherDrive = otherDrive
+        self.sourceIsDriveCopy = sourceIsDriveCopy
+    }
+}
+
 private struct NASArchiveGroup: Sendable {
     var root: URL
     var deviceID: String?
@@ -238,7 +295,9 @@ final class EventsWorkspace {
     var selectedStackIDs: Set<String> = []
     var focusedStackID: String?
     var presence: [UUID: EventPresenceSummary] = [:]
-    var eventStacks: [UUID: [OrganizeStack]] = [:]
+    var eventStacks: [UUID: [OrganizeStack]] = [:] {
+        didSet { reindexEventStacks(from: oldValue) }
+    }
     var eventImmichStatuses: [UUID: [String: ImmichCatalogStatus]] = [:]
     var discoveredDriveEvents: [DiscoveredDriveEvent] = []
     var newEventRequest: NewEventRequest?
@@ -297,6 +356,15 @@ final class EventsWorkspace {
     /// Storage-location resolver reused within one configuration revision so
     /// event hierarchy lookups share its index.
     @ObservationIgnored private var locationsCache: (revision: Int, locations: EventStorageLocations)?
+    /// `OrganizeStack.id` → stack per event board — rebuilt when the board
+    /// writes `eventStacks`, so a context menu or key press resolves its
+    /// targets by lookup instead of scanning every stack in the event.
+    @ObservationIgnored private var eventStacksByID: [UUID: [String: OrganizeStack]] = [:]
+    /// Event id → event index for title/policy lookups that must stay
+    /// filesystem-free: `EventStorageLocations` standardizes the drive roots
+    /// when it is built, so context menus and rows ask `EventHierarchy`
+    /// through this index instead.
+    @ObservationIgnored private var eventsByIDCache: (revision: Int, byID: [UUID: SavedCameraEvent])?
     @ObservationIgnored private let mountObservers = MountObserverBox()
 
     /// Holds move journals and the capture-time cache.
@@ -421,14 +489,30 @@ final class EventsWorkspace {
         return discoveredDriveEvents.filter { OrganizeSearch.matches($0.name, needle: needle) }
     }
 
-    /// "Parent / Child" title for menus, headers, and plan rows.
-    func eventTitle(_ event: SavedCameraEvent) -> String {
-        locations.displayName(for: event)
+    /// The event id → event index backing `eventTitle`/`resolvedPolicy` —
+    /// rebuilt once per configuration revision and shared by every caller in
+    /// between, so titles never rebuild `locations` (a filesystem-touching
+    /// resolver) inside a menu body or row render.
+    private var eventsByID: [UUID: SavedCameraEvent] {
+        if let cached = eventsByIDCache, cached.revision == model.configurationRevision {
+            return cached.byID
+        }
+        let byID = EventHierarchy.index(model.configuration.savedEvents)
+        eventsByIDCache = (model.configurationRevision, byID)
+        return byID
     }
 
-    /// The event's effective storage policy, following parent inheritance.
+    /// "Parent / Child" title for menus, headers, and plan rows — pure
+    /// in-memory: same answer as `locations.displayName`, without building
+    /// `EventStorageLocations` (which standardizes the drive roots).
+    func eventTitle(_ event: SavedCameraEvent) -> String {
+        EventHierarchy.displayName(of: event, byID: eventsByID)
+    }
+
+    /// The event's effective storage policy, following parent inheritance —
+    /// same answer as `locations.resolvedPolicy`, without touching the disk.
     func resolvedPolicy(for event: SavedCameraEvent) -> EventStoragePolicy {
-        locations.resolvedPolicy(for: event)
+        EventHierarchy.resolvedPolicy(of: event, byID: eventsByID)
     }
 
     /// Events that may parent `eventID` — every event except it and its own
@@ -773,6 +857,67 @@ final class EventsWorkspace {
     func assets(for stack: OrganizeStack, in eventID: UUID) -> [EventAssetPresence] {
         let index = eventAssetsByPathKey[eventID] ?? [:]
         return stack.files.compactMap { index[$0.pathKey] }
+    }
+
+    /// Rebuilds only the boards whose stack list just changed, keeping the
+    /// id index in step with `eventStacks` without re-scanning untouched
+    /// events.
+    private func reindexEventStacks(from oldValue: [UUID: [OrganizeStack]]) {
+        for key in Set(eventStacks.keys).union(oldValue.keys) {
+            guard eventStacks[key] != oldValue[key] else { continue }
+            eventStacksByID[key] = eventStacks[key].map { stacks in
+                Dictionary(stacks.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+            }
+        }
+    }
+
+    /// The stacks behind a menu or key target on an event board — answered
+    /// from the id index, so a right-click never scans the whole board.
+    func stacks(matching ids: Set<String>, inEvent eventID: UUID) -> [OrganizeStack] {
+        let byID = eventStacksByID[eventID] ?? [:]
+        return ids.compactMap { byID[$0] }
+    }
+
+    /// Same lookup for an unsorted board.
+    func stacks(matching ids: Set<String>, inLocation locationID: UUID) -> [OrganizeStack] {
+        let byID = sources[locationID]?.stacksByID ?? [:]
+        return ids.compactMap { byID[$0] }
+    }
+
+    /// "Move to Event"/"Sort Into" rows in sidebar order. `excluding` drops
+    /// the event the stacks already sit in; nil keeps every event (the
+    /// unsorted board's menu). Breadcrumb titles come from the shared
+    /// hierarchy index — never `locations` — so building the menu does no
+    /// filesystem work.
+    private func menuTargets(excluding eventID: UUID?) -> [EventMenuTarget] {
+        sidebarEvents.compactMap { row in
+            guard row.event.id != eventID else { return nil }
+            return EventMenuTarget(id: row.event.id, title: eventTitle(row.event))
+        }
+    }
+
+    /// Everything the event board's right-click menu needs, answered from
+    /// indexes the workspace already maintains — no stack scan and no
+    /// filesystem work, so the menu opens instantly even while the event is
+    /// still "Checking".
+    func stackMenuState(forStackID stackID: String, inEvent eventID: UUID) -> OrganizeStackMenuState {
+        let targets = targetStackIDs(including: stackID)
+        return OrganizeStackMenuState(
+            targetIDs: targets,
+            stacks: stacks(matching: targets, inEvent: eventID),
+            eventTargets: menuTargets(excluding: eventID)
+        )
+    }
+
+    /// Same state for the unsorted board's menu; its "Sort Into" lists every
+    /// event.
+    func stackMenuState(forStackID stackID: String, inLocation locationID: UUID) -> OrganizeStackMenuState {
+        let targets = targetStackIDs(including: stackID)
+        return OrganizeStackMenuState(
+            targetIDs: targets,
+            stacks: stacks(matching: targets, inLocation: locationID),
+            eventTargets: menuTargets(excluding: nil)
+        )
     }
 
     func badge(for stack: OrganizeStack, in eventID: UUID) -> TileLocationBadge? {
@@ -1823,13 +1968,112 @@ final class EventsWorkspace {
 
     // MARK: - Reorganize inside events
 
+    /// Every exit leaves the owner a sentence: a queued or running job, an
+    /// already-there note, or a name collision. A board still painting or a
+    /// presence index still empty is never a reason to drop the click.
     func moveStacks(_ stackIDs: Set<String>, fromEvent sourceEventID: UUID, toEvent targetEventID: UUID) {
-        guard sourceEventID != targetEventID,
-              let from = event(sourceEventID),
-              let to = event(targetEventID),
-              let stacks = eventStacks[sourceEventID] else { return }
-        let assets = stacks.filter { stackIDs.contains($0.id) }.flatMap { self.assets(for: $0, in: sourceEventID) }
-        guard !assets.isEmpty else { return }
+        guard let from = event(sourceEventID), let to = event(targetEventID) else {
+            model.statusMessage = "The source or destination event no longer exists — nothing was moved."
+            return
+        }
+        guard sourceEventID != targetEventID else {
+            model.statusMessage = "Those files are already in \(eventTitle(to))."
+            return
+        }
+        guard let stacks = eventStacks[sourceEventID] else {
+            queueMove(stackIDs, from: from, to: to)
+            return
+        }
+        moveLoadedStacks(stacks.filter { stackIDs.contains($0.id) }, from: from, to: to)
+    }
+
+    /// A click arrived before the board painted, so the stack ids cannot be
+    /// opened into their files yet. The click waits on the in-flight refresh
+    /// (or starts one) and then runs the same move — it is never dropped.
+    private func queueMove(_ stackIDs: Set<String>, from: SavedCameraEvent, to: SavedCameraEvent) {
+        model.statusMessage = "Move to \(eventTitle(to)) queued — \(eventTitle(from)) is still loading. It runs as soon as the board appears."
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await waitForBoard(from.id)
+            moveLoadedStacks(
+                (eventStacks[from.id] ?? []).filter { stackIDs.contains($0.id) },
+                from: from,
+                to: to
+            )
+        }
+    }
+
+    /// Suspends until `eventStacks[eventID]` exists: waits out the in-flight
+    /// sweep when one is already publishing the board, or drives a refresh
+    /// for a board nobody opened. Clicks queued while a grid loads land here
+    /// instead of vanishing.
+    private func waitForBoard(_ eventID: UUID) async {
+        guard eventStacks[eventID] == nil else { return }
+        if let sweep = presenceTasks[eventID] {
+            await sweep.value
+            guard eventStacks[eventID] == nil else { return }
+        }
+        await refreshEvent(eventID)
+    }
+
+    /// `EventPresenceScanner`'s answer without the sweep: while an event is
+    /// still "Checking", each file's catalog assignment plus the Card Copy
+    /// path the grid implied is enough to plan a move. A location reads
+    /// `.present` only where the file's own path matches — exactly the place
+    /// the file was drawn at — and `.missing` elsewhere, so a plan never
+    /// points a rename at a location the sweep never verified. When the file
+    /// is not actually there anymore, the rename's own preflight skips it
+    /// and the completion reports why.
+    private func catalogAssets(for stacks: [OrganizeStack], in event: SavedCameraEvent) -> [MoveCandidate] {
+        let locations = self.locations
+        let policy = locations.resolvedPolicy(for: event)
+        let otherPolicy: EventStoragePolicy = policy == .buffer ? .archiveOnly : .buffer
+        var byPath: [String: PhotoEventAssignment] = [:]
+        for assignment in model.configuration.photoEventAssignments where assignment.eventID == event.id {
+            for url in [
+                locations.sourceURL(for: assignment),
+                locations.driveURL(for: assignment, event: event, policy: policy),
+                locations.driveURL(for: assignment, event: event, policy: otherPolicy),
+                locations.archiveURL(for: assignment, event: event)
+            ] {
+                if let path = url?.path { byPath[path] = assignment }
+            }
+        }
+        return stacks.flatMap(\.files).compactMap { file in
+            guard let assignment = byPath[file.path] else { return nil }
+            let source = locations.sourceURL(for: assignment)?.path
+            let drive = locations.driveURL(for: assignment, event: event, policy: policy)?.path
+            let other = locations.driveURL(for: assignment, event: event, policy: otherPolicy)?.path
+            let sourceIsDriveCopy = [drive, other].contains { candidate in
+                guard let candidate, let source else { return false }
+                return candidate == source
+            }
+            return MoveCandidate(
+                assignment: assignment,
+                sourcePath: source,
+                drivePath: drive,
+                otherDrivePath: other,
+                source: file.path == source ? .present : .missing,
+                drive: file.path == drive ? .present : .missing,
+                otherDrive: file.path == other ? .present : .missing,
+                sourceIsDriveCopy: sourceIsDriveCopy
+            )
+        }
+    }
+
+    private func moveLoadedStacks(_ targetStacks: [OrganizeStack], from: SavedCameraEvent, to: SavedCameraEvent) {
+        let sourceEventID = from.id
+        let targetEventID = to.id
+        var assets = targetStacks.flatMap { self.assets(for: $0, in: sourceEventID).map(MoveCandidate.init) }
+        if assets.isEmpty {
+            assets = catalogAssets(for: targetStacks, in: from)
+        }
+        guard !assets.isEmpty else {
+            model.statusMessage = targetStacks.isEmpty
+                ? "Nothing to move — that selection no longer matches \(eventTitle(from))'s board. Click the stacks again."
+                : "Nothing to move — none of those files are in \(eventTitle(from))'s catalog yet."
+            return
+        }
         let locations = self.locations
         let targetPolicy = locations.resolvedPolicy(for: to)
         var targetNames = Set(model.configuration.photoEventAssignments
@@ -1926,10 +2170,47 @@ final class EventsWorkspace {
         )
     }
 
+    /// Same rule as `moveStacks`: every click ends in a readable result —
+    /// a queued or running job, an already-organized note, or a reason the
+    /// files stayed — never a bare return while the board is loading.
     func returnToUnsorted(_ stackIDs: Set<String>, eventID: UUID) {
-        guard let event = event(eventID), let stacks = eventStacks[eventID] else { return }
-        let assets = stacks.filter { stackIDs.contains($0.id) }.flatMap { self.assets(for: $0, in: eventID) }
-        guard !assets.isEmpty else { return }
+        guard let event = event(eventID) else {
+            model.statusMessage = "That event no longer exists — nothing was returned."
+            return
+        }
+        guard let stacks = eventStacks[eventID] else {
+            queueReturnToUnsorted(stackIDs, in: event)
+            return
+        }
+        returnLoadedStacks(stacks.filter { stackIDs.contains($0.id) }, from: event)
+    }
+
+    /// The Return to Unsorted counterpart of `queueMove`: the click waits
+    /// for the board to paint, then runs the same return.
+    private func queueReturnToUnsorted(_ stackIDs: Set<String>, in event: SavedCameraEvent) {
+        model.statusMessage = "Return to Unsorted queued — \(eventTitle(event)) is still loading. It runs as soon as the board appears."
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await waitForBoard(event.id)
+            returnLoadedStacks(
+                (eventStacks[event.id] ?? []).filter { stackIDs.contains($0.id) },
+                from: event
+            )
+        }
+    }
+
+    private func returnLoadedStacks(_ targetStacks: [OrganizeStack], from event: SavedCameraEvent) {
+        let eventID = event.id
+        var assets = targetStacks.flatMap { self.assets(for: $0, in: eventID).map(MoveCandidate.init) }
+        if assets.isEmpty {
+            assets = catalogAssets(for: targetStacks, in: event)
+        }
+        guard !assets.isEmpty else {
+            model.statusMessage = targetStacks.isEmpty
+                ? "Nothing to return — that selection no longer matches \(eventTitle(event))'s board. Click the stacks again."
+                : "Nothing to return — none of those files are in \(eventTitle(event))'s catalog yet."
+            return
+        }
         let mounted = VolumeInfo.mountedVolumePaths()
         var removed: [PhotoEventAssignment] = []
         var moves: [DriveMove] = []

@@ -321,13 +321,17 @@ struct UnsortedBoardView: View {
         previewStackID = stackID
     }
 
+    /// Same filesystem-free menu construction as the event board: the
+    /// workspace answers every row from its stack-id index, so the menu
+    /// opens instantly even mid-scan.
     @ViewBuilder
     private func contextMenu(_ stack: OrganizeStack) -> some View {
-        let targets = workspace.targetStackIDs(including: stack.id)
+        let menu = workspace.stackMenuState(forStackID: stack.id, inLocation: location.id)
+        let targets = menu.targetIDs
         Menu("Sort Into") {
-            ForEach(workspace.sidebarEvents, id: \.event.id) { row in
-                Button(workspace.eventTitle(row.event)) {
-                    workspace.assign(stackIDs: targets, from: location.id, to: row.event.id)
+            ForEach(menu.eventTargets) { target in
+                Button(target.title) {
+                    workspace.assign(stackIDs: targets, from: location.id, to: target.id)
                 }
             }
         }
@@ -340,19 +344,20 @@ struct UnsortedBoardView: View {
         Button("Unsort") {
             workspace.unassign(stackIDs: targets, from: location.id)
         }
-        Menu(targets.count > 1 ? "Rotate Selection" : "Rotate Burst") {
+        Menu(menu.rotateTitle) {
             Button("Rotate All 90° Left") { rotate(targets, by: -1) }
             Button("Rotate All 180°") { rotate(targets, by: 2) }
             Button("Rotate All 90° Right") { rotate(targets, by: 1) }
         }
-        .disabled(!stacks(for: targets).contains { !DisplayRotation.rotatableFiles(in: $0).isEmpty })
+        .disabled(!menu.canRotate)
+        .optionalHelp(menu.rotateHelp)
         Divider()
         Button("Preview") { openPreview(stack.id) }
         Button("Open in Photomator") {
-            PhotomatorLauncher.open(urls(for: targets))
+            openInPhotomator(targets)
         }
         Button("Reveal in Finder") {
-            NSWorkspace.shared.activateFileViewerSelecting(urls(for: targets))
+            reveal(targets)
         }
         Divider()
         Button("Move to Trash…") {
@@ -366,7 +371,25 @@ struct UnsortedBoardView: View {
     }
 
     private func stacks(for ids: Set<String>) -> [OrganizeStack] {
-        (state.result?.stacks ?? []).filter { ids.contains($0.id) }
+        workspace.stacks(matching: ids, inLocation: location.id)
+    }
+
+    private func openInPhotomator(_ ids: Set<String>) {
+        let urls = urls(for: ids)
+        guard !urls.isEmpty else {
+            workspace.model.statusMessage = "Those stacks are not on the board anymore — click them again."
+            return
+        }
+        PhotomatorLauncher.open(urls)
+    }
+
+    private func reveal(_ ids: Set<String>) {
+        let urls = urls(for: ids)
+        guard !urls.isEmpty else {
+            workspace.model.statusMessage = "Those stacks are not on the board anymore — click them again."
+            return
+        }
+        NSWorkspace.shared.activateFileViewerSelecting(urls)
     }
 
     /// One Rotate Selection action turns every targeted burst the same way.
