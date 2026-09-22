@@ -107,6 +107,8 @@ struct EventBoardView: View {
     }
 
     private func header(_ event: SavedCameraEvent, groups: [OrganizeBoardGroup]) -> some View {
+        let people = workspace.eventPeople(eventID)
+        return VStack(alignment: .leading, spacing: 10) {
         HStack(alignment: .center, spacing: 12) {
             Circle()
                 .fill(EventPalette.color(for: event.id))
@@ -118,20 +120,6 @@ struct EventBoardView: View {
                 Text("\(event.eventDate.formatted(date: .complete, time: .omitted)) · \(workspace.assignmentCount(for: eventID)) files · \(workspace.assignmentBytes(for: eventID).formattedBytes)")
                     .font(.callout)
                     .foregroundStyle(.secondary)
-                let people = workspace.eventPeople(eventID)
-                if !people.isEmpty {
-                    HStack(spacing: 4) {
-                        ForEach(people.prefix(6)) { person in
-                            PersonChip(person: person)
-                        }
-                        if people.count > 6 {
-                            Text("+\(people.count - 6) more")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                    .padding(.top, 2)
-                }
             }
             Spacer()
             OrganizeSearchBar(
@@ -237,6 +225,15 @@ struct EventBoardView: View {
             }
             .menuStyle(.borderlessButton)
             .fixedSize()
+        }
+        if !people.isEmpty {
+            FlowLayout(horizontalSpacing: 8, verticalSpacing: 8) {
+                ForEach(people) { person in
+                    PersonChip(person: person)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
         }
         .padding(16)
     }

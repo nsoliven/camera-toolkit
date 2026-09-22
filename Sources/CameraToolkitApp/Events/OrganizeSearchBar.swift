@@ -498,9 +498,9 @@ struct OrganizeSearchBar: View {
     }
 }
 
-/// Left-to-right wrapping layout — a row's value chips flow onto the next
-/// line instead of clipping.
-private struct FlowLayout: Layout {
+/// Left-to-right wrapping layout — chips flow onto the next line instead
+/// of clipping.
+struct FlowLayout: Layout {
     var horizontalSpacing: CGFloat = 6
     var verticalSpacing: CGFloat = 6
 

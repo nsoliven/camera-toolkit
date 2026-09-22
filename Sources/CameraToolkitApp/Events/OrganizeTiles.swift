@@ -59,9 +59,10 @@ struct PersonChip: View {
         }
         .font(.caption.weight(.semibold))
         .foregroundStyle(.white)
-        .padding(.horizontal, 7)
-        .padding(.vertical, 3)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 5)
         .background(EventPalette.color(for: person.id), in: Capsule())
+        .fixedSize()
         .help("\(person.faceCount) detection\(person.faceCount == 1 ? "" : "s") in this event")
     }
 }
