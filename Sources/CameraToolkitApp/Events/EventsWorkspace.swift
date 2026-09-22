@@ -288,6 +288,27 @@ private final class MountObserverBox: @unchecked Sendable {
     var observers: [NSObjectProtocol] = []
 }
 
+/// One `Card Copy` root per (member, device id) for the default implied-path
+/// resolver — building the root spends a `DateFormatter` and an ancestor
+/// walk per call, so the build runs once per key and only `relativePath`
+/// joins per file.
+private final class ImpliedCardCopyRoots: @unchecked Sendable {
+    private let lock = NSLock()
+    private var roots: [String: URL] = [:]
+
+    func root(memberID: UUID, deviceID: String?, build: () -> URL) -> URL {
+        let key = "\(memberID.uuidString)|\(deviceID ?? "")"
+        return lock.withLock {
+            if let cached = roots[key] {
+                return cached
+            }
+            let built = build()
+            roots[key] = built
+            return built
+        }
+    }
+}
+
 /// State and actions for the event-first organizer: sorting unsorted folders
 /// into events, moving events between the shared Buffer and private staging,
 /// archiving to the NAS, freeing cards and drives, and sending to Immich.
@@ -313,6 +334,11 @@ final class EventsWorkspace {
     /// count sits here the board's grid is real but partial — scrollable
     /// and openable — and a status line says the rest is still coming.
     var eventBuildRemainders: [UUID: Int] = [:]
+    /// Cache-miss capture-date reads still running behind an event's
+    /// provisional grid. The board is already complete — every resolved
+    /// file is on it — and a status line says dates are still being read
+    /// until the dated build lands.
+    var eventDateReadRemainders: [UUID: Int] = [:]
     var eventImmichStatuses: [UUID: [String: ImmichCatalogStatus]] = [:]
     var discoveredDriveEvents: [DiscoveredDriveEvent] = []
     var newEventRequest: NewEventRequest?
@@ -369,6 +395,12 @@ final class EventsWorkspace {
     /// screen published before the rest of the files were resolved at
     /// all, let alone through `standardizedFileURL`.
     @ObservationIgnored var eventPathResolver: (@Sendable (PhotoEventAssignment) -> String?)?
+    /// Test seam: replaces the capture-date header read inside the
+    /// deferred build's dated pass — nil in production, where a cache
+    /// miss reads through `CaptureDateReader.timestamp`. A test parks the
+    /// first read to prove the provisional grid already published every
+    /// implied file.
+    @ObservationIgnored var captureDateReadProbe: (@Sendable (URL) -> CaptureTimestamp?)?
     @ObservationIgnored private var loadedCaptureDateCache: CaptureDateCache?
     @ObservationIgnored private var lastConnectivityRefresh = Date.distantPast
     @ObservationIgnored private var connectivityRefreshTask: Task<Void, Never>?
@@ -1719,11 +1751,14 @@ final class EventsWorkspace {
     /// Pass two resolves the rest of the family onto the same kind of
     /// implied path. A parent board includes its subevents, and each
     /// member's files join that member's own folder, not the parent's.
-    /// The build applies itself through `applyEventBuild` — never
-    /// `await task.value` here, which would escalate it to this
-    /// context's priority and hold the spinner the way the old single
-    /// pass did. Stacks that survive the merge keep the ids an open
-    /// preview or a decoded tile is bound to.
+    /// It publishes twice: first a provisional grid stacked on whatever
+    /// the capture-date cache already knows — every resolved file boards
+    /// without waiting on a header read — then the dated grid once the
+    /// remaining camera dates have been read. Both applies go through
+    /// `applyEventBuild` — never `await task.value` here, which would
+    /// escalate it to this context's priority and hold the spinner the
+    /// way the old single pass did. Stacks that survive the merge keep
+    /// the ids an open preview or a decoded tile is bound to.
     ///
     /// Pass three is the truthful four-place sweep, still on the same
     /// utility task so its corrections can never be overwritten by a
@@ -1747,6 +1782,7 @@ final class EventsWorkspace {
         let burstSplits = model.configuration.burstSplits
         let catalogURL = URL(fileURLWithPath: DashboardModel.expandedPath(model.configuration.catalogDatabasePath))
         let probe = presenceProbe
+        let dateReadProbe = captureDateReadProbe
 
         // The board shows each direct subevent as its own section, so
         // the family is this event plus every descendant. Each member's
@@ -1764,10 +1800,19 @@ final class EventsWorkspace {
         let driveAvailableByMember = Dictionary(uniqueKeysWithValues: members.map { member in
             (member.id, VolumeInfo.isAvailable(locations.driveRoot(for: locations.resolvedPolicy(for: member))))
         })
-        let resolve: @Sendable (PhotoEventAssignment) -> String? = eventPathResolver ?? { assignment in
-            let owner = memberByID[assignment.eventID] ?? event
-            let ownerPolicy = locations.resolvedPolicy(for: owner)
-            return locations.impliedDrivePath(for: assignment, event: owner, policy: ownerPolicy)
+        let resolve: @Sendable (PhotoEventAssignment) -> String?
+        if let eventPathResolver {
+            resolve = eventPathResolver
+        } else {
+            let cardCopyRoots = ImpliedCardCopyRoots()
+            resolve = { assignment in
+                guard (try? PathSafety.validateRelativePath(assignment.relativePath)) != nil else { return nil }
+                let owner = memberByID[assignment.eventID] ?? event
+                let root = cardCopyRoots.root(memberID: owner.id, deviceID: assignment.deviceID) {
+                    locations.cardCopyRoot(for: owner, deviceID: assignment.deviceID, policy: locations.resolvedPolicy(for: owner))
+                }
+                return root.appendingPathComponent(assignment.relativePath).path
+            }
         }
 
         // Pass one is skipped when this event's drive is offline: there
@@ -1802,6 +1847,7 @@ final class EventsWorkspace {
         } else {
             eventBuildRemainders[eventID] = nil
         }
+        eventDateReadRemainders[eventID] = nil
 
         // The rest of the family, then the four-place sweep, is one
         // utility-priority pipeline that applies itself back on this
@@ -1818,10 +1864,34 @@ final class EventsWorkspace {
                 files.append(OrganizeFile(literalPath: path, size: assignment.fileSize, modifiedAt: assignment.modifiedAt))
             }
             if !Task.isCancelled, !files.isEmpty {
-                let items = OrganizeScanner.items(for: files, cache: cache).items
+                // The provisional grid stacks on whatever the cache already
+                // knows — a miss is "no camera date" here, never a header
+                // read — so every resolved file boards at once instead of
+                // waiting out the remaining capture-date reads. The count
+                // of those reads rides the apply so the board can say
+                // dates are still coming without saying files are.
+                let undated = OrganizeScanner.items(for: files, cache: cache, readMissingCaptureDates: false)
+                await applyEventBuild(
+                    eventID: eventID,
+                    generation: generation,
+                    build: EventImpliedGrid(
+                        files: files,
+                        stacks: OrganizeStacker.stacks(for: undated.items, splits: burstSplits)
+                    ),
+                    pendingDateReads: undated.missingCaptureDates
+                )
+            }
+            if !Task.isCancelled, !files.isEmpty {
+                // The dated pass the provisional grid stood in for. The
+                // read seam attaches only here so a parked read always
+                // means "after the provisional publish".
+                let previousProbe = cache.timestampProbe
+                cache.timestampProbe = dateReadProbe
+                let dated = OrganizeScanner.items(for: files, cache: cache)
+                cache.timestampProbe = previousProbe
                 built = EventImpliedGrid(
                     files: files,
-                    stacks: OrganizeStacker.stacks(for: items, splits: burstSplits)
+                    stacks: OrganizeStacker.stacks(for: dated.items, splits: burstSplits)
                 )
             }
             await applyEventBuild(eventID: eventID, generation: generation, build: built)
@@ -1888,12 +1958,17 @@ final class EventsWorkspace {
     /// Main-actor landing point for the deferred build: the full implied
     /// grid replaces the first screen, carrying the stack ids an open
     /// preview or a decoded tile is bound to wherever the same files
-    /// land together again. A stale generation drops the build instead.
-    private func applyEventBuild(eventID: UUID, generation: UUID, build: EventImpliedGrid?) {
+    /// land together again. `pendingDateReads` is how many cache-miss
+    /// capture-date reads the dated pass still owes — the provisional
+    /// grid carries it so the board can say dates are still coming, and
+    /// the dated grid lands with zero to clear it. A stale generation
+    /// drops the build instead.
+    private func applyEventBuild(eventID: UUID, generation: UUID, build: EventImpliedGrid?, pendingDateReads: Int = 0) {
         guard refreshGenerations[eventID] == generation else { return }
         guard let build else { return }
         eventStacks[eventID] = build.stacks.carryingIDs(from: eventStacks[eventID] ?? [])
         eventBuildRemainders[eventID] = nil
+        eventDateReadRemainders[eventID] = pendingDateReads > 0 ? pendingDateReads : nil
     }
 
     /// Main-actor landing point for the utility-priority sweep. Publishes
@@ -1913,6 +1988,7 @@ final class EventsWorkspace {
         // This generation's pipeline is done — build landed or was
         // dropped, sweep landed — so nothing is still coming.
         eventBuildRemainders[eventID] = nil
+        eventDateReadRemainders[eventID] = nil
         guard let output else { return }
 
         eventAssetsByPathKey[eventID] = output.assetsByPathKey

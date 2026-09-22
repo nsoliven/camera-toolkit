@@ -206,6 +206,12 @@ public final class CaptureDateCache: @unchecked Sendable {
     }
 
     public let url: URL?
+    /// Test seam — nil in production. When set, `OrganizeScanner.items`
+    /// calls it instead of `CaptureDateReader.timestamp` for the header
+    /// read a cache miss triggers, so a test can observe or park that
+    /// read. It never fires on a cache hit or on a
+    /// `readMissingCaptureDates: false` pass.
+    public var timestampProbe: (@Sendable (URL) -> CaptureTimestamp?)?
     private let lock = NSLock()
     private var entries: [String: Entry]
     private var isDirty = false
