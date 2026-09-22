@@ -306,4 +306,188 @@ final class MediaTrashServiceTests: XCTestCase {
             XCTAssertTrue(FileManager.default.fileExists(atPath: photo.path))
         }
     }
+
+    func testManifestRecordsEventNamePeopleAndCaptureDate() throws {
+        try withTemporaryDirectory { root in
+            let unsorted = root.appendingPathComponent("Unsorted", isDirectory: true)
+            let trash = root.appendingPathComponent("Drive/.Camera Toolkit/_Trash", isDirectory: true)
+            let photo = try writeFile(unsorted.appendingPathComponent("DSC00001.ARW"), "raw")
+            let eventID = UUID()
+            // Whole-second timestamp: the manifest's ISO-8601 dates keep no
+            // fraction, so the round trip stays exact.
+            let captured = Date(timeIntervalSince1970: 1_700_000_000)
+            let key = EventStorageLocations.pathKey(photo.standardizedFileURL.path)
+
+            let batch = try service(removedFilesRoot: trash).trash(
+                files: [file(photo)],
+                originRoot: unsorted,
+                context: TrashContext(
+                    locationName: "Unsorted",
+                    eventIDsByPathKey: [key: eventID],
+                    eventNamesByID: [eventID: "Nina's Birthday"],
+                    personNamesByPathKey: [key: ["Sam", "Nina"]],
+                    captureDatesByPathKey: [key: captured]
+                )
+            )
+
+            let manifest = try readManifest(trash.appendingPathComponent("\(batch.name)/manifest.json"))
+            let entry = try XCTUnwrap(manifest.entries.first)
+            XCTAssertEqual(entry.eventID, eventID)
+            XCTAssertEqual(entry.eventName, "Nina's Birthday")
+            XCTAssertEqual(entry.personNames, ["Sam", "Nina"])
+            XCTAssertEqual(entry.capturedAt, captured)
+
+            let item = try XCTUnwrap(service(removedFilesRoot: trash).listItems(under: [trash]).first)
+            XCTAssertEqual(item.fileName, "DSC00001.ARW")
+            XCTAssertEqual(item.eventName, "Nina's Birthday")
+            XCTAssertEqual(item.personNames, ["Sam", "Nina"])
+            XCTAssertEqual(item.capturedAt, captured)
+            XCTAssertEqual(item.sortDate, captured)
+            XCTAssertEqual(item.originalAbsolutePath, photo.standardizedFileURL.path)
+        }
+    }
+
+    func testListItemsSearchMatchesFileNameEventAndPerson() throws {
+        try withTemporaryDirectory { root in
+            let unsorted = root.appendingPathComponent("Unsorted", isDirectory: true)
+            let trash = root.appendingPathComponent("Drive/.Camera Toolkit/_Trash", isDirectory: true)
+            let photo = try writeFile(unsorted.appendingPathComponent("DSC00001.ARW"), "raw")
+            let clip = try writeFile(unsorted.appendingPathComponent("C0001.MP4"), "clip")
+            let eventID = UUID()
+            let key = EventStorageLocations.pathKey(photo.standardizedFileURL.path)
+            let svc = service(removedFilesRoot: trash)
+
+            _ = try svc.trash(
+                files: [file(photo), file(clip)],
+                originRoot: unsorted,
+                context: TrashContext(
+                    eventIDsByPathKey: [key: eventID],
+                    eventNamesByID: [eventID: "Nina's Birthday"],
+                    personNamesByPathKey: [key: ["Sam"]]
+                )
+            )
+
+            let items = svc.listItems(under: [trash])
+            XCTAssertEqual(items.count, 2)
+            XCTAssertEqual(items.filter { MediaTrashQuery(text: "sam").matches($0) }.map(\.fileName), ["DSC00001.ARW"])
+            XCTAssertEqual(items.filter { MediaTrashQuery(text: "c0001").matches($0) }.map(\.fileName), ["C0001.MP4"])
+            XCTAssertEqual(items.filter { MediaTrashQuery(text: "birthday").matches($0) }.map(\.fileName), ["DSC00001.ARW"])
+            XCTAssertTrue(items.filter { MediaTrashQuery(text: "nobody").matches($0) }.isEmpty)
+            XCTAssertEqual(items.filter { MediaTrashQuery().matches($0) }.count, 2)
+        }
+    }
+
+    func testListItemsDateRangeUsesCaptureDateThenTrashedDate() throws {
+        try withTemporaryDirectory { root in
+            let unsorted = root.appendingPathComponent("Unsorted", isDirectory: true)
+            let trash = root.appendingPathComponent("Drive/.Camera Toolkit/_Trash", isDirectory: true)
+            let dated = try writeFile(unsorted.appendingPathComponent("a.ARW"), "a")
+            let undated = try writeFile(unsorted.appendingPathComponent("b.ARW"), "b")
+            let datedKey = EventStorageLocations.pathKey(dated.standardizedFileURL.path)
+            // A capture day a month before the fixed trash day.
+            let captured = fixedNow.addingTimeInterval(-30 * 86_400)
+            let svc = service(removedFilesRoot: trash)
+
+            _ = try svc.trash(
+                files: [file(dated), file(undated)],
+                originRoot: unsorted,
+                context: TrashContext(captureDatesByPathKey: [datedKey: captured])
+            )
+
+            let items = svc.listItems(under: [trash])
+            XCTAssertEqual(items.count, 2)
+
+            // The capture-day range keeps the dated file and drops the one
+            // that falls back to the trash day.
+            let captureDay = MediaTrashQuery(dayStart: captured, dayEnd: captured)
+            XCTAssertEqual(items.filter { captureDay.matches($0) }.map(\.fileName), ["a.ARW"])
+
+            // The trash-day range keeps the undated file and drops the dated
+            // one — its capture date, not the trash day, is its sort date.
+            let trashDay = MediaTrashQuery(dayStart: fixedNow, dayEnd: fixedNow)
+            XCTAssertEqual(items.filter { trashDay.matches($0) }.map(\.fileName), ["b.ARW"])
+        }
+    }
+
+    func testRestoreSingleItemLeavesTheRestOfTheBatch() throws {
+        try withTemporaryDirectory { root in
+            let unsorted = root.appendingPathComponent("Unsorted", isDirectory: true)
+            let trash = root.appendingPathComponent("Drive/.Camera Toolkit/_Trash", isDirectory: true)
+            let stays = try writeFile(unsorted.appendingPathComponent("DCIM/DSC1.ARW"), "one")
+            let returns = try writeFile(unsorted.appendingPathComponent("DCIM/DSC2.ARW"), "two")
+            let svc = service(removedFilesRoot: trash)
+
+            let batch = try svc.trash(files: [file(stays), file(returns)], originRoot: unsorted, context: TrashContext())
+            let items = svc.listItems(under: [trash])
+            XCTAssertEqual(items.count, 2)
+            let target = try XCTUnwrap(items.first { $0.fileName == "DSC2.ARW" })
+
+            let report = svc.restore(items: [target])
+
+            XCTAssertEqual(report.restored, [returns.standardizedFileURL.path])
+            XCTAssertTrue(report.conflicts.isEmpty)
+            XCTAssertTrue(report.missing.isEmpty)
+            XCTAssertTrue(report.failed.isEmpty)
+            XCTAssertEqual(try Data(contentsOf: returns), Data("two".utf8))
+            XCTAssertEqual(try Data(contentsOf: trash.appendingPathComponent("\(batch.name)/DCIM/DSC1.ARW")), Data("one".utf8))
+
+            let manifest = try readManifest(trash.appendingPathComponent("\(batch.name)/manifest.json"))
+            XCTAssertEqual(manifest.entries.map(\.trashedRelativePath), ["DCIM/DSC1.ARW"])
+            XCTAssertEqual(svc.listItems(under: [trash]).map(\.fileName), ["DSC1.ARW"])
+        }
+    }
+
+    func testRestoreItemsReportsManifestlessFiles() throws {
+        try withTemporaryDirectory { root in
+            let trash = root.appendingPathComponent("Drive/.Camera Toolkit/_Trash", isDirectory: true)
+            let legacy = try writeFile(trash.appendingPathComponent("1999-01-01_000000/DCIM/old.ARW"), "precious")
+            let svc = service(removedFilesRoot: trash)
+            let item = try XCTUnwrap(svc.listItems(under: [trash]).first)
+
+            let report = svc.restore(items: [item])
+
+            XCTAssertTrue(report.restored.isEmpty)
+            XCTAssertEqual(report.failed.count, 1)
+            XCTAssertEqual(try Data(contentsOf: legacy), Data("precious".utf8))
+        }
+    }
+
+    func testListItemsResolvesEventNameForManifestsWithoutTagFields() throws {
+        try withTemporaryDirectory { root in
+            let trash = root.appendingPathComponent("Drive/.Camera Toolkit/_Trash", isDirectory: true)
+            let batch = trash.appendingPathComponent("1999-01-01_000000", isDirectory: true)
+            try writeFile(batch.appendingPathComponent("DCIM/old.ARW"), "precious")
+            // A manifest from before the tag fields existed: eventID only.
+            let eventID = UUID()
+            try writeFile(batch.appendingPathComponent("manifest.json"), """
+            {
+                "batchID": "1999-01-01_000000",
+                "createdAt": "1999-01-01T00:00:00Z",
+                "entries": [
+                    {
+                        "trashedRelativePath": "DCIM/old.ARW",
+                        "originalAbsolutePath": "/somewhere/DCIM/old.ARW",
+                        "eventID": "\(eventID.uuidString)",
+                        "size": 8
+                    }
+                ],
+                "version": 1
+            }
+            """)
+
+            let svc = service(removedFilesRoot: trash)
+            // With the event gone the item still lists — file name, no tags.
+            var item = try XCTUnwrap(svc.listItems(under: [trash]).first)
+            XCTAssertEqual(item.fileName, "old.ARW")
+            XCTAssertNil(item.eventName)
+            XCTAssertEqual(item.personNames, [])
+            XCTAssertEqual(item.originalAbsolutePath, "/somewhere/DCIM/old.ARW")
+            // No capture date recorded — the item sorts by the batch's day.
+            XCTAssertEqual(item.sortDate, ISO8601DateFormatter().date(from: "1999-01-01T00:00:00Z"))
+
+            // With the event still configured its current title shows.
+            item = try XCTUnwrap(svc.listItems(under: [trash], eventNames: [eventID: "Beach Day"]).first)
+            XCTAssertEqual(item.eventName, "Beach Day")
+        }
+    }
 }

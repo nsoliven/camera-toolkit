@@ -5,7 +5,7 @@ import XCTest
 @MainActor
 final class WindowSizingTests: XCTestCase {
     func testEveryPopOutHasAUsableMinimumSize() {
-        XCTAssertEqual(CameraToolkitPopOutWindow.allCases.count, 8)
+        XCTAssertEqual(CameraToolkitPopOutWindow.allCases.count, 9)
         for kind in CameraToolkitPopOutWindow.allCases {
             XCTAssertGreaterThanOrEqual(kind.minimumContentSize.width, 620)
             XCTAssertGreaterThanOrEqual(kind.minimumContentSize.height, 440)

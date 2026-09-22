@@ -433,6 +433,9 @@ struct EventsSidebar: View {
             ) {
                 PeopleWindowController.shared.show(model: model, workspace: workspace)
             }
+            footerButton("Trash…", detail: nil, symbol: "trash") {
+                TrashWindowController.shared.show(model: model)
+            }
             footerButton("File Browser", detail: nil, symbol: "folder") {
                 AppShellMode.show(.files)
             }
@@ -807,7 +810,7 @@ struct RemovalConfirmSheet: View {
     private var explanation: String {
         switch request.kind {
         case .drive:
-            "Camera Toolkit re-hashes every drive copy against its NAS copy. Only if all of them match, the drive copies move into the hidden _Trash folder on the same drive. They stay recoverable there until you empty it in Settings."
+            "Camera Toolkit re-hashes every drive copy against its NAS copy. Only if all of them match, the drive copies move into the hidden _Trash folder on the same drive. They stay recoverable there until you empty it in Trash."
         case .source:
             "Camera Toolkit re-hashes every file on the card or unsorted folder against its drive copy. Only if all of them match, the source originals are permanently deleted. The drive copies stay."
         }
@@ -852,7 +855,7 @@ struct TrashConfirmSheet: View {
             Label {
                 Text("Not the Finder Trash. ")
                     .fontWeight(.semibold)
-                    + Text("Restore from Settings → Trash — nothing is permanently deleted until you empty it.")
+                    + Text("Restore from the Trash window — nothing is permanently deleted until you empty it.")
             } icon: {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .foregroundStyle(.orange)

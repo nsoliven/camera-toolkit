@@ -13,6 +13,16 @@ enum EventPalette {
         }
         return colors[hash % colors.count]
     }
+
+    /// Stable color for a name string — the Trash browser tags people and
+    /// events that may no longer exist, so it hashes the name itself.
+    static func color(forName name: String) -> Color {
+        var hash = 0
+        for scalar in name.unicodeScalars {
+            hash = (hash &* 31 &+ Int(scalar.value)) & 0x7fff_ffff
+        }
+        return colors[hash % colors.count]
+    }
 }
 
 struct EventChip: View {

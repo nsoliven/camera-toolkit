@@ -2259,7 +2259,7 @@ final class EventsWorkspace {
                             + ": " + reasons.joined(separator: "; ") + "."
                     )
                 }
-                return "Took \(report.moved.count) file(s) (\(report.movedBytes.formattedBytes)) of \(self?.eventTitle(event) ?? event.name) off the drive. They stay recoverable in \(report.batchPath ?? trashRoot.path) until you empty it in Settings."
+                return "Took \(report.moved.count) file(s) (\(report.movedBytes.formattedBytes)) of \(self?.eventTitle(event) ?? event.name) off the drive. They stay recoverable in \(report.batchPath ?? trashRoot.path) until you empty it in Trash."
             }
         )
     }
@@ -2317,7 +2317,7 @@ final class EventsWorkspace {
 
     /// Moves every file of the given stacks — primaries and companions — into
     /// the drive-local `.Camera Toolkit/_Trash` batch on whichever volume
-    /// each file lives. Recoverable from Settings → Trash.
+    /// each file lives. Recoverable from the Trash window.
     func trash(stackIDs: Set<String>, from locationID: UUID) {
         guard let result = sources[locationID]?.result else { return }
         let items = result.stacks.filter { stackIDs.contains($0.id) }.flatMap(\.items)
@@ -2414,7 +2414,10 @@ final class EventsWorkspace {
         let context = TrashContext(
             locationName: location.name,
             deviceID: deviceID(for: location),
-            eventIDsByPathKey: eventIDs
+            eventIDsByPathKey: eventIDs,
+            eventNamesByID: trashEventNames(for: eventIDs),
+            personNamesByPathKey: trashPersonNames(for: files),
+            captureDatesByPathKey: trashCaptureDates(for: items)
         )
         let originRoot = URL(fileURLWithPath: DashboardModel.expandedPath(location.path), isDirectory: true).standardizedFileURL
         let fallbackTrashRoot = locations.removedFilesRoot
@@ -2428,7 +2431,7 @@ final class EventsWorkspace {
             action: .organize,
             runningNote: "Moving \(files.count) file(s) to Trash",
             logTitle: "Moved files to Trash",
-            logDetail: "Renamed files into the drive-local .Camera Toolkit/_Trash folder and wrote a manifest recording where each file lived. Nothing was deleted; batches are restorable from Settings.",
+            logDetail: "Renamed files into the drive-local .Camera Toolkit/_Trash folder and wrote a manifest recording where each file lived. Nothing was deleted; batches are restorable from the Trash window.",
             operation: { progress in
                 try MediaTrashService(removedFilesRoot: fallbackTrashRoot).trash(
                     files: files,
@@ -2459,7 +2462,7 @@ final class EventsWorkspace {
                     : " \(batch.skipped.count) stayed in place: \(batch.skipped[0].reason)"
                 return batch.entries.isEmpty
                     ? "Nothing moved to Trash.\(skippedNote)"
-                    : "Moved \(batch.entries.count) files to Trash — restorable from Settings.\(skippedNote)"
+                    : "Moved \(batch.entries.count) files to Trash — restorable from the Trash window.\(skippedNote)"
             }
         )
     }
@@ -2499,7 +2502,10 @@ final class EventsWorkspace {
         let context = TrashContext(
             locationName: eventTitle(event),
             deviceID: nil,
-            eventIDsByPathKey: eventIDs
+            eventIDsByPathKey: eventIDs,
+            eventNamesByID: trashEventNames(for: eventIDs),
+            personNamesByPathKey: trashPersonNames(for: files),
+            captureDatesByPathKey: trashCaptureDates(for: items)
         )
         let originRoot = locations.eventFolder(for: event, policy: resolvedPolicy(for: event))
         let fallbackTrashRoot = locations.removedFilesRoot
@@ -2507,7 +2513,7 @@ final class EventsWorkspace {
             action: .organize,
             runningNote: "Moving \(files.count) file(s) to Trash",
             logTitle: "Moved files to Trash",
-            logDetail: "Renamed files from the event folder into the drive-local .Camera Toolkit/_Trash folder. Nothing was deleted; batches are restorable from Settings.",
+            logDetail: "Renamed files from the event folder into the drive-local .Camera Toolkit/_Trash folder. Nothing was deleted; batches are restorable from the Trash window.",
             operation: { progress in
                 try MediaTrashService(removedFilesRoot: fallbackTrashRoot).trash(
                     files: files,
@@ -2543,9 +2549,53 @@ final class EventsWorkspace {
                     : " \(batch.skipped.count) stayed in place: \(batch.skipped[0].reason)"
                 return batch.entries.isEmpty
                     ? "Nothing moved to Trash.\(skippedNote)"
-                    : "Moved \(batch.entries.count) files to Trash — restorable from Settings.\(skippedNote)"
+                    : "Moved \(batch.entries.count) files to Trash — restorable from the Trash window.\(skippedNote)"
             }
         )
+    }
+
+    /// The event's display title for every event ID a trash run recorded —
+    /// written into the manifest so the tag still reads correctly after the
+    /// file leaves the board or the event is renamed.
+    private func trashEventNames(for eventIDs: [String: UUID]) -> [UUID: String] {
+        var names: [UUID: String] = [:]
+        for id in Set(eventIDs.values) {
+            if let event = event(id) {
+                names[id] = eventTitle(event)
+            }
+        }
+        return names
+    }
+
+    /// Confirmed person names per file being trashed, keyed by path key —
+    /// one read of the already-built catalog index, never a rescan.
+    private func trashPersonNames(for files: [OrganizeFile]) -> [String: [String]] {
+        let names = faceNamesByFileKey()
+        guard !names.isEmpty else { return [:] }
+        var perFile: [String: [String]] = [:]
+        for file in files {
+            let key = FaceIndexStore.fileKey(
+                fileName: file.name,
+                byteCount: file.size,
+                modifiedAt: file.modifiedAt
+            )
+            if let found = names[key], !found.isEmpty {
+                perFile[file.pathKey] = found.sorted()
+            }
+        }
+        return perFile
+    }
+
+    /// The capture date the board already shows each item under, keyed by
+    /// every file's path key so a RAW's sidecar travels with the same date.
+    private func trashCaptureDates(for items: [OrganizeItem]) -> [String: Date] {
+        var dates: [String: Date] = [:]
+        for item in items {
+            for file in item.files {
+                dates[file.pathKey] = item.captureDate
+            }
+        }
+        return dates
     }
 
     /// Drop trashed files from cached event boards immediately so a tagged
