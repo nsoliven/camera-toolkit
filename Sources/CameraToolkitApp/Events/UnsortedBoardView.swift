@@ -235,7 +235,7 @@ struct UnsortedBoardView: View {
                     workspace.trash(stackIDs: workspace.targetStackIDs(), from: location.id)
                 }
                 .disabled(workspace.targetStackIDs().isEmpty)
-                .help("Move the selected items to the drive's Trash folder. Restorable from Settings.")
+                .help("Move the selected items to the drive's Trash folder. Restorable from the Trash window.")
                 Divider()
                 Button("Remove from Unsorted List") {
                     workspace.removeUnsortedFolder(location.id)
@@ -358,7 +358,7 @@ struct UnsortedBoardView: View {
         Button("Move to Trash…") {
             workspace.trash(stackIDs: targets, from: location.id)
         }
-        .help("Move to the drive's Trash folder. Restorable from Settings.")
+        .help("Move to the drive's Trash folder. Restorable from the Trash window.")
     }
 
     private func urls(for ids: Set<String>) -> [URL] {

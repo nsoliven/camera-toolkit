@@ -60,6 +60,9 @@ public struct EventStorageLocations: Sendable {
     public var removedFilesRoot: URL
     public var libraryRoot: URL
     public var fallbackDeviceID: String
+    /// Paths the Trash roots are derived from — every configured location
+    /// plus the Buffer, private staging, and library roots.
+    private let trashSourcePaths: [String]
     /// Known events, so subevent paths resolve through their parent chain.
     public var events: [SavedCameraEvent] {
         didSet { eventsByID = EventHierarchy.index(events) }
@@ -85,8 +88,34 @@ public struct EventStorageLocations: Sendable {
             isDirectory: true
         ).standardizedFileURL
         fallbackDeviceID = configuration.selectedDeviceID
+        var sourcePaths = configuration.configuredLocations.map(\.path)
+        sourcePaths.append(configuration.bufferPath)
+        sourcePaths.append(configuration.privateStagingPath)
+        sourcePaths.append(configuration.cameraLibraryRootPath)
+        trashSourcePaths = sourcePaths
         events = configuration.savedEvents
         eventsByID = EventHierarchy.index(configuration.savedEvents)
+    }
+
+    /// Every `_Trash` root the Trash browser and Empty Trash cover: the
+    /// configured removed-files folder plus `.Camera Toolkit/_Trash` on the
+    /// volume of each configured location. Listing, browsing, and emptying
+    /// share this scope — a file outside these roots is never touched.
+    public func trashRoots() -> [URL] {
+        var roots = [removedFilesRoot]
+        var seen = Set(roots.map { Self.pathKey($0.path) })
+        for path in trashSourcePaths {
+            let url = URL(fileURLWithPath: NSString(string: path).expandingTildeInPath, isDirectory: true)
+                .standardizedFileURL
+            guard let volume = VolumeInfo.volumeRoot(for: url) else { continue }
+            let root = volume
+                .appendingPathComponent(Self.toolkitFolderName, isDirectory: true)
+                .appendingPathComponent(MediaTrashService.trashFolderName, isDirectory: true)
+            if seen.insert(Self.pathKey(root.path)).inserted {
+                roots.append(root)
+            }
+        }
+        return roots
     }
 
     /// `/Volumes/Drive/.Camera Toolkit` for a Buffer on an external drive,

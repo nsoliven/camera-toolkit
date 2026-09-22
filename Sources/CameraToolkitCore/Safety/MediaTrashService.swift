@@ -10,11 +10,31 @@ public struct TrashContext: Sendable {
     /// Event each file was sorted into at that moment, keyed by lower-cased
     /// standardized path (see `EventStorageLocations.pathKey`).
     public var eventIDsByPathKey: [String: UUID]
+    /// Event display titles at trash time, keyed by event ID. Recorded so
+    /// the tag survives the event being renamed or deleted afterwards.
+    public var eventNamesByID: [UUID: String]
+    /// Confirmed person names per file, keyed like `eventIDsByPathKey`.
+    /// Read from the catalog at trash time only — never rescanned to fill
+    /// an entry later.
+    public var personNamesByPathKey: [String: [String]]
+    /// Capture dates the board already knew, keyed like `eventIDsByPathKey`.
+    /// Files without one fall back to the batch's trash date when filtered.
+    public var captureDatesByPathKey: [String: Date]
 
-    public init(locationName: String? = nil, deviceID: String? = nil, eventIDsByPathKey: [String: UUID] = [:]) {
+    public init(
+        locationName: String? = nil,
+        deviceID: String? = nil,
+        eventIDsByPathKey: [String: UUID] = [:],
+        eventNamesByID: [UUID: String] = [:],
+        personNamesByPathKey: [String: [String]] = [:],
+        captureDatesByPathKey: [String: Date] = [:]
+    ) {
         self.locationName = locationName
         self.deviceID = deviceID
         self.eventIDsByPathKey = eventIDsByPathKey
+        self.eventNamesByID = eventNamesByID
+        self.personNamesByPathKey = personNamesByPathKey
+        self.captureDatesByPathKey = captureDatesByPathKey
     }
 }
 
@@ -26,6 +46,16 @@ public struct MediaTrashEntry: Codable, Hashable, Sendable {
     public var originalAbsolutePath: String
     public var originalLocationName: String?
     public var eventID: UUID?
+    /// The event's title at trash time. Older manifests carry only
+    /// `eventID`; the browser resolves those live when the event still
+    /// exists and shows just the file name when it does not.
+    public var eventName: String?
+    /// Confirmed people on the file at trash time, captured from the
+    /// catalog — never invented afterwards.
+    public var personNames: [String]
+    /// Capture date the board knew when the file was trashed. `nil` means
+    /// the browser falls back to the batch's creation date.
+    public var capturedAt: Date?
     public var deviceID: String?
     public var size: Int64
 
@@ -34,6 +64,9 @@ public struct MediaTrashEntry: Codable, Hashable, Sendable {
         originalAbsolutePath: String,
         originalLocationName: String? = nil,
         eventID: UUID? = nil,
+        eventName: String? = nil,
+        personNames: [String] = [],
+        capturedAt: Date? = nil,
         deviceID: String? = nil,
         size: Int64
     ) {
@@ -41,8 +74,38 @@ public struct MediaTrashEntry: Codable, Hashable, Sendable {
         self.originalAbsolutePath = originalAbsolutePath
         self.originalLocationName = originalLocationName
         self.eventID = eventID
+        self.eventName = eventName
+        self.personNames = personNames
+        self.capturedAt = capturedAt
         self.deviceID = deviceID
         self.size = size
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case trashedRelativePath
+        case originalAbsolutePath
+        case originalLocationName
+        case eventID
+        case eventName
+        case personNames
+        case capturedAt
+        case deviceID
+        case size
+    }
+
+    /// Manifests written before the tag fields existed decode with empty
+    /// values — an old entry still lists and restores exactly as before.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        trashedRelativePath = try container.decode(String.self, forKey: .trashedRelativePath)
+        originalAbsolutePath = try container.decode(String.self, forKey: .originalAbsolutePath)
+        originalLocationName = try container.decodeIfPresent(String.self, forKey: .originalLocationName)
+        eventID = try container.decodeIfPresent(UUID.self, forKey: .eventID)
+        eventName = try container.decodeIfPresent(String.self, forKey: .eventName)
+        personNames = try container.decodeIfPresent([String].self, forKey: .personNames) ?? []
+        capturedAt = try container.decodeIfPresent(Date.self, forKey: .capturedAt)
+        deviceID = try container.decodeIfPresent(String.self, forKey: .deviceID)
+        size = try container.decode(Int64.self, forKey: .size)
     }
 }
 
@@ -99,13 +162,17 @@ public struct MediaTrashBatch: Identifiable, Sendable {
         /// The manifest read from the folder; `nil` for `_Trash` batches
         /// written before manifests existed (Free Up / Take Off Drive).
         public var manifest: MediaTrashManifest?
+        /// Actual files found in the folder, excluding `manifest.json` —
+        /// relative `path`, size, and mtime for each.
+        public var files: [FileRecord]
         /// Actual files found in the folder, excluding `manifest.json`.
         public var fileCount: Int
         public var byteCount: Int64
 
-        public init(folder: URL, manifest: MediaTrashManifest?, fileCount: Int, byteCount: Int64) {
+        public init(folder: URL, manifest: MediaTrashManifest?, fileCount: Int, byteCount: Int64, files: [FileRecord] = []) {
             self.folder = folder
             self.manifest = manifest
+            self.files = files
             self.fileCount = fileCount
             self.byteCount = byteCount
         }
@@ -134,6 +201,164 @@ public struct MediaTrashBatch: Identifiable, Sendable {
     public var fileCount: Int { segments.reduce(0) { $0 + $1.fileCount } }
     public var byteCount: Int64 { segments.reduce(0) { $0 + $1.byteCount } }
     public var folders: [URL] { segments.map(\.folder) }
+
+    /// Every file on disk across the batch's segments, joined with its
+    /// manifest entry — the Trash browser's per-file unit. `eventNames`
+    /// resolves `eventID` for older manifests that recorded no event title;
+    /// a recorded `eventName` always wins over a live lookup.
+    public func items(eventNames: [UUID: String] = [:]) -> [MediaTrashItem] {
+        segments.flatMap { segment in
+            let entriesByPath = Dictionary(
+                segment.entries.map { ($0.trashedRelativePath, $0) },
+                uniquingKeysWith: { first, _ in first }
+            )
+            let trashedAt = segment.manifest?.createdAt ?? createdAt
+            return segment.files
+                .filter { !JunkPolicy.isJunkFile(($0.path as NSString).lastPathComponent) }
+                .map { file in
+                    let entry = entriesByPath[file.path]
+                    return MediaTrashItem(
+                        batchName: name,
+                        batchFolder: segment.folder,
+                        relativePath: file.path,
+                        fileName: (file.path as NSString).lastPathComponent,
+                        size: file.size,
+                        modifiedAt: file.modifiedAt,
+                        trashedAt: trashedAt,
+                        capturedAt: entry?.capturedAt,
+                        eventID: entry?.eventID,
+                        eventName: entry?.eventName ?? entry?.eventID.flatMap { eventNames[$0] },
+                        personNames: entry?.personNames ?? [],
+                        originalAbsolutePath: entry?.originalAbsolutePath,
+                        originalLocationName: entry?.originalLocationName,
+                        deviceID: entry?.deviceID
+                    )
+                }
+        }
+    }
+}
+
+/// One file sitting inside a `_Trash/<batch>` folder — what the Trash
+/// browser lists, searches, previews, and restores. The file itself is the
+/// source of truth: an item exists only because its file is on disk, and
+/// manifest data rides along as its tags.
+public struct MediaTrashItem: Identifiable, Hashable, Sendable {
+    /// Batch folder plus the path inside it — unique across roots.
+    public var id: String { batchFolder.path + "\n" + relativePath }
+    /// The `yyyy-MM-dd_HHmmss` batch this file's folder belongs to.
+    public var batchName: String
+    /// The `<trashRoot>/<batch>` folder holding the file.
+    public var batchFolder: URL
+    /// Path inside `batchFolder` — the manifest entry's key.
+    public var relativePath: String
+    /// The file inside `_Trash`. Previews decode this copy and nothing else.
+    public var fileURL: URL
+    public var fileName: String
+    public var size: Int64
+    /// The file's modification time inside the batch.
+    public var modifiedAt: Date
+    /// When the batch was created — the day the file was trashed.
+    public var trashedAt: Date
+    /// Capture date the board recorded at trash time, when it knew one.
+    public var capturedAt: Date?
+    /// Event the file was sorted into at trash time.
+    public var eventID: UUID?
+    /// The event's title — recorded in the manifest, or resolved live for
+    /// older manifests that carry only `eventID`.
+    public var eventName: String?
+    /// Confirmed people on the file at trash time.
+    public var personNames: [String]
+    /// Recorded absolute origin — `nil` for files in manifest-less batches.
+    public var originalAbsolutePath: String?
+    /// The unsorted location or event the file was browsed under.
+    public var originalLocationName: String?
+    public var deviceID: String?
+
+    public init(
+        batchName: String,
+        batchFolder: URL,
+        relativePath: String,
+        fileName: String,
+        size: Int64,
+        modifiedAt: Date,
+        trashedAt: Date,
+        capturedAt: Date? = nil,
+        eventID: UUID? = nil,
+        eventName: String? = nil,
+        personNames: [String] = [],
+        originalAbsolutePath: String? = nil,
+        originalLocationName: String? = nil,
+        deviceID: String? = nil
+    ) {
+        self.batchName = batchName
+        self.batchFolder = batchFolder
+        self.relativePath = relativePath
+        self.fileURL = batchFolder.appendingPathComponent(relativePath)
+        self.fileName = fileName
+        self.size = size
+        self.modifiedAt = modifiedAt
+        self.trashedAt = trashedAt
+        self.capturedAt = capturedAt
+        self.eventID = eventID
+        self.eventName = eventName
+        self.personNames = personNames
+        self.originalAbsolutePath = originalAbsolutePath
+        self.originalLocationName = originalLocationName
+        self.deviceID = deviceID
+    }
+
+    /// The manifest knows where this file came from, so it can go back.
+    public var hasRecordedOrigin: Bool { originalAbsolutePath != nil }
+
+    /// The date Trash sorts and filters by: the capture date the board knew
+    /// at trash time, else the day the file was trashed.
+    public var sortDate: Date { capturedAt ?? trashedAt }
+}
+
+/// The Trash browser's filters: free text matching a file's name, event,
+/// or confirmed people, plus an inclusive day range over `sortDate`.
+public struct MediaTrashQuery: Equatable, Sendable {
+    public var text: String = ""
+    public var dayStart: Date?
+    public var dayEnd: Date?
+
+    public init(text: String = "", dayStart: Date? = nil, dayEnd: Date? = nil) {
+        self.text = text
+        self.dayStart = dayStart
+        self.dayEnd = dayEnd
+    }
+
+    /// Nothing applied — the browser shows everything.
+    public var isEmpty: Bool {
+        text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && dayStart == nil && dayEnd == nil
+    }
+
+    /// The normalized search needle — trimmed and lowercased.
+    private var needle: String {
+        text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    /// Text matches file name, event title, a confirmed person's name, or
+    /// the place the file was browsed under; the day range compares at
+    /// calendar-day granularity like the board's Date row.
+    public func matches(_ item: MediaTrashItem, calendar: Calendar = .current) -> Bool {
+        let needle = self.needle
+        if !needle.isEmpty {
+            let hit = item.fileName.lowercased().contains(needle)
+                || (item.eventName?.lowercased().contains(needle) ?? false)
+                || item.personNames.contains { $0.lowercased().contains(needle) }
+                || (item.originalLocationName?.lowercased().contains(needle) ?? false)
+            guard hit else { return false }
+        }
+        if dayStart != nil || dayEnd != nil {
+            let lower = dayStart.map { calendar.startOfDay(for: $0) } ?? .distantPast
+            let upper = dayEnd.map {
+                calendar.date(byAdding: .day, value: 1, to: calendar.startOfDay(for: $0)) ?? .distantFuture
+            } ?? .distantFuture
+            guard item.sortDate >= lower && item.sortDate < upper else { return false }
+        }
+        return true
+    }
 }
 
 public struct MediaTrashRestoreReport: Sendable {
@@ -422,6 +647,13 @@ public struct MediaTrashService {
         return batches.values.sorted { $0.name > $1.name }
     }
 
+    /// Every file inside every `_Trash` batch under the given roots —
+    /// the browser's flat list. `eventNames` lets manifests that predate
+    /// recorded event titles still show one when the event exists today.
+    public func listItems(under roots: [URL], eventNames: [UUID: String] = [:]) -> [MediaTrashItem] {
+        listBatches(under: roots).flatMap { $0.items(eventNames: eventNames) }
+    }
+
     /// Moves every manifest entry back to its recorded original path.
     /// Existing files are never replaced — conflicts keep the trashed copy in
     /// the batch — and manifest-less batches report their files as unrestored
@@ -431,32 +663,82 @@ public struct MediaTrashService {
     public func restore(batch: MediaTrashBatch, progress: FileOperationProgressHandler? = nil) -> MediaTrashRestoreReport {
         var report = MediaTrashRestoreReport()
         for segment in batch.segments {
-            restore(segment: segment, into: &report, progress: progress)
+            restore(segment: segment, onlyPaths: nil, into: &report, progress: progress)
+        }
+        return report
+    }
+
+    /// Restores just the given items — a single file or a selection — each
+    /// back to its recorded original path. Unselected entries in the same
+    /// batch stay in the manifest untouched, so restoring one file leaves
+    /// the rest of the batch restorable. The manifest on disk is re-read
+    /// per folder, so a list that went stale still restores truthfully.
+    public func restore(items: [MediaTrashItem], progress: FileOperationProgressHandler? = nil) -> MediaTrashRestoreReport {
+        var report = MediaTrashRestoreReport()
+        var byFolder: [URL: [MediaTrashItem]] = [:]
+        for item in items {
+            byFolder[item.batchFolder.standardizedFileURL, default: []].append(item)
+        }
+        for (folder, group) in byFolder.sorted(by: { $0.key.path < $1.key.path }) {
+            guard let manifest = try? Self.readManifest(folder.appendingPathComponent(Self.manifestFileName)) else {
+                for item in group {
+                    report.failed[item.fileURL.path] =
+                        "This Trash batch has no manifest, so where it came from is not recorded."
+                }
+                continue
+            }
+            // A file sitting in the folder without a manifest entry has no
+            // recorded origin either — report it rather than guessing.
+            let covered = Set(manifest.entries.map(\.trashedRelativePath))
+            for item in group where !covered.contains(item.relativePath) {
+                report.failed[item.fileURL.path] =
+                    "This file is not in the batch's manifest, so where it came from is not recorded."
+            }
+            let segment = MediaTrashBatch.Segment(
+                folder: folder,
+                manifest: manifest,
+                fileCount: group.count,
+                byteCount: group.reduce(Int64(0)) { $0 + $1.size },
+                files: group.map { FileRecord(path: $0.relativePath, size: $0.size, modifiedAt: $0.modifiedAt) }
+            )
+            restore(segment: segment, onlyPaths: Set(group.map(\.relativePath)), into: &report, progress: progress)
         }
         return report
     }
 
     private func restore(
         segment: MediaTrashBatch.Segment,
+        onlyPaths: Set<String>?,
         into report: inout MediaTrashRestoreReport,
         progress: FileOperationProgressHandler?
     ) {
         let folder = segment.folder.standardizedFileURL
         guard let manifest = segment.manifest else {
             let leftovers = scannedFiles(under: folder)
-            for file in leftovers {
+            for file in leftovers where onlyPaths?.contains(file.path) ?? true {
                 report.failed[folder.appendingPathComponent(file.path).path] =
                     "This Trash batch has no manifest, so where it came from is not recorded."
             }
             return
         }
         guard fileManager.fileExists(atPath: folder.path) else {
-            report.missing.append(contentsOf: manifest.entries.map(\.originalAbsolutePath))
+            report.missing.append(contentsOf: manifest.entries
+                .filter { onlyPaths?.contains($0.trashedRelativePath) ?? true }
+                .map(\.originalAbsolutePath))
             return
         }
 
         var remaining: [MediaTrashEntry] = []
-        for (index, entry) in manifest.entries.enumerated() {
+        var processedFiles = 0
+        let selectedCount = onlyPaths.map { only in manifest.entries.count { only.contains($0.trashedRelativePath) } }
+            ?? manifest.entries.count
+        for entry in manifest.entries {
+            guard onlyPaths?.contains(entry.trashedRelativePath) ?? true else {
+                // Not part of this restore — the entry and its file stay
+                // exactly where they are.
+                remaining.append(entry)
+                continue
+            }
             do {
                 try PathSafety.validateRelativePath(entry.trashedRelativePath)
                 guard entry.originalAbsolutePath.hasPrefix("/"),
@@ -486,11 +768,12 @@ public struct MediaTrashService {
                 report.failed[entry.originalAbsolutePath] = error.localizedDescription
                 remaining.append(entry)
             }
+            processedFiles += 1
             progress?(FileOperationProgress(
                 phase: "Restoring from Trash",
                 currentPath: (entry.originalAbsolutePath as NSString).lastPathComponent,
-                processedFiles: index + 1,
-                totalFiles: manifest.entries.count
+                processedFiles: processedFiles,
+                totalFiles: selectedCount
             ))
         }
 
@@ -547,11 +830,15 @@ public struct MediaTrashService {
 
     private func entry(for move: PlannedMove, batchFolder: URL, context: TrashContext) -> MediaTrashEntry {
         let key = move.file.pathKey
+        let eventID = context.eventIDsByPathKey[key]
         return MediaTrashEntry(
             trashedRelativePath: FileScanner.relativePath(for: move.destination, under: batchFolder),
             originalAbsolutePath: move.source.path,
             originalLocationName: context.locationName,
-            eventID: context.eventIDsByPathKey[key],
+            eventID: eventID,
+            eventName: eventID.flatMap { context.eventNamesByID[$0] },
+            personNames: context.personNamesByPathKey[key] ?? [],
+            capturedAt: context.captureDatesByPathKey[key],
             deviceID: context.deviceID,
             size: move.file.size
         )
@@ -592,7 +879,8 @@ public struct MediaTrashService {
             folder: folder,
             manifest: manifest,
             fileCount: files.count,
-            byteCount: files.reduce(Int64(0)) { $0 + $1.size }
+            byteCount: files.reduce(Int64(0)) { $0 + $1.size },
+            files: files
         )
     }
 

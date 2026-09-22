@@ -333,7 +333,7 @@ struct EventBoardView: View {
         Button("Move to Trash…", role: .destructive) {
             workspace.requestTrash(stackIDs: targets, fromEvent: eventID)
         }
-        .help("Move these event files to the drive's Trash folder. Restorable from Settings.")
+        .help("Move these event files to the drive's Trash folder. Restorable from the Trash window.")
     }
 
     private func urls(for ids: Set<String>) -> [URL] {

@@ -165,7 +165,18 @@ struct ConfigView: View {
             }
 
             Section {
-                TrashBatchesView(model: model)
+                LabeledContent {
+                    Button("Open Trash…") {
+                        TrashWindowController.shared.show(model: model)
+                    }
+                } label: {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Browse and restore files")
+                        Text("The Trash window lists every file in _Trash with previews, search, and per-file restore — the trash-can button in the Organize sidebar opens the same place.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
             } header: {
                 Text("Trash")
             } footer: {
@@ -450,7 +461,7 @@ private struct EmptyRemovedFilesRow: View {
     /// removed-files folder plus each configured volume's Trash — off the
     /// main thread. A root that fails keeps its batches and is reported.
     private func emptyRemovedFiles() {
-        let roots = trashRoots(configuration: model.configuration)
+        let roots = EventStorageLocations(configuration: model.configuration).trashRoots()
         let token = confirmation
         model.runBackgroundJob(
             action: .freeUp,
@@ -490,145 +501,3 @@ private struct EmptyRemovedFilesRow: View {
     }
 }
 
-/// Lists `_Trash` batches under every configured drive's Trash root and the
-/// Buffer's removed-files folder, with a Restore button per batch.
-private struct TrashBatchesView: View {
-    @Bindable var model: DashboardModel
-    @State private var batches: [MediaTrashBatch]?
-    @State private var message: String?
-
-    var body: some View {
-        Group {
-            if let batches {
-                if batches.isEmpty {
-                    Text("No Trash batches on any configured drive.")
-                        .foregroundStyle(.secondary)
-                } else {
-                    ForEach(batches) { batch in
-                        LabeledContent {
-                            HStack(spacing: 10) {
-                                Text("\(batch.fileCount) file\(batch.fileCount == 1 ? "" : "s") · \(batch.byteCount.formattedBytes)")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                Button("Restore") { restore(batch) }
-                                    .disabled(model.isBusy)
-                                    .help(batch.segments.allSatisfy(\.hasManifest)
-                                        ? "Rename every file back to its recorded location. Existing files are never replaced."
-                                        : "This batch has no manifest of where its files lived, so it cannot be restored here.")
-                            }
-                        } label: {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(batch.createdAt == .distantPast
-                                    ? batch.name
-                                    : batch.createdAt.formatted(date: .abbreviated, time: .shortened))
-                                Text(whereabouts(batch))
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                    .lineLimit(1)
-                                    .truncationMode(.middle)
-                            }
-                        }
-                    }
-                }
-            } else {
-                Text("Reading Trash folders…")
-                    .foregroundStyle(.secondary)
-            }
-            if let message {
-                Text(message)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-        }
-        .task { reload() }
-        .onReceive(NotificationCenter.default.publisher(for: .cameraToolkitStorageLocationsChanged)) { _ in
-            reload()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .cameraToolkitMediaTrashChanged)) { _ in
-            reload()
-        }
-    }
-
-    private func whereabouts(_ batch: MediaTrashBatch) -> String {
-        let places = batch.segments.map { segment -> String in
-            if let volume = VolumeInfo.volumeRoot(for: segment.folder) {
-                return volume.lastPathComponent
-            }
-            // <root>/.Camera Toolkit/_Trash/<batch> → the folder holding .Camera Toolkit
-            return segment.folder
-                .deletingLastPathComponent()
-                .deletingLastPathComponent()
-                .deletingLastPathComponent()
-                .lastPathComponent
-        }
-        return Array(Set(places)).sorted().joined(separator: ", ")
-    }
-
-    private func reload() {
-        let roots = trashRoots(configuration: model.configuration)
-        let fallback = EventStorageLocations(configuration: model.configuration).removedFilesRoot
-        Task { @MainActor in
-            let found = await Task.detached(priority: .utility) {
-                MediaTrashService(removedFilesRoot: fallback).listBatches(under: roots)
-            }.value
-            batches = found
-        }
-    }
-
-    private func restore(_ batch: MediaTrashBatch) {
-        let fallback = EventStorageLocations(configuration: model.configuration).removedFilesRoot
-        model.runBackgroundJob(
-            action: .organize,
-            runningNote: "Restoring \(batch.fileCount) file(s) from Trash",
-            logTitle: "Restored a Trash batch",
-            logDetail: "Renamed files back to the paths their batch manifest recorded. Existing files were never replaced.",
-            operation: { progress in
-                MediaTrashService(removedFilesRoot: fallback).restore(batch: batch) { update in
-                    progress(DashboardModel.jobUpdate(from: update, notePrefix: "Restoring", command: ""))
-                }
-            },
-            completion: { report in
-                var parts = ["Restored \(report.restored.count) file(s) (\(report.restoredBytes.formattedBytes)) back to where they lived."]
-                if !report.conflicts.isEmpty {
-                    parts.append("\(report.conflicts.count) stayed in Trash because a file already exists at the original path.")
-                }
-                if !report.missing.isEmpty {
-                    parts.append("\(report.missing.count) recorded file(s) were no longer in the batch.")
-                }
-                if !report.failed.isEmpty {
-                    parts.append("\(report.failed.count) could not move back: \(report.failed.values.first ?? "")")
-                }
-                let summary = parts.joined(separator: " ")
-                message = summary
-                NotificationCenter.default.post(name: .cameraToolkitMediaTrashChanged, object: nil)
-                reload()
-                return summary
-            }
-        )
-    }
-}
-
-/// `_Trash` roots shown in Settings' Trash section: the configured
-/// removed-files folder plus `.Camera Toolkit/_Trash` on the volume of every
-/// configured location. Listing and emptying share this scope.
-private func trashRoots(configuration: AppConfiguration) -> [URL] {
-    let locations = EventStorageLocations(configuration: configuration)
-    var roots = [locations.removedFilesRoot]
-    var seen = Set(roots.map { EventStorageLocations.pathKey($0.path) })
-    var paths = configuration.configuredLocations.map(\.path)
-    paths.append(configuration.bufferPath)
-    paths.append(configuration.privateStagingPath)
-    paths.append(configuration.cameraLibraryRootPath)
-    for path in paths {
-        let url = URL(fileURLWithPath: NSString(string: path).expandingTildeInPath, isDirectory: true)
-            .standardizedFileURL
-        guard let volume = VolumeInfo.volumeRoot(for: url) else { continue }
-        let root = volume
-            .appendingPathComponent(EventStorageLocations.toolkitFolderName, isDirectory: true)
-            .appendingPathComponent("_Trash", isDirectory: true)
-        if seen.insert(EventStorageLocations.pathKey(root.path)).inserted {
-            roots.append(root)
-        }
-    }
-    return roots
-}
