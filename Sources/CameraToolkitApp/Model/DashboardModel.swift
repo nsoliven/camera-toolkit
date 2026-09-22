@@ -23,7 +23,7 @@ private struct OrganizedArchiveJobResult: Sendable {
     var plan: OrganizedArchivePlan
 }
 
-private struct BackgroundJobUpdate: Sendable {
+struct BackgroundJobUpdate: Sendable {
     var progress: Double
     var note: String
     var phase: String
@@ -37,6 +37,7 @@ private struct BackgroundJobUpdate: Sendable {
     var processedBytes: Int64
     var totalBytes: Int64
     var bytesPerSecond: Double
+    var telemetry: JobTelemetry?
 
     init(
         progress: Double,
@@ -51,7 +52,8 @@ private struct BackgroundJobUpdate: Sendable {
         totalFiles: Int = 0,
         processedBytes: Int64 = 0,
         totalBytes: Int64 = 0,
-        bytesPerSecond: Double = 0
+        bytesPerSecond: Double = 0,
+        telemetry: JobTelemetry? = nil
     ) {
         self.progress = progress
         self.note = note
@@ -66,6 +68,7 @@ private struct BackgroundJobUpdate: Sendable {
         self.processedBytes = processedBytes
         self.totalBytes = totalBytes
         self.bytesPerSecond = bytesPerSecond
+        self.telemetry = telemetry
     }
 }
 
@@ -99,6 +102,9 @@ final class DashboardModel {
     var transferQueue: TransferQueueSnapshot?
     var pendingTransferBatches: [PendingTransferBatch]
     var storageCapacityRevision: Int = 0
+    /// Increments on every saved configuration change so views can cheaply
+    /// rebuild indexes derived from events and assignments.
+    var configurationRevision: Int = 0
     var sourceCleanupMessage: String?
     var sourceCleanupError: String?
     var selectedEventCopyAvailability = EventCopyAvailability()
@@ -114,8 +120,9 @@ final class DashboardModel {
     @ObservationIgnored private let configurationStore: ConfigurationStore
     @ObservationIgnored private let transferQueueStore: TransferQueueStore
     @ObservationIgnored private let pendingTransferQueueStore: PendingTransferQueueStore
-    @ObservationIgnored private let secretStore = KeychainSecretStore(service: "org.cameratoolkit.CameraToolkit")
+    @ObservationIgnored let secretStore = KeychainSecretStore(service: "org.cameratoolkit.CameraToolkit")
     @ObservationIgnored private var catalogSyncTask: Task<Void, Never>?
+    @ObservationIgnored private var configurationSaveTask: Task<Void, Never>?
     @ObservationIgnored private var lastTransferQueuePersistence = Date.distantPast
     @ObservationIgnored private var lastStorageCapacityRefreshRequest = Date.distantPast
     @ObservationIgnored private var eventCopyAvailabilityTask: Task<EventCopyAvailability, Never>?
@@ -247,6 +254,17 @@ extension DashboardModel {
         }
     }
 
+    /// Events in sidebar order — parents newest-first, subevents nested under
+    /// them — for pickers and menus.
+    var displayEvents: [(event: SavedCameraEvent, depth: Int)] {
+        EventHierarchy.flattened(configuration.savedEvents)
+    }
+
+    /// "Parent / Child" breadcrumb title for menus and headers.
+    func eventTitle(_ event: SavedCameraEvent) -> String {
+        EventHierarchy.displayName(of: event, in: configuration.savedEvents)
+    }
+
     var selectedEvent: SavedCameraEvent? {
         guard let id = configuration.selectedEventID else { return nil }
         return configuration.savedEvents.first { $0.id == id }
@@ -365,24 +383,31 @@ extension DashboardModel {
     }
 
     @discardableResult
-    func createEvent(named rawName: String, on eventDate: Date) -> Bool {
+    func createEvent(named rawName: String, on eventDate: Date, parentEventID: UUID? = nil) -> Bool {
         let validation = EventNamePolicy.validate(rawName)
         guard validation.isValid else {
             statusMessage = validation.errorMessage ?? "Choose a different event name."
             return false
         }
         let name = validation.normalizedName
+        // A missing or self-referencing parent resolves to top-level.
+        let parentID = parentEventID.flatMap { id in
+            configuration.savedEvents.contains { $0.id == id } ? id : nil
+        }
 
         var selectedID: UUID?
         updateConfiguration { configuration in
+            // The dated folder name is unique per parent: a same-named event
+            // under a different parent is a different folder, not a duplicate.
             if let index = configuration.savedEvents.firstIndex(where: {
-                $0.name.localizedCaseInsensitiveCompare(name) == .orderedSame
+                $0.parentEventID == parentID
+                    && $0.name.localizedCaseInsensitiveCompare(name) == .orderedSame
                     && Calendar.current.isDate($0.eventDate, inSameDayAs: eventDate)
             }) {
                 configuration.savedEvents[index].lastUsedAt = Date()
                 selectedID = configuration.savedEvents[index].id
             } else {
-                let event = SavedCameraEvent(name: name, eventDate: eventDate)
+                let event = SavedCameraEvent(name: name, eventDate: eventDate, parentEventID: parentID)
                 configuration.savedEvents.append(event)
                 selectedID = event.id
             }
@@ -413,8 +438,8 @@ extension DashboardModel {
         queuedFilePaths.removeAll()
         selectedEventCopyAvailability = EventCopyAvailability()
         statusMessage = selectedEventFiles.isEmpty
-            ? "Selected \(event.name). Select photos and assign them to this event."
-            : "Selected \(event.name) with \(selectedEventFiles.count) assigned file(s)."
+            ? "Selected \(eventTitle(event)). Select photos and assign them to this event."
+            : "Selected \(eventTitle(event)) with \(selectedEventFiles.count) assigned file(s)."
     }
 
     func assignFilesToSelectedEvent(_ files: [FileRecord]) {
@@ -476,7 +501,7 @@ extension DashboardModel {
         let sourceCount = Set(validSelections.map(\.sourceRootPath)).count
         let sourceNote = sourceCount == 1 ? "" : " across \(sourceCount) camera sources"
         selectedEventCopyAvailability = EventCopyAvailability()
-        statusMessage = "Assigned \(validSelections.count) file(s)\(sourceNote) to \(event.name)."
+        statusMessage = "Assigned \(validSelections.count) file(s)\(sourceNote) to \(eventTitle(event))."
     }
 
     func queueSelectedEventFiles() {
@@ -511,7 +536,7 @@ extension DashboardModel {
             sourcePath: expandedImportSourcePath,
             destinationPath: expandedBufferIngestPath,
             eventID: selectedEvent?.id,
-            eventName: selectedEvent?.name ?? configuration.eventName,
+            eventName: selectedEvent.map { eventTitle($0) } ?? configuration.eventName,
             deviceID: configuration.selectedDeviceID
         )
     }
@@ -587,9 +612,9 @@ extension DashboardModel {
                     withIntermediateDirectories: true
                 )
             }
-            statusMessage = "Created the \(event.name) card-copy, Photomator, Masters, Web, and Social folders."
+            statusMessage = "Created the \(eventTitle(event)) card-copy, Photomator, Masters, Web, and Social folders."
         } catch {
-            statusMessage = "Could not create folders for \(event.name): \(error.localizedDescription)"
+            statusMessage = "Could not create folders for \(eventTitle(event)): \(error.localizedDescription)"
         }
     }
 
@@ -1243,7 +1268,7 @@ extension DashboardModel {
             sourcePath: expandedImportSourcePath,
             destinationPath: expandedBufferIngestPath,
             eventID: selectedEvent?.id,
-            eventName: selectedEvent?.name ?? configuration.eventName,
+            eventName: selectedEvent.map { eventTitle($0) } ?? configuration.eventName,
             deviceID: configuration.selectedDeviceID
         )
     }
@@ -1296,7 +1321,7 @@ extension DashboardModel {
         return paths
     }
 
-    private func enqueueTransfer(
+    func enqueueTransfer(
         files: [FileRecord],
         sourcePath: String,
         destinationPath: String,
@@ -1579,8 +1604,12 @@ extension DashboardModel {
         var notes: [String] = []
 
         do {
+            // Flush first: a pending debounced save must reach disk before a
+            // reload, or the read would revert mutations made moments ago.
+            flushConfigurationSave()
             let defaults = AppConfiguration.defaults(applicationSupport: Self.defaultApplicationSupportURL)
             configuration = try configurationStore.load(defaults: defaults)
+            configurationRevision &+= 1
             configMessage = "Config reloaded at \(Self.defaultConfigurationURL.path)."
             notes.append("config")
         } catch {
@@ -1639,7 +1668,7 @@ extension DashboardModel {
         }
     }
 
-    nonisolated private static func jobUpdate(
+    nonisolated static func jobUpdate(
         from update: FileOperationProgress,
         lowerBound: Double = 0.02,
         upperBound: Double = 0.95,
@@ -1693,7 +1722,8 @@ extension DashboardModel {
             totalFiles: update.totalFiles,
             processedBytes: update.processedBytes,
             totalBytes: update.totalBytes,
-            bytesPerSecond: update.bytesPerSecond
+            bytesPerSecond: update.bytesPerSecond,
+            telemetry: update.telemetry
         )
     }
 
@@ -1946,7 +1976,11 @@ extension DashboardModel {
         return "The transfer stopped safely: \(detail) Camera originals were untouched."
     }
 
-    private func runBackgroundJob<Result: Sendable>(
+    /// Runs a job on a worker task and reports progress on `jobs`. Returns the
+    /// job's id so callers can correlate a running job with UI they show while
+    /// it is in flight; nil when another job already occupies the model.
+    @discardableResult
+    func runBackgroundJob<Result: Sendable>(
         action: JobAction,
         runningNote: String,
         logTitle: String,
@@ -1955,12 +1989,16 @@ extension DashboardModel {
         sourcePath: String? = nil,
         destinationPath: String? = nil,
         tracksTransferQueue: Bool = false,
+        /// Runs after the job settles — done, failed, or cancelled — so
+        /// callers can clear bookkeeping the success-only `completion`
+        /// cannot cover.
+        onSettled: (@MainActor @Sendable () -> Void)? = nil,
         operation: @escaping @Sendable (@escaping @Sendable (BackgroundJobUpdate) -> Void) throws -> Result,
         completion: @escaping (Result) throws -> String
-    ) {
+    ) -> UUID? {
         guard !isBusy, !isStorageBenchmarkRunning else {
             statusMessage = "Another file job is already running. Wait for it to finish, then try again."
-            return
+            return nil
         }
 
         isBusy = true
@@ -1995,6 +2033,7 @@ extension DashboardModel {
         }
 
         Task { @MainActor [weak self] in
+            defer { onSettled?() }
             guard let self else {
                 return
             }
@@ -2044,9 +2083,10 @@ extension DashboardModel {
                 )
             }
         }
+        return jobID
     }
 
-    private func updateJob(id: UUID, update: BackgroundJobUpdate) {
+    func updateJob(id: UUID, update: BackgroundJobUpdate) {
         guard let index = jobs.firstIndex(where: { $0.id == id }) else {
             return
         }
@@ -2062,6 +2102,9 @@ extension DashboardModel {
         jobs[index].processedBytes = update.processedBytes
         jobs[index].totalBytes = update.totalBytes
         jobs[index].bytesPerSecond = update.bytesPerSecond
+        if let telemetry = update.telemetry {
+            jobs[index].telemetry = telemetry
+        }
 
         let phase = update.phase.lowercased()
         let changesStoredBytes = phase.contains("copying") || phase.contains("removing from camera")
@@ -2072,7 +2115,7 @@ extension DashboardModel {
         }
     }
 
-    private func finishJob(
+    func finishJob(
         id: UUID,
         action: JobAction,
         state: JobState,
@@ -2100,13 +2143,22 @@ extension DashboardModel {
         storageCapacityRevision &+= 1
     }
 
-    private func recordActivity(action: JobAction, state: JobState, title: String, summary: String, detail: String) {
+    func recordActivity(action: JobAction, state: JobState, title: String, summary: String, detail: String) {
         let entry = ActivityLogEntry(
             action: action,
             state: state,
             title: title,
             summary: summary,
             detail: detail
+        )
+        // Mirror the terminal state into the debug stream — action and
+        // outcome only; user-facing strings stay in the activity log.
+        DebugLog.shared.log(
+            "job.finish",
+            subsystem: .apply,
+            level: state == .failed ? .error : .info,
+            outcome: state == .done ? .ok : (state == .cancelled ? .cancel : .error),
+            detail: "\(action.rawValue) \(state.rawValue)"
         )
         activityLog.insert(entry, at: 0)
         do {
@@ -2116,19 +2168,49 @@ extension DashboardModel {
         }
     }
 
-    private func updateConfiguration(_ mutate: (inout AppConfiguration) -> Void) {
+    func updateConfiguration(_ mutate: (inout AppConfiguration) -> Void) {
         var next = configuration
         mutate(&next)
         next.normalizeLocationSelections()
         next.normalizeEventSelection()
         configuration = next
+        configurationRevision &+= 1
+        scheduleConfigurationSave()
+        scheduleCatalogSync(configuration: next)
+    }
+
+    /// Config JSON writes are debounced so a burst of mutations (sorting,
+    /// event edits, Settings changes) costs one disk write shortly after the
+    /// last change. The write runs on the main actor, so saves stay in order;
+    /// `flushConfigurationSave()` forces a synchronous write on termination.
+    private func scheduleConfigurationSave() {
+        configurationSaveTask?.cancel()
+        configurationSaveTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(for: .milliseconds(250))
+            } catch {
+                return
+            }
+            self?.saveConfigurationNow()
+        }
+    }
+
+    /// Writes the current configuration synchronously, cancelling any pending
+    /// debounced save. Called from `applicationWillTerminate` so the last
+    /// mutations of a session always reach disk.
+    func flushConfigurationSave() {
+        configurationSaveTask?.cancel()
+        configurationSaveTask = nil
+        saveConfigurationNow()
+    }
+
+    private func saveConfigurationNow() {
         do {
-            try configurationStore.save(next)
+            try configurationStore.save(configuration)
             configMessage = "Config saved at \(Self.defaultConfigurationURL.path)."
         } catch {
             configMessage = "Could not save config: \(error.localizedDescription)"
         }
-        scheduleCatalogSync(configuration: next)
     }
 
     private func scheduleCatalogSync(configuration: AppConfiguration) {
@@ -2160,7 +2242,7 @@ extension DashboardModel {
         }
     }
 
-    private static var defaultApplicationSupportURL: URL {
+    static var defaultApplicationSupportURL: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? FileManager.default.temporaryDirectory
     }
@@ -2169,7 +2251,7 @@ extension DashboardModel {
         defaultApplicationSupportURL.appendingPathComponent("CameraToolkit/config.json")
     }
 
-    private static let immichAPIKeyAccount = "immich-api-key"
+    static let immichAPIKeyAccount = "immich-api-key"
     private static let trueNASAPIKeyAccount = "truenas-api-key"
 
     private static func shortFingerprint(_ fingerprint: String) -> String {

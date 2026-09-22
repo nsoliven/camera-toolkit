@@ -1,0 +1,1005 @@
+import AppKit
+import CameraToolkitCore
+import SwiftUI
+
+/// The main window: unsorted folders and events on the left; the selected
+/// folder's burst board or the selected event on the right. Storage
+/// locations live in Settings to keep this window simple.
+struct EventsRootView: View {
+    @Bindable var model: DashboardModel
+    @Bindable var workspace: EventsWorkspace
+    @AppStorage(OrganizeChromeSizing.sidebarWidthDefaultsKey)
+    private var sidebarWidth = OrganizeChromeSizing.defaultSidebarWidth
+
+    var body: some View {
+        let panelAlignment: Alignment = (workspace.guide?.step.prefersTop ?? false) ? .topTrailing : .bottomTrailing
+        HStack(spacing: 0) {
+            if !model.isSidebarCollapsed {
+                EventsSidebar(model: model, workspace: workspace)
+                    .frame(width: OrganizeChromeSizing.clampedSidebarWidth(sidebarWidth))
+                    .frame(maxHeight: .infinity)
+                    .background(OrganizeSidebarMaterial())
+                ChromeResizeHandle(
+                    orientation: .vertical,
+                    value: $sidebarWidth,
+                    transform: OrganizeChromeSizing.clampedSidebarWidth,
+                    onDoubleClick: {
+                        withAnimation(.easeOut(duration: 0.15)) {
+                            sidebarWidth = OrganizeChromeSizing.defaultSidebarWidth
+                        }
+                    },
+                    help: "Drag to resize the sidebar — double-click resets",
+                    accessibilityLabel: "Resize Sidebar"
+                )
+            }
+            detail
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(Color(nsColor: .windowBackgroundColor))
+        }
+        .overlay(alignment: panelAlignment) {
+            if let guide = workspace.guide {
+                SetupGuidePanel(guide: guide, workspace: workspace, model: model)
+                    .padding(.horizontal, 20)
+                    .padding(.vertical, guide.step.prefersTop ? 70 : 40)
+            }
+        }
+        .onAppear { workspace.start() }
+        .onReceive(NotificationCenter.default.publisher(for: .cameraToolkitUndoSort)) { _ in
+            workspace.undoLastSort()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .cameraToolkitStorageLocationsChanged)) { _ in
+            workspace.discoverDriveEvents()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .cameraToolkitMediaTrashChanged)) { _ in
+            for location in workspace.unsortedLocations where workspace.sources[location.id]?.result != nil {
+                workspace.scan(location, force: true)
+            }
+        }
+        .sheet(item: $workspace.newEventRequest) { request in
+            EventDetailsSheet(
+                title: "New Event",
+                confirmTitle: "Create Event",
+                initialName: "",
+                initialDate: request.suggestedDate,
+                initialPolicy: request.parentEventID == nil ? .buffer : nil,
+                initialParentEventID: request.parentEventID,
+                parents: workspace.parentCandidates(excluding: nil),
+                onCancel: { workspace.newEventRequest = nil },
+                onSave: { name, date, policy, parentEventID in
+                    workspace.completeNewEvent(request, name: name, date: date, policy: policy, parentEventID: parentEventID)
+                }
+            )
+        }
+        .sheet(item: $workspace.renameRequest) { request in
+            if let event = workspace.event(request.eventID) {
+                EventDetailsSheet(
+                    title: "Edit Event",
+                    confirmTitle: "Save",
+                    initialName: event.name,
+                    initialDate: event.eventDate,
+                    initialPolicy: event.storagePolicy,
+                    initialParentEventID: event.parentEventID,
+                    parents: workspace.parentCandidates(excluding: event.id),
+                    onCancel: { workspace.renameRequest = nil },
+                    onSave: { name, date, policy, parentEventID in
+                        workspace.renameEvent(request.eventID, name: name, date: date, policy: policy, parentEventID: parentEventID)
+                    }
+                )
+            }
+        }
+        .sheet(item: $workspace.pendingApplyPlan) { plan in
+            ApplyPlanSheet(
+                plan: plan,
+                onCancel: { workspace.pendingApplyPlan = nil },
+                onApply: { workspace.performApply(plan) }
+            )
+        }
+        .sheet(item: $workspace.pendingTrash) { request in
+            TrashConfirmSheet(
+                request: request,
+                onCancel: { workspace.pendingTrash = nil },
+                onConfirm: { workspace.confirmTrash(request) }
+            )
+        }
+        .sheet(item: $workspace.pendingRemoval) { request in
+            RemovalConfirmSheet(
+                request: request,
+                eventName: workspace.event(request.eventID).map { workspace.eventTitle($0) } ?? "this event",
+                onCancel: { workspace.pendingRemoval = nil },
+                onConfirm: { workspace.confirmRemoval(request, confirmation: $0) }
+            )
+        }
+        .sheet(item: $workspace.faceScanRequest) { request in
+            switch request.subject {
+            case .location(let locationID):
+                if let location = workspace.location(locationID) {
+                    FaceScanSheet(
+                        name: location.name,
+                        engineInstalled: workspace.faceEngineInstalled,
+                        onCancel: { workspace.faceScanRequest = nil },
+                        onScan: { options in
+                            workspace.faceScanRequest = nil
+                            workspace.faceScan(location, options: options)
+                        }
+                    )
+                }
+            case .event(let eventID):
+                if let event = workspace.event(eventID) {
+                    FaceScanSheet(
+                        name: workspace.eventTitle(event),
+                        engineInstalled: workspace.faceEngineInstalled,
+                        onCancel: { workspace.faceScanRequest = nil },
+                        onScan: { options in
+                            workspace.faceScanRequest = nil
+                            workspace.faceScan(event, options: options)
+                        }
+                    )
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var detail: some View {
+        switch workspace.selection {
+        case .unsorted(let id):
+            if let location = workspace.location(id) {
+                UnsortedBoardView(model: model, workspace: workspace, location: location)
+                    .id(id)
+            } else {
+                EventsWelcomeView(model: model, workspace: workspace)
+            }
+        case .event(let id):
+            EventBoardView(model: model, workspace: workspace, eventID: id)
+                .id(id)
+        case nil:
+            EventsWelcomeView(model: model, workspace: workspace)
+        }
+    }
+}
+
+struct EventsSidebar: View {
+    @Bindable var model: DashboardModel
+    @Bindable var workspace: EventsWorkspace
+    @State private var targetedEventID: UUID?
+    @State private var searchText = ""
+
+    /// Explicit binding instead of `$workspace.selection`: AppKit-backed
+    /// `List(selection:)` does not reliably write through `@Bindable` into an
+    /// `@Observable` model, which left sidebar clicks dead. Rows also set the
+    /// selection on tap as a fallback.
+    private var sidebarSelection: Binding<EventsSidebarSelection?> {
+        Binding(
+            get: { workspace.selection },
+            set: { workspace.selection = $0 }
+        )
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                Image(systemName: "rectangle.3.group")
+                    .foregroundStyle(.blue)
+                Text("Organize")
+                    .font(.headline)
+                Spacer()
+                Button {
+                    workspace.startGuide()
+                } label: {
+                    Label("Guide…", systemImage: "questionmark.circle")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .help("Open the step-by-step setup guide")
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            Divider()
+
+            List(selection: sidebarSelection) {
+                let discovered = workspace.discoveredDriveEvents(matching: searchText)
+                if !discovered.isEmpty {
+                    Section("Found on Your Drive") {
+                        discoveryBanner(discovered)
+                            .guideHighlight(.discovered, in: workspace)
+                    }
+                }
+
+                Section("Unsorted Photos") {
+                    ForEach(workspace.unsortedLocations(matching: searchText)) { location in
+                        unsortedRow(location)
+                            .tag(EventsSidebarSelection.unsorted(location.id) as EventsSidebarSelection?)
+                            .contentShape(Rectangle())
+                            .simultaneousGesture(TapGesture().onEnded {
+                                workspace.selection = .unsorted(location.id)
+                            })
+                            .contextMenu {
+                                Button("Rescan") { workspace.scan(location, force: true) }
+                                    .disabled(workspace.sources[location.id]?.isScanning == true || model.isBusy)
+                                Button("Regroup Bursts") { workspace.regroupBursts(location) }
+                                    .disabled(workspace.sources[location.id]?.isScanning == true || model.isBusy || workspace.sources[location.id]?.result == nil)
+                                    .help("Re-run burst grouping on the scanned files with the current Settings sliders — files are not re-read.")
+                                Button("Scan for Faces…") { workspace.requestFaceScan(location) }
+                                    .disabled(workspace.faceScanBlocker(for: location) != nil)
+                                    .help(workspace.faceScanBlocker(for: location)
+                                        ?? "Detect and match faces on a sample of each burst — not every frame. Writes only to the catalog — media is read, never touched.")
+                                Button("Reveal in Finder") {
+                                    NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: DashboardModel.expandedPath(location.path))])
+                                }
+                                Divider()
+                                Button("Remove from Unsorted List") { workspace.removeUnsortedFolder(location.id) }
+                            }
+                    }
+                    Button {
+                        workspace.addUnsortedFolder()
+                    } label: {
+                        Label("Add Folder or Card…", systemImage: "plus.rectangle.on.folder")
+                    }
+                    .buttonStyle(.borderless)
+                    .guideHighlight(.addFolder, in: workspace)
+                }
+
+                Section {
+                    if workspace.events.isEmpty {
+                        Text("No events yet")
+                            .foregroundStyle(.secondary)
+                    }
+                    // A board popover's condition rows narrow this list —
+                    // events are tested against the same OR-of-AND groups.
+                    if workspace.search.hasActiveConditions {
+                        Button {
+                            workspace.search.groups = []
+                        } label: {
+                            Label("Filtered — clear", systemImage: "line.3.horizontal.decrease.circle.fill")
+                                .font(.caption)
+                        }
+                        .buttonStyle(.borderless)
+                        .foregroundStyle(Color.accentColor)
+                        .help("A board's filter is hiding events that don't match — click to show every event")
+                    }
+                    // Parents newest-first; each subevent sits indented under
+                    // its parent — the flat row style stays the same.
+                    ForEach(workspace.sidebarRows(matching: searchText, applying: workspace.search), id: \.event.id) { row in
+                        eventRow(row.event, depth: row.depth)
+                            .tag(EventsSidebarSelection.event(row.event.id) as EventsSidebarSelection?)
+                            .contentShape(Rectangle())
+                            .simultaneousGesture(TapGesture().onEnded {
+                                workspace.selection = .event(row.event.id)
+                            })
+                            .dropDestination(for: String.self) { items, _ in
+                                workspace.handleDrop(items, onto: row.event.id)
+                            } isTargeted: { targeted in
+                                if targeted {
+                                    targetedEventID = row.event.id
+                                } else if targetedEventID == row.event.id {
+                                    targetedEventID = nil
+                                }
+                            }
+                            .contextMenu {
+                                Button("New Subevent…") {
+                                    workspace.requestNewEvent(from: nil, parentEventID: row.event.id)
+                                }
+                                Button("Rename or Change Date…") {
+                                    workspace.renameRequest = RenameEventRequest(eventID: row.event.id)
+                                }
+                                Button("Scan for Faces…") { workspace.requestFaceScan(row.event) }
+                                    .disabled(workspace.faceScanBlocker(for: row.event) != nil)
+                                    .help(workspace.faceScanBlocker(for: row.event)
+                                        ?? "Detect and match faces on a sample of each burst — not every frame. Writes only to the catalog — media is read, never touched.")
+                                Button("Delete Empty Event", role: .destructive) {
+                                    workspace.deleteEmptyEvent(row.event.id)
+                                }
+                                .disabled(workspace.assignmentCount(for: row.event.id) > 0)
+                            }
+                    }
+                } header: {
+                    HStack {
+                        Text("Events")
+                        Spacer()
+                        Button {
+                            workspace.requestNewEvent(from: nil)
+                        } label: {
+                            Label("New Event…", systemImage: "plus")
+                                .font(.caption)
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Make a new event")
+                    }
+                }
+            }
+            .listStyle(.sidebar)
+
+            Divider()
+            footer
+        }
+        .searchable(text: $searchText, placement: .sidebar, prompt: "Search")
+    }
+
+    private func discoveryBanner(_ found: [DiscoveredDriveEvent]) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("\(found.count) event folder\(found.count == 1 ? " is" : "s are") on your drive but not in the list yet.")
+                .font(.callout.weight(.semibold))
+                .fixedSize(horizontal: false, vertical: true)
+            ForEach(found.prefix(3)) { event in
+                Text("\(event.name) · \(event.files.count) files")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            if found.count > 3 {
+                Text("and \(found.count - 3) more")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Button("Add to Events") { workspace.adoptDiscoveredDriveEvents() }
+                .controlSize(.small)
+                .help("Lists these folders as events. No files move.")
+        }
+        .padding(.vertical, 4)
+    }
+
+    private func unsortedRow(_ location: ConfiguredLocation) -> some View {
+        let connected = workspace.isConnected(location)
+        return HStack(spacing: 8) {
+            Image(systemName: connected ? "tray.full" : "externaldrive.badge.xmark")
+                .foregroundStyle(connected ? Color.orange : .secondary)
+                .frame(width: 18)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(location.name)
+                    .lineLimit(1)
+                Text(workspace.unsortedDetail(for: location))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 0)
+            if workspace.sources[location.id]?.isScanning == true {
+                ProgressView()
+                    .controlSize(.mini)
+            } else if !connected {
+                Button {
+                    workspace.refreshConnectivity()
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .buttonStyle(.borderless)
+                .controlSize(.small)
+                .foregroundStyle(.secondary)
+                .help("Check again — the drive or card may have just connected")
+            }
+        }
+        .padding(.vertical, 2)
+    }
+
+    private func eventRow(_ event: SavedCameraEvent, depth: Int = 0) -> some View {
+        let count = workspace.assignmentCount(for: event.id)
+        let summary = workspace.presence[event.id]
+        let names = workspace.eventPeople(event.id).map(\.name).joined(separator: ", ")
+        return HStack(spacing: 8) {
+            Circle()
+                .fill(EventPalette.color(for: event.id))
+                .frame(width: 9, height: 9)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(event.name)
+                    .lineLimit(1)
+                Text("\(event.eventDate.formatted(date: .abbreviated, time: .omitted)) · \(count) file\(count == 1 ? "" : "s")\(names.isEmpty ? "" : " · \(names)")")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 0)
+            if workspace.resolvedPolicy(for: event) == .archiveOnly {
+                Image(systemName: "lock.fill")
+                    .font(.caption)
+                    .foregroundStyle(.purple)
+                    .help("Private · NAS only")
+            }
+            if let summary, summary.total > 0 {
+                HStack(spacing: 3) {
+                    Image(systemName: "externaldrive.fill")
+                        .foregroundStyle(summary.onDrive == summary.total ? Color.green : Color.secondary.opacity(0.5))
+                    Image(systemName: "server.rack")
+                        .foregroundStyle(summary.onArchive == summary.total ? Color.green : Color.secondary.opacity(0.5))
+                }
+                .font(.caption2)
+                .help("Drive \(summary.onDrive) of \(summary.total) · NAS \(summary.onArchive) of \(summary.total)")
+            }
+        }
+        .padding(.vertical, 2)
+        .padding(.horizontal, 4)
+        .padding(.leading, CGFloat(depth) * 16)
+        .background {
+            RoundedRectangle(cornerRadius: 6)
+                .fill(targetedEventID == event.id ? Color.accentColor.opacity(0.25) : Color.clear)
+                .allowsHitTesting(false)
+        }
+    }
+
+    private var footer: some View {
+        VStack(spacing: 2) {
+            footerButton(
+                "Jobs…",
+                detail: model.activeJob?.note
+                    ?? model.transferQueue?.sidebarSummary.detail
+                    ?? (model.pendingTransferFileCount > 0 ? "\(model.pendingTransferFileCount) waiting" : nil),
+                symbol: model.activeJob != nil ? "list.bullet.clipboard.fill" : "list.bullet.clipboard"
+            ) {
+                TransferQueueWindowController.shared.show(model: model)
+            }
+            footerButton(
+                "People…",
+                detail: workspace.faceEngineInstalled ? nil : "engine missing",
+                symbol: "person.2"
+            ) {
+                PeopleWindowController.shared.show(model: model, workspace: workspace)
+            }
+            footerButton("File Browser", detail: nil, symbol: "folder") {
+                AppShellMode.show(.files)
+            }
+            footerButton("Settings…", detail: nil, symbol: "gearshape") {
+                CameraToolkitConfigWindow.shared.show(model: model)
+            }
+        }
+        .buttonStyle(.plain)
+        .padding(12)
+    }
+
+    private func footerButton(_ title: String, detail: String?, symbol: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack {
+                Label(title, systemImage: symbol)
+                Spacer()
+                if let detail {
+                    Text(detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+    }
+}
+
+struct EventsWelcomeView: View {
+    @Bindable var model: DashboardModel
+    @Bindable var workspace: EventsWorkspace
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 20) {
+                Image(systemName: "rectangle.3.group")
+                    .font(.system(size: 52))
+                    .foregroundStyle(.blue)
+                    .padding(.top, 40)
+                Text("Welcome to Camera Toolkit")
+                    .font(.largeTitle.bold())
+                Text("Sort your photos into events, then keep each event on your drive, your NAS, and Immich.")
+                    .font(.title3)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 560)
+
+                Button {
+                    workspace.startGuide()
+                } label: {
+                    Label("Start Guided Setup…", systemImage: "play.circle.fill")
+                        .font(.title3.weight(.semibold))
+                        .padding(.horizontal, 20)
+                        .padding(.vertical, 8)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+
+                Text("It checks your drives, finds your unsorted photos, and walks you through sorting your first burst. Nothing moves or gets deleted without a plan you confirm.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 520)
+
+                GroupBox {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("Where your photos go")
+                            .font(.headline)
+                        PlacesExplainer()
+                    }
+                    .padding(8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxWidth: 600)
+
+                HStack {
+                    Button("Add Folder or Card…") { workspace.addUnsortedFolder() }
+                    Button("New Event…") { workspace.requestNewEvent(from: nil) }
+                }
+                .padding(.bottom, 40)
+            }
+            .padding(.horizontal, 40)
+            .frame(maxWidth: .infinity)
+        }
+    }
+}
+
+/// The translucent material NavigationSplitView used to paint behind the
+/// sidebar column — kept so the hand-sized sidebar still looks like a
+/// macOS sidebar.
+private struct OrganizeSidebarMaterial: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let view = NSVisualEffectView()
+        view.material = .sidebar
+        view.blendingMode = .behindWindow
+        view.state = .followsWindowActiveState
+        return view
+    }
+
+    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {}
+}
+
+struct EventDetailsSheet: View {
+    let title: String
+    let confirmTitle: String
+    /// Candidate parents in sidebar order (the edited event and its subevents
+    /// are already excluded, so a parent loop can't be picked).
+    let parents: [(event: SavedCameraEvent, depth: Int)]
+    let onCancel: () -> Void
+    /// (name, date, storagePolicy, parentEventID) — a nil policy follows the
+    /// parent's setting for a subevent, or the shared Buffer at top level.
+    let onSave: (String, Date, EventStoragePolicy?, UUID?) -> Void
+
+    @State private var name: String
+    @State private var date: Date
+    @State private var policy: EventStoragePolicy?
+    @State private var parentEventID: UUID?
+    @FocusState private var isNameFocused: Bool
+
+    init(
+        title: String,
+        confirmTitle: String,
+        initialName: String,
+        initialDate: Date,
+        initialPolicy: EventStoragePolicy?,
+        initialParentEventID: UUID?,
+        parents: [(event: SavedCameraEvent, depth: Int)],
+        onCancel: @escaping () -> Void,
+        onSave: @escaping (String, Date, EventStoragePolicy?, UUID?) -> Void
+    ) {
+        self.title = title
+        self.confirmTitle = confirmTitle
+        self.parents = parents
+        self.onCancel = onCancel
+        self.onSave = onSave
+        _name = State(initialValue: initialName)
+        _date = State(initialValue: initialDate)
+        _policy = State(initialValue: initialPolicy)
+        _parentEventID = State(initialValue: initialParentEventID)
+    }
+
+    private var validation: EventNameValidation {
+        EventNamePolicy.validate(name)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text(title)
+                .font(.title2.bold())
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Name")
+                    .font(.headline)
+                EventNameField(text: $name, isFocused: $isNameFocused, onSubmit: save)
+                    .frame(height: 24)
+            }
+            if !name.isEmpty, let error = validation.errorMessage {
+                Label(error, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+            Form {
+                DatePicker("Date", selection: $date, displayedComponents: .date)
+                Picker("Inside event", selection: $parentEventID) {
+                    Text("None — top level").tag(UUID?.none)
+                    ForEach(parents, id: \.event.id) { row in
+                        Text(String(repeating: "    ", count: row.depth) + row.event.name)
+                            .tag(UUID?.some(row.event.id))
+                    }
+                }
+                .help("A subevent's folder lives inside its parent event's folder.")
+                if parentEventID == nil {
+                    Picker("Keep on drive", selection: Binding(
+                        get: { policy ?? .buffer },
+                        set: { policy = $0 }
+                    )) {
+                        Text("Shared Buffer").tag(EventStoragePolicy.buffer)
+                        Text("Private · NAS only").tag(EventStoragePolicy.archiveOnly)
+                    }
+                    .pickerStyle(.radioGroup)
+                } else {
+                    Picker("Keep on drive", selection: $policy) {
+                        Text("Same as parent").tag(EventStoragePolicy?.none)
+                        Text("Shared Buffer").tag(EventStoragePolicy?.some(.buffer))
+                        Text("Private · NAS only").tag(EventStoragePolicy?.some(.archiveOnly))
+                    }
+                    .pickerStyle(.radioGroup)
+                }
+                Text(policyHelp)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .formStyle(.grouped)
+            HStack {
+                Spacer()
+                Button("Cancel", action: onCancel)
+                    .keyboardShortcut(.cancelAction)
+                Button(confirmTitle, action: save)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(!validation.isValid)
+            }
+        }
+        .padding(20)
+        .frame(width: 520)
+        .onAppear { isNameFocused = true }
+    }
+
+    private var policyHelp: String {
+        let shared = "Originals go into the shared Camera Buffer, where anyone browsing the drive can see them."
+        let private_ = "Originals never enter the shared Buffer. They wait in a hidden folder on the drive until they are archived to the NAS, and then you can take them off the drive."
+        if parentEventID != nil, policy == nil {
+            let parent = parents.first { $0.event.id == parentEventID }?.event
+            let resolved = parent.map {
+                EventHierarchy.resolvedPolicy(of: $0, in: parents.map(\.event))
+            } ?? .buffer
+            return "Follows the parent event's setting (currently \(resolved == .buffer ? "Shared Buffer" : "Private · NAS only"))."
+        }
+        return (policy ?? .buffer) == .buffer ? shared : private_
+    }
+
+    private func save() {
+        guard validation.isValid else { return }
+        onSave(validation.normalizedName, date, policy, parentEventID)
+    }
+}
+
+/// AppKit field so a trailing space is visible immediately. SwiftUI's
+/// grouped Form TextField on macOS swallows that space until the next key.
+private struct EventNameField: NSViewRepresentable {
+    @Binding var text: String
+    var isFocused: FocusState<Bool>.Binding
+    var onSubmit: () -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    func makeNSView(context: Context) -> NSTextField {
+        let field = NSTextField(string: text)
+        field.placeholderString = "Beach day, Birthday, Client shoot…"
+        field.font = .systemFont(ofSize: NSFont.systemFontSize)
+        field.delegate = context.coordinator
+        field.isBordered = true
+        field.isBezeled = true
+        field.bezelStyle = .roundedBezel
+        field.focusRingType = .default
+        field.lineBreakMode = .byClipping
+        field.cell?.isScrollable = true
+        field.cell?.wraps = false
+        field.cell?.usesSingleLineMode = true
+        field.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        return field
+    }
+
+    func updateNSView(_ field: NSTextField, context: Context) {
+        context.coordinator.parent = self
+        if field.stringValue != text, field.currentEditor() == nil {
+            field.stringValue = text
+        }
+        if isFocused.wrappedValue, field.window?.firstResponder !== field.currentEditor() {
+            field.window?.makeFirstResponder(field)
+        }
+    }
+
+    final class Coordinator: NSObject, NSTextFieldDelegate {
+        var parent: EventNameField
+        init(_ parent: EventNameField) { self.parent = parent }
+
+        func controlTextDidChange(_ notification: Notification) {
+            guard let field = notification.object as? NSTextField else { return }
+            parent.text = field.stringValue
+        }
+
+        func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+            if commandSelector == #selector(NSResponder.insertNewline(_:)) {
+                parent.onSubmit()
+                return true
+            }
+            return false
+        }
+    }
+}
+
+struct ApplyPlanSheet: View {
+    let plan: OrganizeApplyPlan
+    let onCancel: () -> Void
+    let onApply: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text(plan.title)
+                .font(.title2.bold())
+            Text(summary)
+                .foregroundStyle(.secondary)
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 10) {
+                    ForEach(plan.groups) { group in
+                        ApplyEventGroupCard(group: group)
+                    }
+                }
+            }
+            .frame(minHeight: 220)
+            Label(
+                "Moves on the same drive are instant renames. Copies from another drive are checksum-verified and leave the originals in place. Nothing is overwritten, and Undo can move files back.",
+                systemImage: "checkmark.shield"
+            )
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            HStack {
+                Spacer()
+                Button("Cancel", action: onCancel)
+                    .keyboardShortcut(.cancelAction)
+                Button("Apply", action: onApply)
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(plan.isEmpty)
+            }
+        }
+        .padding(20)
+        .frame(width: 680, height: 560)
+    }
+
+    private var summary: String {
+        var parts: [String] = []
+        if plan.moveCount > 0 {
+            parts.append("\(plan.moveCount) instant move\(plan.moveCount == 1 ? "" : "s")")
+        }
+        if plan.copyCount > 0 {
+            parts.append("\(plan.copyCount) verified cop\(plan.copyCount == 1 ? "y" : "ies")")
+        }
+        let events = plan.groups.count { !$0.moves.isEmpty || !$0.copies.isEmpty }
+        return parts.joined(separator: " and ") + " · \(plan.byteCount.formattedBytes) into \(events) event\(events == 1 ? "" : "s")"
+    }
+}
+
+struct RemovalConfirmSheet: View {
+    let request: RemovalRequest
+    let eventName: String
+    let onCancel: () -> Void
+    let onConfirm: (String) -> Void
+
+    @State private var confirmation = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text(request.kind == .drive ? "Take \(eventName) off the drive?" : "Free up the source for \(eventName)?")
+                .font(.title2.bold())
+            Text(explanation)
+                .fixedSize(horizontal: false, vertical: true)
+            Text("\(request.fileCount) file\(request.fileCount == 1 ? "" : "s") · \(request.byteCount.formattedBytes)")
+                .font(.callout.monospacedDigit())
+                .foregroundStyle(.secondary)
+            TextField("Type \(VerifiedRemovalService.confirmationToken) to continue", text: $confirmation)
+                .textFieldStyle(.roundedBorder)
+            HStack {
+                Spacer()
+                Button("Cancel", action: onCancel)
+                    .keyboardShortcut(.cancelAction)
+                Button(request.kind == .drive ? "Verify and Take Off Drive" : "Verify and Remove from Source", role: .destructive) {
+                    onConfirm(confirmation)
+                }
+                .disabled(confirmation != VerifiedRemovalService.confirmationToken)
+            }
+        }
+        .padding(20)
+        .frame(width: 520)
+    }
+
+    private var explanation: String {
+        switch request.kind {
+        case .drive:
+            "Camera Toolkit re-hashes every drive copy against its NAS copy. Only if all of them match, the drive copies move into the hidden _Trash folder on the same drive. They stay recoverable there until you empty it in Settings."
+        case .source:
+            "Camera Toolkit re-hashes every file on the card or unsorted folder against its drive copy. Only if all of them match, the source originals are permanently deleted. The drive copies stay."
+        }
+    }
+}
+
+/// Organizer Trash confirmation. Count and source sit in the header, each
+/// volume's `_Trash` folder gets its own boxed row — the line the owner must
+/// not miss — and a note keeps it distinct from Finder Trash. Esc cancels;
+/// Move to Trash is the red default button.
+struct TrashConfirmSheet: View {
+    let request: PendingTrashRequest
+    let onCancel: () -> Void
+    let onConfirm: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: "trash.fill")
+                    .font(.title)
+                    .foregroundStyle(.orange)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Move \(request.fileCount) file\(request.fileCount == 1 ? "" : "s") to Trash?")
+                        .font(.title2.bold())
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text("\(request.byteCount.formattedBytes) · from \(request.locationName)")
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+
+            destinationCard
+
+            if !request.sampleNames.isEmpty {
+                Text(fileList)
+                    .font(.system(.callout, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(3)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Label {
+                Text("Not the Finder Trash. ")
+                    .fontWeight(.semibold)
+                    + Text("Restore from Settings → Trash — nothing is permanently deleted until you empty it.")
+            } icon: {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+            }
+            .font(.callout)
+            .fixedSize(horizontal: false, vertical: true)
+
+            HStack {
+                Spacer()
+                Button("Cancel", action: onCancel)
+                    .keyboardShortcut(.cancelAction)
+                Button("Move to Trash", role: .destructive, action: onConfirm)
+                    .buttonStyle(.borderedProminent)
+                    .tint(.red)
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20)
+        .frame(width: 520)
+    }
+
+    /// The "where they go" card: one row per volume's `_Trash` folder so the
+    /// destination reads as a destination, not a bullet inside a paragraph.
+    private var destinationCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Where they go")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+            if request.destinations.isEmpty {
+                Text("No reachable files to move.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(request.destinations, id: \.trashFolderPath) { destination in
+                    HStack(alignment: .top, spacing: 10) {
+                        Image(systemName: "externaldrive.fill")
+                            .font(.title3)
+                            .foregroundStyle(.orange)
+                        VStack(alignment: .leading, spacing: 2) {
+                            HStack(alignment: .firstTextBaseline) {
+                                Text(destination.volumeLabel)
+                                    .font(.headline)
+                                if request.destinations.count > 1 {
+                                    Spacer(minLength: 8)
+                                    Text("\(destination.fileCount) file\(destination.fileCount == 1 ? "" : "s") · \(destination.byteCount.formattedBytes)")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                            Text(destination.trashFolderPath)
+                                .font(.system(.callout, design: .monospaced))
+                                .textSelection(.enabled)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                }
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Color.orange.opacity(0.08))
+        }
+        .overlay {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(Color.orange.opacity(0.3), lineWidth: 1)
+        }
+    }
+
+    private var fileList: String {
+        var list = request.sampleNames.joined(separator: ", ")
+        if request.fileCount > request.sampleNames.count {
+            list += " and \(request.fileCount - request.sampleNames.count) more"
+        }
+        return list
+    }
+}
+
+/// The one compute sheet for face scans: quality tier plus Fast (pin the
+/// Mac). No model names — the owner picks how hard to look, the models
+/// are fixed.
+struct FaceScanSheet: View {
+    /// What is being scanned — an unsorted location's name or an event's
+    /// breadcrumb title.
+    let name: String
+    /// MED and above need the converted detector package; without it the
+    /// scan button stays off and the fix is spelled out inline.
+    let engineInstalled: Bool
+    let onCancel: () -> Void
+    let onScan: (FaceScanOptions) -> Void
+
+    @State private var mode: FaceScanGrade = .low
+    @State private var fast = true
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Scan for Faces")
+                .font(.title2.bold())
+            Text(name)
+                .foregroundStyle(.secondary)
+            Form {
+                Picker("Quality", selection: $mode) {
+                    Text("Low").tag(FaceScanGrade.low)
+                    Text("Medium").tag(FaceScanGrade.med)
+                    Text("High").tag(FaceScanGrade.high)
+                    Text("Extra High").tag(FaceScanGrade.xhigh)
+                }
+                .pickerStyle(.segmented)
+                Toggle("Fast — pin the Mac", isOn: $fast)
+                    .help("Uses every core it can and will run hot. Turn off to keep the machine quiet; same quality, longer wait.")
+            }
+            .formStyle(.grouped)
+            Text(modeHelp)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if !engineInstalled {
+                Label(
+                    "Face scans need the face engine installed — run \(FaceSidecarInstallation.setupCommand) once on this Mac.",
+                    systemImage: "exclamationmark.triangle.fill"
+                )
+                .font(.caption)
+                .foregroundStyle(.orange)
+                .fixedSize(horizontal: false, vertical: true)
+            }
+            HStack {
+                Spacer()
+                Button("Cancel", action: onCancel)
+                    .keyboardShortcut(.cancelAction)
+                Button("Scan") {
+                    onScan(FaceScanOptions(mode: mode, fast: fast))
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(!engineInstalled)
+            }
+        }
+        .padding(20)
+        .frame(width: 460)
+    }
+
+
+    private var modeHelp: String {
+        switch mode {
+        case .med:
+            "A more careful pass: stills plus a light sample of video frames, and it finds smaller faces down to about 40 px."
+        case .high:
+            "The deep pass: stills at two scales, faces down to about 30 px, and roughly one frame per second of video. Takes a while on big libraries."
+        case .xhigh:
+            "The everything pass: every burst frame, stills at three scales, faces down to about 30 px, about two video frames per second, and a second look at each face that sharpens your named people's templates. Best overnight, after naming people."
+        default:
+            "The quick pass: still photos only, faces large enough to matter. Videos are skipped."
+        }
+    }
+}

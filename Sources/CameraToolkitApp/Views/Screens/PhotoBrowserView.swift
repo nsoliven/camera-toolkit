@@ -178,7 +178,7 @@ struct PhotoBrowserView: View {
     @State private var isCollectingEventFiles = false
     @State private var collectedEventFiles: [String: EventFileSelection] = [:]
     @State private var isShowingCollectedFiles = false
-    @State private var previewPaneWidth: CGFloat = 390
+    @AppStorage("CameraToolkit.browser.previewPaneWidth") private var previewPaneWidth: Double = 390
     @State private var browserOperationLabel: String?
     @State private var storageCapacities: [String: StorageCapacitySnapshot] = [:]
     @State private var copyAvailabilityRefreshRevision = 0
@@ -207,14 +207,14 @@ struct PhotoBrowserView: View {
                             .frame(minWidth: 420, maxWidth: .infinity, minHeight: 320, maxHeight: .infinity)
                         if let selectedPreviewURL {
                         let maximumPreviewWidth = max(260, geometry.size.width - 420 - PreviewPaneResizeHandle.width)
-                        let renderedPreviewWidth = min(max(previewPaneWidth, 260), maximumPreviewWidth)
+                        let renderedPreviewWidth = min(max(previewPaneWidth, 260), Double(maximumPreviewWidth))
                             PreviewPaneResizeHandle(
                                 previewWidth: $previewPaneWidth,
                                 renderedPreviewWidth: renderedPreviewWidth,
-                                maximumPreviewWidth: maximumPreviewWidth
+                                maximumPreviewWidth: Double(maximumPreviewWidth)
                             )
                             CameraSelectionPreview(url: selectedPreviewURL)
-                                .frame(width: renderedPreviewWidth)
+                                .frame(width: CGFloat(renderedPreviewWidth))
                         }
                     }
                 }
@@ -263,6 +263,12 @@ struct PhotoBrowserView: View {
                 try? await Task.sleep(for: .seconds(10))
             }
         }
+        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didMountNotification)) { _ in
+            handleVolumeChange()
+        }
+        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didUnmountNotification)) { _ in
+            handleVolumeChange()
+        }
         .onChange(of: selectedLocationID) { _, newValue in
             guard let location = locations.first(where: { $0.id == newValue }) else { return }
             hasRequestedImportPreview = false
@@ -283,8 +289,8 @@ struct PhotoBrowserView: View {
             }
         }
         .sheet(isPresented: $isCreatingEvent) {
-            NewCameraEventSheet { name, date in
-                model.createEvent(named: name, on: date)
+            NewCameraEventSheet(parents: model.displayEvents) { name, date, parentEventID in
+                model.createEvent(named: name, on: date, parentEventID: parentEventID)
                 isCreatingEvent = false
             }
         }
@@ -341,12 +347,12 @@ struct PhotoBrowserView: View {
 
                 Section("Activity") {
                     sidebarActionButton(
-                        title: "Transfers",
-                        detail: transferSidebarDetail,
-                        symbol: transferSidebarSymbol,
-                        color: transferSidebarColor,
-                        badge: transferSidebarBadge,
-                        help: "Open the separate Transfer Queue window and see copy or checksum progress"
+                        title: "Jobs…",
+                        detail: jobsSidebarDetail,
+                        symbol: jobsSidebarSymbol,
+                        color: jobsSidebarColor,
+                        badge: jobsSidebarBadge,
+                        help: "Open the Jobs window — transfers, burst regrouping, face scans, and other background work with progress"
                     ) {
                         TransferQueueWindowController.shared.show(model: model)
                     }
@@ -354,7 +360,7 @@ struct PhotoBrowserView: View {
 
                 Section("Tools") {
                     sidebarActionButton(
-                        title: "Speed Tests",
+                        title: "Speed Tests…",
                         detail: model.isStorageBenchmarkRunning ? "Measuring connected storage" : "Find the slowest drive or USB link",
                         symbol: "gauge.with.dots.needle.50percent",
                         color: model.isStorageBenchmarkRunning ? .blue : .secondary,
@@ -364,7 +370,7 @@ struct PhotoBrowserView: View {
                     }
 
                     sidebarActionButton(
-                        title: "Events",
+                        title: "Events…",
                         detail: "Browse \(model.savedEvents.count) saved event\(model.savedEvents.count == 1 ? "" : "s")",
                         symbol: "calendar.badge.clock",
                         color: .blue,
@@ -374,7 +380,7 @@ struct PhotoBrowserView: View {
                     }
 
                     sidebarActionButton(
-                        title: "Photo Database",
+                        title: "Photo Database…",
                         detail: "Files, locations, and read-only SQL",
                         symbol: "cylinder.split.1x2",
                         color: .secondary,
@@ -384,7 +390,7 @@ struct PhotoBrowserView: View {
                     }
 
                     sidebarActionButton(
-                        title: "Keyboard Shortcuts",
+                        title: "Keyboard Shortcuts…",
                         detail: "See every app shortcut",
                         symbol: "keyboard",
                         color: .secondary,
@@ -398,6 +404,15 @@ struct PhotoBrowserView: View {
 
             Divider()
             VStack(spacing: 2) {
+                Button {
+                    AppShellMode.show(.events)
+                } label: {
+                    Label("Events", systemImage: "rectangle.grid.2x2")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
+                }
+                .help("Switch to the event organizer (Option-Command-1)")
+
                 Button {
                     chooseAnyFolder()
                 } label: {
@@ -456,7 +471,7 @@ struct PhotoBrowserView: View {
             Button {
                 showDriveInformation(location)
             } label: {
-                Label("Get Info", systemImage: "info.circle")
+                Label("Get Info…", systemImage: "info.circle")
             }
 
             Divider()
@@ -698,37 +713,42 @@ struct PhotoBrowserView: View {
         .accessibilityLabel("\(title), \(detail)")
     }
 
-    private var transferSidebarDetail: String {
+    private var jobsSidebarDetail: String {
+        if let job = model.activeJob {
+            return job.note
+        }
         if model.pendingTransferFileCount > 0 {
-            if let active = model.transferQueue, active.state == .running {
-                return "\(active.sidebarSummary.detail) · \(model.pendingTransferFileCount) next"
-            }
             return "\(model.pendingTransferFileCount) file\(model.pendingTransferFileCount == 1 ? "" : "s") waiting"
         }
         return model.transferQueue?.sidebarSummary.detail ?? "Nothing running"
     }
 
-    private var transferSidebarBadge: String? {
-        model.transferQueue?.sidebarSummary.badge ?? (model.pendingTransferFileCount > 0 ? "\(model.pendingTransferFileCount)" : nil)
+    private var jobsSidebarBadge: String? {
+        if let job = model.activeJob {
+            return job.progress.formatted(.percent.precision(.fractionLength(0)))
+        }
+        return model.transferQueue?.sidebarSummary.badge ?? (model.pendingTransferFileCount > 0 ? "\(model.pendingTransferFileCount)" : nil)
     }
 
-    private var transferSidebarSymbol: String {
+    private var jobsSidebarSymbol: String {
+        if model.activeJob != nil { return "list.bullet.clipboard.fill" }
         switch model.transferQueue?.state {
-        case .running: "arrow.down.circle.fill"
-        case .completed: "checkmark.circle.fill"
-        case .failed: "exclamationmark.circle.fill"
-        case .cancelled: "xmark.circle.fill"
-        case nil: model.pendingTransferFileCount > 0 ? "clock.arrow.circlepath" : "arrow.down.circle"
+        case .completed: return "checkmark.circle"
+        case .failed: return "exclamationmark.circle"
+        case .cancelled: return "xmark.circle"
+        case .running, nil:
+            return model.pendingTransferFileCount > 0 ? "clock.arrow.circlepath" : "list.bullet.clipboard"
         }
     }
 
-    private var transferSidebarColor: Color {
+    private var jobsSidebarColor: Color {
+        if model.activeJob != nil { return .blue }
         switch model.transferQueue?.state {
-        case .running: .blue
-        case .completed: .green
-        case .failed: .red
-        case .cancelled: .secondary
-        case nil: model.pendingTransferFileCount > 0 ? .blue : .secondary
+        case .completed: return .green
+        case .failed: return .red
+        case .cancelled: return .secondary
+        case .running, nil:
+            return model.pendingTransferFileCount > 0 ? .blue : .secondary
         }
     }
 
@@ -822,7 +842,7 @@ struct PhotoBrowserView: View {
             Button {
                 createFolder()
             } label: {
-                Label("New Folder", systemImage: "folder.badge.plus")
+                Label("New Folder…", systemImage: "folder.badge.plus")
             }
             .help("New Folder")
 
@@ -1032,30 +1052,30 @@ struct PhotoBrowserView: View {
                     }
                 }
                 .onKeyPress(.space) {
-                    guard isFileTableFocused else { return .ignored }
+                    guard isFileTableFocused, !KeyboardTextFocus.isTypingInTextField() else { return .ignored }
                     previewSelection()
                     return .handled
                 }
                 .onKeyPress(.upArrow) {
-                    guard isFileTableFocused else { return .ignored }
+                    guard isFileTableFocused, !KeyboardTextFocus.isTypingInTextField() else { return .ignored }
                     selectAdjacentItem(offset: -1)
                     return .handled
                 }
                 .onKeyPress(.downArrow) {
-                    guard isFileTableFocused else { return .ignored }
+                    guard isFileTableFocused, !KeyboardTextFocus.isTypingInTextField() else { return .ignored }
                     selectAdjacentItem(offset: 1)
                     return .handled
                 }
                 .onKeyPress(.leftArrow) {
-                    guard isFileTableFocused else { return .ignored }
+                    guard isFileTableFocused, !KeyboardTextFocus.isTypingInTextField() else { return .ignored }
                     return collapseSelectionOrSelectParent()
                 }
                 .onKeyPress(.rightArrow) {
-                    guard isFileTableFocused else { return .ignored }
+                    guard isFileTableFocused, !KeyboardTextFocus.isTypingInTextField() else { return .ignored }
                     return expandSelectionOrSelectFirstChild()
                 }
                 .onKeyPress(.return) {
-                    guard isFileTableFocused else { return .ignored }
+                    guard isFileTableFocused, !KeyboardTextFocus.isTypingInTextField() else { return .ignored }
                     openSelection()
                     return .handled
                 }
@@ -1256,7 +1276,7 @@ struct PhotoBrowserView: View {
                     model.assignFilesToSelectedEvent(assignableSelections)
                 } label: {
                     Label(
-                        "Assign \(assignableSelections.count) to \(event.name)",
+                        "Assign \(assignableSelections.count) to \(model.eventTitle(event))",
                         systemImage: "calendar.badge.plus"
                     )
                 }
@@ -1428,9 +1448,9 @@ struct PhotoBrowserView: View {
                 }
             )) {
                 Text("Choose an event").tag(UUID?.none)
-                ForEach(model.savedEvents) { event in
-                    Text("\(event.name) · \(event.eventDate.formatted(date: .abbreviated, time: .omitted))")
-                        .tag(Optional(event.id))
+                ForEach(model.displayEvents, id: \.event.id) { row in
+                    Text("\(model.eventTitle(row.event)) · \(row.event.eventDate.formatted(date: .abbreviated, time: .omitted))")
+                        .tag(Optional(row.event.id))
                 }
             }
             .frame(width: 250)
@@ -1438,7 +1458,7 @@ struct PhotoBrowserView: View {
             Button {
                 isCreatingEvent = true
             } label: {
-                Label("New Event", systemImage: "plus")
+                Label("New Event…", systemImage: "plus")
             }
 
             Button {
@@ -1668,7 +1688,7 @@ struct PhotoBrowserView: View {
 
     private var archiveOriginalsRelativePath: String {
         let layout = OrganizedArchiveLayout(configuration: model.configuration)
-        return ["Originals", layout.year, layout.eventFolder, layout.deviceFolder].joined(separator: "/")
+        return ["Originals", layout.year, layout.eventFolderPath, layout.deviceFolder].joined(separator: "/")
     }
 
     private var archiveOriginalsBasePath: String {
@@ -2083,7 +2103,10 @@ struct PhotoBrowserView: View {
             fileURLWithPath: DashboardModel.expandedPath(model.configuration.importSourcePath),
             isDirectory: true
         ).standardizedFileURL.path
-        let eventsByID = Dictionary(uniqueKeysWithValues: model.savedEvents.map { ($0.id, $0) })
+        var eventsByID: [UUID: SavedCameraEvent] = [:]
+        for event in model.savedEvents where eventsByID[event.id] == nil {
+            eventsByID[event.id] = event
+        }
         var result: [BrowserFileIdentity: SavedCameraEvent] = [:]
         for assignment in model.configuration.photoEventAssignments where
             URL(fileURLWithPath: assignment.sourceRootPath, isDirectory: true).standardizedFileURL.path == root {
@@ -2372,6 +2395,7 @@ struct PhotoBrowserView: View {
     }
 
     private func perform(_ command: BrowserCommand) {
+        guard command.isAllowedWhileTyping || !KeyboardTextFocus.isTypingInTextField() else { return }
         switch command {
         case .copySelection:
             FileClipboardWriter.copy(selectedURLs)
@@ -2411,6 +2435,9 @@ struct PhotoBrowserView: View {
                 return
             }
             showDriveInformation(location)
+        case .find:
+            // The file browser has no search field; Events boards handle it.
+            break
         }
     }
 
@@ -2736,6 +2763,24 @@ struct PhotoBrowserView: View {
         return FileManager.default.fileExists(atPath: DashboardModel.expandedPath(path), isDirectory: &directory) && directory.boolValue
     }
 
+    /// A volume mounted or unmounted: refresh the sidebar dots and capacities
+    /// right away (the 10s poll would catch up anyway), reload the current
+    /// folder when its drive just came back, and flag it when its drive left.
+    private func handleVolumeChange() {
+        copyAvailabilityRefreshRevision &+= 1
+        Task { await refreshStorageCapacities() }
+        guard !isLoading else { return }
+        if folderExists(currentURL.path) {
+            if browserError != nil {
+                Task { await loadCurrentDirectory() }
+            }
+        } else if browserError == nil {
+            items = []
+            resetBrowserTree()
+            browserError = "This folder is on a drive that is not connected right now."
+        }
+    }
+
     private func sourceDisplayName(_ location: ConfiguredLocation) -> String {
         let path = location.path.lowercased()
         if path.contains("/cameratoolkit/simulation/") { return "Safety Test Card" }
@@ -2778,11 +2823,11 @@ struct PhotoBrowserView: View {
 private struct PreviewPaneResizeHandle: View {
     static let width: CGFloat = 10
 
-    @Binding var previewWidth: CGFloat
-    let renderedPreviewWidth: CGFloat
-    let maximumPreviewWidth: CGFloat
+    @Binding var previewWidth: Double
+    let renderedPreviewWidth: Double
+    let maximumPreviewWidth: Double
 
-    @State private var dragOriginWidth: CGFloat?
+    @State private var dragOriginWidth: Double?
     @State private var isHovering = false
 
     var body: some View {
@@ -2898,11 +2943,14 @@ private struct CollectedEventFilesView: View {
 }
 
 private struct NewCameraEventSheet: View {
-    var onCreate: (String, Date) -> Void
+    /// Candidate parents in flattened sidebar order for the "Inside event" picker.
+    var parents: [(event: SavedCameraEvent, depth: Int)] = []
+    var onCreate: (String, Date, UUID?) -> Void
 
     @Environment(\.dismiss) private var dismiss
     @State private var name = ""
     @State private var date = Date()
+    @State private var parentEventID: UUID?
     @State private var hasAttemptedCreate = false
     @FocusState private var isNameFocused: Bool
 
@@ -2950,6 +2998,14 @@ private struct NewCameraEventSheet: View {
                     }
                 }
                 DatePicker("Event date", selection: $date, displayedComponents: .date)
+                Picker("Inside event", selection: $parentEventID) {
+                    Text("None — top level").tag(UUID?.none)
+                    ForEach(parents, id: \.event.id) { row in
+                        Text(String(repeating: "    ", count: row.depth) + row.event.name)
+                            .tag(UUID?.some(row.event.id))
+                    }
+                }
+                .help("A subevent's folder lives inside its parent event's folder.")
             }
             .formStyle(.grouped)
 
@@ -2977,7 +3033,7 @@ private struct NewCameraEventSheet: View {
             isNameFocused = true
             return
         }
-        onCreate(validation.normalizedName, date)
+        onCreate(validation.normalizedName, date, parentEventID)
     }
 }
 

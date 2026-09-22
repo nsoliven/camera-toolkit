@@ -718,6 +718,75 @@ final class DashboardModelTests: XCTestCase {
             XCTAssertEqual(model.pendingTransferBatches[0].files.map(\.path), ["DCIM/READY.ARW"])
         }
     }
+
+    /// Config writes are debounced, so a burst of mutations lands as one
+    /// write; `flushConfigurationSave` (termination) persists synchronously.
+    func testConfigurationMutationsPersistAfterDebounceAndFlush() async throws {
+        try await withTemporaryDirectoryAsync { root in
+            let store = ConfigurationStore(url: root.appendingPathComponent("config.json"))
+            let defaults = AppConfiguration.defaults(applicationSupport: root)
+            let model = DashboardModel(
+                activePlan: CopyPlan(),
+                jobs: [],
+                configuration: defaults,
+                configurationStore: store,
+                transferQueueStore: TransferQueueStore(url: root.appendingPathComponent("transfer-queue.json")),
+                pendingTransferQueueStore: PendingTransferQueueStore(url: root.appendingPathComponent("pending-transfers.json"))
+            )
+
+            model.updateConfiguration { $0.selectedDeviceID = "sony-a7v" }
+            model.updateConfiguration { $0.selectedDeviceID = "dji-nano" }
+            model.flushConfigurationSave()
+            XCTAssertEqual(try store.load(defaults: defaults).selectedDeviceID, "dji-nano")
+
+            model.updateConfiguration { $0.selectedDeviceID = "fuji-x100vi" }
+            var persisted = ""
+            let deadline = Date().addingTimeInterval(3)
+            while Date() < deadline, persisted != "fuji-x100vi" {
+                try await Task.sleep(for: .milliseconds(50))
+                persisted = (try? store.load(defaults: defaults).selectedDeviceID) ?? ""
+            }
+            XCTAssertEqual(persisted, "fuji-x100vi")
+        }
+    }
+
+    /// The apply board correlates its in-flight route diagram with the rename
+    /// job through the id `runBackgroundJob` hands back.
+    func testRunBackgroundJobReturnsIDAndRefusesWhileBusy() async throws {
+        try await withTemporaryDirectoryAsync { root in
+            let model = DashboardModel(
+                activePlan: CopyPlan(),
+                jobs: [],
+                configuration: AppConfiguration.defaults(applicationSupport: root),
+                configurationStore: ConfigurationStore(url: root.appendingPathComponent("config.json"))
+            )
+
+            let jobID = model.runBackgroundJob(
+                action: .organize,
+                runningNote: "Working",
+                logTitle: "Job",
+                logDetail: "",
+                operation: { _ in 42 },
+                completion: { _ in "Done" }
+            )
+            XCTAssertNotNil(jobID)
+            XCTAssertEqual(model.jobs.first?.id, jobID)
+            XCTAssertEqual(model.jobs.first?.state, .running)
+
+            let refused = model.runBackgroundJob(
+                action: .organize,
+                runningNote: "Working",
+                logTitle: "Job",
+                logDetail: "",
+                operation: { _ in 42 },
+                completion: { _ in "Done" }
+            )
+            XCTAssertNil(refused)
+
+            try await waitForIdle(model)
+            XCTAssertEqual(model.jobs.first?.state, .done)
+        }
+    }
 }
 
 @discardableResult

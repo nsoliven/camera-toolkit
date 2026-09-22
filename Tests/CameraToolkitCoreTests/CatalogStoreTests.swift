@@ -136,6 +136,51 @@ final class CatalogStoreTests: XCTestCase {
         }
     }
 
+    func testBootstrapAddsParentEventIDToExistingCatalogs() throws {
+        try withTemporaryDirectory { root in
+            let catalog = root.appendingPathComponent("catalog.sqlite")
+            // A catalog written before subevents existed: `events` has no
+            // parent_event_id column.
+            var legacy: OpaquePointer?
+            XCTAssertEqual(sqlite3_open(catalog.path, &legacy), SQLITE_OK)
+            XCTAssertEqual(sqlite3_exec(
+                legacy,
+                """
+                CREATE TABLE events(
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    event_date TEXT NOT NULL,
+                    immich_upload_enabled INTEGER NOT NULL DEFAULT 0,
+                    immich_album_policy TEXT NOT NULL DEFAULT 'none',
+                    immich_album_name TEXT,
+                    created_at TEXT NOT NULL,
+                    last_used_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                """,
+                nil, nil, nil
+            ), SQLITE_OK)
+            sqlite3_close(legacy)
+
+            let parent = SavedCameraEvent(name: "PHIL2026", eventDate: Date(timeIntervalSince1970: 1_787_414_400))
+            let child = SavedCameraEvent(name: "Matcha", eventDate: Date(timeIntervalSince1970: 1_787_414_400), parentEventID: parent.id)
+            var configuration = testConfiguration(root: root)
+            configuration.savedEvents = [parent, child]
+
+            _ = try CatalogStore(url: catalog).bootstrap(
+                configuration: configuration,
+                createBackup: false,
+                createLibraryFolders: false
+            )
+
+            XCTAssertEqual(
+                try stringValue("SELECT parent_event_id FROM events WHERE id = '\(child.id.uuidString)'", database: catalog),
+                parent.id.uuidString
+            )
+            XCTAssertNil(try stringValue("SELECT parent_event_id FROM events WHERE id = '\(parent.id.uuidString)'", database: catalog))
+        }
+    }
+
     private func integerValue(_ sql: String, database url: URL) throws -> Int {
         var database: OpaquePointer?
         guard sqlite3_open(url.path, &database) == SQLITE_OK, let database else {
@@ -153,5 +198,26 @@ final class CatalogStoreTests: XCTestCase {
             return 0
         }
         return Int(sqlite3_column_int(statement, 0))
+    }
+
+    private func stringValue(_ sql: String, database url: URL) throws -> String? {
+        var database: OpaquePointer?
+        guard sqlite3_open(url.path, &database) == SQLITE_OK, let database else {
+            throw XCTSkip("Could not open catalog database")
+        }
+        defer { sqlite3_close(database) }
+
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK, let statement else {
+            throw XCTSkip("Could not prepare catalog query")
+        }
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_step(statement) == SQLITE_ROW,
+              sqlite3_column_type(statement, 0) != SQLITE_NULL,
+              let text = sqlite3_column_text(statement, 0) else {
+            return nil
+        }
+        return String(cString: text)
     }
 }

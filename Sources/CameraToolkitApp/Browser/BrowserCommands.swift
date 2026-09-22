@@ -1,7 +1,7 @@
 import AppKit
 import SwiftUI
 
-enum BrowserCommand: String, Sendable {
+enum BrowserCommand: String, Sendable, CaseIterable {
     case copySelection
     case moveSelectionToTrash
     case selectAll
@@ -18,6 +18,15 @@ enum BrowserCommand: String, Sendable {
     case decreaseThumbnailSize
     case reload
     case showSelectedLocationInformation
+    /// Focus the search field of whichever board supports it (the organize
+    /// board today). Boards without a search field ignore it.
+    case find
+
+    /// Commands that may still run while a text field owns typing. Menu and
+    /// monitor posts are gated before they reach a board; `.reload` is
+    /// posted by the app itself after a job finishes and is never a
+    /// keyboard shortcut.
+    var isAllowedWhileTyping: Bool { self == .reload }
 
     static let notification = Notification.Name("CameraToolkit.BrowserCommand")
 
@@ -157,7 +166,7 @@ enum CameraToolkitShortcutCatalog {
                 .init(action: "Larger or smaller thumbnails", keys: "⌘+  ⌘−", detail: "Resizes browser thumbnails and remembers the chosen size."),
                 .init(action: "Select across folders", keys: "+ button", detail: "Starts an event-selection basket that stays with you while browsing folders or camera sources."),
                 .init(action: "Open Event Library", keys: "⌥⌘E", detail: "Shows event photos across their camera, buffer, library, and Immich locations."),
-                .init(action: "Open Transfer Queue", keys: "⌥⌘T", detail: "Shows what is copying or verifying, current speed, progress, and any problem."),
+                .init(action: "Open Jobs", keys: "⌥⌘T", detail: "Shows transfers, burst regrouping, face scans, and other background jobs with progress and any problem."),
                 .init(action: "Open SQL Inspector", keys: "⇧⌘I", detail: "Browses the SQLite photo list, schema, and read-only SQL queries."),
                 .init(action: "New folder", keys: "⇧⌘N", detail: "Creates a folder in the location currently being browsed."),
                 .init(action: "Reveal in Finder", keys: "⇧⌘R", detail: "Shows the selected files in Finder."),

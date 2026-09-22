@@ -166,6 +166,9 @@ public enum JobAction: String, Codable, CaseIterable, Sendable {
     case verifyManifest
     case diskSpeed
     case networkSpeed
+    case organize
+    case immichUpload
+    case faceScan
 }
 
 public struct JobSnapshot: Identifiable, Codable, Hashable, Sendable {
@@ -184,6 +187,10 @@ public struct JobSnapshot: Identifiable, Codable, Hashable, Sendable {
     public var processedBytes: Int64
     public var totalBytes: Int64
     public var bytesPerSecond: Double
+    /// Live detail for the Jobs window's activity pane — the last
+    /// `JobTelemetry` the job reported, kept after completion as its final
+    /// counters.
+    public var telemetry: JobTelemetry?
     public var createdAt: Date
     public var finishedAt: Date?
 
@@ -203,6 +210,7 @@ public struct JobSnapshot: Identifiable, Codable, Hashable, Sendable {
         processedBytes: Int64 = 0,
         totalBytes: Int64 = 0,
         bytesPerSecond: Double = 0,
+        telemetry: JobTelemetry? = nil,
         createdAt: Date = Date(),
         finishedAt: Date? = nil
     ) {
@@ -221,6 +229,7 @@ public struct JobSnapshot: Identifiable, Codable, Hashable, Sendable {
         self.processedBytes = processedBytes
         self.totalBytes = totalBytes
         self.bytesPerSecond = bytesPerSecond
+        self.telemetry = telemetry
         self.createdAt = createdAt
         self.finishedAt = finishedAt
     }

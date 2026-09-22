@@ -139,29 +139,30 @@ private struct EventLibraryView: View {
             .padding(12)
             Divider()
             List(selection: $selectedEventID) {
-                ForEach(model.savedEvents) { event in
+                ForEach(EventHierarchy.flattened(model.configuration.savedEvents), id: \.event.id) { row in
                     VStack(alignment: .leading, spacing: 4) {
                         HStack {
-                            Text(event.name)
+                            Text(row.event.name)
                                 .lineLimit(1)
                             Spacer()
-                            Text("\(assignmentCount(for: event.id))")
+                            Text("\(assignmentCount(for: row.event.id))")
                                 .font(.caption.monospacedDigit())
                                 .foregroundStyle(.secondary)
                         }
                         HStack(spacing: 6) {
-                            Text(event.eventDate.formatted(date: .abbreviated, time: .omitted))
+                            Text(row.event.eventDate.formatted(date: .abbreviated, time: .omitted))
                             Text("·")
                             Label(
-                                event.sendsToImmich ? "Immich" : "Storage only",
-                                systemImage: event.sendsToImmich ? "cloud" : "externaldrive"
+                                row.event.sendsToImmich ? "Immich" : "Storage only",
+                                systemImage: row.event.sendsToImmich ? "cloud" : "externaldrive"
                             )
                         }
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     }
                     .padding(.vertical, 3)
-                    .tag(Optional(event.id))
+                    .padding(.leading, CGFloat(row.depth) * 14)
+                    .tag(Optional(row.event.id))
                 }
             }
             .listStyle(.sidebar)
@@ -174,7 +175,7 @@ private struct EventLibraryView: View {
             VStack(spacing: 10) {
                 HStack(spacing: 12) {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(event.name)
+                        Text(EventHierarchy.displayName(of: event, in: model.configuration.savedEvents))
                             .font(.title2.bold())
                         Text("\(event.eventDate.formatted(date: .long, time: .omitted)) · \(rows.count) assigned item\(rows.count == 1 ? "" : "s")")
                             .font(.caption)
@@ -339,7 +340,7 @@ private struct EventLibraryView: View {
             Button {
                 CatalogInspectorWindowController.shared.show(model: model)
             } label: {
-                Label("SQL Inspector", systemImage: "cylinder.split.1x2")
+                Label("SQL Inspector…", systemImage: "cylinder.split.1x2")
             }
             .buttonStyle(.borderless)
         }
@@ -431,28 +432,18 @@ private struct EventLibraryView: View {
     }
 
     private func eventFolderURLs(_ event: SavedCameraEvent) -> (photomator: URL, exports: URL, libraryEdited: URL) {
-        let formatter = DateFormatter()
-        formatter.calendar = Calendar(identifier: .gregorian)
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "yyyy-MM-dd"
-        let layout = OrganizedArchiveLayout(
-            eventDate: formatter.string(from: event.eventDate),
-            eventName: event.name,
-            deviceID: model.configuration.selectedDeviceID
-        )
-        let bufferEvent = URL(
-            fileURLWithPath: NSString(string: model.configuration.bufferPath).expandingTildeInPath,
-            isDirectory: true
-        )
-            .appendingPathComponent(layout.year, isDirectory: true)
-            .appendingPathComponent(layout.eventFolder, isDirectory: true)
-        let editedEvent = URL(
-            fileURLWithPath: NSString(string: model.configuration.cameraLibraryRootPath).expandingTildeInPath,
-            isDirectory: true
-        )
+        // The shared resolver keeps subevent folders nested inside their
+        // parent event folder on both the Buffer and the library.
+        let locations = EventStorageLocations(configuration: model.configuration)
+        let layout = locations.layout(for: event, deviceID: model.configuration.selectedDeviceID)
+        let bufferEvent = locations.eventFolder(for: event, policy: .buffer)
+        var editedEvent = locations.libraryRoot
             .appendingPathComponent("Edited", isDirectory: true)
             .appendingPathComponent(layout.year, isDirectory: true)
-            .appendingPathComponent(layout.eventFolder, isDirectory: true)
+        for folder in layout.parentEventFolders {
+            editedEvent.appendPathComponent(folder, isDirectory: true)
+        }
+        editedEvent.appendPathComponent(layout.eventFolder, isDirectory: true)
         return (
             bufferEvent.appendingPathComponent("Photomator", isDirectory: true),
             bufferEvent.appendingPathComponent("Exports", isDirectory: true),
@@ -631,29 +622,19 @@ private struct EventLibraryView: View {
         configuration: AppConfiguration,
         cachedAssets: [String: CatalogEventAsset]
     ) -> [EventAssetRow] {
-        let formatter = DateFormatter()
-        formatter.calendar = Calendar(identifier: .gregorian)
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "yyyy-MM-dd"
-        let eventDate = formatter.string(from: event.eventDate)
+        let locations = EventStorageLocations(configuration: configuration)
 
         return assignments.compactMap { assignment in
             guard (try? PathSafety.validateRelativePath(assignment.relativePath)) != nil else { return nil }
             let deviceID = assignment.deviceID ?? configuration.selectedDeviceID
-            let layout = OrganizedArchiveLayout(eventDate: eventDate, eventName: event.name, deviceID: deviceID)
+            let layout = locations.layout(for: event, deviceID: deviceID)
             let sourceRoot = NSString(string: assignment.sourceRootPath).expandingTildeInPath
-            let bufferRoot = NSString(string: configuration.bufferPath).expandingTildeInPath
-            let libraryRoot = NSString(string: configuration.cameraLibraryRootPath).expandingTildeInPath
             let sourceURL = URL(fileURLWithPath: sourceRoot, isDirectory: true)
                 .appendingPathComponent(assignment.relativePath)
-            let bufferURL = URL(fileURLWithPath: bufferRoot, isDirectory: true)
-                .appendingPathComponent(layout.year, isDirectory: true)
-                .appendingPathComponent(layout.eventFolder, isDirectory: true)
-                .appendingPathComponent(layout.deviceFolder, isDirectory: true)
-                .appendingPathComponent("Card Copy", isDirectory: true)
+            let bufferURL = locations.cardCopyRoot(for: event, deviceID: deviceID, policy: .buffer)
                 .appendingPathComponent(assignment.relativePath)
             guard let archiveRelativePath = try? layout.destinationRelativePath(for: assignment.relativePath) else { return nil }
-            let archiveURL = URL(fileURLWithPath: libraryRoot, isDirectory: true)
+            let archiveURL = locations.libraryRoot
                 .appendingPathComponent(archiveRelativePath)
             let id = CatalogStore.eventAssetID(assignment)
             let cached = cachedAssets[id]

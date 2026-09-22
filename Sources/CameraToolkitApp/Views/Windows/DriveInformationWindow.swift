@@ -295,7 +295,7 @@ private struct DriveInformationView: View {
                 Button {
                     StorageBenchmarkWindowController.shared.show(model: dashboardModel)
                 } label: {
-                    Label("Run Speed Test", systemImage: "gauge.with.dots.needle.50percent")
+                    Label("Run Speed Test…", systemImage: "gauge.with.dots.needle.50percent")
                 }
                 .disabled(dashboardModel.isBusy)
 

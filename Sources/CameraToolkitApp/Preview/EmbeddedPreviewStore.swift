@@ -58,11 +58,18 @@ actor EmbeddedPreviewStore {
         return data
     }
 
+    /// Wall-clock bound on a preview decode wait. A read stuck on a dead or
+    /// sleeping volume never resolves, so the caller is released after this
+    /// and the failure UI can replace the spinner. The decode keeps running
+    /// in the background — a late finish still lands in the cache.
+    static let decodeTimeout: Duration = .seconds(15)
+
     func previewImage(
         from url: URL,
         preference: EmbeddedJPEGPreviewPreference,
         maximumPixelSize: Int,
-        priority: TaskPriority
+        priority: TaskPriority,
+        timeout: Duration = EmbeddedPreviewStore.decodeTimeout
     ) async -> CGImage? {
         guard !Task.isCancelled else { return nil }
         let sourceKey = CacheKey(
@@ -72,21 +79,100 @@ actor EmbeddedPreviewStore {
         let key = ImageCacheKey(source: sourceKey, maximumPixelSize: maximumPixelSize)
         if let cached = imageCache[key] { return cached }
 
-        let image: CGImage?
+        DebugLog.shared.log(
+            "decode.start",
+            subsystem: .preview,
+            url: url,
+            detail: "\(maximumPixelSize) px"
+        )
+        let start = ContinuousClock.now
+        let pending = PendingDecode()
+        // Detached rather than a task-group child: a group scope waits for
+        // every child, so a decode parked in an uninterruptible read would
+        // hold the group — and the caller — open forever. The size stat runs
+        // inside the worker for the same reason: it can hang on a dead
+        // volume, and the waiter must still be released by the timer.
+        _ = Task.detached(priority: priority) { [self] in
+            pending.size = DebugLog.fileSize(of: url)
+            let decoded = await self.decodeImage(
+                url: url,
+                preference: preference,
+                maximumPixelSize: maximumPixelSize,
+                priority: priority
+            )
+            if let decoded { await self.store(decoded, for: key) }
+            pending.resolve(.decoded(decoded))
+        }
+        let timer = Task.detached {
+            try? await Task.sleep(for: timeout)
+            pending.resolve(.timeout)
+        }
+        let resolution = await withTaskCancellationHandler {
+            await withCheckedContinuation { pending.arm($0) }
+        } onCancel: {
+            pending.resolve(.cancelled)
+        }
+        timer.cancel()
+        let elapsed = ContinuousClock.now - start
+
+        switch resolution {
+        case .decoded(let image):
+            DebugLog.shared.log(
+                "decode.finish",
+                subsystem: .preview,
+                level: image == nil ? .warning : .debug,
+                outcome: image == nil ? .error : .ok,
+                duration: elapsed,
+                url: url,
+                size: pending.size,
+                error: image == nil ? "decode produced no image" : nil
+            )
+            return Task.isCancelled ? nil : image
+        case .timeout:
+            DebugLog.shared.log(
+                "decode.timeout",
+                subsystem: .preview,
+                level: .warning,
+                outcome: .timeout,
+                duration: elapsed,
+                url: url,
+                size: pending.size,
+                detail: "wait released; decode still running in background"
+            )
+            return nil
+        case .cancelled:
+            DebugLog.shared.log(
+                "decode.finish",
+                subsystem: .preview,
+                outcome: .cancel,
+                duration: elapsed,
+                url: url
+            )
+            return nil
+        }
+    }
+
+    private func decodeImage(
+        url: URL,
+        preference: EmbeddedJPEGPreviewPreference,
+        maximumPixelSize: Int,
+        priority: TaskPriority
+    ) async -> CGImage? {
         if CameraPreviewSupport.isEmbeddedSonyRAW(url) {
-            guard let data = await jpegData(from: url, preference: preference),
-                  !Task.isCancelled else { return nil }
-            image = await Task.detached(priority: priority) {
+            guard let data = await jpegData(from: url, preference: preference) else { return nil }
+            return await Task.detached(priority: priority) {
                 PreviewImageDecoder.cgImage(data: data, maximumPixelSize: maximumPixelSize)
             }.value
-        } else {
-            image = await Task.detached(priority: priority) {
-                PreviewImageDecoder.cgImage(url: url, maximumPixelSize: maximumPixelSize)
-            }.value
         }
+        return await Task.detached(priority: priority) {
+            PreviewImageDecoder.cgImage(url: url, maximumPixelSize: maximumPixelSize)
+        }.value
+    }
 
-        guard !Task.isCancelled, let image else { return nil }
-        if let cached = imageCache[key] { return cached }
+    /// Cache insert shared by the caller's own decode and a decode that
+    /// finishes after its waiter already timed out.
+    private func store(_ image: CGImage, for key: ImageCacheKey) {
+        if imageCache[key] != nil { return }
         imageCache[key] = image
         imageCacheOrder.append(key)
         cachedImageBytes += image.bytesPerRow * image.height
@@ -97,7 +183,58 @@ actor EmbeddedPreviewStore {
                 cachedImageBytes -= removed.bytesPerRow * removed.height
             }
         }
-        return image
+    }
+}
+
+/// First-wins resume box bounding a wait on a decode that may be parked in
+/// an uninterruptible filesystem call: the waiter is released on timeout or
+/// cancellation while the worker keeps running in the background.
+private final class PendingDecode: @unchecked Sendable {
+    enum Resolution {
+        case decoded(CGImage?)
+        case timeout
+        case cancelled
+    }
+
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Resolution, Never>?
+    private var resolution: Resolution?
+    private var reportedSize: Int64?
+
+    /// File size captured by the worker before decoding, so timeout and
+    /// finish events can report it when the `stat` got through.
+    var size: Int64? {
+        get { lock.lock(); defer { lock.unlock() }; return reportedSize }
+        set { lock.lock(); reportedSize = newValue; lock.unlock() }
+    }
+
+    func arm(_ continuation: CheckedContinuation<Resolution, Never>) {
+        lock.lock()
+        if let resolution {
+            lock.unlock()
+            continuation.resume(returning: resolution)
+            return
+        }
+        self.continuation = continuation
+        lock.unlock()
+    }
+
+    /// First call wins; a resolve that lands before `arm` is stashed so the
+    /// continuation still resumes instead of parking forever.
+    func resolve(_ resolution: Resolution) {
+        lock.lock()
+        guard self.resolution == nil else {
+            lock.unlock()
+            return
+        }
+        self.resolution = resolution
+        if let continuation {
+            self.continuation = nil
+            lock.unlock()
+            continuation.resume(returning: resolution)
+        } else {
+            lock.unlock()
+        }
     }
 }
 
@@ -113,6 +250,31 @@ enum CameraPreviewSupport {
 
     static func isEmbeddedSonyRAW(_ url: URL) -> Bool {
         url.pathExtension.lowercased() == "arw"
+    }
+}
+
+/// Spinner text that names what the file actually is — a PNG reads as
+/// "PNG", a RAW reads its embedded JPEG — so a stalled read on screen says
+/// something truthful about the file it's stuck on.
+enum PreviewLoadMessage {
+    static func title(for url: URL?) -> String {
+        guard let ext = url?.pathExtension.lowercased(), !ext.isEmpty else {
+            return "Reading preview…"
+        }
+        if OrganizeFileClassifier.rawExtensions.contains(ext) {
+            return "Reading embedded JPEG…"
+        }
+        switch ext {
+        case "jpg", "jpeg": return "Reading JPEG…"
+        case "png": return "Reading PNG…"
+        case "heic", "heif": return "Reading HEIC…"
+        case "tif", "tiff": return "Reading TIFF…"
+        case "webp": return "Reading WebP…"
+        default:
+            return OrganizeFileClassifier.videoExtensions.contains(ext)
+                ? "Reading video frame…"
+                : "Reading preview…"
+        }
     }
 }
 
@@ -203,209 +365,6 @@ struct CameraFileThumbnail: View {
     }
 }
 
-private struct InteractivePreviewCanvas: View {
-    let image: CGImage?
-    let isLoading: Bool
-    var unavailableTitle = "No Preview"
-    var unavailableDescription = "No embedded JPEG was found."
-    var onDismiss: (() -> Void)?
-
-    @State private var zoom: CGFloat = 1
-    @State private var panOffset: CGSize = .zero
-    @GestureState private var dragTranslation: CGSize = .zero
-    @GestureState private var magnification: CGFloat = 1
-    @FocusState private var hasKeyboardFocus: Bool
-
-    var body: some View {
-        GeometryReader { geometry in
-            let effectiveZoom = clampedZoom(zoom * magnification)
-            let proposedOffset = CGSize(
-                width: panOffset.width + dragTranslation.width,
-                height: panOffset.height + dragTranslation.height
-            )
-            let displayOffset = clampedOffset(
-                proposedOffset,
-                image: image,
-                canvasSize: geometry.size,
-                zoom: effectiveZoom
-            )
-
-            ZStack {
-                Color.black
-                if let image {
-                    Image(decorative: image, scale: 1)
-                        .resizable()
-                        .scaledToFit()
-                        .scaleEffect(effectiveZoom)
-                        .offset(displayOffset)
-                        .padding(10)
-                } else if isLoading {
-                    ProgressView("Reading embedded JPEG…")
-                        .tint(.white)
-                        .foregroundStyle(.white)
-                } else {
-                    ContentUnavailableView(
-                        unavailableTitle,
-                        systemImage: "photo.badge.exclamationmark",
-                        description: Text(unavailableDescription)
-                    )
-                    .foregroundStyle(.white)
-                }
-
-                if image != nil {
-                    VStack {
-                        Spacer()
-                        HStack(spacing: 6) {
-                            Button {
-                                setZoom(zoom / 1.25, image: image, canvasSize: geometry.size)
-                            } label: {
-                                Image(systemName: "minus.magnifyingglass")
-                            }
-                            .accessibilityLabel("Zoom Out")
-                            .help("Zoom Out")
-
-                            Text("\(Int(effectiveZoom * 100))%")
-                                .font(.caption.monospacedDigit())
-                                .frame(minWidth: 42)
-
-                            Button {
-                                setZoom(zoom * 1.25, image: image, canvasSize: geometry.size)
-                            } label: {
-                                Image(systemName: "plus.magnifyingglass")
-                            }
-                            .accessibilityLabel("Zoom In")
-                            .help("Zoom In")
-
-                            Divider().frame(height: 16)
-
-                            Button {
-                                setZoom(1, image: image, canvasSize: geometry.size)
-                            } label: {
-                                Image(systemName: "arrow.down.right.and.arrow.up.left")
-                            }
-                            .accessibilityLabel("Zoom to Fit")
-                            .help("Zoom to Fit (Command-0)")
-                            .keyboardShortcut("0", modifiers: .command)
-
-                            Button {
-                                setZoom(actualSizeZoom(image: image, canvasSize: geometry.size), image: image, canvasSize: geometry.size)
-                            } label: {
-                                Text("1:1")
-                                    .font(.caption.bold())
-                            }
-                            .accessibilityLabel("Actual Size")
-                            .help("Actual Size (Command-1)")
-                            .keyboardShortcut("1", modifiers: .command)
-                        }
-                        .buttonStyle(.borderless)
-                        .padding(.horizontal, 9)
-                        .padding(.vertical, 7)
-                        .background(.ultraThinMaterial, in: Capsule())
-                        .padding(12)
-                    }
-                }
-            }
-            .contentShape(Rectangle())
-            .simultaneousGesture(
-                DragGesture(minimumDistance: 0)
-                    .updating($dragTranslation) { value, state, _ in
-                        state = value.translation
-                    }
-                    .onEnded { value in
-                        let requestedOffset = CGSize(
-                            width: panOffset.width + value.translation.width,
-                            height: panOffset.height + value.translation.height
-                        )
-                        panOffset = clampedOffset(
-                            requestedOffset,
-                            image: image,
-                            canvasSize: geometry.size,
-                            zoom: zoom
-                        )
-                    }
-            )
-            .simultaneousGesture(
-                MagnifyGesture()
-                    .updating($magnification) { value, state, _ in
-                        state = value.magnification
-                    }
-                    .onEnded { value in
-                        setZoom(zoom * value.magnification, image: image, canvasSize: geometry.size)
-                    }
-            )
-            .onTapGesture(count: 2) {
-                let requestedZoom = zoom == 1 ? actualSizeZoom(image: image, canvasSize: geometry.size) : 1
-                setZoom(requestedZoom, image: image, canvasSize: geometry.size)
-            }
-            .focusable(onDismiss != nil)
-            .focused($hasKeyboardFocus)
-            .focusEffectDisabled()
-            .onAppear {
-                if onDismiss != nil {
-                    hasKeyboardFocus = true
-                }
-            }
-            .onKeyPress(.space) {
-                guard let onDismiss else { return .ignored }
-                onDismiss()
-                return .handled
-            }
-            .onKeyPress(.escape) {
-                guard let onDismiss else { return .ignored }
-                onDismiss()
-                return .handled
-            }
-        }
-        .clipped()
-        .accessibilityLabel("Interactive Photo Preview")
-        .accessibilityHint("Zoom, then drag to pan the photo")
-    }
-
-    private func setZoom(_ requestedZoom: CGFloat, image: CGImage?, canvasSize: CGSize) {
-        zoom = clampedZoom(requestedZoom)
-        if zoom == 1 {
-            panOffset = .zero
-        } else {
-            panOffset = clampedOffset(panOffset, image: image, canvasSize: canvasSize, zoom: zoom)
-        }
-    }
-
-    private func clampedZoom(_ value: CGFloat) -> CGFloat {
-        min(max(value, 1), 8)
-    }
-
-    private func actualSizeZoom(image: CGImage?, canvasSize: CGSize) -> CGFloat {
-        guard let image, image.width > 0, image.height > 0,
-              canvasSize.width > 0, canvasSize.height > 0 else {
-            return 1
-        }
-        let usableSize = CGSize(width: max(1, canvasSize.width - 20), height: max(1, canvasSize.height - 20))
-        let fitScale = min(usableSize.width / CGFloat(image.width), usableSize.height / CGFloat(image.height))
-        return clampedZoom(1 / max(fitScale, 0.001))
-    }
-
-    private func clampedOffset(
-        _ proposedOffset: CGSize,
-        image: CGImage?,
-        canvasSize: CGSize,
-        zoom: CGFloat
-    ) -> CGSize {
-        guard let image, image.width > 0, image.height > 0 else { return .zero }
-        let usableSize = CGSize(width: max(1, canvasSize.width - 20), height: max(1, canvasSize.height - 20))
-        let imageWidth = CGFloat(image.width)
-        let imageHeight = CGFloat(image.height)
-        let fitScale = min(usableSize.width / imageWidth, usableSize.height / imageHeight)
-        let displayedWidth = imageWidth * fitScale * zoom
-        let displayedHeight = imageHeight * fitScale * zoom
-        let maximumX = max(0, (displayedWidth - usableSize.width) / 2)
-        let maximumY = max(0, (displayedHeight - usableSize.height) / 2)
-        return CGSize(
-            width: min(max(proposedOffset.width, -maximumX), maximumX),
-            height: min(max(proposedOffset.height, -maximumY), maximumY)
-        )
-    }
-}
-
 struct CameraSelectionPreview: View {
     let url: URL
 
@@ -436,24 +395,30 @@ struct CameraSelectionPreview: View {
             .padding(10)
             .background(.bar)
 
-            InteractivePreviewCanvas(image: image, isLoading: isLoading)
+            InteractivePreviewCanvas(image: image, isLoading: isLoading, file: url)
                 .id(url.path)
         }
         .task(id: url.path) {
             isLoading = true
-            image = nil
+            // Paint any tile decode already in the loader's cache — cheaper
+            // and instant — while the full preview reads underneath.
+            image = TileImageLoader.shared.cachedImage(for: url, maximumPixelSize: 2_400)
+                ?? TileImageLoader.shared.cachedImage(for: url, maximumPixelSize: 1_280)
+                ?? TileImageLoader.shared.cachedImage(for: url, maximumPixelSize: 768)
+                ?? TileImageLoader.shared.cachedImage(for: url, maximumPixelSize: 384)
             // Avoid starting card I/O for every row the user flicks through.
             // The spinner is immediate, while the actual preview work begins
             // only after the selection has remained stable briefly.
             try? await Task.sleep(for: .milliseconds(90))
             guard !Task.isCancelled else { return }
             if CameraPreviewSupport.canDecode(url) {
-                image = await EmbeddedPreviewStore.shared.previewImage(
+                let decoded = await EmbeddedPreviewStore.shared.previewImage(
                     from: url,
                     preference: .thumbnail,
                     maximumPixelSize: 1_600,
                     priority: .userInitiated
                 )
+                if let decoded { image = decoded }
             }
             if !Task.isCancelled {
                 isLoading = false
@@ -571,6 +536,7 @@ private struct EmbeddedPreviewView: View {
             InteractivePreviewCanvas(
                 image: image,
                 isLoading: isLoading,
+                file: currentURL,
                 unavailableTitle: "No Embedded Preview",
                 unavailableDescription: "Camera Toolkit could not find a JPEG preview in this RAW file.",
                 onDismiss: { EmbeddedPreviewWindowController.shared.close() }
@@ -579,14 +545,18 @@ private struct EmbeddedPreviewView: View {
         }
         .task(id: currentURL.path) {
             isLoading = true
-            image = nil
+            image = TileImageLoader.shared.cachedImage(for: currentURL, maximumPixelSize: 2_400)
+                ?? TileImageLoader.shared.cachedImage(for: currentURL, maximumPixelSize: 1_280)
+                ?? TileImageLoader.shared.cachedImage(for: currentURL, maximumPixelSize: 768)
+                ?? TileImageLoader.shared.cachedImage(for: currentURL, maximumPixelSize: 384)
             if CameraPreviewSupport.canDecode(currentURL) {
-                image = await EmbeddedPreviewStore.shared.previewImage(
+                let decoded = await EmbeddedPreviewStore.shared.previewImage(
                     from: currentURL,
                     preference: .fullSize,
                     maximumPixelSize: 2_048,
                     priority: .userInitiated
                 )
+                if let decoded { image = decoded }
             }
             if !Task.isCancelled {
                 isLoading = false

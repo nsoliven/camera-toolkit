@@ -3,7 +3,7 @@ import SwiftUI
 
 @main
 @MainActor
-final class CameraToolkitApplication: NSObject, NSApplicationDelegate {
+final class CameraToolkitApplication: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private static var retainedDelegate: CameraToolkitApplication?
 
     private let model = CameraToolkitRuntime.model
@@ -39,6 +39,7 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate {
         if let thumbnailShortcutMonitor {
             NSEvent.removeMonitor(thumbnailShortcutMonitor)
         }
+        model.flushConfigurationSave()
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -57,10 +58,11 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate {
     private func installThumbnailShortcutMonitor() {
         guard thumbnailShortcutMonitor == nil else { return }
         thumbnailShortcutMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-            guard let command = BrowserThumbnailShortcut.command(
-                for: event.charactersIgnoringModifiers,
-                modifierFlags: event.modifierFlags
-            ) else {
+            guard !KeyboardTextFocus.isTypingInTextField(),
+                  let command = BrowserThumbnailShortcut.command(
+                      for: event.charactersIgnoringModifiers,
+                      modifierFlags: event.modifierFlags
+                  ) else {
                 return event
             }
 
@@ -88,7 +90,7 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate {
         appMenu.addItem(.separator())
 
         let settingsItem = NSMenuItem(
-            title: "Settings...",
+            title: "Settings…",
             action: #selector(openSettings),
             keyEquivalent: ","
         )
@@ -111,7 +113,7 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate {
         fileMenuItem.submenu = fileMenu
         addBrowserCommand(
             to: fileMenu,
-            title: "Get Selected Location Info",
+            title: "Get Selected Location Info…",
             command: .showSelectedLocationInformation,
             keyEquivalent: "i"
         )
@@ -167,6 +169,22 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate {
             command: .selectAll,
             keyEquivalent: "a"
         )
+        editMenu.addItem(.separator())
+        addBrowserCommand(
+            to: editMenu,
+            title: "Find…",
+            command: .find,
+            keyEquivalent: "f"
+        )
+        editMenu.addItem(.separator())
+        let undoSortItem = NSMenuItem(
+            title: "Undo Sort",
+            action: #selector(undoSort),
+            keyEquivalent: "z"
+        )
+        undoSortItem.keyEquivalentModifierMask = [.command]
+        undoSortItem.target = self
+        editMenu.addItem(undoSortItem)
 
         let goMenuItem = NSMenuItem()
         mainMenu.addItem(goMenuItem)
@@ -242,6 +260,26 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate {
 
         viewMenu.addItem(.separator())
 
+        let eventsModeItem = NSMenuItem(
+            title: "Events",
+            action: #selector(showEventsMode),
+            keyEquivalent: "1"
+        )
+        eventsModeItem.keyEquivalentModifierMask = [.command, .option]
+        eventsModeItem.target = self
+        viewMenu.addItem(eventsModeItem)
+
+        let filesModeItem = NSMenuItem(
+            title: "File Browser",
+            action: #selector(showFilesMode),
+            keyEquivalent: "2"
+        )
+        filesModeItem.keyEquivalentModifierMask = [.command, .option]
+        filesModeItem.target = self
+        viewMenu.addItem(filesModeItem)
+
+        viewMenu.addItem(.separator())
+
         let eventLibraryItem = NSMenuItem(
             title: "Event Library…",
             action: #selector(openEventLibrary),
@@ -250,6 +288,15 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate {
         eventLibraryItem.keyEquivalentModifierMask = [.command, .option]
         eventLibraryItem.target = self
         viewMenu.addItem(eventLibraryItem)
+
+        let peopleItem = NSMenuItem(
+            title: "People…",
+            action: #selector(openPeople),
+            keyEquivalent: "p"
+        )
+        peopleItem.keyEquivalentModifierMask = [.command, .option]
+        peopleItem.target = self
+        viewMenu.addItem(peopleItem)
 
         let catalogInspectorItem = NSMenuItem(
             title: "Photo List SQL Inspector…",
@@ -300,7 +347,7 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate {
         windowMenu.addItem(mainWindowItem)
 
         let transferQueueItem = NSMenuItem(
-            title: "Transfer Queue…",
+            title: "Jobs…",
             action: #selector(openTransferQueue),
             keyEquivalent: "t"
         )
@@ -330,6 +377,14 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate {
         shortcutsItem.keyEquivalentModifierMask = [.command, .shift]
         shortcutsItem.target = self
         helpMenu.addItem(shortcutsItem)
+
+        let guideItem = NSMenuItem(
+            title: "Setup Guide…",
+            action: #selector(startSetupGuide),
+            keyEquivalent: ""
+        )
+        guideItem.target = self
+        helpMenu.addItem(guideItem)
         NSApp.helpMenu = helpMenu
 
         NSApp.mainMenu = mainMenu
@@ -353,6 +408,15 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate {
         menu.addItem(item)
     }
 
+    /// Every item targeted at the delegate is a board or app command, and
+    /// none may run while a text field owns typing — ⌘⌫ stays "delete to
+    /// here," not "Move to Trash." Commands the field handles itself (⌘C,
+    /// ⌘A, ⌘Z) are claimed by the field editor before menus are consulted;
+    /// disabling ours keeps them with the field either way.
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        !KeyboardTextFocus.isTypingInTextField()
+    }
+
     @objc private func openSettings() {
         CameraToolkitConfigWindow.shared.show(model: model)
     }
@@ -362,7 +426,8 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate {
     }
 
     @objc private func performBrowserCommand(_ sender: NSMenuItem) {
-        guard let rawValue = sender.representedObject as? String,
+        guard !KeyboardTextFocus.isTypingInTextField(),
+              let rawValue = sender.representedObject as? String,
               let command = BrowserCommand(rawValue: rawValue) else {
             return
         }
@@ -373,8 +438,34 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate {
         KeyboardShortcutsWindowController.shared.show()
     }
 
+    @objc private func startSetupGuide() {
+        AppShellMode.show(.events)
+        CameraToolkitMainWindow.shared.show(model: model)
+        CameraToolkitRuntime.workspace.startGuide()
+    }
+
+    @objc private func showEventsMode() {
+        AppShellMode.show(.events)
+        CameraToolkitMainWindow.shared.show(model: model)
+    }
+
+    @objc private func showFilesMode() {
+        AppShellMode.show(.files)
+        CameraToolkitMainWindow.shared.show(model: model)
+    }
+
+    @objc private func undoSort() {
+        guard !KeyboardTextFocus.isTypingInTextField() else { return }
+        NotificationCenter.default.post(name: .cameraToolkitUndoSort, object: nil)
+    }
+
     @objc private func openEventLibrary() {
         EventLibraryWindowController.shared.show(model: model)
+    }
+
+    @objc private func openPeople() {
+        AppShellMode.show(.events)
+        PeopleWindowController.shared.show(model: model, workspace: CameraToolkitRuntime.workspace)
     }
 
     @objc private func openCatalogInspector() {
@@ -405,6 +496,7 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate {
 @MainActor
 private enum CameraToolkitRuntime {
     static let model = DashboardModel.live()
+    static let workspace = EventsWorkspace(model: model)
 }
 
 @MainActor
@@ -421,7 +513,7 @@ private final class CameraToolkitMainWindow: NSObject, NSWindowDelegate {
         }
 
         let hostingController = NSHostingController(
-            rootView: AppShell(model: model)
+            rootView: AppShell(model: model, workspace: CameraToolkitRuntime.workspace)
                 .frame(minWidth: 1040, minHeight: 720)
         )
         let window = NSWindow(

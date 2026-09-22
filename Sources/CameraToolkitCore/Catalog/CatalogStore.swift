@@ -16,6 +16,24 @@ public struct CatalogBootstrapReport: Codable, Equatable, Sendable {
 }
 
 public struct CatalogStore {
+    /// A catalog SQL failure that keeps the SQLite result code so the
+    /// bootstrap retry can tell a NAS lock/IO stutter from a real error.
+    /// Its description matches the `ToolkitError` text the store has
+    /// always thrown.
+    private struct SQLiteError: Error, LocalizedError {
+        let code: Int32
+        let message: String
+        var errorDescription: String? { message }
+    }
+
+    /// True when `error` carries a transient BUSY/IOERR — the failures a
+    /// network volume returns for a momentary lock. Anything else is a
+    /// real failure and ends the retry.
+    private static func isTransientSQLiteError(_ error: Error) -> Bool {
+        guard let error = error as? SQLiteError else { return false }
+        return CatalogTransactionRetry.isTransient(error.code)
+    }
+
     public let url: URL
     private let fileManager: FileManager
 
@@ -97,6 +115,7 @@ public struct CatalogStore {
             immich_upload_enabled INTEGER NOT NULL DEFAULT 0,
             immich_album_policy TEXT NOT NULL DEFAULT 'none',
             immich_album_name TEXT,
+            parent_event_id TEXT,
             created_at TEXT NOT NULL,
             last_used_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
@@ -131,29 +150,117 @@ public struct CatalogStore {
             checked_at TEXT NOT NULL,
             FOREIGN KEY(event_asset_id) REFERENCES event_assets(id) ON DELETE CASCADE
         );
+        CREATE TABLE IF NOT EXISTS face_photos (
+            path_key TEXT PRIMARY KEY,
+            path TEXT NOT NULL,
+            file_name TEXT NOT NULL,
+            byte_count INTEGER NOT NULL,
+            modified_at TEXT NOT NULL,
+            taken_at TEXT,
+            scan_grade TEXT NOT NULL DEFAULT 'none',
+            face_count INTEGER NOT NULL DEFAULT 0,
+            engine TEXT NOT NULL DEFAULT '',
+            indexed_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS face_photos_file_key
+            ON face_photos(file_name, byte_count, modified_at);
+        CREATE TABLE IF NOT EXISTS people (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            is_roster INTEGER NOT NULL DEFAULT 0,
+            face_count INTEGER NOT NULL DEFAULT 0,
+            cover_face_id TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS faces (
+            id TEXT PRIMARY KEY,
+            photo_id TEXT NOT NULL,
+            person_id TEXT,
+            box_x REAL NOT NULL,
+            box_y REAL NOT NULL,
+            box_w REAL NOT NULL,
+            box_h REAL NOT NULL,
+            det_score REAL NOT NULL,
+            match_score REAL,
+            quality REAL,
+            face_px REAL,
+            embedding BLOB,
+            model TEXT NOT NULL DEFAULT 'insightface/buffalo_l',
+            state TEXT NOT NULL DEFAULT 'cached',
+            scan_grade TEXT NOT NULL DEFAULT 'low',
+            crop BLOB,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(photo_id) REFERENCES face_photos(path_key) ON DELETE CASCADE,
+            FOREIGN KEY(person_id) REFERENCES people(id) ON DELETE SET NULL
+        );
+        CREATE INDEX IF NOT EXISTS faces_photo_id ON faces(photo_id);
+        CREATE INDEX IF NOT EXISTS faces_person_id ON faces(person_id);
+        CREATE INDEX IF NOT EXISTS faces_state ON faces(state);
+        CREATE TABLE IF NOT EXISTS face_templates (
+            person_id TEXT NOT NULL,
+            face_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(person_id, face_id),
+            FOREIGN KEY(person_id) REFERENCES people(id) ON DELETE CASCADE,
+            FOREIGN KEY(face_id) REFERENCES faces(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS face_rejections (
+            person_id TEXT NOT NULL,
+            face_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(person_id, face_id),
+            FOREIGN KEY(person_id) REFERENCES people(id) ON DELETE CASCADE,
+            FOREIGN KEY(face_id) REFERENCES faces(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS face_rejections_face_id ON face_rejections(face_id);
         """, database: database)
 
-        try execute("BEGIN IMMEDIATE;", database: database)
-        do {
-            try upsertAppState("cameraLibraryRootPath", value: configuration.cameraLibraryRootPath, database: database)
-            try upsertAppState("archivePath", value: configuration.archivePath, database: database)
-            try upsertAppState("bufferPath", value: configuration.bufferPath, database: database)
-            try upsertAppState("catalogBackupFolderPath", value: configuration.catalogBackupFolderPath, database: database)
+        // Face columns added after the first face catalogs shipped: the
+        // engine stamp that drives the skip rule, and the engine's quality
+        // and size readings the grouping gate uses.
+        try ensureColumn(table: "face_photos", column: "engine", definition: "engine TEXT NOT NULL DEFAULT ''", database: database)
+        try ensureColumn(table: "faces", column: "quality", definition: "quality REAL", database: database)
+        try ensureColumn(table: "faces", column: "face_px", definition: "face_px REAL", database: database)
 
-            for folder in CameraLibraryFolder.allCases {
-                try upsertLibraryFolder(folder, path: configuration.libraryFolderPath(folder).path, database: database)
+        // `parent_event_id` was added after the first catalogs shipped, so
+        // databases that already have `events` need the column grafted on.
+        try ensureColumn(table: "events", column: "parent_event_id", definition: "parent_event_id TEXT", database: database)
+        // `cover_face_id` is the user-picked People-list thumbnail; older
+        // catalogs get it grafted on the same way.
+        try ensureColumn(table: "people", column: "cover_face_id", definition: "cover_face_id TEXT", database: database)
+
+        // The whole bootstrap transaction — BEGIN IMMEDIATE through
+        // COMMIT — retries a transient BUSY/IOERR with a short backoff:
+        // on a network volume a lock stutter surfaces as SQLITE_IOERR
+        // (10), not a clean busy. A failure that outlasts the retries is
+        // rethrown with the real SQLite message. Every attempt starts
+        // clean because the previous one rolled back.
+        try CatalogTransactionRetry.run(isTransient: Self.isTransientSQLiteError) {
+            try execute("BEGIN IMMEDIATE;", database: database)
+            do {
+                try upsertAppState("cameraLibraryRootPath", value: configuration.cameraLibraryRootPath, database: database)
+                try upsertAppState("archivePath", value: configuration.archivePath, database: database)
+                try upsertAppState("bufferPath", value: configuration.bufferPath, database: database)
+                try upsertAppState("catalogBackupFolderPath", value: configuration.catalogBackupFolderPath, database: database)
+
+                for folder in CameraLibraryFolder.allCases {
+                    try upsertLibraryFolder(folder, path: configuration.libraryFolderPath(folder).path, database: database)
+                }
+
+                for location in configuration.configuredLocations {
+                    let selected = configuration.selectedLocationID(for: location.role) == location.id
+                    try upsertStorageLocation(location, selected: selected, database: database)
+                }
+
+                try synchronizeEvents(configuration: configuration, database: database)
+                try execute("COMMIT;", database: database)
+            } catch {
+                try? execute("ROLLBACK;", database: database)
+                throw error
             }
-
-            for location in configuration.configuredLocations {
-                let selected = configuration.selectedLocationID(for: location.role) == location.id
-                try upsertStorageLocation(location, selected: selected, database: database)
-            }
-
-            try synchronizeEvents(configuration: configuration, database: database)
-            try execute("COMMIT;", database: database)
-        } catch {
-            try? execute("ROLLBACK;", database: database)
-            throw error
         }
 
         let backupURL = createBackup ? try backupIfConfigured(configuration: configuration) : nil
@@ -210,10 +317,11 @@ public struct CatalogStore {
 
     private func execute(_ sql: String, database: OpaquePointer) throws {
         var error: UnsafeMutablePointer<CChar>?
-        guard sqlite3_exec(database, sql, nil, nil, &error) == SQLITE_OK else {
+        let code = sqlite3_exec(database, sql, nil, nil, &error)
+        guard code == SQLITE_OK else {
             let message = error.map { String(cString: $0) } ?? String(cString: sqlite3_errmsg(database))
             sqlite3_free(error)
-            throw ToolkitError.commandFailed("Catalog SQL failed: \(message)")
+            throw SQLiteError(code: code, message: "Catalog SQL failed: \(message)")
         }
     }
 
@@ -267,21 +375,25 @@ public struct CatalogStore {
 
     private func synchronizeEvents(configuration: AppConfiguration, database: OpaquePointer) throws {
         let now = Self.isoTimestamp()
-        let eventsByID = Dictionary(uniqueKeysWithValues: configuration.savedEvents.map { ($0.id, $0) })
+        var eventsByID: [UUID: SavedCameraEvent] = [:]
+        for event in configuration.savedEvents where eventsByID[event.id] == nil {
+            eventsByID[event.id] = event
+        }
 
         for event in configuration.savedEvents {
             try runUpsert(
                 """
                 INSERT INTO events(
                     id, name, event_date, immich_upload_enabled, immich_album_policy,
-                    immich_album_name, created_at, last_used_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    immich_album_name, parent_event_id, created_at, last_used_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     name = excluded.name,
                     event_date = excluded.event_date,
                     immich_upload_enabled = excluded.immich_upload_enabled,
                     immich_album_policy = excluded.immich_album_policy,
                     immich_album_name = excluded.immich_album_name,
+                    parent_event_id = excluded.parent_event_id,
                     last_used_at = excluded.last_used_at,
                     updated_at = excluded.updated_at;
                 """,
@@ -292,6 +404,7 @@ public struct CatalogStore {
                     event.sendsToImmich ? "1" : "0",
                     event.resolvedImmichAlbumPolicy.rawValue,
                     event.immichAlbumName ?? "",
+                    event.parentEventID?.uuidString,
                     Self.isoTimestamp(event.createdAt),
                     Self.isoTimestamp(event.lastUsedAt),
                     now
@@ -370,19 +483,50 @@ public struct CatalogStore {
         )
     }
 
-    private func runUpsert(_ sql: String, values: [String], database: OpaquePointer) throws {
+    /// Adds `column` to an existing table; a no-op once it is present. Keeps
+    /// catalogs created before a column existed on the current schema.
+    private func ensureColumn(table: String, column: String, definition: String, database: OpaquePointer) throws {
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(database, "PRAGMA table_info(\(table));", -1, &statement, nil) == SQLITE_OK,
+              let statement else {
+            throw ToolkitError.commandFailed("Could not inspect catalog table \(table)")
+        }
+        var exists = false
+        while sqlite3_step(statement) == SQLITE_ROW {
+            if let name = sqlite3_column_text(statement, 1), String(cString: name) == column {
+                exists = true
+            }
+        }
+        sqlite3_finalize(statement)
+        if !exists {
+            try execute("ALTER TABLE \(table) ADD COLUMN \(definition);", database: database)
+        }
+    }
+
+    private func runUpsert(_ sql: String, values: [String?], database: OpaquePointer) throws {
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK, let statement else {
-            throw ToolkitError.commandFailed("Could not prepare catalog statement: \(String(cString: sqlite3_errmsg(database)))")
+            throw SQLiteError(
+                code: sqlite3_errcode(database),
+                message: "Could not prepare catalog statement: \(String(cString: sqlite3_errmsg(database)))"
+            )
         }
         defer { sqlite3_finalize(statement) }
 
         for (index, value) in values.enumerated() {
-            sqlite3_bind_text(statement, Int32(index + 1), value, -1, Self.transient)
+            if let value {
+                sqlite3_bind_text(statement, Int32(index + 1), value, -1, Self.transient)
+            } else {
+                sqlite3_bind_null(statement, Int32(index + 1))
+            }
         }
 
-        guard sqlite3_step(statement) == SQLITE_DONE else {
-            throw ToolkitError.commandFailed("Could not write catalog row: \(String(cString: sqlite3_errmsg(database)))")
+        let code = sqlite3_step(statement)
+        guard code == SQLITE_DONE else {
+            throw SQLiteError(
+                code: code,
+                message: "Could not write catalog row: \(String(cString: sqlite3_errmsg(database)))"
+            )
         }
     }
 

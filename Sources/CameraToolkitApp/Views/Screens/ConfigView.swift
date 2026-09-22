@@ -1,3 +1,4 @@
+import AppKit
 import CameraToolkitCore
 import SwiftUI
 
@@ -32,9 +33,57 @@ extension ConfiguredLocationRole {
 
 struct ConfigView: View {
     @Bindable var model: DashboardModel
+    @AppStorage(BurstGroupingConfiguration.visualRecoveryDefaultsKey) private var burstVisualRecovery = true
+    @AppStorage(BurstGroupingConfiguration.maximumGapDefaultsKey) private var burstMaximumGap = 2.0
+    @AppStorage(BurstGroupingConfiguration.maximumVisionDistanceDefaultsKey) private var burstVisionDistance = 0.48
+    /// Bumped to re-run the `PlaceStatus.check` probes in `body` — volume
+    /// mount and unmount notifications bump it too so this window updates
+    /// itself when a drive or share appears or disappears.
+    @State private var placeStatusRevision = 0
 
     var body: some View {
         Form {
+            Section {
+                PlaceRow(
+                    title: "Shared Buffer",
+                    symbol: "externaldrive.fill",
+                    tint: .blue,
+                    status: PlaceStatus.check(EventStorageLocations(configuration: model.configuration).bufferRoot),
+                    missingIsFine: false,
+                    onRefresh: { placeStatusRevision &+= 1 }
+                ) {
+                    if model.chooseFolder(title: "Choose the Shared Buffer Folder", keyPath: \.bufferPath) {
+                        NotificationCenter.default.post(name: .cameraToolkitStorageLocationsChanged, object: nil)
+                    }
+                }
+                PlaceRow(
+                    title: "Private (hidden)",
+                    symbol: "lock.fill",
+                    tint: .purple,
+                    status: PlaceStatus.check(EventStorageLocations(configuration: model.configuration).privateStagingRoot, includeFreeSpace: false),
+                    missingIsFine: true,
+                    onRefresh: { placeStatusRevision &+= 1 }
+                ) {
+                    if model.chooseFolder(title: "Choose the Private Folder", keyPath: \.privateStagingPath) {
+                        NotificationCenter.default.post(name: .cameraToolkitStorageLocationsChanged, object: nil)
+                    }
+                }
+                PlaceRow(
+                    title: "NAS Library",
+                    symbol: "server.rack",
+                    tint: .green,
+                    status: PlaceStatus.check(EventStorageLocations(configuration: model.configuration).libraryRoot, includeFreeSpace: false),
+                    missingIsFine: false,
+                    onRefresh: { placeStatusRevision &+= 1 }
+                ) {
+                    model.chooseCameraLibraryRoot()
+                }
+            } header: {
+                Text("Where Things Live")
+            } footer: {
+                Text("Shared events live in the Buffer. Private events wait in the hidden folder until they’re on the NAS. The NAS library is the permanent home.")
+            }
+
             Section("Photo Library") {
                 PathSettingRow(
                     title: "Library root",
@@ -71,21 +120,77 @@ struct ConfigView: View {
             LocationSettingsSection(
                 title: "Camera Sources",
                 role: .importSource,
-                addTitle: "Add Camera Source",
+                addTitle: "Add Camera Source…",
                 model: model
             )
             LocationSettingsSection(
                 title: "Library Targets",
                 role: .archive,
-                addTitle: "Add Library Target",
+                addTitle: "Add Library Target…",
                 model: model
             )
             LocationSettingsSection(
                 title: "Buffer Drives",
                 role: .buffer,
-                addTitle: "Add Buffer Drive",
+                addTitle: "Add Buffer Drive…",
                 model: model
             )
+
+            Section {
+                PathSettingRow(
+                    title: "Private staging",
+                    path: Binding(
+                        get: { model.configuration.privateStagingPath },
+                        set: { model.setConfigPath(\.privateStagingPath, to: $0) }
+                    ),
+                    choose: {
+                        _ = model.chooseFolder(title: "Choose Private Staging Folder", keyPath: \.privateStagingPath)
+                    }
+                )
+                LabeledContent("In use") {
+                    Text(EventStorageLocations(configuration: model.configuration).privateStagingRoot.path)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                }
+                LabeledContent("Taken off the drive") {
+                    Text(EventStorageLocations(configuration: model.configuration).removedFilesRoot.path)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                }
+                EmptyRemovedFilesRow(model: model)
+            } header: {
+                Text("Private Events")
+            } footer: {
+                Text("Events marked Private · NAS only never enter the shared Buffer. Their originals wait in the private staging folder, which Finder hides, until they are archived to the NAS. Leave the path empty to use a hidden folder on the Buffer drive. Files taken off the drive stay recoverable until you empty them here.")
+            }
+
+            Section {
+                TrashBatchesView(model: model)
+            } header: {
+                Text("Trash")
+            } footer: {
+                Text("Move to Trash in the organizer renames files into the drive's own .Camera Toolkit/_Trash folder and records where each file lived in a manifest, so a batch stays restorable even when it came from a card, an external drive, or the NAS. Restore puts files back where they were; nothing is deleted here unless you empty the folder above.")
+            }
+
+            Section {
+                Toggle("Recover matching frames", isOn: $burstVisualRecovery)
+                LabeledContent("Recovery gap limit") {
+                    Text("\(burstMaximumGap, specifier: "%.1f") s")
+                        .monospacedDigit()
+                }
+                Slider(value: $burstMaximumGap, in: 1.5...5, step: 0.5)
+                    .disabled(!burstVisualRecovery)
+                LabeledContent("Similarity distance limit") {
+                    Text(burstVisionDistance, format: .number.precision(.fractionLength(2)))
+                        .monospacedDigit()
+                }
+                Slider(value: $burstVisionDistance, in: 0.2...0.9, step: 0.02)
+                    .disabled(!burstVisualRecovery)
+            } header: {
+                Text("Burst Grouping")
+            } footer: {
+                Text("Consecutive frames up to a second apart always chain into a burst. With recovery on, consecutive frames up to the gap limit are compared with Apple Vision and merged when they look alike. Lower distance limits are stricter. These sliders apply on the next regroup — press Regroup Bursts on an Unsorted board to re-run grouping without re-reading files.")
+            }
 
             Section("Import Defaults") {
                 Picker(
@@ -216,6 +321,12 @@ struct ConfigView: View {
         }
         .formStyle(.grouped)
         .padding()
+        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didMountNotification)) { _ in
+            placeStatusRevision &+= 1
+        }
+        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didUnmountNotification)) { _ in
+            placeStatusRevision &+= 1
+        }
     }
 }
 
@@ -312,4 +423,212 @@ private struct LocationSettingRow: View {
             .frame(minHeight: 28)
         }
     }
+}
+
+private struct EmptyRemovedFilesRow: View {
+    @Bindable var model: DashboardModel
+    @State private var confirmation = ""
+    @State private var message: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                TextField("Type DELETE to empty permanently", text: $confirmation)
+                    .frame(maxWidth: 260)
+                Button("Empty Trash", role: .destructive, action: emptyRemovedFiles)
+                    .disabled(confirmation != FreeUpService.confirmationToken || model.isBusy)
+            }
+            if let message {
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    /// Empties every `_Trash` root the Trash section lists — the configured
+    /// removed-files folder plus each configured volume's Trash — off the
+    /// main thread. A root that fails keeps its batches and is reported.
+    private func emptyRemovedFiles() {
+        let roots = trashRoots(configuration: model.configuration)
+        let token = confirmation
+        model.runBackgroundJob(
+            action: .freeUp,
+            runningNote: "Emptying Trash folders",
+            logTitle: "Emptied Trash",
+            logDetail: "Permanently removed _Trash batches under every configured Trash root after the DELETE confirmation.",
+            operation: { _ in
+                let service = FreeUpService()
+                var deleted: [String] = []
+                var freed: Int64 = 0
+                var failures: [String] = []
+                for root in roots {
+                    do {
+                        let result = try service.emptyTrash(trashRoot: root, confirm: token)
+                        deleted.append(contentsOf: result.deletedBatches)
+                        freed += result.freedBytes
+                    } catch {
+                        failures.append("\(root.lastPathComponent): \(error.localizedDescription)")
+                    }
+                }
+                return (deleted, freed, failures)
+            },
+            completion: { outcome in
+                var parts = [
+                    outcome.0.isEmpty
+                        ? (outcome.2.isEmpty ? "There was nothing to empty." : "Nothing was deleted.")
+                        : "Permanently deleted \(outcome.0.count) batch(es), freeing \(outcome.1.formattedBytes)."
+                ]
+                parts.append(contentsOf: outcome.2)
+                let summary = parts.joined(separator: " ")
+                message = summary
+                confirmation = ""
+                NotificationCenter.default.post(name: .cameraToolkitMediaTrashChanged, object: nil)
+                return summary
+            }
+        )
+    }
+}
+
+/// Lists `_Trash` batches under every configured drive's Trash root and the
+/// Buffer's removed-files folder, with a Restore button per batch.
+private struct TrashBatchesView: View {
+    @Bindable var model: DashboardModel
+    @State private var batches: [MediaTrashBatch]?
+    @State private var message: String?
+
+    var body: some View {
+        Group {
+            if let batches {
+                if batches.isEmpty {
+                    Text("No Trash batches on any configured drive.")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(batches) { batch in
+                        LabeledContent {
+                            HStack(spacing: 10) {
+                                Text("\(batch.fileCount) file\(batch.fileCount == 1 ? "" : "s") · \(batch.byteCount.formattedBytes)")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                Button("Restore") { restore(batch) }
+                                    .disabled(model.isBusy)
+                                    .help(batch.segments.allSatisfy(\.hasManifest)
+                                        ? "Rename every file back to its recorded location. Existing files are never replaced."
+                                        : "This batch has no manifest of where its files lived, so it cannot be restored here.")
+                            }
+                        } label: {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(batch.createdAt == .distantPast
+                                    ? batch.name
+                                    : batch.createdAt.formatted(date: .abbreviated, time: .shortened))
+                                Text(whereabouts(batch))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                            }
+                        }
+                    }
+                }
+            } else {
+                Text("Reading Trash folders…")
+                    .foregroundStyle(.secondary)
+            }
+            if let message {
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .task { reload() }
+        .onReceive(NotificationCenter.default.publisher(for: .cameraToolkitStorageLocationsChanged)) { _ in
+            reload()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .cameraToolkitMediaTrashChanged)) { _ in
+            reload()
+        }
+    }
+
+    private func whereabouts(_ batch: MediaTrashBatch) -> String {
+        let places = batch.segments.map { segment -> String in
+            if let volume = VolumeInfo.volumeRoot(for: segment.folder) {
+                return volume.lastPathComponent
+            }
+            // <root>/.Camera Toolkit/_Trash/<batch> → the folder holding .Camera Toolkit
+            return segment.folder
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .lastPathComponent
+        }
+        return Array(Set(places)).sorted().joined(separator: ", ")
+    }
+
+    private func reload() {
+        let roots = trashRoots(configuration: model.configuration)
+        let fallback = EventStorageLocations(configuration: model.configuration).removedFilesRoot
+        Task { @MainActor in
+            let found = await Task.detached(priority: .utility) {
+                MediaTrashService(removedFilesRoot: fallback).listBatches(under: roots)
+            }.value
+            batches = found
+        }
+    }
+
+    private func restore(_ batch: MediaTrashBatch) {
+        let fallback = EventStorageLocations(configuration: model.configuration).removedFilesRoot
+        model.runBackgroundJob(
+            action: .organize,
+            runningNote: "Restoring \(batch.fileCount) file(s) from Trash",
+            logTitle: "Restored a Trash batch",
+            logDetail: "Renamed files back to the paths their batch manifest recorded. Existing files were never replaced.",
+            operation: { progress in
+                MediaTrashService(removedFilesRoot: fallback).restore(batch: batch) { update in
+                    progress(DashboardModel.jobUpdate(from: update, notePrefix: "Restoring", command: ""))
+                }
+            },
+            completion: { report in
+                var parts = ["Restored \(report.restored.count) file(s) (\(report.restoredBytes.formattedBytes)) back to where they lived."]
+                if !report.conflicts.isEmpty {
+                    parts.append("\(report.conflicts.count) stayed in Trash because a file already exists at the original path.")
+                }
+                if !report.missing.isEmpty {
+                    parts.append("\(report.missing.count) recorded file(s) were no longer in the batch.")
+                }
+                if !report.failed.isEmpty {
+                    parts.append("\(report.failed.count) could not move back: \(report.failed.values.first ?? "")")
+                }
+                let summary = parts.joined(separator: " ")
+                message = summary
+                NotificationCenter.default.post(name: .cameraToolkitMediaTrashChanged, object: nil)
+                reload()
+                return summary
+            }
+        )
+    }
+}
+
+/// `_Trash` roots shown in Settings' Trash section: the configured
+/// removed-files folder plus `.Camera Toolkit/_Trash` on the volume of every
+/// configured location. Listing and emptying share this scope.
+private func trashRoots(configuration: AppConfiguration) -> [URL] {
+    let locations = EventStorageLocations(configuration: configuration)
+    var roots = [locations.removedFilesRoot]
+    var seen = Set(roots.map { EventStorageLocations.pathKey($0.path) })
+    var paths = configuration.configuredLocations.map(\.path)
+    paths.append(configuration.bufferPath)
+    paths.append(configuration.privateStagingPath)
+    paths.append(configuration.cameraLibraryRootPath)
+    for path in paths {
+        let url = URL(fileURLWithPath: NSString(string: path).expandingTildeInPath, isDirectory: true)
+            .standardizedFileURL
+        guard let volume = VolumeInfo.volumeRoot(for: url) else { continue }
+        let root = volume
+            .appendingPathComponent(EventStorageLocations.toolkitFolderName, isDirectory: true)
+            .appendingPathComponent("_Trash", isDirectory: true)
+        if seen.insert(EventStorageLocations.pathKey(root.path)).inserted {
+            roots.append(root)
+        }
+    }
+    return roots
 }

@@ -21,6 +21,9 @@ let package = Package(
             dependencies: [
                 .product(name: "GRDB", package: "GRDB.swift")
             ],
+            resources: [
+                .copy("Resources/face_sidecar.py")
+            ],
             linkerSettings: [
                 .linkedLibrary("sqlite3")
             ]
@@ -35,7 +38,10 @@ let package = Package(
         ),
         .testTarget(
             name: "CameraToolkitCoreTests",
-            dependencies: ["CameraToolkitCore"],
+            dependencies: [
+                "CameraToolkitCore",
+                .product(name: "GRDB", package: "GRDB.swift")
+            ],
             linkerSettings: [
                 .linkedLibrary("sqlite3")
             ]
