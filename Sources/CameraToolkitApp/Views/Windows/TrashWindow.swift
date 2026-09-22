@@ -48,6 +48,32 @@ private struct TrashDaySection: Identifiable {
     var items: [MediaTrashItem]
 }
 
+/// Generations for Trash board reloads. Every read takes the next stamp and
+/// only the newest may publish: a slow listing that lands late is dropped
+/// instead of painting an older list over the current one. `reading` stays
+/// set while a read is in flight so the summary can say the board is
+/// re-reading instead of implying the old list is still current.
+struct TrashReloadGate {
+    private(set) var latest = 0
+    private(set) var reading = false
+
+    /// Starts a read, superseding every earlier one.
+    mutating func begin() -> Int {
+        latest += 1
+        reading = true
+        return latest
+    }
+
+    /// True only for the newest read — the caller may publish its list. A
+    /// superseded read returns false and leaves `reading` set for the read
+    /// that replaced it.
+    mutating func finish(_ stamp: Int) -> Bool {
+        guard stamp == latest else { return false }
+        reading = false
+        return true
+    }
+}
+
 /// The Trash board itself — also what Settings links to, so there is exactly
 /// one list of trashed files in the app.
 struct TrashBrowserView: View {
@@ -57,6 +83,7 @@ struct TrashBrowserView: View {
     /// nil while the first scan of the Trash roots is in flight.
     @State private var batches: [MediaTrashBatch]?
     @State private var items: [MediaTrashItem] = []
+    @State private var reloads = TrashReloadGate()
     @State private var query = MediaTrashQuery()
     @State private var selectedIDs: Set<String> = []
     @State private var anchorID: String?
@@ -115,6 +142,7 @@ struct TrashBrowserView: View {
 
     private var summaryLine: String {
         guard let batches else { return "Reading Trash folders…" }
+        if reloads.reading { return "Re-reading Trash folders…" }
         if items.isEmpty { return "Nothing in Trash" }
         let bytes = items.reduce(Int64(0)) { $0 + $1.size }
         let base = "\(items.count) file\(items.count == 1 ? "" : "s") · \(bytes.formattedBytes) · \(batches.count) batch\(batches.count == 1 ? "" : "es")"
@@ -564,12 +592,16 @@ struct TrashBrowserView: View {
         let roots = locations.trashRoots()
         let fallback = locations.removedFilesRoot
         let names = eventNames
+        let stamp = reloads.begin()
         Task { @MainActor in
             let found = await Task.detached(priority: .utility) {
                 let service = MediaTrashService(removedFilesRoot: fallback)
                 let batches = service.listBatches(under: roots)
                 return (batches, batches.flatMap { $0.items(eventNames: names) })
             }.value
+            // A newer read superseded this one while it listed — drop the
+            // stale result instead of painting an older list back.
+            guard reloads.finish(stamp) else { return }
             batches = found.0
             items = found.1
             selectedIDs = selectedIDs.intersection(Set(found.1.map(\.id)))

@@ -2978,7 +2978,6 @@ final class EventsWorkspace {
         // Don't leave the event board showing a tile whose file is in _Trash.
         // Unsorted used to update only its own scan result; eventStacks stayed
         // stale until the user hit Refresh.
-        let affectedEvents = Set(eventIDs.values)
         removeFilesFromEventBoards(Set(files.map(\.pathKey)), events: [])
 
         let trashedStackIDs = affectedStackIDs(for: items, in: locationID)
@@ -3024,9 +3023,10 @@ final class EventsWorkspace {
                     selectionAnchorID = nil
                 }
                 self.removeFilesFromEventBoards(movedKeys, events: [])
-                let refreshIDs = affectedEvents.isEmpty ? Set(self.eventStacks.keys) : affectedEvents
-                for eventID in refreshIDs {
-                    Task { await self.refreshEvent(eventID) }
+                // The boards are already truthful — tell the Trash window its
+                // list changed rather than re-reading whole events.
+                if !batch.entries.isEmpty {
+                    NotificationCenter.default.post(name: .cameraToolkitMediaTrashChanged, object: nil)
                 }
                 let skippedNote = batch.skipped.isEmpty
                     ? ""
@@ -3114,7 +3114,12 @@ final class EventsWorkspace {
                     self.focusedStackID = nil
                     selectionAnchorID = nil
                 }
-                Task { await self.refreshEvent(eventID) }
+                // The board update above already dropped the moved files — a
+                // full refreshEvent would repaint the grid and bury the move
+                // confirmation under a reload of the whole event.
+                if !batch.entries.isEmpty {
+                    NotificationCenter.default.post(name: .cameraToolkitMediaTrashChanged, object: nil)
+                }
                 let skippedNote = batch.skipped.isEmpty
                     ? ""
                     : " \(batch.skipped.count) stayed in place: \(batch.skipped[0].reason)"
