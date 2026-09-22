@@ -2057,6 +2057,374 @@ final class EventsWorkspaceTests: XCTestCase {
         }
     }
 
+    /// The bug: Move to Event clicked while the storage row still says
+    /// "Checking" used to vanish — `eventStacks` is painted but the presence
+    /// index behind it is empty until the sweep lands. The catalog already
+    /// knows each file's event and the Card Copy path the grid implied, so
+    /// the click must plan the rename from that and open a tracked job in
+    /// the same moment — never return silently.
+    func testMoveStacksWhilePresenceIndexIsEmptyRunsFromTheCatalog() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let eventID = try XCTUnwrap(workspace.createEvent(name: "Trip 2026", date: organizerDay("2026-08-26"), policy: .buffer))
+            let targetID = try XCTUnwrap(workspace.createEvent(name: "Japan 2026", date: organizerDay("2026-08-27"), policy: .buffer))
+            let event = try XCTUnwrap(workspace.event(eventID))
+            let locations = workspace.locations
+            let cardCopy = locations.cardCopyRoot(for: event, deviceID: "sony-a7v", policy: .buffer)
+            let unsorted = root.appendingPathComponent("Drive/Unsorted A7V", isDirectory: true)
+
+            // Post-Apply state: the originals already sit in the event's
+            // Card Copy folder and the catalog says where they came from.
+            var assignments: [PhotoEventAssignment] = []
+            for (name, sub) in [("B0001_DSC00001.ARW", "100"), ("B0001_DSC00002.ARW", "400")] {
+                let url = try writeOrganizerARW(cardCopy.appendingPathComponent(name), "2026:08:26 10:00:00", sub)
+                assignments.append(PhotoEventAssignment(
+                    sourceRootPath: unsorted.path,
+                    relativePath: name,
+                    fileSize: Int64(try XCTUnwrap(try url.resourceValues(forKeys: [.fileSizeKey]).fileSize)),
+                    modifiedAt: Date(),
+                    eventID: eventID,
+                    deviceID: "sony-a7v"
+                ))
+            }
+            model.updateConfiguration { $0.photoEventAssignments.append(contentsOf: assignments) }
+
+            // Park the first archive stat — the stand-in for a NAS share
+            // mid-sweep. The board paints; the presence index stays empty.
+            let box = PresenceProbeBox()
+            let gate = DispatchSemaphore(value: 0)
+            defer { gate.signal() }
+            let libraryPrefix = locations.libraryRoot.path
+            workspace.presenceProbe = { url, size, mounted in
+                box.noteCall()
+                if let url, url.path.hasPrefix(libraryPrefix), box.archiveCalls == 0 {
+                    box.noteArchiveCall()
+                    _ = gate.wait(timeout: .now() + 30)
+                }
+                return EventPresenceScanner.state(url, size: size, mounted: mounted)
+            }
+
+            let refresh = Task { await workspace.refreshEvent(eventID) }
+            try await waitUntil { box.archiveCalls > 0 }
+            let stack = try XCTUnwrap(workspace.eventStacks[eventID]?.first)
+            XCTAssertNil(workspace.presence[eventID])
+
+            workspace.moveStacks([stack.id], fromEvent: eventID, toEvent: targetID)
+
+            // Same-moment observability: a running organize job and a status
+            // line, while the sweep is still parked.
+            XCTAssertTrue(model.isBusy)
+            XCTAssertTrue(model.jobs.contains { $0.action == .organize && $0.state == .running })
+            XCTAssertTrue(model.statusMessage.contains("Moving"))
+            XCTAssertNil(workspace.presence[eventID])
+
+            gate.signal()
+            try await waitUntil { !model.isBusy && workspace.latestMoveJournalTitle == "Move to Japan 2026" }
+            await refresh.value
+
+            let target = try XCTUnwrap(workspace.event(targetID))
+            let targetCopy = locations.cardCopyRoot(for: target, deviceID: "sony-a7v", policy: .buffer)
+            for name in ["B0001_DSC00001.ARW", "B0001_DSC00002.ARW"] {
+                XCTAssertTrue(FileManager.default.fileExists(atPath: targetCopy.appendingPathComponent(name).path))
+                XCTAssertFalse(FileManager.default.fileExists(atPath: cardCopy.appendingPathComponent(name).path))
+            }
+            XCTAssertEqual(model.configuration.photoEventAssignments.filter { $0.eventID == targetID }.count, 2)
+            XCTAssertTrue(model.configuration.photoEventAssignments.filter { $0.eventID == eventID }.isEmpty)
+        }
+    }
+
+    /// Move to Event before the board has painted at all: no stacks exist
+    /// to open into files, so the click is queued with a readable message
+    /// and runs as soon as the refresh publishes the grid.
+    func testMoveStacksBeforeBoardPaintsQueuesThenRuns() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let eventID = try XCTUnwrap(workspace.createEvent(name: "Trip 2026", date: organizerDay("2026-08-26"), policy: .buffer))
+            let targetID = try XCTUnwrap(workspace.createEvent(name: "Japan 2026", date: organizerDay("2026-08-27"), policy: .buffer))
+            let event = try XCTUnwrap(workspace.event(eventID))
+            let locations = workspace.locations
+            let cardCopy = locations.cardCopyRoot(for: event, deviceID: "sony-a7v", policy: .buffer)
+            let unsorted = root.appendingPathComponent("Drive/Unsorted A7V", isDirectory: true)
+            let url = try writeOrganizerARW(cardCopy.appendingPathComponent("DSC00001.ARW"), "2026:08:26 10:00:00", "000")
+            let assignment = PhotoEventAssignment(
+                sourceRootPath: unsorted.path,
+                relativePath: "DSC00001.ARW",
+                fileSize: Int64(try XCTUnwrap(try url.resourceValues(forKeys: [.fileSizeKey]).fileSize)),
+                modifiedAt: Date(),
+                eventID: eventID,
+                deviceID: "sony-a7v"
+            )
+            model.updateConfiguration { $0.photoEventAssignments.append(assignment) }
+            XCTAssertNil(workspace.eventStacks[eventID])
+
+            // The board never painted, so the stack id is the cover path the
+            // first paint will draw — the implied Card Copy path.
+            let stackID = try XCTUnwrap(locations.driveURL(for: assignment, event: event, policy: .buffer)).path
+            workspace.moveStacks([stackID], fromEvent: eventID, toEvent: targetID)
+
+            XCTAssertTrue(model.statusMessage.contains("queued"))
+            XCTAssertFalse(model.isBusy)
+
+            let target = try XCTUnwrap(workspace.event(targetID))
+            let destination = locations.cardCopyRoot(for: target, deviceID: "sony-a7v", policy: .buffer)
+                .appendingPathComponent("DSC00001.ARW")
+            try await waitUntil {
+                FileManager.default.fileExists(atPath: destination.path)
+                    && workspace.latestMoveJournalTitle == "Move to Japan 2026"
+                    && !model.isBusy
+            }
+            XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+            XCTAssertEqual(model.configuration.photoEventAssignments.first?.eventID, targetID)
+        }
+    }
+
+    /// A click that cannot move anything still answers: a destination name
+    /// collision and a move onto the same event each leave a sentence.
+    func testMoveStacksExplainsWhenNothingCanMove() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let eventID = try XCTUnwrap(workspace.createEvent(name: "Trip 2026", date: organizerDay("2026-08-26"), policy: .buffer))
+            let targetID = try XCTUnwrap(workspace.createEvent(name: "Japan 2026", date: organizerDay("2026-08-27"), policy: .buffer))
+            let event = try XCTUnwrap(workspace.event(eventID))
+            let locations = workspace.locations
+            let cardCopy = locations.cardCopyRoot(for: event, deviceID: "sony-a7v", policy: .buffer)
+            let url = try writeOrganizerARW(cardCopy.appendingPathComponent("DSC00001.ARW"), "2026:08:26 10:00:00", "000")
+            let unsorted = root.appendingPathComponent("Drive/Unsorted A7V", isDirectory: true)
+            let fileSize = Int64(try XCTUnwrap(try url.resourceValues(forKeys: [.fileSizeKey]).fileSize))
+            model.updateConfiguration {
+                $0.photoEventAssignments.append(PhotoEventAssignment(
+                    sourceRootPath: unsorted.path,
+                    relativePath: "DSC00001.ARW",
+                    fileSize: fileSize,
+                    modifiedAt: Date(),
+                    eventID: eventID,
+                    deviceID: "sony-a7v"
+                ))
+                // The destination catalog already owns that file name.
+                $0.photoEventAssignments.append(PhotoEventAssignment(
+                    sourceRootPath: unsorted.path,
+                    relativePath: "DSC00001.ARW",
+                    fileSize: 1,
+                    modifiedAt: Date(),
+                    eventID: targetID,
+                    deviceID: "sony-a7v"
+                ))
+            }
+            await workspace.refreshEvent(eventID)
+            let stack = try XCTUnwrap(workspace.eventStacks[eventID]?.first)
+
+            workspace.moveStacks([stack.id], fromEvent: eventID, toEvent: eventID)
+            XCTAssertTrue(model.statusMessage.contains("already in"))
+
+            workspace.moveStacks([stack.id], fromEvent: eventID, toEvent: targetID)
+            XCTAssertTrue(model.statusMessage.contains("already has files with those names"))
+            XCTAssertTrue(model.statusMessage.contains("Nothing moved"))
+            XCTAssertNil(workspace.latestMoveJournalTitle)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
+        }
+    }
+
+    /// Return to Unsorted obeys the same rule: while "Checking" hides the
+    /// presence index, the catalog fallback still plans the rename back to
+    /// the file's unsorted folder, and a tracked job runs it.
+    func testReturnToUnsortedWhilePresenceIndexIsEmptyRenamesBack() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let eventID = try XCTUnwrap(workspace.createEvent(name: "Trip 2026", date: organizerDay("2026-08-26"), policy: .buffer))
+            let event = try XCTUnwrap(workspace.event(eventID))
+            let locations = workspace.locations
+            let cardCopy = locations.cardCopyRoot(for: event, deviceID: "sony-a7v", policy: .buffer)
+            let unsorted = root.appendingPathComponent("Drive/Unsorted A7V", isDirectory: true)
+            let url = try writeOrganizerARW(cardCopy.appendingPathComponent("DSC00001.ARW"), "2026:08:26 10:00:00", "000")
+            let fileSize = Int64(try XCTUnwrap(try url.resourceValues(forKeys: [.fileSizeKey]).fileSize))
+            model.updateConfiguration {
+                $0.photoEventAssignments.append(PhotoEventAssignment(
+                    sourceRootPath: unsorted.path,
+                    relativePath: "DSC00001.ARW",
+                    fileSize: fileSize,
+                    modifiedAt: Date(),
+                    eventID: eventID,
+                    deviceID: "sony-a7v"
+                ))
+            }
+
+            let box = PresenceProbeBox()
+            let gate = DispatchSemaphore(value: 0)
+            defer { gate.signal() }
+            let libraryPrefix = locations.libraryRoot.path
+            workspace.presenceProbe = { url, size, mounted in
+                box.noteCall()
+                if let url, url.path.hasPrefix(libraryPrefix), box.archiveCalls == 0 {
+                    box.noteArchiveCall()
+                    _ = gate.wait(timeout: .now() + 30)
+                }
+                return EventPresenceScanner.state(url, size: size, mounted: mounted)
+            }
+
+            let refresh = Task { await workspace.refreshEvent(eventID) }
+            try await waitUntil { box.archiveCalls > 0 }
+            let stack = try XCTUnwrap(workspace.eventStacks[eventID]?.first)
+            XCTAssertNil(workspace.presence[eventID])
+
+            workspace.returnToUnsorted([stack.id], eventID: eventID)
+
+            XCTAssertTrue(model.isBusy)
+            XCTAssertTrue(model.jobs.contains { $0.action == .organize && $0.state == .running })
+            XCTAssertTrue(model.statusMessage.contains("Returning"))
+
+            gate.signal()
+            try await waitUntil { !model.isBusy && workspace.latestMoveJournalTitle != nil }
+            await refresh.value
+
+            // The original was renamed back to its unsorted folder — never
+            // copied, never rewritten.
+            XCTAssertTrue(FileManager.default.fileExists(atPath: unsorted.appendingPathComponent("DSC00001.ARW").path))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+            XCTAssertTrue(model.configuration.photoEventAssignments.isEmpty)
+        }
+    }
+
+    /// A file adopted from a Card Copy folder has no unsorted home: its
+    /// catalog source is the Card Copy path itself. Return to Unsorted must
+    /// say that instead of doing nothing — the note exists for the swept
+    /// path and now also for the mid-"Checking" catalog path.
+    func testReturnToUnsortedAdoptedFileExplainsItselfWhileChecking() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let eventID = try XCTUnwrap(workspace.createEvent(name: "Trip 2026", date: organizerDay("2026-08-26"), policy: .buffer))
+            let event = try XCTUnwrap(workspace.event(eventID))
+            let locations = workspace.locations
+            let cardCopy = locations.cardCopyRoot(for: event, deviceID: "sony-a7v", policy: .buffer)
+            let url = try writeOrganizerARW(cardCopy.appendingPathComponent("DSC00001.ARW"), "2026:08:26 10:00:00", "000")
+            let fileSize = Int64(try XCTUnwrap(try url.resourceValues(forKeys: [.fileSizeKey]).fileSize))
+            model.updateConfiguration {
+                $0.photoEventAssignments.append(PhotoEventAssignment(
+                    sourceRootPath: cardCopy.path,
+                    relativePath: "DSC00001.ARW",
+                    fileSize: fileSize,
+                    modifiedAt: Date(),
+                    eventID: eventID,
+                    deviceID: "sony-a7v"
+                ))
+            }
+
+            let box = PresenceProbeBox()
+            let gate = DispatchSemaphore(value: 0)
+            defer { gate.signal() }
+            let libraryPrefix = locations.libraryRoot.path
+            workspace.presenceProbe = { url, size, mounted in
+                box.noteCall()
+                if let url, url.path.hasPrefix(libraryPrefix), box.archiveCalls == 0 {
+                    box.noteArchiveCall()
+                    _ = gate.wait(timeout: .now() + 30)
+                }
+                return EventPresenceScanner.state(url, size: size, mounted: mounted)
+            }
+
+            let refresh = Task { await workspace.refreshEvent(eventID) }
+            try await waitUntil { box.archiveCalls > 0 }
+            let stack = try XCTUnwrap(workspace.eventStacks[eventID]?.first)
+
+            workspace.returnToUnsorted([stack.id], eventID: eventID)
+
+            XCTAssertTrue(model.statusMessage.contains("already organized on the drive"))
+            XCTAssertFalse(model.isBusy)
+            XCTAssertNil(workspace.latestMoveJournalTitle)
+
+            gate.signal()
+            await refresh.value
+            // Nothing moved and nothing was unassigned.
+            XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
+            XCTAssertEqual(model.configuration.photoEventAssignments.count, 1)
+        }
+    }
+
+    /// The context-menu state type answers from the stack values it is
+    /// handed — the fixture paths point at files that do not exist, so any
+    /// `standardizedFileURL`/`resourceValues` work inside it could not even
+    /// produce an answer.
+    func testStackMenuStateAnswersWithoutFilesystem() {
+        let photo = OrganizeItem(
+            primary: OrganizeFile(path: "/definitely/not/here/B0001_DSC00001.ARW", size: 1, modifiedAt: Date()),
+            kind: .raw,
+            captureDate: Date(),
+            hasCameraDate: true
+        )
+        let sidecar = OrganizeItem(
+            primary: OrganizeFile(path: "/definitely/not/here/B0001_DSC00001.xmp", size: 1, modifiedAt: Date()),
+            kind: .other,
+            captureDate: Date(),
+            hasCameraDate: false
+        )
+        let photoStack = OrganizeStack(items: [photo])
+        let sidecarStack = OrganizeStack(items: [sidecar])
+        let targets = [EventMenuTarget(id: UUID(), title: "Trip")]
+
+        let rotatable = OrganizeStackMenuState(targetIDs: [photoStack.id], stacks: [photoStack], eventTargets: targets)
+        XCTAssertTrue(rotatable.canRotate)
+        XCTAssertNil(rotatable.rotateHelp)
+        XCTAssertEqual(rotatable.rotateTitle, "Rotate Burst")
+        XCTAssertEqual(rotatable.eventTargets, targets)
+
+        let sidecarsOnly = OrganizeStackMenuState(targetIDs: [sidecarStack.id], stacks: [sidecarStack], eventTargets: targets)
+        XCTAssertFalse(sidecarsOnly.canRotate)
+        XCTAssertNotNil(sidecarsOnly.rotateHelp)
+
+        let multi = OrganizeStackMenuState(targetIDs: [photoStack.id, sidecarStack.id], stacks: [photoStack, sidecarStack], eventTargets: targets)
+        XCTAssertTrue(multi.canRotate)
+        XCTAssertEqual(multi.rotateTitle, "Rotate Selection")
+
+        let gone = OrganizeStackMenuState(targetIDs: ["ghost"], stacks: [], eventTargets: targets)
+        XCTAssertFalse(gone.canRotate)
+        XCTAssertNotNil(gone.rotateHelp)
+    }
+
+    /// The workspace's menu state resolves clicked/selected stacks through
+    /// the id indexes — a right-click on a painted event board or a scanned
+    /// unsorted board answers without walking the board's stacks.
+    func testStackMenuStateResolvesTargetsAndEvents() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let unsorted = root.appendingPathComponent("Drive/Unsorted A7V", isDirectory: true)
+            try writeOrganizerARW(unsorted.appendingPathComponent("B0001_DSC00001.ARW"), "2026:08:26 10:00:00", "100")
+            try writeOrganizerARW(unsorted.appendingPathComponent("B0001_DSC00002.ARW"), "2026:08:26 10:00:00", "400")
+            try organizerWrite(unsorted.appendingPathComponent("DSC00010.xmp"), "<xmp/>")
+            let location = addUnsorted(unsorted, to: model)
+            workspace.scan(location)
+            try await waitUntil { workspace.sources[location.id]?.result != nil }
+            let stacks = try XCTUnwrap(workspace.sources[location.id]?.result?.stacks)
+            let burst = try XCTUnwrap(stacks.first { $0.isBurst })
+            let sidecar = try XCTUnwrap(stacks.first { !$0.isBurst })
+
+            let eventID = try XCTUnwrap(workspace.createEvent(name: "Trip 2026", date: organizerDay("2026-08-26"), policy: .buffer))
+            let otherID = try XCTUnwrap(workspace.createEvent(name: "Japan 2026", date: organizerDay("2026-08-27"), policy: .buffer))
+
+            // Unsorted board: every event is a Sort Into target.
+            let unsortedMenu = workspace.stackMenuState(forStackID: burst.id, inLocation: location.id)
+            XCTAssertEqual(unsortedMenu.targetIDs, [burst.id])
+            XCTAssertEqual(Set(unsortedMenu.eventTargets.map(\.id)), [eventID, otherID])
+            XCTAssertTrue(unsortedMenu.canRotate)
+
+            let sidecarMenu = workspace.stackMenuState(forStackID: sidecar.id, inLocation: location.id)
+            XCTAssertFalse(sidecarMenu.canRotate)
+            XCTAssertNotNil(sidecarMenu.rotateHelp)
+
+            // A clicked stack inside the selection targets the selection.
+            workspace.selectStacks([burst.id, sidecar.id])
+            let selectedMenu = workspace.stackMenuState(forStackID: burst.id, inLocation: location.id)
+            XCTAssertEqual(selectedMenu.targetIDs, [burst.id, sidecar.id])
+            XCTAssertEqual(selectedMenu.rotateTitle, "Rotate Selection")
+
+            // Event board: the board's own event is not a Move target.
+            workspace.assign(stackIDs: [burst.id], from: location.id, to: eventID)
+            await workspace.refreshEvent(eventID)
+            let boardStack = try XCTUnwrap(workspace.eventStacks[eventID]?.first)
+            let eventMenu = workspace.stackMenuState(forStackID: boardStack.id, inEvent: eventID)
+            XCTAssertEqual(eventMenu.targetIDs, [boardStack.id])
+            XCTAssertEqual(eventMenu.eventTargets.map(\.id), [otherID])
+            XCTAssertTrue(eventMenu.canRotate)
+
+            // A stack id that is not on the board still answers, disabled.
+            let staleMenu = workspace.stackMenuState(forStackID: "ghost", inEvent: eventID)
+            XCTAssertFalse(staleMenu.canRotate)
+            XCTAssertNotNil(staleMenu.rotateHelp)
+        }
+    }
+
     // MARK: - Helpers
 
     private func withOrganizerSandbox(

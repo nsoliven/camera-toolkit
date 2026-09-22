@@ -527,7 +527,7 @@ public enum EventHierarchy {
     /// array (flattened, descendants, `EventStorageLocations`) build it once
     /// and share it through the `byID` overloads instead of rebuilding per
     /// event.
-    static func index(_ events: [SavedCameraEvent]) -> [UUID: SavedCameraEvent] {
+    public static func index(_ events: [SavedCameraEvent]) -> [UUID: SavedCameraEvent] {
         var byID: [UUID: SavedCameraEvent] = [:]
         for event in events where byID[event.id] == nil { byID[event.id] = event }
         return byID
@@ -538,7 +538,7 @@ public enum EventHierarchy {
         ancestors(of: event, byID: index(events))
     }
 
-    static func ancestors(of event: SavedCameraEvent, byID: [UUID: SavedCameraEvent]) -> [SavedCameraEvent] {
+    public static func ancestors(of event: SavedCameraEvent, byID: [UUID: SavedCameraEvent]) -> [SavedCameraEvent] {
         var chain: [SavedCameraEvent] = []
         var seen: Set<UUID> = [event.id]
         var current = event
@@ -556,7 +556,7 @@ public enum EventHierarchy {
         chain(of: event, byID: index(events))
     }
 
-    static func chain(of event: SavedCameraEvent, byID: [UUID: SavedCameraEvent]) -> [SavedCameraEvent] {
+    public static func chain(of event: SavedCameraEvent, byID: [UUID: SavedCameraEvent]) -> [SavedCameraEvent] {
         ancestors(of: event, byID: byID) + [event]
     }
 
@@ -566,7 +566,7 @@ public enum EventHierarchy {
         resolvedPolicy(of: event, byID: index(events))
     }
 
-    static func resolvedPolicy(of event: SavedCameraEvent, byID: [UUID: SavedCameraEvent]) -> EventStoragePolicy {
+    public static func resolvedPolicy(of event: SavedCameraEvent, byID: [UUID: SavedCameraEvent]) -> EventStoragePolicy {
         var seen: Set<UUID> = [event.id]
         var current = event
         while true {
@@ -593,7 +593,7 @@ public enum EventHierarchy {
         displayName(of: event, byID: index(events))
     }
 
-    static func displayName(of event: SavedCameraEvent, byID: [UUID: SavedCameraEvent]) -> String {
+    public static func displayName(of event: SavedCameraEvent, byID: [UUID: SavedCameraEvent]) -> String {
         chain(of: event, byID: byID).map(\.name).joined(separator: " / ")
     }
 
