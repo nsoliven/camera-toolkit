@@ -50,7 +50,11 @@ struct EventsRootView: View {
         .onReceive(NotificationCenter.default.publisher(for: .cameraToolkitStorageLocationsChanged)) { _ in
             workspace.discoverDriveEvents()
         }
-        .onReceive(NotificationCenter.default.publisher(for: .cameraToolkitMediaTrashChanged)) { _ in
+        .onReceive(NotificationCenter.default.publisher(for: .cameraToolkitMediaTrashChanged)) { notification in
+            // A move already removed those tiles. Rescanning here would
+            // read every unsorted folder again, which is what a restore
+            // needs and a move does not.
+            if notification.userInfo?["rescanUnsorted"] as? Bool == false { return }
             for location in workspace.unsortedLocations where workspace.sources[location.id]?.result != nil {
                 workspace.scan(location, force: true)
             }

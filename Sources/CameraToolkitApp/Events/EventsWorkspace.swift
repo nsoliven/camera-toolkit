@@ -2884,6 +2884,18 @@ final class EventsWorkspace {
         )
     }
 
+    /// Tells the Trash window to reload. `rescanUnsorted` is false for a move
+    /// that already dropped the files from the in-memory boards — a true
+    /// value, or no flag, still makes unsorted folders rescan so a restore
+    /// can show the files that came back.
+    static func postTrashChanged(rescanUnsorted: Bool) {
+        NotificationCenter.default.post(
+            name: .cameraToolkitMediaTrashChanged,
+            object: nil,
+            userInfo: ["rescanUnsorted": rescanUnsorted]
+        )
+    }
+
     // MARK: - Trash
 
     /// Moves every file of the given stacks — primaries and companions — into
@@ -3026,7 +3038,7 @@ final class EventsWorkspace {
                 // The boards are already truthful — tell the Trash window its
                 // list changed rather than re-reading whole events.
                 if !batch.entries.isEmpty {
-                    NotificationCenter.default.post(name: .cameraToolkitMediaTrashChanged, object: nil)
+                    Self.postTrashChanged(rescanUnsorted: false)
                 }
                 let skippedNote = batch.skipped.isEmpty
                     ? ""
@@ -3118,7 +3130,7 @@ final class EventsWorkspace {
                 // full refreshEvent would repaint the grid and bury the move
                 // confirmation under a reload of the whole event.
                 if !batch.entries.isEmpty {
-                    NotificationCenter.default.post(name: .cameraToolkitMediaTrashChanged, object: nil)
+                    Self.postTrashChanged(rescanUnsorted: false)
                 }
                 let skippedNote = batch.skipped.isEmpty
                     ? ""
