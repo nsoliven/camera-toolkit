@@ -63,6 +63,37 @@ struct ApplyRouteRow: Identifiable, Equatable, Sendable {
     }
 }
 
+/// One row of the apply sheet's pinned plan summary: the event, how many
+/// files Apply will move into it, and how those files break down. Images
+/// (RAW + photo), videos, and sidecars stay in separate counts so a video
+/// folder never reads as a missing photo.
+struct ApplyEventSummary: Identifiable, Equatable, Sendable {
+    var event: SavedCameraEvent
+    var isPrivate: Bool
+    /// Moves plus verified copies — the files Apply will relocate.
+    /// `alreadyThere`/`unavailable` stay footnotes, like on the route cards.
+    var fileCount: Int
+    /// RAW + ordinary photos.
+    var imageCount: Int
+    var videoCount: Int
+    /// Sidecars and anything that is not an image or video.
+    var otherCount: Int
+    var byteCount: Int64
+    var alreadyThere: Int
+    var unavailable: Int
+
+    var id: UUID { event.id }
+
+    /// "3 already in place · 2 on a disconnected drive"
+    var footnote: String? {
+        let parts = [
+            alreadyThere > 0 ? "\(alreadyThere) already in place" : nil,
+            unavailable > 0 ? "\(unavailable) on a disconnected drive" : nil,
+        ].compactMap { $0 }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+}
+
 enum ApplyRouteDiagram {
     /// The "where does each folder land" rows for one event group.
     static func routes(for group: OrganizeApplyPlan.EventGroup) -> [ApplyRouteRow] {
@@ -146,6 +177,34 @@ enum ApplyRouteDiagram {
                     .joined(separator: " ▸ ")
                 return row
             }
+        }
+    }
+
+    /// The pinned per-event summary for the apply sheet: every event in the
+    /// plan, counted through the same classification as the route rows so
+    /// images + videos + sidecars always equal the event's file count and
+    /// the rows add up to the headline total.
+    static func eventSummaries(for plan: OrganizeApplyPlan) -> [ApplyEventSummary] {
+        plan.groups.map { group in
+            var summary = ApplyEventSummary(
+                event: group.event,
+                isPrivate: group.isPrivate,
+                fileCount: 0,
+                imageCount: 0,
+                videoCount: 0,
+                otherCount: 0,
+                byteCount: 0,
+                alreadyThere: group.alreadyThere,
+                unavailable: group.unavailable
+            )
+            for route in routes(for: group) {
+                summary.fileCount += route.fileCount
+                summary.imageCount += route.photoCount
+                summary.videoCount += route.videoCount
+                summary.otherCount += route.otherCount
+                summary.byteCount += route.byteCount
+            }
+            return summary
         }
     }
 
@@ -323,6 +382,81 @@ struct ApplyEventGroupCard: View {
 
     private var fileCount: Int {
         group.moves.count + group.copyFileCount + group.alreadyThere + group.unavailable
+    }
+}
+
+/// The pinned "what lands in each event" table at the top of the apply
+/// sheet — one row per event plus a total row, so the whole plan is on
+/// screen before anyone scrolls the folder routes below. A plan with more
+/// events than fit scrolls inside the card instead of pushing the routes
+/// or the safety line off the sheet.
+struct ApplyPlanSummaryCard: View {
+    let plan: OrganizeApplyPlan
+
+    var body: some View {
+        let summaries = ApplyRouteDiagram.eventSummaries(for: plan)
+        ScrollView {
+            Grid(alignment: .trailing, horizontalSpacing: 16, verticalSpacing: 8) {
+                GridRow {
+                    Text("Event")
+                        .gridColumnAlignment(.leading)
+                    Text("Files")
+                    Text("Images")
+                    Text("Videos")
+                    Text("Sidecars")
+                    Text("Size")
+                }
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.secondary)
+                Divider()
+                ForEach(summaries) { row in
+                    GridRow {
+                        VStack(alignment: .leading, spacing: 2) {
+                            HStack(spacing: 8) {
+                                EventChip(event: row.event, isPrivate: row.isPrivate)
+                                Text(row.event.eventDate.formatted(date: .abbreviated, time: .omitted))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            if let footnote = row.footnote {
+                                Text(footnote)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .frame(maxWidth: 260, alignment: .leading)
+                        .gridColumnAlignment(.leading)
+                        Text(row.fileCount.formatted())
+                        Text(row.imageCount.formatted())
+                        Text(row.videoCount.formatted())
+                        Text(row.otherCount.formatted())
+                        Text(row.byteCount.formattedBytes)
+                    }
+                    .font(.callout.monospacedDigit())
+                }
+                if summaries.count > 1 {
+                    Divider()
+                    GridRow {
+                        Text("Total")
+                            .gridColumnAlignment(.leading)
+                        Text(summaries.reduce(0) { $0 + $1.fileCount }.formatted())
+                        Text(summaries.reduce(0) { $0 + $1.imageCount }.formatted())
+                        Text(summaries.reduce(0) { $0 + $1.videoCount }.formatted())
+                        Text(summaries.reduce(0) { $0 + $1.otherCount }.formatted())
+                        Text(summaries.reduce(Int64(0)) { $0 + $1.byteCount }.formattedBytes)
+                    }
+                    .font(.callout.monospacedDigit().weight(.semibold))
+                }
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .frame(maxHeight: 170)
+        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5)
+        }
     }
 }
 

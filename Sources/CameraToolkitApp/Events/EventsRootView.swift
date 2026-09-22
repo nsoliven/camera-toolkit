@@ -725,6 +725,10 @@ struct ApplyPlanSheet: View {
                 .font(.title2.bold())
             Text(summary)
                 .foregroundStyle(.secondary)
+            ApplyPlanSummaryCard(plan: plan)
+            Text("Where each folder lands")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 10) {
                     ForEach(plan.groups) { group in
@@ -732,7 +736,8 @@ struct ApplyPlanSheet: View {
                     }
                 }
             }
-            .frame(minHeight: 220)
+            .scrollIndicators(.visible)
+            .frame(minHeight: 120)
             Label(
                 "Moves on the same drive are instant renames. Copies from another drive are checksum-verified and leave the originals in place. Nothing is overwritten, and Undo can move files back.",
                 systemImage: "checkmark.shield"

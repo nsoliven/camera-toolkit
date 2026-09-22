@@ -126,4 +126,43 @@ final class ApplyRouteDiagramTests: XCTestCase {
     func testEmptyGroupProducesNoRoutes() {
         XCTAssertTrue(ApplyRouteDiagram.routes(for: eventGroup()).isEmpty)
     }
+
+    func testPlanSummaryListsEveryEventWithBalancedCounts() {
+        let first = eventGroup(name: "Trip 2026", moves: [
+            move("/Card/DCIM/DSC00001.ARW", "/E1/Sony A7V/Card Copy/DSC00001.ARW", bytes: 200),
+            move("/Card/DCIM/DSC00002.ARW", "/E1/Sony A7V/Card Copy/DSC00002.ARW", bytes: 200),
+            move("/Card/DCIM/C0001.MP4", "/E1/Sony A7V/Card Copy/C0001.MP4", bytes: 900),
+            move("/Card/DCIM/DSC00001.xmp", "/E1/Sony A7V/Card Copy/DSC00001.xmp"),
+        ], destination: "/E1")
+        let batch = OrganizeApplyPlan.CopyBatch(
+            sourceRoot: "/Volumes/LEXAR/DCIM",
+            destinationRoot: "/E2/Card Copy",
+            deviceID: "sony-a7v",
+            files: [
+                FileRecord(path: "DCIM/100MSDCF/DSC00003.ARW", size: 50, modifiedAt: Date()),
+                FileRecord(path: "DCIM/100MSDCF/DSC00004.ARW", size: 50, modifiedAt: Date()),
+            ]
+        )
+        let second = eventGroup(name: "Second Event", copies: [batch], destination: "/E2")
+        let plan = OrganizeApplyPlan(title: "Apply", groups: [first, second], pruneBoundaries: [])
+
+        let summaries = ApplyRouteDiagram.eventSummaries(for: plan)
+        XCTAssertEqual(summaries.map(\.event.name), ["Trip 2026", "Second Event"])
+
+        for row in summaries {
+            XCTAssertEqual(row.imageCount + row.videoCount + row.otherCount, row.fileCount)
+        }
+        XCTAssertEqual(summaries[0].fileCount, 4)
+        XCTAssertEqual(summaries[0].imageCount, 2)
+        XCTAssertEqual(summaries[0].videoCount, 1)
+        XCTAssertEqual(summaries[0].otherCount, 1)
+        XCTAssertEqual(summaries[0].byteCount, 1_400)
+        XCTAssertEqual(summaries[1].fileCount, 2)
+        XCTAssertEqual(summaries[1].imageCount, 2)
+        XCTAssertEqual(summaries[1].videoCount, 0)
+        XCTAssertEqual(summaries[1].otherCount, 0)
+
+        XCTAssertEqual(summaries.reduce(0) { $0 + $1.fileCount }, plan.fileCount)
+        XCTAssertEqual(summaries.reduce(Int64(0)) { $0 + $1.byteCount }, plan.byteCount)
+    }
 }

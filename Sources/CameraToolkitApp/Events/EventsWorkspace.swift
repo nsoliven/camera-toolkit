@@ -114,6 +114,8 @@ struct OrganizeApplyPlan: Identifiable, Sendable {
 
     var moveCount: Int { groups.reduce(0) { $0 + $1.moves.count } }
     var copyCount: Int { groups.reduce(0) { $0 + $1.copyFileCount } }
+    /// Files Apply will relocate — every move plus every verified copy.
+    var fileCount: Int { moveCount + copyCount }
     var byteCount: Int64 { groups.reduce(Int64(0)) { $0 + $1.byteCount } }
     var isEmpty: Bool { moveCount == 0 && copyCount == 0 }
 }
