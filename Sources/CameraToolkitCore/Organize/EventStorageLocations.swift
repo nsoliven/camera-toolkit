@@ -177,6 +177,20 @@ public struct EventStorageLocations: Sendable {
             .standardizedFileURL
     }
 
+    /// The path the event board trusts before any place is probed: the
+    /// policy's `Card Copy` root joined with the assignment's relative
+    /// path. Unlike `driveURL` this never calls `standardizedFileURL`,
+    /// which resolves symlinked ancestors through the filesystem — the
+    /// root was standardized once at init and `relativePath` is already
+    /// validated, so the join is pure string work. A file that actually
+    /// lives somewhere else is corrected by the presence sweep.
+    public func impliedDrivePath(for assignment: PhotoEventAssignment, event: SavedCameraEvent, policy: EventStoragePolicy) -> String? {
+        guard (try? PathSafety.validateRelativePath(assignment.relativePath)) != nil else { return nil }
+        return cardCopyRoot(for: event, deviceID: assignment.deviceID, policy: policy)
+            .appendingPathComponent(assignment.relativePath)
+            .path
+    }
+
     public func archiveURL(for assignment: PhotoEventAssignment, event: SavedCameraEvent) -> URL? {
         guard let relative = try? layout(for: event, deviceID: assignment.deviceID)
             .destinationRelativePath(for: assignment.relativePath) else { return nil }
