@@ -153,9 +153,10 @@ private struct AssignmentChange {
     var added: [PhotoEventAssignment]
 }
 
-/// Pass one of an event open: the grid built from the catalog-implied
-/// `Card Copy` paths, before any place has been probed.
-private struct EventFirstPaint: Sendable {
+/// A grid built from the catalog-implied `Card Copy` paths, before any
+/// place has been probed. Pass one of an event open paints the first
+/// screen of one of these; the deferred pass builds the whole event's.
+private struct EventImpliedGrid: Sendable {
     var files: [OrganizeFile]
     var stacks: [OrganizeStack]
 }
@@ -239,6 +240,10 @@ final class EventsWorkspace {
     var focusedStackID: String?
     var presence: [UUID: EventPresenceSummary] = [:]
     var eventStacks: [UUID: [OrganizeStack]] = [:]
+    /// Files still resolving behind an event's first screen. While a
+    /// count sits here the board's grid is real but partial — scrollable
+    /// and openable — and a status line says the rest is still coming.
+    var eventBuildRemainders: [UUID: Int] = [:]
     var eventImmichStatuses: [UUID: [String: ImmichCatalogStatus]] = [:]
     var discoveredDriveEvents: [DiscoveredDriveEvent] = []
     var newEventRequest: NewEventRequest?
@@ -269,11 +274,13 @@ final class EventsWorkspace {
     @ObservationIgnored private var assignmentBytes: [UUID: Int64] = [:]
     @ObservationIgnored private var eventAssetsByPathKey: [UUID: [String: EventAssetPresence]] = [:]
     @ObservationIgnored private var refreshGenerations: [UUID: UUID] = [:]
-    /// The four-place sweep running per event; a new refresh cancels the
-    /// stale one so it never finishes against an old generation. Never
-    /// awaited: `await task.value` would escalate it to the caller's
-    /// priority, undoing the utility tier that keeps it off the UI path.
-    /// The sweep applies its own results and resolves `presenceWaiters`.
+    /// The deferred refresh pipeline running per event — the remaining
+    /// files' implied-path build, then the four-place presence sweep. A
+    /// new refresh cancels the stale one so it never finishes against an
+    /// old generation. Never awaited: `await task.value` would escalate
+    /// it to the caller's priority, undoing the utility tier that keeps
+    /// it off the UI path. The pipeline applies its own results and
+    /// resolves `presenceWaiters`.
     @ObservationIgnored private var presenceTasks: [UUID: Task<Void, Never>] = [:]
     /// `refreshEvent` calls parked until their generation's sweep lands —
     /// (generation, continuation) pairs. A waiter whose generation went
@@ -285,6 +292,14 @@ final class EventsWorkspace {
     /// test can park on the archive URL to prove the grid paints before
     /// the NAS answers.
     @ObservationIgnored var presenceProbe: EventPresenceScanner.PresenceProbe?
+    /// Test seam: resolves one assignment's board path inside an event
+    /// refresh — the first screen and the deferred build both go through
+    /// it. Production joins the catalog-implied `Card Copy` path, pure
+    /// string work that never touches the filesystem; a test counts
+    /// which assignments resolved — or parks on one — to prove the first
+    /// screen published before the rest of the files were resolved at
+    /// all, let alone through `standardizedFileURL`.
+    @ObservationIgnored var eventPathResolver: (@Sendable (PhotoEventAssignment) -> String?)?
     @ObservationIgnored private var loadedCaptureDateCache: CaptureDateCache?
     @ObservationIgnored private var lastConnectivityRefresh = Date.distantPast
     @ObservationIgnored private var connectivityRefreshTask: Task<Void, Never>?
@@ -1400,21 +1415,37 @@ final class EventsWorkspace {
 
     // MARK: - Presence
 
-    /// Two passes, ordered by what the board needs first.
+    /// How many of an event's earliest files paint the first screen —
+    /// enough tiles to fill a window before the rest of the build
+    /// resolves behind them.
+    nonisolated static let firstScreenFileLimit = 240
+
+    /// Three passes, ordered by what the board needs first.
     ///
-    /// Pass one draws the grid from the place the catalog already implies —
-    /// the event policy's `Card Copy` folder on its drive — without a
-    /// single per-file stat, so first paint never waits on the card, the
-    /// other drive, or the NAS. Pass two is the truthful four-place sweep:
-    /// it runs at utility priority so it cannot contend with scrolling or
-    /// tile decode, and publishes the storage chips when it lands. When a
-    /// file actually lives somewhere other than the implied drive path —
-    /// still on the card, only on the NAS, or gone — the grid is rebuilt
-    /// onto the real paths; when nothing moved, the tiles the board
-    /// already decoded are left alone.
+    /// Pass one draws only the first screen of the grid — the earliest
+    /// files — from the place the catalog already implies: the event
+    /// policy's `Card Copy` folder joined with each assignment's
+    /// relative path. That join is pure string work — no
+    /// `standardizedFileURL`, no `resourceValues`, no per-file stat — so
+    /// the first tiles never wait on the card, the other drive, or the
+    /// NAS, and `eventStacks` is assigned as soon as the screen exists.
+    ///
+    /// Pass two resolves the remaining files onto the same implied
+    /// paths inside a utility-priority task that applies itself through
+    /// `applyEventBuild` — never `await task.value` here, which would
+    /// escalate it to this context's priority and hold the spinner the
+    /// way the old single pass did. Stacks that survive the merge keep
+    /// the ids an open preview or a decoded tile is bound to.
+    ///
+    /// Pass three is the truthful four-place sweep, still on the same
+    /// utility task so its corrections can never be overwritten by a
+    /// late-running build: it publishes the storage chips and rebuilds
+    /// the grid onto real paths only where files turned out to live
+    /// somewhere else — still on the card, only on the NAS, or gone.
     ///
     /// A second open or a Refresh starts a new generation and cancels the
-    /// stale sweep; the generation guard keeps its results out either way.
+    /// stale pipeline; the generation guard keeps its results out either
+    /// way.
     func refreshEvent(_ eventID: UUID) async {
         guard let event = event(eventID) else { return }
         let generation = UUID()
@@ -1427,21 +1458,26 @@ final class EventsWorkspace {
         let burstSplits = model.configuration.burstSplits
         let catalogURL = URL(fileURLWithPath: DashboardModel.expandedPath(model.configuration.catalogDatabasePath))
         let probe = presenceProbe
+        let resolve: @Sendable (PhotoEventAssignment) -> String? = eventPathResolver ?? { assignment in
+            locations.impliedDrivePath(for: assignment, event: event, policy: policy)
+        }
 
         // Pass one is skipped when the policy's drive is offline: there is
         // no local copy to point a tile at, and drawing one anyway would
         // paint a grid of dead paths. The sweep then publishes the grid.
-        var firstPaint: EventFirstPaint?
-        if VolumeInfo.isAvailable(locations.driveRoot(for: policy)) {
-            firstPaint = await Task.detached(priority: .userInitiated) { () -> EventFirstPaint in
-                var files: [OrganizeFile] = []
-                files.reserveCapacity(assignments.count)
-                for assignment in assignments {
-                    guard let url = locations.driveURL(for: assignment, event: event, policy: policy) else { continue }
-                    files.append(OrganizeFile(path: url.path, size: assignment.fileSize, modifiedAt: assignment.modifiedAt))
+        let driveAvailable = VolumeInfo.isAvailable(locations.driveRoot(for: policy))
+        var firstPaint: EventImpliedGrid?
+        if driveAvailable {
+            firstPaint = await Task.detached(priority: .userInitiated) { () -> EventImpliedGrid in
+                let earliest = assignments
+                    .sorted { ($0.modifiedAt, $0.relativePath) < ($1.modifiedAt, $1.relativePath) }
+                    .prefix(Self.firstScreenFileLimit)
+                let files = earliest.compactMap { assignment -> OrganizeFile? in
+                    guard let path = resolve(assignment) else { return nil }
+                    return OrganizeFile(literalPath: path, size: assignment.fileSize, modifiedAt: assignment.modifiedAt)
                 }
                 let items = OrganizeScanner.items(for: files, cache: cache).items
-                return EventFirstPaint(
+                return EventImpliedGrid(
                     files: files,
                     stacks: OrganizeStacker.stacks(for: items, splits: burstSplits)
                 )
@@ -1451,13 +1487,37 @@ final class EventsWorkspace {
         guard refreshGenerations[eventID] == generation else { return }
         if let firstPaint {
             eventStacks[eventID] = firstPaint.stacks.carryingIDs(from: eventStacks[eventID] ?? [])
+            let remaining = assignments.count - firstPaint.files.count
+            eventBuildRemainders[eventID] = remaining > 0 ? remaining : nil
+        } else {
+            eventBuildRemainders[eventID] = nil
         }
-        let firstPaintFiles = firstPaint?.files
 
-        // The sweep applies itself through `finishPresenceSweep` instead of
-        // being awaited here — `await sweep.value` would escalate it to
-        // this context's priority and put it right back on the hot tier.
-        let sweep = Task.detached(priority: .utility) { [self] in
+        // The rest of the event — the remaining files' implied-path
+        // build, then the four-place sweep — is one utility-priority
+        // pipeline that applies itself back on this actor instead of
+        // being awaited here. Building before the sweep keeps
+        // `finishPresenceSweep`'s path comparison honest, and utility
+        // priority keeps both off scrolling and tile decode.
+        let pipeline = Task.detached(priority: .utility) { [self] in
+            var built: EventImpliedGrid?
+            if driveAvailable {
+                var files: [OrganizeFile] = []
+                files.reserveCapacity(assignments.count)
+                for assignment in assignments where !Task.isCancelled {
+                    guard let path = resolve(assignment) else { continue }
+                    files.append(OrganizeFile(literalPath: path, size: assignment.fileSize, modifiedAt: assignment.modifiedAt))
+                }
+                if !Task.isCancelled {
+                    let items = OrganizeScanner.items(for: files, cache: cache).items
+                    built = EventImpliedGrid(
+                        files: files,
+                        stacks: OrganizeStacker.stacks(for: items, splits: burstSplits)
+                    )
+                }
+            }
+            await applyEventBuild(eventID: eventID, generation: generation, build: built)
+
             var output: EventRefreshOutput?
             if let summary = EventPresenceScanner.scan(
                 event: event,
@@ -1478,36 +1538,50 @@ final class EventsWorkspace {
             await finishPresenceSweep(
                 eventID: eventID,
                 generation: generation,
-                firstPaintFiles: firstPaintFiles,
+                builtFiles: built?.files,
                 output: output
             )
         }
-        presenceTasks[eventID] = sweep
+        presenceTasks[eventID] = pipeline
         await withCheckedContinuation { (cc: CheckedContinuation<Void, Never>) in
             presenceWaiters[eventID, default: []].append((generation, cc))
         }
     }
 
+    /// Main-actor landing point for the deferred build: the full implied
+    /// grid replaces the first screen, carrying the stack ids an open
+    /// preview or a decoded tile is bound to wherever the same files
+    /// land together again. A stale generation drops the build instead.
+    private func applyEventBuild(eventID: UUID, generation: UUID, build: EventImpliedGrid?) {
+        guard refreshGenerations[eventID] == generation else { return }
+        guard let build else { return }
+        eventStacks[eventID] = build.stacks.carryingIDs(from: eventStacks[eventID] ?? [])
+        eventBuildRemainders[eventID] = nil
+    }
+
     /// Main-actor landing point for the utility-priority sweep. Publishes
     /// the storage chips and badge index, rebuilds the grid only when the
-    /// truthful paths differ from what pass one drew, and wakes the
-    /// `refreshEvent` calls waiting on this pass. Stale generations only
-    /// resume their waiters — their results are dropped.
+    /// truthful paths differ from what the implied build drew, and wakes
+    /// the `refreshEvent` calls waiting on this pass. Stale generations
+    /// only resume their waiters — their results are dropped.
     private func finishPresenceSweep(
         eventID: UUID,
         generation: UUID,
-        firstPaintFiles: [OrganizeFile]?,
+        builtFiles: [OrganizeFile]?,
         output: EventRefreshOutput?
     ) async {
         defer { resumePresenceWaiters(for: eventID, appliedGeneration: generation) }
         guard refreshGenerations[eventID] == generation else { return }
         presenceTasks[eventID] = nil
+        // This generation's pipeline is done — build landed or was
+        // dropped, sweep landed — so nothing is still coming.
+        eventBuildRemainders[eventID] = nil
         guard let output else { return }
 
         eventAssetsByPathKey[eventID] = output.assetsByPathKey
         presence[eventID] = output.summary
         eventImmichStatuses[eventID] = output.immich
-        guard output.files != firstPaintFiles else { return }
+        guard output.files != builtFiles else { return }
 
         // Files resolved somewhere other than the implied Card Copy path —
         // restack onto the real ones. Continuation, not `task.value`, so

@@ -49,6 +49,19 @@ struct EventBoardView: View {
                 header(event, groups: groups)
                 StorageStrip(model: model, workspace: workspace, event: event, summary: workspace.presence[eventID])
                     .guideHighlight(.storageStrip, in: workspace)
+                if let remaining = workspace.eventBuildRemainders[eventID], remaining > 0 {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("First photos are up — the remaining \(remaining.formatted()) files are still loading.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 5)
+                    .background(.bar)
+                }
                 if stacks != nil {
                     if groups.isEmpty {
                         if workspace.search.isEmpty {

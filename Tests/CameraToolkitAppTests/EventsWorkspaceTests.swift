@@ -1157,6 +1157,80 @@ final class EventsWorkspaceTests: XCTestCase {
         }
     }
 
+    /// First paint is a first screen, not the whole build: while the
+    /// deferred pass is parked on its first beyond-the-screen resolve,
+    /// the board already shows the earliest `firstScreenFileLimit`
+    /// files — and none of the parked files went through any path
+    /// resolution at all, let alone a `standardizedFileURL`. When the
+    /// rest lands, the stacks that were on screen keep the ids an open
+    /// preview would be bound to. 2,000 files stand in for the real
+    /// 10,987-file events.
+    func testRefreshEventPaintsFirstScreenBeforeRestResolves() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let eventID = try XCTUnwrap(workspace.createEvent(name: "Big Trip", date: organizerDay("2026-08-26"), policy: .buffer))
+            let event = try XCTUnwrap(workspace.event(eventID))
+            let locations = workspace.locations
+            let cardCopy = locations.cardCopyRoot(for: event, deviceID: "sony-a7v", policy: .buffer)
+            let fileCount = 2_000
+            // Frame numbers step by 10 — never consecutive — and
+            // modifiedAt climbs one second per file, so every file stays
+            // a single and "the earliest" is exactly the first
+            // firstScreenFileLimit assignments.
+            var assignments: [PhotoEventAssignment] = []
+            for index in 0..<fileCount {
+                let name = String(format: "DSC%05d.ARW", index * 10)
+                let url = try writeOrganizerARW(cardCopy.appendingPathComponent(name), "2026:08:26 10:00:00", "000")
+                assignments.append(PhotoEventAssignment(
+                    sourceRootPath: "/Volumes/MissingCard/DCIM",
+                    relativePath: name,
+                    fileSize: Int64(try XCTUnwrap(try url.resourceValues(forKeys: [.fileSizeKey]).fileSize)),
+                    modifiedAt: Date(timeIntervalSince1970: 1_752_000_000 + TimeInterval(index)),
+                    eventID: eventID,
+                    deviceID: "sony-a7v"
+                ))
+            }
+            model.updateConfiguration { $0.photoEventAssignments.append(contentsOf: assignments) }
+
+            let firstScreen = Set(assignments.prefix(EventsWorkspace.firstScreenFileLimit).map(\.relativePath))
+            let box = EventPathProbeBox()
+            let gate = DispatchSemaphore(value: 0)
+            defer { gate.signal() }
+            workspace.eventPathResolver = { assignment in
+                if firstScreen.contains(assignment.relativePath) {
+                    box.noteResolved(assignment.relativePath)
+                } else if box.noteParkedCall() {
+                    // The deferred build parks on its first
+                    // beyond-the-screen resolve — the stand-in for a
+                    // drive that answers one file at a time, slowly.
+                    // Later parked-file resolves just record and return.
+                    _ = gate.wait(timeout: .now() + 30)
+                }
+                return locations.impliedDrivePath(for: assignment, event: event, policy: .buffer)
+            }
+
+            let refresh = Task { await workspace.refreshEvent(eventID) }
+            // Parked inside the deferred build's first beyond-the-screen
+            // resolve: the first screen must already be on the board, and
+            // nothing parked was resolved — no `standardizedFileURL`, no
+            // stat — to get it there.
+            try await waitUntil { box.parkedCalls > 0 }
+            let firstStacks = try XCTUnwrap(workspace.eventStacks[eventID])
+            XCTAssertFalse(firstStacks.isEmpty)
+            XCTAssertEqual(firstStacks.flatMap(\.files).count, EventsWorkspace.firstScreenFileLimit)
+            XCTAssertTrue(box.resolved.isSubset(of: firstScreen))
+            XCTAssertFalse(box.onMainThread)
+
+            gate.signal()
+            await refresh.value
+            let finalStacks = try XCTUnwrap(workspace.eventStacks[eventID])
+            XCTAssertEqual(finalStacks.flatMap(\.files).count, fileCount)
+            XCTAssertEqual(workspace.presence[eventID]?.onDrive, fileCount)
+            // Every stack the first screen drew still owns its id — an
+            // open preview bound to one never lost it to the append.
+            XCTAssertTrue(Set(firstStacks.map(\.id)).isSubset(of: Set(finalStacks.map(\.id))))
+        }
+    }
+
     func testEventFaceScanRunsAsTrackedJobOnReachableFiles() async throws {
         try await withOrganizerSandbox { root, model, workspace in
             let unsorted = root.appendingPathComponent("Card", isDirectory: true)
@@ -2111,6 +2185,37 @@ private final class PresenceProbeBox: @unchecked Sendable {
 
     func noteArchiveCall() {
         lock.withLock { _archiveCalls += 1 }
+    }
+}
+
+/// What the injected path resolver observed inside an event refresh:
+/// which assignments resolved before the deferred build parked, and
+/// whether any of that ran on the main thread.
+private final class EventPathProbeBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _resolved: Set<String> = []
+    private var _parkedCalls = 0
+    private var _onMainThread = false
+
+    var resolved: Set<String> { lock.withLock { _resolved } }
+    var parkedCalls: Int { lock.withLock { _parkedCalls } }
+    var onMainThread: Bool { lock.withLock { _onMainThread } }
+
+    func noteResolved(_ relativePath: String) {
+        lock.withLock {
+            _resolved.insert(relativePath)
+            _onMainThread = _onMainThread || Thread.isMainThread
+        }
+    }
+
+    /// Returns true for the first parked call only — the one the test
+    /// holds on its gate while it inspects the first-screen publish.
+    func noteParkedCall() -> Bool {
+        lock.withLock {
+            _parkedCalls += 1
+            _onMainThread = _onMainThread || Thread.isMainThread
+            return _parkedCalls == 1
+        }
     }
 }
 

@@ -176,6 +176,19 @@ public struct OrganizeFile: Codable, Hashable, Sendable {
         pathKey = EventStorageLocations.pathKey(path)
     }
 
+    /// A file whose path spelling is already final — such as the
+    /// catalog-implied `Card Copy` join — so `pathKey` skips the
+    /// filesystem resolve `EventStorageLocations.pathKey(_:)` pays for.
+    /// For a path with no symlinked components the keys are identical; a
+    /// file that turns out to live elsewhere is rebuilt through the
+    /// standardizing initializer when the presence sweep learns where.
+    public init(literalPath path: String, size: Int64, modifiedAt: Date) {
+        self.path = path
+        self.size = size
+        self.modifiedAt = modifiedAt
+        pathKey = path.lowercased()
+    }
+
     private enum CodingKeys: String, CodingKey {
         case path, size, modifiedAt
     }
