@@ -123,9 +123,12 @@ public final class FaceIndexStore: @unchecked Sendable {
         }
     }
 
-    /// Inserts or replaces a photo's detected faces. Confirmed faces are
-    /// never touched, and a fresh detection whose box overlaps a confirmed
-    /// face is dropped instead of duplicating it.
+    /// Inserts or replaces a photo's detected faces. A confirmed face keeps
+    /// its label and its row: a fresh detection that overlaps one refreshes
+    /// that row's box, vector, quality, and crop in place instead of
+    /// duplicating it — the person the user named is trusted, the old
+    /// measurement is not, and this is how a named gallery migrates into a
+    /// new engine's embedding space without anyone re-tagging.
     public func replaceFaces(
         photo: FacePhotoRecord,
         faces: [FaceRecord],
@@ -136,16 +139,16 @@ public final class FaceIndexStore: @unchecked Sendable {
         try write { database in
             let confirmed = try Row.fetchAll(
                 database,
-                sql: "SELECT box_x, box_y, box_w, box_h FROM faces WHERE photo_id = ? AND state = 'confirmed'",
+                sql: "SELECT id, box_x, box_y, box_w, box_h FROM faces WHERE photo_id = ? AND state = 'confirmed'",
                 arguments: [photo.pathKey]
-            ).map(Self.box)
+            ).map { (id: $0["id"] as String, box: Self.box($0)) }
 
             try database.execute(
                 sql: """
                 INSERT INTO face_photos(
                     path_key, path, file_name, byte_count, modified_at,
-                    taken_at, scan_grade, face_count, indexed_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    taken_at, scan_grade, face_count, engine, indexed_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(path_key) DO UPDATE SET
                     path = excluded.path,
                     file_name = excluded.file_name,
@@ -153,6 +156,7 @@ public final class FaceIndexStore: @unchecked Sendable {
                     modified_at = excluded.modified_at,
                     taken_at = excluded.taken_at,
                     scan_grade = excluded.scan_grade,
+                    engine = excluded.engine,
                     updated_at = excluded.updated_at
                 """,
                 arguments: [
@@ -164,6 +168,7 @@ public final class FaceIndexStore: @unchecked Sendable {
                     photo.takenAt.map { Self.timestamp($0, formatter) },
                     photo.scanGrade.rawValue,
                     photo.faceCount,
+                    photo.engine,
                     now,
                     now,
                 ]
@@ -174,8 +179,30 @@ public final class FaceIndexStore: @unchecked Sendable {
                 arguments: [photo.pathKey]
             )
 
+            var refreshed: Set<String> = []
             for face in faces {
-                if confirmed.contains(where: { face.box.iou(with: $0) > confirmedOverlap }) {
+                if let match = confirmed
+                    .filter({ !refreshed.contains($0.id) })
+                    .max(by: { face.box.iou(with: $0.box) < face.box.iou(with: $1.box) }),
+                   face.box.iou(with: match.box) > confirmedOverlap {
+                    refreshed.insert(match.id)
+                    try database.execute(
+                        sql: """
+                        UPDATE faces SET
+                            box_x = ?, box_y = ?, box_w = ?, box_h = ?,
+                            det_score = ?, embedding = COALESCE(?, embedding),
+                            quality = ?, face_px = ?, crop = COALESCE(?, crop),
+                            model = ?, scan_grade = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        arguments: [
+                            face.box.x, face.box.y, face.box.width, face.box.height,
+                            face.detScore, face.embeddingData,
+                            face.quality, face.facePixels, face.crop,
+                            face.model, face.scanGrade.rawValue, now,
+                            match.id,
+                        ]
+                    )
                     continue
                 }
                 try insertFace(face, database: database, now: now, formatter: formatter)
@@ -223,8 +250,8 @@ public final class FaceIndexStore: @unchecked Sendable {
                 sql: """
                 INSERT INTO face_photos(
                     path_key, path, file_name, byte_count, modified_at,
-                    taken_at, scan_grade, face_count, indexed_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+                    taken_at, scan_grade, face_count, engine, indexed_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
                 ON CONFLICT(path_key) DO UPDATE SET
                     path = excluded.path,
                     file_name = excluded.file_name,
@@ -232,6 +259,7 @@ public final class FaceIndexStore: @unchecked Sendable {
                     modified_at = excluded.modified_at,
                     taken_at = excluded.taken_at,
                     scan_grade = excluded.scan_grade,
+                    engine = excluded.engine,
                     updated_at = excluded.updated_at
                 """,
                 arguments: [
@@ -242,6 +270,7 @@ public final class FaceIndexStore: @unchecked Sendable {
                     Self.timestamp(photo.modifiedAt, formatter),
                     photo.takenAt.map { Self.timestamp($0, formatter) },
                     photo.scanGrade.rawValue,
+                    photo.engine,
                     now,
                     now,
                 ]
@@ -590,8 +619,9 @@ public final class FaceIndexStore: @unchecked Sendable {
             SELECT t.person_id, f.embedding FROM face_templates t
             JOIN faces f ON f.id = t.face_id
             JOIN people p ON p.id = t.person_id
-            WHERE p.is_roster = 1 AND f.embedding IS NOT NULL
-            """
+            WHERE p.is_roster = 1 AND f.embedding IS NOT NULL AND f.model = ?
+            """,
+            arguments: [FaceEngine.identifier]
         )
         return rows.compactMap { row in
             guard let personID = UUID(uuidString: row["person_id"] as String? ?? ""),
@@ -614,8 +644,10 @@ public final class FaceIndexStore: @unchecked Sendable {
             \(Self.faceSelect)
             WHERE f.state IN ('cached', 'proposed', 'other')
               AND f.embedding IS NOT NULL
+              AND f.model = ?
             ORDER BY f.det_score DESC
-            """
+            """,
+            arguments: [FaceEngine.identifier]
         ).map { Self.faceRecord($0) }
     }
 
@@ -626,19 +658,27 @@ public final class FaceIndexStore: @unchecked Sendable {
     }
 
     func groupEmbeddings(database: Database) throws -> [UUID: [[Float]]] {
+        try groupMembers(database: database).mapValues { $0.map(\.embedding) }
+    }
+
+    /// Member faces of each non-roster group — ids and embeddings — so a
+    /// grouping pass can honour the rejections its members carry.
+    func groupMembers(database: Database) throws -> [UUID: [(faceID: UUID, embedding: [Float])]] {
         let rows = try Row.fetchAll(
             database,
             sql: """
-            SELECT f.person_id, f.embedding FROM faces f
+            SELECT f.id, f.person_id, f.embedding FROM faces f
             JOIN people p ON p.id = f.person_id
-            WHERE p.is_roster = 0 AND f.embedding IS NOT NULL
-            """
+            WHERE p.is_roster = 0 AND f.embedding IS NOT NULL AND f.model = ?
+            """,
+            arguments: [FaceEngine.identifier]
         )
-        var groups: [UUID: [[Float]]] = [:]
+        var groups: [UUID: [(faceID: UUID, embedding: [Float])]] = [:]
         for row in rows {
             guard let id = UUID(uuidString: row["person_id"] as String? ?? ""),
+                  let faceID = UUID(uuidString: row["id"] as String? ?? ""),
                   let data: Data = row["embedding"] else { continue }
-            groups[id, default: []].append(FaceRecord.embedding(from: data))
+            groups[id, default: []].append((faceID, FaceRecord.embedding(from: data)))
         }
         return groups
     }
@@ -1240,9 +1280,9 @@ public final class FaceIndexStore: @unchecked Sendable {
             sql: """
             INSERT INTO faces(
                 id, photo_id, person_id, box_x, box_y, box_w, box_h,
-                det_score, match_score, embedding, model, state, scan_grade,
+                det_score, match_score, quality, face_px, embedding, model, state, scan_grade,
                 crop, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             arguments: [
                 face.id.uuidString,
@@ -1254,6 +1294,8 @@ public final class FaceIndexStore: @unchecked Sendable {
                 face.box.height,
                 face.detScore,
                 face.matchScore,
+                face.quality,
+                face.facePixels,
                 face.embeddingData,
                 face.model,
                 face.state.rawValue,
@@ -1277,7 +1319,8 @@ public final class FaceIndexStore: @unchecked Sendable {
             modifiedAt: formatter.date(from: modified) ?? .distantPast,
             takenAt: taken.flatMap { formatter.date(from: $0) },
             scanGrade: FaceScanGrade(rawValue: row["scan_grade"]) ?? .none,
-            faceCount: Int(row["face_count"] as Int64? ?? 0)
+            faceCount: Int(row["face_count"] as Int64? ?? 0),
+            engine: row["engine"] as String? ?? ""
         )
     }
 
@@ -1292,6 +1335,8 @@ public final class FaceIndexStore: @unchecked Sendable {
             box: box(row),
             detScore: row["det_score"],
             matchScore: matchScore,
+            quality: row["quality"],
+            facePixels: row["face_px"],
             embedding: embeddingData.map(FaceRecord.embedding(from:)),
             crop: row["crop"],
             model: row["model"],

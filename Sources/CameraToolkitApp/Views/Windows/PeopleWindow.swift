@@ -168,11 +168,11 @@ private struct PeopleView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text("People")
                     .font(.headline)
-                Text(workspace.faceModelInstalled
+                Text(workspace.faceEngineInstalled
                     ? "Faces are matched on-device. Name a group and its faces become that person everywhere."
-                    : "Face model not installed — run scripts/convert-arcface.sh once on this Mac.")
+                    : "Face engine not installed — run \(FaceSidecarInstallation.setupCommand) once on this Mac.")
                     .font(.caption)
-                    .foregroundStyle(workspace.faceModelInstalled ? Color.secondary : Color.orange)
+                    .foregroundStyle(workspace.faceEngineInstalled ? Color.secondary : Color.orange)
                     .lineLimit(1)
             }
             Spacer()

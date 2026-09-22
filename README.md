@@ -42,6 +42,7 @@ New here? Press **Start Guided Setup** on the welcome screen, or **Guide** in th
 
 - macOS 14 or newer
 - Swift 6 and Xcode 16 or newer for source builds
+- [`uv`](https://docs.astral.sh/uv/) (`brew install uv`) to install the on-device face engine once: `scripts/setup-face-sidecar.sh`
 - Photomator is optional, but required for the **Open in Photomator** actions
 - An Immich server and API key are optional
 - A TrueNAS server and read-only API key are optional when exact NAS capacity is needed
@@ -93,6 +94,8 @@ Open **Camera Toolkit → Settings** and choose:
 3. Optionally, a private staging folder. Leave it empty to use a hidden `.Camera Toolkit/Private` folder on the Buffer drive.
 4. Optionally, an Immich server URL and API key.
 5. Optionally, a TrueNAS server URL and read-only API key. Leave the dataset blank to match it from the mounted SMB library share.
+
+To use **Scan for Faces…**, run `scripts/setup-face-sidecar.sh` once. It builds a private Python environment under the app's support folder with the reference InsightFace models (see `docs/FACE-PIPELINE.md`); face scans are refused until it exists.
 
 Then add cards and unsorted folders from the Events sidebar with **Add Folder or Card…**. No removable-drive, network-share, username, or home-directory path is compiled into the app. API keys are stored in macOS Keychain; paths and event preferences stay in the app's local configuration.
 

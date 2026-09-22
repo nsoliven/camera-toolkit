@@ -2558,12 +2558,10 @@ final class EventsWorkspace {
         URL(fileURLWithPath: DashboardModel.expandedPath(model.configuration.catalogDatabasePath))
     }
 
-    var faceModelInstalled: Bool {
-        FaceModelCatalog.isModelInstalled(applicationSupport: DashboardModel.defaultApplicationSupportURL)
-    }
-
-    var faceDetectorInstalled: Bool {
-        FaceModelCatalog.isDetectorInstalled(applicationSupport: DashboardModel.defaultApplicationSupportURL)
+    /// True once `scripts/setup-face-sidecar.sh` has installed the face
+    /// engine on this Mac — the gate every scan and the People window show.
+    var faceEngineInstalled: Bool {
+        FaceSidecarInstallation(applicationSupport: DashboardModel.defaultApplicationSupportURL).isInstalled
     }
 
     /// Opens the "Scan for Faces" sheet for a location — quality and the
@@ -2578,9 +2576,10 @@ final class EventsWorkspace {
         faceScanRequest = FaceScanRequest(subject: .event(event.id))
     }
 
-    /// Test seam: supplies the embedder so a face scan can run without the
-    /// on-disk CoreML package. Nil in production — the model loads per scan.
-    @ObservationIgnored var faceEmbedderProvider: (@Sendable () async throws -> FaceEmbeddingProviding?)?
+    /// Test seam: supplies the face engine so a face scan can run without
+    /// the sidecar installed. Nil in production — a sidecar pool opens per
+    /// scan and shuts down with it.
+    @ObservationIgnored var faceAnalyzerProvider: (@Sendable () async throws -> FaceAnalyzing?)?
 
     /// Why Face Scan cannot start on this location right now, or nil when it
     /// can. Faces are detected per burst stack, so a location must finish
@@ -2733,17 +2732,13 @@ final class EventsWorkspace {
         runFaceScanJob(title: eventTitle(event), stacks: stacks, options: options)
     }
 
-    /// The shared face-scan job: loads the embedder (and the SCRFD detector
-    /// for MED and above), runs `FaceIndexService` over the given stacks,
-    /// and reports progress and the summary line to the Jobs window.
+    /// The shared face-scan job: opens the face engine, runs
+    /// `FaceIndexService` over the given stacks, and reports progress and
+    /// the summary line to the Jobs window.
     private func runFaceScanJob(title: String, stacks: [OrganizeStack], options: FaceScanOptions) {
-        let embedderProvider = faceEmbedderProvider
-        guard faceModelInstalled || embedderProvider != nil else {
-            model.statusMessage = "The face model is not installed yet. Run scripts/convert-arcface.sh once on this Mac, then scan again."
-            return
-        }
-        if options.detectorKind == .scrfd, !faceDetectorInstalled {
-            model.statusMessage = "The face detector is not installed yet. Run scripts/convert-scrfd.sh once on this Mac, then scan again."
+        let analyzerProvider = faceAnalyzerProvider
+        guard faceEngineInstalled || analyzerProvider != nil else {
+            model.statusMessage = FaceSidecarInstallation.notInstalledMessage
             return
         }
         let support = DashboardModel.defaultApplicationSupportURL
@@ -2754,7 +2749,7 @@ final class EventsWorkspace {
             action: .faceScan,
             runningNote: "Scanning \(title) for faces",
             logTitle: "Face scan: \(title)",
-            logDetail: "Quality \(options.mode.rawValue). Detected faces on \(burstScope), single stills, and — at MED and above — video frames; embedded them on-device, matched named people, and grouped the rest. Files were only read — nothing was written or moved.",
+            logDetail: "Quality \(options.mode.rawValue). Detected faces on \(burstScope), single stills, and — at MED and above — video frames with the on-device face engine; matched named people and grouped the rest. Files were only read — nothing was written or moved.",
             operation: { progress in
                 // Bootstrap is idempotent: it guarantees the face tables
                 // exist even if no catalog sync has run since the upgrade.
@@ -2763,29 +2758,20 @@ final class EventsWorkspace {
                     createBackup: false,
                     createLibraryFolders: false
                 )
-                let embedder: FaceEmbeddingProviding?
-                if let embedderProvider {
-                    embedder = try await embedderProvider()
+                let analyzer: FaceAnalyzing
+                if let analyzerProvider, let provided = try await analyzerProvider() {
+                    analyzer = provided
                 } else {
-                    embedder = try await FaceModelCatalog.loadEmbedder(applicationSupport: support)
+                    // Sidecar processes live for this job only.
+                    analyzer = try FaceSidecarPool.open(applicationSupport: support, options: options)
                 }
-                guard let embedder else {
-                    throw FaceIndexError.modelNotInstalled(FaceModelCatalog.modelURL(applicationSupport: support).path)
-                }
-                var detector: FaceDetecting?
-                if options.detectorKind == .scrfd {
-                    guard let loaded = try await FaceModelCatalog.loadDetector(applicationSupport: support) else {
-                        throw FaceIndexError.detectorNotInstalled(FaceModelCatalog.detectorURL(applicationSupport: support).path)
-                    }
-                    detector = loaded
-                }
+                defer { (analyzer as? FaceSidecarPool)?.shutdown() }
                 // The board's burst stacks drive sampling — a burst decodes
                 // its first/middle/last stills instead of every frame (all
                 // stills at HIGH and above).
                 return try FaceIndexService(catalogURL: catalogURL, options: options).scan(
                     stacks: stacks,
-                    embedder: embedder,
-                    detector: detector
+                    analyzer: analyzer
                 ) { update in
                     progress(DashboardModel.jobUpdate(
                         from: update,
@@ -2801,7 +2787,7 @@ final class EventsWorkspace {
                 let video = report.videoFramesRead > 0 ? "; \(report.videoFramesRead) video frames read" : ""
                 let burst = report.photosBurstCovered > 0 ? "; \(report.photosBurstCovered) burst frames covered by sampled siblings" : ""
                 // The Jobs log may name packages — the scan sheet cannot.
-                let packages = report.detectorSummary.map { " Detector: \($0)." } ?? ""
+                let packages = report.detectorSummary.map { " Engine: \($0)." } ?? ""
                 return "Face scan done — \(report.facesDetected) face\(report.facesDetected == 1 ? "" : "s") on \(report.photosProcessed) sampled photo(s); \(report.photosSkipped) already scanned\(burst); \(report.facesProposed) matched to people, \(report.facesGrouped) grouped\(video).\(packages)"
             }
         )

@@ -2,13 +2,14 @@ import CoreGraphics
 import Foundation
 import GRDB
 
-/// The face pass for every quality mode: detection on bounded decodes
-/// (Vision for LOW, SCRFD for MED+), ArcFace embeddings for every face
-/// that clears the mode's size floor, cosine matching against roster
-/// templates, and greedy grouping of the leftovers. MED/HIGH/XHIGH
-/// additionally sample video frames — stills plus a light frame pass at
-/// MED, ~1 fps at HIGH, ~2 fps at XHIGH — and XHIGH adds a third detector
-/// scale, flip-TTA embeddings, and a roster-template rebuild.
+/// The face pass for every quality mode: bounded decodes handed to the
+/// face engine (`FaceAnalyzing` — the InsightFace sidecar in production),
+/// which detects, aligns, and embeds; then the mode's size floor, cosine
+/// matching against roster templates, and average-linkage grouping of the
+/// leftovers. MED/HIGH/XHIGH additionally sample video frames — stills
+/// plus a light frame pass at MED, ~1 fps at HIGH, ~2 fps at XHIGH — and
+/// higher grades add detector scales, flip-TTA embeddings, and a
+/// roster-template rebuild.
 ///
 /// The service writes only to the catalog database — media files are never
 /// touched. Skip rules come from `face_photos.scan_grade` plus the
@@ -94,21 +95,14 @@ public struct FaceIndexService: Sendable {
     /// board already produced. This is the grouping gate: the scan runs
     /// against the current burst structure, sampling each burst per
     /// `scanTargets` (first/middle/last stills at LOW and MED, every still
-    /// at HIGH and above). `detector` is the engine for the mode: nil
-    /// resolves to Vision for LOW and throws for MED+, where the SCRFD
-    /// package must be installed. Modes that do not read video frames
-    /// skip video targets entirely.
+    /// at HIGH and above). `analyzer` is the face engine — the sidecar
+    /// pool, or a stub in tests. Modes that do not read video frames skip
+    /// video targets entirely.
     public func scan(
         stacks: [OrganizeStack],
-        embedder: FaceEmbeddingProviding?,
-        detector: FaceDetecting? = nil,
+        analyzer: FaceAnalyzing,
         progress: FileOperationProgressHandler? = nil
     ) throws -> FaceScanReport {
-        guard let embedder else {
-            throw FaceIndexError.modelNotInstalled(FaceModelCatalog.modelFileName)
-        }
-        let engine = try resolveEngine(detector)
-
         var report = FaceScanReport()
         var targets = Self.scanTargets(for: stacks, mode: options.mode)
         if !options.scansVideo {
@@ -116,14 +110,15 @@ public struct FaceIndexService: Sendable {
         }
         report.photosConsidered = targets.count
 
-        // New-files-only rule: a photo whose recorded grade covers this mode
-        // — and whose size/mtime still match — is skipped without decoding.
+        // New-files-only rule: a photo the current engine already scanned
+        // at a grade covering this mode — with size/mtime still matching —
+        // is skipped without decoding.
         let existing = try store.photos(pathKeys: targets.map(\.primary.pathKey))
         var pending: [OrganizeItem] = []
         for item in targets {
             let file = item.primary
             if let known = existing[file.pathKey],
-               known.scanGrade.covers(options.mode),
+               known.covers(options.mode),
                known.describes(path: file.path, size: file.size, modifiedAt: file.modifiedAt) {
                 report.photosSkipped += 1
             } else {
@@ -134,8 +129,7 @@ public struct FaceIndexService: Sendable {
         try executeScan(
             pending: pending,
             covered: [],
-            embedder: embedder,
-            engine: engine,
+            analyzer: analyzer,
             report: &report,
             progress: progress
         )
@@ -143,9 +137,8 @@ public struct FaceIndexService: Sendable {
     }
 
     /// Scans a location's media (the photo, RAW, and — at MED and above —
-    /// video primaries of an `OrganizeScanner` result). `detector` is the
-    /// engine for the mode: nil resolves to Vision for LOW and throws for
-    /// MED+, where the SCRFD package must be installed.
+    /// video primaries of an `OrganizeScanner` result). `analyzer` is the
+    /// face engine — the sidecar pool, or a stub in tests.
     ///
     /// `stacks` is the scanner's burst grouping. When present, a burst of
     /// stills is sampled — at most three spread frames are decoded and the
@@ -155,16 +148,10 @@ public struct FaceIndexService: Sendable {
     /// target regardless of grouping.
     public func scan(
         items: [OrganizeItem],
-        embedder: FaceEmbeddingProviding?,
-        detector: FaceDetecting? = nil,
+        analyzer: FaceAnalyzing,
         stacks: [OrganizeStack]? = nil,
         progress: FileOperationProgressHandler? = nil
     ) throws -> FaceScanReport {
-        guard let embedder else {
-            throw FaceIndexError.modelNotInstalled(FaceModelCatalog.modelFileName)
-        }
-        let engine = try resolveEngine(detector)
-
         var report = FaceScanReport()
         let eligible = items.filter {
             $0.kind == .raw || $0.kind == .photo || (options.scansVideo && $0.kind == .video)
@@ -189,15 +176,16 @@ public struct FaceIndexService: Sendable {
             }
         }
 
-        // New-files-only rule: a photo whose recorded grade covers this mode
-        // — and whose size/mtime still match — is skipped without decoding.
+        // New-files-only rule: a photo the current engine already scanned
+        // at a grade covering this mode — with size/mtime still matching —
+        // is skipped without decoding.
         let existing = try store.photos(pathKeys: eligible.map(\.primary.pathKey))
         var pending: [OrganizeItem] = []
         var covered: [OrganizeItem] = []
         for item in eligible {
             let file = item.primary
             if let known = existing[file.pathKey],
-               known.scanGrade.covers(options.mode),
+               known.covers(options.mode),
                known.describes(path: file.path, size: file.size, modifiedAt: file.modifiedAt) {
                 report.photosSkipped += 1
             } else if burstMemberIDs.contains(item.id), !sampledIDs.contains(item.id) {
@@ -210,21 +198,11 @@ public struct FaceIndexService: Sendable {
         try executeScan(
             pending: pending,
             covered: covered,
-            embedder: embedder,
-            engine: engine,
+            analyzer: analyzer,
             report: &report,
             progress: progress
         )
         return report
-    }
-
-    /// The detector for this pass: an explicit engine if the caller built
-    /// one (a stub in tests, SCRFD for MED+), else Vision for LOW and an
-    /// install error for MED+.
-    private func resolveEngine(_ detector: FaceDetecting?) throws -> FaceDetecting {
-        if let detector { return detector }
-        if options.detectorKind == .vision { return VisionDetector() }
-        throw FaceIndexError.detectorNotInstalled(FaceModelCatalog.detectorFileName)
     }
 
     /// Runs the decode/detect/embed pass over `pending`, stamps covered
@@ -233,8 +211,7 @@ public struct FaceIndexService: Sendable {
     private func executeScan(
         pending: [OrganizeItem],
         covered: [OrganizeItem],
-        embedder: FaceEmbeddingProviding,
-        engine: FaceDetecting,
+        analyzer: FaceAnalyzing,
         report: inout FaceScanReport,
         progress: FileOperationProgressHandler?
     ) throws {
@@ -242,7 +219,7 @@ public struct FaceIndexService: Sendable {
         let total = pending.count
         let totalBytes = pending.reduce(Int64(0)) { $0 + $1.primary.size }
         let telemetry = FaceScanTelemetry()
-        let models = Self.telemetryModels(engine: engine, embedder: embedder)
+        let models = [analyzer.displayName]
         let facts = Self.telemetryFacts(for: options)
         // Stable for the whole parallel pass — it was decided when pending
         // was split — so a let keeps the Sendable emit closure honest.
@@ -285,8 +262,7 @@ public struct FaceIndexService: Sendable {
                         items[index],
                         token: index,
                         options: options,
-                        detector: engine,
-                        embedder: embedder,
+                        analyzer: analyzer,
                         store: store,
                         telemetry: telemetry
                     )
@@ -320,12 +296,13 @@ public struct FaceIndexService: Sendable {
                 byteCount: file.size,
                 modifiedAt: file.modifiedAt,
                 takenAt: item.captureDate,
-                scanGrade: grade
+                scanGrade: grade,
+                engine: FaceEngine.identifier
             ))
             report.photosBurstCovered += 1
         }
 
-        report.detectorSummary = (engine as? SCRFDDetector)?.packageSummary(for: options)
+        report.detectorSummary = "\(FaceEngine.identifier) scales \(options.detectorScales.map(String.init).joined(separator: "/"))"
 
         // XHIGH rebuilds the gallery first so the match below runs against
         // the sharpened templates; the rebuild reads confirmed faces only.
@@ -341,32 +318,6 @@ public struct FaceIndexService: Sendable {
         )
     }
 
-    /// The engine/embedder identities the Jobs debug pane lists — actual
-    /// package names, not marketing labels: SCRFD's converted files per
-    /// installed input size, the ArcFace package, or the concrete stub type
-    /// when a test double stands in.
-    private static func telemetryModels(
-        engine: FaceDetecting,
-        embedder: FaceEmbeddingProviding
-    ) -> [String] {
-        var models: [String] = []
-        if let scrfd = engine as? SCRFDDetector {
-            models.append(contentsOf: scrfd.nativeInputSizes.map {
-                FaceModelCatalog.detectorFileName(size: $0)
-            })
-        } else if engine is VisionDetector {
-            models.append("Apple Vision (VNDetectFaceLandmarks)")
-        } else {
-            models.append(String(describing: type(of: engine)))
-        }
-        models.append(
-            embedder is ArcFaceEmbedder
-                ? FaceModelCatalog.modelFileName
-                : String(describing: type(of: embedder))
-        )
-        return models
-    }
-
     /// How this pass is configured — the mode, worker width, and the
     /// thresholds that change what it reads.
     private static func telemetryFacts(for options: FaceScanOptions) -> [String] {
@@ -374,10 +325,9 @@ public struct FaceIndexService: Sendable {
             options.mode.rawValue.uppercased(),
             options.fast ? "FAST · \(options.concurrency) workers" : "Quiet · \(options.concurrency) workers",
             "min face \(Int(options.minimumFacePixels)) px",
+            "scales \(options.detectorScales.map(String.init).joined(separator: "/"))",
+            "group det ≥ \(options.groupingMinDetScore) · ≥ \(Int(options.groupingMinFacePixels)) px · ≥ \(options.minimumGroupFaces) faces",
         ]
-        if options.detectorKind == .scrfd {
-            facts.append("scales \(options.detectorScales.map(String.init).joined(separator: "/"))")
-        }
         if let stride = options.videoFrameStride, options.scansVideo {
             facts.append("video every \(Int(stride)) s")
         }
@@ -486,82 +436,60 @@ public struct FaceIndexService: Sendable {
         _ item: OrganizeItem,
         token: Int,
         options: FaceScanOptions,
-        detector: FaceDetecting,
-        embedder: FaceEmbeddingProviding,
+        analyzer: FaceAnalyzing,
         store: FaceIndexStore,
         telemetry: FaceScanTelemetry?
     ) -> PhotoOutcome {
         telemetry?.begin(token, file: item.primary)
         if item.kind == .video {
-            return processVideo(item, token: token, options: options, detector: detector, embedder: embedder, store: store, telemetry: telemetry)
+            return processVideo(item, token: token, options: options, analyzer: analyzer, store: store, telemetry: telemetry)
         }
-        return processPhoto(item, token: token, options: options, detector: detector, embedder: embedder, store: store, telemetry: telemetry)
+        return processPhoto(item, token: token, options: options, analyzer: analyzer, store: store, telemetry: telemetry)
     }
 
-    /// Detect → align → embed for every face on one image. Shared by still
-    /// decodes and sampled video frames; `pixelSize` is the native image
-    /// size the min-face floor is measured against.
+    /// Detect → align → embed for every face on one image, all inside the
+    /// engine. Shared by still decodes and sampled video frames;
+    /// `pixelSize` is the native image size the min-face floor is measured
+    /// against. Throws when the engine fails so the photo counts as failed
+    /// instead of being stamped scanned with no faces.
     private static func facesOnImage(
         _ image: CGImage,
         pixelSize: CGSize,
         file: OrganizeFile,
         token: Int,
         options: FaceScanOptions,
-        detector: FaceDetecting,
-        embedder: FaceEmbeddingProviding,
+        analyzer: FaceAnalyzing,
         telemetry: FaceScanTelemetry?
-    ) -> [FaceRecord] {
+    ) throws -> [FaceRecord] {
         telemetry?.step(token, .detect)
-        let detections = detector.detect(
-            in: image,
-            imagePixelSize: pixelSize,
-            options: options
-        )
-        var faces: [FaceRecord] = []
-        for detection in detections {
-            telemetry?.step(token, .align)
-            let aligned: CGImage?
-            if let landmarks = detection.landmarks {
-                aligned = FaceAligner.alignedImage(image, landmarks: landmarks)
-            } else {
-                aligned = FaceAligner.boxCrop(image, box: detection.boundingBox)
-            }
-            guard let aligned else { continue }
-            telemetry?.step(token, .embed)
-            guard var embedding = try? embedder.embed(aligned) else { continue }
-            // XHIGH hflip TTA: embed the mirrored crop too and store the
-            // L2-normalized mean — the standard ArcFace second view.
-            if options.flipTTA,
-               let flipped = FaceAligner.flippedHorizontally(aligned),
-               let flippedEmbedding = try? embedder.embed(flipped),
-               let averaged = FaceEmbeddingMath.centroid([embedding, flippedEmbedding]) {
-                embedding = averaged
-            }
-            faces.append(FaceRecord(
+        let analyzed = try analyzer.analyze(image, options: options)
+        telemetry?.step(token, .embed)
+        let grade = executedGrade(for: options.mode)
+        return analyzed.compactMap { face in
+            // The size floor is measured on the native image so it means
+            // the same thing at every decode bound.
+            let nativeMinSide = min(face.box.width * pixelSize.width, face.box.height * pixelSize.height)
+            guard nativeMinSide >= options.minimumFacePixels else { return nil }
+            return FaceRecord(
                 photoID: file.pathKey,
-                box: NormalizedFaceBox(
-                    x: Double(detection.boundingBox.origin.x),
-                    y: Double(detection.boundingBox.origin.y),
-                    width: Double(detection.boundingBox.width),
-                    height: Double(detection.boundingBox.height)
-                ),
-                detScore: Double(detection.confidence),
-                embedding: embedding,
-                crop: FaceAligner.jpegData(aligned),
+                box: face.box,
+                detScore: face.detScore,
+                quality: face.quality,
+                facePixels: face.facePixels,
+                embedding: face.embedding,
+                crop: face.crop,
                 state: .cached,
-                scanGrade: executedGrade(for: options.mode),
+                scanGrade: grade,
                 photoPath: file.path
-            ))
+            )
         }
-        return faces
     }
 
     private static func processPhoto(
         _ item: OrganizeItem,
         token: Int,
         options: FaceScanOptions,
-        detector: FaceDetecting,
-        embedder: FaceEmbeddingProviding,
+        analyzer: FaceAnalyzing,
         store: FaceIndexStore,
         telemetry: FaceScanTelemetry?
     ) -> PhotoOutcome {
@@ -575,16 +503,18 @@ public struct FaceIndexService: Sendable {
         let fullSize = FaceImageDecoder.pixelSize(of: url)
             ?? CGSize(width: image.width, height: image.height)
 
-        let faces = facesOnImage(
+        guard let faces = try? facesOnImage(
             image,
             pixelSize: fullSize,
             file: file,
             token: token,
             options: options,
-            detector: detector,
-            embedder: embedder,
+            analyzer: analyzer,
             telemetry: telemetry
-        )
+        ) else {
+            telemetry?.finish(token, faces: 0, videoFramesRead: 0, failed: true)
+            return .failed
+        }
 
         telemetry?.step(token, .write)
         let photo = FacePhotoRecord(
@@ -595,7 +525,8 @@ public struct FaceIndexService: Sendable {
             modifiedAt: file.modifiedAt,
             takenAt: item.captureDate,
             scanGrade: executedGrade(for: options.mode),
-            faceCount: faces.count
+            faceCount: faces.count,
+            engine: FaceEngine.identifier
         )
         guard (try? store.replaceFaces(photo: photo, faces: faces)) != nil else {
             telemetry?.finish(token, faces: 0, videoFramesRead: 0, failed: true)
@@ -613,8 +544,7 @@ public struct FaceIndexService: Sendable {
         _ item: OrganizeItem,
         token: Int,
         options: FaceScanOptions,
-        detector: FaceDetecting,
-        embedder: FaceEmbeddingProviding,
+        analyzer: FaceAnalyzing,
         store: FaceIndexStore,
         telemetry: FaceScanTelemetry?
     ) -> PhotoOutcome {
@@ -650,16 +580,19 @@ public struct FaceIndexService: Sendable {
             framesRead += 1
             telemetry?.noteReadBytes(bytesPerFrame)
             let size = nativeSize ?? CGSize(width: frame.width, height: frame.height)
-            for face in facesOnImage(
+            guard let frameFaces = try? facesOnImage(
                 frame,
                 pixelSize: size,
                 file: file,
                 token: token,
                 options: options,
-                detector: detector,
-                embedder: embedder,
+                analyzer: analyzer,
                 telemetry: telemetry
-            ) {
+            ) else {
+                telemetry?.finish(token, faces: 0, videoFramesRead: framesRead, failed: true)
+                return .failed
+            }
+            for face in frameFaces {
                 if let embedding = face.embedding,
                    keptEmbeddings.contains(where: {
                        FaceEmbeddingMath.cosine($0, embedding) >= options.videoDuplicateCosine
@@ -680,7 +613,8 @@ public struct FaceIndexService: Sendable {
             modifiedAt: file.modifiedAt,
             takenAt: item.captureDate,
             scanGrade: executedGrade(for: options.mode),
-            faceCount: faces.count
+            faceCount: faces.count,
+            engine: FaceEngine.identifier
         )
         guard (try? store.replaceFaces(photo: photo, faces: faces)) != nil else {
             telemetry?.finish(token, faces: 0, videoFramesRead: framesRead, failed: true)
@@ -705,7 +639,7 @@ public struct FaceIndexService: Sendable {
         try store.inWriteTransaction { database in
             for person in try store.rosterPeople(database: database) {
                 let confirmed = try store.faces(personID: person.id, database: database)
-                    .filter { $0.state == .confirmed && $0.embedding != nil }
+                    .filter { $0.state == .confirmed && $0.embedding != nil && $0.model == FaceEngine.identifier }
                 var perPhoto: [String: FaceRecord] = [:]
                 for face in confirmed {
                     // `faces(personID:)` arrives detScore-sorted, so the first
@@ -927,34 +861,95 @@ public struct FaceIndexService: Sendable {
         return nil
     }
 
-    /// One automatic cluster while a grouping pass is running.
-    ///
-    /// `seed` is the first face and never moves. The centroid is a running
-    /// mean, which on its own walks from person to person: each new face
-    /// only has to resemble the average, so a drawer like Person 308
-    /// absorbs hundreds of strangers. A face may join only when it still
-    /// resembles that first face. A group loaded from the catalog whose
-    /// members have already drifted apart accepts nobody new.
+    /// One automatic cluster while a grouping pass is running: the running
+    /// sum of its members' unit vectors, so a candidate's mean cosine to
+    /// every member is a single dot product, plus the bookkeeping that
+    /// keeps "not this person" verdicts binding while rows are in flux.
     private struct OpenCluster {
-        var personID: UUID
-        var centroid: [Float]
-        var seed: [Float]
-        /// Every member. A new face has to clear the cutoff against all of
-        /// them. Matching only the first face still builds a crowd: the
-        /// biggest automatic group was 176 faces, each at least 0.50 from
-        /// the first face, with pairs inside it down at 0.22.
-        var memberEmbeddings: [[Float]]
-        var acceptsNewMembers: Bool
+        /// Nil until a cluster formed in this pass earns a "Person N" row.
+        var personID: UUID?
+        var sum: [Float] = []
+        var members = 0
+        /// Faces this pass placed here, with the score they joined at (nil
+        /// for the face that opened the cluster).
+        var pending: [(faceID: UUID, score: Float?)] = []
+        /// The automatic rows the members were pulled out of, by count —
+        /// the rows a rejection may name, and the first choice when this
+        /// cluster needs a row of its own, so the verdict rows survive.
+        var origins: [UUID: Int] = [:]
+        /// Every person some member was rejected from. A face that came
+        /// out of one of those groups may not join a cluster holding a
+        /// face the user pulled out of it.
+        var bannedPersons: Set<UUID> = []
 
-        var members: Int { memberEmbeddings.count }
+        init(personID: UUID?) {
+            self.personID = personID
+        }
+
+        /// Average linkage: the mean cosine between `embedding` and every
+        /// member. Comparing to one face (the first, or a sliding mean)
+        /// let strangers who all resembled that face pile up together.
+        func meanCosine(_ embedding: [Float]) -> Float {
+            guard embedding.count == sum.count, members > 0 else { return -1 }
+            var dot: Float = 0
+            for index in embedding.indices { dot += embedding[index] * sum[index] }
+            return dot / Float(members)
+        }
+
+        /// False when a rejection ties this face and this cluster apart in
+        /// either direction: the face was refused from the cluster's row or
+        /// one of its origin rows, or a member was refused from the row the
+        /// face came out of.
+        func admits(origin: UUID?, banned: Set<UUID>) -> Bool {
+            if let personID, banned.contains(personID) { return false }
+            if banned.contains(where: { origins[$0] != nil }) { return false }
+            if let origin, bannedPersons.contains(origin) { return false }
+            return true
+        }
+
+        /// The persons whose rejected faces may veto a candidate here.
+        var vetoPersons: [UUID] {
+            var persons = Array(origins.keys)
+            if let personID, origins[personID] == nil { persons.append(personID) }
+            return persons
+        }
+
+        mutating func add(_ embedding: [Float], origin: UUID?, banned: Set<UUID>) {
+            if sum.isEmpty {
+                sum = embedding
+            } else if embedding.count == sum.count {
+                for index in sum.indices { sum[index] += embedding[index] }
+            } else {
+                return
+            }
+            members += 1
+            if let origin { origins[origin, default: 0] += 1 }
+            bannedPersons.formUnion(banned)
+        }
     }
 
-    /// Greedy cosine grouping: faces in detection-confidence order join the
-    /// nearest existing group at or above `clusterThreshold` and still close
-    /// to that group's first face, else seed a cluster — reusing an emptied
-    /// "Person N" row when the rebundle left one, else minting a new group.
-    /// Rejections bar the people a face was refused from and veto any group
-    /// whose rejected faces beat its centroid.
+    /// True when a face is clean enough to shape an automatic group: a
+    /// confident detection of a face that was not tiny in the decoded
+    /// image. Anything else is still stored and can still be proposed to a
+    /// named person, but it never seeds or joins a "Person N".
+    static func qualifiesForGrouping(_ face: FaceRecord, options: FaceScanOptions) -> Bool {
+        guard face.detScore >= Double(options.groupingMinDetScore) else { return false }
+        if let pixels = face.facePixels, pixels < options.groupingMinFacePixels { return false }
+        return true
+    }
+
+    /// Average-linkage grouping. Faces in detection-confidence order join
+    /// the existing group whose members they resemble most on average when
+    /// that mean cosine clears `clusterThreshold`; otherwise they open a new
+    /// cluster. Rejections bind in both directions — a face never rejoins
+    /// the faces it was pulled away from, even while the dissolved row is
+    /// still being rebuilt — and veto any cluster whose rejected faces
+    /// describe the candidate better. A cluster opened in this pass is
+    /// written only once it holds `minimumGroupFaces` faces, preferring the
+    /// emptied "Person N" row most of its members came from (so the
+    /// verdicts recorded against that row stay alive), then any emptied
+    /// row, else a fresh group. Smaller clusters and faces that fail the
+    /// quality gate stay ungrouped.
     private func assignToGroups(
         _ faces: [FaceRecord],
         options: FaceScanOptions,
@@ -963,103 +958,95 @@ public struct FaceIndexService: Sendable {
         database: Database
     ) throws -> (assigned: Int, created: Int) {
         let store = self.store
-        let groupEmbeddings = try store.groupEmbeddings(database: database)
         var clusters: [OpenCluster] = []
-        clusters.reserveCapacity(groupEmbeddings.count)
-        for (personID, embeddings) in groupEmbeddings.sorted(by: { $0.key.uuidString < $1.key.uuidString }) {
-            guard let centroid = FaceEmbeddingMath.centroid(embeddings) else { continue }
-            let seed = embeddings.max { lhs, rhs in
-                FaceEmbeddingMath.cosine(lhs, centroid) < FaceEmbeddingMath.cosine(rhs, centroid)
-            } ?? centroid
-            let threshold = options.clusterThreshold
-            let cohesive = embeddings.allSatisfy { candidate in
-                embeddings.allSatisfy {
-                    FaceEmbeddingMath.cosine(candidate, $0) >= threshold
-                }
+        for (personID, members) in try store.groupMembers(database: database)
+            .sorted(by: { $0.key.uuidString < $1.key.uuidString }) where !members.isEmpty {
+            var cluster = OpenCluster(personID: personID)
+            for member in members {
+                cluster.add(
+                    member.embedding,
+                    origin: nil,
+                    banned: rejections.personIDsByFaceID[member.faceID] ?? []
+                )
             }
-            clusters.append(OpenCluster(
-                personID: personID,
-                centroid: centroid,
-                seed: seed,
-                memberEmbeddings: embeddings,
-                acceptsNewMembers: cohesive
-            ))
+            clusters.append(cluster)
+        }
+
+        // Deterministic order: most confident detections shape groups first.
+        for face in faces.sorted(by: { $0.detScore > $1.detScore }) {
+            guard let embedding = face.embedding,
+                  Self.qualifiesForGrouping(face, options: options) else { continue }
+            let banned = rejections.personIDsByFaceID[face.id] ?? []
+            // The row the face was pulled out of — unless it was pulled out
+            // by a verdict, in which case it never belonged there.
+            let origin = face.personID.flatMap { banned.contains($0) ? nil : $0 }
+            var bestIndex: Int?
+            var bestScore = options.clusterThreshold
+            for (index, cluster) in clusters.enumerated() {
+                guard cluster.admits(origin: origin, banned: banned) else { continue }
+                let score = cluster.meanCosine(embedding)
+                guard score >= bestScore else { continue }
+                // The rejected faces of this row, or of the rows its members
+                // came from, must not describe this face better than the
+                // cluster itself does.
+                if cluster.vetoPersons.contains(where: {
+                    rejections.vetoes(embedding, personID: $0, score: score)
+                }) { continue }
+                bestScore = score
+                bestIndex = index
+            }
+            if let bestIndex {
+                clusters[bestIndex].add(embedding, origin: origin, banned: banned)
+                clusters[bestIndex].pending.append((face.id, bestScore))
+            } else {
+                var cluster = OpenCluster(personID: nil)
+                cluster.add(embedding, origin: origin, banned: banned)
+                cluster.pending.append((face.id, nil))
+                clusters.append(cluster)
+            }
         }
 
         var reusable = reusableGroups
         var assigned = 0
         var created = 0
-        // Deterministic order: most confident detections form groups first.
-        for face in faces.sorted(by: { $0.detScore > $1.detScore }) {
-            guard let embedding = face.embedding else { continue }
-            var bestIndex: Int?
-            var bestScore: Float = options.clusterThreshold
-            for (index, entry) in clusters.enumerated() {
-                // A drifted drawer stays frozen. New faces start their own groups.
-                if !entry.acceptsNewMembers { continue }
-                // Never back to a person this face was rejected from.
-                if rejections.blocks(faceID: face.id, personID: entry.personID) { continue }
-                // Must clear the cutoff against every member, not only the
-                // first face. Two strangers can both resemble one face and
-                // not resemble each other.
-                let score = entry.memberEmbeddings.reduce(Float.greatestFiniteMagnitude) { worst, member in
-                    min(worst, FaceEmbeddingMath.cosine(embedding, member))
-                }
-                if score >= bestScore {
-                    // The group's rejected faces must not describe this
-                    // face better than the group itself does.
-                    if rejections.vetoes(embedding, personID: entry.personID, score: score) { continue }
-                    bestScore = score
-                    bestIndex = index
-                }
-            }
+        for cluster in clusters where !cluster.pending.isEmpty {
             let personID: UUID
-            if let bestIndex {
-                personID = clusters[bestIndex].personID
-                var updated = clusters[bestIndex].centroid.map {
-                    $0 * Float(clusters[bestIndex].members)
-                }
-                for i in updated.indices { updated[i] += embedding[i] }
-                clusters[bestIndex].memberEmbeddings.append(embedding)
-                clusters[bestIndex].centroid = FaceEmbeddingMath.l2Normalized(updated)
-            } else if let reuseIndex = reusable.firstIndex(where: {
-                !rejections.blocks(faceID: face.id, personID: $0)
-            }) {
-                // Recycle an emptied "Person N" row before minting a new
-                // one — but never a row this face was rejected from.
-                personID = reusable.remove(at: reuseIndex)
-                clusters.append(OpenCluster(
-                    personID: personID,
-                    centroid: embedding,
-                    seed: embedding,
-                    memberEmbeddings: [embedding],
-                    acceptsNewMembers: true
-                ))
-                created += 1
+            if let existing = cluster.personID {
+                personID = existing
             } else {
-                let group = try store.createPerson(
-                    name: store.nextGroupName(database: database),
-                    isRoster: false,
+                guard cluster.members >= options.minimumGroupFaces else { continue }
+                let memberIDs = cluster.pending.map(\.faceID)
+                // Never a row one of these faces was rejected from.
+                func usable(_ row: UUID) -> Bool {
+                    !memberIDs.contains { rejections.blocks(faceID: $0, personID: row) }
+                }
+                let preferred = cluster.origins
+                    .sorted { $0.value != $1.value ? $0.value > $1.value : $0.key.uuidString < $1.key.uuidString }
+                    .map(\.key)
+                    .first { reusable.contains($0) && usable($0) }
+                if let preferred, let index = reusable.firstIndex(of: preferred) {
+                    personID = reusable.remove(at: index)
+                } else if let index = reusable.firstIndex(where: usable) {
+                    personID = reusable.remove(at: index)
+                } else {
+                    personID = try store.createPerson(
+                        name: store.nextGroupName(database: database),
+                        isRoster: false,
+                        database: database
+                    ).id
+                }
+                created += 1
+            }
+            for entry in cluster.pending {
+                try store.assignFace(
+                    entry.faceID,
+                    to: personID,
+                    state: .other,
+                    score: entry.score.map(Double.init),
                     database: database
                 )
-                personID = group.id
-                clusters.append(OpenCluster(
-                    personID: personID,
-                    centroid: embedding,
-                    seed: embedding,
-                    memberEmbeddings: [embedding],
-                    acceptsNewMembers: true
-                ))
-                created += 1
+                assigned += 1
             }
-            try store.assignFace(
-                face.id,
-                to: personID,
-                state: .other,
-                score: bestIndex.map { _ in Double(bestScore) },
-                database: database
-            )
-            assigned += 1
         }
         return (assigned, created)
     }

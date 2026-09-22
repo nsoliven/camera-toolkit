@@ -896,7 +896,7 @@ final class EventsWorkspaceTests: XCTestCase {
                     && workspace.sources[location.id]?.isScanning == false
             }
 
-            workspace.faceEmbedderProvider = { StubFaceEmbedder() }
+            workspace.faceAnalyzerProvider = { StubFaceAnalyzer() }
             workspace.faceScan(location)
             try await waitUntil { !model.isBusy }
 
@@ -984,7 +984,7 @@ final class EventsWorkspaceTests: XCTestCase {
             await workspace.refreshEvent(beach)
             XCTAssertEqual(workspace.eventStacks[beach]?.count, 1)
 
-            workspace.faceEmbedderProvider = { StubFaceEmbedder() }
+            workspace.faceAnalyzerProvider = { StubFaceAnalyzer() }
             workspace.faceScan(event)
             try await waitUntil { !model.isBusy }
 
@@ -1047,9 +1047,11 @@ final class EventsWorkspaceTests: XCTestCase {
     }
 
     /// "Not this person" is a real move: the face leaves the person
-    /// immediately, lands in an unnamed group, and `facesRevision` bumps
-    /// so the open People grid and Unsure list re-read. The persisted
-    /// verdict keeps it off the person through a later Re-match.
+    /// immediately and `facesRevision` bumps so the open People grid and
+    /// Unsure list re-read. Alone it is under the group-size floor, so it
+    /// returns to the unassigned pool rather than minting a "Person N".
+    /// The persisted verdict keeps it off the person through a later
+    /// Re-match.
     func testRejectFaceMovesItOutImmediatelyAndStaysOut() async throws {
         try await withOrganizerSandbox { root, model, workspace in
             let catalog = root.appendingPathComponent("catalog.sqlite")
@@ -1082,9 +1084,9 @@ final class EventsWorkspaceTests: XCTestCase {
 
             XCTAssertEqual(workspace.facesRevision, 1)
             let moved = try XCTUnwrap(store.face(id: face.id))
-            XCTAssertEqual(moved.state, .other)
-            let group = try XCTUnwrap(moved.personID.flatMap { try? store.person($0) })
-            XCTAssertFalse(group.isRoster)
+            XCTAssertEqual(moved.state, .cached)
+            XCTAssertNil(moved.personID)
+            XCTAssertTrue(try store.otherGroups().isEmpty)
             XCTAssertTrue(model.statusMessage.contains("Dad"))
             XCTAssertTrue(try store.faceRejections().blocks(faceID: face.id, personID: dad.id))
 
@@ -1093,7 +1095,7 @@ final class EventsWorkspaceTests: XCTestCase {
             try await waitUntil { !model.isBusy }
             let after = try XCTUnwrap(store.face(id: face.id))
             XCTAssertNotEqual(after.personID, dad.id)
-            XCTAssertEqual(after.state, .other)
+            XCTAssertNotEqual(after.state, .proposed)
         }
     }
 
@@ -1118,24 +1120,30 @@ final class EventsWorkspaceTests: XCTestCase {
                 modifiedAt: Date(timeIntervalSince1970: 1_752_000_000),
                 scanGrade: .med
             )
-            // Two near-orthogonal identities shoved into one group.
-            let a = FaceRecord(
-                photoID: photo.pathKey,
-                box: NormalizedFaceBox(x: 0.1, y: 0.1, width: 0.2, height: 0.2),
-                detScore: 0.9,
-                embedding: [1, 0],
-                state: .cached
-            )
-            let b = FaceRecord(
-                photoID: photo.pathKey,
-                box: NormalizedFaceBox(x: 0.5, y: 0.1, width: 0.2, height: 0.2),
-                detScore: 0.8,
-                embedding: [0, 1],
-                state: .cached
-            )
-            try store.replaceFaces(photo: photo, faces: [a, b])
-            try store.assignFace(a.id, to: drawer.id, state: .other, score: 0.9)
-            try store.assignFace(b.id, to: drawer.id, state: .other, score: 0.9)
+            // Two orthogonal identities, three sightings each — enough for
+            // both to clear the group-size floor — shoved into one group.
+            let alex = (0..<3).map { index in
+                FaceRecord(
+                    photoID: photo.pathKey,
+                    box: NormalizedFaceBox(x: 0.1 + Double(index) * 0.3, y: 0.1, width: 0.2, height: 0.2),
+                    detScore: 0.9,
+                    embedding: [1, 0],
+                    state: .cached
+                )
+            }
+            let sam = (0..<3).map { index in
+                FaceRecord(
+                    photoID: photo.pathKey,
+                    box: NormalizedFaceBox(x: 0.1 + Double(index) * 0.3, y: 0.5, width: 0.2, height: 0.2),
+                    detScore: 0.8,
+                    embedding: [0, 1],
+                    state: .cached
+                )
+            }
+            try store.replaceFaces(photo: photo, faces: alex + sam)
+            for face in alex + sam {
+                try store.assignFace(face.id, to: drawer.id, state: .other, score: 0.9)
+            }
 
             workspace.rematchFaces()
             try await waitUntil { !model.isBusy }
@@ -1143,7 +1151,15 @@ final class EventsWorkspaceTests: XCTestCase {
             let job = try XCTUnwrap(model.jobs.first { $0.action == .faceScan })
             XCTAssertEqual(job.state, .done)
             XCTAssertEqual(workspace.facesRevision, 1)
-            XCTAssertNotEqual(try store.face(id: a.id)?.personID, try store.face(id: b.id)?.personID)
+            let alexGroup = try XCTUnwrap(store.face(id: alex[0].id)?.personID)
+            let samGroup = try XCTUnwrap(store.face(id: sam[0].id)?.personID)
+            XCTAssertNotEqual(alexGroup, samGroup)
+            for face in alex {
+                XCTAssertEqual(try store.face(id: face.id)?.personID, alexGroup)
+            }
+            for face in sam {
+                XCTAssertEqual(try store.face(id: face.id)?.personID, samGroup)
+            }
             XCTAssertTrue(model.statusMessage.contains("Re-match done"))
             XCTAssertTrue(model.statusMessage.contains("moved"))
         }
@@ -1622,10 +1638,11 @@ final class EventsWorkspaceTests: XCTestCase {
     }
 }
 
-/// Embeds nothing real — a fixed unit vector — so face scans can run in
-/// tests without the CoreML package.
-private struct StubFaceEmbedder: FaceEmbeddingProviding {
-    func embed(_ image: CGImage) throws -> [Float] {
-        FaceEmbeddingMath.l2Normalized([Float](repeating: 1, count: 512))
+/// Finds nothing — so face scans can run in tests without the sidecar.
+private struct StubFaceAnalyzer: FaceAnalyzing {
+    var displayName: String { "StubFaceAnalyzer" }
+
+    func analyze(_ image: CGImage, options: FaceScanOptions) throws -> [AnalyzedFace] {
+        []
     }
 }

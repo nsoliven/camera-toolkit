@@ -43,7 +43,7 @@ public struct JobTelemetry: Codable, Equatable, Hashable, Sendable {
     /// Ordered live counters ("Faces", "Skipped", "Video frames").
     public var counters: [JobCounter]
     /// Engine and package names actually in use — debug-accurate, e.g.
-    /// "Apple Vision", "det_10g.mlpackage", "w600k_r50.mlpackage".
+    /// "InsightFace buffalo_l (SCRFD-10G + ArcFace w600k_r50) · insightface 2.0 · onnxruntime 1.30.0 CoreML".
     public var models: [String]
     /// Short facts about how the job is configured — "MED · FAST ·
     /// 10 workers".

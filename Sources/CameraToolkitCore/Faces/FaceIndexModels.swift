@@ -123,6 +123,10 @@ public struct FacePhotoRecord: Equatable, Sendable {
     public var takenAt: Date?
     public var scanGrade: FaceScanGrade
     public var faceCount: Int
+    /// `FaceEngine.identifier` of the pass that scanned the file. A row from
+    /// another engine never satisfies the skip rule, so an engine change
+    /// re-reads the photo instead of mixing embedding spaces.
+    public var engine: String
 
     public init(
         pathKey: String,
@@ -132,7 +136,8 @@ public struct FacePhotoRecord: Equatable, Sendable {
         modifiedAt: Date,
         takenAt: Date? = nil,
         scanGrade: FaceScanGrade = .none,
-        faceCount: Int = 0
+        faceCount: Int = 0,
+        engine: String = ""
     ) {
         self.pathKey = pathKey
         self.path = path
@@ -142,6 +147,13 @@ public struct FacePhotoRecord: Equatable, Sendable {
         self.takenAt = takenAt
         self.scanGrade = scanGrade
         self.faceCount = faceCount
+        self.engine = engine
+    }
+
+    /// True when this row was produced by the current engine at a grade
+    /// that covers `mode` — the whole skip rule besides file identity.
+    public func covers(_ mode: FaceScanGrade) -> Bool {
+        engine == FaceEngine.identifier && scanGrade.covers(mode)
     }
 
     /// True when this row describes the same file bytes — same size and
@@ -161,10 +173,17 @@ public struct FaceRecord: Identifiable, Equatable, Sendable {
     public var photoID: String
     public var personID: UUID?
     public var box: NormalizedFaceBox
-    /// Vision's detection confidence (0–1).
+    /// Detector confidence (0–1).
     public var detScore: Double
     /// Cosine score of the current assignment, when one exists.
     public var matchScore: Double?
+    /// The embedding's pre-normalization norm — the engine's own quality
+    /// signal; blurry, tiny, or occluded faces come out short. Nil on rows
+    /// written before it was recorded and on manual tags.
+    public var quality: Double?
+    /// The face's shorter box side in pixels of the decoded image the
+    /// engine saw. The grouping size floor reads this.
+    public var facePixels: Double?
     /// 512-d L2-normalized embedding. Nil only while a detection is being
     /// written before its embed step finished.
     public var embedding: [Float]?
@@ -184,9 +203,11 @@ public struct FaceRecord: Identifiable, Equatable, Sendable {
         box: NormalizedFaceBox,
         detScore: Double,
         matchScore: Double? = nil,
+        quality: Double? = nil,
+        facePixels: Double? = nil,
         embedding: [Float]? = nil,
         crop: Data? = nil,
-        model: String = FaceModelCatalog.modelName,
+        model: String = FaceEngine.identifier,
         state: FaceState = .cached,
         scanGrade: FaceScanGrade = .low,
         photoPath: String = ""
@@ -197,6 +218,8 @@ public struct FaceRecord: Identifiable, Equatable, Sendable {
         self.box = box
         self.detScore = detScore
         self.matchScore = matchScore
+        self.quality = quality
+        self.facePixels = facePixels
         self.embedding = embedding
         self.crop = crop
         self.model = model
@@ -273,14 +296,6 @@ public struct FacePerson: Identifiable, Equatable, Sendable {
     }
 }
 
-/// Which detector a scan runs. LOW uses Apple Vision on the Neural Engine;
-/// MED and above use the SCRFD detector from the same model pack as the
-/// embedder. The identity model never changes per mode.
-public enum FaceDetectorKind: String, Codable, Sendable {
-    case vision
-    case scrfd
-}
-
 /// Options for one face scan pass. `mode` is the quality knob; `fast`
 /// pins the Mac (max workers). Off keeps a quiet 2-wide pass. Same models.
 public struct FaceScanOptions: Equatable, Sendable {
@@ -291,19 +306,33 @@ public struct FaceScanOptions: Equatable, Sendable {
     /// faces only; MED ~40px; HIGH and XHIGH ~30px — still a real face,
     /// not tourists.
     public var minimumFacePixels: Double
-    /// Cosine threshold for proposing a roster person.
+    /// Cosine floor for proposing a roster person (best template match).
     public var matchThreshold: Float
-    /// Cosine threshold for joining an existing Other group.
+    /// Cosine floor for joining an automatic group — the mean similarity
+    /// to the group's members (average linkage), never to one face.
     public var clusterThreshold: Float
     /// Longer edge of the bounded decode detection runs on.
     public var detectPixels: Int
     /// Most templates kept per person — when a group is named, and as the
     /// XHIGH gallery rebuild's cap.
     public var templateCap: Int
-    /// Detector score floor for the SCRFD path.
+    /// Detector confidence floor: faces below it are not stored at all.
     public var detScoreThreshold: Float
-    /// Detector letterbox sizes for the SCRFD path — MED runs 640 only,
-    /// HIGH adds a 960 pass, XHIGH adds 1024 for smaller faces.
+    /// Detector confidence floor for grouping (Immich's default). Faces
+    /// below it are stored — boxes and roster proposals still work — but
+    /// never seed or join an automatic group.
+    public var groupingMinDetScore: Float
+    /// Smallest face (shorter box side, decoded pixels) that may be
+    /// grouped. Below it the embedding is an upscaled smear that resembles
+    /// every other smear — the raw material of junk piles.
+    public var groupingMinFacePixels: Double
+    /// Faces a cluster formed in one pass needs before it becomes a
+    /// "Person N" row. Smaller clusters stay ungrouped rather than
+    /// littering People with pairs and singletons.
+    public var minimumGroupFaces: Int
+    /// Detector input sizes the engine runs — LOW and MED 640, HIGH adds
+    /// 960, XHIGH adds 1024 for smaller faces. Detections merge under one
+    /// NMS.
     public var detectorScales: [Int]
     /// Seconds between sampled video frames. Nil means video is skipped
     /// (LOW stills-only); MED samples sparsely, HIGH ~1 fps, XHIGH ~2 fps.
@@ -323,28 +352,25 @@ public struct FaceScanOptions: Equatable, Sendable {
     /// spread across photos instead of whatever happened to be pinned.
     /// Off below XHIGH.
     public var rebuildTemplates: Bool
-    /// The optional larger SCRFD sibling package — XHIGH's last resort
-    /// when the standard detector still misses real group-shot faces.
-    /// Default off; silently unused when no `det_34g*` package is
-    /// installed alongside the 10G ones. Never a different recognizer.
-    public var usesLargeDetector: Bool
 
     public init(
         mode: FaceScanGrade = .low,
         fast: Bool = true,
         minimumFacePixels: Double? = nil,
-        matchThreshold: Float = 0.48,
-        clusterThreshold: Float = 0.5,
+        matchThreshold: Float = 0.45,
+        clusterThreshold: Float = 0.40,
         detectPixels: Int? = nil,
         templateCap: Int? = nil,
-        detScoreThreshold: Float = 0.5,
+        detScoreThreshold: Float = 0.6,
+        groupingMinDetScore: Float = 0.7,
+        groupingMinFacePixels: Double = 48,
+        minimumGroupFaces: Int = 3,
         detectorScales: [Int]? = nil,
         videoFrameStride: TimeInterval? = nil,
         maximumVideoFrames: Int? = nil,
         videoDuplicateCosine: Float = 0.92,
         flipTTA: Bool? = nil,
-        rebuildTemplates: Bool? = nil,
-        usesLargeDetector: Bool = false
+        rebuildTemplates: Bool? = nil
     ) {
         self.mode = mode
         self.fast = fast
@@ -354,18 +380,15 @@ public struct FaceScanOptions: Equatable, Sendable {
         self.detectPixels = detectPixels ?? Self.defaultDetectPixels(for: mode)
         self.templateCap = templateCap ?? Self.defaultTemplateCap(for: mode)
         self.detScoreThreshold = detScoreThreshold
+        self.groupingMinDetScore = groupingMinDetScore
+        self.groupingMinFacePixels = groupingMinFacePixels
+        self.minimumGroupFaces = minimumGroupFaces
         self.detectorScales = detectorScales ?? Self.defaultDetectorScales(for: mode)
         self.videoFrameStride = videoFrameStride ?? Self.defaultVideoFrameStride(for: mode)
         self.maximumVideoFrames = maximumVideoFrames ?? Self.defaultMaximumVideoFrames(for: mode)
         self.videoDuplicateCosine = videoDuplicateCosine
         self.flipTTA = flipTTA ?? (mode == .xhigh)
         self.rebuildTemplates = rebuildTemplates ?? (mode == .xhigh)
-        self.usesLargeDetector = usesLargeDetector
-    }
-
-    /// The detector this mode runs.
-    public var detectorKind: FaceDetectorKind {
-        mode == .low || mode == .none ? .vision : .scrfd
     }
 
     /// The grade a scan actually achieves: every pipeline through XHIGH is
@@ -455,23 +478,24 @@ public struct FaceScanReport: Equatable, Sendable {
     /// Auto "Person N" groups the rebundle dissolved outright — rows left
     /// with no faces after their members re-pooled.
     public var groupsDissolved: Int = 0
-    /// The detector packages that ran — e.g. "det_10g 640/960/1024" — for
-    /// the Jobs log, which may name packages. Nil on the Vision path.
+    /// The engine and detector scales that ran — for the Jobs log, which
+    /// may name packages. Nil for a vectors-only re-match.
     public var detectorSummary: String?
 
     public init() {}
 }
 
 public enum FaceIndexError: Error, Equatable, LocalizedError {
-    case modelNotInstalled(String)
-    case detectorNotInstalled(String)
+    /// The sidecar environment or model pack is missing; the payload is
+    /// the user-facing sentence naming the setup command.
+    case engineNotInstalled(String)
+    /// The sidecar failed to start, died, timed out, or rejected a request.
+    case engineFailed(String)
 
     public var errorDescription: String? {
         switch self {
-        case .modelNotInstalled(let path):
-            "The face model is not installed. Run scripts/convert-arcface.sh once to build it at \(path)."
-        case .detectorNotInstalled(let path):
-            "The face detector is not installed. Run scripts/convert-scrfd.sh once to build it at \(path)."
+        case .engineNotInstalled(let message), .engineFailed(let message):
+            message
         }
     }
 }

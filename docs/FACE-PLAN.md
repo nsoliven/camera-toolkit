@@ -54,11 +54,12 @@ Auto ingest = **LOW + FAST**.
 | Role | Model | Notes |
 |---|---|---|
 | Identity (all modes) | **InsightFace ArcFace R50 `w600k_r50`** (buffalo_l recognizer) | 512-d, L2-normalized. **Never change per mode.** Gallery dies if you swap. |
-| LOW detect | **Apple Vision** (`VNDetectFaceRectangles` + landmarks) | ANE, large/clear faces. Does **not** group or recognize. |
-| MED / HIGH / XHIGH detect | **SCRFD-10G** (buffalo_l detector), 5-point landmarks | Better box + ArcFace-native align. |
-| XHIGH detect extra | Optional SCRFD-34G **only** if we still miss real group-shot faces. Default off. | Do not hunt 15px heads. |
-| Align | 5-point → 112×112 ArcFace crop | Vision landmarks mapped to 5-point on LOW. |
-| Group / match | Cosine on R50 vectors | Roster 1:N, then cluster leftovers. |
+| Detect (all modes) | **SCRFD-10G** (buffalo_l detector), 5-point landmarks | 640 input; HIGH adds 960, XHIGH adds 1024. |
+| Align | 5-point → 112×112 ArcFace crop | `insightface` `norm_crop`, never our own warp. |
+| Runtime | **`insightface` in a Python sidecar** (onnxruntime, CoreML provider) | The reference code runs the models; Swift never touches pixels or anchors. `docs/FACE-PIPELINE.md`. |
+| Group / match | Cosine on R50 vectors | Roster 1:N, then average-linkage clustering of leftovers behind a quality gate. |
+
+Decided 2026-09-21 after the in-house CoreML port shipped two silent accuracy bugs (anchor offset, BGR/RGB): Apple Vision for LOW and the SCRFD-34G option are gone; one engine for every grade.
 
 **Rejected:** MobileFaceNet for “speed,” antelopev2 / R100, RetinaFace-R50 as default, training/finetuning ArcFace, dual embedding spaces, Apple Vision for identity.
 
@@ -72,10 +73,10 @@ Min face size is the small-face policy. Not a different recognizer.
 
 | Mode | Detect | Min face (guide) | Extra | ~20k new stills, FAST off |
 |---|---|---|---|---|
-| **LOW** | Vision | ~60–80px | stills only, poster frame for video | ≤3 min |
+| **LOW** | SCRFD-10G @ 640 | ~64px | stills only, poster frame for video | ≤3 min |
 | **MED** | SCRFD-10G @ 640 | ~40px | stills; light video keyframes | 10–20 min |
 | **HIGH** | 10G @ 640 and 960 | ~30px+ (still a real face) | video ~1 fps | 1–2 h (video is the hour) |
-| **XHIGH** | 10G (optional 34G), scales 640/960/1024 | same ~30px floor | video ~2 fps, hflip TTA, rebuild templates | overnight if lots of video; stills-only is much less |
+| **XHIGH** | 10G, scales 640/960/1024 | same ~30px floor | video ~2 fps, hflip TTA, rebuild templates | overnight if lots of video; stills-only is much less |
 
 XHIGH is **more angles/lighting/video of the ~20 people**, and better templates. It is **not** “detect every head in the crowd.”
 
@@ -159,7 +160,7 @@ Unplug = pause. Replug = resume hashes.
 ## Implement order
 
 1. Ingest + events (hash, EXIF, time gaps). No faces.
-2. LOW: Vision → R50 → SQLite. Match roster if templates exist, else cluster all (including Others). Event chips for named only.
+2. LOW: sidecar (SCRFD → R50) → SQLite. Match roster if templates exist, else cluster all (including Others). Event chips for named only.
 3. Name/merge UI + confirmed lock. This is what makes LOW good.
 4. MED: SCRFD-10G, min-size ~40px, process new + lower-grade + unreviewed proposed.
 5. FAST on = pin the runner; off = 2-wide quiet pass.
@@ -172,7 +173,7 @@ Unplug = pause. Replug = resume hashes.
 
 - `photos`: path, hash, taken_at, scan_grade, indexed_at
 - `people`: id, name, is_roster, centroid optional, face_count
-- `faces`: photo_id, person_id nullable, box, det_score, quality, embedding BLOB (512 float32 L2), model=`w600k_r50`, state=`cached|proposed|confirmed|other`, scan_grade
+- `faces`: photo_id, person_id nullable, box, det_score, quality (pre-norm embedding norm), face_px, embedding BLOB (512 float32 L2), model=`insightface/buffalo_l`, state=`cached|proposed|confirmed|other`, scan_grade
 - `templates`: person_id, face_id, pose/quality optional
 - `events`: time range; `event_people` derived from confirmed+proposed roster faces
 
