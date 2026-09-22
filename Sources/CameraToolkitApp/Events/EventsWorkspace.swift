@@ -2749,7 +2749,7 @@ final class EventsWorkspace {
             action: .faceScan,
             runningNote: "Scanning \(title) for faces",
             logTitle: "Face scan: \(title)",
-            logDetail: "Quality \(options.mode.rawValue). Detected faces on \(burstScope), single stills, and — at MED and above — video frames with the on-device face engine; matched named people and grouped the rest. Files were only read — nothing was written or moved.",
+            logDetail: "Quality \(options.mode.rawValue). Detected faces on \(burstScope), single stills, and — at MED and above — video frames with the on-device face engine; matched faces against the approved people and grouped the rest — every classification lands in the Inbox, unapproved until the user says so. Files were only read — nothing was written or moved.",
             operation: { progress in
                 // Bootstrap is idempotent: it guarantees the face tables
                 // exist even if no catalog sync has run since the upgrade.
@@ -2788,14 +2788,14 @@ final class EventsWorkspace {
                 let burst = report.photosBurstCovered > 0 ? "; \(report.photosBurstCovered) burst frames covered by sampled siblings" : ""
                 // The Jobs log may name packages — the scan sheet cannot.
                 let packages = report.detectorSummary.map { " Engine: \($0)." } ?? ""
-                return "Face scan done — \(report.facesDetected) face\(report.facesDetected == 1 ? "" : "s") on \(report.photosProcessed) sampled photo(s); \(report.photosSkipped) already scanned\(burst); \(report.facesProposed) matched to people, \(report.facesGrouped) grouped\(video).\(packages)"
+                return "Face scan done — \(report.facesDetected) face\(report.facesDetected == 1 ? "" : "s") on \(report.photosProcessed) sampled photo(s); \(report.photosSkipped) already scanned\(burst); \(report.facesProposed) filed in the Inbox as lookalikes, \(report.facesGrouped) grouped\(video).\(packages)"
             }
         )
     }
 
-    /// Named people detected on this event's photos — the "event.people"
-    /// derivation. Confirmed and proposed roster faces count; unnamed groups
-    /// never appear here.
+    /// Approved people detected on this event's photos — the "event.people"
+    /// derivation. Only confirmed faces on approved people count; Inbox
+    /// faces never put a name on an event.
     func eventPeople(_ eventID: UUID) -> [FacePerson] {
         if let cache = eventPeopleCache,
            cache.0 == facesRevision,
@@ -2845,10 +2845,11 @@ final class EventsWorkspace {
         return kinds[eventID] ?? []
     }
 
-    /// Person and unnamed-group names detected on the stack's files, joined
-    /// through the catalog's face rows by file key (name|bytes|mtime — it
-    /// survives the file moving between folders). Board search matches
-    /// these, so "Sam" keeps every burst she appears in.
+    /// Approved-person names detected on the stack's files, joined through
+    /// the catalog's confirmed face rows by file key (name|bytes|mtime —
+    /// it survives the file moving between folders). Board search matches
+    /// these, so "Sam" keeps every burst she appears in — while an
+    /// Inbox face never names a stack.
     func personNames(on stack: OrganizeStack) -> Set<String> {
         let names = faceNamesByFileKey()
         guard !names.isEmpty else { return [] }
@@ -2885,10 +2886,11 @@ final class EventsWorkspace {
         people: (options: [FacePerson], byStackID: [String: Set<UUID>])
     )?
 
-    /// Which catalog people each stack's files carry, plus the filter
-    /// picker's options — roster members and unnamed groups actually seen
-    /// on these stacks, roster first. Stacks without indexed faces map to
-    /// an empty set; boards never scanned for faces return no options.
+    /// Which approved people each stack's files carry (confirmed faces
+    /// only), plus the filter picker's options — the approved people
+    /// actually seen on these stacks. Inbox faces never satisfy a People
+    /// filter; stacks without confirmed faces map to an empty set and
+    /// boards never scanned for faces return no options.
     func boardPeople(for stacks: [OrganizeStack]) -> (options: [FacePerson], byStackID: [String: Set<UUID>]) {
         if let cache = boardPeopleCache,
            cache.facesRevision == facesRevision,
@@ -2935,14 +2937,34 @@ final class EventsWorkspace {
 
     // MARK: - Face review actions
 
-    /// Review data for the People window: roster, unnamed groups, and the
-    /// proposed faces awaiting confirmation.
-    func faceSnapshot() -> (roster: [FacePerson], groups: [FacePerson], unsure: [FaceRecord]) {
+    /// Set after the first `faceSnapshot` checks for legacy proposals —
+    /// the sweep runs once per workspace, not on every render.
+    @ObservationIgnored private var didCheckRosterProposals = false
+
+    /// Review data for the People window: the approved people and the
+    /// Inbox — automatic clusters plus "looks like" suggestion rows.
+    /// The first read sweeps any faces an older build proposed onto the
+    /// roster into the Inbox (stored vectors only, in a background job).
+    func faceSnapshot() -> (approved: [FacePerson], inbox: [FacePerson]) {
+        if !didCheckRosterProposals {
+            didCheckRosterProposals = true
+            if (try? faceStore.hasUnapprovedRosterFaces()) == true {
+                rematchFaces()
+            }
+        }
         let store = faceStore
-        let roster = (try? store.rosterPeople()) ?? []
+        let approved = (try? store.rosterPeople()) ?? []
         let groups = (try? store.otherGroups()) ?? []
-        let unsure = (try? store.unsureFaces()) ?? []
-        return (roster, groups, unsure)
+        // "Looks like" rows first — they are the closest to an approval —
+        // then the plain clusters, largest first.
+        let inbox = groups.sorted { lhs, rhs in
+            if (lhs.suggestedPersonID != nil) != (rhs.suggestedPersonID != nil) {
+                return lhs.suggestedPersonID != nil
+            }
+            if lhs.faceCount != rhs.faceCount { return lhs.faceCount > rhs.faceCount }
+            return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+        }
+        return (approved, inbox)
     }
 
     /// The live counts the Clear Face Scan sheet lists — scanned photos,
@@ -2974,6 +2996,20 @@ final class EventsWorkspace {
 
     func faces(for personID: UUID) -> [FaceRecord] {
         (try? faceStore.faces(personID: personID)) ?? []
+    }
+
+    /// An Inbox person's faces in review order: the stored match score,
+    /// strongest first, so the doubtful ones sit at the bottom. A face
+    /// with no score is a cluster seed — it belongs with the strongest.
+    /// The strip and the full grid both use this order, uncapped.
+    func inboxFaces(for personID: UUID) -> [FaceRecord] {
+        faces(for: personID).sorted { lhs, rhs in
+            let left = lhs.matchScore ?? .infinity
+            let right = rhs.matchScore ?? .infinity
+            if left != right { return left > right }
+            if lhs.detScore != rhs.detScore { return lhs.detScore > rhs.detScore }
+            return lhs.id.uuidString < rhs.id.uuidString
+        }
     }
 
     /// A new roster person created from the overlay's tag picker.
@@ -3045,36 +3081,37 @@ final class EventsWorkspace {
         model.statusMessage = "Merged \(source.name) into \(target.name)."
     }
 
-    /// Takes a person off the roster; the faces become an unnamed group
-    /// again rather than disappearing.
+    /// Takes a person off the approved list; the faces become an Inbox
+    /// group again rather than disappearing. Confirmed faces keep their
+    /// frozen state.
     func demotePerson(_ personID: UUID) {
         try? faceStore.demoteFromRoster(personID)
         facesRevision &+= 1
-        model.statusMessage = "Removed from the people list. The faces stay grouped under Other."
+        model.statusMessage = "Moved to the Inbox — the confirmed faces stay grouped there."
     }
 
-    /// Names an Other group: it joins the roster, its faces are confirmed,
-    /// and a spread of them become the templates future scans match against.
-    /// Then cached vectors re-match against the new gallery.
+    /// Approves an Inbox person: it joins the approved list with the given
+    /// name, and only the faces in that cluster are confirmed — a spread
+    /// of them become the templates future scans match against. Nothing
+    /// else moves; approving never triggers a catalog-wide re-match.
     func nameGroup(_ personID: UUID, name: String) {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         try? faceStore.promoteGroup(personID, name: trimmed, templateCap: FaceScanOptions().templateCap)
         facesRevision &+= 1
-        model.statusMessage = "Named \(trimmed). Existing faces are being re-matched against the new gallery."
-        rematchFaces()
+        model.statusMessage = "Approved \(trimmed) — only the faces in this cluster were confirmed."
     }
 
-    /// Junks the one unnamed group the user confirmed (statues, dogs,
+    /// Junks the one Inbox person the user confirmed (statues, dogs,
     /// strangers) — that cluster and its face rows are removed, nothing
-    /// else. Named people can never be junked, no Junk person is created,
-    /// and photos keep their scan grade so a same-mode scan does not
-    /// bring the faces back.
+    /// else. Approved people can never be junked, no Junk person is
+    /// created, and photos keep their scan grade so a same-mode scan does
+    /// not bring the faces back.
     func junkGroup(_ personID: UUID) {
         do {
             guard let person = try faceStore.person(personID) else { return }
             guard !person.isRoster else {
-                model.statusMessage = "\(person.name) is a named person — only unnamed groups can be junked."
+                model.statusMessage = "\(person.name) is an approved person — only Inbox rows can be junked."
                 return
             }
             try faceStore.deletePersonAndFaces(personID)
@@ -3085,21 +3122,49 @@ final class EventsWorkspace {
         }
     }
 
-    /// Confirms a proposed face and pins it as a template — confirmed faces
-    /// are frozen and never reclassified.
-    func confirmFace(_ faceID: UUID) {
-        try? faceStore.confirmFace(faceID)
-        if let face = try? faceStore.face(id: faceID), let personID = face.personID {
-            try? faceStore.addTemplate(personID: personID, faceID: faceID)
+    /// Deletes one face row — the Inbox's per-face junk. The photo, its
+    /// scan grade, and every other face stay untouched.
+    func junkFace(_ faceID: UUID) {
+        do {
+            try faceStore.deleteFaces([faceID])
+            try faceStore.refreshFaceCounts()
+            facesRevision &+= 1
+            model.statusMessage = "Face removed from the index. The photo was not touched."
+        } catch {
+            model.statusMessage = "Could not remove the face: \(error.localizedDescription)"
         }
-        try? faceStore.refreshFaceCounts()
-        facesRevision &+= 1
+    }
+
+    /// Confirms a face and pins it as a template — confirmed faces are
+    /// frozen and never reclassified. A face on a "looks like X" row is
+    /// confirmed onto X itself: the row is only a holding pen, and the
+    /// rest of its faces stay unapproved.
+    func confirmFace(_ faceID: UUID) {
+        do {
+            guard let face = try faceStore.face(id: faceID) else { return }
+            if let personID = face.personID,
+               let person = try faceStore.person(personID),
+               !person.isRoster,
+               let target = person.suggestedPersonID {
+                try faceStore.assignFace(faceID, to: target, state: .confirmed, score: face.matchScore)
+                try faceStore.addTemplate(personID: target, faceID: faceID)
+            } else {
+                try faceStore.confirmFace(faceID)
+                if let personID = face.personID {
+                    try faceStore.addTemplate(personID: personID, faceID: faceID)
+                }
+            }
+            try faceStore.refreshFaceCounts()
+            facesRevision &+= 1
+        } catch {
+            model.statusMessage = "Could not confirm the face: \(error.localizedDescription)"
+        }
     }
 
     /// "Not this person" / "not this group": the verdict is persisted — the
     /// face can never be matched back to that person and its embedding
     /// becomes a negative example that vetoes lookalikes — then the face
-    /// re-groups with the Other clusters. Confirmed faces are frozen and
+    /// re-groups with the Inbox clusters. Confirmed faces are frozen and
     /// never move; the detection and the photo stay untouched.
     func rejectFace(_ faceID: UUID) {
         do {
@@ -3108,7 +3173,8 @@ final class EventsWorkspace {
                 model.statusMessage = "Confirmed faces are frozen — this one stays where it is."
                 return
             }
-            let personName = face.personID.flatMap { try? faceStore.person($0) }?.name
+            let person = face.personID.flatMap { try? faceStore.person($0) }
+            let personName = person?.suggestedPersonName ?? person?.name
             try FaceIndexService(catalogURL: catalogDatabaseURL).reject([faceID])
             facesRevision &+= 1
             model.statusMessage = personName.map {
@@ -3142,11 +3208,13 @@ final class EventsWorkspace {
         try? faceStore.person(id)
     }
 
-    /// The Re-match button: re-matches every stored, unconfirmed face to
-    /// named people, then rebundles the unnamed "Person N" groups so a
-    /// drifted cluster can split into real ones — all on stored vectors,
-    /// so no photo is re-read, no ML runs, and nothing on disk moves.
-    /// Named groups keep their faces; confirmed faces never move.
+    /// The Re-match button: re-matches every stored, unconfirmed face
+    /// against the approved people — matches file into Inbox "looks like"
+    /// rows, never onto the approved person — then rebundles the
+    /// automatic "Person N" groups so a drifted cluster can split into
+    /// real ones. All on stored vectors, so no photo is re-read, no ML
+    /// runs, and nothing on disk moves. Named Inbox rows keep their
+    /// faces; confirmed faces never move.
     func rematchFaces() {
         let catalogURL = catalogDatabaseURL
         let configuration = model.configuration
@@ -3154,7 +3222,7 @@ final class EventsWorkspace {
             action: .faceScan,
             runningNote: "Re-matching and regrouping stored faces",
             logTitle: "Re-matched faces",
-            logDetail: "Stored face vectors were matched to named people and the unnamed groups were rebundled — a drifted cluster can split into real groups. No photos were re-read, no ML ran, and no files or events moved.",
+            logDetail: "Stored face vectors were matched against the approved people — matches filed into the Inbox as lookalikes — and the automatic clusters were rebundled so a drifted cluster can split into real groups. No photos were re-read, no ML ran, and no files or events moved.",
             operation: { progress in
                 let service = FaceIndexService(catalogURL: catalogURL)
                 // Bootstrap stays the path that creates the face tables,
@@ -3180,7 +3248,7 @@ final class EventsWorkspace {
                 }
                 var parts = ["\(report.facesMoved) face\(report.facesMoved == 1 ? "" : "s") moved"]
                 if report.facesProposed > 0 {
-                    parts.append("\(report.facesProposed) matched to named people")
+                    parts.append("\(report.facesProposed) filed in the Inbox as lookalikes")
                 }
                 if report.groupsCreated > 0 {
                     parts.append("\(report.groupsCreated) group\(report.groupsCreated == 1 ? "" : "s") formed")

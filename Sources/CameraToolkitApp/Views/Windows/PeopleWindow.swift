@@ -37,17 +37,17 @@ final class PeopleWindowController: NSObject, NSWindowDelegate {
     }
 }
 
-/// The face review surface: named people, auto-formed groups waiting for a
-/// name, and the proposed matches that need a yes/no. Everything here is
-/// catalog data — no photo is ever written to.
+/// The face review surface: the Approved list of people the user named
+/// or confirmed, and the Inbox of everything the machine classified —
+/// automatic clusters and "looks like" rows that stay unapproved until
+/// the user approves, merges, or junks them. Everything here is catalog
+/// data — no photo is ever written to.
 private struct PeopleView: View {
     @Bindable var model: DashboardModel
     @Bindable var workspace: EventsWorkspace
 
-    @State private var tab = Tab.people
-    @State private var roster: [FacePerson] = []
-    @State private var groups: [FacePerson] = []
-    @State private var unsure: [FaceRecord] = []
+    @State private var approved: [FacePerson] = []
+    @State private var inbox: [FacePerson] = []
     @State private var expanded: Set<UUID> = []
     @State private var naming: NamingRequest?
     @State private var junkTarget: FacePerson?
@@ -59,24 +59,18 @@ private struct PeopleView: View {
     @State private var detail: FacePerson?
     /// The face whose source photo fills the preview overlay.
     @State private var previewFace: FaceRecord?
-    /// Filters the people/group/unsure lists.
+    /// Filters the approved and Inbox lists.
     @State private var searchText = ""
     /// Filters the open detail grid — separate state so a list query does
     /// not hide detections when a person opens.
     @State private var gridSearchText = ""
 
-    private enum Tab: String, CaseIterable, Identifiable {
-        case people = "People"
-        case groups = "New Groups"
-        case unsure = "Unsure"
-        var id: String { rawValue }
-    }
-
     private struct NamingRequest: Identifiable {
         var id: UUID { person.id }
         var person: FacePerson
         var title: String
-        var isGroup: Bool
+        var initialName: String
+        var isApproval: Bool
     }
 
     var body: some View {
@@ -92,21 +86,7 @@ private struct PeopleView: View {
                     onOpenPhoto: { previewFace = $0 }
                 )
             } else {
-                Picker("Review", selection: $tab) {
-                    ForEach(Tab.allCases) { tab in
-                        Text("\(tab.rawValue) \(tabCount(tab))").tag(tab)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .padding(.horizontal, 14)
-                .padding(.vertical, 8)
-
-                switch tab {
-                case .people: rosterList
-                case .groups: groupsList
-                case .unsure: unsureList
-                }
+                reviewList
             }
 
             Divider()
@@ -135,11 +115,11 @@ private struct PeopleView: View {
         .sheet(item: $naming) { request in
             NamePersonSheet(
                 title: request.title,
-                initialName: request.isGroup ? "" : request.person.name,
+                initialName: request.initialName,
                 onCancel: { naming = nil },
                 onSave: { name in
                     naming = nil
-                    if request.isGroup {
+                    if request.isApproval {
                         workspace.nameGroup(request.person.id, name: name)
                     } else {
                         workspace.renamePerson(request.person.id, name: name)
@@ -148,16 +128,16 @@ private struct PeopleView: View {
             )
         }
         .alert(
-            "Remove “\(junkTarget?.name ?? "")”?",
+            "Remove “\(junkTarget.map(displayName) ?? "")”?",
             isPresented: Binding(get: { junkTarget != nil }, set: { if !$0 { junkTarget = nil } })
         ) {
-            Button("Remove Group", role: .destructive) {
+            Button("Remove", role: .destructive) {
                 if let junkTarget { workspace.junkGroup(junkTarget.id) }
                 junkTarget = nil
             }
             Button("Cancel", role: .cancel) { junkTarget = nil }
         } message: {
-            Text("The group and its face detections are dropped from the index. Photos are untouched, and a rescan will not bring them back at the same quality.")
+            Text("The Inbox row and its face detections are dropped from the index. Photos are untouched, and a rescan will not bring them back at the same quality.")
         }
     }
 
@@ -169,7 +149,7 @@ private struct PeopleView: View {
                 Text("People")
                     .font(.headline)
                 Text(workspace.faceEngineInstalled
-                    ? "Faces are matched on-device. Name a group and its faces become that person everywhere."
+                    ? "A scan never adds faces to Approved — its clusters and lookalikes wait in the Inbox."
                     : "Face engine not installed — run \(FaceSidecarInstallation.setupCommand) once on this Mac.")
                     .font(.caption)
                     .foregroundStyle(workspace.faceEngineInstalled ? Color.secondary : Color.orange)
@@ -182,8 +162,8 @@ private struct PeopleView: View {
             } label: {
                 Label("Re-match", systemImage: "arrow.triangle.2.circlepath")
             }
-            .disabled(model.isBusy || (roster.isEmpty && groups.isEmpty && unsure.isEmpty))
-            .help("Match stored faces to named people and rebuild the unnamed groups — a group that collected different people can split. Reads the catalog's stored vectors only: no rescan, and no files or events move.")
+            .disabled(model.isBusy || (approved.isEmpty && inbox.isEmpty))
+            .help("Re-file stored faces into the Inbox — lookalikes beside the approved people they resemble, strangers into fresh clusters. Reads the catalog's stored vectors only: no rescan, and no files or events move.")
             Button {
                 clearingFaceIndex = true
             } label: {
@@ -245,58 +225,45 @@ private struct PeopleView: View {
         OrganizeSearch.needle(searchText)
     }
 
-    /// A person or group matches when its name hits or when one of its
-    /// member detections sits on a photo whose file name hits — the owner's
-    /// "find every face of Sam" path. Catalog data only.
+    /// What the row is called: a suggestion row wears its target's name
+    /// under "Looks like".
+    private func displayName(_ person: FacePerson) -> String {
+        person.suggestedPersonName.map { "Looks like \($0)" } ?? person.name
+    }
+
+    /// A person or Inbox row matches when its name hits — a suggestion row
+    /// also matches its target's name — or when one of its member
+    /// detections sits on a photo whose file name hits. Catalog data only.
     private func personMatches(_ person: FacePerson) -> Bool {
         OrganizeSearch.matches(person.name, needle: needle)
+            || OrganizeSearch.matches(person.suggestedPersonName ?? "", needle: needle)
             || workspace.faces(for: person.id).contains {
                 OrganizeSearch.matches(facePhotoName($0), needle: needle)
             }
     }
 
-    private var filteredRoster: [FacePerson] {
-        guard !needle.isEmpty else { return roster }
-        return roster.filter(personMatches)
+    private var filteredApproved: [FacePerson] {
+        guard !needle.isEmpty else { return approved }
+        return approved.filter(personMatches)
     }
 
-    private var filteredGroups: [FacePerson] {
-        guard !needle.isEmpty else { return groups }
-        return groups.filter(personMatches)
+    private var filteredInbox: [FacePerson] {
+        guard !needle.isEmpty else { return inbox }
+        return inbox.filter(personMatches)
     }
 
-    private var filteredUnsure: [FaceRecord] {
-        guard !needle.isEmpty else { return unsure }
-        return unsure.filter {
-            OrganizeSearch.matches(facePhotoName($0), needle: needle)
-                || OrganizeSearch.matches(personName(of: $0), needle: needle)
-        }
-    }
-
-    private func personName(of face: FaceRecord) -> String? {
-        face.personID.flatMap { try? workspace.faceStore.person($0) }?.name
-    }
-
-    private func tabCount(_ tab: Tab) -> String {
-        switch tab {
-        case .people: "\(roster.count)"
-        case .groups: "\(groups.count)"
-        case .unsure: "\(unsure.count)"
-        }
-    }
-
-    // MARK: - People (roster)
+    // MARK: - The two lists
 
     @ViewBuilder
-    private var rosterList: some View {
-        if roster.isEmpty {
+    private var reviewList: some View {
+        if approved.isEmpty && inbox.isEmpty {
             ContentUnavailableView(
-                "No Named People Yet",
+                "No People Yet",
                 systemImage: "person.crop.rectangle.stack",
-                description: Text("Run a face scan on an Unsorted folder, then name a group in New Groups.")
+                description: Text("Run a face scan on an Unsorted folder — the clusters and lookalikes it finds land in the Inbox.")
             )
             .frame(maxHeight: .infinity)
-        } else if filteredRoster.isEmpty {
+        } else if filteredApproved.isEmpty && filteredInbox.isEmpty {
             ContentUnavailableView(
                 "No Matches",
                 systemImage: "magnifyingglass",
@@ -305,22 +272,41 @@ private struct PeopleView: View {
             .frame(maxHeight: .infinity)
         } else {
             List {
-                ForEach(filteredRoster) { person in
-                    personRow(person)
+                if !filteredApproved.isEmpty {
+                    Section {
+                        ForEach(filteredApproved) { person in
+                            approvedRow(person)
+                        }
+                    } header: {
+                        Text("Approved · \(filteredApproved.count)")
+                    }
+                }
+                if !filteredInbox.isEmpty {
+                    Section {
+                        ForEach(filteredInbox) { person in
+                            inboxRow(person)
+                        }
+                    } header: {
+                        Text("Inbox · \(filteredInbox.count)")
+                    } footer: {
+                        Text("The machine's guesses — approve, merge, or junk. Nothing here names an event until you do.")
+                    }
                 }
             }
             .listStyle(.inset)
         }
     }
 
-    private func personRow(_ person: FacePerson) -> some View {
+    // MARK: - Approved
+
+    private func approvedRow(_ person: FacePerson) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 10) {
                 PersonCover(workspace: workspace, personID: person.id)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(person.name)
                         .font(.headline)
-                    Text("\(person.faceCount) detection\(person.faceCount == 1 ? "" : "s")")
+                    Text("\(person.faceCount) confirmed detection\(person.faceCount == 1 ? "" : "s")")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -340,20 +326,25 @@ private struct PeopleView: View {
                 .buttonStyle(.borderless)
                 .help("Show member faces")
                 Menu("Merge Into") {
-                    ForEach(roster.filter { $0.id != person.id }) { target in
+                    ForEach(approved.filter { $0.id != person.id }) { target in
                         Button(target.name) { workspace.mergePerson(person.id, into: target.id) }
                     }
                 }
                 .menuStyle(.borderlessButton)
                 .fixedSize()
-                .disabled(roster.count < 2)
+                .disabled(approved.count < 2)
                 Button("Rename…") {
-                    naming = NamingRequest(person: person, title: "Rename \(person.name)", isGroup: false)
+                    naming = NamingRequest(
+                        person: person,
+                        title: "Rename \(person.name)",
+                        initialName: person.name,
+                        isApproval: false
+                    )
                 }
-                Button("Remove from Roster") {
+                Button("Move to Inbox") {
                     workspace.demotePerson(person.id)
                 }
-                .help("Faces stay grouped as an unnamed cluster under New Groups")
+                .help("Faces stay grouped as an unapproved Inbox cluster — confirmed faces keep their state")
             }
             if expanded.contains(person.id) {
                 memberStrip(person)
@@ -362,147 +353,86 @@ private struct PeopleView: View {
         .padding(.vertical, 4)
     }
 
-    // MARK: - New Groups (unnamed clusters)
+    // MARK: - Inbox
 
-    @ViewBuilder
-    private var groupsList: some View {
-        if groups.isEmpty {
-            ContentUnavailableView(
-                "No New Groups",
-                systemImage: "person.2.crop.square.stack",
-                description: Text("Unmatched faces cluster here after a face scan. Name the ones that matter.")
-            )
-            .frame(maxHeight: .infinity)
-        } else if filteredGroups.isEmpty {
-            ContentUnavailableView(
-                "No Matches",
-                systemImage: "magnifyingglass",
-                description: Text("No groups or photo names match “\(searchText)”.")
-            )
-            .frame(maxHeight: .infinity)
-        } else {
-            List {
-                ForEach(filteredGroups) { group in
-                    groupRow(group)
-                }
-            }
-            .listStyle(.inset)
-        }
-    }
-
-    private func groupRow(_ group: FacePerson) -> some View {
+    private func inboxRow(_ person: FacePerson) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 10) {
-                PersonCover(workspace: workspace, personID: group.id)
+                PersonCover(workspace: workspace, personID: person.id)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(group.name)
+                    Text(displayName(person))
                         .font(.headline)
-                    Text("\(group.faceCount) detection\(group.faceCount == 1 ? "" : "s") · grouped automatically")
+                    Text(inboxSubtitle(person))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
                 Button {
-                    detail = group
+                    detail = person
                 } label: {
                     Image(systemName: "square.grid.2x2")
                 }
                 .buttonStyle(.borderless)
-                .help("Show all \(group.faceCount) detections in a grid")
+                .help("Review all \(person.faceCount) detections, weakest matches last")
                 Button {
-                    toggleExpanded(group.id)
+                    toggleExpanded(person.id)
                 } label: {
-                    Image(systemName: expanded.contains(group.id) ? "chevron.down" : "chevron.right")
+                    Image(systemName: expanded.contains(person.id) ? "chevron.down" : "chevron.right")
                 }
                 .buttonStyle(.borderless)
-                .help("Show member faces")
+                .help("Show member faces, weakest matches last")
+                if let targetID = person.suggestedPersonID, let target = person.suggestedPersonName {
+                    Button("Merge into \(target)") {
+                        workspace.mergePerson(person.id, into: targetID)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .help("Confirms every face here onto \(target) — the faces move because you said so")
+                }
                 Menu("Merge Into") {
-                    ForEach(roster) { target in
-                        Button(target.name) { workspace.mergePerson(group.id, into: target.id) }
+                    ForEach(approved.filter { $0.id != person.suggestedPersonID }) { target in
+                        Button(target.name) { workspace.mergePerson(person.id, into: target.id) }
                     }
                 }
                 .menuStyle(.borderlessButton)
                 .fixedSize()
-                .disabled(roster.isEmpty)
-                Button("Name…") {
-                    naming = NamingRequest(person: group, title: "Name \(group.name)", isGroup: true)
+                .disabled(approved.isEmpty || (approved.count == 1 && person.suggestedPersonID != nil))
+                Button("Approve…") {
+                    naming = NamingRequest(
+                        person: person,
+                        title: "Approve \(displayName(person))",
+                        // A "Looks like X" pile starts blank — approving it
+                        // as "X" would just duplicate the approved person.
+                        initialName: person.suggestedPersonID == nil ? person.name : "",
+                        isApproval: true
+                    )
                 }
-                .help("Adds this person to the roster and re-matches every stored face")
+                .help("Makes this an approved person and confirms just these faces — nothing else moves")
                 Button("Junk…", role: .destructive) {
-                    junkTarget = group
+                    junkTarget = person
                 }
-                .help("Drop this cluster — statues, strangers, duplicates of nothing")
+                .help("Drop this row — statues, strangers, duplicates of nothing")
             }
-            if expanded.contains(group.id) {
-                memberStrip(group)
+            if expanded.contains(person.id) {
+                memberStrip(person)
             }
         }
         .padding(.vertical, 4)
     }
 
-    // MARK: - Unsure (proposed matches)
-
-    @ViewBuilder
-    private var unsureList: some View {
-        if unsure.isEmpty {
-            ContentUnavailableView(
-                "Nothing to Confirm",
-                systemImage: "checkmark.circle",
-                description: Text("Proposed matches land here after a face scan. Confirm the right ones and the model learns nothing extra — it just keeps them frozen.")
-            )
-            .frame(maxHeight: .infinity)
-        } else if filteredUnsure.isEmpty {
-            ContentUnavailableView(
-                "No Matches",
-                systemImage: "magnifyingglass",
-                description: Text("No proposed matches or photo names match “\(searchText)”.")
-            )
-            .frame(maxHeight: .infinity)
-        } else {
-            List {
-                ForEach(filteredUnsure) { face in
-                    unsureRow(face)
-                }
-            }
-            .listStyle(.inset)
+    private func inboxSubtitle(_ person: FacePerson) -> String {
+        let count = "\(person.faceCount) detection\(person.faceCount == 1 ? "" : "s")"
+        if let target = person.suggestedPersonName {
+            return "\(count) · resembles \(target)"
         }
-    }
-
-    private func unsureRow(_ face: FaceRecord) -> some View {
-        let personName = personName(of: face) ?? "this person"
-        return HStack(spacing: 10) {
-            FaceCropView(face: face)
-                .frame(width: 44, height: 44)
-                .clipShape(RoundedRectangle(cornerRadius: 6))
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Is this \(personName)?")
-                    .font(.headline)
-                Text("\(facePhotoName(face)) · match \(Int((face.matchScore ?? 0) * 100))%")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-            }
-            Spacer()
-            Button("Not \(personName)") {
-                workspace.rejectFace(face.id)
-            }
-            .help("Removes the face — it lands in another group and can never be matched to \(personName) again")
-            Button("Confirm") {
-                workspace.confirmFace(face.id)
-            }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.small)
-            .help("Freezes this face as \(personName) — confirmed faces are never reclassified")
-        }
-        .padding(.vertical, 4)
+        return "\(count) · grouped automatically"
     }
 
     // MARK: - Shared pieces
 
     private var statusBar: some View {
         HStack {
-            Text("\(roster.count) named · \(groups.count) unnamed group\(groups.count == 1 ? "" : "s") · \(unsure.count) to confirm")
+            Text("\(approved.count) approved · \(inbox.count) in the Inbox")
                 .font(.caption)
                 .foregroundStyle(.secondary)
             Spacer()
@@ -514,17 +444,26 @@ private struct PeopleView: View {
         .padding(.vertical, 7)
     }
 
+    /// The member strip: an approved person previews its strongest dozen
+    /// detections; an Inbox person shows every member in review order —
+    /// stored match score, strongest first, weak ones last — because the
+    /// user opened the row specifically to see the doubtful faces.
     private func memberStrip(_ person: FacePerson) -> some View {
-        let all = workspace.faces(for: person.id)
-        let members = Array(all.prefix(12))
+        let all = person.isRoster ? workspace.faces(for: person.id) : workspace.inboxFaces(for: person.id)
+        let members = person.isRoster ? Array(all.prefix(12)) : all
         return ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 6) {
                 ForEach(members) { face in
                     FaceCropView(face: face)
                         .frame(width: 48, height: 48)
                         .clipShape(RoundedRectangle(cornerRadius: 6))
+                        .overlay(alignment: .bottomLeading) {
+                            if !person.isRoster {
+                                scoreBadge(face)
+                            }
+                        }
                         .overlay {
-                            if face.id == person.coverFaceID {
+                            if person.isRoster && face.id == person.coverFaceID {
                                 Image(systemName: "star.fill")
                                     .font(.system(size: 9))
                                     .padding(2)
@@ -534,17 +473,11 @@ private struct PeopleView: View {
                                     .padding(1)
                             }
                         }
-                        .overlay {
-                            if face.state == .proposed {
-                                RoundedRectangle(cornerRadius: 6)
-                                    .stroke(Color.orange, lineWidth: 2)
-                            }
-                        }
                         .onTapGesture(count: 2) { previewFace = face }
                         .contextMenu {
                             FaceContextMenu(workspace: workspace, face: face, person: person, onOpenPhoto: { previewFace = $0 })
                         }
-                        .help("\(facePhotoName(face)) · \(face.state.rawValue) · double-click opens the photo")
+                        .help("\(facePhotoName(face))\(face.matchScore.map { " · match \(Int($0 * 100))%" } ?? "") · double-click opens the photo")
                 }
                 if all.count > members.count {
                     Button {
@@ -555,11 +488,24 @@ private struct PeopleView: View {
                             .frame(width: 48, height: 48)
                     }
                     .buttonStyle(.borderless)
-                    .help("Show every detection of \(person.name) in a grid")
+                    .help("Show every detection of \(displayName(person)) in a grid")
                 }
             }
             .padding(.vertical, 2)
         }
+    }
+
+    /// The stored match score on an Inbox face — the number that sorted
+    /// it. A nil score is a cluster seed, shown at the top with the
+    /// strongest instead of pretending to be a zero.
+    private func scoreBadge(_ face: FaceRecord) -> some View {
+        Text(face.matchScore.map { "\(Int($0 * 100))%" } ?? "seed")
+            .font(.system(size: 8, weight: .semibold))
+            .padding(.horizontal, 3)
+            .padding(.vertical, 1)
+            .background(.black.opacity(0.65), in: Capsule())
+            .foregroundStyle(.white)
+            .padding(2)
     }
 
     private func facePhotoName(_ face: FaceRecord) -> String {
@@ -576,9 +522,8 @@ private struct PeopleView: View {
 
     private func reload() {
         let snapshot = workspace.faceSnapshot()
-        roster = snapshot.roster
-        groups = snapshot.groups
-        unsure = snapshot.unsure
+        approved = snapshot.approved
+        inbox = snapshot.inbox
         scanGrades = workspace.storedFaceScanGrades()
     }
 }
@@ -765,16 +710,32 @@ private struct FaceContextMenu: View {
                 workspace.rejectFace(face.id)
             }
         } else {
-            Button("Not This Group") {
-                workspace.rejectFace(face.id)
+            if let target = person.suggestedPersonName {
+                Button("Confirm \(target)") {
+                    workspace.confirmFace(face.id)
+                }
+                Button("Not \(target)") {
+                    workspace.rejectFace(face.id)
+                }
+            } else {
+                Button("Not This Group") {
+                    workspace.rejectFace(face.id)
+                }
+            }
+            if face.state != .confirmed {
+                Button("Junk Face", role: .destructive) {
+                    workspace.junkFace(face.id)
+                }
             }
         }
     }
 }
 
-/// Every detection of one person or group as a scrollable grid — what the
-/// "N detections" count expands into. Single-click selects, double-click
-/// opens the source photo, right-click offers cover and review actions.
+/// Every detection of one approved person or Inbox row as a scrollable
+/// grid — what the "N detections" count expands into. An Inbox grid is
+/// the same uncapped, score-sorted order as the strip: strongest first,
+/// weak matches at the bottom. Single-click selects, double-click opens
+/// the source photo, right-click offers cover and review actions.
 private struct PersonFacesGrid: View {
     let workspace: EventsWorkspace
     /// Normalized query narrowing the grid by photo file name; empty shows
@@ -850,6 +811,12 @@ private struct PersonFacesGrid: View {
         .onChange(of: workspace.facesRevision) { reload() }
     }
 
+    /// What this row is called in the header: a suggestion row wears its
+    /// target's name under "Looks like".
+    private var title: String {
+        person.suggestedPersonName.map { "Looks like \($0)" } ?? person.name
+    }
+
     private var gridHeader: some View {
         HStack(spacing: 10) {
             Button(action: onBack) {
@@ -857,10 +824,10 @@ private struct PersonFacesGrid: View {
             }
             PersonCover(workspace: workspace, personID: person.id)
             VStack(alignment: .leading, spacing: 2) {
-                Text(person.name)
+                Text(title)
                     .font(.headline)
                 Text(needle.isEmpty
-                    ? "\(faces.count) detection\(faces.count == 1 ? "" : "s") in \(photoCount) photo\(photoCount == 1 ? "" : "s")"
+                    ? "\(faces.count) detection\(faces.count == 1 ? "" : "s") in \(photoCount) photo\(photoCount == 1 ? "" : "s")\(person.isRoster ? "" : " · weakest matches last")"
                     : "\(visibleFaces.count) of \(faces.count) detections")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -879,6 +846,17 @@ private struct PersonFacesGrid: View {
             .aspectRatio(1, contentMode: .fit)
             .overlay { FaceCropView(face: face) }
             .clipShape(RoundedRectangle(cornerRadius: 6))
+            .overlay(alignment: .bottomLeading) {
+                if !person.isRoster {
+                    Text(face.matchScore.map { "\(Int($0 * 100))%" } ?? "seed")
+                        .font(.system(size: 9, weight: .semibold))
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 2)
+                        .background(.black.opacity(0.65), in: Capsule())
+                        .foregroundStyle(.white)
+                        .padding(4)
+                }
+            }
             .overlay {
                 if face.id == person.coverFaceID {
                     Image(systemName: "star.fill")
@@ -892,11 +870,6 @@ private struct PersonFacesGrid: View {
             }
             .overlay {
                 RoundedRectangle(cornerRadius: 6)
-                    .stroke(Color.orange, lineWidth: 2)
-                    .opacity(face.state == .proposed ? 1 : 0)
-            }
-            .overlay {
-                RoundedRectangle(cornerRadius: 6)
                     .stroke(Color.accentColor, lineWidth: 2.5)
                     .opacity(face.id == selectedID ? 1 : 0)
             }
@@ -905,7 +878,7 @@ private struct PersonFacesGrid: View {
             .contextMenu {
                 FaceContextMenu(workspace: workspace, face: face, person: person, onOpenPhoto: onOpenPhoto)
             }
-            .help("\(photoName(face)) · \(face.state.rawValue)")
+            .help("\(photoName(face))\(face.matchScore.map { " · match \(Int($0 * 100))%" } ?? "")")
     }
 
     private func photoName(_ face: FaceRecord) -> String {
@@ -919,7 +892,11 @@ private struct PersonFacesGrid: View {
             return
         }
         person = fresh
-        faces = workspace.faces(for: person.id)
+        // Approved people keep their portrait order; an Inbox row reviews
+        // weakest-last by stored match score — the strip's order exactly.
+        faces = person.isRoster
+            ? workspace.faces(for: person.id)
+            : workspace.inboxFaces(for: person.id)
         if let selectedID, !faces.contains(where: { $0.id == selectedID }) {
             self.selectedID = nil
         }

@@ -66,11 +66,17 @@ public struct FaceIndexCounts: Equatable, Sendable {
 }
 
 /// What the index currently believes about one detected face.
+///
+/// Only `confirmed` faces may sit on a roster (approved) person — a scan
+/// or re-match never attaches a face to one. Every other state is Inbox
+/// material the user has not approved.
 public enum FaceState: String, Codable, CaseIterable, Sendable {
     /// Embedded and kept, but not matched or grouped yet — the vector is
     /// re-evaluated whenever the roster changes, without re-running ML.
     case cached
-    /// Matched against a roster person's templates, awaiting review.
+    /// The matcher thinks this face resembles an approved person. It sits
+    /// on that person's Inbox suggestion row — never on the approved
+    /// person itself — until the user confirms, merges, or rejects it.
     case proposed
     /// The user said this is that person. Frozen: no scan or re-match may
     /// reclassify it.
@@ -276,8 +282,11 @@ public struct FaceRejectionIndex: Sendable {
     }
 }
 
-/// A named roster person or an unnamed "Other" group. `isRoster == false`
-/// marks an auto-created cluster the user may name, merge, or junk.
+/// An approved person or an Inbox row. `isRoster == true` is a person the
+/// user named, approved, or tagged by hand — a scan never adds faces to
+/// it. `isRoster == false` is machine-made review material: a "Person N"
+/// cluster, or a suggestion row (`suggestedPersonID` set) holding the
+/// faces the matcher thinks resemble that approved person.
 public struct FacePerson: Identifiable, Equatable, Sendable {
     public var id: UUID
     public var name: String
@@ -286,13 +295,28 @@ public struct FacePerson: Identifiable, Equatable, Sendable {
     /// The face the user pinned as this person's cover thumbnail. Nil means
     /// the highest-confidence detection stands in.
     public var coverFaceID: UUID?
+    /// On an Inbox suggestion row, the approved person its faces resemble.
+    /// Nil on approved people and plain "Person N" clusters.
+    public var suggestedPersonID: UUID?
+    /// The suggested person's current display name, joined for the UI.
+    public var suggestedPersonName: String?
 
-    public init(id: UUID = UUID(), name: String, isRoster: Bool, faceCount: Int = 0, coverFaceID: UUID? = nil) {
+    public init(
+        id: UUID = UUID(),
+        name: String,
+        isRoster: Bool,
+        faceCount: Int = 0,
+        coverFaceID: UUID? = nil,
+        suggestedPersonID: UUID? = nil,
+        suggestedPersonName: String? = nil
+    ) {
         self.id = id
         self.name = name
         self.isRoster = isRoster
         self.faceCount = faceCount
         self.coverFaceID = coverFaceID
+        self.suggestedPersonID = suggestedPersonID
+        self.suggestedPersonName = suggestedPersonName
     }
 }
 
@@ -319,8 +343,8 @@ public struct FaceScanOptions: Equatable, Sendable {
     /// Detector confidence floor: faces below it are not stored at all.
     public var detScoreThreshold: Float
     /// Detector confidence floor for grouping (Immich's default). Faces
-    /// below it are stored — boxes and roster proposals still work — but
-    /// never seed or join an automatic group.
+    /// below it are stored — boxes and "looks like" matches still work —
+    /// but never seed or join an automatic group.
     public var groupingMinDetScore: Float
     /// Smallest face (shorter box side, decoded pixels) that may be
     /// grouped. Below it the embedding is an upscaled smear that resembles
@@ -464,6 +488,8 @@ public struct FaceScanReport: Equatable, Sendable {
     public var photosSkipped: Int = 0
     public var photosFailed: Int = 0
     public var facesDetected: Int = 0
+    /// Faces filed into Inbox "looks like" suggestion rows this pass —
+    /// they resemble an approved person but were not attached to them.
     public var facesProposed: Int = 0
     public var facesGrouped: Int = 0
     public var groupsCreated: Int = 0

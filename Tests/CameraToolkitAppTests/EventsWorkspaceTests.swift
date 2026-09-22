@@ -751,19 +751,20 @@ final class EventsWorkspaceTests: XCTestCase {
                 )
             }
 
-            // Picker options: roster first, then groups — only people
-            // actually seen on this board.
+            // Picker options: approved people only — an Inbox face never
+            // satisfies a People filter, so the unnamed group is not an
+            // option and no stack "carries" it.
             let people = workspace.boardPeople(for: result.stacks)
-            XCTAssertEqual(people.options.map(\.name), ["Dad", "Person 1"])
-            XCTAssertEqual(people.options.map(\.isRoster), [true, false])
+            XCTAssertEqual(people.options.map(\.name), ["Dad"])
             XCTAssertEqual(people.byStackID[single.id], [dad.id])
-            XCTAssertEqual(people.byStackID[burst.id], [group.id])
+            XCTAssertEqual(people.byStackID[burst.id], [])
             XCTAssertEqual(people.byStackID[clip.id], [])
 
             XCTAssertEqual(board(filter([.people([dad.id])])), [single.id])
-            XCTAssertEqual(board(filter([.people([dad.id, group.id])])), [burst.id, single.id])
-            // "is none of": the burst carries the group, the clip has nobody.
-            XCTAssertEqual(board(filter([.people([group.id], exclude: true)])), [single.id, clip.id])
+            XCTAssertEqual(board(filter([.people([dad.id, group.id])])), [single.id])
+            // "is none of": nothing carries the Inbox group, so every
+            // stack passes.
+            XCTAssertEqual(board(filter([.people([group.id], exclude: true)])), [burst.id, single.id, clip.id])
 
             // Rows in a group AND together — and with the text needle.
             search = filter([.people([dad.id, group.id]), .media([.raw]), .days(from: singleDay, to: singleDay)])
@@ -788,7 +789,10 @@ final class EventsWorkspaceTests: XCTestCase {
             XCTAssertEqual(workspace.visibleEventStacks(beach, search: eventSearch).map(\.id), [clip.id])
             eventSearch = OrganizeSearchFilter()
             eventSearch.groups = [OrganizeFilterGroup(rows: [.people([group.id])])]
-            XCTAssertEqual(workspace.visibleEventStacks(beach, search: eventSearch).map(\.id), [burst.id])
+            XCTAssertEqual(workspace.visibleEventStacks(beach, search: eventSearch).map(\.id), [])
+            eventSearch = OrganizeSearchFilter()
+            eventSearch.groups = [OrganizeFilterGroup(rows: [.people([dad.id])])]
+            XCTAssertEqual(workspace.visibleEventStacks(beach, search: eventSearch).map(\.id), [single.id])
             XCTAssertEqual(workspace.visibleEventStacks(beach, search: OrganizeSearchFilter()).count, 3)
 
             // Event rows carried over from an unsorted board's panel are
@@ -812,7 +816,7 @@ final class EventsWorkspaceTests: XCTestCase {
             let groupStack = try XCTUnwrap(result.stacks.first { $0.coverItem.primary.name == "DSC00002.ARW" })
 
             // Seed the face index as if a scan ran: Sam confirmed on the
-            // first photo, an unnamed group on the second.
+            // first photo, an Inbox cluster on the second.
             let catalog = root.appendingPathComponent("catalog.sqlite")
             _ = try CatalogStore(url: catalog).bootstrap(
                 configuration: model.configuration,
@@ -841,11 +845,12 @@ final class EventsWorkspaceTests: XCTestCase {
                 ])
             }
 
-            // Typing a roster or group name keeps exactly the stacks whose
-            // files carry that person's face — the catalog join needs no
-            // filesystem reads.
+            // Typing an approved name keeps exactly the stacks whose files
+            // carry that person's confirmed face — the catalog join needs
+            // no filesystem reads. An Inbox face names no stack: a needle
+            // matching its row's name still doesn't surface it.
             XCTAssertEqual(workspace.visibleDays(result, hideSorted: false, matching: "sam").flatMap(\.stacks).map(\.id), [samStack.id])
-            XCTAssertEqual(workspace.visibleDays(result, hideSorted: false, matching: "person 1").flatMap(\.stacks).map(\.id), [groupStack.id])
+            XCTAssertEqual(workspace.visibleDays(result, hideSorted: false, matching: "person 1").flatMap(\.stacks).map(\.id), [])
             XCTAssertEqual(Set(workspace.visibleDays(result, hideSorted: false, matching: "").flatMap(\.stacks).map(\.id)), [samStack.id, groupStack.id])
             XCTAssertTrue(workspace.visibleDays(result, hideSorted: false, matching: "zzz").isEmpty)
 
@@ -1048,7 +1053,7 @@ final class EventsWorkspaceTests: XCTestCase {
 
     /// "Not this person" is a real move: the face leaves the person
     /// immediately and `facesRevision` bumps so the open People grid and
-    /// Unsure list re-read. Alone it is under the group-size floor, so it
+    /// Inbox re-read. Alone it is under the group-size floor, so it
     /// returns to the unassigned pool rather than minting a "Person N".
     /// The persisted verdict keeps it off the person through a later
     /// Re-match.
@@ -1165,9 +1170,9 @@ final class EventsWorkspaceTests: XCTestCase {
         }
     }
 
-    /// Junk removes only the group the user confirmed — the neighboring
-    /// group and its faces stay, photos keep their scan grade, and named
-    /// people refuse the junk path entirely.
+    /// Junk removes only the Inbox row the user confirmed — the
+    /// neighboring row and its faces stay, photos keep their scan grade,
+    /// and approved people refuse the junk path entirely.
     func testJunkGroupRemovesOnlyTheConfirmedGroup() async throws {
         try await withOrganizerSandbox { root, model, workspace in
             let catalog = root.appendingPathComponent("catalog.sqlite")
@@ -1214,13 +1219,249 @@ final class EventsWorkspaceTests: XCTestCase {
                 .med
             )
 
-            // A named person refuses the junk path — no group is removed
+            // An approved person refuses the junk path — no row is removed
             // and nothing else moves.
             let dad = try store.createPerson(name: "Dad", isRoster: true)
             workspace.junkGroup(dad.id)
             XCTAssertNotNil(try store.person(dad.id))
             XCTAssertEqual(workspace.facesRevision, 1)
-            XCTAssertTrue(model.statusMessage.contains("named person"))
+            XCTAssertTrue(model.statusMessage.contains("approved person"))
+        }
+    }
+
+    /// The People window's data: approved people on one side, every
+    /// unapproved cluster on the other — automatic "Person N" groups and
+    /// "looks like" suggestion rows alike, suggestions first.
+    func testFaceSnapshotSplitsApprovedAndInbox() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let catalog = root.appendingPathComponent("catalog.sqlite")
+            _ = try CatalogStore(url: catalog).bootstrap(
+                configuration: model.configuration,
+                createBackup: false,
+                createLibraryFolders: false
+            )
+            let store = workspace.faceStore
+            let dad = try store.createPerson(name: "Dad", isRoster: true)
+            let pile = try store.createPerson(name: "Dad", isRoster: false, suggestedPersonID: dad.id)
+            let group = try store.createPerson(name: "Person 1", isRoster: false)
+            let photo = FacePhotoRecord(
+                pathKey: EventStorageLocations.pathKey("/Card/DCIM/SN1.JPG"),
+                path: "/Card/DCIM/SN1.JPG",
+                fileName: "SN1.JPG",
+                byteCount: 4_096,
+                modifiedAt: Date(timeIntervalSince1970: 1_752_000_000),
+                scanGrade: .med
+            )
+            let box = NormalizedFaceBox(x: 0.1, y: 0.1, width: 0.2, height: 0.2)
+            try store.replaceFaces(photo: photo, faces: [
+                FaceRecord(photoID: photo.pathKey, personID: dad.id, box: box, detScore: 0.9, embedding: [0.5, 0.5], state: .confirmed),
+                FaceRecord(photoID: photo.pathKey, personID: pile.id, box: box, detScore: 0.8, matchScore: 0.5, embedding: [0.5, 0.4], state: .proposed),
+                FaceRecord(photoID: photo.pathKey, personID: group.id, box: box, detScore: 0.7, embedding: [0.1, 0.9], state: .other),
+            ])
+            try store.refreshFaceCounts()
+
+            let snapshot = workspace.faceSnapshot()
+            XCTAssertEqual(snapshot.approved.map(\.id), [dad.id])
+            // The lookalike row leads the Inbox; its display name is the
+            // live target name.
+            XCTAssertEqual(snapshot.inbox.map(\.id), [pile.id, group.id])
+            XCTAssertEqual(snapshot.inbox.first?.suggestedPersonName, "Dad")
+            // Nothing Inbox leaks into approved.
+            XCTAssertFalse(snapshot.approved.contains { !$0.isRoster })
+        }
+    }
+
+    /// Reading the snapshot when a catalog still has a legacy proposed
+    /// face sitting on an approved person kicks off the sweep: a stored-
+    /// vectors re-match files it into the "looks like" Inbox row and
+    /// leaves the approved person's membership untouched.
+    func testFaceSnapshotSweepsLegacyRosterProposalsIntoInbox() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let catalog = root.appendingPathComponent("catalog.sqlite")
+            _ = try CatalogStore(url: catalog).bootstrap(
+                configuration: model.configuration,
+                createBackup: false,
+                createLibraryFolders: false
+            )
+            let store = workspace.faceStore
+            let dad = try store.createPerson(name: "Dad", isRoster: true)
+            let photo = FacePhotoRecord(
+                pathKey: EventStorageLocations.pathKey("/Card/DCIM/LG1.JPG"),
+                path: "/Card/DCIM/LG1.JPG",
+                fileName: "LG1.JPG",
+                byteCount: 4_096,
+                modifiedAt: Date(timeIntervalSince1970: 1_752_000_000),
+                scanGrade: .med
+            )
+            let box = NormalizedFaceBox(x: 0.1, y: 0.1, width: 0.2, height: 0.2)
+            let confirmed = FaceRecord(photoID: photo.pathKey, personID: dad.id, box: box, detScore: 0.9, embedding: [1, 0], state: .confirmed)
+            let legacy = FaceRecord(photoID: photo.pathKey, personID: dad.id, box: box, detScore: 0.85, embedding: [1, 0], state: .proposed)
+            try store.replaceFaces(photo: photo, faces: [confirmed, legacy])
+            try store.addTemplate(personID: dad.id, faceID: confirmed.id)
+            XCTAssertTrue(try store.hasUnapprovedRosterFaces())
+
+            _ = workspace.faceSnapshot()
+            try await waitUntil { !model.isBusy }
+
+            let moved = try XCTUnwrap(store.face(id: legacy.id))
+            let rowID = try XCTUnwrap(moved.personID)
+            XCTAssertNotEqual(rowID, dad.id)
+            let row = try XCTUnwrap(store.person(rowID))
+            XCTAssertFalse(row.isRoster)
+            XCTAssertEqual(row.suggestedPersonID, dad.id)
+            // Dad keeps only his confirmed face; the probe is quiet again.
+            XCTAssertEqual(try store.faces(personID: dad.id).map(\.id), [confirmed.id])
+            XCTAssertFalse(try store.hasUnapprovedRosterFaces())
+        }
+    }
+
+    /// An Inbox person's faces read in review order: stored match score,
+    /// strongest first; a face with no score was a cluster seed and rides
+    /// with the strongest.
+    func testInboxFacesOrdersByMatchScore() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let catalog = root.appendingPathComponent("catalog.sqlite")
+            _ = try CatalogStore(url: catalog).bootstrap(
+                configuration: model.configuration,
+                createBackup: false,
+                createLibraryFolders: false
+            )
+            let store = workspace.faceStore
+            let group = try store.createPerson(name: "Person 1", isRoster: false)
+            let photo = FacePhotoRecord(
+                pathKey: EventStorageLocations.pathKey("/Card/DCIM/SC1.JPG"),
+                path: "/Card/DCIM/SC1.JPG",
+                fileName: "SC1.JPG",
+                byteCount: 4_096,
+                modifiedAt: Date(timeIntervalSince1970: 1_752_000_000),
+                scanGrade: .med
+            )
+            let box = NormalizedFaceBox(x: 0.1, y: 0.1, width: 0.2, height: 0.2)
+            let weak = FaceRecord(photoID: photo.pathKey, personID: group.id, box: box, detScore: 0.9, matchScore: 0.41, embedding: [0.5, 0.5], state: .other)
+            let seed = FaceRecord(photoID: photo.pathKey, personID: group.id, box: box, detScore: 0.6, matchScore: nil, embedding: [0.5, 0.5], state: .other)
+            let strong = FaceRecord(photoID: photo.pathKey, personID: group.id, box: box, detScore: 0.7, matchScore: 0.9, embedding: [0.5, 0.5], state: .other)
+            let mid = FaceRecord(photoID: photo.pathKey, personID: group.id, box: box, detScore: 0.8, matchScore: 0.6, embedding: [0.5, 0.5], state: .other)
+            try store.replaceFaces(photo: photo, faces: [weak, seed, strong, mid])
+
+            let ordered = workspace.inboxFaces(for: group.id)
+            XCTAssertEqual(ordered.map(\.id), [seed.id, strong.id, mid.id, weak.id])
+        }
+    }
+
+    /// Confirming a face out of a "looks like Dad" row lands it on Dad —
+    /// the user saying so is the approval — while the rest of the pile
+    /// stays unapproved.
+    func testConfirmFaceFromSuggestionRowConfirmsOntoTarget() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let catalog = root.appendingPathComponent("catalog.sqlite")
+            _ = try CatalogStore(url: catalog).bootstrap(
+                configuration: model.configuration,
+                createBackup: false,
+                createLibraryFolders: false
+            )
+            let store = workspace.faceStore
+            let dad = try store.createPerson(name: "Dad", isRoster: true)
+            let pile = try store.createPerson(name: "Dad", isRoster: false, suggestedPersonID: dad.id)
+            let photo = FacePhotoRecord(
+                pathKey: EventStorageLocations.pathKey("/Card/DCIM/CF1.JPG"),
+                path: "/Card/DCIM/CF1.JPG",
+                fileName: "CF1.JPG",
+                byteCount: 4_096,
+                modifiedAt: Date(timeIntervalSince1970: 1_752_000_000),
+                scanGrade: .med
+            )
+            let box = NormalizedFaceBox(x: 0.1, y: 0.1, width: 0.2, height: 0.2)
+            let yes = FaceRecord(photoID: photo.pathKey, personID: pile.id, box: box, detScore: 0.9, matchScore: 0.5, embedding: [0.5, 0.5], state: .proposed)
+            let still = FaceRecord(photoID: photo.pathKey, personID: pile.id, box: box, detScore: 0.8, matchScore: 0.45, embedding: [0.5, 0.4], state: .proposed)
+            try store.replaceFaces(photo: photo, faces: [yes, still])
+
+            workspace.confirmFace(yes.id)
+
+            XCTAssertEqual(workspace.facesRevision, 1)
+            let confirmed = try XCTUnwrap(store.face(id: yes.id))
+            XCTAssertEqual(confirmed.state, .confirmed)
+            XCTAssertEqual(confirmed.personID, dad.id)
+            XCTAssertEqual(try store.rosterTemplates().map(\.personID), [dad.id])
+            // The pilemate stays unapproved on the row.
+            let leftover = try XCTUnwrap(store.face(id: still.id))
+            XCTAssertEqual(leftover.state, .proposed)
+            XCTAssertEqual(leftover.personID, pile.id)
+        }
+    }
+
+    /// Approving an Inbox group confirms only its own faces — no
+    /// catalog-wide re-match runs behind it, so a similar cached face
+    /// waits in the Inbox rather than jumping onto the new person.
+    func testNameGroupApprovesClusterWithoutSweepingCatalog() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let catalog = root.appendingPathComponent("catalog.sqlite")
+            _ = try CatalogStore(url: catalog).bootstrap(
+                configuration: model.configuration,
+                createBackup: false,
+                createLibraryFolders: false
+            )
+            let store = workspace.faceStore
+            let group = try store.createPerson(name: "Person 1", isRoster: false)
+            let photo = FacePhotoRecord(
+                pathKey: EventStorageLocations.pathKey("/Card/DCIM/NG1.JPG"),
+                path: "/Card/DCIM/NG1.JPG",
+                fileName: "NG1.JPG",
+                byteCount: 4_096,
+                modifiedAt: Date(timeIntervalSince1970: 1_752_000_000),
+                scanGrade: .med
+            )
+            let box = NormalizedFaceBox(x: 0.1, y: 0.1, width: 0.2, height: 0.2)
+            let member = FaceRecord(photoID: photo.pathKey, personID: group.id, box: box, detScore: 0.9, embedding: [1, 0], state: .other)
+            let lookalike = FaceRecord(photoID: photo.pathKey, box: box, detScore: 0.8, embedding: [1, 0], state: .cached)
+            try store.replaceFaces(photo: photo, faces: [member, lookalike])
+
+            workspace.nameGroup(group.id, name: "Alex")
+
+            XCTAssertEqual(workspace.facesRevision, 1)
+            let alex = try XCTUnwrap(store.person(group.id))
+            XCTAssertTrue(alex.isRoster)
+            XCTAssertEqual(alex.name, "Alex")
+            XCTAssertEqual(try store.face(id: member.id)?.state, .confirmed)
+            // The lookalike was not swept onto Alex — no re-match ran.
+            let waiting = try XCTUnwrap(store.face(id: lookalike.id))
+            XCTAssertNil(waiting.personID)
+            XCTAssertEqual(waiting.state, .cached)
+            XCTAssertTrue(model.statusMessage.contains("Approved Alex"))
+            XCTAssertFalse(model.jobs.contains { $0.action == .faceScan })
+        }
+    }
+
+    /// Junking one face deletes just that catalog row — the rest of the
+    /// Inbox row and the photo's scan grade stay put.
+    func testJunkFaceDeletesOnlyThatFace() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let catalog = root.appendingPathComponent("catalog.sqlite")
+            _ = try CatalogStore(url: catalog).bootstrap(
+                configuration: model.configuration,
+                createBackup: false,
+                createLibraryFolders: false
+            )
+            let store = workspace.faceStore
+            let group = try store.createPerson(name: "Person 1", isRoster: false)
+            let photo = FacePhotoRecord(
+                pathKey: EventStorageLocations.pathKey("/Card/DCIM/JF1.JPG"),
+                path: "/Card/DCIM/JF1.JPG",
+                fileName: "JF1.JPG",
+                byteCount: 4_096,
+                modifiedAt: Date(timeIntervalSince1970: 1_752_000_000),
+                scanGrade: .med
+            )
+            let box = NormalizedFaceBox(x: 0.1, y: 0.1, width: 0.2, height: 0.2)
+            let junk = FaceRecord(photoID: photo.pathKey, personID: group.id, box: box, detScore: 0.9, embedding: [0.5, 0.5], state: .other)
+            let keep = FaceRecord(photoID: photo.pathKey, personID: group.id, box: box, detScore: 0.8, embedding: [0.5, 0.4], state: .other)
+            try store.replaceFaces(photo: photo, faces: [junk, keep])
+
+            workspace.junkFace(junk.id)
+
+            XCTAssertEqual(workspace.facesRevision, 1)
+            XCTAssertNil(try store.face(id: junk.id))
+            XCTAssertEqual(try store.face(id: keep.id)?.personID, group.id)
+            XCTAssertEqual(try store.photos(pathKeys: [photo.pathKey])[photo.pathKey]?.scanGrade, .med)
         }
     }
 

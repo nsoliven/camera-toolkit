@@ -53,7 +53,7 @@ Each request is one JSON object on one line; each response is one line; stderr i
 | `groupingMinFacePixels` | 48 px (decoded image, short side) | below this a face is never grouped | measured: sub-40 px crops were the junk piles |
 | `minimumGroupFaces` | 3 | a new cluster needs this many faces to become "Person N" | Immich `minRecognizedFaces` |
 | `clusterThreshold` | 0.40 | mean cosine to a group's members to join it (average linkage) | Immich max distance 0.6 → similarity 0.4 |
-| `matchThreshold` | 0.45 | best template cosine to propose a named person | InsightFace publishes 0.30–0.45 for this model |
+| `matchThreshold` | 0.45 | best template cosine to file a face on the approved person's "looks like" Inbox row | InsightFace publishes 0.30–0.45 for this model |
 | `minimumFacePixels` | 64 / 40 / 30 px native by grade | detection size floor | product decision (FACE-PLAN.md) |
 
 Change a default only with a measurement on real data — the confirmed faces in the catalog are the ground truth (same-person vs different-person cosine distributions). Never tune by eye on one pile.
@@ -62,12 +62,12 @@ Change a default only with a measurement on real data — the confirmed faces in
 
 `FaceIndexService.assignToGroups` is average-linkage, single pass, deterministic (detection-confidence order):
 
-1. Faces failing the quality gate (`qualifiesForGrouping`) are skipped; they can still be proposed to named people.
+1. Faces failing the quality gate (`qualifiesForGrouping`) are skipped; they can still match into a "looks like" Inbox row.
 2. A face joins the existing cluster with the highest **mean** cosine to all its members when that mean clears `clusterThreshold`; otherwise it opens a cluster. Comparing to one face (first, or a sliding mean) is what built the 700-person piles — two strangers can both resemble a hub face and not each other.
 3. Rejections (`face_rejections`) bar a face from a person and veto groups whose rejected faces describe the candidate better.
 4. A cluster opened this pass is persisted only at `minimumGroupFaces`; smaller ones leave their faces ungrouped.
 
-Re-match dissolves the automatic "Person N" groups and re-runs this over stored vectors; named people and confirmed faces never move.
+Re-match dissolves the automatic "Person N" groups and re-runs this over stored vectors; approved people and confirmed faces never change — a scan or re-match only ever files faces into the Inbox. A face resembling an approved person lands on that person's "looks like" suggestion row (`people.suggested_person_id`), not on the person itself; only an explicit review action — approve, merge, confirm, tag — puts a face on an approved person.
 
 ## Confirmed faces and engine migration
 

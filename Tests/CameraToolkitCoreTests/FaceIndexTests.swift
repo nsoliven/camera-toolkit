@@ -735,7 +735,10 @@ final class FaceIndexTests: XCTestCase {
 
     // MARK: - Match, cluster, review
 
-    func testRosterMatchProposesAndGroupsLeftovers() throws {
+    /// The new law: a face resembling an approved person files into an
+    /// Inbox "looks like" row — never onto the person itself. Approved
+    /// people only ever hold faces the user confirmed.
+    func testRosterMatchFilesIntoInboxSuggestionRow() throws {
         try withFaceStore { store, catalog in
             let dad = try store.createPerson(name: "Dad", isRoster: true)
             let galleryPhoto = photoRecord("G1.JPG")
@@ -760,19 +763,74 @@ final class FaceIndexTests: XCTestCase {
                 options: FaceScanOptions(minimumGroupFaces: 1)
             ).rematchRoster()
 
+            // The lookalike sits on a "Looks like Dad" Inbox row — Dad's
+            // own member list is untouched.
             let proposed = try store.face(id: nearDad.id)
             XCTAssertEqual(proposed?.state, .proposed)
-            XCTAssertEqual(proposed?.personID, dad.id)
             XCTAssertGreaterThan(proposed?.matchScore ?? 0, 0.48)
+            let pile = try XCTUnwrap(proposed?.personID.flatMap { try? store.person($0) })
+            XCTAssertFalse(pile.isRoster)
+            XCTAssertEqual(pile.suggestedPersonID, dad.id)
+            XCTAssertEqual(pile.suggestedPersonName, "Dad")
+            XCTAssertEqual(try store.faces(personID: dad.id).map(\.id), [galleryFace.id])
+            XCTAssertFalse(try store.hasUnapprovedRosterFaces())
 
+            // The stranger lands in a plain Inbox cluster.
             let grouped = try store.face(id: stranger.id)
             XCTAssertEqual(grouped?.state, .other)
-            XCTAssertNotNil(grouped?.personID)
-            let group = try store.person(grouped!.personID!)
-            XCTAssertEqual(group?.isRoster, false)
+            let group = try XCTUnwrap(grouped?.personID.flatMap { try? store.person($0) })
+            XCTAssertFalse(group.isRoster)
+            XCTAssertNil(group.suggestedPersonID)
 
-            XCTAssertEqual(try store.unsureFaces().map(\.id), [nearDad.id])
-            XCTAssertEqual(try store.otherGroups().count, 1)
+            // The Inbox is the pile plus the cluster — nothing else.
+            XCTAssertEqual(try store.otherGroups().count, 2)
+            // Suggestion members are matcher-filed only: they never seed
+            // or join a cosine cluster.
+            XCTAssertEqual(try store.groupEmbeddings().count, 1)
+        }
+    }
+
+    /// Faces an older build proposed straight onto a roster person are
+    /// not approved. The next match pass sweeps them into the Inbox —
+    /// confirmed faces on the same person never move.
+    func testLegacyProposedRosterFacesSweepIntoInbox() throws {
+        try withFaceStore { store, catalog in
+            let dad = try store.createPerson(name: "Dad", isRoster: true)
+            let galleryPhoto = photoRecord("LG1.JPG")
+            let confirmedFace = faceRecord(
+                galleryPhoto,
+                embedding: testEmbedding(seed: 13),
+                state: .confirmed,
+                personID: dad.id
+            )
+            // The legacy shape: proposed and other rows sitting on the
+            // roster row itself.
+            let legacyProposed = faceRecord(
+                galleryPhoto,
+                box: NormalizedFaceBox(x: 0.5, y: 0.1, width: 0.2, height: 0.2),
+                embedding: testEmbedding(seed: 13, noise: 0.1),
+                state: .proposed,
+                personID: dad.id
+            )
+            try store.replaceFaces(photo: galleryPhoto, faces: [confirmedFace, legacyProposed])
+            try store.addTemplate(personID: dad.id, faceID: confirmedFace.id)
+            XCTAssertTrue(try store.hasUnapprovedRosterFaces())
+
+            try FaceIndexService(catalogURL: catalog).rematchRoster()
+
+            XCTAssertFalse(try store.hasUnapprovedRosterFaces())
+            let swept = try XCTUnwrap(store.face(id: legacyProposed.id))
+            XCTAssertEqual(swept.state, .proposed)
+            let pile = try XCTUnwrap(swept.personID.flatMap { try? store.person($0) })
+            XCTAssertFalse(pile.isRoster)
+            XCTAssertEqual(pile.suggestedPersonID, dad.id)
+
+            // The confirmed face stayed put — approved people change only
+            // when the user acts.
+            let confirmed = try XCTUnwrap(store.face(id: confirmedFace.id))
+            XCTAssertEqual(confirmed.state, .confirmed)
+            XCTAssertEqual(confirmed.personID, dad.id)
+            XCTAssertEqual(try store.faces(personID: dad.id).map(\.id), [confirmedFace.id])
         }
     }
 
@@ -1163,21 +1221,31 @@ final class FaceIndexTests: XCTestCase {
             XCTAssertEqual(try store.face(id: f2.id)?.state, .confirmed)
             XCTAssertEqual(try store.rosterTemplates().count, 2)
 
-            // The new gallery immediately matches a similar cached face.
+            // Approving cleared the suggestion pointer, and the new
+            // gallery immediately files a similar cached face into a
+            // "Looks like Alex" Inbox row — not onto Alex.
+            XCTAssertNil(person.suggestedPersonID)
             let p3 = photoRecord("P3.JPG")
             let f3 = faceRecord(p3, embedding: testEmbedding(seed: 31, noise: 0.12))
             try store.replaceFaces(photo: p3, faces: [f3])
             try service.rematchRoster()
             let matched = try store.face(id: f3.id)
             XCTAssertEqual(matched?.state, .proposed)
-            XCTAssertEqual(matched?.personID, groupID)
+            let pile = try XCTUnwrap(matched?.personID.flatMap { try? store.person($0) })
+            XCTAssertFalse(pile.isRoster)
+            XCTAssertEqual(pile.suggestedPersonID, groupID)
+            XCTAssertEqual(try store.faces(personID: groupID).count, 2)
         }
     }
 
-    func testMergeIntoRosterKeepsFacesAsProposed() throws {
+    /// Merging into an approved person is the explicit approval: every
+    /// unconfirmed face moves confirmed, and "looks like" rows that
+    /// pointed at the source now point at the target.
+    func testMergeIntoRosterConfirmsUnapprovedFaces() throws {
         try withFaceStore { store, _ in
             let dad = try store.createPerson(name: "Dad", isRoster: true)
             let mom = try store.createPerson(name: "Mom", isRoster: true)
+            let pile = try store.createPerson(name: "Dad", isRoster: false, suggestedPersonID: dad.id)
 
             let photo = photoRecord("M1.JPG")
             let confirmedDad = faceRecord(photo, embedding: testEmbedding(seed: 51), state: .confirmed, personID: dad.id)
@@ -1193,19 +1261,57 @@ final class FaceIndexTests: XCTestCase {
             try store.mergePerson(dad.id, into: mom.id)
 
             XCTAssertNil(try store.person(dad.id))
-            // Confirmed stays frozen; the unconfirmed face stays attached as
-            // a reviewable proposal on the roster target.
+            // Confirmed stays frozen; the unconfirmed face is confirmed on
+            // the roster target because the merge was the user's call.
             XCTAssertEqual(try store.face(id: confirmedDad.id)?.state, .confirmed)
             let moved = try store.face(id: looseDad.id)
             XCTAssertEqual(moved?.personID, mom.id)
-            XCTAssertEqual(moved?.state, .proposed)
+            XCTAssertEqual(moved?.state, .confirmed)
+            // The "looks like" row followed the person it resembled.
+            XCTAssertEqual(try store.person(pile.id)?.suggestedPersonID, mom.id)
         }
     }
 
-    /// Pulling a proposal off a person sends the face back through the
-    /// grouping pass. Alone, it is a cluster of one — under the group-size
-    /// floor — so it returns to the unassigned pool rather than minting a
-    /// "Person N" of its own.
+    /// Approving a "looks like" row promotes it into a new approved
+    /// person: the suggestion pointer clears, only its own faces are
+    /// confirmed, and the person it resembled keeps its member list.
+    func testApproveSuggestionRowConfirmsJustThatCluster() throws {
+        try withFaceStore { store, catalog in
+            let dad = try store.createPerson(name: "Dad", isRoster: true)
+            let galleryPhoto = photoRecord("AP1.JPG")
+            let galleryFace = faceRecord(galleryPhoto, embedding: testEmbedding(seed: 41), state: .confirmed, personID: dad.id)
+            try store.replaceFaces(photo: galleryPhoto, faces: [galleryFace])
+            try store.addTemplate(personID: dad.id, faceID: galleryFace.id)
+
+            let photo = photoRecord("AP2.JPG")
+            let near1 = faceRecord(photo, embedding: testEmbedding(seed: 41, noise: 0.1))
+            let near2 = faceRecord(
+                photo,
+                box: NormalizedFaceBox(x: 0.5, y: 0.1, width: 0.2, height: 0.2),
+                embedding: testEmbedding(seed: 41, noise: 0.15)
+            )
+            try store.replaceFaces(photo: photo, faces: [near1, near2])
+            try FaceIndexService(catalogURL: catalog).rematchRoster()
+
+            let pileID = try XCTUnwrap(store.face(id: near1.id)?.personID)
+            try store.promoteGroup(pileID, name: "Jordan", templateCap: 8)
+
+            let jordan = try XCTUnwrap(store.person(pileID))
+            XCTAssertTrue(jordan.isRoster)
+            XCTAssertEqual(jordan.name, "Jordan")
+            XCTAssertNil(jordan.suggestedPersonID)
+            XCTAssertEqual(try store.face(id: near1.id)?.state, .confirmed)
+            XCTAssertEqual(try store.face(id: near2.id)?.state, .confirmed)
+            // Dad is untouched — approving the pile never pulls faces
+            // onto the person it resembled.
+            XCTAssertEqual(try store.faces(personID: dad.id).map(\.id), [galleryFace.id])
+        }
+    }
+
+    /// Pulling a proposal out of its Inbox row sends the face back through
+    /// the grouping pass. Alone, it is a cluster of one — under the
+    /// group-size floor — so it returns to the unassigned pool rather
+    /// than minting a "Person N" of its own.
     func testRegroupReturnsALoneFaceToTheUnassignedPool() throws {
         try withFaceStore { store, catalog in
             let dad = try store.createPerson(name: "Dad", isRoster: true)
@@ -1225,7 +1331,11 @@ final class FaceIndexTests: XCTestCase {
             let regrouped = try XCTUnwrap(store.face(id: wrongMatch.id))
             XCTAssertEqual(regrouped.state, .cached)
             XCTAssertNil(regrouped.personID)
-            XCTAssertTrue(try store.otherGroups().isEmpty)
+            // No cluster formed — the emptied "Looks like Dad" row waits
+            // for the next match pass to drop it.
+            XCTAssertTrue(try store.otherGroups().allSatisfy {
+                $0.suggestedPersonID == dad.id && $0.faceCount == 0
+            })
         }
     }
 
@@ -1251,22 +1361,27 @@ final class FaceIndexTests: XCTestCase {
             try store.replaceFaces(photo: photo, faces: [wrongMatch])
             let service = FaceIndexService(catalogURL: catalog)
             try service.rematchRoster()
-            XCTAssertEqual(try store.face(id: wrongMatch.id)?.personID, dad.id)
+            // Matched into the "Looks like Dad" row, never onto Dad.
+            let pileID = try XCTUnwrap(store.face(id: wrongMatch.id)?.personID)
+            XCTAssertEqual(try store.person(pileID)?.suggestedPersonID, dad.id)
+            XCTAssertNotEqual(pileID, dad.id)
 
-            // The face leaves Dad at once. Alone it is under the group-size
-            // floor, so it waits unassigned rather than minting a group.
+            // The face leaves the pile at once — refused from Dad too, so
+            // no later match can file it back. Alone it is under the
+            // group-size floor, so it waits unassigned.
             try service.reject([wrongMatch.id])
             let rejected = try XCTUnwrap(store.face(id: wrongMatch.id))
             XCTAssertEqual(rejected.state, .cached)
             XCTAssertNil(rejected.personID)
-            XCTAssertTrue(try store.otherGroups().isEmpty)
+            XCTAssertTrue(try store.faceRejections().blocks(faceID: wrongMatch.id, personID: pileID))
+            XCTAssertTrue(try store.faceRejections().blocks(faceID: wrongMatch.id, personID: dad.id))
 
             // The verdict is persisted: no later pass can put it back.
-            XCTAssertTrue(try store.faceRejections().blocks(faceID: wrongMatch.id, personID: dad.id))
             try service.rematchRoster()
             let after = try XCTUnwrap(store.face(id: wrongMatch.id))
             XCTAssertNotEqual(after.state, .proposed)
             XCTAssertNotEqual(after.personID, dad.id)
+            XCTAssertNil(after.personID)
 
             // The frozen face refuses the same path — confirmed never
             // moves, and no rejection row is written for it.
@@ -1590,10 +1705,12 @@ final class FaceIndexTests: XCTestCase {
 
     // MARK: - event.people
 
-    func testEventPeopleListsRosterOnly() throws {
+    func testEventPeopleListsApprovedConfirmedFacesOnly() throws {
         try withFaceStore { store, _ in
             let dad = try store.createPerson(name: "Dad", isRoster: true)
             let mom = try store.createPerson(name: "Mom", isRoster: true)
+            let aunt = try store.createPerson(name: "Aunt", isRoster: true)
+            let auntPile = try store.createPerson(name: "Aunt", isRoster: false, suggestedPersonID: aunt.id)
             let stranger = try store.createPerson(name: "Person 1", isRoster: false)
 
             let modified = Date(timeIntervalSince1970: 1_752_000_000)
@@ -1604,8 +1721,16 @@ final class FaceIndexTests: XCTestCase {
                     photo,
                     box: NormalizedFaceBox(x: 0.5, y: 0.1, width: 0.2, height: 0.2),
                     embedding: testEmbedding(seed: 72),
-                    state: .proposed,
+                    state: .confirmed,
                     personID: mom.id
+                ),
+                // A "Looks like Aunt" face — Inbox data, never an event chip.
+                faceRecord(
+                    photo,
+                    box: NormalizedFaceBox(x: 0.3, y: 0.4, width: 0.15, height: 0.15),
+                    embedding: testEmbedding(seed: 76),
+                    state: .proposed,
+                    personID: auntPile.id
                 ),
                 // A stranger grouped automatically — must not show on chips.
                 faceRecord(
@@ -1644,25 +1769,22 @@ final class FaceIndexTests: XCTestCase {
         }
     }
 
-    func testPersonNamesByFileKeyCoversRosterAndGroups() throws {
+    /// Only confirmed faces on approved people name a stack — an Inbox
+    /// face, grouped or lookalike, never does.
+    func testPersonNamesByFileKeyCoversConfirmedApprovedPeople() throws {
         try withFaceStore { store, _ in
             let sam = try store.createPerson(name: "Sam", isRoster: true)
             let group = try store.createPerson(name: "Person 1", isRoster: false)
+            let pile = try store.createPerson(name: "Sam", isRoster: false, suggestedPersonID: sam.id)
 
             let modified = Date(timeIntervalSince1970: 1_752_000_000)
             let photoA = photoRecord("DSC00001.ARW", size: 4_096, modified: modified)
             let photoB = photoRecord("DSC00002.ARW", size: 8_192, modified: modified)
             let photoC = photoRecord("DSC00003.ARW", size: 2_048, modified: modified)
+            let photoD = photoRecord("DSC00004.ARW", size: 1_024, modified: modified)
 
             try store.replaceFaces(photo: photoA, faces: [
                 faceRecord(photoA, embedding: testEmbedding(seed: 81), state: .confirmed, personID: sam.id),
-                faceRecord(
-                    photoA,
-                    box: NormalizedFaceBox(x: 0.6, y: 0.1, width: 0.2, height: 0.2),
-                    embedding: testEmbedding(seed: 82),
-                    state: .proposed,
-                    personID: sam.id
-                ),
             ])
             try store.replaceFaces(photo: photoB, faces: [
                 faceRecord(photoB, embedding: testEmbedding(seed: 83), state: .other, personID: group.id),
@@ -1671,38 +1793,41 @@ final class FaceIndexTests: XCTestCase {
             try store.replaceFaces(photo: photoC, faces: [
                 faceRecord(photoC, embedding: testEmbedding(seed: 84)),
             ])
+            // Nor does a proposed face in the "Looks like Sam" pile.
+            try store.replaceFaces(photo: photoD, faces: [
+                faceRecord(photoD, embedding: testEmbedding(seed: 85), state: .proposed, personID: pile.id),
+            ])
 
             let names = try store.personNamesByFileKey()
             let keyA = FaceIndexStore.fileKey(fileName: "DSC00001.ARW", byteCount: 4_096, modifiedAt: modified)
             let keyB = FaceIndexStore.fileKey(fileName: "DSC00002.ARW", byteCount: 8_192, modifiedAt: modified)
             let keyC = FaceIndexStore.fileKey(fileName: "DSC00003.ARW", byteCount: 2_048, modifiedAt: modified)
+            let keyD = FaceIndexStore.fileKey(fileName: "DSC00004.ARW", byteCount: 1_024, modifiedAt: modified)
 
-            // Roster and unnamed-group names both land on their photo keys —
-            // the board search can keep a burst for either kind of person.
+            // Sam's confirmed face names her photo; the Inbox kinds —
+            // cluster member and lookalike — name nothing.
             XCTAssertEqual(names[keyA], ["Sam"])
-            XCTAssertEqual(names[keyB], ["Person 1"])
+            XCTAssertNil(names[keyB])
             XCTAssertNil(names[keyC])
+            XCTAssertNil(names[keyD])
             XCTAssertNil(names[FaceIndexStore.fileKey(fileName: "OTHER.ARW", byteCount: 1, modifiedAt: modified)])
         }
     }
 
-    func testPeopleByFileKeyMapsRosterAndGroupsPerPhoto() throws {
+    /// The board People filter sees approved people with confirmed faces
+    /// only — an Inbox face never satisfies the filter.
+    func testPeopleByFileKeyMapsConfirmedApprovedPeopleOnly() throws {
         try withFaceStore { store, _ in
             let dad = try store.createPerson(name: "Dad", isRoster: true)
             let group = try store.createPerson(name: "Person 1", isRoster: false)
+            let pile = try store.createPerson(name: "Dad", isRoster: false, suggestedPersonID: dad.id)
 
             let modified = Date(timeIntervalSince1970: 1_752_000_000)
             let first = photoRecord("A1.JPG", modified: modified)
             let second = photoRecord("A2.JPG", modified: modified)
+            let third = photoRecord("A3.JPG", modified: modified)
             try store.replaceFaces(photo: first, faces: [
                 faceRecord(first, embedding: testEmbedding(seed: 81), state: .confirmed, personID: dad.id),
-                faceRecord(
-                    first,
-                    box: NormalizedFaceBox(x: 0.5, y: 0.5, width: 0.2, height: 0.2),
-                    embedding: testEmbedding(seed: 82),
-                    state: .proposed,
-                    personID: dad.id
-                ),
                 // An ungrouped cached face contributes no person.
                 faceRecord(
                     first,
@@ -1713,14 +1838,18 @@ final class FaceIndexTests: XCTestCase {
             try store.replaceFaces(photo: second, faces: [
                 faceRecord(second, embedding: testEmbedding(seed: 84), state: .other, personID: group.id),
             ])
+            try store.replaceFaces(photo: third, faces: [
+                faceRecord(third, embedding: testEmbedding(seed: 85), state: .proposed, personID: pile.id),
+            ])
 
             let key1 = FaceIndexStore.fileKey(fileName: "A1.JPG", byteCount: first.byteCount, modifiedAt: modified)
             let key2 = FaceIndexStore.fileKey(fileName: "A2.JPG", byteCount: second.byteCount, modifiedAt: modified)
-            let byKey = try store.peopleByFileKey(fileKeys: [key1, key2])
+            let key3 = FaceIndexStore.fileKey(fileName: "A3.JPG", byteCount: third.byteCount, modifiedAt: modified)
+            let byKey = try store.peopleByFileKey(fileKeys: [key1, key2, key3])
             XCTAssertEqual(byKey[key1]?.map(\.id), [dad.id])
-            XCTAssertEqual(byKey[key1]?.first?.faceCount, 2)
-            XCTAssertEqual(byKey[key2]?.map(\.id), [group.id])
-            XCTAssertEqual(byKey[key2]?.first?.isRoster, false)
+            XCTAssertEqual(byKey[key1]?.first?.faceCount, 1)
+            XCTAssertNil(byKey[key2])
+            XCTAssertNil(byKey[key3])
 
             // Unqueried and unmatched keys return nothing.
             XCTAssertNil(byKey[FaceIndexStore.fileKey(fileName: "OTHER.JPG", byteCount: 1, modifiedAt: modified)])

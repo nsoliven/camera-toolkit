@@ -111,7 +111,7 @@ Per **face**: `cached` | `proposed` | `confirmed` | `other`.
 Closed set of ~20 named people.
 
 - Each person: several **templates** (8–15 after XHIGH; 1+ after first name). Diverse views (front, side, glasses, years) — not 8 random.
-- New face → cosine vs templates. ≥ ~0.45–0.50 → `proposed` that person. Else → Other clustering.
+- New face → cosine vs templates. ≥ ~0.45–0.50 → `proposed` onto that person's Inbox "looks like" row — never onto the approved person itself. Else → Other clustering.
 - Adding person 21: user names an Other group (or a face). Templates stored. Next pass matches them. No retrain. Optional MED/HIGH backfill onto old events.
 - Do **not** auto-create roster people forever. Auto clusters live in **Other groups**. User **promotes** to roster.
 
@@ -130,11 +130,10 @@ Like Immich, but roster chips on events only show **named** people.
 
 ---
 
-## Review UI (3 tabs)
+## Review UI (Approved + Inbox)
 
-1. **People** — roster ~20. Rename, merge, split, pin template, remove from roster.
-2. **New groups** — clusters this run created/changed. Adopt or junk.
-3. **Unsure** — `proposed` below high confidence. Confirm / not this person / Other.
+1. **Approved** — roster ~20. Rename, merge, split, pin template, remove from roster.
+2. **Inbox** — the machine's classifications: "Person N" clusters plus "looks like" rows holding faces that resembled an approved person. Approve, merge into an approved person, confirm one face, not this person, or junk.
 
 Confirm → `confirmed`. Until then, higher modes may overwrite proposals.
 
@@ -160,7 +159,7 @@ Unplug = pause. Replug = resume hashes.
 ## Implement order
 
 1. Ingest + events (hash, EXIF, time gaps). No faces.
-2. LOW: sidecar (SCRFD → R50) → SQLite. Match roster if templates exist, else cluster all (including Others). Event chips for named only.
+2. LOW: sidecar (SCRFD → R50) → SQLite. Match roster if templates exist — matches file into the Inbox, never onto the person — else cluster all (including Others). Event chips for named only.
 3. Name/merge UI + confirmed lock. This is what makes LOW good.
 4. MED: SCRFD-10G, min-size ~40px, process new + lower-grade + unreviewed proposed.
 5. FAST on = pin the runner; off = 2-wide quiet pass.
@@ -175,7 +174,7 @@ Unplug = pause. Replug = resume hashes.
 - `people`: id, name, is_roster, centroid optional, face_count
 - `faces`: photo_id, person_id nullable, box, det_score, quality (pre-norm embedding norm), face_px, embedding BLOB (512 float32 L2), model=`insightface/buffalo_l`, state=`cached|proposed|confirmed|other`, scan_grade
 - `templates`: person_id, face_id, pose/quality optional
-- `events`: time range; `event_people` derived from confirmed+proposed roster faces
+- `events`: time range; `event_people` derived from confirmed faces on roster people only
 
 One embedding space. If model name changes someday, re-embed. Don’t mix.
 

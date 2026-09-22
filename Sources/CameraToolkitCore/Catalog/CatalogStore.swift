@@ -171,6 +171,7 @@ public struct CatalogStore {
             is_roster INTEGER NOT NULL DEFAULT 0,
             face_count INTEGER NOT NULL DEFAULT 0,
             cover_face_id TEXT,
+            suggested_person_id TEXT REFERENCES people(id) ON DELETE SET NULL,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
@@ -231,6 +232,16 @@ public struct CatalogStore {
         // `cover_face_id` is the user-picked People-list thumbnail; older
         // catalogs get it grafted on the same way.
         try ensureColumn(table: "people", column: "cover_face_id", definition: "cover_face_id TEXT", database: database)
+        // `suggested_person_id` marks an Inbox "looks like" row: the
+        // approved person the row's faces resemble, without attaching
+        // them. Deleting the target clears the pointer, leaving a plain
+        // cluster. Older catalogs get it grafted on.
+        try ensureColumn(
+            table: "people",
+            column: "suggested_person_id",
+            definition: "suggested_person_id TEXT REFERENCES people(id) ON DELETE SET NULL",
+            database: database
+        )
 
         // The whole bootstrap transaction — BEGIN IMMEDIATE through
         // COMMIT — retries a transient BUSY/IOERR with a short backoff:

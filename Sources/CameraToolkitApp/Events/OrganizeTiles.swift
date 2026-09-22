@@ -1710,7 +1710,8 @@ struct StackPreviewOverlay: View {
             var names: [UUID: String] = [:]
             for id in Set(faces.compactMap(\.personID)) {
                 if let person = try? store.person(id) {
-                    names[id] = person.name
+                    // A "looks like" row wears its target's live name.
+                    names[id] = person.suggestedPersonName ?? person.name
                 }
             }
             return (photo, faces, names, (try? store.rosterPeople()) ?? [])

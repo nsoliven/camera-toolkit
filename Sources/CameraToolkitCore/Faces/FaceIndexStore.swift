@@ -489,6 +489,17 @@ public final class FaceIndexStore: @unchecked Sendable {
 
     // MARK: - Roster, groups, and review queues
 
+    /// The people select shared by every person read: self-joins the
+    /// suggestion target so an Inbox "looks like" row carries the name of
+    /// the approved person it points at.
+    private static let personSelect = """
+        SELECT p.*, s.name AS suggested_person_name
+        FROM people p
+        LEFT JOIN people s ON s.id = p.suggested_person_id
+        """
+
+    /// The approved people — named, confirmed, or tagged by hand. A scan
+    /// never attaches faces to these.
     public func rosterPeople() throws -> [FacePerson] {
         try read { database in try rosterPeople(database: database) }
     }
@@ -496,10 +507,13 @@ public final class FaceIndexStore: @unchecked Sendable {
     func rosterPeople(database: Database) throws -> [FacePerson] {
         try Row.fetchAll(
             database,
-            sql: "SELECT * FROM people WHERE is_roster = 1 ORDER BY name COLLATE NOCASE"
+            sql: "\(Self.personSelect) WHERE p.is_roster = 1 ORDER BY p.name COLLATE NOCASE"
         ).map(Self.person)
     }
 
+    /// Every non-roster row — the Inbox: automatic "Person N" clusters
+    /// plus the suggestion rows (`suggested_person_id` set) the matcher
+    /// files "looks like X" faces into.
     public func otherGroups() throws -> [FacePerson] {
         try read { database in try otherGroups(database: database) }
     }
@@ -507,7 +521,7 @@ public final class FaceIndexStore: @unchecked Sendable {
     func otherGroups(database: Database) throws -> [FacePerson] {
         try Row.fetchAll(
             database,
-            sql: "SELECT * FROM people WHERE is_roster = 0 ORDER BY face_count DESC, name COLLATE NOCASE"
+            sql: "\(Self.personSelect) WHERE p.is_roster = 0 ORDER BY p.face_count DESC, p.name COLLATE NOCASE"
         ).map(Self.person)
     }
 
@@ -518,23 +532,25 @@ public final class FaceIndexStore: @unchecked Sendable {
     func person(_ id: UUID, database: Database) throws -> FacePerson? {
         try Row.fetchOne(
             database,
-            sql: "SELECT * FROM people WHERE id = ?",
+            sql: "\(Self.personSelect) WHERE p.id = ?",
             arguments: [id.uuidString]
         ).map(Self.person)
     }
 
-    /// Faces awaiting review: machine-proposed matches, lowest confidence
-    /// first so the least certain decisions surface first.
-    public func unsureFaces() throws -> [FaceRecord] {
+    /// `true` while a catalog still carries a legacy `proposed`/`other`/
+    /// `cached` face on an approved person — residue from builds that let
+    /// a scan attach faces to the roster. The first match pass sweeps
+    /// them into the Inbox; confirmed faces are never counted.
+    public func hasUnapprovedRosterFaces() throws -> Bool {
         try read { database in
-            try Row.fetchAll(
+            (try Int.fetchOne(
                 database,
                 sql: """
-                \(Self.faceSelect)
-                WHERE f.state = 'proposed' AND f.person_id IS NOT NULL
-                ORDER BY COALESCE(f.match_score, 0) ASC, f.det_score DESC
+                SELECT COUNT(*) FROM faces f
+                JOIN people p ON p.id = f.person_id
+                WHERE p.is_roster = 1 AND f.state != 'confirmed'
                 """
-            ).map { Self.faceRecord($0) }
+            ) ?? 0) > 0
         }
     }
 
@@ -663,13 +679,16 @@ public final class FaceIndexStore: @unchecked Sendable {
 
     /// Member faces of each non-roster group — ids and embeddings — so a
     /// grouping pass can honour the rejections its members carry.
+    /// Suggestion rows are excluded: their members are filed by the
+    /// matcher, never joined by cosine.
     func groupMembers(database: Database) throws -> [UUID: [(faceID: UUID, embedding: [Float])]] {
         let rows = try Row.fetchAll(
             database,
             sql: """
             SELECT f.id, f.person_id, f.embedding FROM faces f
             JOIN people p ON p.id = f.person_id
-            WHERE p.is_roster = 0 AND f.embedding IS NOT NULL AND f.model = ?
+            WHERE p.is_roster = 0 AND p.suggested_person_id IS NULL
+              AND f.embedding IS NOT NULL AND f.model = ?
             """,
             arguments: [FaceEngine.identifier]
         )
@@ -718,20 +737,34 @@ public final class FaceIndexStore: @unchecked Sendable {
     // MARK: - Mutations (review actions)
 
     @discardableResult
-    public func createPerson(name: String, isRoster: Bool) throws -> FacePerson {
-        try write { database in try createPerson(name: name, isRoster: isRoster, database: database) }
+    public func createPerson(name: String, isRoster: Bool, suggestedPersonID: UUID? = nil) throws -> FacePerson {
+        try write { database in
+            try createPerson(name: name, isRoster: isRoster, suggestedPersonID: suggestedPersonID, database: database)
+        }
     }
 
     @discardableResult
-    func createPerson(name: String, isRoster: Bool, database: Database) throws -> FacePerson {
-        let person = FacePerson(name: name, isRoster: isRoster)
+    func createPerson(
+        name: String,
+        isRoster: Bool,
+        suggestedPersonID: UUID? = nil,
+        database: Database
+    ) throws -> FacePerson {
+        let person = FacePerson(name: name, isRoster: isRoster, suggestedPersonID: suggestedPersonID)
         let now = Self.formatter().string(from: Date())
         try database.execute(
             sql: """
-            INSERT INTO people(id, name, is_roster, face_count, created_at, updated_at)
-            VALUES (?, ?, ?, 0, ?, ?)
+            INSERT INTO people(id, name, is_roster, face_count, suggested_person_id, created_at, updated_at)
+            VALUES (?, ?, ?, 0, ?, ?, ?)
             """,
-            arguments: [person.id.uuidString, name, isRoster ? 1 : 0, now, now]
+            arguments: [
+                person.id.uuidString,
+                name,
+                isRoster ? 1 : 0,
+                suggestedPersonID?.uuidString,
+                now,
+                now,
+            ]
         )
         return person
     }
@@ -757,11 +790,19 @@ public final class FaceIndexStore: @unchecked Sendable {
         return "Person \(highest + 1)"
     }
 
+    /// Renames a person. Inbox suggestion rows pointing at them take the
+    /// new label too, so a "looks like" pile is never named after what
+    /// the person used to be called.
     public func renamePerson(_ id: UUID, name: String) throws {
         try write { database in
+            let now = Self.formatter().string(from: Date())
             try database.execute(
                 sql: "UPDATE people SET name = ?, updated_at = ? WHERE id = ?",
-                arguments: [name, Self.formatter().string(from: Date()), id.uuidString]
+                arguments: [name, now, id.uuidString]
+            )
+            try database.execute(
+                sql: "UPDATE people SET name = ?, updated_at = ? WHERE suggested_person_id = ?",
+                arguments: [name, now, id.uuidString]
             )
         }
     }
@@ -822,6 +863,24 @@ public final class FaceIndexStore: @unchecked Sendable {
         )
     }
 
+    /// Deletes face rows outright — the "junk this face" review action on
+    /// an Inbox member. Templates and rejections cascade; a pinned cover
+    /// falls back to auto-pick. Only the catalog is touched, never files.
+    public func deleteFaces(_ faceIDs: [UUID]) throws {
+        guard !faceIDs.isEmpty else { return }
+        try write { database in
+            let keys = faceIDs.map(\.uuidString)
+            try database.execute(
+                sql: "DELETE FROM faces WHERE id IN (\(keys.map { _ in "?" }.joined(separator: ", ")))",
+                arguments: StatementArguments(keys)
+            )
+            try database.execute(
+                sql: "UPDATE people SET cover_face_id = NULL WHERE cover_face_id IN (\(keys.map { _ in "?" }.joined(separator: ", ")))",
+                arguments: StatementArguments(keys)
+            )
+        }
+    }
+
     /// Marks a proposed face confirmed — frozen from here on. Also pins it
     /// as a template so the gallery gains a reviewed view.
     public func confirmFace(_ faceID: UUID) throws {
@@ -863,15 +922,19 @@ public final class FaceIndexStore: @unchecked Sendable {
         )
     }
 
-    /// Promotes a non-roster group to a named roster person. Member faces
-    /// become confirmed — naming a group is the review — and up to
-    /// `templateCap` distinct-photo members become templates.
+    /// Approves an Inbox row: it becomes a named roster person, its member
+    /// faces are confirmed — approving is the review — and up to
+    /// `templateCap` distinct-photo members become templates. Nothing
+    /// outside this cluster moves; no catalog-wide re-match runs.
     public func promoteGroup(_ personID: UUID, name: String, templateCap: Int) throws {
         let formatter = Self.formatter()
         let now = formatter.string(from: Date())
         try write { database in
             try database.execute(
-                sql: "UPDATE people SET name = ?, is_roster = 1, updated_at = ? WHERE id = ?",
+                sql: """
+                UPDATE people SET name = ?, is_roster = 1, suggested_person_id = NULL, updated_at = ?
+                WHERE id = ?
+                """,
                 arguments: [name, now, personID.uuidString]
             )
             try database.execute(
@@ -909,9 +972,12 @@ public final class FaceIndexStore: @unchecked Sendable {
     }
 
     /// Moves every face and template of `source` onto `target` and removes
-    /// the empty source row. Confirmed faces keep their frozen state; faces
-    /// that were not confirmed become `proposed` on a roster target so they
-    /// stay attached and reviewable — a merge is a claim, not a confirmation.
+    /// the empty source row. Merging an Inbox row into an approved person
+    /// is an explicit approval: faces that were not confirmed become
+    /// confirmed on the roster target. Merging into another Inbox row is
+    /// just tidying — unconfirmed faces stay `.other`. Confirmed faces
+    /// keep their frozen state either way, and Inbox rows that pointed at
+    /// the source now point at the target.
     public func mergePerson(_ sourceID: UUID, into targetID: UUID) throws {
         let now = Self.formatter().string(from: Date())
         try write { database in
@@ -920,7 +986,7 @@ public final class FaceIndexStore: @unchecked Sendable {
                 sql: "SELECT is_roster FROM people WHERE id = ?",
                 arguments: [targetID.uuidString]
             ) ?? 0
-            let movedState = targetRoster != 0 ? FaceState.proposed : FaceState.other
+            let movedState = targetRoster != 0 ? FaceState.confirmed : FaceState.other
             try database.execute(
                 sql: """
                 UPDATE faces SET person_id = ?, state = CASE WHEN state = 'confirmed' THEN 'confirmed' ELSE ? END,
@@ -934,6 +1000,12 @@ public final class FaceIndexStore: @unchecked Sendable {
                 INSERT OR IGNORE INTO face_templates(person_id, face_id, created_at)
                 SELECT ?, face_id, ? FROM face_templates WHERE person_id = ?
                 """,
+                arguments: [targetID.uuidString, now, sourceID.uuidString]
+            )
+            // "Looks like source" rows now look like the target — remap
+            // before the source row goes away.
+            try database.execute(
+                sql: "UPDATE people SET suggested_person_id = ?, updated_at = ? WHERE suggested_person_id = ?",
                 arguments: [targetID.uuidString, now, sourceID.uuidString]
             )
             try database.execute(
@@ -1113,9 +1185,10 @@ public final class FaceIndexStore: @unchecked Sendable {
     // MARK: - Event people
 
     /// Every (roster person, photo file identity) pair that counts toward
-    /// `event.people` — proposed and confirmed faces on named people only.
-    /// File identity is name + size + mtime so a face found on an unsorted
-    /// copy still attaches after the file moves into an event folder.
+    /// `event.people` — confirmed faces on approved people only. Inbox
+    /// faces never name an event. File identity is name + size + mtime so
+    /// a face found on an unsorted copy still attaches after the file
+    /// moves into an event folder.
     private func rosterFaceFiles() throws -> [(personID: UUID, name: String, fileKey: String)] {
         try read { database in
             let rows = try Row.fetchAll(
@@ -1125,7 +1198,7 @@ public final class FaceIndexStore: @unchecked Sendable {
                 FROM people p
                 JOIN faces f ON f.person_id = p.id
                 JOIN face_photos ph ON ph.path_key = f.photo_id
-                WHERE p.is_roster = 1 AND f.state IN ('proposed', 'confirmed')
+                WHERE p.is_roster = 1 AND f.state = 'confirmed'
                 """
             )
             let formatter = Self.formatter()
@@ -1145,11 +1218,11 @@ public final class FaceIndexStore: @unchecked Sendable {
         }
     }
 
-    /// Display names of every person and unnamed group keyed by the file
-    /// key (name|bytes|mtime) of each photo carrying one of their faces —
-    /// any assigned state counts, so a proposed match still finds its
-    /// person. Search uses this to join stacks to people from catalog data
-    /// alone; it never walks the filesystem.
+    /// Display names of approved people keyed by the file key
+    /// (name|bytes|mtime) of each photo carrying one of their confirmed
+    /// faces. Search uses this to join stacks to people from catalog data
+    /// alone; it never walks the filesystem, and Inbox faces never put a
+    /// name on a stack.
     public func personNamesByFileKey() throws -> [String: Set<String>] {
         try read { database in
             let rows = try Row.fetchAll(
@@ -1159,6 +1232,7 @@ public final class FaceIndexStore: @unchecked Sendable {
                 FROM faces f
                 JOIN people p ON p.id = f.person_id
                 JOIN face_photos ph ON ph.path_key = f.photo_id
+                WHERE p.is_roster = 1 AND f.state = 'confirmed'
                 """
             )
             let formatter = Self.formatter()
@@ -1176,12 +1250,12 @@ public final class FaceIndexStore: @unchecked Sendable {
         }
     }
 
-    /// The people attached to each queried file key — roster members and
-    /// unnamed groups alike, keyed by `fileKey(fileName:byteCount:
-    /// modifiedAt:)`. This is the board People filter's raw material:
-    /// unlike `eventPeople` it keeps per-file granularity so the board can
-    /// tell exactly which stacks a person is on, and it includes groups so
-    /// an unnamed cluster can still be filtered to. `faceCount` is the
+    /// The approved people attached to each queried file key, keyed by
+    /// `fileKey(fileName:byteCount:modifiedAt:)`. This is the board People
+    /// filter's raw material: unlike `eventPeople` it keeps per-file
+    /// granularity so the board can tell exactly which stacks a person is
+    /// on, but like it only confirmed faces on approved people count — an
+    /// Inbox face never satisfies a People filter. `faceCount` is the
     /// person's matching-face total across `fileKeys`.
     public func peopleByFileKey(fileKeys: Set<String>) throws -> [String: [FacePerson]] {
         guard !fileKeys.isEmpty else { return [:] }
@@ -1193,7 +1267,7 @@ public final class FaceIndexStore: @unchecked Sendable {
                 FROM people p
                 JOIN faces f ON f.person_id = p.id
                 JOIN face_photos ph ON ph.path_key = f.photo_id
-                WHERE f.state IN ('proposed', 'confirmed', 'other')
+                WHERE p.is_roster = 1 AND f.state = 'confirmed'
                 """
             )
             let formatter = Self.formatter()
@@ -1232,9 +1306,9 @@ public final class FaceIndexStore: @unchecked Sendable {
         }
     }
 
-    /// Roster people with at least one proposed or confirmed face on a photo
-    /// whose file key is in `fileKeys`. This is `event.people`: named people
-    /// only — Other groups never clutter event chips.
+    /// Approved people with at least one confirmed face on a photo whose
+    /// file key is in `fileKeys`. This is `event.people`: approved people
+    /// only — Inbox faces never clutter event chips.
     public func eventPeople(fileKeys: Set<String>) throws -> [FacePerson] {
         guard !fileKeys.isEmpty else { return [] }
         var seen: [UUID: FacePerson] = [:]
@@ -1255,17 +1329,6 @@ public final class FaceIndexStore: @unchecked Sendable {
             copy.faceCount = counts[person.id] ?? 0
             return copy
         }.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
-    }
-
-    /// Roster person names keyed by file identity — the same join
-    /// `eventPeople(fileKeys:)` filters, indexed so a board can match every
-    /// stack against one catalog pass instead of one query per stack.
-    public func rosterNamesByFileKey() throws -> [String: Set<String>] {
-        var map: [String: Set<String>] = [:]
-        for faceFile in try rosterFaceFiles() {
-            map[faceFile.fileKey, default: []].insert(faceFile.name)
-        }
-        return map
     }
 
     // MARK: - Row mapping
@@ -1361,7 +1424,9 @@ public final class FaceIndexStore: @unchecked Sendable {
             name: row["name"],
             isRoster: (row["is_roster"] as Int64? ?? 0) != 0,
             faceCount: Int(row["face_count"] as Int64? ?? 0),
-            coverFaceID: (row["cover_face_id"] as String?).flatMap(UUID.init(uuidString:))
+            coverFaceID: (row["cover_face_id"] as String?).flatMap(UUID.init(uuidString:)),
+            suggestedPersonID: (row["suggested_person_id"] as String?).flatMap(UUID.init(uuidString:)),
+            suggestedPersonName: row["suggested_person_name"]
         )
     }
 }

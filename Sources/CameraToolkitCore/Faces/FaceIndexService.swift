@@ -6,10 +6,13 @@ import GRDB
 /// face engine (`FaceAnalyzing` — the InsightFace sidecar in production),
 /// which detects, aligns, and embeds; then the mode's size floor, cosine
 /// matching against roster templates, and average-linkage grouping of the
-/// leftovers. MED/HIGH/XHIGH additionally sample video frames — stills
-/// plus a light frame pass at MED, ~1 fps at HIGH, ~2 fps at XHIGH — and
-/// higher grades add detector scales, flip-TTA embeddings, and a
-/// roster-template rebuild.
+/// leftovers. Everything the machine classifies lands in the Inbox: a
+/// match files a face on a "looks like" suggestion row, a group files it
+/// on a "Person N" cluster — approved people are only ever changed by
+/// the user's explicit review actions. MED/HIGH/XHIGH additionally sample
+/// video frames — stills plus a light frame pass at MED, ~1 fps at HIGH,
+/// ~2 fps at XHIGH — and higher grades add detector scales, flip-TTA
+/// embeddings, and a roster-template rebuild.
 ///
 /// The service writes only to the catalog database — media files are never
 /// touched. Skip rules come from `face_photos.scan_grade` plus the
@@ -343,10 +346,13 @@ public struct FaceIndexService: Sendable {
     }
 
     /// Re-matches every stored, unconfirmed embedding against the current
-    /// roster, then rebundles the unnamed groups: members of auto "Person
-    /// N" clusters re-pool so a drifted drawer can split into real groups.
-    /// Rejected faces never return to the person they were refused from,
-    /// and lookalikes closer to a rejected face than to the person's own
+    /// roster — matches land on Inbox "looks like" rows, never on the
+    /// approved person itself — then rebundles the unnamed groups: members
+    /// of auto "Person N" clusters re-pool so a drifted drawer can split
+    /// into real groups. Legacy faces an older build proposed straight
+    /// onto the roster are swept into the Inbox the same way. Rejected
+    /// faces never return to the person they were refused from, and
+    /// lookalikes closer to a rejected face than to the person's own
     /// templates are vetoed. Groups the user named keep their faces, and
     /// confirmed faces never move. Reads vectors only; nothing is
     /// re-decoded and no ML runs. Returns the counts the status line shows.
@@ -391,10 +397,12 @@ public struct FaceIndexService: Sendable {
     /// first so the face can never be assigned back — and its embedding
     /// becomes a negative example that vetoes lookalikes — then the face
     /// goes through the same regrouping pass, landing in another group or
-    /// a new "Person N" cluster. Confirmed faces are frozen and never
-    /// move; the detection row and its photo stay untouched. The verdict
-    /// rows and the regrouping commit as one transaction — a failure
-    /// leaves the face exactly where it was.
+    /// a new "Person N" cluster. A face pulled out of a "looks like X" row
+    /// is refused from X too, so the next match can never file it back.
+    /// Confirmed faces are frozen and never move; the detection row and
+    /// its photo stay untouched. The verdict rows and the regrouping
+    /// commit as one transaction — a failure leaves the face exactly
+    /// where it was.
     public func reject(_ faceIDs: [UUID]) throws {
         try store.inWriteTransaction { database in
             var pool: [FaceRecord] = []
@@ -403,6 +411,10 @@ public struct FaceIndexService: Sendable {
                       face.state != .confirmed else { continue }
                 if let personID = face.personID {
                     try store.recordRejection(personID: personID, faceID: id, database: database)
+                    if let person = try store.person(personID, database: database),
+                       let target = person.suggestedPersonID {
+                        try store.recordRejection(personID: target, faceID: id, database: database)
+                    }
                 }
                 try store.unassignFace(id, database: database)
                 pool.append(face)
@@ -734,12 +746,23 @@ public struct FaceIndexService: Sendable {
             // On a rebundle the automatic "Person N" clusters dissolve: their
             // unconfirmed members re-pool so a drifted drawer can split into
             // real groups. Groups the user named — a demoted roster person
-            // keeps its name — stay intact, and confirmed faces never move.
+            // keeps its name — stay intact, confirmed faces never move, and
+            // suggestion rows are never dissolved (their membership
+            // re-derives from the match below) nor recycled as clusters —
+            // a recycled row would carry a stale suggestion.
             let autoGroups = rebundleGroups
-                ? try store.otherGroups(database: database).filter { Self.isAutoGroupName($0.name) }
+                ? try store.otherGroups(database: database)
+                    .filter { Self.isAutoGroupName($0.name) && $0.suggestedPersonID == nil }
                 : []
             let dissolvingIDs = Set(autoGroups.map(\.id))
             let templates = try store.rosterTemplates(database: database)
+            // Inbox "looks like X" rows keyed by the approved person they
+            // point at. A match lands on the row for X, never on X itself —
+            // the face stays unapproved until the user confirms or merges.
+            var suggestionRowIDs: [UUID: UUID] = [:]
+            for group in try store.otherGroups(database: database) where group.suggestedPersonID != nil {
+                suggestionRowIDs[group.suggestedPersonID!] = group.id
+            }
             var unmatched: [FaceRecord] = []
             for (index, face) in faces.enumerated() {
                 guard let embedding = face.embedding else { continue }
@@ -750,9 +773,25 @@ public struct FaceIndexService: Sendable {
                     threshold: options.matchThreshold,
                     rejections: rejections
                 ) {
+                    let rowID: UUID
+                    if let existing = suggestionRowIDs[match.personID] {
+                        rowID = existing
+                    } else {
+                        // The pile is labelled with the target's name so
+                        // overlay chips and search read naturally; the
+                        // join carries the live name to the People window.
+                        let target = try store.person(match.personID, database: database)
+                        rowID = try store.createPerson(
+                            name: target?.name ?? "Person",
+                            isRoster: false,
+                            suggestedPersonID: match.personID,
+                            database: database
+                        ).id
+                        suggestionRowIDs[match.personID] = rowID
+                    }
                     try store.assignFace(
                         face.id,
-                        to: match.personID,
+                        to: rowID,
                         state: .proposed,
                         score: Double(match.score),
                         database: database
@@ -761,9 +800,10 @@ public struct FaceIndexService: Sendable {
                     telemetry?.noteMatch()
                 } else if let personID = face.personID,
                           let person = try store.person(personID, database: database),
-                          person.isRoster || dissolvingIDs.contains(personID) {
-                    // A proposal that no longer holds — or a member of a
-                    // dissolving auto group — returns to the pool.
+                          person.isRoster || person.suggestedPersonID != nil || dissolvingIDs.contains(personID) {
+                    // A legacy proposal sitting on an approved person, a
+                    // suggestion member whose match no longer holds, or a
+                    // member of a dissolving auto group — back to the pool.
                     try store.unassignFace(face.id, database: database)
                     unmatched.append(face)
                 } else if face.personID == nil {
@@ -807,8 +847,12 @@ public struct FaceIndexService: Sendable {
             grouped = grouping.assigned
             created = grouping.created
             // Emptied rows the pass did not reuse are gone — the dissolve is
-            // real. Nothing user-named is ever deleted here.
+            // real. Nothing user-named is ever deleted here, and a "looks
+            // like" row left with no faces is dropped the same way.
             for group in autoGroups where try store.deleteEmptyGroup(group.id, database: database) {
+                dissolved += 1
+            }
+            for rowID in suggestionRowIDs.values where try store.deleteEmptyGroup(rowID, database: database) {
                 dissolved += 1
             }
             try store.refreshFaceCounts(database: database)
@@ -930,8 +974,8 @@ public struct FaceIndexService: Sendable {
 
     /// True when a face is clean enough to shape an automatic group: a
     /// confident detection of a face that was not tiny in the decoded
-    /// image. Anything else is still stored and can still be proposed to a
-    /// named person, but it never seeds or joins a "Person N".
+    /// image. Anything else is still stored and can still match into a
+    /// "looks like" row, but it never seeds or joins a "Person N".
     static func qualifiesForGrouping(_ face: FaceRecord, options: FaceScanOptions) -> Bool {
         guard face.detScore >= Double(options.groupingMinDetScore) else { return false }
         if let pixels = face.facePixels, pixels < options.groupingMinFacePixels { return false }
