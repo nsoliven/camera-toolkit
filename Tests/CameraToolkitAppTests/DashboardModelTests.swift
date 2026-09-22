@@ -750,6 +750,104 @@ final class DashboardModelTests: XCTestCase {
         }
     }
 
+    /// "Refreshing latest app state" must not decode the configuration JSON
+    /// on the main actor — for a library with ~14,000 assignments that decode
+    /// is the freeze the owner saw behind the event grid. The loader parks
+    /// mid-refresh; the main actor (this test) keeps running the whole time,
+    /// and the parked load is recorded off-main at utility priority. A
+    /// mutation that lands while the disk pass is in flight is newer than
+    /// what was read and must survive the apply.
+    func testRefreshAllDecodesConfigurationOffTheMainActor() async throws {
+        try await withTemporaryDirectoryAsync { root in
+            let store = ConfigurationStore(url: root.appendingPathComponent("config.json"))
+            var configuration = AppConfiguration(
+                demoRootPath: root.appendingPathComponent("Safety Test").path,
+                importSourcePath: root.appendingPathComponent("Card").path,
+                archivePath: root.appendingPathComponent("Library/Originals").path,
+                bufferPath: root.appendingPathComponent("Buffer").path,
+                activityLogPath: root.appendingPathComponent("activity.jsonl").path,
+                selectedDeviceID: "sony-a7v"
+            )
+            configuration.eventName = "Before Refresh"
+            let model = DashboardModel(
+                activePlan: CopyPlan(),
+                jobs: [],
+                configuration: configuration,
+                configurationStore: store
+            )
+            var onDisk = configuration
+            onDisk.eventName = "From Disk"
+            try store.save(onDisk)
+
+            let box = RefreshLoadProbeBox()
+            let gate = DispatchSemaphore(value: 0)
+            defer { gate.signal() }
+            model.configurationLoader = { url, defaults in
+                box.mark()
+                _ = gate.wait(timeout: .now() + 30)
+                return try ConfigurationStore(url: url).load(defaults: defaults)
+            }
+
+            model.refreshAll()
+            XCTAssertTrue(model.isRefreshing)
+            // Parked inside the decode: the refresh is still open and the
+            // main actor was never stuck inside it.
+            try await waitForCondition { box.started }
+            XCTAssertTrue(model.isRefreshing)
+
+            gate.signal()
+            try await waitForCondition { !model.isRefreshing }
+
+            XCTAssertFalse(box.onMainThread)
+            XCTAssertEqual(box.priority, .utility)
+            XCTAssertEqual(model.configuration.eventName, "From Disk")
+            XCTAssertTrue(model.statusMessage.contains("Refreshed latest"))
+        }
+    }
+
+    /// While the disk pass is in flight, a local mutation is newer than
+    /// what was read — the refresh must not roll it back.
+    func testRefreshAllKeepsMutationMadeDuringInFlightReload() async throws {
+        try await withTemporaryDirectoryAsync { root in
+            let store = ConfigurationStore(url: root.appendingPathComponent("config.json"))
+            let configuration = AppConfiguration(
+                demoRootPath: root.appendingPathComponent("Safety Test").path,
+                importSourcePath: root.appendingPathComponent("Card").path,
+                archivePath: root.appendingPathComponent("Library/Originals").path,
+                bufferPath: root.appendingPathComponent("Buffer").path,
+                activityLogPath: root.appendingPathComponent("activity.jsonl").path,
+                selectedDeviceID: "sony-a7v"
+            )
+            let model = DashboardModel(
+                activePlan: CopyPlan(),
+                jobs: [],
+                configuration: configuration,
+                configurationStore: store
+            )
+            var onDisk = configuration
+            onDisk.eventName = "Stale On Disk"
+            try store.save(onDisk)
+
+            let box = RefreshLoadProbeBox()
+            let gate = DispatchSemaphore(value: 0)
+            defer { gate.signal() }
+            model.configurationLoader = { url, defaults in
+                box.mark()
+                _ = gate.wait(timeout: .now() + 30)
+                return try ConfigurationStore(url: url).load(defaults: defaults)
+            }
+
+            model.refreshAll()
+            try await waitForCondition { box.started }
+            // Newer than the parked read — wins over the disk result.
+            model.updateConfiguration { $0.eventName = "Typed Meanwhile" }
+            gate.signal()
+            try await waitForCondition { !model.isRefreshing }
+
+            XCTAssertEqual(model.configuration.eventName, "Typed Meanwhile")
+        }
+    }
+
     /// The apply board correlates its in-flight route diagram with the rename
     /// job through the id `runBackgroundJob` hands back.
     func testRunBackgroundJobReturnsIDAndRefusesWhileBusy() async throws {
@@ -817,6 +915,39 @@ private func withTemporaryDirectoryAsync<T: Sendable>(
 
 private enum DashboardModelTestError: Error {
     case timedOutWaitingForJob
+}
+
+/// What the injected configuration loader observed inside the refresh's
+/// disk pass: where it ran and at what priority.
+private final class RefreshLoadProbeBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _started = false
+    private var _onMainThread = true
+    private var _priority: TaskPriority?
+
+    var started: Bool { lock.withLock { _started } }
+    var onMainThread: Bool { lock.withLock { _onMainThread } }
+    var priority: TaskPriority? { lock.withLock { _priority } }
+
+    func mark() {
+        lock.withLock {
+            _started = true
+            _onMainThread = Thread.isMainThread
+            _priority = Task<Never, Never>.currentPriority
+        }
+    }
+}
+
+@MainActor
+private func waitForCondition(timeout: TimeInterval = 15, _ condition: () -> Bool) async throws {
+    let deadline = Date().addingTimeInterval(timeout)
+    while !condition() {
+        if Date() > deadline {
+            XCTFail("Timed out waiting for condition")
+            return
+        }
+        try await Task.sleep(nanoseconds: 20_000_000)
+    }
 }
 
 @MainActor

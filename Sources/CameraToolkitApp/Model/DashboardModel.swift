@@ -23,6 +23,15 @@ private struct OrganizedArchiveJobResult: Sendable {
     var plan: OrganizedArchivePlan
 }
 
+/// What the refresh pass read from disk — produced off the main actor so
+/// decoding a large configuration can never freeze the UI.
+private struct RefreshedDiskState: Sendable {
+    var configuration: AppConfiguration?
+    var configurationError: String?
+    var activityLog: [ActivityLogEntry]?
+    var activityLogError: String?
+}
+
 struct BackgroundJobUpdate: Sendable {
     var progress: Double
     var note: String
@@ -123,6 +132,14 @@ final class DashboardModel {
     @ObservationIgnored let secretStore = KeychainSecretStore(service: "org.cameratoolkit.CameraToolkit")
     @ObservationIgnored private var catalogSyncTask: Task<Void, Never>?
     @ObservationIgnored private var configurationSaveTask: Task<Void, Never>?
+    /// True when `configuration` holds changes the debounced save has not
+    /// written yet — `flushConfigurationSave()` writes only then.
+    @ObservationIgnored private var configurationSaveIsDirty = false
+    /// Test seam: substitutes the on-disk config reload inside
+    /// `refreshAllNow`'s background pass — production reads through
+    /// `ConfigurationStore` there. Lets a test prove the decode happens
+    /// off the main actor.
+    @ObservationIgnored var configurationLoader: (@Sendable (URL, AppConfiguration) throws -> AppConfiguration)?
     @ObservationIgnored private var lastTransferQueuePersistence = Date.distantPast
     @ObservationIgnored private var lastStorageCapacityRefreshRequest = Date.distantPast
     @ObservationIgnored private var eventCopyAvailabilityTask: Task<EventCopyAvailability, Never>?
@@ -1603,24 +1620,62 @@ extension DashboardModel {
 
         var notes: [String] = []
 
-        do {
-            // Flush first: a pending debounced save must reach disk before a
-            // reload, or the read would revert mutations made moments ago.
-            flushConfigurationSave()
-            let defaults = AppConfiguration.defaults(applicationSupport: Self.defaultApplicationSupportURL)
-            configuration = try configurationStore.load(defaults: defaults)
-            configurationRevision &+= 1
-            configMessage = "Config reloaded at \(Self.defaultConfigurationURL.path)."
-            notes.append("config")
-        } catch {
-            configMessage = "Could not reload config: \(error.localizedDescription)"
+        // Flush first: a pending debounced save must reach disk before a
+        // reload, or the read would revert mutations made moments ago.
+        // The reload itself — decoding the whole configuration JSON and
+        // the activity log — runs at utility priority off the main actor;
+        // doing it here is what used to freeze the board on every
+        // activation for libraries with thousands of assignments.
+        flushConfigurationSave()
+        let storeURL = configurationStore.url
+        let logURL = URL(fileURLWithPath: Self.expandedPath(configuration.activityLogPath))
+        let defaults = AppConfiguration.defaults(applicationSupport: Self.defaultApplicationSupportURL)
+        let revisionBefore = configurationRevision
+        let logCountBefore = activityLog.count
+        let loader = configurationLoader
+        // Continuation, not `await task.value` — awaiting a detached task
+        // escalates it to the caller's priority, which would put the decode
+        // right back on the tier it is being moved off of.
+        let disk = await withCheckedContinuation { (cc: CheckedContinuation<RefreshedDiskState, Never>) in
+            Task.detached(priority: .utility) {
+                var state = RefreshedDiskState()
+                do {
+                    state.configuration = try loader?(storeURL, defaults)
+                        ?? ConfigurationStore(url: storeURL).load(defaults: defaults)
+                } catch {
+                    state.configurationError = error.localizedDescription
+                }
+                do {
+                    state.activityLog = try ActivityLogStore(url: logURL).load()
+                } catch {
+                    state.activityLogError = error.localizedDescription
+                }
+                cc.resume(returning: state)
+            }
+        }
+
+        if let reloaded = disk.configuration {
+            // A mutation that landed while the disk pass ran is newer than
+            // what was read — keep it; its own scheduled save will persist.
+            if configurationRevision == revisionBefore {
+                configuration = reloaded
+                configurationRevision &+= 1
+                configMessage = "Config reloaded at \(Self.defaultConfigurationURL.path)."
+                notes.append("config")
+            } else {
+                notes.append("config kept local changes")
+            }
+        } else {
+            configMessage = "Could not reload config: \(disk.configurationError ?? "unknown error")"
             notes.append("config failed")
         }
 
-        do {
-            activityLog = try ActivityLogStore(url: URL(fileURLWithPath: Self.expandedPath(configuration.activityLogPath))).load()
+        if let entries = disk.activityLog {
+            if activityLog.count == logCountBefore {
+                activityLog = entries
+            }
             notes.append("\(activityLog.count) log entries")
-        } catch {
+        } else {
             notes.append("log unavailable")
         }
 
@@ -2184,6 +2239,7 @@ extension DashboardModel {
     /// last change. The write runs on the main actor, so saves stay in order;
     /// `flushConfigurationSave()` forces a synchronous write on termination.
     private func scheduleConfigurationSave() {
+        configurationSaveIsDirty = true
         configurationSaveTask?.cancel()
         configurationSaveTask = Task { @MainActor [weak self] in
             do {
@@ -2197,16 +2253,20 @@ extension DashboardModel {
 
     /// Writes the current configuration synchronously, cancelling any pending
     /// debounced save. Called from `applicationWillTerminate` so the last
-    /// mutations of a session always reach disk.
+    /// mutations of a session always reach disk. Skips the write entirely
+    /// when nothing changed since the last save — an unconditional encode
+    /// of the whole config is wasted work, not a guarantee.
     func flushConfigurationSave() {
         configurationSaveTask?.cancel()
         configurationSaveTask = nil
+        guard configurationSaveIsDirty else { return }
         saveConfigurationNow()
     }
 
     private func saveConfigurationNow() {
         do {
             try configurationStore.save(configuration)
+            configurationSaveIsDirty = false
             configMessage = "Config saved at \(Self.defaultConfigurationURL.path)."
         } catch {
             configMessage = "Could not save config: \(error.localizedDescription)"

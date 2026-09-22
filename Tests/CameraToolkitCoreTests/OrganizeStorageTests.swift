@@ -83,21 +83,21 @@ final class OrganizeStorageTests: XCTestCase {
             let source = try writeFile(root.appendingPathComponent("Unsorted/DSC00001.ARW"), bytes)
             let assignment = PhotoEventAssignment(sourceRootPath: source.deletingLastPathComponent().path, relativePath: "DSC00001.ARW", fileSize: 100, modifiedAt: Date(), eventID: event.id, deviceID: "sony-a7v")
 
-            var summary = EventPresenceScanner.scan(event: event, assignments: [assignment], locations: locations)
+            var summary = try XCTUnwrap(EventPresenceScanner.scan(event: event, assignments: [assignment], locations: locations))
             XCTAssertEqual(summary.onSource, 1)
             XCTAssertEqual(summary.onDrive, 0)
 
             let drive = try XCTUnwrap(locations.driveURL(for: assignment, event: event, policy: .buffer))
             try writeFile(drive, bytes)
             try writeFile(try XCTUnwrap(locations.archiveURL(for: assignment, event: event)), bytes)
-            summary = EventPresenceScanner.scan(event: event, assignments: [assignment], locations: locations)
+            summary = try XCTUnwrap(EventPresenceScanner.scan(event: event, assignments: [assignment], locations: locations))
             XCTAssertEqual(summary.onDrive, 1)
             XCTAssertEqual(summary.onArchive, 1)
             XCTAssertEqual(summary.assets.first?.bestLocalPath, drive.path)
 
             var privateEvent = event
             privateEvent.storagePolicy = .archiveOnly
-            summary = EventPresenceScanner.scan(event: privateEvent, assignments: [assignment], locations: locations)
+            summary = try XCTUnwrap(EventPresenceScanner.scan(event: privateEvent, assignments: [assignment], locations: locations))
             XCTAssertEqual(summary.onDrive, 0)
             XCTAssertEqual(summary.onOtherDrive, 1)
         }
@@ -235,11 +235,11 @@ final class OrganizeStorageTests: XCTestCase {
             XCTAssertEqual(adopted.addedAssignments, 2)
 
             let event = try XCTUnwrap(configuration.savedEvents.first { $0.name == "Harbor + Ferry" })
-            let summary = EventPresenceScanner.scan(
+            let summary = try XCTUnwrap(EventPresenceScanner.scan(
                 event: event,
                 assignments: configuration.photoEventAssignments.filter { $0.eventID == event.id },
                 locations: EventStorageLocations(configuration: configuration)
-            )
+            ))
             XCTAssertEqual(summary.onDrive, 2)
             XCTAssertEqual(summary.onSource, 0)
             XCTAssertTrue(summary.assets.allSatisfy(\.sourceIsDriveCopy))

@@ -153,9 +153,18 @@ private struct AssignmentChange {
     var added: [PhotoEventAssignment]
 }
 
+/// Pass one of an event open: the grid built from the catalog-implied
+/// `Card Copy` paths, before any place has been probed.
+private struct EventFirstPaint: Sendable {
+    var files: [OrganizeFile]
+    var stacks: [OrganizeStack]
+}
+
+/// Pass two: the truthful four-place sweep plus everything that hangs off
+/// it — the storage-strip summary, the badge index, and Immich statuses.
 private struct EventRefreshOutput: Sendable {
     var summary: EventPresenceSummary
-    var stacks: [OrganizeStack]
+    var files: [OrganizeFile]
     var assetsByPathKey: [String: EventAssetPresence]
     var immich: [String: ImmichCatalogStatus]
 }
@@ -260,6 +269,22 @@ final class EventsWorkspace {
     @ObservationIgnored private var assignmentBytes: [UUID: Int64] = [:]
     @ObservationIgnored private var eventAssetsByPathKey: [UUID: [String: EventAssetPresence]] = [:]
     @ObservationIgnored private var refreshGenerations: [UUID: UUID] = [:]
+    /// The four-place sweep running per event; a new refresh cancels the
+    /// stale one so it never finishes against an old generation. Never
+    /// awaited: `await task.value` would escalate it to the caller's
+    /// priority, undoing the utility tier that keeps it off the UI path.
+    /// The sweep applies its own results and resolves `presenceWaiters`.
+    @ObservationIgnored private var presenceTasks: [UUID: Task<Void, Never>] = [:]
+    /// `refreshEvent` calls parked until their generation's sweep lands —
+    /// (generation, continuation) pairs. A waiter whose generation went
+    /// stale resumes as soon as any sweep finishes, instead of hanging on
+    /// a pass that will never apply.
+    @ObservationIgnored private var presenceWaiters: [UUID: [(UUID, CheckedContinuation<Void, Never>)]] = [:]
+    /// Test seam: replaces the per-file presence stat inside the sweep —
+    /// nil in production, where `EventPresenceScanner.state` does it. A
+    /// test can park on the archive URL to prove the grid paints before
+    /// the NAS answers.
+    @ObservationIgnored var presenceProbe: EventPresenceScanner.PresenceProbe?
     @ObservationIgnored private var loadedCaptureDateCache: CaptureDateCache?
     @ObservationIgnored private var lastConnectivityRefresh = Date.distantPast
     @ObservationIgnored private var connectivityRefreshTask: Task<Void, Never>?
@@ -1375,40 +1400,145 @@ final class EventsWorkspace {
 
     // MARK: - Presence
 
+    /// Two passes, ordered by what the board needs first.
+    ///
+    /// Pass one draws the grid from the place the catalog already implies —
+    /// the event policy's `Card Copy` folder on its drive — without a
+    /// single per-file stat, so first paint never waits on the card, the
+    /// other drive, or the NAS. Pass two is the truthful four-place sweep:
+    /// it runs at utility priority so it cannot contend with scrolling or
+    /// tile decode, and publishes the storage chips when it lands. When a
+    /// file actually lives somewhere other than the implied drive path —
+    /// still on the card, only on the NAS, or gone — the grid is rebuilt
+    /// onto the real paths; when nothing moved, the tiles the board
+    /// already decoded are left alone.
+    ///
+    /// A second open or a Refresh starts a new generation and cancels the
+    /// stale sweep; the generation guard keeps its results out either way.
     func refreshEvent(_ eventID: UUID) async {
         guard let event = event(eventID) else { return }
         let generation = UUID()
         refreshGenerations[eventID] = generation
+        presenceTasks[eventID]?.cancel()
         let assignments = model.configuration.photoEventAssignments.filter { $0.eventID == eventID }
         let locations = self.locations
+        let policy = locations.resolvedPolicy(for: event)
         let cache = captureDateCache
         let burstSplits = model.configuration.burstSplits
         let catalogURL = URL(fileURLWithPath: DashboardModel.expandedPath(model.configuration.catalogDatabasePath))
+        let probe = presenceProbe
 
-        let output = await Task.detached(priority: .userInitiated) { () -> EventRefreshOutput in
-            let summary = EventPresenceScanner.scan(event: event, assignments: assignments, locations: locations)
-            var files: [OrganizeFile] = []
-            var byPath: [String: EventAssetPresence] = [:]
-            for asset in summary.assets {
-                guard let path = asset.bestLocalPath else { continue }
-                files.append(OrganizeFile(path: path, size: asset.assignment.fileSize, modifiedAt: asset.assignment.modifiedAt))
-                byPath[EventStorageLocations.pathKey(path)] = asset
-            }
-            let items = OrganizeScanner.items(for: files, cache: cache).items
-            let immich = (try? CatalogInspector(url: catalogURL).immichStatuses(eventID: eventID)) ?? [:]
-            return EventRefreshOutput(
-                summary: summary,
-                stacks: OrganizeStacker.stacks(for: items, splits: burstSplits),
-                assetsByPathKey: byPath,
-                immich: immich
-            )
-        }.value
+        // Pass one is skipped when the policy's drive is offline: there is
+        // no local copy to point a tile at, and drawing one anyway would
+        // paint a grid of dead paths. The sweep then publishes the grid.
+        var firstPaint: EventFirstPaint?
+        if VolumeInfo.isAvailable(locations.driveRoot(for: policy)) {
+            firstPaint = await Task.detached(priority: .userInitiated) { () -> EventFirstPaint in
+                var files: [OrganizeFile] = []
+                files.reserveCapacity(assignments.count)
+                for assignment in assignments {
+                    guard let url = locations.driveURL(for: assignment, event: event, policy: policy) else { continue }
+                    files.append(OrganizeFile(path: url.path, size: assignment.fileSize, modifiedAt: assignment.modifiedAt))
+                }
+                let items = OrganizeScanner.items(for: files, cache: cache).items
+                return EventFirstPaint(
+                    files: files,
+                    stacks: OrganizeStacker.stacks(for: items, splits: burstSplits)
+                )
+            }.value
+        }
 
         guard refreshGenerations[eventID] == generation else { return }
+        if let firstPaint {
+            eventStacks[eventID] = firstPaint.stacks.carryingIDs(from: eventStacks[eventID] ?? [])
+        }
+        let firstPaintFiles = firstPaint?.files
+
+        // The sweep applies itself through `finishPresenceSweep` instead of
+        // being awaited here — `await sweep.value` would escalate it to
+        // this context's priority and put it right back on the hot tier.
+        let sweep = Task.detached(priority: .utility) { [self] in
+            var output: EventRefreshOutput?
+            if let summary = EventPresenceScanner.scan(
+                event: event,
+                assignments: assignments,
+                locations: locations,
+                probe: probe
+            ) {
+                var files: [OrganizeFile] = []
+                var byPath: [String: EventAssetPresence] = [:]
+                for asset in summary.assets {
+                    guard let path = asset.bestLocalPath else { continue }
+                    files.append(OrganizeFile(path: path, size: asset.assignment.fileSize, modifiedAt: asset.assignment.modifiedAt))
+                    byPath[EventStorageLocations.pathKey(path)] = asset
+                }
+                let immich = (try? CatalogInspector(url: catalogURL).immichStatuses(eventID: eventID)) ?? [:]
+                output = EventRefreshOutput(summary: summary, files: files, assetsByPathKey: byPath, immich: immich)
+            }
+            await finishPresenceSweep(
+                eventID: eventID,
+                generation: generation,
+                firstPaintFiles: firstPaintFiles,
+                output: output
+            )
+        }
+        presenceTasks[eventID] = sweep
+        await withCheckedContinuation { (cc: CheckedContinuation<Void, Never>) in
+            presenceWaiters[eventID, default: []].append((generation, cc))
+        }
+    }
+
+    /// Main-actor landing point for the utility-priority sweep. Publishes
+    /// the storage chips and badge index, rebuilds the grid only when the
+    /// truthful paths differ from what pass one drew, and wakes the
+    /// `refreshEvent` calls waiting on this pass. Stale generations only
+    /// resume their waiters — their results are dropped.
+    private func finishPresenceSweep(
+        eventID: UUID,
+        generation: UUID,
+        firstPaintFiles: [OrganizeFile]?,
+        output: EventRefreshOutput?
+    ) async {
+        defer { resumePresenceWaiters(for: eventID, appliedGeneration: generation) }
+        guard refreshGenerations[eventID] == generation else { return }
+        presenceTasks[eventID] = nil
+        guard let output else { return }
+
         eventAssetsByPathKey[eventID] = output.assetsByPathKey
         presence[eventID] = output.summary
-        eventStacks[eventID] = output.stacks.carryingIDs(from: eventStacks[eventID] ?? [])
         eventImmichStatuses[eventID] = output.immich
+        guard output.files != firstPaintFiles else { return }
+
+        // Files resolved somewhere other than the implied Card Copy path —
+        // restack onto the real ones. Continuation, not `task.value`, so
+        // the rebuild keeps its utility priority.
+        let cache = captureDateCache
+        let splits = model.configuration.burstSplits
+        let files = output.files
+        let rebuilt = await withCheckedContinuation { (cc: CheckedContinuation<[OrganizeStack], Never>) in
+            Task.detached(priority: .utility) {
+                cc.resume(returning: OrganizeStacker.stacks(
+                    for: OrganizeScanner.items(for: files, cache: cache).items,
+                    splits: splits
+                ))
+            }
+        }
+        guard refreshGenerations[eventID] == generation else { return }
+        eventStacks[eventID] = rebuilt.carryingIDs(from: eventStacks[eventID] ?? [])
+    }
+
+    /// Wakes refresh waiters whose sweep just landed, plus every waiter
+    /// left over from a stale generation — a stale pass has already been
+    /// dropped, so it must not keep waiting for the newer one.
+    private func resumePresenceWaiters(for eventID: UUID, appliedGeneration: UUID) {
+        let current = refreshGenerations[eventID]
+        var pending = presenceWaiters[eventID] ?? []
+        pending.removeAll { generation, cc in
+            guard generation == appliedGeneration || generation != current else { return false }
+            cc.resume()
+            return true
+        }
+        presenceWaiters[eventID] = pending.isEmpty ? nil : pending
     }
 
     // MARK: - Apply (put originals where their event keeps them)
@@ -1472,7 +1602,7 @@ final class EventsWorkspace {
             let policy = locations.resolvedPolicy(for: event)
             let driveRoot = locations.driveRoot(for: policy)
             let assignments = configuration.photoEventAssignments.filter { $0.eventID == event.id }
-            let summary = EventPresenceScanner.scan(event: event, assignments: assignments, locations: locations, mountedVolumes: mounted)
+            guard let summary = EventPresenceScanner.scan(event: event, assignments: assignments, locations: locations, mountedVolumes: mounted) else { continue }
             var moves: [DriveMove] = []
             var copies: [String: OrganizeApplyPlan.CopyBatch] = [:]
             var alreadyThere = 0
