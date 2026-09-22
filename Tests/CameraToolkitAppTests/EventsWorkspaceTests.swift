@@ -1,3 +1,4 @@
+import AppKit
 import CameraToolkitCore
 import CoreGraphics
 import Foundation
@@ -128,6 +129,73 @@ final class EventsWorkspaceTests: XCTestCase {
             XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("Drive/Camera Buffer/2026/2026-08-27 City Walk").path))
             XCTAssertEqual(model.configuration.photoEventAssignments.filter { $0.eventID == hidden }.count, 2)
             XCTAssertTrue(model.configuration.photoEventAssignments.filter { $0.eventID == shared }.isEmpty)
+        }
+    }
+
+    /// Regression: an Apply rename used to leave every open preview and tile
+    /// pointing at the vacated path, which decoded as a "could not decode"
+    /// failure until a full event restat replaced the stacks. The move
+    /// report must retarget the preview's path to the destination in the
+    /// same update that records the move.
+    func testApplyMoveRetargetsOpenPreviewPathsToTheDestination() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let unsorted = root.appendingPathComponent("Drive/Unsorted A7V", isDirectory: true)
+            let source = try writeOrganizerJPEG(unsorted.appendingPathComponent("101MSDCF/DSC05012.JPG"))
+            let location = addUnsorted(unsorted, to: model)
+            workspace.scan(location)
+            try await waitUntil { workspace.sources[location.id]?.result != nil }
+            let stack = try XCTUnwrap(workspace.sources[location.id]?.result?.stacks.first)
+
+            let eventID = try XCTUnwrap(workspace.createEvent(name: "Beach Day", date: organizerDay("2026-08-26"), policy: .buffer))
+            workspace.assign(stackIDs: [stack.id], from: location.id, to: eventID)
+
+            // The state an open preview is bound to: the event board already
+            // lists the file at its unsorted path ("On source" badge).
+            await workspace.refreshEvent(eventID)
+            let boardStack = try XCTUnwrap(workspace.eventStacks[eventID]?.first)
+            XCTAssertEqual(boardStack.items.first?.primary.path, source.path)
+
+            let plan = EventsWorkspace.buildApplyPlan(
+                events: [try XCTUnwrap(workspace.event(eventID))],
+                configuration: model.configuration,
+                locations: workspace.locations,
+                onlyUnder: unsorted.path,
+                title: "Apply",
+                unsortedRoots: [unsorted]
+            )
+            XCTAssertEqual(plan.moveCount, 1)
+            workspace.performApply(plan)
+            try await waitUntil { !model.isBusy && workspace.latestMoveJournalTitle != nil }
+
+            let destination = root.appendingPathComponent(
+                "Drive/Camera Buffer/2026/2026-08-26 Beach Day/Sony A7V/Card Copy/DSC05012.JPG"
+            )
+            XCTAssertTrue(FileManager.default.fileExists(atPath: destination.path))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: source.path))
+
+            // The preview's decode target moved with the file in the same
+            // update — before any refreshEvent restat could rebuild stacks.
+            let retargeted = try XCTUnwrap(workspace.eventStacks[eventID]?.first)
+            XCTAssertEqual(retargeted.items.first?.primary.path, destination.path)
+            XCTAssertEqual(retargeted.id, boardStack.id)
+
+            // A path the move just vacated is not a decode failure: the
+            // loader follows the move to the destination. A missing path
+            // with no move behind it still reports failure.
+            TileImageLoader.shared.invalidate(url: destination)
+            let decoded = await TileImageLoader.shared.image(for: source, maximumPixelSize: 384)
+            XCTAssertNotNil(decoded)
+            let untouched = unsorted.appendingPathComponent("101MSDCF/NEVER_THERE.JPG")
+            let missingDecode = await TileImageLoader.shared.image(for: untouched, maximumPixelSize: 384)
+            XCTAssertNil(missingDecode)
+
+            // The unsorted board dropped the file; the event refresh that
+            // lands afterwards agrees — and keeps the stack identity the
+            // preview is bound to.
+            XCTAssertEqual(workspace.sources[location.id]?.result?.items.count, 0)
+            await workspace.refreshEvent(eventID)
+            XCTAssertEqual(workspace.eventStacks[eventID]?.first?.items.first?.primary.path, destination.path)
+            XCTAssertEqual(workspace.eventStacks[eventID]?.first?.id, boardStack.id)
         }
     }
 
@@ -1855,6 +1923,28 @@ final class EventsWorkspaceTests: XCTestCase {
     private func organizerWrite(_ url: URL, _ string: String) throws -> URL {
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         try Data(string.utf8).write(to: url)
+        return url
+    }
+
+    /// A real JPEG the tile loader can actually decode — unlike the fake
+    /// ARW stub, which is only a header.
+    @discardableResult
+    private func writeOrganizerJPEG(_ url: URL, width: Int = 320, height: Int = 240) throws -> URL {
+        let representation = try XCTUnwrap(NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: width,
+            pixelsHigh: height,
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: width * 4,
+            bitsPerPixel: 32
+        ))
+        let data = try XCTUnwrap(representation.representation(using: .jpeg, properties: [:]))
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try data.write(to: url)
         return url
     }
 

@@ -1407,7 +1407,7 @@ final class EventsWorkspace {
         guard refreshGenerations[eventID] == generation else { return }
         eventAssetsByPathKey[eventID] = output.assetsByPathKey
         presence[eventID] = output.summary
-        eventStacks[eventID] = output.stacks
+        eventStacks[eventID] = output.stacks.carryingIDs(from: eventStacks[eventID] ?? [])
         eventImmichStatuses[eventID] = output.immich
     }
 
@@ -1607,6 +1607,7 @@ final class EventsWorkspace {
     }
 
     private func didMove(report: DriveMoveReport, events: [UUID]) {
+        retargetMovedPaths(report.moved)
         let movedKeys = Set(report.moved.map { EventStorageLocations.pathKey($0.sourcePath) })
         for (id, state) in sources {
             if let result = state.result {
@@ -1625,6 +1626,26 @@ final class EventsWorkspace {
 
     func refreshLatestJournal() {
         latestMoveJournalTitle = DriveMoveService.latestUndoableJournal(in: self.journalFolder)?.journal.title
+    }
+
+    /// A rename batch landed, straight from the move report: every stack
+    /// the boards already show repoints at the destination paths and the
+    /// tile loader reroutes decodes off the vacated ones, so an open
+    /// preview or tile keeps reading the moved file instead of failing on
+    /// its old path. Called in the same update that records the move —
+    /// `refreshEvent` still runs afterwards to restat the library; the
+    /// preview is already correct before that finishes.
+    private func retargetMovedPaths(_ moved: [DriveMove]) {
+        guard !moved.isEmpty else { return }
+        TileImageLoader.shared.retarget(moves: moved)
+        var destinations: [String: String] = [:]
+        for move in moved {
+            destinations[EventStorageLocations.pathKey(move.sourcePath)] =
+                URL(fileURLWithPath: move.destinationPath).standardizedFileURL.path
+        }
+        for (eventID, stacks) in eventStacks {
+            eventStacks[eventID] = stacks.map { $0.retargetingPaths(destinations) }
+        }
     }
 
     func undoLastMove() {
@@ -1647,6 +1668,7 @@ final class EventsWorkspace {
             },
             completion: { [weak self] outcome in
                 guard let self else { return "" }
+                retargetMovedPaths(outcome.report.moved)
                 let journal = outcome.journal
                 if !journal.addedAssignments.isEmpty || !journal.removedAssignments.isEmpty {
                     applyAssignmentChange(
@@ -1761,6 +1783,11 @@ final class EventsWorkspace {
                     AssignmentChange(title: title, removed: applied.map(\.removed), added: applied.map(\.added)),
                     touching: targetEventID
                 )
+                removeFilesFromEventBoards(
+                    Set(report.moved.map { EventStorageLocations.pathKey($0.sourcePath) }),
+                    events: [sourceEventID]
+                )
+                retargetMovedPaths(report.moved)
                 refreshLatestJournal()
                 refreshBoth(sourceEventID, targetEventID)
                 let skippedNote = report.skipped.isEmpty ? "" : " \(report.skipped.count) could not move: \(report.skipped[0].reason)"
@@ -1838,6 +1865,11 @@ final class EventsWorkspace {
                 let failed = Set(report.skipped.map { EventStorageLocations.pathKey($0.move.destinationPath) })
                 let applied = removed.filter { !failed.contains(Self.sourceKey($0)) }
                 applyAssignmentChange(AssignmentChange(title: title, removed: applied, added: []), touching: nil)
+                removeFilesFromEventBoards(
+                    Set(report.moved.map { EventStorageLocations.pathKey($0.sourcePath) }),
+                    events: [eventID]
+                )
+                retargetMovedPaths(report.moved)
                 refreshLatestJournal()
                 for location in unsortedLocations where sources[location.id]?.result != nil {
                     scan(location, force: true)
@@ -2289,6 +2321,7 @@ final class EventsWorkspace {
                         !item.files.contains { movedKeys.contains($0.pathKey) }
                     }
                     eventStacks[eventID] = OrganizeStacker.stacks(for: remaining, splits: model.configuration.burstSplits)
+                        .carryingIDs(from: stacks)
                 }
                 for (id, state) in sources {
                     if let result = state.result {
@@ -2323,6 +2356,7 @@ final class EventsWorkspace {
                 !item.files.contains { pathKeys.contains($0.pathKey) }
             }
             eventStacks[eventID] = OrganizeStacker.stacks(for: remaining, splits: splits)
+                .carryingIDs(from: stacks)
         }
     }
 
@@ -2356,6 +2390,7 @@ final class EventsWorkspace {
         for id in Array(eventStacks.keys) {
             if let stacks = eventStacks[id] {
                 eventStacks[id] = OrganizeStacker.stacks(for: stacks.flatMap(\.items), splits: splits)
+                    .carryingIDs(from: stacks)
             }
         }
         // Restacking changed some stack IDs; drop board selections that no
@@ -3261,5 +3296,28 @@ final class EventsWorkspace {
                 return "Re-match done — \(parts.joined(separator: ", ")). Stored vectors only; nothing on disk moved."
             }
         )
+    }
+}
+
+private extension Array where Element == OrganizeStack {
+    /// Reuses the previous board's stack ids wherever a rebuilt stack holds
+    /// the same files (matched by path keys). A rename repoints paths inside
+    /// the stacks already on the board, so the id a preview or selection is
+    /// bound to survives the refresh that follows instead of pointing at a
+    /// stack that no longer exists.
+    func carryingIDs(from previous: [OrganizeStack]) -> [OrganizeStack] {
+        var idByFiles: [Set<String>: String] = [:]
+        for stack in previous {
+            let files = Set(stack.files.map(\.pathKey))
+            if !files.isEmpty { idByFiles[files] = stack.id }
+        }
+        guard !idByFiles.isEmpty else { return self }
+        return map { stack in
+            var stack = stack
+            if let id = idByFiles[Set(stack.files.map(\.pathKey))] {
+                stack.id = id
+            }
+            return stack
+        }
     }
 }
