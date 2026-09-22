@@ -1196,11 +1196,11 @@ struct PhotoBrowserView: View {
                 }
 
                 if !item.isDirectory {
-                    openWithMenu(for: contextURLs, supportsPhotomator: !selectedPreviewURLs.isEmpty)
+                    openWithMenu(for: contextURLs)
                 }
             } else {
                 Button {
-                    openWithDefaultApplications(contextURLs)
+                    OpenInAppActions.openWithDefaultApplications(contextURLs)
                 } label: {
                     Label("Open \(selectedItems.count) Items", systemImage: "arrow.up.forward.app")
                 }
@@ -1217,10 +1217,7 @@ struct PhotoBrowserView: View {
                 }
 
                 if selectedItems.allSatisfy({ !$0.isDirectory }) {
-                    openWithMenu(
-                        for: contextURLs,
-                        supportsPhotomator: selectedPreviewURLs.count == contextURLs.count
-                    )
+                    openWithMenu(for: contextURLs)
                 }
             }
 
@@ -1312,23 +1309,9 @@ struct PhotoBrowserView: View {
     }
 
     @ViewBuilder
-    private func openWithMenu(for urls: [URL], supportsPhotomator: Bool) -> some View {
+    private func openWithMenu(for urls: [URL]) -> some View {
         Menu {
-            Button("Default Application") {
-                openWithDefaultApplications(urls)
-            }
-
-            if supportsPhotomator {
-                Button("Photomator") {
-                    PhotomatorLauncher.open(urls)
-                }
-            }
-
-            Divider()
-
-            Button("Choose Application…") {
-                chooseApplication(toOpen: urls)
-            }
+            OpenInAppMenuItems(urls: urls)
         } label: {
             Label("Open With", systemImage: "app.badge")
         }
@@ -2455,31 +2438,6 @@ struct PhotoBrowserView: View {
         } else {
             NSWorkspace.shared.open(item.url)
         }
-    }
-
-    private func openWithDefaultApplications(_ urls: [URL]) {
-        urls.forEach { NSWorkspace.shared.open($0) }
-    }
-
-    private func chooseApplication(toOpen urls: [URL]) {
-        guard !urls.isEmpty else { return }
-
-        let panel = NSOpenPanel()
-        panel.canChooseDirectories = false
-        panel.canChooseFiles = true
-        panel.allowsMultipleSelection = false
-        panel.allowedContentTypes = [.application]
-        panel.treatsFilePackagesAsDirectories = false
-        panel.directoryURL = URL(fileURLWithPath: "/Applications", isDirectory: true)
-        panel.title = "Choose an Application"
-        panel.message = "Choose an app to open \(urls.count == 1 ? urls[0].lastPathComponent : "\(urls.count) selected items")."
-        panel.prompt = "Open"
-
-        guard panel.runModal() == .OK, let applicationURL = panel.url else { return }
-
-        let configuration = NSWorkspace.OpenConfiguration()
-        configuration.activates = true
-        NSWorkspace.shared.open(urls, withApplicationAt: applicationURL, configuration: configuration)
     }
 
     private func previewSelection() {

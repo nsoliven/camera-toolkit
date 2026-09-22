@@ -1264,11 +1264,14 @@ struct StackPreviewOverlay: View {
                 .disabled(DisplayRotation.rotatableFiles(in: stack).isEmpty)
                 .help("Rotate every frame in this burst together ( [ ] or R / Shift-R ). Display-only — originals are never rewritten.")
             }
-            Button {
-                PhotomatorLauncher.open(item.files.map(\.url))
+            Menu {
+                OpenInAppMenuItems(urls: [item.primary.url])
             } label: {
                 Label("Open", systemImage: "arrow.up.forward.app")
             }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .help("Open \(item.primary.name) in another app")
             Button {
                 stackID = nil
             } label: {
