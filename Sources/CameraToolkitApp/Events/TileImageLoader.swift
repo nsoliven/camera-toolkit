@@ -20,12 +20,16 @@ final class TileImageLoader: @unchecked Sendable {
     /// for the rest.
     private final class WaiterGroup: @unchecked Sendable {
         let operation: TileDecodeOperation
+        /// The cache/in-flight key this decode reports under. A rename can
+        /// move it mid-flight so the result lands at the file's new path.
+        var cacheKey: String
         var waiters = 0
         var continuations: [UUID: CheckedContinuation<CGImage?, Never>] = [:]
         var finished = false
         var result: CGImage?
 
-        init(url: URL, bucket: Int, orientation: Int, priority: Operation.QueuePriority) {
+        init(url: URL, bucket: Int, orientation: Int, priority: Operation.QueuePriority, cacheKey: String) {
+            self.cacheKey = cacheKey
             operation = TileDecodeOperation(url: url, maximumPixelSize: bucket, orientation: orientation)
             operation.queuePriority = priority
             operation.qualityOfService = TileImageLoader.qos(for: priority)
@@ -44,6 +48,10 @@ final class TileImageLoader: @unchecked Sendable {
     private let queue: OperationQueue
     private let lock = NSLock()
     private var inFlight: [String: WaiterGroup] = [:]
+    /// Standardized paths a completed rename left vacant, mapped to where
+    /// each file landed. Only consulted while the asked-for path is really
+    /// missing, so a name another file later reuses is never rerouted.
+    private var redirects: [String: String] = [:]
 
     init() {
         cache.totalCostLimit = 768 * 1_024 * 1_024
@@ -71,7 +79,8 @@ final class TileImageLoader: @unchecked Sendable {
     /// `DisplayRotation`). It is part of the cache key so a rotated decode
     /// never joins or reuses an unrotated one.
     func cachedImage(for url: URL, maximumPixelSize: Int, orientation: Int = 0) -> CGImage? {
-        cache.object(forKey: key(url, Self.bucket(for: maximumPixelSize), orientation) as NSString)?.image
+        let url = resolvedURL(for: url)
+        return cache.object(forKey: key(url, Self.bucket(for: maximumPixelSize), orientation) as NSString)?.image
     }
 
     /// Wall-clock bound on a single decode wait. A read stuck on a dead or
@@ -93,6 +102,7 @@ final class TileImageLoader: @unchecked Sendable {
         priority: Operation.QueuePriority = .normal,
         timeout: Duration = TileImageLoader.waitTimeout
     ) async -> CGImage? {
+        let url = resolvedURL(for: url)
         let bucket = Self.bucket(for: maximumPixelSize)
         let cacheKey = key(url, bucket, orientation)
         if let cached = cache.object(forKey: cacheKey as NSString) {
@@ -112,7 +122,7 @@ final class TileImageLoader: @unchecked Sendable {
                 park(continuation, id: id, in: group)
             }
         } onCancel: {
-            cancelWaiter(id: id, cacheKey: cacheKey, in: group)
+            cancelWaiter(id: id, in: group)
         }
     }
 
@@ -132,11 +142,11 @@ final class TileImageLoader: @unchecked Sendable {
             existing.boost(priority)
             return existing
         }
-        let group = WaiterGroup(url: url, bucket: bucket, orientation: orientation, priority: priority)
+        let group = WaiterGroup(url: url, bucket: bucket, orientation: orientation, priority: priority, cacheKey: cacheKey)
         group.waiters = 1
         inFlight[cacheKey] = group
         group.operation.completionBlock = { [weak self] in
-            self?.finish(cacheKey: cacheKey, group: group)
+            self?.finish(group: group)
         }
         queue.addOperation(group.operation)
         return group
@@ -165,7 +175,7 @@ final class TileImageLoader: @unchecked Sendable {
     /// When the last waiter leaves before the decode finished, the shared
     /// operation is cancelled so it exits early instead of decoding for no
     /// one; its completion block still drains any continuations left.
-    private func cancelWaiter(id: UUID, cacheKey: String, in group: WaiterGroup) {
+    private func cancelWaiter(id: UUID, in group: WaiterGroup) {
         lock.lock()
         guard let continuation = group.continuations.removeValue(forKey: id) else {
             lock.unlock()
@@ -173,8 +183,8 @@ final class TileImageLoader: @unchecked Sendable {
         }
         group.waiters -= 1
         let shouldCancel = group.waiters == 0 && !group.finished
-        if shouldCancel {
-            inFlight.removeValue(forKey: cacheKey)
+        if shouldCancel, inFlight[group.cacheKey] === group {
+            inFlight.removeValue(forKey: group.cacheKey)
         }
         lock.unlock()
         continuation.resume(returning: nil)
@@ -208,18 +218,21 @@ final class TileImageLoader: @unchecked Sendable {
         )
     }
 
-    /// Runs once when the shared decode operation finishes: fills the cache,
-    /// drops the in-flight slot, and resumes every waiter with the result
-    /// (nil when the operation was cancelled).
-    private func finish(cacheKey: String, group: WaiterGroup) {
+    /// Runs once when the shared decode operation finishes: fills the cache
+    /// under the group's current key — which a rename may have moved — drops
+    /// the in-flight slot, and resumes every waiter with the result (nil
+    /// when the operation was cancelled).
+    private func finish(group: WaiterGroup) {
         lock.lock()
         group.finished = true
         let result = group.operation.isCancelled ? nil : group.operation.result
         group.result = result
         if let result {
-            cache.setObject(Box(result), forKey: cacheKey as NSString, cost: result.bytesPerRow * result.height)
+            cache.setObject(Box(result), forKey: group.cacheKey as NSString, cost: result.bytesPerRow * result.height)
         }
-        inFlight.removeValue(forKey: cacheKey)
+        if inFlight[group.cacheKey] === group {
+            inFlight.removeValue(forKey: group.cacheKey)
+        }
         let continuations = Array(group.continuations.values)
         group.continuations.removeAll()
         lock.unlock()
@@ -228,10 +241,66 @@ final class TileImageLoader: @unchecked Sendable {
         }
     }
 
+    /// A rename batch landed: a decode asked for a path the move vacated
+    /// resolves to the destination instead of failing on a file that is no
+    /// longer there, cached bitmaps move to the new path's keys, and an
+    /// in-flight decode's result lands there too. Called once per move
+    /// report — a path this move vacated is not a decode failure.
+    func retarget(moves: [DriveMove]) {
+        guard !moves.isEmpty else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        for move in moves {
+            let source = URL(fileURLWithPath: move.sourcePath).standardizedFileURL.path
+            let destination = URL(fileURLWithPath: move.destinationPath).standardizedFileURL.path
+            guard source != destination else { continue }
+            // Chained moves collapse: anything that pointed at the path this
+            // move just vacated now points where the file actually landed.
+            for key in redirects.filter({ $0.value == source }).map(\.key) {
+                redirects[key] = destination
+            }
+            redirects[source] = destination
+            let sourceURL = URL(fileURLWithPath: source)
+            let destinationURL = URL(fileURLWithPath: destination)
+            for bucket in [384, 768, 1_280, 2_400, 4_800] {
+                for orientation in 0..<4 {
+                    let oldKey = key(sourceURL, bucket, orientation)
+                    let newKey = key(destinationURL, bucket, orientation)
+                    if let box = cache.object(forKey: oldKey as NSString) {
+                        cache.setObject(box, forKey: newKey as NSString, cost: box.image.bytesPerRow * box.image.height)
+                        cache.removeObject(forKey: oldKey as NSString)
+                    }
+                    if let group = inFlight.removeValue(forKey: oldKey) {
+                        group.cacheKey = newKey
+                        inFlight[newKey] = group
+                    }
+                }
+            }
+        }
+    }
+
+    /// The path a decode should actually read. A file still where it was
+    /// asked for is never rerouted; a path a move left vacant follows the
+    /// redirect to wherever the file landed — a request for it decodes the
+    /// destination, so the vacated path never reports a decode failure.
+    private func resolvedURL(for url: URL) -> URL {
+        guard !FileManager.default.fileExists(atPath: url.path) else { return url }
+        lock.lock()
+        var path = url.path
+        var hops = 0
+        while let next = redirects[path], next != path, hops < 8 {
+            path = next
+            hops += 1
+        }
+        lock.unlock()
+        return path == url.path ? url : URL(fileURLWithPath: path)
+    }
+
     /// Drops every cached decode of `url` — all size buckets and all
     /// orientations — so a display-rotation change frees its stale bitmaps
     /// instead of waiting for the cost limit to evict them.
     func invalidate(url: URL) {
+        let url = resolvedURL(for: url)
         for bucket in [384, 768, 1_280, 2_400, 4_800] {
             for orientation in 0..<4 {
                 cache.removeObject(forKey: key(url, bucket, orientation) as NSString)

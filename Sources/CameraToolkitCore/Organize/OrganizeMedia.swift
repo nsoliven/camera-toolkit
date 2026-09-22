@@ -249,6 +249,31 @@ public struct OrganizeStack: Identifiable, Hashable, Sendable {
     public var kind: OrganizeMediaKind { items.first?.kind ?? .other }
 }
 
+extension OrganizeStack {
+    /// The same stack after a rename: every file the move redirected is
+    /// repointed at its destination — primary and companions alike. The
+    /// stack keeps its id so board selection, focus, and an open preview
+    /// bound to it follow the files instead of losing the stack
+    /// mid-rename. `destinations` maps `OrganizeFile.pathKey` of the
+    /// vacated path to the file's new standardized absolute path.
+    public func retargetingPaths(_ destinations: [String: String]) -> OrganizeStack {
+        guard !destinations.isEmpty else { return self }
+        var stack = self
+        for itemIndex in stack.items.indices {
+            retarget(&stack.items[itemIndex].primary, destinations: destinations)
+            for fileIndex in stack.items[itemIndex].companions.indices {
+                retarget(&stack.items[itemIndex].companions[fileIndex], destinations: destinations)
+            }
+        }
+        return stack
+    }
+
+    private func retarget(_ file: inout OrganizeFile, destinations: [String: String]) {
+        guard let destination = destinations[file.pathKey] else { return }
+        file.path = destination
+    }
+}
+
 public struct OrganizeDay: Identifiable, Hashable, Sendable {
     /// `yyyy-MM-dd` in the camera's wall clock.
     public var id: String
