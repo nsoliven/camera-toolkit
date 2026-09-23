@@ -403,8 +403,9 @@ struct OrganizeSearchBar: View {
     // MARK: - Media values
 
     /// The kinds a Media row can pick, in menu order — same three the old
-    /// facet offered.
-    private static let mediaOptions: [(kind: OrganizeMediaKind, title: String, symbol: String)] = [
+    /// facet offered. The header's hot links label Media rows from the
+    /// same titles.
+    static let mediaOptions: [(kind: OrganizeMediaKind, title: String, symbol: String)] = [
         (.photo, "Stills", "photo"),
         (.raw, "RAW", "camera.aperture"),
         (.video, "Video", "video.fill"),
@@ -485,6 +486,137 @@ struct OrganizeSearchBar: View {
         }
         .buttonStyle(.plain)
         .help("Clear")
+    }
+}
+
+/// The active filter rows as hot links under the board's tag chips — one
+/// chip per row carrying picks, labeled in plain language ("Event is any
+/// of ● TRIP2026 / Matcha"). A tap suspends the row: it stays in the
+/// panel with its picks, draws as an outline, and stops filtering; the
+/// next tap resumes it. Rows in a group stay AND, groups stay OR.
+struct OrganizeFilterHotLinks: View {
+    let workspace: EventsWorkspace
+    /// The unfiltered board's stacks — People chips resolve names from the
+    /// same options the panel's People picker offers.
+    let stacks: [OrganizeStack]
+    @Binding var search: OrganizeSearchFilter
+
+    var body: some View {
+        FlowLayout(horizontalSpacing: 8, verticalSpacing: 8) {
+            ForEach(search.rowsWithValues) { row in
+                chip(row)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func chip(_ row: OrganizeFilterRow) -> some View {
+        Button {
+            search.toggleRow(row.id)
+        } label: {
+            HStack(spacing: 4) {
+                Text(row.property.title)
+                    .fontWeight(.semibold)
+                if row.property != .date {
+                    Text(row.operator.title)
+                        .foregroundStyle(.secondary)
+                }
+                valueLabel(for: row)
+            }
+            .font(.caption)
+            .padding(.horizontal, 9)
+            .padding(.vertical, 4)
+            .foregroundStyle(row.isEnabled ? Color.primary : Color.secondary)
+            .background {
+                if row.isEnabled {
+                    Capsule().fill(Color.primary.opacity(0.12))
+                } else {
+                    Capsule().strokeBorder(Color.secondary.opacity(0.5), lineWidth: 1)
+                }
+            }
+            .fixedSize()
+        }
+        .buttonStyle(.plain)
+        .help(row.isEnabled
+            ? "This filter is on — click to pause it (the row stays in the filter panel)"
+            : "This filter is paused — click to turn it back on")
+    }
+
+    /// The picked values, rendered after the property and operator.
+    @ViewBuilder
+    private func valueLabel(for row: OrganizeFilterRow) -> some View {
+        switch row.property {
+        case .people:
+            Text(peopleLabel(for: row))
+        case .media:
+            Text(mediaLabel(for: row))
+        case .date:
+            Text(dateLabel(for: row))
+        case .event:
+            eventValueLabel(for: row)
+        }
+    }
+
+    /// The People row's picks as "Sam, Person 1" — roster members and
+    /// unnamed groups in the picker's order, then stale picks the board
+    /// no longer offers.
+    private func peopleLabel(for row: OrganizeFilterRow) -> String {
+        let options = workspace.boardPeople(for: stacks).options
+        let picked = options.filter { row.peopleIDs.contains($0.id) }.map(\.name)
+        let stale = row.peopleIDs.count - picked.count
+        return (picked + (stale > 0 ? [stale == 1 ? "Unknown person" : "\(stale) unknown people"] : []))
+            .joined(separator: ", ")
+    }
+
+    /// The Media row's picks as "Stills, RAW" — the picker's titles, with
+    /// "Other" for a kind the picker does not offer.
+    private func mediaLabel(for row: OrganizeFilterRow) -> String {
+        var titles = OrganizeSearchBar.mediaOptions
+            .filter { row.mediaKinds.contains($0.kind) }
+            .map(\.title)
+        if row.mediaKinds.contains(.other) { titles.append("Other") }
+        return titles.joined(separator: ", ")
+    }
+
+    /// The Date row's range as "Aug 26 – Aug 27", "from Aug 26", or
+    /// "through Aug 27" for an open bound.
+    private func dateLabel(for row: OrganizeFilterRow) -> String {
+        func day(_ date: Date) -> String { date.formatted(date: .abbreviated, time: .omitted) }
+        switch (row.dayStart, row.dayEnd) {
+        case let (start?, end?): return "\(day(start)) – \(day(end))"
+        case let (start?, nil): return "from \(day(start))"
+        case let (nil, end?): return "through \(day(end))"
+        case (nil, nil): return ""
+        }
+    }
+
+    /// The Event row's picks — each with a dot of its palette color, plus
+    /// the "Not Sorted Yet" pseudo-value and stale picks.
+    private func eventValueLabel(for row: OrganizeFilterRow) -> some View {
+        let events = workspace.sidebarEvents.map(\.event)
+        let picked = events.filter { row.eventIDs.contains($0.id) }
+        let stale = row.eventIDs.count - picked.count
+        return HStack(spacing: 4) {
+            if row.includesUnsorted {
+                Text("Not Sorted Yet")
+            }
+            ForEach(Array(picked.enumerated()), id: \.element.id) { index, event in
+                if index > 0 || row.includesUnsorted {
+                    Text(",")
+                }
+                Circle()
+                    .fill(EventPalette.color(for: event.id))
+                    .frame(width: 6, height: 6)
+                Text(workspace.eventTitle(event))
+                    .lineLimit(1)
+            }
+            if stale > 0 {
+                if !picked.isEmpty || row.includesUnsorted {
+                    Text(",")
+                }
+                Text(stale == 1 ? "Deleted event" : "\(stale) deleted events")
+            }
+        }
     }
 }
 

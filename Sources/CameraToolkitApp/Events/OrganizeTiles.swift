@@ -55,8 +55,9 @@ struct EventChip: View {
     }
 }
 
-/// A subevent's color on a photo. Just the dot — the name is the hover
-/// label, not text on the picture.
+/// A subevent's color mark — on a tile it sits under the title line, on a
+/// list row at the title's start. Just the dot — the name is the hover
+/// label, never text.
 struct EventTagCapsule: View {
     let event: SavedCameraEvent
 
@@ -237,8 +238,8 @@ struct StackTileView: View {
     /// Resolved private flag for `event` — a subevent can inherit the lock
     /// from a private parent, so the caller resolves it.
     var isPrivate: Bool? = nil
-    /// The owning subevent's color dot, drawn at the bottom right of the
-    /// photo. Nil hides it.
+    /// The owning subevent's color dot, drawn on its own line under the
+    /// title. Nil hides it.
     var tag: SavedCameraEvent? = nil
     let isMixed: Bool
     let isDimmed: Bool
@@ -316,14 +317,6 @@ struct StackTileView: View {
                 }
                 .padding(6)
             }
-            .overlay(alignment: .bottomTrailing) {
-                if let tag {
-                    EventTagCapsule(event: tag)
-                        .fixedSize()
-                        .padding(6)
-                        .allowsHitTesting(false)
-                }
-            }
             .frame(width: width, height: width * 2 / 3)
             .background(Color.black.opacity(0.12))
             .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
@@ -343,6 +336,10 @@ struct StackTileView: View {
             .font(.caption)
             .foregroundStyle(.secondary)
             .frame(width: width, alignment: .leading)
+
+            if let tag {
+                EventTagCapsule(event: tag)
+            }
         }
         .opacity(isDimmed ? 0.45 : 1)
         .contentShape(Rectangle())
@@ -426,8 +423,8 @@ struct StackRowView: View {
     let isExpanded: Bool
     let event: SavedCameraEvent?
     var isPrivate: Bool? = nil
-    /// The owning subevent's color dot, after the burst label on a list
-    /// row. Nil hides it.
+    /// The owning subevent's color dot, at the start of the title line on
+    /// a list row. Nil hides it.
     var tag: SavedCameraEvent? = nil
     let isMixed: Bool
     let isDimmed: Bool
@@ -450,6 +447,9 @@ struct StackRowView: View {
 
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
+                    if let tag {
+                        EventTagCapsule(event: tag)
+                    }
                     if stack.isBurst {
                         Image(systemName: "square.stack.3d.down.right.fill")
                             .foregroundStyle(.secondary)
@@ -458,9 +458,6 @@ struct StackRowView: View {
                         .font(.callout.weight(.medium))
                         .lineLimit(1)
                         .truncationMode(.middle)
-                    if let tag {
-                        EventTagCapsule(event: tag)
-                    }
                     if isMixed {
                         Label("Mixed", systemImage: "square.split.2x1")
                             .font(.caption2.weight(.semibold))

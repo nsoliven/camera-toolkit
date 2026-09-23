@@ -285,6 +285,13 @@ struct EventBoardView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
+        if !workspace.search.rowsWithValues.isEmpty {
+            OrganizeFilterHotLinks(
+                workspace: workspace,
+                stacks: workspace.eventStacks[eventID] ?? [],
+                search: $workspace.search
+            )
+        }
         }
         .padding(16)
         .onChange(of: eventID) { _, _ in showAllPeople = false }

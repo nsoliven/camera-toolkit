@@ -366,6 +366,90 @@ final class OrganizeSearchTests: XCTestCase {
         XCTAssertFalse(matches(stack, search: search, facts: OrganizeStackFacts(personIDs: [person])))
     }
 
+    // MARK: - Pausing rows
+
+    func testPausedRowStopsMatchingWithoutDeletingIt() {
+        let stack = OrganizeStack(items: [item("/Card/DSC00001.ARW")])
+        let dad = UUID()
+        let stranger = UUID()
+
+        var search = filter([[.people([dad])]])
+        let rowID = search.groups[0].rows[0].id
+        XCTAssertTrue(matches(stack, search: search, facts: OrganizeStackFacts(personIDs: [dad])))
+        XCTAssertFalse(matches(stack, search: search, facts: OrganizeStackFacts(personIDs: [stranger])))
+
+        // Off: the row keeps its picks and its seat but stops filtering —
+        // the board and the "N of M" count read the search as unfiltered.
+        search.toggleRow(rowID)
+        XCTAssertFalse(search.groups[0].rows[0].isEnabled)
+        XCTAssertEqual(search.groups[0].rows.count, 1)
+        XCTAssertEqual(search.groups[0].rows[0].peopleIDs, [dad])
+        XCTAssertTrue(matches(stack, search: search, facts: OrganizeStackFacts(personIDs: [stranger])))
+        XCTAssertTrue(matches(stack, search: search, facts: OrganizeStackFacts()))
+        XCTAssertTrue(search.isEmpty)
+        XCTAssertFalse(search.hasActiveConditions)
+        XCTAssertEqual(search.activeRowCount, 0)
+        XCTAssertFalse(search.needsPeople)
+        // The row still exists, so Clear All still has something to clear.
+        XCTAssertFalse(search.isUntouched)
+        // A paused row stays a hot link — only valueless rows drop out.
+        XCTAssertEqual(search.rowsWithValues.count, 1)
+
+        // Back on: the same row filters again.
+        search.toggleRow(rowID)
+        XCTAssertTrue(search.groups[0].rows[0].isEnabled)
+        XCTAssertEqual(search.groups[0].rows.count, 1)
+        XCTAssertFalse(matches(stack, search: search, facts: OrganizeStackFacts(personIDs: [stranger])))
+        XCTAssertTrue(matches(stack, search: search, facts: OrganizeStackFacts(personIDs: [dad])))
+        XCTAssertTrue(search.hasActiveConditions)
+        XCTAssertEqual(search.activeRowCount, 1)
+        XCTAssertTrue(search.needsPeople)
+    }
+
+    func testPausedRowLeavesItsSiblingsFiltering() {
+        let sam = UUID()
+        let raw = OrganizeStack(items: [item("/Card/DSC00001.ARW", kind: .raw)])
+        let video = OrganizeStack(items: [item("/Card/C0001.MP4", kind: .video)])
+
+        // AND inside a group: pausing the media row leaves the people
+        // row deciding on its own.
+        var search = filter([[.people([sam]), .media([.video])]])
+        search.toggleRow(search.groups[0].rows[1].id)
+        XCTAssertTrue(matches(raw, search: search, facts: OrganizeStackFacts(personIDs: [sam])))
+        XCTAssertFalse(matches(raw, search: search, facts: OrganizeStackFacts()))
+        XCTAssertFalse(matches(video, search: search, facts: OrganizeStackFacts()))
+        XCTAssertTrue(search.hasActiveConditions)
+
+        // OR across groups: a group whose only row is paused drops out of
+        // the OR instead of widening the match.
+        search = filter([[.media([.video])], [.people([sam])]])
+        search.toggleRow(search.groups[1].rows[0].id)
+        XCTAssertEqual(search.groups.count, 2)
+        XCTAssertTrue(matches(video, search: search))
+        XCTAssertFalse(matches(raw, search: search, facts: OrganizeStackFacts(personIDs: [sam])))
+    }
+
+    func testPausedExclusionRowUnmarksTheSubeventChip() {
+        let child = UUID()
+        var search = OrganizeSearchFilter()
+        search.toggleEventExclusion(child)
+        XCTAssertEqual(search.excludedEventIDs, [child])
+
+        // Pausing the "is none of" row lifts the exclusion — the chip
+        // drops its outline — while the row and its pick survive.
+        search.toggleRow(search.groups[0].rows[0].id)
+        XCTAssertTrue(search.excludedEventIDs.isEmpty)
+        XCTAssertEqual(search.groups[0].rows[0].eventIDs, [child])
+        XCTAssertEqual(search.rowsWithValues.count, 1)
+
+        // Tapping the subevent chip again resumes the paused row rather
+        // than stacking a second one.
+        search.toggleEventExclusion(child)
+        XCTAssertEqual(search.excludedEventIDs, [child])
+        XCTAssertEqual(search.groups.flatMap(\.rows).count, 1)
+        XCTAssertTrue(search.groups[0].rows[0].isEnabled)
+    }
+
     // MARK: - Family scoping
 
     func testScopingEventRowsToAFamilyDropsOutsidePicks() {

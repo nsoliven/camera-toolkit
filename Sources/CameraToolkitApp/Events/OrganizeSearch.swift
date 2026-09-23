@@ -38,11 +38,18 @@ struct OrganizeSearchFilter: Equatable, Sendable {
         groups.reduce(0) { $0 + $1.rows.filter { !$0.isEmpty }.count }
     }
 
+    /// Every row carrying picks, in panel order — the board header's
+    /// hot-link chips. Paused rows stay listed (they draw as outlines);
+    /// a row with no values never chips.
+    var rowsWithValues: [OrganizeFilterRow] {
+        groups.flatMap(\.rows).filter(\.hasValues)
+    }
+
     /// Whether any row reads the face catalog — boards skip the
     /// people-by-stack index unless a People row is filtering.
     var needsPeople: Bool {
         groups.contains { group in
-            group.rows.contains { $0.property == .people && !$0.peopleIDs.isEmpty }
+            group.rows.contains { $0.property == .people && !$0.isEmpty }
         }
     }
 
@@ -67,11 +74,14 @@ struct OrganizeSearchFilter: Equatable, Sendable {
         return copy
     }
 
-    /// Event ids an "is none of" Event row excludes — a header chip's
-    /// outline state: the tag's photos are filtered out.
+    /// Event ids an enabled "is none of" Event row excludes — a header
+    /// chip's outline state: the tag's photos are filtered out. A paused
+    /// exclusion row keeps its picks but hides nothing, so it does not
+    /// mark the chip.
     var excludedEventIDs: Set<UUID> {
         groups.reduce(into: Set<UUID>()) { ids, group in
-            for row in group.rows where row.property == .event && row.operator == .noneOf {
+            for row in group.rows
+            where row.property == .event && row.operator == .noneOf && row.isEnabled {
                 ids.formUnion(row.eventIDs)
             }
         }
@@ -91,7 +101,7 @@ struct OrganizeSearchFilter: Equatable, Sendable {
                     groups[groupIndex].rows[rowIndex].eventIDs.remove(id)
                 }
                 groups[groupIndex].rows.removeAll {
-                    $0.property == .event && $0.operator == .noneOf && $0.isEmpty
+                    $0.property == .event && $0.operator == .noneOf && !$0.hasValues
                 }
             }
             groups.removeAll { $0.rows.isEmpty }
@@ -103,9 +113,23 @@ struct OrganizeSearchFilter: Equatable, Sendable {
                     $0.property == .event && $0.operator == .noneOf
                 }) {
                     groups[groupIndex].rows[rowIndex].eventIDs.insert(id)
+                    // A paused exclusion row resumes — the chip tap must
+                    // hide the tag's photos, not edit a suspended row.
+                    groups[groupIndex].rows[rowIndex].isEnabled = true
                 } else {
                     groups[groupIndex].rows.append(.events([id], operator: .noneOf))
                 }
+            }
+        }
+    }
+
+    /// Flips one row's `isEnabled` — the header hot links' tap: pause the
+    /// row without deleting its picks, tap again to resume filtering.
+    mutating func toggleRow(_ id: UUID) {
+        for groupIndex in groups.indices {
+            if let rowIndex = groups[groupIndex].rows.firstIndex(where: { $0.id == id }) {
+                groups[groupIndex].rows[rowIndex].isEnabled.toggle()
+                return
             }
         }
     }
@@ -180,6 +204,10 @@ struct OrganizeFilterRow: Equatable, Sendable, Identifiable {
     var id = UUID()
     var property: Property
     var `operator`: Operator = .anyOf
+    /// Whether the row filters. The board header's hot links flip this —
+    /// off keeps the row and its picks but suspends the match, and the
+    /// chip draws as an outline until tapped again.
+    var isEnabled = true
     /// Values for a People row — roster people or unnamed face groups.
     var peopleIDs: Set<UUID> = []
     /// Values for an Event row.
@@ -245,15 +273,21 @@ struct OrganizeFilterRow: Equatable, Sendable, Identifiable {
         return row
     }
 
-    /// A row carrying no values never filters — it sits in the panel
-    /// waiting for a pick.
-    var isEmpty: Bool {
+    /// The row holds at least one picked value — independent of
+    /// `isEnabled`, so a paused row still counts for chips and cleanup.
+    var hasValues: Bool {
         switch property {
-        case .people: peopleIDs.isEmpty
-        case .event: eventIDs.isEmpty && !includesUnsorted
-        case .media: mediaKinds.isEmpty
-        case .date: dayStart == nil && dayEnd == nil
+        case .people: !peopleIDs.isEmpty
+        case .event: !eventIDs.isEmpty || includesUnsorted
+        case .media: !mediaKinds.isEmpty
+        case .date: dayStart != nil || dayEnd != nil
         }
+    }
+
+    /// A row carrying no values — or switched off — never filters: it
+    /// sits in the panel waiting for a pick or a tap on its chip.
+    var isEmpty: Bool {
+        !isEnabled || !hasValues
     }
 
     /// Switching property starts the row over — the old values would
@@ -264,11 +298,12 @@ struct OrganizeFilterRow: Equatable, Sendable, Identifiable {
     }
 
     /// The row's test against one subject — boards pass a stack's facts,
-    /// the sidebar an event's. An empty row passes. "is any of" keeps a
-    /// subject sharing a pick, "is all of" keeps only a subject carrying
-    /// them all, "is none of" drops it on a shared pick, and "is not
-    /// all of" drops it only when it carries them all.
+    /// the sidebar an event's. An empty or switched-off row passes.
+    /// "is any of" keeps a subject sharing a pick, "is all of" keeps only
+    /// a subject carrying them all, "is none of" drops it on a shared
+    /// pick, and "is not all of" drops it only when it carries them all.
     func matches(subject: OrganizeFilterSubject, calendar: Calendar = .current) -> Bool {
+        guard isEnabled else { return true }
         switch property {
         case .people:
             guard !peopleIDs.isEmpty else { return true }
