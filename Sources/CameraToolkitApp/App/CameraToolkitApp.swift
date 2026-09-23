@@ -255,7 +255,7 @@ private final class CameraToolkitMainWindow: NSObject, NSWindowDelegate {
     func show(model: DashboardModel) {
         if let window {
             window.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
+            NSApp.activate()
             return
         }
 
@@ -263,6 +263,6 @@ private final class CameraToolkitMainWindow: NSObject, NSWindowDelegate {
         window.delegate = self
         self.window = window
         window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        NSApp.activate()
     }
 }

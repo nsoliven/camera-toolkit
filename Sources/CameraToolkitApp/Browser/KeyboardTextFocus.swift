@@ -4,9 +4,9 @@ import AppKit
 /// fire — Delete in a search field edits text, it does not trash or unsort
 /// the board's selection. During editing the first responder is usually
 /// the shared field editor (an `NSTextView`), so the check treats any text
-/// view or text field as "typing." Commands the field handles itself
-/// (⌘C, ⌘A, ⌘Z) are claimed by the field editor before menus run, so they
-/// stay with the field.
+/// view or text field as "typing." ⌘X/⌘C/⌘V reach the field through the
+/// nil-targeted Edit menu items, and the menu hands ⌘Z and ⌘A to the field
+/// while this is true (see `MainMenu`).
 enum KeyboardTextFocus {
     /// True when `responder` is a text editing view: an `NSTextView` —
     /// including the field editor that `NSTextField`, `NSSearchField`,
