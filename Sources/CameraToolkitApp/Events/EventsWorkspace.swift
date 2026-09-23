@@ -3449,7 +3449,11 @@ final class EventsWorkspace {
 
     /// Bumped whenever face rows change so people chips and the People
     /// window re-read the catalog.
-    private(set) var facesRevision = 0
+    private(set) var facesRevision = 0 {
+        // Face review writes only the catalog; let the debounced backup
+        // know a session is under way.
+        didSet { model.noteCatalogWrite() }
+    }
 
     @ObservationIgnored private var faceStoreInstance: FaceIndexStore?
     /// (facesRevision, configurationRevision, people by event) — rebuilt

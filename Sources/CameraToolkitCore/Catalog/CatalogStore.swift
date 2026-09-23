@@ -44,7 +44,7 @@ public struct CatalogStore {
 
     public func bootstrap(
         configuration: AppConfiguration,
-        createBackup: Bool = true,
+        createBackup: Bool = false,
         createLibraryFolders: Bool = true
     ) throws -> CatalogBootstrapReport {
         let folders = createLibraryFolders ? try ensureLibraryFolders(configuration: configuration) : []
@@ -324,24 +324,24 @@ public struct CatalogStore {
         return folders
     }
 
+    /// A verified backup through `CatalogBackupService` — the SQLite online
+    /// backup API, never a file copy — into a `Backups` folder beside the
+    /// catalog and the configured NAS folder. Returns the NAS copy when one
+    /// was made, the local set otherwise.
     private func backupIfConfigured(configuration: AppConfiguration) throws -> URL? {
-        let backupPath = configuration.catalogBackupFolderPath.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !backupPath.isEmpty, fileManager.fileExists(atPath: url.path) else {
-            return nil
+        let remotePath = configuration.catalogBackupFolderPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        let service = CatalogBackupService(
+            catalogURL: url,
+            configurationURL: nil,
+            localFolder: url.deletingLastPathComponent().appendingPathComponent("Backups", isDirectory: true),
+            remoteFolder: remotePath.isEmpty ? nil : URL(fileURLWithPath: remotePath, isDirectory: true)
+        )
+        let result = try service.backupNow(reason: .manual)
+        guard let local = result.catalogURL else { return nil }
+        if case .copied(let folder) = result.remote {
+            return folder.appendingPathComponent(local.lastPathComponent)
         }
-
-        let backupRoot = URL(fileURLWithPath: backupPath, isDirectory: true)
-        guard Self.configuredVolumeIsAvailable(for: backupRoot, fileManager: fileManager) else {
-            return nil
-        }
-        try fileManager.createDirectory(at: backupRoot, withIntermediateDirectories: true)
-        let stamp = Self.backupTimestamp()
-        let destination = backupRoot.appendingPathComponent("catalog-\(stamp).sqlite")
-        if fileManager.fileExists(atPath: destination.path) {
-            try fileManager.removeItem(at: destination)
-        }
-        try fileManager.copyItem(at: url, to: destination)
-        return destination
+        return local
     }
 
     private func execute(_ sql: String, database: OpaquePointer) throws {
@@ -581,15 +581,9 @@ public struct CatalogStore {
         ].joined(separator: "|")
     }
 
-    private static func backupTimestamp() -> String {
-        let formatter = DateFormatter()
-        formatter.calendar = Calendar(identifier: .gregorian)
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "yyyyMMdd-HHmmss"
-        return formatter.string(from: Date())
-    }
-
-    private static func configuredVolumeIsAvailable(for url: URL, fileManager: FileManager) -> Bool {
+    /// False when `url` sits under `/Volumes/<name>` and that volume is not
+    /// mounted — an offline NAS or drive is skipped, never recreated.
+    static func configuredVolumeIsAvailable(for url: URL, fileManager: FileManager = .default) -> Bool {
         let components = url.standardizedFileURL.pathComponents
         guard components.count >= 3, components[1] == "Volumes" else { return true }
         let mountURL = URL(fileURLWithPath: "/Volumes", isDirectory: true)

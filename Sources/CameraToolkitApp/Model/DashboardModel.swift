@@ -90,6 +90,9 @@ final class DashboardModel {
     var lastRefreshedAt: Date?
     var catalogReport: CatalogBootstrapReport?
     var catalogMessage: String = "Photo list has not been prepared yet."
+    /// Newest local/NAS backup times and the last failure, for Settings.
+    var catalogBackupSummary: CatalogBackupSummary?
+    var isBackingUpCatalog: Bool = false
     var transferQueue: TransferQueueSnapshot?
     var pendingTransferBatches: [PendingTransferBatch]
     var storageCapacityRevision: Int = 0
@@ -107,7 +110,7 @@ final class DashboardModel {
     var isSourceCleanupRunning: Bool {
         sourceCleanupJob?.state == .running || sourceCleanupJob?.state == .queued
     }
-    @ObservationIgnored private let configurationStore: ConfigurationStore
+    @ObservationIgnored let configurationStore: ConfigurationStore
     @ObservationIgnored private let transferQueueStore: TransferQueueStore
     @ObservationIgnored private let pendingTransferQueueStore: PendingTransferQueueStore
     @ObservationIgnored let secretStore = KeychainSecretStore(service: "org.cameratoolkit.CameraToolkit")
@@ -123,6 +126,9 @@ final class DashboardModel {
     @ObservationIgnored var configurationLoader: (@Sendable (URL, AppConfiguration) throws -> AppConfiguration)?
     @ObservationIgnored private var lastTransferQueuePersistence = Date.distantPast
     @ObservationIgnored private var lastStorageCapacityRefreshRequest = Date.distantPast
+    /// The debounced after-writes backup (see `noteCatalogWrite`).
+    @ObservationIgnored var catalogBackupDebounceTask: Task<Void, Never>?
+    @ObservationIgnored var lastCatalogBackupAt: Date?
 
     init(
         jobs: [JobSnapshot],
@@ -199,6 +205,7 @@ final class DashboardModel {
             loadActivityLog: true
         )
         model.scheduleCatalogSync(configuration: configuration)
+        model.scheduleLaunchCatalogBackup()
         return model
     }
 
@@ -374,19 +381,26 @@ extension DashboardModel {
         let snapshot = configuration
         let catalogURL = URL(fileURLWithPath: Self.expandedPath(snapshot.catalogDatabasePath))
         catalogMessage = "Preparing the local photo list in the background…"
+        let backupService = catalogBackupService(for: snapshot)
         catalogSyncTask = Task { @MainActor in
             let outcome = await Task.detached(priority: .utility) {
                 do {
-                    let report = try CatalogStore(url: catalogURL).bootstrap(
+                    var report = try CatalogStore(url: catalogURL).bootstrap(
                         configuration: snapshot,
-                        createBackup: createBackup
+                        createBackup: false
                     )
+                    if createBackup {
+                        // Same verified backup service as the automatic runs.
+                        let result = try backupService.backupNow(reason: .manual)
+                        report.backupPath = result.catalogURL?.path
+                    }
                     return (report: Optional(report), error: String?.none)
                 } catch {
                     return (report: CatalogBootstrapReport?.none, error: Optional(error.localizedDescription))
                 }
             }.value
             guard !Task.isCancelled else { return }
+            if createBackup { refreshCatalogBackupSummary() }
             if let report = outcome.report {
                 catalogReport = report
                 catalogMessage = "Photo list ready with \(report.storageLocationCount) saved place(s)."
@@ -1571,6 +1585,7 @@ extension DashboardModel {
         next.normalizeEventSelection()
         configuration = next
         configurationRevision &+= 1
+        noteCatalogWrite()
         scheduleConfigurationSave()
         scheduleCatalogSync(configuration: next)
     }
