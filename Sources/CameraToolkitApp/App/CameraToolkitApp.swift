@@ -4,7 +4,7 @@ import SwiftUI
 
 @main
 @MainActor
-final class CameraToolkitApplication: NSObject, NSApplicationDelegate, NSMenuItemValidation {
+final class CameraToolkitApplication: NSObject, NSApplicationDelegate, NSMenuItemValidation, MainMenuActions {
     private static var retainedDelegate: CameraToolkitApplication?
 
     private let model = CameraToolkitRuntime.model
@@ -16,7 +16,7 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate, NSMenuIte
         retainedDelegate = delegate
         application.delegate = delegate
         application.setActivationPolicy(.regular)
-        delegate.installMenu()
+        MainMenu.install(target: delegate)
         application.run()
     }
 
@@ -51,8 +51,10 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate, NSMenuIte
         alert.alertStyle = .warning
         alert.messageText = "A job is still running."
         alert.informativeText = "“\(job.note)” is \(job.progress.formatted(.percent.precision(.fractionLength(0)))) done. Quitting abandons it — no original files are at risk, but the job will have to be run again."
-        alert.addButton(withTitle: "Quit Anyway")
-        alert.addButton(withTitle: "Don't Quit")
+        let quit = alert.addButton(withTitle: "Quit Anyway")
+        quit.hasDestructiveAction = true
+        let stay = alert.addButton(withTitle: "Don't Quit")
+        stay.keyEquivalent = "\u{1b}"
         return alert.runModal() == .alertFirstButtonReturn ? .terminateNow : .terminateCancel
     }
 
@@ -69,263 +71,102 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate, NSMenuIte
         false
     }
 
-    private func installMenu() {
-        let mainMenu = NSMenu()
-
-        let appMenuItem = NSMenuItem()
-        mainMenu.addItem(appMenuItem)
-        let appMenu = NSMenu(title: "Camera Toolkit")
-        appMenuItem.submenu = appMenu
-
-        let aboutItem = NSMenuItem(
-            title: "About Camera Toolkit",
-            action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)),
-            keyEquivalent: ""
-        )
-        aboutItem.target = NSApp
-        appMenu.addItem(aboutItem)
-
-        appMenu.addItem(.separator())
-
-        let settingsItem = NSMenuItem(
-            title: "Settings…",
-            action: #selector(openSettings),
-            keyEquivalent: ","
-        )
-        settingsItem.target = self
-        appMenu.addItem(settingsItem)
-
-        appMenu.addItem(.separator())
-
-        let quitItem = NSMenuItem(
-            title: "Quit Camera Toolkit",
-            action: #selector(NSApplication.terminate(_:)),
-            keyEquivalent: "q"
-        )
-        quitItem.target = NSApp
-        appMenu.addItem(quitItem)
-
-        let fileMenuItem = NSMenuItem()
-        mainMenu.addItem(fileMenuItem)
-        let fileMenu = NSMenu(title: "File")
-        fileMenuItem.submenu = fileMenu
-        addBrowserCommand(
-            to: fileMenu,
-            title: "Open Selected Item",
-            command: .openSelection,
-            keyEquivalent: "o"
-        )
-        addBrowserCommand(
-            to: fileMenu,
-            title: "Preview Selected Photos",
-            command: .previewSelection,
-            keyEquivalent: "y"
-        )
-        fileMenu.addItem(.separator())
-        addBrowserCommand(
-            to: fileMenu,
-            title: "Reveal in Finder",
-            command: .revealSelection,
-            keyEquivalent: "r",
-            modifiers: [.command, .shift]
-        )
-        fileMenu.addItem(.separator())
-        addBrowserCommand(
-            to: fileMenu,
-            title: "Move to Trash…",
-            command: .moveSelectionToTrash,
-            keyEquivalent: "\u{8}"
-        )
-
-        let editMenuItem = NSMenuItem()
-        mainMenu.addItem(editMenuItem)
-        let editMenu = NSMenu(title: "Edit")
-        editMenuItem.submenu = editMenu
-        addBrowserCommand(
-            to: editMenu,
-            title: "Select All",
-            command: .selectAll,
-            keyEquivalent: "a"
-        )
-        editMenu.addItem(.separator())
-        addBrowserCommand(
-            to: editMenu,
-            title: "Find…",
-            command: .find,
-            keyEquivalent: "f"
-        )
-        editMenu.addItem(.separator())
-        let undoSortItem = NSMenuItem(
-            title: "Undo Sort",
-            action: #selector(undoSort),
-            keyEquivalent: "z"
-        )
-        undoSortItem.keyEquivalentModifierMask = [.command]
-        undoSortItem.target = self
-        editMenu.addItem(undoSortItem)
-
-        let viewMenuItem = NSMenuItem()
-        mainMenu.addItem(viewMenuItem)
-        let viewMenu = NSMenu(title: "View")
-        viewMenuItem.submenu = viewMenu
-
-        let sidebarItem = NSMenuItem(
-            title: "Toggle Sidebar",
-            action: #selector(toggleSidebar),
-            keyEquivalent: "b"
-        )
-        sidebarItem.keyEquivalentModifierMask = [.command]
-        sidebarItem.target = self
-        viewMenu.addItem(sidebarItem)
-
-        viewMenu.addItem(.separator())
-
-        let eventLibraryItem = NSMenuItem(
-            title: "Event Library…",
-            action: #selector(openEventLibrary),
-            keyEquivalent: "e"
-        )
-        eventLibraryItem.keyEquivalentModifierMask = [.command, .option]
-        eventLibraryItem.target = self
-        viewMenu.addItem(eventLibraryItem)
-
-        let peopleItem = NSMenuItem(
-            title: "People…",
-            action: #selector(openPeople),
-            keyEquivalent: "p"
-        )
-        peopleItem.keyEquivalentModifierMask = [.command, .option]
-        peopleItem.target = self
-        viewMenu.addItem(peopleItem)
-
-        let catalogInspectorItem = NSMenuItem(
-            title: "Photo List SQL Inspector…",
-            action: #selector(openCatalogInspector),
-            keyEquivalent: "i"
-        )
-        catalogInspectorItem.keyEquivalentModifierMask = [.command, .shift]
-        catalogInspectorItem.target = self
-        viewMenu.addItem(catalogInspectorItem)
-
-        viewMenu.addItem(.separator())
-
-        let refreshItem = NSMenuItem(
-            title: "Refresh All",
-            action: #selector(refreshAll),
-            keyEquivalent: "r"
-        )
-        refreshItem.keyEquivalentModifierMask = [.command]
-        refreshItem.target = self
-        viewMenu.addItem(refreshItem)
-
-        let windowMenuItem = NSMenuItem()
-        mainMenu.addItem(windowMenuItem)
-        let windowMenu = NSMenu(title: "Window")
-        windowMenuItem.submenu = windowMenu
-
-        let minimizeItem = NSMenuItem(
-            title: "Minimize",
-            action: #selector(NSWindow.performMiniaturize(_:)),
-            keyEquivalent: "m"
-        )
-        windowMenu.addItem(minimizeItem)
-
-        let zoomItem = NSMenuItem(
-            title: "Zoom",
-            action: #selector(NSWindow.performZoom(_:)),
-            keyEquivalent: ""
-        )
-        windowMenu.addItem(zoomItem)
-        windowMenu.addItem(.separator())
-
-        let mainWindowItem = NSMenuItem(
-            title: "Camera Toolkit",
-            action: #selector(openMainWindow),
-            keyEquivalent: "0"
-        )
-        mainWindowItem.target = self
-        windowMenu.addItem(mainWindowItem)
-
-        let transferQueueItem = NSMenuItem(
-            title: "Jobs…",
-            action: #selector(openTransferQueue),
-            keyEquivalent: "t"
-        )
-        transferQueueItem.keyEquivalentModifierMask = [.command, .option]
-        transferQueueItem.target = self
-        windowMenu.addItem(transferQueueItem)
-
-        let storageSpeedItem = NSMenuItem(
-            title: "Storage Speed Tests…",
-            action: #selector(openStorageSpeedTests),
-            keyEquivalent: ""
-        )
-        storageSpeedItem.target = self
-        windowMenu.addItem(storageSpeedItem)
-        NSApp.windowsMenu = windowMenu
-
-        let helpMenuItem = NSMenuItem()
-        mainMenu.addItem(helpMenuItem)
-        let helpMenu = NSMenu(title: "Help")
-        helpMenuItem.submenu = helpMenu
-
-        let shortcutsItem = NSMenuItem(
-            title: "Keyboard Shortcuts…",
-            action: #selector(openKeyboardShortcuts),
-            keyEquivalent: "k"
-        )
-        shortcutsItem.keyEquivalentModifierMask = [.command, .shift]
-        shortcutsItem.target = self
-        helpMenu.addItem(shortcutsItem)
-
-        let guideItem = NSMenuItem(
-            title: "Setup Guide…",
-            action: #selector(startSetupGuide),
-            keyEquivalent: ""
-        )
-        guideItem.target = self
-        helpMenu.addItem(guideItem)
-        NSApp.helpMenu = helpMenu
-
-        NSApp.mainMenu = mainMenu
-    }
-
-    private func addBrowserCommand(
-        to menu: NSMenu,
-        title: String,
-        command: BrowserCommand,
-        keyEquivalent: String,
-        modifiers: NSEvent.ModifierFlags = [.command]
-    ) {
-        let item = NSMenuItem(
-            title: title,
-            action: #selector(performBrowserCommand(_:)),
-            keyEquivalent: keyEquivalent
-        )
-        item.keyEquivalentModifierMask = modifiers
-        item.representedObject = command.rawValue
-        item.target = self
-        menu.addItem(item)
-    }
-
-    /// Every item targeted at the delegate is a board or app command, and
-    /// none may run while a text field owns typing — ⌘⌫ stays "delete to
-    /// here," not "Move to Trash." Commands the field handles itself (⌘C,
-    /// ⌘A, ⌘Z) are claimed by the field editor before menus are consulted;
-    /// disabling ours keeps them with the field either way.
+    /// Board-selection commands stay off while a text field owns typing —
+    /// ⌘⌫ in the search field deletes text, it does not trash the board's
+    /// selection — and act only when a window that answers them is key.
+    /// Undo and Select All belong to the field while typing and to the
+    /// board otherwise. Everything else (Settings, windows, sidebar) works
+    /// regardless of focus.
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
-        !KeyboardTextFocus.isTypingInTextField()
+        let typing = KeyboardTextFocus.isTypingInTextField()
+        let keyWindow = NSApp.keyWindow?.identifier?.rawValue
+        let boardIsKey = BrowserCommand.targetsMainWindow(keyWindowIdentifier: keyWindow)
+        let defaults = UserDefaults.standard
+        switch menuItem.action {
+        case #selector(performBrowserCommand(_:)):
+            return !typing && (boardIsKey || keyWindow == TrashWindowController.windowIdentifier)
+        case #selector(undoSortOrText(_:)):
+            menuItem.title = typing ? "Undo" : "Undo Sort"
+            return typing || (boardIsKey && CameraToolkitRuntime.workspace.canUndoSort)
+        case #selector(selectAllOnBoardOrText(_:)):
+            return typing || boardIsKey || keyWindow == TrashWindowController.windowIdentifier
+        case #selector(toggleSidebar(_:)):
+            menuItem.title = model.isSidebarCollapsed ? "Show Sidebar" : "Hide Sidebar"
+            return true
+        case #selector(toggleInspector(_:)):
+            menuItem.title = defaults.bool(forKey: MainMenu.DefaultsKey.showInspector) ? "Hide Inspector" : "Show Inspector"
+            return true
+        case #selector(showTiles(_:)):
+            menuItem.state = boardMode == .tiles ? .on : .off
+            return true
+        case #selector(showList(_:)):
+            menuItem.state = boardMode == .list ? .on : .off
+            return true
+        case #selector(toggleHideSorted(_:)):
+            menuItem.state = defaults.bool(forKey: MainMenu.DefaultsKey.hideSorted) ? .on : .off
+            return true
+        case #selector(zoomTilesIn(_:)), #selector(zoomTilesOut(_:)):
+            return !typing && boardMode == .tiles
+        default:
+            return true
+        }
     }
 
-    @objc private func openSettings() {
+    private var boardMode: OrganizeBoardMode {
+        UserDefaults.standard.string(forKey: MainMenu.DefaultsKey.boardMode).flatMap(OrganizeBoardMode.init(rawValue:)) ?? .tiles
+    }
+
+    @objc func openSettings(_ sender: Any?) {
         CameraToolkitConfigWindow.shared.show(model: model)
     }
 
-    @objc private func toggleSidebar() {
+    @objc func newEvent(_ sender: Any?) {
+        CameraToolkitMainWindow.shared.show(model: model)
+        CameraToolkitRuntime.workspace.requestNewEvent(from: nil)
+    }
+
+    @objc func addFolderOrCard(_ sender: Any?) {
+        CameraToolkitMainWindow.shared.show(model: model)
+        CameraToolkitRuntime.workspace.addUnsortedFolder()
+    }
+
+    @objc func toggleSidebar(_ sender: Any?) {
         model.toggleSidebar()
     }
 
-    @objc private func performBrowserCommand(_ sender: NSMenuItem) {
+    @objc func toggleInspector(_ sender: Any?) {
+        let defaults = UserDefaults.standard
+        defaults.set(!defaults.bool(forKey: MainMenu.DefaultsKey.showInspector), forKey: MainMenu.DefaultsKey.showInspector)
+    }
+
+    @objc func showTiles(_ sender: Any?) {
+        UserDefaults.standard.set(OrganizeBoardMode.tiles.rawValue, forKey: MainMenu.DefaultsKey.boardMode)
+    }
+
+    @objc func showList(_ sender: Any?) {
+        UserDefaults.standard.set(OrganizeBoardMode.list.rawValue, forKey: MainMenu.DefaultsKey.boardMode)
+    }
+
+    @objc func toggleHideSorted(_ sender: Any?) {
+        let defaults = UserDefaults.standard
+        defaults.set(!defaults.bool(forKey: MainMenu.DefaultsKey.hideSorted), forKey: MainMenu.DefaultsKey.hideSorted)
+    }
+
+    @objc func zoomTilesIn(_ sender: Any?) {
+        stepTileWidth(by: 1)
+    }
+
+    @objc func zoomTilesOut(_ sender: Any?) {
+        stepTileWidth(by: -1)
+    }
+
+    private func stepTileWidth(by direction: Double) {
+        let defaults = UserDefaults.standard
+        let current = defaults.object(forKey: MainMenu.DefaultsKey.tileWidth) as? Double ?? 220
+        defaults.set(MainMenu.steppedTileWidth(current, by: direction), forKey: MainMenu.DefaultsKey.tileWidth)
+    }
+
+    @objc func performBrowserCommand(_ sender: NSMenuItem) {
         guard !KeyboardTextFocus.isTypingInTextField(),
               let rawValue = sender.representedObject as? String,
               let command = BrowserCommand(rawValue: rawValue) else {
@@ -334,49 +175,67 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate, NSMenuIte
         BrowserCommand.post(command)
     }
 
-    @objc private func openKeyboardShortcuts() {
+    /// ⌘Z undoes typing in a field and the last sort everywhere else.
+    @objc func undoSortOrText(_ sender: Any?) {
+        if KeyboardTextFocus.isTypingInTextField() {
+            NSApp.sendAction(Selector(("undo:")), to: nil, from: sender)
+        } else {
+            NotificationCenter.default.post(name: .cameraToolkitUndoSort, object: nil)
+        }
+    }
+
+    /// ⌘A selects a field's text while typing and the board's stacks
+    /// everywhere else.
+    @objc func selectAllOnBoardOrText(_ sender: Any?) {
+        if KeyboardTextFocus.isTypingInTextField() {
+            NSApp.sendAction(#selector(NSResponder.selectAll(_:)), to: nil, from: sender)
+        } else {
+            BrowserCommand.post(.selectAll)
+        }
+    }
+
+    @objc func openKeyboardShortcuts(_ sender: Any?) {
         KeyboardShortcutsWindowController.shared.show()
     }
 
-    @objc private func startSetupGuide() {
+    @objc func startSetupGuide(_ sender: Any?) {
         CameraToolkitMainWindow.shared.show(model: model)
         CameraToolkitRuntime.workspace.startGuide()
     }
 
-    @objc private func undoSort() {
-        guard !KeyboardTextFocus.isTypingInTextField() else { return }
-        NotificationCenter.default.post(name: .cameraToolkitUndoSort, object: nil)
-    }
-
-    @objc private func openEventLibrary() {
+    @objc func openEventLibrary(_ sender: Any?) {
         EventLibraryWindowController.shared.show(model: model)
     }
 
-    @objc private func openPeople() {
+    @objc func openPeople(_ sender: Any?) {
         PeopleWindowController.shared.show(model: model, workspace: CameraToolkitRuntime.workspace)
     }
 
-    @objc private func openCatalogInspector() {
+    @objc func openTrash(_ sender: Any?) {
+        TrashWindowController.shared.show(model: model)
+    }
+
+    @objc func openCatalogInspector(_ sender: Any?) {
         CatalogInspectorWindowController.shared.show(model: model)
     }
 
-    @objc private func openMainWindow() {
+    @objc func openMainWindow(_ sender: Any?) {
         CameraToolkitMainWindow.shared.show(model: model)
     }
 
-    @objc private func openTransferQueue() {
+    @objc func openTransferQueue(_ sender: Any?) {
         TransferQueueWindowController.shared.show(model: model)
     }
 
-    @objc private func openStorageSpeedTests() {
+    @objc func openStorageSpeedTests(_ sender: Any?) {
         StorageBenchmarkWindowController.shared.show(model: model)
     }
 
     @objc private func handleTransferQueueRequest(_ notification: Notification) {
-        openTransferQueue()
+        openTransferQueue(nil)
     }
 
-    @objc private func refreshAll() {
+    @objc func refreshAll(_ sender: Any?) {
         model.refreshAll()
     }
 }

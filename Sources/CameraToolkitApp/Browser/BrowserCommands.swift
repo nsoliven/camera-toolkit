@@ -88,12 +88,14 @@ enum CameraToolkitShortcutCatalog {
             title: "Windows",
             symbol: "macwindow",
             shortcuts: [
-                .init(action: "Show or hide the sidebar", keys: "⌘B", detail: "Toggles the Organize sidebar."),
+                .init(action: "Show or hide the sidebar", keys: "⌃⌘S", detail: "Toggles the Organize sidebar; ⌘B also still works."),
+                .init(action: "Show or hide the inspector", keys: "⌥⌘I", detail: "Toggles the event's storage and info inspector."),
+                .init(action: "Bigger or smaller tiles", keys: "⌘+  ⌘−", detail: "Steps the tile size on the board."),
                 .init(action: "Main window", keys: "⌘0", detail: "Brings the organizer forward."),
                 .init(action: "Event Library", keys: "⌥⌘E", detail: "Shows event photos across their camera, buffer, library, and Immich locations."),
                 .init(action: "People", keys: "⌥⌘P", detail: "Shows the people the face index found and their events."),
                 .init(action: "Photo List SQL Inspector", keys: "⇧⌘I", detail: "Browses the SQLite photo list, schema, and read-only SQL queries."),
-                .init(action: "Jobs", keys: "⌥⌘T", detail: "Shows transfers, face scans, and other background jobs with progress and any problem."),
+                .init(action: "Jobs", keys: "⌥⌘J", detail: "Shows transfers, face scans, and other background jobs with progress and any problem."),
                 .init(action: "Settings", keys: "⌘,", detail: "Opens storage locations, cameras, and service settings."),
                 .init(action: "Keyboard shortcuts", keys: "⇧⌘K", detail: "Opens this shortcut reference window."),
             ]
