@@ -24,6 +24,20 @@ enum BrowserCommand: String, Sendable, CaseIterable {
     static func post(_ command: BrowserCommand) {
         NotificationCenter.default.post(name: notification, object: command.rawValue)
     }
+
+    static let mainWindowIdentifier = "CameraToolkitMainWindow"
+
+    /// Commands are a global notification, so a board must check that its
+    /// window is the key one — otherwise ⌘⌫ with Trash or People in front
+    /// would act on the main board's selection behind it.
+    static func targetsMainWindow(keyWindowIdentifier: String?) -> Bool {
+        keyWindowIdentifier == mainWindowIdentifier
+    }
+
+    @MainActor
+    static func targetsMainWindow() -> Bool {
+        targetsMainWindow(keyWindowIdentifier: NSApp.keyWindow?.identifier?.rawValue)
+    }
 }
 
 struct KeyboardShortcutReference: Identifiable, Equatable, Sendable {

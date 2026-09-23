@@ -411,7 +411,7 @@ private final class CameraToolkitMainWindow: NSObject, NSWindowDelegate {
             defer: false
         )
         window.title = "Camera Toolkit"
-        window.identifier = NSUserInterfaceItemIdentifier("CameraToolkitMainWindow")
+        window.identifier = NSUserInterfaceItemIdentifier(BrowserCommand.mainWindowIdentifier)
         window.isRestorable = false
         window.contentViewController = hostingController
         window.minSize = NSSize(width: 1040, height: 720)
