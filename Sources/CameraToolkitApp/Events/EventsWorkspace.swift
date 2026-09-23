@@ -323,6 +323,14 @@ final class EventsWorkspace {
         }
     }
     var guide: SetupGuide?
+    /// Bumped when keyboard focus should return to the open board's grid —
+    /// Return in the toolbar search field. The grid re-focuses itself when
+    /// it sees a new value.
+    private(set) var boardFocusRequest = 0
+
+    func requestBoardFocus() {
+        boardFocusRequest &+= 1
+    }
     var sources: [UUID: UnsortedSourceState] = [:]
     var selectedStackIDs: Set<String> = []
     var focusedStackID: String?

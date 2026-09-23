@@ -1,6 +1,21 @@
 import CameraToolkitCore
 import Foundation
 
+/// What the window's one search field searches. The board scope filters
+/// the open board's stacks (`OrganizeSearchFilter.text`); the sidebar scope
+/// narrows the sidebar's folders and events instead, so a file-name query
+/// never empties the sidebar and hides the selected row.
+enum OrganizeSearchScope: String, Hashable, Sendable {
+    case board
+    case sidebar
+
+    /// The scope a fresh search starts in: the open board, or the sidebar
+    /// when no board is open (the welcome view).
+    static func defaultScope(hasBoard: Bool) -> OrganizeSearchScope {
+        hasBoard ? .board : .sidebar
+    }
+}
+
 /// The structured filters behind the board's search field — the builder
 /// panel that opens under it. Conditions are rows grouped into
 /// conjunctions: every non-empty row in a group must match, and a stack

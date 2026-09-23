@@ -18,6 +18,44 @@ struct EventsRootView: View {
     /// offset that turns later measurements back into column widths.
     @State private var sidebarWidthInset: Double?
 
+    /// The window's one search field. In the board scope its text is the
+    /// open board's `workspace.search.text`; in the sidebar scope it
+    /// narrows the sidebar's folders and events.
+    @State private var searchScope: OrganizeSearchScope
+    @State private var sidebarQuery = ""
+    @FocusState private var searchFocused: Bool
+
+    init(model: DashboardModel, workspace: EventsWorkspace) {
+        self.model = model
+        self.workspace = workspace
+        _searchScope = State(initialValue: .defaultScope(hasBoard: workspace.selection != nil))
+    }
+
+    private var searchText: Binding<String> {
+        Binding(
+            get: { searchScope == .board ? workspace.search.text : sidebarQuery },
+            set: { text in
+                if searchScope == .board {
+                    workspace.search.text = text
+                } else {
+                    sidebarQuery = text
+                }
+            }
+        )
+    }
+
+    private var searchPrompt: String {
+        guard searchScope == .board else { return "Search Events & Folders" }
+        switch workspace.selection {
+        case .event(let id):
+            return workspace.event(id).map { "Search \(workspace.eventTitle($0))" } ?? "Search"
+        case .unsorted(let id):
+            return workspace.location(id).map { "Search \($0.name)" } ?? "Search"
+        case nil:
+            return "Search"
+        }
+    }
+
     /// ⌘B, the View menu, and the toolbar's sidebar button all flow through
     /// `isSidebarCollapsed`, so the menu stays deterministic.
     private var columnVisibility: Binding<NavigationSplitViewVisibility> {
@@ -30,7 +68,7 @@ struct EventsRootView: View {
     var body: some View {
         let panelAlignment: Alignment = (workspace.guide?.step.prefersTop ?? false) ? .topTrailing : .bottomTrailing
         NavigationSplitView(columnVisibility: columnVisibility) {
-            EventsSidebar(model: model, workspace: workspace)
+            EventsSidebar(model: model, workspace: workspace, query: searchScope == .sidebar ? sidebarQuery : "")
                 .onGeometryChange(for: Double.self) { $0.size.width.rounded() } action: { width in
                     measuredSidebarWidth = width
                 }
@@ -46,6 +84,45 @@ struct EventsRootView: View {
             detail
                 .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity)
                 .clipped()
+                // On the detail column, outside the per-board `.id`, so the
+                // field keeps its text and focus across selection changes
+                // and each board's toolbar can place it.
+                .searchable(text: searchText, placement: .toolbar, prompt: Text(searchPrompt))
+                .searchScopes($searchScope, activation: .onSearchPresentation) {
+                    Text("This Board").tag(OrganizeSearchScope.board)
+                    Text("Events & Folders").tag(OrganizeSearchScope.sidebar)
+                }
+                .searchFocused($searchFocused)
+        }
+        // Return hands the keyboard back to the board.
+        .onSubmit(of: .search) {
+            searchFocused = false
+            workspace.requestBoardFocus()
+        }
+        // Switching scope carries the typed text over to the new target.
+        .onChange(of: searchScope) { oldScope, newScope in
+            let text = oldScope == .board ? workspace.search.text : sidebarQuery
+            if newScope == .board {
+                sidebarQuery = ""
+                workspace.search.text = text
+            } else {
+                workspace.search.text = ""
+                sidebarQuery = text
+            }
+        }
+        // No board open: search the sidebar. Opening a board with an empty
+        // field returns to searching the board.
+        .onChange(of: workspace.selection) { _, selection in
+            if selection == nil {
+                searchScope = .sidebar
+            } else if searchText.wrappedValue.isEmpty {
+                searchScope = .board
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: BrowserCommand.notification)) { notification in
+            guard notification.object as? String == BrowserCommand.find.rawValue,
+                  BrowserCommand.targetsMainWindow() else { return }
+            searchFocused = true
         }
         // Debounced write-back of a dragged width — never a body side effect.
         .task(id: measuredSidebarWidth) {
@@ -189,8 +266,9 @@ struct EventsRootView: View {
 struct EventsSidebar: View {
     @Bindable var model: DashboardModel
     @Bindable var workspace: EventsWorkspace
+    /// The window search's text while it is scoped to Events & Folders.
+    var query: String = ""
     @State private var targetedEventID: UUID?
-    @State private var searchText = ""
     @AppStorage("CameraToolkit.organize.sidebar.unsortedExpanded") private var unsortedExpanded = true
     @AppStorage("CameraToolkit.organize.sidebar.eventsExpanded") private var eventsExpanded = true
 
@@ -203,10 +281,10 @@ struct EventsSidebar: View {
     @State private var listSelection: EventsSidebarSelection?
 
     var body: some View {
-        let locations = workspace.unsortedLocations(matching: searchText)
+        let locations = workspace.unsortedLocations(matching: query)
         let hasLocations = !workspace.unsortedLocations.isEmpty
         List(selection: $listSelection) {
-            let discovered = workspace.discoveredDriveEvents(matching: searchText)
+            let discovered = workspace.discoveredDriveEvents(matching: query)
             if !discovered.isEmpty {
                 Section("Found on Your Drive") {
                     discoveryBanner(discovered)
@@ -266,7 +344,7 @@ struct EventsSidebar: View {
                 }
                 // Parents newest-first; each subevent sits indented under
                 // its parent.
-                ForEach(workspace.sidebarRows(matching: searchText, applying: workspace.search), id: \.event.id) { row in
+                ForEach(workspace.sidebarRows(matching: query, applying: workspace.search), id: \.event.id) { row in
                     eventRow(row.event, depth: row.depth)
                         .tag(EventsSidebarSelection.event(row.event.id))
                         .contentShape(Rectangle())
@@ -305,7 +383,6 @@ struct EventsSidebar: View {
         .safeAreaBar(edge: .bottom) {
             SidebarFooter(model: model, workspace: workspace)
         }
-        .searchable(text: $searchText, placement: .sidebar, prompt: "Search")
     }
 
     private func discoveryBanner(_ found: [DiscoveredDriveEvent]) -> some View {
@@ -575,6 +652,7 @@ struct EventsWelcomeView: View {
             .padding(.horizontal, 40)
             .frame(maxWidth: .infinity)
         }
+        .navigationTitle("Camera Toolkit")
     }
 }
 

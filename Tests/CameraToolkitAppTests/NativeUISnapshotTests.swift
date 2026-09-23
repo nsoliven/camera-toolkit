@@ -41,6 +41,11 @@ final class NativeUISnapshotTests: XCTestCase {
             try await snapshot(window, size: NSSize(width: 1320, height: 840), name: "main-event-board-\(suffix)")
             try await snapshot(window, size: NSSize(width: 1040, height: 720), name: "main-event-board-narrow-\(suffix)")
 
+            // A search narrowing the board: "N of M" in the title capsule.
+            workspace.search.text = "DSC0000"
+            try await snapshot(window, size: NSSize(width: 1320, height: 840), name: "main-event-board-search-\(suffix)")
+            workspace.search.text = ""
+
             workspace.selection = .unsorted(unsorted.id)
             try await waitUntil { self.workspace.sources[self.unsorted.id]?.result != nil }
             try await snapshot(window, size: NSSize(width: 1320, height: 840), name: "main-unsorted-board-\(suffix)")
