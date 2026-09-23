@@ -115,6 +115,7 @@ struct ConfigView: View {
                     }
                 )
                 Button("Prepare Photo List") { model.prepareLibraryCatalog() }
+                CatalogBackupStatusRow(model: model)
             }
 
             LocationSettingsSection(
@@ -338,6 +339,34 @@ struct ConfigView: View {
         .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didUnmountNotification)) { _ in
             placeStatusRevision &+= 1
         }
+    }
+}
+
+/// "Last backup: 2 hours ago, local and NAS", a warning when backups are
+/// stale or failing, and Back Up Now.
+private struct CatalogBackupStatusRow: View {
+    @Bindable var model: DashboardModel
+
+    var body: some View {
+        LabeledContent("Backups") {
+            VStack(alignment: .trailing, spacing: 4) {
+                HStack {
+                    Text(DashboardModel.catalogBackupDescription(model.catalogBackupSummary))
+                        .foregroundStyle(.secondary)
+                    Button(model.isBackingUpCatalog ? "Backing Up…" : "Back Up Now") {
+                        model.backUpCatalogNow()
+                    }
+                    .disabled(model.isBackingUpCatalog)
+                    Button("Restore Face Labels…") { model.restoreFaceLabelsFromBackup() }
+                }
+                if let warning = DashboardModel.catalogBackupWarning(model.catalogBackupSummary) {
+                    Label(warning, systemImage: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                        .font(.callout)
+                }
+            }
+        }
+        .onAppear { model.refreshCatalogBackupSummary() }
     }
 }
 

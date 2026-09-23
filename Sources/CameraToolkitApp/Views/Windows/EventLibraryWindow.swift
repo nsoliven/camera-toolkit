@@ -462,6 +462,9 @@ private struct EventLibraryView: View {
         let refreshID = UUID()
         activeRefreshID = refreshID
         customAlbumName = event.immichAlbumName ?? ""
+        // Presence rows written below reference the catalog's assignment
+        // rows; make sure recent edits have reached it.
+        model.persistCatalogStateNow()
         let configuration = model.configuration
         let configuredAssignments = configuration.photoEventAssignments.filter { $0.eventID == event.id }
         // Metadata is cheap and local. Put selectable rows on screen before any

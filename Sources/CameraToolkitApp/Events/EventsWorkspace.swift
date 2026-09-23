@@ -443,12 +443,27 @@ final class EventsWorkspace {
         self.model = model
         self.supportFolder = supportFolder
         self.driveActivityGate = driveActivityGate
+        // A face-label restore from Settings rewrites face rows behind the
+        // workspace; re-read people like after any other face change.
+        let observer = NotificationCenter.default.addObserver(
+            forName: .cameraToolkitFaceLabelsRestored,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.facesRevision &+= 1 }
+        }
+        faceLabelsRestoredObserver.observers = [observer]
     }
+
+    @ObservationIgnored private let faceLabelsRestoredObserver = MountObserverBox()
 
     deinit {
         let center = NSWorkspace.shared.notificationCenter
         for observer in mountObservers.observers {
             center.removeObserver(observer)
+        }
+        for observer in faceLabelsRestoredObserver.observers {
+            NotificationCenter.default.removeObserver(observer)
         }
     }
 
@@ -3380,6 +3395,8 @@ final class EventsWorkspace {
                 : "Turn on Send to Immich for \(eventTitle(event)) first."
             return
         }
+        // The Immich status rows reference the catalog's assignment rows.
+        model.persistCatalogStateNow()
         let catalogURL = URL(fileURLWithPath: DashboardModel.expandedPath(model.configuration.catalogDatabasePath))
         let configuration = model.configuration
 
@@ -3468,7 +3485,11 @@ final class EventsWorkspace {
 
     /// Bumped whenever face rows change so people chips and the People
     /// window re-read the catalog.
-    private(set) var facesRevision = 0
+    private(set) var facesRevision = 0 {
+        // Face review writes only the catalog; let the debounced backup
+        // know a session is under way.
+        didSet { model.noteCatalogWrite() }
+    }
 
     @ObservationIgnored private var faceStoreInstance: FaceIndexStore?
     /// (facesRevision, configurationRevision, people by event) — rebuilt

@@ -121,6 +121,48 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         case privateStagingPath
         case burstSplits
         case displayOrientations
+        /// Present (true) in a settings-only file: events, assignments,
+        /// display rotations, and burst splits live in the catalog.
+        case catalogOwnsEventState
+    }
+
+    /// `JSONEncoder.userInfo` flag: encode settings only, leaving out the
+    /// state the catalog owns (`CatalogOwnedState`) and writing the
+    /// `catalogOwnsEventState` marker instead.
+    public static let settingsOnlyUserInfoKey = CodingUserInfoKey(rawValue: "CameraToolkit.settingsOnly")!
+
+    public func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(demoRootPath, forKey: .demoRootPath)
+        try values.encode(importSourcePath, forKey: .importSourcePath)
+        try values.encode(archivePath, forKey: .archivePath)
+        try values.encode(bufferPath, forKey: .bufferPath)
+        try values.encode(cameraLibraryRootPath, forKey: .cameraLibraryRootPath)
+        try values.encode(catalogDatabasePath, forKey: .catalogDatabasePath)
+        try values.encode(catalogBackupFolderPath, forKey: .catalogBackupFolderPath)
+        try values.encode(configuredLocations, forKey: .configuredLocations)
+        try values.encodeIfPresent(selectedImportSourceID, forKey: .selectedImportSourceID)
+        try values.encodeIfPresent(selectedArchiveID, forKey: .selectedArchiveID)
+        try values.encodeIfPresent(selectedBufferID, forKey: .selectedBufferID)
+        try values.encode(activityLogPath, forKey: .activityLogPath)
+        try values.encode(immichServerURL, forKey: .immichServerURL)
+        try values.encode(trueNASServerURL, forKey: .trueNASServerURL)
+        try values.encode(trueNASUsername, forKey: .trueNASUsername)
+        try values.encode(trueNASDataset, forKey: .trueNASDataset)
+        try values.encode(trueNASTLSPinnedCertificateSHA256, forKey: .trueNASTLSPinnedCertificateSHA256)
+        try values.encode(selectedDeviceID, forKey: .selectedDeviceID)
+        try values.encode(eventName, forKey: .eventName)
+        try values.encode(batchID, forKey: .batchID)
+        try values.encodeIfPresent(selectedEventID, forKey: .selectedEventID)
+        try values.encode(privateStagingPath, forKey: .privateStagingPath)
+        if encoder.userInfo[Self.settingsOnlyUserInfoKey] as? Bool == true {
+            try values.encode(true, forKey: .catalogOwnsEventState)
+        } else {
+            try values.encode(savedEvents, forKey: .savedEvents)
+            try values.encode(photoEventAssignments, forKey: .photoEventAssignments)
+            try values.encode(burstSplits, forKey: .burstSplits)
+            try values.encode(displayOrientations, forKey: .displayOrientations)
+        }
     }
 
     public init(from decoder: Decoder) throws {
@@ -159,7 +201,13 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         burstSplits = try values.decodeIfPresent([BurstSplit].self, forKey: .burstSplits) ?? []
         displayOrientations = try values.decodeIfPresent([String: Int].self, forKey: .displayOrientations) ?? [:]
         normalizeLocationSelections()
-        normalizeEventSelection()
+        // A settings-only file has no events to validate the selection
+        // against; it is normalized once the catalog's events are laid
+        // back on (`CatalogOwnedState.apply(to:)`). Normalizing here would
+        // clear the selection or invent an event from `eventName`.
+        if try values.decodeIfPresent(Bool.self, forKey: .catalogOwnsEventState) != true {
+            normalizeEventSelection()
+        }
     }
 
     public static func defaults(applicationSupport: URL) -> AppConfiguration {
@@ -806,11 +854,27 @@ public struct ConfigurationStore {
         return try JSONDecoder().decode(AppConfiguration.self, from: data)
     }
 
-    public func save(_ configuration: AppConfiguration) throws {
+    /// Writes the configuration atomically. `settingsOnly` leaves out the
+    /// events, assignments, rotations, and burst splits once the catalog
+    /// owns them (see `CatalogStateStore`).
+    public func save(_ configuration: AppConfiguration, settingsOnly: Bool = false) throws {
         try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Self.encode(configuration, settingsOnly: settingsOnly).write(to: url, options: .atomic)
+    }
+
+    public static func encode(_ configuration: AppConfiguration, settingsOnly: Bool = false) throws -> Data {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        let data = try encoder.encode(configuration)
-        try data.write(to: url, options: .atomic)
+        if settingsOnly {
+            encoder.userInfo[AppConfiguration.settingsOnlyUserInfoKey] = true
+        }
+        return try encoder.encode(configuration)
+    }
+
+    /// True when `data` is a settings-only file written after the catalog
+    /// took over events and assignments.
+    public static func isSettingsOnly(_ data: Data) -> Bool {
+        struct Marker: Decodable { var catalogOwnsEventState: Bool? }
+        return (try? JSONDecoder().decode(Marker.self, from: data))?.catalogOwnsEventState == true
     }
 }

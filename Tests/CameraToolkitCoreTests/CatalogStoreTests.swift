@@ -122,10 +122,15 @@ final class CatalogStoreTests: XCTestCase {
             ]
             configuration.normalizeLocationSelections()
 
-            let report = try CatalogStore(url: catalog).bootstrap(configuration: configuration)
+            let report = try CatalogStore(url: catalog).bootstrap(configuration: configuration, createBackup: true)
 
             XCTAssertTrue(FileManager.default.fileExists(atPath: catalog.path))
             XCTAssertEqual(report.storageLocationCount, 3)
+            XCTAssertEqual(
+                URL(fileURLWithPath: report.backupPath ?? "").deletingLastPathComponent().standardizedFileURL,
+                backupRoot.standardizedFileURL,
+                "a mounted backup folder receives the verified copy"
+            )
             XCTAssertNotNil(report.backupPath)
             XCTAssertTrue(FileManager.default.fileExists(atPath: report.backupPath ?? ""))
             for folder in CameraLibraryFolder.allCases {

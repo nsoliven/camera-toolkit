@@ -14,6 +14,10 @@ Multiple locations can be saved for each role. Selecting a different source does
 
 The app stores configuration, activity history, and the SQLite photo list under the current user's Application Support directory unless those paths are changed in Settings.
 
+- `config.json` holds settings. Events, photo assignments, display rotations, and burst splits live in the photo list (`catalog.sqlite`), together with people and face labels. The first launch after upgrading moves them out of an older `config.json` and keeps a `config.pre-sqlite-<date>.json` copy of the original.
+- `Backups/` holds verified backup sets (`ctbackup-<date>.*`): the photo list, its face labels as JSON, `config.json`, and a manifest. The same sets are copied to the Settings backup folder on the NAS when it is mounted. Settings shows the last backup and offers **Back Up Now** and **Restore Face Labels…**.
+- Restore the photo list and `config.json` from the same backup set; the app refuses to save when they do not belong together.
+
 Immich and TrueNAS API keys are stored in macOS Keychain under the Camera Toolkit service. They are not written into JSON, SQLite, logs, or manifests.
 
 ## TrueNAS capacity

@@ -44,25 +44,133 @@ public struct CatalogStore {
 
     public func bootstrap(
         configuration: AppConfiguration,
-        createBackup: Bool = true,
+        createBackup: Bool = false,
         createLibraryFolders: Bool = true
     ) throws -> CatalogBootstrapReport {
         let folders = createLibraryFolders ? try ensureLibraryFolders(configuration: configuration) : []
         try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
 
+        let database = try openConnection()
+        defer { sqlite3_close(database) }
+        try prepareSchema(database: database)
+
+        // The whole bootstrap transaction — BEGIN IMMEDIATE through
+        // COMMIT — retries a transient BUSY/IOERR with a short backoff:
+        // on a network volume a lock stutter surfaces as SQLITE_IOERR
+        // (10), not a clean busy. A failure that outlasts the retries is
+        // rethrown with the real SQLite message. Every attempt starts
+        // clean because the previous one rolled back.
+        try CatalogTransactionRetry.run(isTransient: Self.isTransientSQLiteError) {
+            try execute("BEGIN IMMEDIATE;", database: database)
+            do {
+                try upsertAppState("cameraLibraryRootPath", value: configuration.cameraLibraryRootPath, database: database)
+                try upsertAppState("archivePath", value: configuration.archivePath, database: database)
+                try upsertAppState("bufferPath", value: configuration.bufferPath, database: database)
+                try upsertAppState("catalogBackupFolderPath", value: configuration.catalogBackupFolderPath, database: database)
+
+                for folder in CameraLibraryFolder.allCases {
+                    try upsertLibraryFolder(folder, path: configuration.libraryFolderPath(folder).path, database: database)
+                }
+
+                for location in configuration.configuredLocations {
+                    let selected = configuration.selectedLocationID(for: location.role) == location.id
+                    try upsertStorageLocation(location, selected: selected, database: database)
+                }
+
+                // Once the catalog owns events and assignments
+                // (`CatalogStateStore`), they are written row by row as they
+                // change; mirroring a configuration snapshot here would
+                // overwrite newer rows with an older copy.
+                // A configuration without any event or assignment never
+                // empties the mirror either: that is what an unreadable or
+                // settings-only config.json looks like, not a user edit.
+                let hasEventState = !configuration.savedEvents.isEmpty || !configuration.photoEventAssignments.isEmpty
+                if hasEventState, try !Self.catalogOwnsEventState(database: database) {
+                    try synchronizeEvents(configuration: configuration, database: database)
+                }
+                try execute("COMMIT;", database: database)
+            } catch {
+                try? execute("ROLLBACK;", database: database)
+                throw error
+            }
+        }
+
+        let backupURL = createBackup ? try backupIfConfigured(configuration: configuration) : nil
+        return CatalogBootstrapReport(
+            databasePath: url.path,
+            backupPath: backupURL?.path,
+            libraryFolders: folders.map(\.path),
+            storageLocationCount: configuration.configuredLocations.count
+        )
+    }
+
+    /// Creates or upgrades the catalog schema without writing any rows —
+    /// what `CatalogStateStore` needs before it reads or migrates.
+    public func prepareSchema() throws {
+        try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let database = try openConnection()
+        defer { sqlite3_close(database) }
+        try prepareSchema(database: database)
+    }
+
+    private func openConnection() throws -> OpaquePointer {
         var database: OpaquePointer?
         guard sqlite3_open(url.path, &database) == SQLITE_OK, let database else {
             let message = database.map { String(cString: sqlite3_errmsg($0)) } ?? "Unable to open database"
+            sqlite3_close(database)
             throw ToolkitError.commandFailed("Could not open catalog database: \(message)")
         }
-        defer { sqlite3_close(database) }
-        // Catalog work always runs away from the main actor. A short wait is
-        // preferable to dropping a cache update when a read-only inspector has
-        // the local database open for a moment.
-        sqlite3_busy_timeout(database, 5_000)
+        // Catalog work always runs away from the main actor. The shared
+        // pragmas give this short-lived handle the same busy timeout, WAL
+        // journal, and foreign keys as the app's shared connection, so a
+        // bootstrap waits briefly for another writer instead of failing.
+        CatalogDatabase.configureRawConnection(database, url: url)
+        return database
+    }
 
+    /// Schema creation and column grafts commit as one transaction: a
+    /// crash part-way leaves the previous schema, never half of one.
+    private func prepareSchema(database: OpaquePointer) throws {
+        try CatalogTransactionRetry.run(isTransient: Self.isTransientSQLiteError) {
+            try execute("BEGIN IMMEDIATE;", database: database)
+            do {
+                try createSchema(database: database)
+                try execute("COMMIT;", database: database)
+            } catch {
+                try? execute("ROLLBACK;", database: database)
+                throw error
+            }
+        }
+    }
+
+    /// True once `CatalogStateStore` migrated events and assignments into
+    /// the catalog and made it their only durable home.
+    static func catalogOwnsEventState(database: OpaquePointer) throws -> Bool {
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(
+            database,
+            "SELECT value FROM app_state WHERE key = '\(CatalogStateStore.ownershipKey)';",
+            -1,
+            &statement,
+            nil
+        ) == SQLITE_OK, let statement else {
+            throw SQLiteError(
+                code: sqlite3_errcode(database),
+                message: "Could not read catalog state: \(String(cString: sqlite3_errmsg(database)))"
+            )
+        }
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_step(statement) == SQLITE_ROW, let text = sqlite3_column_text(statement, 0) else {
+            return false
+        }
+        return String(cString: text) == CatalogStateStore.ownershipValue
+    }
+
+    /// Creates every catalog table and index and grafts the columns added
+    /// after the first catalogs shipped. Runs inside bootstrap's schema
+    /// transaction.
+    private func createSchema(database: OpaquePointer) throws {
         try execute("""
-        PRAGMA foreign_keys = ON;
         CREATE TABLE IF NOT EXISTS app_state (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL,
@@ -243,44 +351,30 @@ public struct CatalogStore {
             database: database
         )
 
-        // The whole bootstrap transaction — BEGIN IMMEDIATE through
-        // COMMIT — retries a transient BUSY/IOERR with a short backoff:
-        // on a network volume a lock stutter surfaces as SQLITE_IOERR
-        // (10), not a clean busy. A failure that outlasts the retries is
-        // rethrown with the real SQLite message. Every attempt starts
-        // clean because the previous one rolled back.
-        try CatalogTransactionRetry.run(isTransient: Self.isTransientSQLiteError) {
-            try execute("BEGIN IMMEDIATE;", database: database)
-            do {
-                try upsertAppState("cameraLibraryRootPath", value: configuration.cameraLibraryRootPath, database: database)
-                try upsertAppState("archivePath", value: configuration.archivePath, database: database)
-                try upsertAppState("bufferPath", value: configuration.bufferPath, database: database)
-                try upsertAppState("catalogBackupFolderPath", value: configuration.catalogBackupFolderPath, database: database)
-
-                for folder in CameraLibraryFolder.allCases {
-                    try upsertLibraryFolder(folder, path: configuration.libraryFolderPath(folder).path, database: database)
-                }
-
-                for location in configuration.configuredLocations {
-                    let selected = configuration.selectedLocationID(for: location.role) == location.id
-                    try upsertStorageLocation(location, selected: selected, database: database)
-                }
-
-                try synchronizeEvents(configuration: configuration, database: database)
-                try execute("COMMIT;", database: database)
-            } catch {
-                try? execute("ROLLBACK;", database: database)
-                throw error
-            }
-        }
-
-        let backupURL = createBackup ? try backupIfConfigured(configuration: configuration) : nil
-        return CatalogBootstrapReport(
-            databasePath: url.path,
-            backupPath: backupURL?.path,
-            libraryFolders: folders.map(\.path),
-            storageLocationCount: configuration.configuredLocations.count
-        )
+        // Columns and tables for the catalog as the only durable home of
+        // events, assignments, display rotations, and burst splits
+        // (`CatalogStateStore`). `payload` is the event's full JSON, so
+        // every field round-trips exactly; `modified_at_ref` keeps the
+        // assignment's exact modification time; `ordinal` keeps insertion
+        // order.
+        try ensureColumn(table: "events", column: "payload", definition: "payload TEXT", database: database)
+        try ensureColumn(table: "events", column: "ordinal", definition: "ordinal INTEGER", database: database)
+        try ensureColumn(table: "event_assets", column: "modified_at_ref", definition: "modified_at_ref REAL", database: database)
+        try ensureColumn(table: "event_assets", column: "ordinal", definition: "ordinal INTEGER", database: database)
+        try execute("""
+        CREATE TABLE IF NOT EXISTS display_orientations (
+            file_key TEXT PRIMARY KEY,
+            quarter_turns INTEGER NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS burst_splits (
+            id TEXT PRIMARY KEY,
+            created_at_ref REAL NOT NULL,
+            member_path_keys TEXT NOT NULL,
+            ordinal INTEGER NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        """, database: database)
     }
 
     private func ensureLibraryFolders(configuration: AppConfiguration) throws -> [URL] {
@@ -306,24 +400,24 @@ public struct CatalogStore {
         return folders
     }
 
+    /// A verified backup through `CatalogBackupService` — the SQLite online
+    /// backup API, never a file copy — into a `Backups` folder beside the
+    /// catalog and the configured NAS folder. Returns the NAS copy when one
+    /// was made, the local set otherwise.
     private func backupIfConfigured(configuration: AppConfiguration) throws -> URL? {
-        let backupPath = configuration.catalogBackupFolderPath.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !backupPath.isEmpty, fileManager.fileExists(atPath: url.path) else {
-            return nil
+        let remotePath = configuration.catalogBackupFolderPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        let service = CatalogBackupService(
+            catalogURL: url,
+            configurationURL: nil,
+            localFolder: url.deletingLastPathComponent().appendingPathComponent("Backups", isDirectory: true),
+            remoteFolder: remotePath.isEmpty ? nil : URL(fileURLWithPath: remotePath, isDirectory: true)
+        )
+        let result = try service.backupNow(reason: .manual)
+        guard let local = result.catalogURL else { return nil }
+        if case .copied(let folder) = result.remote {
+            return folder.appendingPathComponent(local.lastPathComponent)
         }
-
-        let backupRoot = URL(fileURLWithPath: backupPath, isDirectory: true)
-        guard Self.configuredVolumeIsAvailable(for: backupRoot, fileManager: fileManager) else {
-            return nil
-        }
-        try fileManager.createDirectory(at: backupRoot, withIntermediateDirectories: true)
-        let stamp = Self.backupTimestamp()
-        let destination = backupRoot.appendingPathComponent("catalog-\(stamp).sqlite")
-        if fileManager.fileExists(atPath: destination.path) {
-            try fileManager.removeItem(at: destination)
-        }
-        try fileManager.copyItem(at: url, to: destination)
-        return destination
+        return local
     }
 
     private func execute(_ sql: String, database: OpaquePointer) throws {
@@ -563,15 +657,9 @@ public struct CatalogStore {
         ].joined(separator: "|")
     }
 
-    private static func backupTimestamp() -> String {
-        let formatter = DateFormatter()
-        formatter.calendar = Calendar(identifier: .gregorian)
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "yyyyMMdd-HHmmss"
-        return formatter.string(from: Date())
-    }
-
-    private static func configuredVolumeIsAvailable(for url: URL, fileManager: FileManager) -> Bool {
+    /// False when `url` sits under `/Volumes/<name>` and that volume is not
+    /// mounted — an offline NAS or drive is skipped, never recreated.
+    static func configuredVolumeIsAvailable(for url: URL, fileManager: FileManager = .default) -> Bool {
         let components = url.standardizedFileURL.pathComponents
         guard components.count >= 3, components[1] == "Volumes" else { return true }
         let mountURL = URL(fileURLWithPath: "/Volumes", isDirectory: true)

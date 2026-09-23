@@ -83,7 +83,10 @@ swift run CameraToolkitCatalogRebuilder \
 ```
 
 Review and validate the candidates before installing them. Filesystem copying
-and checksum verification are deliberately separate operations.
+and checksum verification are deliberately separate operations. The rebuilder
+needs a configuration that still holds events and assignments (from before the
+catalog took them over, such as `config.pre-sqlite-*.json`); it refuses a
+settings-only `config.json`.
 
 ## First-run setup
 

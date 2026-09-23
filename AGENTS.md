@@ -26,7 +26,8 @@ Use `scripts/package-app.sh --install` only when the user asks to refresh the in
 
 ## Configuration And Catalog
 
-- `AppConfiguration` JSON is the durable settings and event-assignment source. `CatalogStore` mirrors that state into SQLite; do not invent rows independently when the app's models can generate them.
+- `config.json` is the durable settings source. Events, assignments, display rotations, and burst splits live only in the SQLite catalog once it has been migrated (`CatalogStateStore`); before that, `CatalogStore` mirrors them from `config.json`. Do not invent rows independently when the app's models can generate them.
+- Stop the app (which checkpoints the WAL) before copying or replacing `catalog.sqlite`; a copy of the main file alone can miss recent writes. Prefer `CatalogBackupService`, which uses the SQLite backup API.
 - Treat files under the user's Camera Toolkit Application Support folder as live state. Create timestamped backups and stop concurrent app writes before atomically replacing configuration or catalog files.
 - Build and validate candidate files separately before installation. Require JSON decode success, `PRAGMA integrity_check = ok`, zero foreign-key violations, and exact expected event and assignment counts.
 - Preserve unrelated events and assignments during scoped reconciliation. Replace only roots explicitly included in the approved plan.

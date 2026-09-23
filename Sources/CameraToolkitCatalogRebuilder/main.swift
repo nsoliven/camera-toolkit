@@ -188,6 +188,14 @@ private func run() throws {
 
     let support = arguments.configuration.deletingLastPathComponent().deletingLastPathComponent()
     let defaults = AppConfiguration.defaults(applicationSupport: support)
+    // After the catalog took over events and assignments, config.json holds
+    // settings only; rebuilding from it would produce a candidate without
+    // the existing events.
+    if ConfigurationStore.isSettingsOnly(try Data(contentsOf: arguments.configuration)) {
+        throw RebuildError.invalidPlan(
+            "\(arguments.configuration.path) is settings-only: events and assignments live in the catalog now. Use a legacy config (config.pre-sqlite-*.json) or rebuild from the catalog."
+        )
+    }
     var configuration = try ConfigurationStore(url: arguments.configuration).load(defaults: defaults)
     let originalEventCount = configuration.savedEvents.count
 
@@ -294,6 +302,9 @@ private func run() throws {
     let inspector = CatalogInspector(url: arguments.outputCatalog)
     try inspector.savePresenceObservations(sourceObservations)
     try inspector.savePresenceObservations(bufferObservations)
+    // The candidate must be complete as a single file before anything
+    // validates or installs it: fold the WAL back and close.
+    CatalogDatabase.checkpointAndClose(url: arguments.outputCatalog)
 
     let summary = RebuildSummary(
         outputConfigurationPath: arguments.outputConfiguration.path,
