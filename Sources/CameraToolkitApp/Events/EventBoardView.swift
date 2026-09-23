@@ -462,8 +462,6 @@ struct EventBoardView: View {
             searchFocused = true
         case .moveSelectionToTrash:
             workspace.requestTrash(stackIDs: workspace.targetStackIDs(), fromEvent: eventID)
-        default:
-            break
         }
     }
 

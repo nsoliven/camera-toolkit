@@ -3,24 +3,9 @@ import AppKit
 import Foundation
 import Observation
 
-private struct CopyToBufferJobResult: Sendable {
-    var copy: LocalCopyResult
-    var plan: CopyPlan
-}
-
 private struct QueueCopyJobResult: Sendable {
     var copy: LocalCopyResult
     var plan: CopyPlan
-}
-
-private struct SafeImportPreviewResult: Sendable {
-    var buffer: CopyPlan
-    var archive: OrganizedArchivePlan
-}
-
-private struct OrganizedArchiveJobResult: Sendable {
-    var copy: OrganizedArchiveResult
-    var plan: OrganizedArchivePlan
 }
 
 /// What the refresh pass read from disk — produced off the main actor so
@@ -85,9 +70,6 @@ struct BackgroundJobUpdate: Sendable {
 @Observable
 final class DashboardModel {
     var isSidebarCollapsed: Bool = false
-    var activePlan: CopyPlan
-    var organizedArchivePlan = OrganizedArchivePlan()
-    var queuedFilePaths: Set<String> = []
     var jobs: [JobSnapshot]
     var activityLog: [ActivityLogEntry]
     var configuration: AppConfiguration
@@ -116,7 +98,6 @@ final class DashboardModel {
     var configurationRevision: Int = 0
     var sourceCleanupMessage: String?
     var sourceCleanupError: String?
-    var selectedEventCopyAvailability = EventCopyAvailability()
     var activeJob: JobSnapshot? {
         jobs.first { $0.state == .running || $0.state == .queued }
     }
@@ -142,11 +123,8 @@ final class DashboardModel {
     @ObservationIgnored var configurationLoader: (@Sendable (URL, AppConfiguration) throws -> AppConfiguration)?
     @ObservationIgnored private var lastTransferQueuePersistence = Date.distantPast
     @ObservationIgnored private var lastStorageCapacityRefreshRequest = Date.distantPast
-    @ObservationIgnored private var eventCopyAvailabilityTask: Task<EventCopyAvailability, Never>?
-    @ObservationIgnored private var eventCopyAvailabilityGeneration = UUID()
 
     init(
-        activePlan: CopyPlan,
         jobs: [JobSnapshot],
         activityLog: [ActivityLogEntry] = [],
         configuration: AppConfiguration = .defaults(applicationSupport: DashboardModel.defaultApplicationSupportURL),
@@ -155,7 +133,6 @@ final class DashboardModel {
         pendingTransferQueueStore: PendingTransferQueueStore? = nil,
         loadActivityLog: Bool = false
     ) {
-        self.activePlan = activePlan
         self.jobs = jobs
         self.configuration = configuration
         self.configurationStore = configurationStore
@@ -216,7 +193,6 @@ final class DashboardModel {
         try? store.save(configuration)
 
         let model = DashboardModel(
-            activePlan: CopyPlan(),
             jobs: [],
             configuration: configuration,
             configurationStore: store,
@@ -230,32 +206,9 @@ final class DashboardModel {
         guard totalBytes > 0 else { return 0 }
         return min(max(Double(processedBytes) / Double(totalBytes), 0), 1)
     }
-
-    private static func eventFileFingerprint(_ files: [FileRecord]) -> UInt64 {
-        var value: UInt64 = 14_695_981_039_346_656_037
-        for file in files.sorted(by: { $0.path < $1.path }) {
-            for byte in file.path.utf8 {
-                value ^= UInt64(byte)
-                value &*= 1_099_511_628_211
-            }
-            value ^= UInt64(bitPattern: file.size)
-            value &*= 1_099_511_628_211
-            value ^= UInt64(bitPattern: Int64(file.modifiedAt.timeIntervalSince1970.rounded()))
-            value &*= 1_099_511_628_211
-        }
-        return value
-    }
 }
 
 extension DashboardModel {
-    var queuedFiles: [FileRecord] {
-        var candidates: [String: FileRecord] = [:]
-        for file in activePlan.new + selectedEventFiles {
-            candidates[file.path] = file
-        }
-        return queuedFilePaths.compactMap { candidates[$0] }.sorted { $0.path < $1.path }
-    }
-
     var pendingTransferFileCount: Int {
         pendingTransferBatches.reduce(0) { $0 + $1.files.count }
     }
@@ -269,117 +222,6 @@ extension DashboardModel {
             if $0.eventDate == $1.eventDate { return $0.name < $1.name }
             return $0.eventDate > $1.eventDate
         }
-    }
-
-    /// Events in sidebar order — parents newest-first, subevents nested under
-    /// them — for pickers and menus.
-    var displayEvents: [(event: SavedCameraEvent, depth: Int)] {
-        EventHierarchy.flattened(configuration.savedEvents)
-    }
-
-    /// `displayEvents` minus the ones already at the depth cap — a depth-2
-    /// event can't take another level, so the "Inside event" picker never
-    /// offers it. Deeper existing events still list in `displayEvents`.
-    var parentEventCandidates: [(event: SavedCameraEvent, depth: Int)] {
-        displayEvents.filter { EventHierarchy.canParent($0.event, in: configuration.savedEvents) }
-    }
-
-    /// "Parent / Child" breadcrumb title for menus and headers.
-    func eventTitle(_ event: SavedCameraEvent) -> String {
-        EventHierarchy.displayName(of: event, in: configuration.savedEvents)
-    }
-
-    var selectedEvent: SavedCameraEvent? {
-        guard let id = configuration.selectedEventID else { return nil }
-        return configuration.savedEvents.first { $0.id == id }
-    }
-
-    var selectedEventFiles: [FileRecord] {
-        guard let eventID = configuration.selectedEventID else { return [] }
-        let root = URL(fileURLWithPath: expandedImportSourcePath, isDirectory: true).standardizedFileURL.path
-        return configuration.photoEventAssignments.compactMap { assignment in
-            guard assignment.eventID == eventID,
-                  URL(fileURLWithPath: assignment.sourceRootPath, isDirectory: true).standardizedFileURL.path == root,
-                  (try? PathSafety.validateRelativePath(assignment.relativePath)) != nil else {
-                return nil
-            }
-            return FileRecord(
-                path: assignment.relativePath,
-                size: assignment.fileSize,
-                modifiedAt: assignment.modifiedAt
-            )
-        }.sorted { $0.path < $1.path }
-    }
-
-    var selectedEventCopyAvailabilityRefreshID: String {
-        let eventID = configuration.selectedEventID?.uuidString ?? "none"
-        let source = URL(fileURLWithPath: expandedImportSourcePath, isDirectory: true).standardizedFileURL.path
-        let destination = URL(fileURLWithPath: expandedBufferIngestPath, isDirectory: true).standardizedFileURL.path
-        let assignments = selectedEventFiles
-        let fingerprint = Self.eventFileFingerprint(assignments)
-        let transferRevision = transferQueue.map {
-            "\($0.id.uuidString):\($0.state.rawValue):\($0.items.count):\($0.sourceRemovedCount)"
-        } ?? "none"
-        return [
-            eventID,
-            source,
-            destination,
-            String(assignments.count),
-            String(fingerprint),
-            String(storageCapacityRevision),
-            transferRevision,
-            String(pendingTransferFileCount),
-        ].joined(separator: "|")
-    }
-
-    var hasSelectedEventFilesReadyToCopy: Bool {
-        selectedEventCopyAvailability.phase == .ready
-            && selectedEventCopyAvailability.contextID == selectedEventCopyAvailabilityRefreshID
-            && selectedEventCopyAvailability.hasFilesReadyToCopy
-    }
-
-    func refreshSelectedEventCopyAvailability() async {
-        let contextID = selectedEventCopyAvailabilityRefreshID
-        let files = selectedEventFiles
-        guard configuration.selectedEventID != nil, !files.isEmpty else {
-            eventCopyAvailabilityTask?.cancel()
-            selectedEventCopyAvailability = EventCopyAvailability(
-                phase: .ready,
-                contextID: contextID,
-                assignedCount: files.count
-            )
-            return
-        }
-
-        selectedEventCopyAvailability = .checking(
-            contextID: contextID,
-            assignedCount: files.count
-        )
-        eventCopyAvailabilityTask?.cancel()
-        let generation = UUID()
-        eventCopyAvailabilityGeneration = generation
-
-        let source = URL(fileURLWithPath: expandedImportSourcePath, isDirectory: true)
-        let destination = URL(fileURLWithPath: expandedBufferIngestPath, isDirectory: true)
-        let scheduledPaths = scheduledTransferPaths(sourcePath: source.path, destinationPath: destination.path)
-        let task = Task.detached(priority: .utility) {
-            EventCopyAvailabilityScanner.scan(
-                contextID: contextID,
-                files: files,
-                sourceRoot: source,
-                bufferRoot: destination,
-                scheduledPaths: scheduledPaths
-            )
-        }
-        eventCopyAvailabilityTask = task
-        let result = await task.value
-
-        guard !Task.isCancelled,
-              generation == eventCopyAvailabilityGeneration,
-              result.contextID == selectedEventCopyAvailabilityRefreshID else {
-            return
-        }
-        selectedEventCopyAvailability = result
     }
 
     func toggleSidebar() {
@@ -404,173 +246,6 @@ extension DashboardModel {
         Task { @MainActor in
             await refreshAllNow()
         }
-    }
-
-    @discardableResult
-    func createEvent(named rawName: String, on eventDate: Date, parentEventID: UUID? = nil) -> Bool {
-        let validation = EventNamePolicy.validate(rawName)
-        guard validation.isValid else {
-            statusMessage = validation.errorMessage ?? "Choose a different event name."
-            return false
-        }
-        let name = validation.normalizedName
-        // A missing or self-referencing parent resolves to top-level.
-        let parentID = parentEventID.flatMap { id in
-            configuration.savedEvents.contains { $0.id == id } ? id : nil
-        }
-        // A parent already at the depth cap refuses — subevents nest at
-        // most two levels deep.
-        if let parentID,
-           let parent = configuration.savedEvents.first(where: { $0.id == parentID }),
-           !EventHierarchy.canParent(parent, in: configuration.savedEvents) {
-            statusMessage = "\(eventTitle(parent)) is already at the deepest level — a subevent can only go two levels under a top-level event."
-            return false
-        }
-
-        var selectedID: UUID?
-        updateConfiguration { configuration in
-            // The dated folder name is unique per parent: a same-named event
-            // under a different parent is a different folder, not a duplicate.
-            if let index = configuration.savedEvents.firstIndex(where: {
-                $0.parentEventID == parentID
-                    && $0.name.localizedCaseInsensitiveCompare(name) == .orderedSame
-                    && Calendar.current.isDate($0.eventDate, inSameDayAs: eventDate)
-            }) {
-                configuration.savedEvents[index].lastUsedAt = Date()
-                selectedID = configuration.savedEvents[index].id
-            } else {
-                let event = SavedCameraEvent(name: name, eventDate: eventDate, parentEventID: parentID)
-                configuration.savedEvents.append(event)
-                selectedID = event.id
-            }
-            configuration.selectedEventID = selectedID
-            configuration.eventName = name
-            configuration.beginNewBatch(now: eventDate)
-        }
-        activePlan = CopyPlan()
-        organizedArchivePlan = OrganizedArchivePlan()
-        queuedFilePaths.removeAll()
-        selectedEventCopyAvailability = EventCopyAvailability()
-        createSelectedEventFolders()
-        return true
-    }
-
-    func selectEvent(_ id: UUID) {
-        guard let event = configuration.savedEvents.first(where: { $0.id == id }) else { return }
-        updateConfiguration { configuration in
-            configuration.selectedEventID = event.id
-            configuration.eventName = event.name
-            configuration.beginNewBatch(now: event.eventDate)
-            if let index = configuration.savedEvents.firstIndex(where: { $0.id == event.id }) {
-                configuration.savedEvents[index].lastUsedAt = Date()
-            }
-        }
-        activePlan = CopyPlan()
-        organizedArchivePlan = OrganizedArchivePlan()
-        queuedFilePaths.removeAll()
-        selectedEventCopyAvailability = EventCopyAvailability()
-        statusMessage = selectedEventFiles.isEmpty
-            ? "Selected \(eventTitle(event)). Select photos and assign them to this event."
-            : "Selected \(eventTitle(event)) with \(selectedEventFiles.count) assigned file(s)."
-    }
-
-    func assignFilesToSelectedEvent(_ files: [FileRecord]) {
-        let root = URL(fileURLWithPath: expandedImportSourcePath, isDirectory: true).standardizedFileURL.path
-        assignFilesToSelectedEvent(files.map {
-            EventFileSelection(sourceRootPath: root, file: $0)
-        })
-    }
-
-    func assignFilesToSelectedEvent(_ selections: [EventFileSelection]) {
-        guard let event = selectedEvent, !selections.isEmpty else {
-            statusMessage = selectedEvent == nil
-                ? "Create or choose an event before assigning photos."
-                : "Select one or more files first."
-            return
-        }
-
-        let validSelections = selections.compactMap { selection -> EventFileSelection? in
-            let root = URL(
-                fileURLWithPath: Self.expandedPath(selection.sourceRootPath),
-                isDirectory: true
-            ).standardizedFileURL.path
-            guard (try? PathSafety.validateRelativePath(selection.file.path)) != nil else { return nil }
-            return EventFileSelection(sourceRootPath: root, file: selection.file)
-        }
-        guard !validSelections.isEmpty else {
-            statusMessage = "None of the selected files had a safe path."
-            return
-        }
-
-        updateConfiguration { configuration in
-            for selection in validSelections {
-                let root = selection.sourceRootPath
-                let file = selection.file
-                configuration.photoEventAssignments.removeAll {
-                    $0.sourceRootPath == root
-                        && $0.relativePath == file.path
-                        && $0.fileSize == file.size
-                        && abs($0.modifiedAt.timeIntervalSince(file.modifiedAt)) < 1
-                }
-                configuration.photoEventAssignments.append(
-                    PhotoEventAssignment(
-                        sourceRootPath: root,
-                        relativePath: file.path,
-                        fileSize: file.size,
-                        modifiedAt: file.modifiedAt,
-                        eventID: event.id,
-                        deviceID: configuration.selectedDeviceID
-                    )
-                )
-            }
-        }
-        let currentRoot = URL(fileURLWithPath: expandedImportSourcePath, isDirectory: true).standardizedFileURL.path
-        queuedFilePaths.formUnion(
-            validSelections
-                .filter { $0.sourceRootPath == currentRoot }
-                .map(\.file.path)
-        )
-        let sourceCount = Set(validSelections.map(\.sourceRootPath)).count
-        let sourceNote = sourceCount == 1 ? "" : " across \(sourceCount) camera sources"
-        selectedEventCopyAvailability = EventCopyAvailability()
-        statusMessage = "Assigned \(validSelections.count) file(s)\(sourceNote) to \(eventTitle(event))."
-    }
-
-    func queueSelectedEventFiles() {
-        guard selectedEventCopyAvailability.contextID == selectedEventCopyAvailabilityRefreshID,
-              selectedEventCopyAvailability.phase == .ready else {
-            statusMessage = "Checking which assigned files are still on the source and need copying…"
-            Task { await refreshSelectedEventCopyAvailability() }
-            return
-        }
-        let files = selectedEventCopyAvailability.filesReadyToCopy
-        queuedFilePaths = Set(files.map(\.path))
-        statusMessage = files.isEmpty
-            ? "Nothing needs copying from this source."
-            : "Queued \(files.count) file(s) that are present on the source and not already in the Buffer."
-    }
-
-    func copySelectedEventFilesToBuffer() {
-        guard selectedEventCopyAvailability.contextID == selectedEventCopyAvailabilityRefreshID,
-              selectedEventCopyAvailability.phase == .ready else {
-            statusMessage = "Checking which assigned files are still on the source and need copying…"
-            Task { await refreshSelectedEventCopyAvailability() }
-            return
-        }
-        let files = selectedEventCopyAvailability.filesReadyToCopy
-        guard !files.isEmpty else {
-            statusMessage = "Nothing needs copying. Assigned files are already in the Buffer, unavailable, missing, or already queued."
-            return
-        }
-        queuedFilePaths = Set(files.map(\.path))
-        enqueueTransfer(
-            files: files,
-            sourcePath: expandedImportSourcePath,
-            destinationPath: expandedBufferIngestPath,
-            eventID: selectedEvent?.id,
-            eventName: selectedEvent.map { eventTitle($0) } ?? configuration.eventName,
-            deviceID: configuration.selectedDeviceID
-        )
     }
 
     func setEventImmichUploadEnabled(_ eventID: UUID, enabled: Bool) {
@@ -630,31 +305,6 @@ extension DashboardModel {
             results += try await client.checkBulkUpload(Array(assets[start..<end]))
         }
         return results
-    }
-
-    func createSelectedEventFolders() {
-        guard let event = selectedEvent else {
-            statusMessage = "Create or choose an event first."
-            return
-        }
-        do {
-            for path in configuration.eventWorkspaceFolderPaths() {
-                try FileManager.default.createDirectory(
-                    at: URL(fileURLWithPath: Self.expandedPath(path), isDirectory: true),
-                    withIntermediateDirectories: true
-                )
-            }
-            statusMessage = "Created the \(eventTitle(event)) card-copy, Photomator, Masters, Web, and Social folders."
-        } catch {
-            statusMessage = "Could not create folders for \(eventTitle(event)): \(error.localizedDescription)"
-        }
-    }
-
-    func openEventFolder(_ path: String) {
-        createSelectedEventFolders()
-        let url = URL(fileURLWithPath: Self.expandedPath(path), isDirectory: true)
-        guard FileManager.default.fileExists(atPath: url.path) else { return }
-        NSWorkspace.shared.open(url)
     }
 
     @discardableResult
@@ -818,27 +468,7 @@ extension DashboardModel {
                 configuration.selectedDeviceID = inferredDeviceID
             }
         }
-        activePlan = CopyPlan()
-        organizedArchivePlan = OrganizedArchivePlan()
-        queuedFilePaths.removeAll()
         statusMessage = "Using \(location.name) for \(location.role.displayName)."
-    }
-
-    func matchCameraToSelectedImportSource() {
-        guard let selectedID = configuration.selectedImportSourceID,
-              let location = configuration.configuredLocations.first(where: { $0.id == selectedID }),
-              let inferredDeviceID = Self.inferredDeviceID(for: location),
-              inferredDeviceID != configuration.selectedDeviceID else {
-            return
-        }
-
-        updateConfiguration { configuration in
-            configuration.selectedDeviceID = inferredDeviceID
-        }
-        activePlan = CopyPlan()
-        organizedArchivePlan = OrganizedArchivePlan()
-        queuedFilePaths.removeAll()
-        statusMessage = "Matched \(location.name) to \(Self.cameraDisplayName(for: inferredDeviceID))."
     }
 
     static func inferredDeviceID(for location: ConfiguredLocation) -> String? {
@@ -857,30 +487,6 @@ extension DashboardModel {
         }
         if fingerprint.contains("iphone") { return "iphone" }
         return nil
-    }
-
-    private static func cameraDisplayName(for deviceID: String) -> String {
-        switch deviceID {
-        case "sony-a7v": "Sony A7V"
-        case "osmo-360": "DJI Osmo 360"
-        case "dji-mini-2": "DJI Mini 2"
-        case "dji-nano": "DJI Nano"
-        case "action-6": "DJI Action 6"
-        case "iphone": "iPhone"
-        default: "the selected camera"
-        }
-    }
-
-    func useFolderAsImportSource(_ url: URL) {
-        let name = url.lastPathComponent.isEmpty ? "Camera Source" : url.lastPathComponent
-        updateConfiguration { configuration in
-            configuration.upsertLocation(role: .importSource, name: name, path: url.path, select: true)
-            configuration.beginNewBatch()
-        }
-        activePlan = CopyPlan()
-        organizedArchivePlan = OrganizedArchivePlan()
-        queuedFilePaths.removeAll()
-        statusMessage = "Using \(name) as the camera source. Nothing has been copied yet."
     }
 
     func setConfiguredLocationName(_ location: ConfiguredLocation, to value: String) {
@@ -928,10 +534,7 @@ extension DashboardModel {
 
     func setDeviceID(_ value: String) {
         updateConfiguration { $0.selectedDeviceID = value }
-        activePlan = CopyPlan()
-        organizedArchivePlan = OrganizedArchivePlan()
-        queuedFilePaths.removeAll()
-        statusMessage = "Camera changed. Preview or copy again before archiving."
+        statusMessage = "Camera changed."
     }
 
     func setEventName(_ value: String) {
@@ -943,10 +546,7 @@ extension DashboardModel {
                 configuration.savedEvents[index].lastUsedAt = Date()
             }
         }
-        activePlan = CopyPlan()
-        organizedArchivePlan = OrganizedArchivePlan()
-        queuedFilePaths.removeAll()
-        statusMessage = "Event folder changed. Preview or copy again before archiving."
+        statusMessage = "Event folder changed."
     }
 
     func setImmichServerURL(_ value: String) {
@@ -1131,180 +731,6 @@ extension DashboardModel {
         }
     }
 
-    func previewImport() {
-        let sourcePath = expandedImportSourcePath
-        let destinationPath = expandedBufferIngestPath
-        let source = URL(fileURLWithPath: sourcePath, isDirectory: true)
-        let destination = URL(fileURLWithPath: destinationPath, isDirectory: true)
-        let command = Self.commandLine(["plan-copy", "--checksum", sourcePath, destinationPath])
-        runBackgroundJob(
-            action: .previewFiles,
-            runningNote: "Checking what would copy to buffer",
-            logTitle: "Previewed copy to buffer",
-            logDetail: "Checked the selected from folder and buffer. No files were copied.",
-            command: command,
-            sourcePath: sourcePath,
-            destinationPath: destinationPath,
-            operation: { progress in
-                try ArchivePlanner().planCopy(source: source, destination: destination) { update in
-                    let bounds = Self.planProgressBounds(for: update)
-                    progress(Self.jobUpdate(from: update, lowerBound: bounds.lower, upperBound: bounds.upper, notePrefix: "Checking copy", command: command, sourcePath: sourcePath, destinationPath: destinationPath))
-                }
-            },
-            completion: { plan in
-                self.activePlan = plan
-                self.queuedFilePaths = Set(plan.new.map(\.path))
-                return "Preview ready: \(plan.new.count) new, \(plan.existing.count) already in buffer, \(plan.conflicts.count) conflicts. To: \(destinationPath)"
-            }
-        )
-    }
-
-    func previewSafeImport() {
-        let sourcePath = expandedImportSourcePath
-        let bufferPath = expandedBufferIngestPath
-        let libraryPath = expandedLibraryRootPath
-        let source = URL(fileURLWithPath: sourcePath, isDirectory: true)
-        let buffer = URL(fileURLWithPath: bufferPath, isDirectory: true)
-        let library = URL(fileURLWithPath: libraryPath, isDirectory: true)
-        let layout = OrganizedArchiveLayout(configuration: configuration)
-        let command = Self.commandLine(["preview-safe-import", sourcePath, bufferPath, libraryPath])
-        runBackgroundJob(
-            action: .previewFiles,
-            runningNote: "Checking the camera source, buffer, and library folders",
-            logTitle: "Previewed safe import",
-            logDetail: "Checked both destinations by checksum. No files were copied.",
-            command: command,
-            sourcePath: sourcePath,
-            destinationPath: libraryPath,
-            operation: { progress in
-                let bufferPlan = try ArchivePlanner().planCopy(source: source, destination: buffer) { update in
-                    let bounds = Self.planProgressBounds(for: update, lowerBound: 0.02, upperBound: 0.58)
-                    progress(Self.jobUpdate(from: update, lowerBound: bounds.lower, upperBound: bounds.upper, notePrefix: "Checking workspace", command: command, sourcePath: sourcePath, destinationPath: bufferPath))
-                }
-                let sourceFiles = bufferPlan.new + bufferPlan.existing + bufferPlan.conflicts
-                let archivePlan = try OrganizedArchivePlanner().plan(
-                    source: source,
-                    sourceFiles: sourceFiles,
-                    libraryRoot: library,
-                    layout: layout
-                ) { update in
-                    progress(Self.jobUpdate(from: update, lowerBound: 0.60, upperBound: 0.97, notePrefix: "Checking library folders", command: command, sourcePath: sourcePath, destinationPath: libraryPath))
-                }
-                return SafeImportPreviewResult(buffer: bufferPlan, archive: archivePlan)
-            },
-            completion: { result in
-                self.activePlan = result.buffer
-                self.organizedArchivePlan = result.archive
-                self.queuedFilePaths = Set(result.buffer.new.map(\.path))
-                return "Preview ready: \(result.buffer.new.count) need copying to the buffer; \(result.archive.new.count) need archiving to the library; \(result.buffer.conflicts.count + result.archive.conflicts.count) conflict(s)."
-            }
-        )
-    }
-
-    func previewSelectedEventImport() {
-        guard selectedEventCopyAvailability.contextID == selectedEventCopyAvailabilityRefreshID,
-              selectedEventCopyAvailability.phase == .ready else {
-            statusMessage = "Checking which assigned files are still available for preview…"
-            Task { await refreshSelectedEventCopyAvailability() }
-            return
-        }
-        let selectedFiles = selectedEventCopyAvailability.presentFiles
-        guard !selectedFiles.isEmpty else {
-            statusMessage = "No assigned files are currently present on this source."
-            return
-        }
-
-        let sourcePath = expandedImportSourcePath
-        let bufferPath = expandedBufferIngestPath
-        let libraryPath = expandedLibraryRootPath
-        let source = URL(fileURLWithPath: sourcePath, isDirectory: true)
-        let buffer = URL(fileURLWithPath: bufferPath, isDirectory: true)
-        let library = URL(fileURLWithPath: libraryPath, isDirectory: true)
-        let layout = OrganizedArchiveLayout(configuration: configuration)
-        let command = Self.commandLine(["preview-event-import", sourcePath, bufferPath, "\(selectedFiles.count) files"])
-        runBackgroundJob(
-            action: .previewFiles,
-            runningNote: "Checking selected event files",
-            logTitle: "Previewed event import",
-            logDetail: "Checked only the photos assigned to the selected event. No files were copied.",
-            command: command,
-            sourcePath: sourcePath,
-            destinationPath: libraryPath,
-            operation: { progress in
-                let bufferPlan = try ArchivePlanner().planCopyMetadata(
-                    source: source,
-                    destination: buffer,
-                    files: selectedFiles
-                ) { update in
-                    progress(Self.jobUpdate(from: update, lowerBound: 0.03, upperBound: 0.62, notePrefix: "Reading event workspace", command: command, sourcePath: sourcePath, destinationPath: bufferPath))
-                }
-                let sourceFiles = bufferPlan.new + bufferPlan.existing + bufferPlan.conflicts
-                let archivePlan = try OrganizedArchivePlanner().planMetadata(
-                    sourceFiles: sourceFiles,
-                    libraryRoot: library,
-                    layout: layout
-                ) { update in
-                    progress(Self.jobUpdate(from: update, lowerBound: 0.64, upperBound: 0.97, notePrefix: "Reading event archive", command: command, sourcePath: sourcePath, destinationPath: libraryPath))
-                }
-                return SafeImportPreviewResult(buffer: bufferPlan, archive: archivePlan)
-            },
-            completion: { result in
-                self.activePlan = result.buffer
-                self.organizedArchivePlan = result.archive
-                self.queuedFilePaths = Set(selectedFiles.map(\.path))
-                return "Fast event preview ready: \(result.buffer.new.count) need copying to the buffer; \(result.archive.new.count) need archiving to the library; \(result.buffer.conflicts.count + result.archive.conflicts.count) size conflict(s). Copy + Verify performs the checksum check."
-            }
-        )
-    }
-
-    func copySourceToBuffer() {
-        let sourcePath = expandedImportSourcePath
-        let destinationPath = expandedBufferIngestPath
-        let source = URL(fileURLWithPath: sourcePath, isDirectory: true)
-        let destination = URL(fileURLWithPath: destinationPath, isDirectory: true)
-        let command = Self.commandLine(["copy-immutable", "--checksum", sourcePath, destinationPath])
-        runBackgroundJob(
-            action: .ingestCard,
-            runningNote: "Copying files to buffer",
-            logTitle: "Copied files to buffer",
-            logDetail: "Copied only new files into the selected buffer batch. Existing conflicts were not overwritten.",
-            command: command,
-            sourcePath: sourcePath,
-            destinationPath: destinationPath,
-            operation: { progress in
-                let result = try LocalTransferService().copyImmutable(source: source, destination: destination) { update in
-                    let isHashing = update.phase.localizedCaseInsensitiveContains("hashing")
-                    progress(Self.jobUpdate(from: update, lowerBound: isHashing ? 0.02 : 0.32, upperBound: isHashing ? 0.32 : 0.82, notePrefix: "Copying to buffer", command: command, sourcePath: sourcePath, destinationPath: destinationPath))
-                }
-                let plan = try ArchivePlanner().planCopy(source: source, destination: destination) { update in
-                    let bounds = Self.planProgressBounds(for: update, lowerBound: 0.82, upperBound: 0.97)
-                    progress(Self.jobUpdate(from: update, lowerBound: bounds.lower, upperBound: bounds.upper, notePrefix: "Checking buffer copy", command: command, sourcePath: sourcePath, destinationPath: destinationPath))
-                }
-                return CopyToBufferJobResult(copy: result, plan: plan)
-            },
-            completion: { result in
-                self.activePlan = result.plan
-                return "Copied \(result.copy.copied.count) file(s) to buffer, skipped \(result.copy.skippedIdentical.count) already there, left \(result.copy.conflicts.count) conflict(s) untouched. Buffer batch: \(destinationPath)"
-            }
-        )
-    }
-
-    func copyQueuedFilesToBuffer() {
-        let selectedFiles = queuedFiles
-        guard !selectedFiles.isEmpty else {
-            statusMessage = "Queue is empty. Preview files, then add files to the queue."
-            return
-        }
-        enqueueTransfer(
-            files: selectedFiles,
-            sourcePath: expandedImportSourcePath,
-            destinationPath: expandedBufferIngestPath,
-            eventID: selectedEvent?.id,
-            eventName: selectedEvent.map { eventTitle($0) } ?? configuration.eventName,
-            deviceID: configuration.selectedDeviceID
-        )
-    }
-
     func resumePendingTransfers() {
         guard !pendingTransferBatches.isEmpty else {
             statusMessage = "There are no waiting transfers."
@@ -1322,35 +748,6 @@ extension DashboardModel {
         pendingTransferBatches.removeAll { $0.id == id }
         persistPendingTransfers()
         statusMessage = "Removed \(batch.files.count) waiting file(s) from the transfer queue. No files were changed."
-    }
-
-    func enqueueTransferBatch(_ batch: PendingTransferBatch) {
-        enqueueTransfer(
-            files: batch.files,
-            sourcePath: batch.sourcePath,
-            destinationPath: batch.destinationPath,
-            eventID: batch.eventID,
-            eventName: batch.eventName,
-            deviceID: batch.deviceID
-        )
-    }
-
-    private func scheduledTransferPaths(sourcePath: String, destinationPath: String) -> Set<String> {
-        let standardizedSource = URL(fileURLWithPath: sourcePath, isDirectory: true).standardizedFileURL.path
-        let standardizedDestination = URL(fileURLWithPath: destinationPath, isDirectory: true).standardizedFileURL.path
-        var paths = Set<String>()
-
-        if let active = transferQueue,
-           active.state == .running,
-           URL(fileURLWithPath: active.sourcePath, isDirectory: true).standardizedFileURL.path == standardizedSource,
-           URL(fileURLWithPath: active.destinationPath, isDirectory: true).standardizedFileURL.path == standardizedDestination {
-            paths.formUnion(active.items.map(\.relativePath))
-        }
-        for batch in pendingTransferBatches
-        where batch.sourcePath == standardizedSource && batch.destinationPath == standardizedDestination {
-            paths.formUnion(batch.files.map(\.path))
-        }
-        return paths
     }
 
     func enqueueTransfer(
@@ -1406,7 +803,6 @@ extension DashboardModel {
             ))
         }
         persistPendingTransfers()
-        queuedFilePaths.formUnion(unscheduledFiles.map(\.path))
         NotificationCenter.default.post(name: .cameraToolkitShowTransferQueue, object: nil)
 
         if isBusy || isStorageBenchmarkRunning {
@@ -1451,8 +847,6 @@ extension DashboardModel {
                 return QueueCopyJobResult(copy: result, plan: plan)
             },
             completion: { result in
-                self.activePlan = result.plan
-                self.queuedFilePaths.subtract(selectedFiles.map(\.path))
                 self.completeTransferQueue(copy: result.copy, plan: result.plan)
                 return "Copied \(result.copy.copied.count) queued file(s) to buffer, skipped \(result.copy.skippedIdentical.count) already there, left \(result.copy.conflicts.count) conflict(s) untouched."
             }
@@ -1557,74 +951,6 @@ extension DashboardModel {
                 return summary
             }
         )
-    }
-
-    var isBufferVerifiedForArchive: Bool {
-        !activePlan.existing.isEmpty
-            && activePlan.new.isEmpty
-            && activePlan.conflicts.isEmpty
-            && activePlan.existing.allSatisfy { $0.sha256 != nil }
-    }
-
-    func archiveBufferToLibrary() {
-        guard isBufferVerifiedForArchive else {
-            statusMessage = "Copy and checksum-verify the event files in the buffer before archiving to the library."
-            return
-        }
-
-        let sourcePath = expandedBufferIngestPath
-        let libraryPath = expandedLibraryRootPath
-        let source = URL(fileURLWithPath: sourcePath, isDirectory: true)
-        let library = URL(fileURLWithPath: libraryPath, isDirectory: true)
-        let layout = OrganizedArchiveLayout(configuration: configuration)
-        let command = Self.commandLine(["archive-organized", "--verify", sourcePath, libraryPath])
-        runBackgroundJob(
-            action: .syncBuffer,
-            runningNote: "Organizing and verifying permanent library originals",
-            logTitle: "Archived verified originals to the library",
-            logDetail: "Copied from the verified buffer into event folders. Existing conflicts were never overwritten, and a checksum manifest was written.",
-            command: command,
-            sourcePath: sourcePath,
-            destinationPath: libraryPath,
-            operation: { progress in
-                let planner = OrganizedArchivePlanner()
-                let plan = try planner.plan(source: source, libraryRoot: library, layout: layout) { update in
-                    progress(Self.jobUpdate(from: update, lowerBound: 0.02, upperBound: 0.34, notePrefix: "Planning library archive", command: command, sourcePath: sourcePath, destinationPath: libraryPath))
-                }
-                let result = try OrganizedArchiveService().archive(source: source, libraryRoot: library, plan: plan) { update in
-                    progress(Self.jobUpdate(from: update, lowerBound: 0.34, upperBound: 0.88, notePrefix: "Archiving to the library", command: command, sourcePath: sourcePath, destinationPath: libraryPath))
-                }
-                let verifiedPlan = try planner.plan(source: source, libraryRoot: library, layout: layout) { update in
-                    progress(Self.jobUpdate(from: update, lowerBound: 0.88, upperBound: 0.98, notePrefix: "Final library verification", command: command, sourcePath: sourcePath, destinationPath: libraryPath))
-                }
-                return OrganizedArchiveJobResult(copy: result, plan: verifiedPlan)
-            },
-            completion: { result in
-                self.organizedArchivePlan = result.plan
-                let proof = result.copy.manifestPath.map { " Proof: \($0)" } ?? ""
-                return "Library archive verified: \(result.copy.copied.count) copied, \(result.copy.skippedIdentical.count) already safe, \(result.copy.conflicts.count) conflict(s) left untouched.\(proof)"
-            }
-        )
-    }
-
-    private var expandedImportSourcePath: String {
-        Self.expandedPath(configuration.importSourcePath)
-    }
-
-    var expandedBufferIngestPath: String {
-        Self.expandedPath(configuration.bufferIngestFolderPath())
-    }
-
-    var expandedBufferExportsPath: String {
-        Self.expandedPath(configuration.bufferExportsFolderPath())
-    }
-
-    var expandedBufferEditsPath: String {
-        Self.expandedPath(configuration.bufferEditsFolderPath())
-    }
-
-    var expandedLibraryRootPath: String {
-        Self.expandedPath(configuration.cameraLibraryRootPath)
     }
 
     private func refreshAllNow() async {

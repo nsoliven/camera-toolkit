@@ -7,7 +7,6 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate, NSMenuIte
     private static var retainedDelegate: CameraToolkitApplication?
 
     private let model = CameraToolkitRuntime.model
-    private var thumbnailShortcutMonitor: Any?
 
     static func main() {
         UserDefaults.standard.set(false, forKey: "NSQuitAlwaysKeepsWindows")
@@ -21,7 +20,6 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate, NSMenuIte
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        installThumbnailShortcutMonitor()
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(handleTransferQueueRequest(_:)),
@@ -36,9 +34,6 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate, NSMenuIte
 
     func applicationWillTerminate(_ notification: Notification) {
         NotificationCenter.default.removeObserver(self)
-        if let thumbnailShortcutMonitor {
-            NSEvent.removeMonitor(thumbnailShortcutMonitor)
-        }
         model.flushConfigurationSave()
     }
 
@@ -53,22 +48,6 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate, NSMenuIte
 
     func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool {
         false
-    }
-
-    private func installThumbnailShortcutMonitor() {
-        guard thumbnailShortcutMonitor == nil else { return }
-        thumbnailShortcutMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-            guard !KeyboardTextFocus.isTypingInTextField(),
-                  let command = BrowserThumbnailShortcut.command(
-                      for: event.charactersIgnoringModifiers,
-                      modifierFlags: event.modifierFlags
-                  ) else {
-                return event
-            }
-
-            BrowserCommand.post(command)
-            return nil
-        }
     }
 
     private func installMenu() {
@@ -113,13 +92,6 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate, NSMenuIte
         fileMenuItem.submenu = fileMenu
         addBrowserCommand(
             to: fileMenu,
-            title: "Get Selected Location Info…",
-            command: .showSelectedLocationInformation,
-            keyEquivalent: "i"
-        )
-        fileMenu.addItem(.separator())
-        addBrowserCommand(
-            to: fileMenu,
             title: "Open Selected Item",
             command: .openSelection,
             keyEquivalent: "o"
@@ -131,13 +103,6 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate, NSMenuIte
             keyEquivalent: "y"
         )
         fileMenu.addItem(.separator())
-        addBrowserCommand(
-            to: fileMenu,
-            title: "New Folder…",
-            command: .createFolder,
-            keyEquivalent: "n",
-            modifiers: [.command, .shift]
-        )
         addBrowserCommand(
             to: fileMenu,
             title: "Reveal in Finder",
@@ -157,12 +122,6 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate, NSMenuIte
         mainMenu.addItem(editMenuItem)
         let editMenu = NSMenu(title: "Edit")
         editMenuItem.submenu = editMenu
-        addBrowserCommand(
-            to: editMenu,
-            title: "Copy",
-            command: .copySelection,
-            keyEquivalent: "c"
-        )
         addBrowserCommand(
             to: editMenu,
             title: "Select All",
@@ -186,50 +145,6 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate, NSMenuIte
         undoSortItem.target = self
         editMenu.addItem(undoSortItem)
 
-        let goMenuItem = NSMenuItem()
-        mainMenu.addItem(goMenuItem)
-        let goMenu = NSMenu(title: "Go")
-        goMenuItem.submenu = goMenu
-        addBrowserCommand(
-            to: goMenu,
-            title: "Back",
-            command: .goBack,
-            keyEquivalent: "["
-        )
-        addBrowserCommand(
-            to: goMenu,
-            title: "Forward",
-            command: .goForward,
-            keyEquivalent: "]"
-        )
-        addBrowserCommand(
-            to: goMenu,
-            title: "Enclosing Folder",
-            command: .goUp,
-            keyEquivalent: "\u{F700}"
-        )
-        addBrowserCommand(
-            to: goMenu,
-            title: "Open Selected Item",
-            command: .openSelection,
-            keyEquivalent: "\u{F701}"
-        )
-        goMenu.addItem(.separator())
-        addBrowserCommand(
-            to: goMenu,
-            title: "Previous Camera Source",
-            command: .previousSource,
-            keyEquivalent: "\t",
-            modifiers: [.control, .shift]
-        )
-        addBrowserCommand(
-            to: goMenu,
-            title: "Next Camera Source",
-            command: .nextSource,
-            keyEquivalent: "\t",
-            modifiers: [.control]
-        )
-
         let viewMenuItem = NSMenuItem()
         mainMenu.addItem(viewMenuItem)
         let viewMenu = NSMenu(title: "View")
@@ -243,40 +158,6 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate, NSMenuIte
         sidebarItem.keyEquivalentModifierMask = [.command]
         sidebarItem.target = self
         viewMenu.addItem(sidebarItem)
-
-        viewMenu.addItem(.separator())
-        addBrowserCommand(
-            to: viewMenu,
-            title: "Larger Thumbnails",
-            command: .increaseThumbnailSize,
-            keyEquivalent: "+"
-        )
-        addBrowserCommand(
-            to: viewMenu,
-            title: "Smaller Thumbnails",
-            command: .decreaseThumbnailSize,
-            keyEquivalent: "-"
-        )
-
-        viewMenu.addItem(.separator())
-
-        let eventsModeItem = NSMenuItem(
-            title: "Events",
-            action: #selector(showEventsMode),
-            keyEquivalent: "1"
-        )
-        eventsModeItem.keyEquivalentModifierMask = [.command, .option]
-        eventsModeItem.target = self
-        viewMenu.addItem(eventsModeItem)
-
-        let filesModeItem = NSMenuItem(
-            title: "File Browser",
-            action: #selector(showFilesMode),
-            keyEquivalent: "2"
-        )
-        filesModeItem.keyEquivalentModifierMask = [.command, .option]
-        filesModeItem.target = self
-        viewMenu.addItem(filesModeItem)
 
         viewMenu.addItem(.separator())
 
@@ -439,19 +320,8 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate, NSMenuIte
     }
 
     @objc private func startSetupGuide() {
-        AppShellMode.show(.events)
         CameraToolkitMainWindow.shared.show(model: model)
         CameraToolkitRuntime.workspace.startGuide()
-    }
-
-    @objc private func showEventsMode() {
-        AppShellMode.show(.events)
-        CameraToolkitMainWindow.shared.show(model: model)
-    }
-
-    @objc private func showFilesMode() {
-        AppShellMode.show(.files)
-        CameraToolkitMainWindow.shared.show(model: model)
     }
 
     @objc private func undoSort() {
@@ -464,7 +334,6 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate, NSMenuIte
     }
 
     @objc private func openPeople() {
-        AppShellMode.show(.events)
         PeopleWindowController.shared.show(model: model, workspace: CameraToolkitRuntime.workspace)
     }
 

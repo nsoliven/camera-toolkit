@@ -40,259 +40,6 @@ final class DashboardModelTests: XCTestCase {
         )
     }
 
-    func testStartupMatchesCameraToAlreadySelectedSource() throws {
-        try withTemporaryDirectory { root in
-            let source = ConfiguredLocation(
-                role: .importSource,
-                name: "Osmo360 · DJI Osmo 360",
-                path: root.appendingPathComponent("Osmo360").path
-            )
-            let configuration = AppConfiguration(
-                demoRootPath: root.appendingPathComponent("Safety Test").path,
-                importSourcePath: source.path,
-                archivePath: root.appendingPathComponent("Library/Originals").path,
-                bufferPath: root.appendingPathComponent("Buffer").path,
-                configuredLocations: [source],
-                selectedImportSourceID: source.id,
-                activityLogPath: root.appendingPathComponent("activity.jsonl").path,
-                selectedDeviceID: "sony-a7v"
-            )
-            let model = DashboardModel(
-                activePlan: CopyPlan(),
-                jobs: [],
-                configuration: configuration,
-                configurationStore: ConfigurationStore(url: root.appendingPathComponent("config.json"))
-            )
-
-            model.matchCameraToSelectedImportSource()
-
-            XCTAssertEqual(model.configuration.selectedDeviceID, "osmo-360")
-            XCTAssertTrue(model.statusMessage.contains("DJI Osmo 360"))
-        }
-    }
-
-    func testPreviewImportUsesBufferBatchInsteadOfArchiveOrTestData() async throws {
-        try await withTemporaryDirectoryAsync { root in
-            let source = root.appendingPathComponent("Configured Source", isDirectory: true)
-            let archive = root.appendingPathComponent("Configured Archive", isDirectory: true)
-            let buffer = root.appendingPathComponent("Configured Buffer", isDirectory: true)
-            let testDataRoot = root.appendingPathComponent("Safety Test", isDirectory: true)
-            let relativePath = "DCIM/100MSDCF/DSC00001.ARW"
-            let bytes = Data("same-photo-bytes".utf8)
-            try writeFile(source.appendingPathComponent(relativePath), bytes)
-            try writeFile(buffer.appendingPathComponent("2026/2026-07-10 Test Batch/Sony A7V/Card Copy").appendingPathComponent(relativePath), bytes)
-
-            let model = DashboardModel(
-                activePlan: CopyPlan(),
-                jobs: [],
-                configuration: AppConfiguration(
-                    demoRootPath: testDataRoot.path,
-                    importSourcePath: source.path,
-                    archivePath: archive.path,
-                    bufferPath: buffer.path,
-                    activityLogPath: root.appendingPathComponent("activity-log.jsonl").path,
-                    immichServerURL: "",
-                    selectedDeviceID: "sony-a7v",
-                    eventName: "Test Batch",
-                    batchID: "2026-07-10_120000_sony-a7v_test"
-                ),
-                configurationStore: ConfigurationStore(url: root.appendingPathComponent("config.json"))
-            )
-
-            model.previewImport()
-            try await waitForIdle(model)
-
-            XCTAssertEqual(model.activePlan.existing.map(\.path), [relativePath])
-            XCTAssertTrue(model.activePlan.new.isEmpty)
-            XCTAssertTrue(model.activePlan.conflicts.isEmpty)
-            XCTAssertEqual(model.jobs.first?.action, .previewFiles)
-        }
-    }
-
-    func testCopySourceToBufferCopiesOnlyIntoBufferBatch() async throws {
-        try await withTemporaryDirectoryAsync { root in
-            let source = root.appendingPathComponent("Card", isDirectory: true)
-            let archive = root.appendingPathComponent("Archive", isDirectory: true)
-            let buffer = root.appendingPathComponent("Buffer", isDirectory: true)
-            let testDataRoot = root.appendingPathComponent("Safety Test", isDirectory: true)
-            let relativePath = "DCIM/100MSDCF/DSC00001.ARW"
-            let bytes = Data("photo".utf8)
-            try writeFile(source.appendingPathComponent(relativePath), bytes)
-
-            let model = DashboardModel(
-                activePlan: CopyPlan(),
-                jobs: [],
-                configuration: AppConfiguration(
-                    demoRootPath: testDataRoot.path,
-                    importSourcePath: source.path,
-                    archivePath: archive.path,
-                    bufferPath: buffer.path,
-                    activityLogPath: root.appendingPathComponent("activity-log.jsonl").path,
-                    immichServerURL: "",
-                    selectedDeviceID: "sony-a7v",
-                    eventName: "Test Batch",
-                    batchID: "2026-07-10_120000_sony-a7v_test"
-                ),
-                configurationStore: ConfigurationStore(url: root.appendingPathComponent("config.json"))
-            )
-
-            model.copySourceToBuffer()
-            try await waitForIdle(model)
-
-            let bufferedFile = buffer
-                .appendingPathComponent("2026/2026-07-10 Test Batch/Sony A7V/Card Copy")
-                .appendingPathComponent(relativePath)
-            XCTAssertEqual(try Data(contentsOf: bufferedFile), bytes)
-            XCTAssertFalse(FileManager.default.fileExists(atPath: archive.appendingPathComponent(relativePath).path))
-            XCTAssertEqual(model.activePlan.existing.map(\.path), [relativePath])
-        }
-    }
-
-    func testPreviewImportUsesSourceOnlyForCatalogBackedLibrary() async throws {
-        try await withTemporaryDirectoryAsync { root in
-            let source = root.appendingPathComponent("Card", isDirectory: true)
-            let libraryRoot = root.appendingPathComponent("Camera", isDirectory: true)
-            let catalog = root.appendingPathComponent("catalog.sqlite")
-            let testDataRoot = root.appendingPathComponent("Safety Test", isDirectory: true)
-            let relativePath = "DCIM/100MSDCF/DSC00001.ARW"
-            try writeFile(source.appendingPathComponent(relativePath), Data("photo".utf8))
-            try writeFile(catalog, Data())
-
-            let model = DashboardModel(
-                activePlan: CopyPlan(),
-                jobs: [],
-                configuration: AppConfiguration(
-                    demoRootPath: testDataRoot.path,
-                    importSourcePath: source.path,
-                    archivePath: libraryRoot.appendingPathComponent("Originals", isDirectory: true).path,
-                    bufferPath: root.appendingPathComponent("Buffer", isDirectory: true).path,
-                    cameraLibraryRootPath: libraryRoot.path,
-                    catalogDatabasePath: catalog.path,
-                    activityLogPath: root.appendingPathComponent("activity-log.jsonl").path
-                ),
-                configurationStore: ConfigurationStore(url: root.appendingPathComponent("config.json"))
-            )
-
-            model.previewImport()
-            try await waitForIdle(model)
-
-            XCTAssertEqual(model.activePlan.new.map(\.path), [relativePath])
-            XCTAssertTrue(model.activePlan.existing.isEmpty)
-            XCTAssertTrue(model.activePlan.conflicts.isEmpty)
-            XCTAssertTrue(model.statusMessage.contains("Preview ready"))
-        }
-    }
-
-    func testSavedEventCopiesOnlyAssignedCardFilesAndCreatesEditingFolders() async throws {
-        try await withTemporaryDirectoryAsync { root in
-            let card = root.appendingPathComponent("Camera Card", isDirectory: true)
-            let buffer = root.appendingPathComponent("Buffer", isDirectory: true)
-            let library = root.appendingPathComponent("Library", isDirectory: true)
-            let includedPath = "DCIM/100MSDCF/INCLUDED.ARW"
-            let otherPath = "DCIM/100MSDCF/OTHER-EVENT.ARW"
-            try writeFile(card.appendingPathComponent(includedPath), Data("included-event".utf8))
-            try writeFile(card.appendingPathComponent(otherPath), Data("different-event".utf8))
-            try FileManager.default.createDirectory(at: library, withIntermediateDirectories: true)
-
-            let configuration = AppConfiguration(
-                demoRootPath: root.appendingPathComponent("Safety Test").path,
-                importSourcePath: card.path,
-                archivePath: library.appendingPathComponent("Originals").path,
-                bufferPath: buffer.path,
-                cameraLibraryRootPath: library.path,
-                activityLogPath: root.appendingPathComponent("activity.jsonl").path,
-                selectedDeviceID: "sony-a7v"
-            )
-            let model = DashboardModel(
-                activePlan: CopyPlan(),
-                jobs: [],
-                configuration: configuration,
-                configurationStore: ConfigurationStore(url: root.appendingPathComponent("config.json"))
-            )
-            let eventDate = try XCTUnwrap(
-                Calendar.current.date(from: DateComponents(year: 2026, month: 7, day: 19, hour: 12))
-            )
-
-            model.createEvent(named: "Portrait Session", on: eventDate)
-            model.assignFilesToSelectedEvent([
-                FileRecord(path: includedPath, size: 14, modifiedAt: try XCTUnwrap(
-                    card.appendingPathComponent(includedPath).resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
-                ))
-            ])
-
-            XCTAssertEqual(model.selectedEventFiles.map(\.path), [includedPath])
-            XCTAssertTrue(FileManager.default.fileExists(atPath: model.expandedBufferEditsPath))
-            XCTAssertTrue(FileManager.default.fileExists(atPath: model.configuration.bufferExportFolderPath("Masters")))
-
-            await model.refreshSelectedEventCopyAvailability()
-            model.previewSelectedEventImport()
-            try await waitForIdle(model)
-            XCTAssertEqual(model.activePlan.new.map(\.path), [includedPath])
-            XCTAssertFalse(model.activePlan.new.contains { $0.path == otherPath })
-
-            model.copyQueuedFilesToBuffer()
-            try await waitForIdle(model)
-
-            XCTAssertTrue(FileManager.default.fileExists(atPath: URL(fileURLWithPath: model.expandedBufferIngestPath).appendingPathComponent(includedPath).path))
-            XCTAssertFalse(FileManager.default.fileExists(atPath: URL(fileURLWithPath: model.expandedBufferIngestPath).appendingPathComponent(otherPath).path))
-            XCTAssertTrue(model.isBufferVerifiedForArchive)
-        }
-    }
-
-    func testFailedEventCopyKeepsAPersistentActionableTransferQueue() async throws {
-        try await withTemporaryDirectoryAsync { root in
-            let card = root.appendingPathComponent("Camera Card", isDirectory: true)
-            let buffer = root.appendingPathComponent("Buffer", isDirectory: true)
-            let relativePath = "DCIM/100MSDCF/TRUNCATED.ARW"
-            let sourceBytes = Data(repeating: 0x41, count: 500)
-            let sourceURL = try writeFile(card.appendingPathComponent(relativePath), sourceBytes)
-            let configStore = ConfigurationStore(url: root.appendingPathComponent("config.json"))
-            let queueStore = TransferQueueStore(url: root.appendingPathComponent("transfer-queue.json"))
-            let model = DashboardModel(
-                activePlan: CopyPlan(),
-                jobs: [],
-                configuration: AppConfiguration(
-                    demoRootPath: root.appendingPathComponent("Safety Test").path,
-                    importSourcePath: card.path,
-                    archivePath: root.appendingPathComponent("Library/Originals").path,
-                    bufferPath: buffer.path,
-                    activityLogPath: root.appendingPathComponent("activity.jsonl").path,
-                    selectedDeviceID: "sony-a7v"
-                ),
-                configurationStore: configStore,
-                transferQueueStore: queueStore
-            )
-
-            model.createEvent(named: "Transfer Failure Test", on: Date())
-            model.assignFilesToSelectedEvent([
-                FileRecord(
-                    path: relativePath,
-                    size: Int64(sourceBytes.count),
-                    modifiedAt: try XCTUnwrap(
-                        sourceURL.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
-                    )
-                )
-            ])
-            await model.refreshSelectedEventCopyAvailability()
-            try FileManager.default.removeItem(at: sourceURL)
-            model.copySelectedEventFilesToBuffer()
-            try await waitForIdle(model)
-
-            let queue = try XCTUnwrap(model.transferQueue)
-            XCTAssertEqual(queue.state, .failed)
-            XCTAssertEqual(queue.items.first?.state, .failed)
-            XCTAssertTrue(try XCTUnwrap(queue.message).contains("Camera originals were untouched"))
-            XCTAssertFalse(FileManager.default.fileExists(
-                atPath: URL(fileURLWithPath: model.expandedBufferIngestPath)
-                    .appendingPathComponent(relativePath).path
-            ))
-
-            let restored = try XCTUnwrap(try queueStore.load())
-            XCTAssertEqual(restored.state, .failed)
-            XCTAssertEqual(restored.items.map(\.relativePath), [relativePath])
-        }
-    }
-
     func testEventTransfersCanQueueWhileBusyAndRunInSavedFIFOOrder() async throws {
         try await withTemporaryDirectoryAsync { root in
             let card = root.appendingPathComponent("Camera Card", isDirectory: true)
@@ -303,9 +50,10 @@ final class DashboardModelTests: XCTestCase {
             let secondBytes = Data("second-event-photo".utf8)
             let firstURL = try writeFile(card.appendingPathComponent(firstPath), firstBytes)
             let secondURL = try writeFile(card.appendingPathComponent(secondPath), secondBytes)
+            let firstDestination = buffer.appendingPathComponent("Morning").path
+            let secondDestination = buffer.appendingPathComponent("Evening").path
             let pendingStore = PendingTransferQueueStore(url: root.appendingPathComponent("pending-transfers.json"))
             let model = DashboardModel(
-                activePlan: CopyPlan(),
                 jobs: [],
                 configuration: AppConfiguration(
                     demoRootPath: root.appendingPathComponent("Safety Test").path,
@@ -321,29 +69,30 @@ final class DashboardModelTests: XCTestCase {
             )
 
             model.isBusy = true
-            XCTAssertTrue(model.createEvent(named: "Morning Event", on: Date(timeIntervalSince1970: 100)))
-            model.assignFilesToSelectedEvent([
-                FileRecord(
+            model.enqueueTransfer(
+                files: [FileRecord(
                     path: firstPath,
                     size: Int64(firstBytes.count),
                     modifiedAt: try XCTUnwrap(firstURL.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)
-                )
-            ])
-            let firstDestination = model.expandedBufferIngestPath
-            await model.refreshSelectedEventCopyAvailability()
-            model.copySelectedEventFilesToBuffer()
-
-            XCTAssertTrue(model.createEvent(named: "Evening Event", on: Date(timeIntervalSince1970: 200)))
-            model.assignFilesToSelectedEvent([
-                FileRecord(
+                )],
+                sourcePath: card.path,
+                destinationPath: firstDestination,
+                eventID: nil,
+                eventName: "Morning Event",
+                deviceID: "sony-a7v"
+            )
+            model.enqueueTransfer(
+                files: [FileRecord(
                     path: secondPath,
                     size: Int64(secondBytes.count),
                     modifiedAt: try XCTUnwrap(secondURL.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)
-                )
-            ])
-            let secondDestination = model.expandedBufferIngestPath
-            await model.refreshSelectedEventCopyAvailability()
-            model.copySelectedEventFilesToBuffer()
+                )],
+                sourcePath: card.path,
+                destinationPath: secondDestination,
+                eventID: nil,
+                eventName: "Evening Event",
+                deviceID: "sony-a7v"
+            )
 
             XCTAssertEqual(model.pendingTransferBatches.map(\.eventName), ["Morning Event", "Evening Event"])
             XCTAssertEqual(model.pendingTransferFileCount, 2)
@@ -365,62 +114,6 @@ final class DashboardModelTests: XCTestCase {
             )
             XCTAssertEqual(model.transferQueue?.items.map(\.relativePath), [secondPath])
             XCTAssertEqual(model.transferQueue?.state, .completed)
-        }
-    }
-
-    func testQueueingDuringActiveTransferAddsOnlyNewlyAssignedFiles() async throws {
-        try await withTemporaryDirectoryAsync { root in
-            let card = root.appendingPathComponent("Camera", isDirectory: true)
-            let buffer = root.appendingPathComponent("Buffer", isDirectory: true)
-            let firstBytes = Data(repeating: 0x31, count: 10)
-            let secondBytes = Data(repeating: 0x32, count: 20)
-            let firstURL = try writeFile(card.appendingPathComponent("DCIM/FIRST.ARW"), firstBytes)
-            let secondURL = try writeFile(card.appendingPathComponent("DCIM/SECOND.ARW"), secondBytes)
-            let first = FileRecord(
-                path: "DCIM/FIRST.ARW",
-                size: Int64(firstBytes.count),
-                modifiedAt: try XCTUnwrap(
-                    firstURL.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
-                )
-            )
-            let second = FileRecord(
-                path: "DCIM/SECOND.ARW",
-                size: Int64(secondBytes.count),
-                modifiedAt: try XCTUnwrap(
-                    secondURL.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
-                )
-            )
-            let model = DashboardModel(
-                activePlan: CopyPlan(),
-                jobs: [],
-                configuration: AppConfiguration(
-                    demoRootPath: root.appendingPathComponent("Safety Test").path,
-                    importSourcePath: card.path,
-                    archivePath: root.appendingPathComponent("Library").path,
-                    bufferPath: buffer.path,
-                    activityLogPath: root.appendingPathComponent("activity.jsonl").path
-                ),
-                configurationStore: ConfigurationStore(url: root.appendingPathComponent("config.json")),
-                transferQueueStore: TransferQueueStore(url: root.appendingPathComponent("transfer-queue.json")),
-                pendingTransferQueueStore: PendingTransferQueueStore(url: root.appendingPathComponent("pending-transfers.json"))
-            )
-
-            XCTAssertTrue(model.createEvent(named: "Long Event", on: Date()))
-            model.assignFilesToSelectedEvent([first, second])
-            model.transferQueue = TransferQueueSnapshot(
-                sourcePath: card.standardizedFileURL.path,
-                destinationPath: model.expandedBufferIngestPath,
-                items: [TransferQueueItem(relativePath: first.path, size: first.size, state: .copying)],
-                totalBytes: first.size
-            )
-            model.isBusy = true
-
-            await model.refreshSelectedEventCopyAvailability()
-            model.copySelectedEventFilesToBuffer()
-
-            XCTAssertEqual(model.pendingTransferBatches.count, 1)
-            XCTAssertEqual(model.pendingTransferBatches[0].files, [second])
-            XCTAssertEqual(model.queuedFilePaths, [second.path])
         }
     }
 
@@ -446,7 +139,6 @@ final class DashboardModelTests: XCTestCase {
             ))
 
             let model = DashboardModel(
-                activePlan: CopyPlan(),
                 jobs: [],
                 configuration: AppConfiguration(
                     demoRootPath: root.appendingPathComponent("Safety Test").path,
@@ -480,7 +172,6 @@ final class DashboardModelTests: XCTestCase {
             try writeFile(buffer.appendingPathComponent(relativePath), bytes)
             let queueStore = TransferQueueStore(url: root.appendingPathComponent("transfer-queue.json"))
             let model = DashboardModel(
-                activePlan: CopyPlan(),
                 jobs: [],
                 configuration: AppConfiguration(
                     demoRootPath: root.appendingPathComponent("Safety Test").path,
@@ -526,199 +217,6 @@ final class DashboardModelTests: XCTestCase {
         }
     }
 
-    func testEventSelectionCanSpanMultipleSourceRootsWithoutMisattribution() throws {
-        try withTemporaryDirectory { root in
-            let firstCard = root.appendingPathComponent("Camera Card A", isDirectory: true)
-            let secondCard = root.appendingPathComponent("Camera Card B", isDirectory: true)
-            let firstFile = FileRecord(
-                path: "DCIM/100MSDCF/FIRST.ARW",
-                size: 10,
-                modifiedAt: Date(timeIntervalSince1970: 100)
-            )
-            let secondFile = FileRecord(
-                path: "DCIM/200MSDCF/SECOND.DNG",
-                size: 20,
-                modifiedAt: Date(timeIntervalSince1970: 200)
-            )
-            let model = DashboardModel(
-                activePlan: CopyPlan(),
-                jobs: [],
-                configuration: AppConfiguration(
-                    demoRootPath: root.appendingPathComponent("Safety Test").path,
-                    importSourcePath: firstCard.path,
-                    archivePath: root.appendingPathComponent("Archive").path,
-                    bufferPath: root.appendingPathComponent("Buffer").path,
-                    activityLogPath: root.appendingPathComponent("activity.jsonl").path
-                ),
-                configurationStore: ConfigurationStore(url: root.appendingPathComponent("config.json"))
-            )
-
-            model.createEvent(named: "All Day Event", on: Date(timeIntervalSince1970: 300))
-            model.assignFilesToSelectedEvent([
-                EventFileSelection(sourceRootPath: firstCard.path, file: firstFile),
-                EventFileSelection(sourceRootPath: secondCard.path, file: secondFile),
-            ])
-
-            XCTAssertEqual(model.configuration.photoEventAssignments.count, 2)
-            XCTAssertEqual(
-                Set(model.configuration.photoEventAssignments.map(\.sourceRootPath)),
-                Set([firstCard.standardizedFileURL.path, secondCard.standardizedFileURL.path])
-            )
-            XCTAssertEqual(model.selectedEventFiles, [firstFile])
-            XCTAssertEqual(model.queuedFilePaths, [firstFile.path])
-            XCTAssertTrue(model.statusMessage.contains("2 camera sources"))
-        }
-    }
-
-    func testTwoButtonImportCopiesToBufferThenOrganizesVerifiedLibraryOriginals() async throws {
-        try await withTemporaryDirectoryAsync { root in
-            let card = root.appendingPathComponent("Camera Card", isDirectory: true)
-            let buffer = root.appendingPathComponent("Buffer", isDirectory: true)
-            let library = root.appendingPathComponent("Library", isDirectory: true)
-            try writeFile(card.appendingPathComponent("DCIM/100MSDCF/PHOTO.ARW"), Data("raw-photo".utf8))
-            try writeFile(card.appendingPathComponent("M4ROOT/CLIP/VIDEO.MP4"), Data("video".utf8))
-            try FileManager.default.createDirectory(at: library, withIntermediateDirectories: true)
-
-            let configuration = AppConfiguration(
-                demoRootPath: root.appendingPathComponent("Safety Test").path,
-                importSourcePath: card.path,
-                archivePath: library.appendingPathComponent("Originals").path,
-                bufferPath: buffer.path,
-                cameraLibraryRootPath: library.path,
-                activityLogPath: root.appendingPathComponent("activity.jsonl").path,
-                selectedDeviceID: "sony-a7v",
-                eventName: "Lee Canyon",
-                batchID: "2026-07-11_120000_sony-a7v_test"
-            )
-            let model = DashboardModel(
-                activePlan: CopyPlan(),
-                jobs: [],
-                configuration: configuration,
-                configurationStore: ConfigurationStore(url: root.appendingPathComponent("config.json"))
-            )
-
-            model.copySourceToBuffer()
-            try await waitForIdle(model)
-            XCTAssertTrue(model.isBufferVerifiedForArchive)
-
-            model.archiveBufferToLibrary()
-            try await waitForIdle(model)
-
-            let raw = library.appendingPathComponent("Originals/2026/2026-07-11 Lee Canyon/Sony A7V/RAW/PHOTO.ARW")
-            let video = library.appendingPathComponent("Originals/2026/2026-07-11 Lee Canyon/Sony A7V/Video/VIDEO.MP4")
-            XCTAssertEqual(try Data(contentsOf: raw), Data("raw-photo".utf8))
-            XCTAssertEqual(try Data(contentsOf: video), Data("video".utf8))
-            XCTAssertTrue(model.organizedArchivePlan.isVerified)
-            XCTAssertTrue(model.statusMessage.contains("Library archive verified"))
-        }
-    }
-
-    func testEventCopyAvailabilitySeparatesReadyBufferedMissingScheduledAndConflictingFiles() throws {
-        try withTemporaryDirectory { root in
-            let source = root.appendingPathComponent("Card", isDirectory: true)
-            let buffer = root.appendingPathComponent("Buffer", isDirectory: true)
-            let readyURL = try writeFile(source.appendingPathComponent("DCIM/READY.ARW"), Data("ready".utf8))
-            let bufferedURL = try writeFile(source.appendingPathComponent("DCIM/BUFFERED.ARW"), Data("buffered".utf8))
-            let scheduledURL = try writeFile(source.appendingPathComponent("DCIM/SCHEDULED.ARW"), Data("scheduled".utf8))
-            let conflictURL = try writeFile(source.appendingPathComponent("DCIM/CONFLICT.ARW"), Data("conflict".utf8))
-            try writeFile(buffer.appendingPathComponent("DCIM/BUFFERED.ARW"), Data("buffered".utf8))
-            try writeFile(buffer.appendingPathComponent("DCIM/CONFLICT.ARW"), Data("short".utf8))
-
-            func record(_ url: URL) throws -> FileRecord {
-                let values = try url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
-                return FileRecord(
-                    path: "DCIM/\(url.lastPathComponent)",
-                    size: Int64(try XCTUnwrap(values.fileSize)),
-                    modifiedAt: try XCTUnwrap(values.contentModificationDate)
-                )
-            }
-            let files = try [
-                record(readyURL),
-                record(bufferedURL),
-                record(scheduledURL),
-                record(conflictURL),
-                FileRecord(path: "DCIM/MISSING.ARW", size: 100, modifiedAt: .distantPast),
-            ]
-
-            let result = EventCopyAvailabilityScanner.scan(
-                contextID: "test",
-                files: files,
-                sourceRoot: source,
-                bufferRoot: buffer,
-                scheduledPaths: ["DCIM/SCHEDULED.ARW"]
-            )
-
-            XCTAssertEqual(result.phase, .ready)
-            XCTAssertEqual(result.assignedCount, 5)
-            XCTAssertEqual(result.presentFiles.count, 4)
-            XCTAssertEqual(result.filesReadyToCopy.map(\.path), ["DCIM/READY.ARW"])
-            XCTAssertEqual(result.alreadyInBufferCount, 1)
-            XCTAssertEqual(result.missingFromSourceCount, 1)
-            XCTAssertEqual(result.scheduledCount, 1)
-            XCTAssertEqual(result.bufferConflictCount, 1)
-            XCTAssertFalse(result.sourceIsUnavailable)
-        }
-    }
-
-    func testEventCopyQueuesOnlyFilesStillPresentAndNotAlreadyInBuffer() async throws {
-        try await withTemporaryDirectoryAsync { root in
-            let source = root.appendingPathComponent("Card", isDirectory: true)
-            let buffer = root.appendingPathComponent("Buffer", isDirectory: true)
-            let readyBytes = Data("needs-copy".utf8)
-            let bufferedBytes = Data("already-buffered".utf8)
-            let readyURL = try writeFile(source.appendingPathComponent("DCIM/READY.ARW"), readyBytes)
-            let bufferedURL = try writeFile(source.appendingPathComponent("DCIM/BUFFERED.ARW"), bufferedBytes)
-            let model = DashboardModel(
-                activePlan: CopyPlan(),
-                jobs: [],
-                configuration: AppConfiguration(
-                    demoRootPath: root.appendingPathComponent("Safety Test").path,
-                    importSourcePath: source.path,
-                    archivePath: root.appendingPathComponent("Library/Originals").path,
-                    bufferPath: buffer.path,
-                    activityLogPath: root.appendingPathComponent("activity.jsonl").path,
-                    selectedDeviceID: "sony-a7v"
-                ),
-                configurationStore: ConfigurationStore(url: root.appendingPathComponent("config.json")),
-                transferQueueStore: TransferQueueStore(url: root.appendingPathComponent("transfer-queue.json")),
-                pendingTransferQueueStore: PendingTransferQueueStore(url: root.appendingPathComponent("pending-transfers.json"))
-            )
-
-            XCTAssertTrue(model.createEvent(named: "Availability Test", on: Date()))
-            try writeFile(
-                URL(fileURLWithPath: model.expandedBufferIngestPath).appendingPathComponent("DCIM/BUFFERED.ARW"),
-                bufferedBytes
-            )
-            let readyValues = try readyURL.resourceValues(forKeys: [.contentModificationDateKey])
-            let bufferedValues = try bufferedURL.resourceValues(forKeys: [.contentModificationDateKey])
-            model.assignFilesToSelectedEvent([
-                FileRecord(
-                    path: "DCIM/READY.ARW",
-                    size: Int64(readyBytes.count),
-                    modifiedAt: try XCTUnwrap(readyValues.contentModificationDate)
-                ),
-                FileRecord(
-                    path: "DCIM/BUFFERED.ARW",
-                    size: Int64(bufferedBytes.count),
-                    modifiedAt: try XCTUnwrap(bufferedValues.contentModificationDate)
-                ),
-                FileRecord(path: "DCIM/MISSING.ARW", size: 50, modifiedAt: .distantPast),
-            ])
-
-            await model.refreshSelectedEventCopyAvailability()
-            XCTAssertEqual(model.selectedEventFiles.count, 3)
-            XCTAssertEqual(model.selectedEventCopyAvailability.filesReadyToCopy.map(\.path), ["DCIM/READY.ARW"])
-            XCTAssertEqual(model.selectedEventCopyAvailability.alreadyInBufferCount, 1)
-            XCTAssertEqual(model.selectedEventCopyAvailability.missingFromSourceCount, 1)
-
-            model.isBusy = true
-            model.copySelectedEventFilesToBuffer()
-
-            XCTAssertEqual(model.pendingTransferBatches.count, 1)
-            XCTAssertEqual(model.pendingTransferBatches[0].files.map(\.path), ["DCIM/READY.ARW"])
-        }
-    }
-
     /// Config writes are debounced, so a burst of mutations lands as one
     /// write; `flushConfigurationSave` (termination) persists synchronously.
     func testConfigurationMutationsPersistAfterDebounceAndFlush() async throws {
@@ -726,7 +224,6 @@ final class DashboardModelTests: XCTestCase {
             let store = ConfigurationStore(url: root.appendingPathComponent("config.json"))
             let defaults = AppConfiguration.defaults(applicationSupport: root)
             let model = DashboardModel(
-                activePlan: CopyPlan(),
                 jobs: [],
                 configuration: defaults,
                 configurationStore: store,
@@ -770,7 +267,6 @@ final class DashboardModelTests: XCTestCase {
             )
             configuration.eventName = "Before Refresh"
             let model = DashboardModel(
-                activePlan: CopyPlan(),
                 jobs: [],
                 configuration: configuration,
                 configurationStore: store
@@ -819,7 +315,6 @@ final class DashboardModelTests: XCTestCase {
                 selectedDeviceID: "sony-a7v"
             )
             let model = DashboardModel(
-                activePlan: CopyPlan(),
                 jobs: [],
                 configuration: configuration,
                 configurationStore: store
@@ -853,7 +348,6 @@ final class DashboardModelTests: XCTestCase {
     func testRunBackgroundJobReturnsIDAndRefusesWhileBusy() async throws {
         try await withTemporaryDirectoryAsync { root in
             let model = DashboardModel(
-                activePlan: CopyPlan(),
                 jobs: [],
                 configuration: AppConfiguration.defaults(applicationSupport: root),
                 configurationStore: ConfigurationStore(url: root.appendingPathComponent("config.json"))

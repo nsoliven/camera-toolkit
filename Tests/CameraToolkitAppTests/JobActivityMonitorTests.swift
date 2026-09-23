@@ -110,7 +110,6 @@ final class JobActivityMonitorTests: XCTestCase {
             .appendingPathComponent("JobActivityMonitorTests-\(UUID().uuidString)")
         let job = JobSnapshot(action: .faceScan, state: .running)
         let model = DashboardModel(
-            activePlan: CopyPlan(),
             jobs: [job],
             configuration: AppConfiguration(
                 demoRootPath: scratch.path,

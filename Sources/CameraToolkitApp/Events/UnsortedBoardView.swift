@@ -501,8 +501,6 @@ struct UnsortedBoardView: View {
             searchFocused = true
         case .moveSelectionToTrash:
             workspace.trash(stackIDs: workspace.targetStackIDs(), from: location.id)
-        default:
-            break
         }
     }
 }

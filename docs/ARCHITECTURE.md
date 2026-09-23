@@ -10,8 +10,8 @@ Camera Toolkit is a Swift Package with two targets:
 ```text
 Sources/
 ├── CameraToolkitApp/
-│   ├── App/            # application lifecycle, main window, Events/Files switch
-│   ├── Browser/        # commands, shortcuts, and Finder clipboard support
+│   ├── App/            # application lifecycle and main window
+│   ├── Browser/        # board commands and keyboard shortcuts
 │   ├── Events/         # event-first organizer: workspace, burst boards, storage strip
 │   ├── Model/          # observable application state and async job coordination
 │   ├── Preview/        # bounded thumbnail and preview decoding
@@ -37,7 +37,7 @@ Swift Package Manager discovers source files recursively, so these folders descr
 
 ## Event-first organizer
 
-The main window opens on **Events**. The file browser remains available as **File Browser**.
+The main window is the **Events** organizer.
 
 ```text
 unsorted folder or card
@@ -103,7 +103,7 @@ FaceIndexStore: faces/people/face_templates/face_rejections/face_photos in the c
 - The People window (View → People, ⌘⌥P) is a two-list review surface: Approved (people the user named, confirmed, or tagged) and Inbox (automatic "Person N" clusters plus "looks like" rows holding faces the matcher filed near an approved person). A scan never attaches faces to an approved person — classification lands in the Inbox. Approving a row promotes it, confirms only its own faces, and pins distinct-photo members as match templates; merging an Inbox row into an approved person is the other explicit approval and confirms the moved faces. Inbox faces read strongest-match first so the doubtful ones sit at the bottom. Re-match re-evaluates stored vectors on CPU only and files matches into the Inbox, never onto approved people. Event chips, the People filter, and board person-name search count approved people with confirmed faces only.
 - Face work runs inside `runAsyncJob` like other file jobs; FAST on uses every core, FAST off is two workers — never changes models or floors. Quality is the mode, Fast is how hard the Mac works. The same `FaceScanSheet` opens from an unsorted location or an event board (or its sidebar row's menu): an event scan runs `FaceIndexService` on the event board's own stacks — the reachable `bestLocalPath` copies — against the same catalog, so faces found there or in Unsorted share one index and one set of skip rules. `EventBoardView` and the sidebar read `eventPeople` through `EventsWorkspace`, cached per faces-revision so rows share one catalog pass; board search matches an approved person's name against a stack's files through `personNamesByFileKey`, so typing a person keeps both the event and the bursts they appear in.
 
-Connectivity is refreshed explicitly instead of relying on Finder: `EventsWorkspace.refreshConnectivity()` re-checks each configured location with cheap mount-table and folder-stat probes, bumps `connectivityRevision` so views that call `isConnected` re-render, re-runs `DriveEventDiscovery` and the cached per-event presence summaries, and rescans only unsorted sources whose earlier scan failed — plus sources on a volume that just mounted. Healthy cached scan results are never rescanned by a connectivity refresh. `NSWorkspace` `didMount`/`didUnmount` observers (registered once via `observeVolumeChanges()`, called from `EventsWorkspace.start()` and `AppShell.onAppear`) drive it automatically through a ~0.75 s trailing debounce that remembers mounted volume URLs, so a flapping hub collapses into one refresh pass; sidebar rows, the setup guide's place cards, the Settings "Where Things Live" rows, and the event storage strip each offer a Refresh/Check Again control that calls it. Refresh never mounts shares itself — the configuration stores local paths and service URLs, not network share URLs, so there is no mount URL to retry. `PhotoBrowserView` listens for the same notifications to refresh capacity dots and reload the current folder when its drive comes back.
+Connectivity is refreshed explicitly instead of relying on Finder: `EventsWorkspace.refreshConnectivity()` re-checks each configured location with cheap mount-table and folder-stat probes, bumps `connectivityRevision` so views that call `isConnected` re-render, re-runs `DriveEventDiscovery` and the cached per-event presence summaries, and rescans only unsorted sources whose earlier scan failed — plus sources on a volume that just mounted. Healthy cached scan results are never rescanned by a connectivity refresh. `NSWorkspace` `didMount`/`didUnmount` observers (registered once via `observeVolumeChanges()`, called from `EventsWorkspace.start()` and `AppShell.onAppear`) drive it automatically through a ~0.75 s trailing debounce that remembers mounted volume URLs, so a flapping hub collapses into one refresh pass; sidebar rows, the setup guide's place cards, the Settings "Where Things Live" rows, and the event storage strip each offer a Refresh/Check Again control that calls it. Refresh never mounts shares itself — the configuration stores local paths and service URLs, not network share URLs, so there is no mount URL to retry.
 
 ## Import flow
 
