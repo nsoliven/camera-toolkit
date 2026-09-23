@@ -850,6 +850,16 @@ public struct ConfigurationStore {
         return try JSONDecoder().decode(AppConfiguration.self, from: data)
     }
 
+    /// The config file's modification date and size — the cheap "did the
+    /// file change on disk" fingerprint an activation check compares
+    /// before paying for a decode. Nil when the file is absent.
+    public func fileStamp() -> (modifiedAt: Date, byteCount: Int64)? {
+        guard let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey]),
+              let modified = values.contentModificationDate,
+              let size = values.fileSize else { return nil }
+        return (modified, Int64(size))
+    }
+
     /// Writes the configuration atomically. `settingsOnly` leaves out the
     /// events, assignments, rotations, and burst splits once the catalog
     /// owns them (see `CatalogStateStore`).

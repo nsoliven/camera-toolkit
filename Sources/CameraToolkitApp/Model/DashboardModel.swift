@@ -88,6 +88,10 @@ final class DashboardModel {
     var trueNASIsInspectingCertificate: Bool = false
     var isRefreshing: Bool = false
     var lastRefreshedAt: Date?
+    /// The config file's (modification date, size) as last written or read
+    /// by this process — the activation check compares the on-disk stamp
+    /// against this before paying for a reload.
+    private var configurationFileStamp: (modifiedAt: Date, byteCount: Int64)?
     var catalogReport: CatalogBootstrapReport?
     var catalogMessage: String = "Photo list has not been prepared yet."
     /// Newest local/NAS backup times and the last failure, for Settings.
@@ -99,6 +103,11 @@ final class DashboardModel {
     /// Increments on every saved configuration change so views can cheaply
     /// rebuild indexes derived from events and assignments.
     var configurationRevision: Int = 0
+    /// Increments only when the catalog-owned state — events, assignments,
+    /// display rotations, burst splits — actually changes. Settings writes
+    /// bump `configurationRevision` alone, so a slider or server URL never
+    /// rebuilds the assignment-derived indexes.
+    var catalogStateRevision: Int = 0
     var sourceCleanupMessage: String?
     var sourceCleanupError: String?
     var activeJob: JobSnapshot? {
@@ -146,6 +155,7 @@ final class DashboardModel {
         self.jobs = jobs
         self.configuration = configuration
         self.configurationStore = configurationStore
+        self.configurationFileStamp = configurationStore.fileStamp()
         let resolvedTransferQueueStore = transferQueueStore ?? TransferQueueStore(
             url: configurationStore.url.deletingLastPathComponent().appendingPathComponent("transfer-queue.json")
         )
@@ -260,9 +270,17 @@ extension DashboardModel {
             refreshAll()
             return
         }
-        if Date().timeIntervalSince(lastRefreshedAt) >= maxAge {
-            refreshAll()
+        guard Date().timeIntervalSince(lastRefreshedAt) >= maxAge else { return }
+        // A reactivation whose config file is byte-for-byte what this
+        // process last read or wrote has nothing to apply — in-memory
+        // state is already current, so the reload is skipped entirely.
+        let stamp = configurationStore.fileStamp()
+        if stamp?.modifiedAt == configurationFileStamp?.modifiedAt,
+           stamp?.byteCount == configurationFileStamp?.byteCount {
+            self.lastRefreshedAt = Date()
+            return
         }
+        refreshAll()
     }
 
     func refreshAll() {
@@ -1040,6 +1058,7 @@ extension DashboardModel {
             // A mutation that landed while the disk pass ran is newer than
             // what was read — keep it; its own scheduled save will persist.
             if configurationRevision == revisionBefore {
+                let ownedBefore = CatalogOwnedState(configuration: configuration)
                 if !catalogStateMode.isLegacy {
                     // config.json holds settings only; events stay as the
                     // catalog-backed memory has them.
@@ -1047,6 +1066,9 @@ extension DashboardModel {
                 }
                 configuration = reloaded
                 configurationRevision &+= 1
+                if CatalogOwnedState(configuration: reloaded) != ownedBefore {
+                    catalogStateRevision &+= 1
+                }
                 configMessage = "Config reloaded at \(Self.defaultConfigurationURL.path)."
                 notes.append("config")
             } else {
@@ -1065,6 +1087,7 @@ extension DashboardModel {
         } else {
             notes.append("log unavailable")
         }
+        configurationFileStamp = configurationStore.fileStamp()
 
         notes.append("paths")
         if !configuration.immichServerURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -1611,12 +1634,19 @@ extension DashboardModel {
     }
 
     func updateConfiguration(_ mutate: (inout AppConfiguration) -> Void) {
+        let catalogBefore = CatalogOwnedState(configuration: configuration)
         var next = configuration
         mutate(&next)
         next.normalizeLocationSelections()
         next.normalizeEventSelection()
+        // A mutation that leaves the configuration untouched is not a
+        // change: no revisions, no save, no catalog sync.
+        guard next != configuration else { return }
         configuration = next
         configurationRevision &+= 1
+        if CatalogOwnedState(configuration: next) != catalogBefore {
+            catalogStateRevision &+= 1
+        }
         noteCatalogWrite()
         scheduleConfigurationSave()
         scheduleCatalogSync(configuration: next)
@@ -1661,6 +1691,7 @@ extension DashboardModel {
             do {
                 try configurationStore.save(configuration)
                 configurationSaveIsDirty = false
+                configurationFileStamp = configurationStore.fileStamp()
                 configMessage = "Config saved at \(Self.defaultConfigurationURL.path)."
             } catch {
                 configMessage = "Could not save config: \(error.localizedDescription)"
@@ -1672,6 +1703,7 @@ extension DashboardModel {
             do {
                 try configurationStore.save(configuration, settingsOnly: true)
                 configurationSaveIsDirty = false
+                configurationFileStamp = configurationStore.fileStamp()
                 configMessage = "Settings saved at \(Self.defaultConfigurationURL.path); events are saved in the photo list."
             } catch {
                 configMessage = "Could not save settings: \(error.localizedDescription)"
@@ -1713,6 +1745,7 @@ extension DashboardModel {
         case .legacy:
             catalogStateMode = .legacy
             try? configurationStore.save(configuration)
+            configurationFileStamp = configurationStore.fileStamp()
         case .suspended:
             catalogStateMode = .suspended
         case .catalog(let baseline):
@@ -1730,6 +1763,7 @@ extension DashboardModel {
                 // The legacy copy (config.pre-sqlite-*.json) and the pinned
                 // migration backup both hold the old file.
                 try? configurationStore.save(configuration, settingsOnly: true)
+                configurationFileStamp = configurationStore.fileStamp()
             }
         }
         if let message = outcome.message {

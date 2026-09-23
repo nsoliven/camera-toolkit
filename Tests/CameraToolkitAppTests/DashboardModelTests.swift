@@ -379,6 +379,92 @@ final class DashboardModelTests: XCTestCase {
             XCTAssertEqual(model.jobs.first?.state, .done)
         }
     }
+
+    /// The catalog-state revision moves only when events, assignments,
+    /// rotations, or burst splits move: a mutation that changes nothing is
+    /// not a change at all, and a settings write leaves the
+    /// assignment-derived indexes alone.
+    func testRevisionCountersSplitSettingsFromCatalogState() async throws {
+        try await withTemporaryDirectoryAsync { root in
+            let model = DashboardModel(
+                jobs: [],
+                configuration: AppConfiguration.defaults(applicationSupport: root),
+                configurationStore: ConfigurationStore(url: root.appendingPathComponent("config.json"))
+            )
+            let configRev = model.configurationRevision
+            let catalogRev = model.catalogStateRevision
+
+            // A no-op mutation is not a change — nothing to save or reload.
+            model.updateConfiguration { _ in }
+            XCTAssertEqual(model.configurationRevision, configRev)
+            XCTAssertEqual(model.catalogStateRevision, catalogRev)
+
+            // A settings write moves the settings revision only.
+            model.updateConfiguration { $0.selectedDeviceID = "sony-a7v" }
+            XCTAssertEqual(model.configurationRevision, configRev + 1)
+            XCTAssertEqual(model.catalogStateRevision, catalogRev)
+
+            // Catalog-owned state moves both.
+            model.updateConfiguration { configuration in
+                configuration.photoEventAssignments.append(PhotoEventAssignment(
+                    sourceRootPath: "/Volumes/Card/DCIM",
+                    relativePath: "DSC00001.ARW",
+                    fileSize: 4_096,
+                    modifiedAt: Date(),
+                    eventID: UUID(),
+                    deviceID: "sony-a7v"
+                ))
+            }
+            XCTAssertEqual(model.configurationRevision, configRev + 2)
+            XCTAssertEqual(model.catalogStateRevision, catalogRev + 1)
+        }
+    }
+
+    /// A stale activation check must not pay for a reload when the config
+    /// file is byte-for-byte what this process last read or wrote — and
+    /// must still reload when something else did touch it.
+    func testActivationReloadsOnlyWhenTheConfigFileMoved() async throws {
+        try await withTemporaryDirectoryAsync { root in
+            let store = ConfigurationStore(url: root.appendingPathComponent("config.json"))
+            let model = DashboardModel(
+                jobs: [],
+                configuration: AppConfiguration.defaults(applicationSupport: root),
+                configurationStore: store
+            )
+            let loadCounter = LoadCounterBox()
+            model.configurationLoader = { url, defaults in
+                loadCounter.mark()
+                return try ConfigurationStore(url: url).load(defaults: defaults)
+            }
+
+            // Persist through the model so its recorded stamp matches the
+            // file exactly.
+            model.updateConfiguration { $0.selectedDeviceID = "sony-a7v" }
+            model.flushConfigurationSave()
+            model.lastRefreshedAt = Date.distantPast
+            model.refreshAllIfStale(maxAge: 0)
+            try await Task.sleep(nanoseconds: 300_000_000)
+            XCTAssertEqual(loadCounter.loads, 0)
+            XCTAssertFalse(model.isRefreshing)
+
+            // An outside writer moves the file — the next check reloads.
+            var onDisk = try store.load(defaults: AppConfiguration.defaults(applicationSupport: root))
+            onDisk.selectedDeviceID = "dji-nano"
+            try store.save(onDisk)
+            model.lastRefreshedAt = Date.distantPast
+            model.refreshAllIfStale(maxAge: 0)
+            try await waitForCondition { loadCounter.loads == 1 }
+        }
+    }
+}
+
+/// How many times the injected configuration loader ran — counted off
+/// the main actor, where the refresh's disk pass executes it.
+private final class LoadCounterBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _loads = 0
+    var loads: Int { lock.withLock { _loads } }
+    func mark() { lock.withLock { _loads += 1 } }
 }
 
 @discardableResult
