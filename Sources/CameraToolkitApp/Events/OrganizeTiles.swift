@@ -1366,6 +1366,8 @@ struct StackPreviewOverlay: View {
     @State private var hiResImage: (key: HiResRequest, image: CGImage)?
     @State private var failed = false
     @State private var zoomCommand: PreviewZoomCommand?
+    /// The canvas's zoom as a percentage, for the bottom bar's readout.
+    @State private var zoomPercent = 100
     /// Face rows for the frame on screen, resolved off the main actor from
     /// the ArcFace catalog — independent of image loading, which never
     /// waits on them.
@@ -1418,47 +1420,35 @@ struct StackPreviewOverlay: View {
         return image.map { ($0, CGFloat(1)) }
     }
 
-    private var hintText: String {
-        if item?.kind == .video {
-            var text = "Space play/pause · ↑ ↓ items · 1–3 sort · O open"
-            if onTrashItems != nil { text += " · ⌫/right-click trash" }
-            return text + " · Esc close"
-        }
-        var text = "← → frames · ⇧← → select · ⇧/⌘-click frames · ↑ ↓ items · click zoom · drag pan · + − 0 zoom · [ ] rotate · 1–3 sort · O open · T tag face · I info"
-        if onTrashItems != nil { text += " · ⌫/right-click trash" }
-        return text + " · Esc close"
-    }
-
     var body: some View {
         ZStack {
             Color.black.opacity(0.95)
             if let stack, let item {
-                HStack(spacing: 0) {
-                    VStack(spacing: 10) {
-                        header(stack: stack, item: item)
+                VStack(spacing: 12) {
+                    header(stack: stack, item: item)
+                    HStack(spacing: 12) {
                         previewPane(stack: stack, item: item)
-                        if stack.items.count > 1 {
-                            filmstrip(stack)
+                        if inspectorVisible {
+                            FrameInspectorPanel(
+                                item: item,
+                                photoRecord: framePhotoRecord,
+                                faces: facesOnFrame,
+                                personNames: facePersonNames,
+                                metadata: frameMetadata,
+                                metadataLoaded: frameMetadataLoaded
+                            )
+                            .frame(width: 260)
+                            // Explicit hierarchical levels: the panel is
+                            // always on dark glass over the black backdrop.
+                            .foregroundStyle(.white, .white.opacity(0.65), .white.opacity(0.45))
+                            .glassEffect(.regular, in: .rect(cornerRadius: 18))
+                            .environment(\.colorScheme, .dark)
+                            .transition(.move(edge: .trailing).combined(with: .opacity))
                         }
-                        Text(hintText)
-                            .font(.caption)
-                            .foregroundStyle(.white.opacity(0.6))
                     }
-                    if inspectorVisible {
-                        FrameInspectorPanel(
-                            item: item,
-                            photoRecord: framePhotoRecord,
-                            faces: facesOnFrame,
-                            personNames: facePersonNames,
-                            metadata: frameMetadata,
-                            metadataLoaded: frameMetadataLoaded
-                        )
-                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                        .padding(.leading, 10)
-                        .transition(.move(edge: .trailing).combined(with: .opacity))
-                    }
+                    .animation(.easeInOut(duration: 0.18), value: inspectorVisible)
+                    bottomBar(stack: stack, item: item)
                 }
-                .animation(.easeInOut(duration: 0.18), value: inspectorVisible)
                 .padding(16)
             }
         }
@@ -1492,6 +1482,11 @@ struct StackPreviewOverlay: View {
             hiResImage = nil
             if hiResRequest != nil { hiResRequest = currentHiResKey }
         }
+        .onChange(of: tagRequest == nil) { _, closed in
+            // The tag popover took the keyboard; hand it back so the
+            // overlay's keys work again the moment it closes.
+            if closed { isFocused = true }
+        }
         .onChange(of: stackIndex) { old, new in
             // The current stack vanished — e.g. its remaining frames were
             // trashed or it was moved to an event. Show whatever slid into its
@@ -1513,21 +1508,64 @@ struct StackPreviewOverlay: View {
         .task(id: item?.primary.path) { await loadMetadata() }
     }
 
+    /// Back button, title and position, the assign chips, then the glass
+    /// controls: Tag Face, Frame Info, Rotate, Open. Every action hands
+    /// focus back to the overlay so its keys keep working. The shortcuts
+    /// live in each control's help text and the Keyboard Shortcuts window.
+    /// One row when it fits; in a narrow detail pane the controls drop to a
+    /// second row instead of squeezing the title and chips.
     private func header(stack: OrganizeStack, item: OrganizeItem) -> some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 12) {
+                headerTitle(stack: stack, item: item)
+                Spacer(minLength: 8)
+                headerActions(stack: stack, item: item)
+            }
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 12) {
+                    headerTitle(stack: stack, item: item)
+                    Spacer(minLength: 0)
+                }
+                HStack(spacing: 12) {
+                    Spacer(minLength: 0)
+                    headerActions(stack: stack, item: item)
+                }
+            }
+        }
+    }
+
+    private func headerTitle(stack: OrganizeStack, item: OrganizeItem) -> some View {
         HStack(spacing: 12) {
+            Button("Back to Board", systemImage: "chevron.backward") {
+                stackID = nil
+            }
+            .labelStyle(.iconOnly)
+            .buttonStyle(.glass)
+            .buttonBorderShape(.circle)
+            .controlSize(.large)
+            .help("Back to the board (Esc or Space)")
+            .environment(\.colorScheme, .dark)
+
             VStack(alignment: .leading, spacing: 2) {
                 Text(item.primary.name)
                     .font(.headline)
                     .foregroundStyle(.white)
-                let selectedCount = selection.selectedItems(in: stack.items).count
-                Text("\(item.captureDate.formatted(date: .abbreviated, time: .standard)) · frame \(min(frameIndex, stack.items.count - 1) + 1) of \(stack.items.count)\(selectedCount > 1 ? " · \(selectedCount) selected" : "") · item \((stackIndex ?? 0) + 1) of \(stacks.count) · \(OrganizeFolderLabel.title(forFolderPath: item.primary.folderPath, rootPath: rootPath))")
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text(headerCaption(stack: stack, item: item))
                     .font(.caption)
                     .foregroundStyle(.white.opacity(0.7))
+                    .lineLimit(2)
             }
+            .layoutPriority(1)
             if let event = eventForStack(stack) {
                 EventChip(event: event, isPrivate: workspace.resolvedPolicy(for: event) == .archiveOnly)
             }
-            Spacer()
+        }
+    }
+
+    private func headerActions(stack: OrganizeStack, item: OrganizeItem) -> some View {
+        HStack(spacing: 12) {
             EventAssignControls(
                 workspace: workspace,
                 verb: assignVerb,
@@ -1535,63 +1573,92 @@ struct StackPreviewOverlay: View {
                 onAssign: { assign(stack, to: $0) },
                 onNewEvent: { onNewEvent(stack) }
             )
-            if item.kind != .video {
-                Button {
-                    tagMode.toggle()
-                    isFocused = true
-                } label: {
-                    Image(systemName: "person.badge.plus")
-                        .font(.system(size: 14, weight: .semibold))
+            GlassEffectContainer(spacing: 8) {
+                HStack(spacing: 8) {
+                    if item.kind != .video {
+                        PreviewGlassToggle(
+                            title: "Tag Face",
+                            systemImage: "person.crop.rectangle.badge.plus",
+                            isOn: tagMode,
+                            help: tagMode ? "Stop drawing face boxes (T)" : "Draw a box on the photo to tag a face (T)"
+                        ) {
+                            tagMode.toggle()
+                            isFocused = true
+                        }
+                    }
+                    PreviewGlassToggle(
+                        title: "Frame Info",
+                        systemImage: "info",
+                        isOn: inspectorVisible,
+                        help: "Frame info — people, capture time, camera, file (I)"
+                    ) {
+                        inspectorVisible.toggle()
+                        isFocused = true
+                    }
+                    if onRotate != nil {
+                        Menu {
+                            Button("Rotate All 90° Left", systemImage: "rotate.left") { rotate(by: -1); isFocused = true }
+                            Button("Rotate All 180°", systemImage: "arrow.trianglehead.2.clockwise.rotate.90") { rotate(by: 2); isFocused = true }
+                            Button("Rotate All 90° Right", systemImage: "rotate.right") { rotate(by: 1); isFocused = true }
+                        } label: {
+                            Label("Rotate Burst", systemImage: "rotate.right")
+                                .labelStyle(.iconOnly)
+                        }
+                        .menuStyle(.button)
+                        .buttonStyle(.glass)
+                        .buttonBorderShape(.circle)
+                        .menuIndicator(.hidden)
+                        .fixedSize()
+                        .disabled(DisplayRotation.rotatableFiles(in: stack).isEmpty)
+                        .help("Rotate every frame in this burst together ( [ ] or R / Shift-R ). Display-only — originals are never rewritten.")
+                    }
+                    Menu {
+                        LazyContextMenu { OpenInAppMenuItems(urls: [item.primary.url]) }
+                    } label: {
+                        Label("Open In", systemImage: "arrow.up.forward.app")
+                            .labelStyle(.iconOnly)
+                    }
+                    .menuStyle(.button)
+                    .buttonStyle(.glass)
+                    .buttonBorderShape(.circle)
+                    .menuIndicator(.hidden)
+                    .fixedSize()
+                    .help("Open \(item.primary.name) in another app (O opens it in Photomator)")
                 }
-                .buttonStyle(.plain)
-                .foregroundStyle(tagMode ? Color.accentColor : Color.white.opacity(0.8))
-                .help(tagMode ? "Stop drawing face boxes (T)" : "Draw a box on the photo to tag a face (T)")
             }
-            Button {
-                inspectorVisible.toggle()
-                isFocused = true
-            } label: {
-                Image(systemName: inspectorVisible ? "info.circle.fill" : "info.circle")
-                    .font(.system(size: 15))
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(.white.opacity(0.8))
-            .help("Frame info — people, capture time, camera, file (I)")
-            if onRotate != nil {
-                Menu {
-                    Button { rotate(by: -1) } label: {
-                        Label("Rotate All 90° Left", systemImage: "rotate.left")
+            .controlSize(.large)
+            .environment(\.colorScheme, .dark)
+        }
+    }
+
+    private func headerCaption(stack: OrganizeStack, item: OrganizeItem) -> String {
+        let selectedCount = selection.selectedItems(in: stack.items).count
+        return "\(item.captureDate.formatted(date: .abbreviated, time: .standard)) · frame \(min(frameIndex, stack.items.count - 1) + 1) of \(stack.items.count)\(selectedCount > 1 ? " · \(selectedCount) selected" : "") · item \((stackIndex ?? 0) + 1) of \(stacks.count) · \(OrganizeFolderLabel.title(forFolderPath: item.primary.folderPath, rootPath: rootPath))"
+    }
+
+    /// Filmstrip and zoom on one floating glass layer under the photo.
+    @ViewBuilder
+    private func bottomBar(stack: OrganizeStack, item: OrganizeItem) -> some View {
+        let showsFilmstrip = stack.items.count > 1
+        let showsZoom = item.kind != .video && displayImage != nil
+        if showsFilmstrip || showsZoom {
+            GlassEffectContainer(spacing: 12) {
+                HStack(spacing: 12) {
+                    if showsFilmstrip {
+                        filmstrip(stack)
+                            .padding(6)
+                            .frame(maxWidth: CGFloat(stack.items.count) * 102 + 6)
+                            .glassEffect(.regular, in: .rect(cornerRadius: 16))
                     }
-                    Button { rotate(by: 2) } label: {
-                        Label("Rotate All 180°", systemImage: "arrow.triangle.2.circlepath")
+                    if showsZoom {
+                        PreviewZoomControls(zoomPercent: zoomPercent) { command in
+                            zoomCommand = command
+                            isFocused = true
+                        }
                     }
-                    Button { rotate(by: 1) } label: {
-                        Label("Rotate All 90° Right", systemImage: "rotate.right")
-                    }
-                } label: {
-                    Label("Rotate Burst", systemImage: "rotate.right")
                 }
-                .menuStyle(.borderlessButton)
-                .fixedSize()
-                .disabled(DisplayRotation.rotatableFiles(in: stack).isEmpty)
-                .help("Rotate every frame in this burst together ( [ ] or R / Shift-R ). Display-only — originals are never rewritten.")
             }
-            Menu {
-                OpenInAppMenuItems(urls: [item.primary.url])
-            } label: {
-                Label("Open", systemImage: "arrow.up.forward.app")
-            }
-            .menuStyle(.borderlessButton)
-            .fixedSize()
-            .help("Open \(item.primary.name) in another app")
-            Button {
-                stackID = nil
-            } label: {
-                Image(systemName: "xmark.circle.fill")
-                    .font(.title2)
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(.white.opacity(0.8))
+            .environment(\.colorScheme, .dark)
         }
     }
 
@@ -1624,10 +1691,21 @@ struct StackPreviewOverlay: View {
             }
         }
         .clipped()
-        .overlay {
-            if let tagRequest {
-                tagPickerLayer(tagRequest)
-            }
+        .popover(
+            item: $tagRequest,
+            attachmentAnchor: .rect(.rect(tagRequest?.anchor ?? .zero)),
+            arrowEdge: .bottom
+        ) { _ in
+            FaceTagPicker(
+                people: rosterPeople,
+                onPick: { person in applyTag(person) },
+                onCreate: { name in
+                    if let person = workspace.createRosterPerson(named: name) {
+                        applyTag(person)
+                    }
+                },
+                onCancel: { tagRequest = nil }
+            )
         }
         .contextMenu {
             LazyContextMenu { frameContextMenu(stack, index: min(max(frameIndex, 0), stack.items.count - 1)) }
@@ -1644,13 +1722,15 @@ struct StackPreviewOverlay: View {
             unavailableDescription: "Camera Toolkit could not decode a preview for this file.",
             zoomCommand: $zoomCommand,
             onZoomChange: { zoom in
+                zoomPercent = Int(zoom * 100)
                 if zoom > 1.5 {
                     hiResRequest = currentHiResKey
                 }
             },
             markupActive: $tagMode,
             onMarkupRect: { rect in handleMarkupRect(rect) },
-            onImageFrameChange: { frame in canvasImageFrame = frame }
+            onImageFrameChange: { frame in canvasImageFrame = frame },
+            showsZoomControls: false
         )
     }
 
@@ -1671,24 +1751,21 @@ struct StackPreviewOverlay: View {
             if let videoPlayer {
                 VideoPreviewPane(player: videoPlayer)
             } else if videoPlayable == false {
-                VStack(spacing: 10) {
-                    Image(systemName: "video.slash")
-                        .font(.system(size: 30))
-                        .foregroundStyle(.white.opacity(0.7))
-                    Text("This clip can't play in-app.")
-                        .foregroundStyle(.white.opacity(0.8))
-                    HStack(spacing: 12) {
-                        Button("Reveal in Finder") {
-                            NSWorkspace.shared.activateFileViewerSelecting([item.primary.url])
-                        }
-                        Button("Open") {
-                            PhotomatorLauncher.open(item.files.map(\.url))
-                        }
+                ContentUnavailableView {
+                    Label("Can’t Play In-App", systemImage: "video.slash")
+                } description: {
+                    Text("This clip’s format doesn’t play here. Open it in another app, or find it in Finder.")
+                } actions: {
+                    Button("Reveal in Finder") {
+                        NSWorkspace.shared.activateFileViewerSelecting([item.primary.url])
+                        isFocused = true
                     }
-                    .foregroundStyle(.white)
+                    Button("Open in Photomator") {
+                        PhotomatorLauncher.open(item.files.map(\.url))
+                    }
+                    .buttonStyle(.borderedProminent)
                 }
-                .padding(24)
-                .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .environment(\.colorScheme, .dark)
             } else {
                 ProgressView()
                     .tint(.white)
@@ -1712,20 +1789,25 @@ struct StackPreviewOverlay: View {
                     ForEach(Array(stack.items.enumerated()), id: \.element.id) { index, frame in
                         let isSelected = selectedIndexes.contains(index)
                         let isCurrent = index == frameIndex
+                        let shape = RoundedRectangle(cornerRadius: BoardMetrics.frameRadius, style: .continuous)
+                        let highlight = Color(nsColor: .selectedContentBackgroundColor)
                         TileThumbnail(url: frame.primary.url, kind: frame.kind, pointSize: 96, orientation: orientationForFile(frame.primary))
                             .frame(width: 96, height: 64)
-                            .clipShape(RoundedRectangle(cornerRadius: 5))
+                            .clipShape(shape)
                             .overlay {
-                                RoundedRectangle(cornerRadius: 5)
-                                    .fill(isSelected ? Color.accentColor.opacity(0.3) : .clear)
+                                shape.fill(isSelected && !isCurrent ? highlight.opacity(0.25) : .clear)
                             }
                             .overlay {
-                                RoundedRectangle(cornerRadius: 5)
-                                    .strokeBorder(
-                                        isCurrent ? Color.accentColor : (isSelected ? Color.white.opacity(0.85) : .clear),
-                                        lineWidth: isCurrent ? 2 : 1.5
-                                    )
+                                shape.strokeBorder(
+                                    isCurrent ? highlight : (isSelected ? highlight.opacity(0.7) : .clear),
+                                    lineWidth: isCurrent ? 2.5 : 1.5
+                                )
                             }
+                            .contentShape(shape)
+                            .accessibilityElement(children: .ignore)
+                            .accessibilityLabel("Frame \(index + 1) of \(stack.items.count), \(frame.primary.name)")
+                            .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)
+                            .accessibilityAction { selectFrame(index, in: stack) }
                             .id(index)
                             .onTapGesture { selectFrame(index, in: stack) }
                             .contextMenu { LazyContextMenu { frameContextMenu(stack, index: index) } }
@@ -1895,6 +1977,7 @@ struct StackPreviewOverlay: View {
         if let index, index + 1 < stacks.count {
             stackID = stacks[index + 1].id
         }
+        isFocused = true
     }
 
     /// One action turns the whole stack: every still plus JPEG companions,
@@ -2087,35 +2170,6 @@ struct StackPreviewOverlay: View {
         tagRequest = FaceTagRequest(target: .drawnBox(box, crop: crop), anchor: anchor)
     }
 
-    /// The floating person picker, dimmed against the canvas and anchored
-    /// near the box it is tagging. Clicks outside dismiss it.
-    private func tagPickerLayer(_ request: FaceTagRequest) -> some View {
-        GeometryReader { geometry in
-            let panelSize = CGSize(width: 240, height: 320)
-            let preferred = CGPoint(x: request.anchor.midX, y: request.anchor.maxY + panelSize.height / 2 + 14)
-            let center = CGPoint(
-                x: min(max(preferred.x, panelSize.width / 2 + 8), geometry.size.width - panelSize.width / 2 - 8),
-                y: min(max(preferred.y, panelSize.height / 2 + 8), geometry.size.height - panelSize.height / 2 - 8)
-            )
-            ZStack {
-                Color.black.opacity(0.001)
-                    .contentShape(Rectangle())
-                    .onTapGesture { tagRequest = nil }
-                FaceTagPicker(
-                    people: rosterPeople,
-                    onPick: { person in applyTag(person) },
-                    onCreate: { name in
-                        if let person = workspace.createRosterPerson(named: name) {
-                            applyTag(person)
-                        }
-                    },
-                    onCancel: { tagRequest = nil }
-                )
-                .position(center)
-            }
-        }
-    }
-
     /// Applies the picker's choice: an existing face is assigned+confirmed;
     /// a drawn box becomes a new confirmed catalog face. Both go through
     /// the store — confirmed faces stay frozen, photos are never rewritten.
@@ -2136,5 +2190,32 @@ struct StackPreviewOverlay: View {
             }
         }
         tagRequest = nil
+    }
+}
+
+/// An icon-only glass button that shows its on state the native way —
+/// prominent (accent-filled) glass while on, plain glass while off.
+private struct PreviewGlassToggle: View {
+    let title: String
+    let systemImage: String
+    let isOn: Bool
+    let help: String
+    let action: () -> Void
+
+    var body: some View {
+        Group {
+            if isOn {
+                Button(title, systemImage: systemImage, action: action)
+                    .buttonStyle(.glassProminent)
+                    .tint(.accentColor)
+            } else {
+                Button(title, systemImage: systemImage, action: action)
+                    .buttonStyle(.glass)
+            }
+        }
+        .labelStyle(.iconOnly)
+        .buttonBorderShape(.circle)
+        .help(help)
+        .accessibilityAddTraits(isOn ? .isSelected : [])
     }
 }

@@ -164,6 +164,10 @@ struct InteractivePreviewCanvas: View {
     /// zoom, pan, layout, or the image itself moves it — a parent aligns
     /// overlays to the photo with it.
     var onImageFrameChange: ((CGRect) -> Void)? = nil
+    /// Draws the floating zoom controls. The burst overlay turns this off
+    /// and hosts the same controls in its own bottom glass bar, driven by
+    /// `zoomCommand` and `onZoomChange`.
+    var showsZoomControls = true
 
     @State private var zoom: CGFloat = 1
     @State private var panOffset: CGSize = .zero
@@ -246,57 +250,13 @@ struct InteractivePreviewCanvas: View {
                         .allowsHitTesting(false)
                 }
 
-                if image != nil {
-                    VStack {
-                        Spacer()
-                        HStack(spacing: 6) {
-                            Button {
-                                perform(.zoomOut, canvasSize: geometry.size)
-                            } label: {
-                                Image(systemName: "minus.magnifyingglass")
-                            }
-                            .accessibilityLabel("Zoom Out")
-                            .help("Zoom Out (-)")
-
-                            Text("\(Int(effectiveZoom * 100))%")
-                                .font(.caption.monospacedDigit())
-                                .frame(minWidth: 42)
-
-                            Button {
-                                perform(.zoomIn, canvasSize: geometry.size)
-                            } label: {
-                                Image(systemName: "plus.magnifyingglass")
-                            }
-                            .accessibilityLabel("Zoom In")
-                            .help("Zoom In (+)")
-
-                            Divider().frame(height: 16)
-
-                            Button {
-                                perform(.fit, canvasSize: geometry.size)
-                            } label: {
-                                Image(systemName: "arrow.down.right.and.arrow.up.left")
-                            }
-                            .accessibilityLabel("Zoom to Fit")
-                            .help("Zoom to Fit (0)")
-                            .keyboardShortcut("0", modifiers: .command)
-
-                            Button {
-                                perform(.actualSize, canvasSize: geometry.size)
-                            } label: {
-                                Text("1:1")
-                                    .font(.caption.bold())
-                            }
-                            .accessibilityLabel("Actual Size")
-                            .help("Actual Size (Command-1)")
-                            .keyboardShortcut("1", modifiers: .command)
-                        }
-                        .buttonStyle(.borderless)
-                        .padding(.horizontal, 9)
-                        .padding(.vertical, 7)
-                        .background(.ultraThinMaterial, in: Capsule())
-                        .padding(12)
-                    }
+                if image != nil, showsZoomControls {
+                    PreviewZoomControls(
+                        zoomPercent: Int(effectiveZoom * 100),
+                        perform: { perform($0, canvasSize: geometry.size) }
+                    )
+                    .padding(12)
+                    .frame(maxHeight: .infinity, alignment: .bottom)
                 }
             }
             .contentShape(Rectangle())
@@ -380,6 +340,9 @@ struct InteractivePreviewCanvas: View {
                 // canvas is already at fit.
                 zoomCommand.wrappedValue = nil
                 onImageFrameChange?(imageFrame)
+                // A remount starts at fit without an onChange — tell the
+                // parent, so an external zoom readout doesn't go stale.
+                onZoomChange?(effectiveZoom)
             }
             .onDisappear {
                 if markupCursorPushed {
@@ -533,5 +496,50 @@ struct InteractivePreviewCanvas: View {
                 zoom: zoom
             )
         }
+    }
+}
+
+/// −, zoom %, +, Fit, and 1:1 as borderless buttons on one glass capsule —
+/// a single glass surface, so the buttons themselves carry no glass.
+/// ⌘0 and ⌘1 live on the Fit and 1:1 buttons, so only one copy of the
+/// controls may be on screen at a time.
+struct PreviewZoomControls: View {
+    let zoomPercent: Int
+    let perform: (PreviewZoomCommand) -> Void
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Button("Zoom Out", systemImage: "minus.magnifyingglass") { perform(.zoomOut) }
+                .help("Zoom Out (-)")
+            Text("\(zoomPercent)%")
+                .font(.callout.monospacedDigit())
+                .foregroundStyle(.white.opacity(0.85))
+                .frame(minWidth: 44)
+                .accessibilityLabel("Zoom \(zoomPercent) percent")
+            Button("Zoom In", systemImage: "plus.magnifyingglass") { perform(.zoomIn) }
+                .help("Zoom In (+)")
+            Divider()
+                .frame(height: 16)
+            Button("Zoom to Fit", systemImage: "arrow.down.right.and.arrow.up.left") { perform(.fit) }
+                .help("Zoom to Fit (0)")
+                .keyboardShortcut("0", modifiers: .command)
+            Button {
+                perform(.actualSize)
+            } label: {
+                Text("1:1")
+                    .font(.callout.bold())
+            }
+            .accessibilityLabel("Actual Size")
+            .help("Actual Size (Command-1)")
+            .keyboardShortcut("1", modifiers: .command)
+        }
+        .labelStyle(.iconOnly)
+        .buttonStyle(.borderless)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .glassEffect(.regular, in: .capsule)
+        // The canvas behind is always black or a photo, so the HUD is
+        // always the dark variant, whatever the window's appearance.
+        .environment(\.colorScheme, .dark)
     }
 }
