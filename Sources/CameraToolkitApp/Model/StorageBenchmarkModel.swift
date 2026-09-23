@@ -250,6 +250,11 @@ final class StorageBenchmarkViewModel {
     /// Background disk work waits at this gate while a target's volume is
     /// being measured — the same gate EventsWorkspace and TileImageLoader use.
     @ObservationIgnored let driveActivityGate: DriveActivityGate
+    /// The cable & enclosure stability test for the sheet — shares the
+    /// gate so it pauses the same background work as a speed test.
+    let stability: StabilityTestViewModel
+    /// The drive the stability sheet is open on; nil closes it.
+    var stabilityTarget: StorageBenchmarkTarget?
     /// Test seam — production runs the real `StorageBenchmarkService`.
     @ObservationIgnored private let makeService: () -> StorageBenchmarkService
     @ObservationIgnored private var task: Task<Void, Never>?
@@ -257,10 +262,24 @@ final class StorageBenchmarkViewModel {
 
     init(
         driveActivityGate: DriveActivityGate = .shared,
-        makeService: @escaping () -> StorageBenchmarkService = { StorageBenchmarkService() }
+        makeService: @escaping () -> StorageBenchmarkService = { StorageBenchmarkService() },
+        stability: StabilityTestViewModel? = nil
     ) {
         self.driveActivityGate = driveActivityGate
         self.makeService = makeService
+        self.stability = stability ?? StabilityTestViewModel(driveActivityGate: driveActivityGate)
+    }
+
+    /// Opens the stability sheet for a drive.
+    func presentStability(for target: StorageBenchmarkTarget) {
+        guard let dashboardModel else { return }
+        stability.present(
+            target: target,
+            typicalRange: linkContexts[target.id]?.linkTypicalMBps
+                ?? linkContexts[target.id]?.typicalRead,
+            dashboardModel: dashboardModel
+        )
+        stabilityTarget = target
     }
 
     var isRunning: Bool { activeTargetID != nil }

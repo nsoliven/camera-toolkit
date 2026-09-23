@@ -86,6 +86,13 @@ private struct StorageBenchmarkView: View {
         }
         .frame(minWidth: 720, minHeight: 520)
         .background(Color(nsColor: .windowBackgroundColor))
+        .sheet(item: $benchmark.stabilityTarget) { target in
+            StabilityTestView(
+                target: target,
+                linkContext: benchmark.linkContexts[target.id],
+                stability: benchmark.stability
+            )
+        }
     }
 
     private var header: some View {
@@ -223,6 +230,11 @@ private struct StorageBenchmarkView: View {
                             }
                             .disabled(benchmark.isRunning || model.isBusy || !canWrite)
                         }
+                        Button("Stability…") {
+                            benchmark.presentStability(for: target)
+                        }
+                        .disabled(benchmark.isRunning || model.isBusy || !target.isAvailable)
+                        .help("Grade this cable + enclosure + port under sustained load")
                     }
                     .controlSize(.small)
                 }
