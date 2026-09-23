@@ -55,8 +55,8 @@ struct EventChip: View {
     }
 }
 
-/// A subevent's color mark — on a tile it sits under the title line, on a
-/// list row at the title's start. Just the dot — the name is the hover
+/// A subevent's color mark — on a tile it sits at the trailing end of the
+/// time and name line under the photo, on a list row at the title's start. Just the dot — the name is the hover
 /// label, never text.
 struct EventTagCapsule: View {
     let event: SavedCameraEvent
@@ -332,14 +332,13 @@ struct StackTileView: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
                 Spacer(minLength: 0)
+                if let tag {
+                    EventTagCapsule(event: tag)
+                }
             }
             .font(.caption)
             .foregroundStyle(.secondary)
             .frame(width: width, alignment: .leading)
-
-            if let tag {
-                EventTagCapsule(event: tag)
-            }
         }
         .opacity(isDimmed ? 0.45 : 1)
         .contentShape(Rectangle())
