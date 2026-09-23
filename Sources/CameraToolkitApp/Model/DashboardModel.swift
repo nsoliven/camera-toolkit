@@ -70,6 +70,10 @@ struct BackgroundJobUpdate: Sendable {
 @Observable
 final class DashboardModel {
     var isSidebarCollapsed: Bool = false
+    /// Power assertions for in-flight file jobs — one token per job id so
+    /// App Nap and idle sleep cannot stall a copy, archive, take-off-drive,
+    /// face scan, or Immich upload the user explicitly asked for.
+    private(set) var jobActivityAssertions: [UUID: any NSObjectProtocol] = [:]
     var jobs: [JobSnapshot]
     var activityLog: [ActivityLogEntry]
     var configuration: AppConfiguration
@@ -1482,6 +1486,7 @@ extension DashboardModel {
             destinationPath: destinationPath
         )
         jobs.insert(startedJob, at: 0)
+        beginJobActivity(id: jobID, reason: "\(logTitle) — a Camera Toolkit file job")
 
         let progressHandler: @Sendable (BackgroundJobUpdate) -> Void = { [weak self] update in
             Task { @MainActor in
@@ -1551,6 +1556,18 @@ extension DashboardModel {
         return jobID
     }
 
+    func beginJobActivity(id: UUID, reason: String) {
+        jobActivityAssertions[id] = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiated, .idleSystemSleepDisabled],
+            reason: reason
+        )
+    }
+
+    func endJobActivity(id: UUID) {
+        guard let token = jobActivityAssertions.removeValue(forKey: id) else { return }
+        ProcessInfo.processInfo.endActivity(token)
+    }
+
     func updateJob(id: UUID, update: BackgroundJobUpdate) {
         guard let index = jobs.firstIndex(where: { $0.id == id }) else {
             return
@@ -1604,6 +1621,7 @@ extension DashboardModel {
             summary: note,
             detail: logDetail
         )
+        endJobActivity(id: id)
         isBusy = false
         storageCapacityRevision &+= 1
     }

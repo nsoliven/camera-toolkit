@@ -31,6 +31,7 @@ extension DashboardModel {
             ),
             at: 0
         )
+        beginJobActivity(id: jobID, reason: "\(logTitle) — a Camera Toolkit file job")
 
         let progressHandler: @Sendable (BackgroundJobUpdate) -> Void = { [weak self] update in
             Task { @MainActor in

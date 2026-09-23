@@ -41,6 +41,21 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate, NSMenuIte
         CatalogDatabase.checkpointAndCloseAll()
     }
 
+    /// A file job keeps its progress in memory — quitting mid-copy or
+    /// mid-scan abandons it. Original camera files are never touched by a
+    /// job, so warn rather than block: the user can still quit anyway.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard let job = model.activeJob else { return .terminateNow }
+
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "A job is still running."
+        alert.informativeText = "“\(job.note)” is \(job.progress.formatted(.percent.precision(.fractionLength(0)))) done. Quitting abandons it — no original files are at risk, but the job will have to be run again."
+        alert.addButton(withTitle: "Quit Anyway")
+        alert.addButton(withTitle: "Don't Quit")
+        return alert.runModal() == .alertFirstButtonReturn ? .terminateNow : .terminateCancel
+    }
+
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         CameraToolkitMainWindow.shared.show(model: model)
         return true

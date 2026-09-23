@@ -380,6 +380,41 @@ final class DashboardModelTests: XCTestCase {
         }
     }
 
+    /// Every file job holds a `ProcessInfo` activity assertion for exactly
+    /// its busy window — App Nap and idle sleep cannot stall a copy or a
+    /// scan, and nothing leaks once the job settles.
+    func testBackgroundJobHoldsActivityAssertionWhileRunning() async throws {
+        try await withTemporaryDirectoryAsync { root in
+            let model = DashboardModel(
+                jobs: [],
+                configuration: AppConfiguration.defaults(applicationSupport: root),
+                configurationStore: ConfigurationStore(url: root.appendingPathComponent("config.json"))
+            )
+            let started = DispatchSemaphore(value: 0)
+            let finish = DispatchSemaphore(value: 0)
+
+            let jobID = model.runBackgroundJob(
+                action: .organize,
+                runningNote: "Working",
+                logTitle: "Job",
+                logDetail: "",
+                operation: { _ in
+                    started.signal()
+                    finish.wait()
+                    return 42
+                },
+                completion: { _ in "Done" }
+            )
+            XCTAssertNotNil(jobID)
+            XCTAssertEqual(started.wait(timeout: .now() + 5), .success)
+            XCTAssertEqual(model.jobActivityAssertions[jobID!] != nil, true)
+
+            finish.signal()
+            try await waitForIdle(model)
+            XCTAssertTrue(model.jobActivityAssertions.isEmpty)
+        }
+    }
+
     /// The catalog-state revision moves only when events, assignments,
     /// rotations, or burst splits move: a mutation that changes nothing is
     /// not a change at all, and a settings write leaves the
