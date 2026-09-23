@@ -440,6 +440,9 @@ struct EventsSidebar: View {
             footerButton("Trash…", detail: nil, symbol: "trash") {
                 TrashWindowController.shared.show(model: model)
             }
+            footerButton("Speed Tests…", detail: nil, symbol: "gauge.with.dots.needle.50percent") {
+                StorageBenchmarkWindowController.shared.show(model: model)
+            }
             footerButton("Settings…", detail: nil, symbol: "gearshape") {
                 CameraToolkitConfigWindow.shared.show(model: model)
             }
