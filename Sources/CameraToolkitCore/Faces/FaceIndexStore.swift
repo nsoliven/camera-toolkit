@@ -37,6 +37,12 @@ public final class FaceIndexStore: @unchecked Sendable {
         try CatalogTransactionRetry.run { try database().read(body) }
     }
 
+    /// One consistent read snapshot for multi-query passes such as the face
+    /// label export.
+    func readSnapshot<T>(_ body: (Database) throws -> T) throws -> T {
+        try read(body)
+    }
+
     /// Every single-statement write: one transaction, retried on a
     /// transient busy/IO refusal. Passes that mutate many rows use
     /// `inWriteTransaction` so their writes share one transaction instead.

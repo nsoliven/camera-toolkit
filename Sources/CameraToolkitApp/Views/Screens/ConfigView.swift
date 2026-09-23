@@ -357,6 +357,7 @@ private struct CatalogBackupStatusRow: View {
                         model.backUpCatalogNow()
                     }
                     .disabled(model.isBackingUpCatalog)
+                    Button("Restore Face Labels…") { model.restoreFaceLabelsFromBackup() }
                 }
                 if let warning = DashboardModel.catalogBackupWarning(model.catalogBackupSummary) {
                     Label(warning, systemImage: "exclamationmark.triangle.fill")

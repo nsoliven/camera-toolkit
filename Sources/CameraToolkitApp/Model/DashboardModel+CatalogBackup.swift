@@ -1,5 +1,7 @@
+import AppKit
 import CameraToolkitCore
 import Foundation
+import UniformTypeIdentifiers
 
 /// Automatic, verified catalog backups: at launch when the newest one is
 /// over a day old, after a write-heavy session (debounced), and on demand.
@@ -171,4 +173,57 @@ extension DashboardModel {
         }
         return nil
     }
+}
+
+// MARK: - Face label restore
+
+extension DashboardModel {
+    /// Settings › Restore Face Labels…: picks a `*.faces.json` from a backup
+    /// set, takes a verified backup of the catalog as it is now, then puts
+    /// the labels back onto the current detections. Faces whose photos
+    /// have not been re-scanned yet are reported; running it again after
+    /// scanning picks them up.
+    func restoreFaceLabelsFromBackup() {
+        let panel = NSOpenPanel()
+        panel.title = "Restore Face Labels"
+        panel.prompt = "Restore"
+        panel.message = "Choose a .faces.json file from a Camera Toolkit backup. The photo list is backed up first."
+        panel.allowedContentTypes = [.json]
+        panel.directoryURL = localCatalogBackupFolder
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        flushConfigurationSave()
+        let service = catalogBackupService(for: configuration)
+        let catalogURL = service.catalogURL
+        statusMessage = "Restoring face labels…"
+        Task { @MainActor [weak self] in
+            let outcome: Result<FaceLabelRestoreReport, Error> = await Task.detached(priority: .userInitiated) {
+                Result {
+                    let labels = try FaceLabelExport.decode(Data(contentsOf: url))
+                    try service.backupNow(reason: .manual)
+                    return try FaceIndexStore(url: catalogURL).restoreFaceLabels(labels)
+                }
+            }.value
+            guard let self else { return }
+            switch outcome {
+            case .success(let report):
+                self.statusMessage = "Restored \(report.facesRestored) face label(s) and \(report.peopleCreated) person(s). "
+                    + "\(report.facesAlreadyLabeled) already labeled, \(report.facesUnmatched) waiting for a face scan, "
+                    + "\(report.facesConflicting) left as they were."
+                self.recordActivity(
+                    action: .verifyManifest,
+                    state: .done,
+                    title: "Restored face labels",
+                    summary: self.statusMessage,
+                    detail: "From \(url.lastPathComponent). The photo list was backed up first. No photo files were touched."
+                )
+                NotificationCenter.default.post(name: .cameraToolkitFaceLabelsRestored, object: nil)
+            case .failure(let error):
+                self.statusMessage = "Could not restore face labels: \(error.localizedDescription)"
+            }
+        }
+    }
+}
+
+extension Notification.Name {
+    static let cameraToolkitFaceLabelsRestored = Notification.Name("CameraToolkitFaceLabelsRestored")
 }

@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import GRDB
 import SQLite3
 
 /// Why a backup ran. Recorded in each set's manifest.
@@ -116,8 +117,9 @@ public struct CatalogBackupSummary: Equatable, Sendable {
 
 /// Verified catalog backups through the SQLite online backup API.
 ///
-/// Each run writes one *set* — the catalog snapshot, a copy of
-/// `config.json` while it exists, and a manifest — into the local backups
+/// Each run writes one *set* — the catalog snapshot, the face labels
+/// exported from it (`FaceLabelExport`), a copy of `config.json` while it
+/// exists, and a manifest — into the local backups
 /// folder, verifies it (`integrity_check = ok` and table row counts equal to
 /// the source snapshot's), then copies the set to the NAS folder when that
 /// volume is mounted and checksum-verifies the copy. A rolling set of
@@ -286,6 +288,14 @@ public struct CatalogBackupService: Sendable {
             written.append(catalogFinal)
             files.append(try Self.describe(catalogFinal, role: .catalog))
 
+            // The face labels, exported from the verified snapshot itself so
+            // they describe exactly the catalog beside them.
+            let labelsURL = localFolder.appendingPathComponent("\(id).faces.json")
+            written.append(labelsURL)
+            try Self.exportFaceLabels(from: catalogFinal, now: createdAt).encoded()
+                .write(to: labelsURL, options: .atomic)
+            files.append(try Self.describe(labelsURL, role: .faceLabels))
+
             var configurationDecodes: Bool?
             if let configurationURL, fileManager.fileExists(atPath: configurationURL.path) {
                 let data = try Data(contentsOf: configurationURL)
@@ -385,6 +395,14 @@ public struct CatalogBackupService: Sendable {
         try? FileManager.default.removeItem(at: wal)
         try? FileManager.default.removeItem(at: URL(fileURLWithPath: destination.path + "-shm"))
         return counts
+    }
+
+    static func exportFaceLabels(from backup: URL, now: Date) throws -> FaceLabelExport {
+        var configuration = Configuration()
+        configuration.readonly = true
+        let queue = try DatabaseQueue(path: backup.path, configuration: configuration)
+        defer { try? queue.close() }
+        return try FaceIndexStore(url: backup, queue: queue).exportFaceLabels(now: now)
     }
 
     struct Verification {

@@ -433,12 +433,27 @@ final class EventsWorkspace {
     init(model: DashboardModel, supportFolder: URL = EventsWorkspace.defaultSupportFolder) {
         self.model = model
         self.supportFolder = supportFolder
+        // A face-label restore from Settings rewrites face rows behind the
+        // workspace; re-read people like after any other face change.
+        let observer = NotificationCenter.default.addObserver(
+            forName: .cameraToolkitFaceLabelsRestored,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.facesRevision &+= 1 }
+        }
+        faceLabelsRestoredObserver.observers = [observer]
     }
+
+    @ObservationIgnored private let faceLabelsRestoredObserver = MountObserverBox()
 
     deinit {
         let center = NSWorkspace.shared.notificationCenter
         for observer in mountObservers.observers {
             center.removeObserver(observer)
+        }
+        for observer in faceLabelsRestoredObserver.observers {
+            NotificationCenter.default.removeObserver(observer)
         }
     }
 
