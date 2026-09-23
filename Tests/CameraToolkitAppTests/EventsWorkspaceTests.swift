@@ -1343,10 +1343,11 @@ final class EventsWorkspaceTests: XCTestCase {
                 workspace.assign(stackIDs: [stack.id], from: location.id, to: beach)
             }
             let beachEvent = try XCTUnwrap(workspace.event(beach))
-            // Before any refresh the blocker warms presence itself; once
-            // that pass lands the gate lifts.
+            // The blocker only reports now — the menu's explicit kick
+            // starts the check, and once that pass lands the gate lifts.
             let warming = try XCTUnwrap(workspace.faceScanBlocker(for: beachEvent))
             XCTAssertTrue(warming.contains("checking"))
+            workspace.prepareFaceScanStatus(for: beachEvent)
             try await waitUntil { workspace.eventStacks[beach] != nil }
             XCTAssertEqual(workspace.eventStacks[beach]?.count, 1)
             XCTAssertNil(workspace.faceScanBlocker(for: beachEvent))
@@ -2099,6 +2100,38 @@ final class EventsWorkspaceTests: XCTestCase {
             XCTAssertNil(try store.face(id: junk.id))
             XCTAssertEqual(try store.face(id: keep.id)?.personID, group.id)
             XCTAssertEqual(try store.photos(pathKeys: [photo.pathKey])[photo.pathKey]?.scanGrade, .med)
+        }
+    }
+
+    /// The sidebar's Face Scan item used to start `refreshEvent` as a
+    /// side effect of `faceScanBlocker` — every unopened event's row
+    /// swept its files at launch just by drawing the menu. The blocker
+    /// is pure now; the explicit kick the menu calls on open is the only
+    /// thing that starts the check.
+    func testFaceScanBlockerReportsWithoutStartingTheSweep() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let unsorted = root.appendingPathComponent("Card", isDirectory: true)
+            try writeOrganizerARW(unsorted.appendingPathComponent("DSC00001.ARW"), "2026:08:26 10:00:00", "000")
+            let location = addUnsorted(unsorted, to: model)
+            workspace.scan(location)
+            try await waitUntil {
+                workspace.sources[location.id]?.result != nil
+                    && workspace.sources[location.id]?.isScanning == false
+            }
+            let result = try XCTUnwrap(workspace.sources[location.id]?.result)
+            let beach = try XCTUnwrap(workspace.createEvent(name: "Beach Day", date: organizerDay("2026-08-26"), policy: .buffer))
+            workspace.assign(stackIDs: [try XCTUnwrap(result.stacks.first).id], from: location.id, to: beach)
+            let event = try XCTUnwrap(workspace.event(beach))
+
+            XCTAssertNil(workspace.eventStacks[beach])
+            XCTAssertNotNil(workspace.faceScanBlocker(for: event))
+            try await Task.sleep(nanoseconds: 200_000_000)
+            XCTAssertFalse(workspace.isCheckingFiles(for: beach))
+            XCTAssertNil(workspace.eventStacks[beach])
+
+            workspace.prepareFaceScanStatus(for: event)
+            try await waitUntil { workspace.eventStacks[beach] != nil }
+            XCTAssertNil(workspace.faceScanBlocker(for: event))
         }
     }
 

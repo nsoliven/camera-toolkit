@@ -25,6 +25,15 @@ enum EventPalette {
     }
 }
 
+/// A context menu whose items live in a view body: `.contextMenu` runs
+/// its content closure while the row renders, but a nested view's body
+/// only runs when the menu actually opens — so per-tile menus stop
+/// paying their build cost on every board render.
+struct LazyContextMenu<Content: View>: View {
+    @ViewBuilder var content: () -> Content
+    var body: some View { content() }
+}
+
 struct EventChip: View {
     let event: SavedCameraEvent
     var number: Int?
@@ -1423,7 +1432,7 @@ struct StackPreviewOverlay: View {
             }
         }
         .contextMenu {
-            frameContextMenu(stack, index: min(max(frameIndex, 0), stack.items.count - 1))
+            LazyContextMenu { frameContextMenu(stack, index: min(max(frameIndex, 0), stack.items.count - 1)) }
         }
     }
 
@@ -1489,7 +1498,7 @@ struct StackPreviewOverlay: View {
         }
         .contextMenu {
             if let stack {
-                frameContextMenu(stack, index: min(max(frameIndex, 0), stack.items.count - 1))
+                LazyContextMenu { frameContextMenu(stack, index: min(max(frameIndex, 0), stack.items.count - 1)) }
             }
         }
         .onDisappear {
@@ -1521,7 +1530,7 @@ struct StackPreviewOverlay: View {
                             }
                             .id(index)
                             .onTapGesture { selectFrame(index, in: stack) }
-                            .contextMenu { frameContextMenu(stack, index: index) }
+                            .contextMenu { LazyContextMenu { frameContextMenu(stack, index: index) } }
                     }
                 }
             }

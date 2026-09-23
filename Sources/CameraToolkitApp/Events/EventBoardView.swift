@@ -341,7 +341,7 @@ struct EventBoardView: View {
                 previewStackID = stack.id
             },
             onKey: { press, _ in handleKey(press) },
-            menu: { stack in contextMenu(stack) }
+            menu: { stack in LazyContextMenu { contextMenu(stack) } }
         )
     }
 

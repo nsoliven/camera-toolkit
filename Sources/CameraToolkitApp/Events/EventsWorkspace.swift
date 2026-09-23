@@ -3694,15 +3694,14 @@ final class EventsWorkspace {
     /// can. The scan runs over the event board's stacks — the reachable
     /// copies — so an event that has never been opened warms its presence
     /// data first, and an event whose files are all offline has nothing to
-    /// scan until a drive or the NAS mounts.
+    /// scan until a drive or the NAS mounts. Pure: it only reports state —
+    /// `prepareFaceScanStatus` starts the check, from the menu that can
+    /// offer the scan, so a render never sweeps events as a side effect.
     func faceScanBlocker(for event: SavedCameraEvent) -> String? {
         guard assignmentCount(for: event.id) > 0 else {
             return "Sort photos into \(event.name) first — there is nothing to scan."
         }
         guard let stacks = eventStacks[event.id] else {
-            if refreshGenerations[event.id] == nil {
-                Task { await refreshEvent(event.id) }
-            }
             return "Still checking where \(event.name)'s files are — the scan unlocks when that finishes."
         }
         guard !stacks.isEmpty else {
@@ -3712,6 +3711,23 @@ final class EventsWorkspace {
             return "Another job is already running. Wait for it to finish, then scan."
         }
         return nil
+    }
+
+    /// Kick the presence check a Face Scan needs on an event whose grid
+    /// was never loaded. The context menu that offers the scan calls this
+    /// when it opens — the one place the check is wanted — instead of
+    /// every row render starting a sweep, which at launch meant all
+    /// events sweeping just because the sidebar drew.
+    func prepareFaceScanStatus(for event: SavedCameraEvent) {
+        guard eventStacks[event.id] == nil, refreshGenerations[event.id] == nil else { return }
+        Task { await refreshEvent(event.id) }
+    }
+
+    /// Whether `refreshEvent` is in flight for this event — the gate
+    /// `prepareFaceScanStatus` shares with the blocker, exposed so a
+    /// render can tell checking from unchecked without starting work.
+    func isCheckingFiles(for eventID: UUID) -> Bool {
+        refreshGenerations[eventID] != nil
     }
 
     /// "Regroup Bursts" on the Unsorted board: re-runs the stacker and the
