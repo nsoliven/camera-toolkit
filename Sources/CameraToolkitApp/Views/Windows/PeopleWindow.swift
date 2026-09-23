@@ -40,6 +40,8 @@ private struct PeopleView: View {
     @State private var approved: [FacePerson] = []
     @State private var inbox: [FacePerson] = []
     @State private var expanded: Set<UUID> = []
+    /// The highlighted list row — double-click or Return opens its grid.
+    @State private var selectedPersonID: UUID?
     @State private var naming: NamingRequest?
     @State private var junkTarget: FacePerson?
     /// Shows the Clear Face Scan confirmation sheet.
@@ -65,9 +67,7 @@ private struct PeopleView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            header
-            Divider()
+        Group {
             if let detail {
                 PersonFacesGrid(
                     workspace: workspace,
@@ -79,9 +79,27 @@ private struct PeopleView: View {
             } else {
                 reviewList
             }
-
-            Divider()
-            statusBar
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            VStack(spacing: 0) {
+                Divider()
+                if !workspace.faceEngineInstalled {
+                    Label {
+                        Text("Face engine not installed — run \(FaceSidecarInstallation.setupCommand) once on this Mac.")
+                            .textSelection(.enabled)
+                    } icon: {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .symbolRenderingMode(.multicolor)
+                    }
+                    .font(.callout)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 12)
+                    .padding(.top, 7)
+                }
+                statusBar
+            }
+            .background(.bar)
         }
         .overlay {
             if let previewFace {
@@ -90,7 +108,14 @@ private struct PeopleView: View {
                 }
             }
         }
-        .background(Color(nsColor: .controlBackgroundColor))
+        .navigationTitle(detail.map(displayName) ?? "People")
+        .navigationSubtitle(windowSubtitle)
+        .searchable(
+            text: Binding(get: { activeQuery }, set: { activeQuery = $0 }),
+            placement: .toolbar,
+            prompt: detail == nil ? "Search people" : "Search photos"
+        )
+        .toolbar { toolbar }
         .onAppear(perform: reload)
         .onChange(of: workspace.facesRevision) { reload() }
         .sheet(isPresented: $clearingFaceIndex) {
@@ -132,74 +157,58 @@ private struct PeopleView: View {
         }
     }
 
-    private var header: some View {
-        HStack(spacing: 12) {
-            Image(systemName: "person.2.fill")
-                .foregroundStyle(.blue)
-            VStack(alignment: .leading, spacing: 2) {
-                Text("People")
-                    .font(.headline)
-                Text(workspace.faceEngineInstalled
-                    ? "A scan never adds faces to Approved — its clusters and lookalikes wait in the Inbox."
-                    : "Face engine not installed — run \(FaceSidecarInstallation.setupCommand) once on this Mac.")
-                    .font(.caption)
-                    .foregroundStyle(workspace.faceEngineInstalled ? Color.secondary : Color.orange)
-                    .lineLimit(1)
+    /// The list's one-line explanation, or the setup command when the face
+    /// engine is missing. Inside a person's grid the grid says what it shows.
+    private var windowSubtitle: String {
+        guard workspace.faceEngineInstalled else {
+            return "Face engine not installed"
+        }
+        if detail != nil {
+            return "Double-click opens the photo · right-click for actions"
+        }
+        return "A scan never adds faces to Approved — its clusters and lookalikes wait in the Inbox."
+    }
+
+    @ToolbarContentBuilder
+    private var toolbar: some ToolbarContent {
+        if detail != nil {
+            ToolbarItem(placement: .navigation) {
+                Button("Back", systemImage: "chevron.backward") {
+                    detail = nil
+                }
+                .keyboardShortcut("[", modifiers: .command)
+                .help("Back to People (⌘[)")
             }
-            Spacer()
-            searchField
+        }
+        ToolbarItem {
             Button {
                 workspace.rematchFaces()
             } label: {
-                Label("Re-match", systemImage: "arrow.triangle.2.circlepath")
+                Label("Re-match", systemImage: "arrow.trianglehead.2.clockwise.rotate.90")
             }
             .disabled(model.isBusy || (approved.isEmpty && inbox.isEmpty))
             .help("Re-file stored faces into the Inbox — lookalikes beside the approved people they resemble, strangers into fresh clusters. Reads the catalog's stored vectors only: no rescan, and no files or events move.")
-            Button {
-                clearingFaceIndex = true
-            } label: {
-                Label("Clear Face Scan…", systemImage: "trash")
-            }
-            .disabled(model.isBusy)
-            .help("Throw away the face index so a scan can start over. Catalog rows only — no file is touched.")
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 10)
-    }
-
-    /// One field serves both contexts: in the lists it edits `searchText`,
-    /// inside a person's grid it edits `gridSearchText` — so a list query
-    /// never hides detections after the grid opens.
-    private var searchField: some View {
-        HStack(spacing: 5) {
-            Image(systemName: "magnifyingglass")
-                .foregroundStyle(.secondary)
-            TextField(
-                detail == nil ? "Search people" : "Search photos",
-                text: detail == nil ? $searchText : $gridSearchText
-            )
-            .textFieldStyle(.plain)
-            .frame(width: 150)
-            if !activeQuery.isEmpty {
-                Button {
-                    activeQuery = ""
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .foregroundStyle(.secondary)
+        ToolbarItem {
+            // The catalog wipe sits one menu deeper than Re-match, so it is
+            // never a single stray click away.
+            Menu {
+                Button("Clear Face Scan…", systemImage: "trash", role: .destructive) {
+                    clearingFaceIndex = true
                 }
-                .buttonStyle(.plain)
-                .help("Clear search")
+                .disabled(model.isBusy)
+                .help("Throw away the face index so a scan can start over. Catalog rows only — no file is touched.")
+            } label: {
+                Label("More", systemImage: "ellipsis")
             }
+            .menuIndicator(.hidden)
+            .help("More face index actions")
         }
-        .font(.callout)
-        .padding(.horizontal, 7)
-        .padding(.vertical, 4)
-        .background(.quaternary, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
-        .help(detail == nil
-            ? "Filter people, groups, and matches by name or photo file name"
-            : "Filter this grid by photo file name")
     }
 
+    /// One search field serves both contexts: in the lists it edits
+    /// `searchText`, inside a person's grid it edits `gridSearchText` — so a
+    /// list query never hides detections after the grid opens.
     private var activeQuery: String {
         get { detail == nil ? searchText : gridSearchText }
         nonmutating set {
@@ -210,7 +219,6 @@ private struct PeopleView: View {
             }
         }
     }
-
     /// Normalized list query — empty means "show everything".
     private var needle: String {
         OrganizeSearch.needle(searchText)
@@ -262,11 +270,11 @@ private struct PeopleView: View {
             )
             .frame(maxHeight: .infinity)
         } else {
-            List {
+            List(selection: $selectedPersonID) {
                 if !filteredApproved.isEmpty {
                     Section {
                         ForEach(filteredApproved) { person in
-                            approvedRow(person)
+                            personRow(person)
                         }
                     } header: {
                         Text("Approved · \(filteredApproved.count)")
@@ -275,7 +283,7 @@ private struct PeopleView: View {
                 if !filteredInbox.isEmpty {
                     Section {
                         ForEach(filteredInbox) { person in
-                            inboxRow(person)
+                            personRow(person)
                         }
                     } header: {
                         Text("Inbox · \(filteredInbox.count)")
@@ -285,130 +293,130 @@ private struct PeopleView: View {
                 }
             }
             .listStyle(.inset)
-        }
-    }
-
-    // MARK: - Approved
-
-    private func approvedRow(_ person: FacePerson) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 10) {
-                PersonCover(workspace: workspace, personID: person.id)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(person.name)
-                        .font(.headline)
-                    Text("\(person.faceCount) confirmed detection\(person.faceCount == 1 ? "" : "s")")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+            // Double-click (or Return) opens the full detection grid; the
+            // context menu carries every row action.
+            .contextMenu(forSelectionType: UUID.self) { ids in
+                if let person = person(in: ids) {
+                    actionsMenu(for: person)
                 }
-                Spacer()
-                Button {
+            } primaryAction: { ids in
+                if let person = person(in: ids) {
                     detail = person
-                } label: {
-                    Image(systemName: "square.grid.2x2")
                 }
-                .buttonStyle(.borderless)
-                .help("Show all \(person.faceCount) detections in a grid")
-                Button {
-                    toggleExpanded(person.id)
-                } label: {
-                    Image(systemName: expanded.contains(person.id) ? "chevron.down" : "chevron.right")
-                }
-                .buttonStyle(.borderless)
-                .help("Show member faces")
-                Menu("Merge Into") {
-                    ForEach(approved.filter { $0.id != person.id }) { target in
-                        Button(target.name) { workspace.mergePerson(person.id, into: target.id) }
-                    }
-                }
-                .menuStyle(.borderlessButton)
-                .fixedSize()
-                .disabled(approved.count < 2)
-                Button("Rename…") {
-                    naming = NamingRequest(
-                        person: person,
-                        title: "Rename \(person.name)",
-                        initialName: person.name,
-                        isApproval: false
-                    )
-                }
-                Button("Move to Inbox") {
-                    workspace.demotePerson(person.id)
-                }
-                .help("Faces stay grouped as an unapproved Inbox cluster — confirmed faces keep their state")
-            }
-            if expanded.contains(person.id) {
-                memberStrip(person)
             }
         }
-        .padding(.vertical, 4)
     }
 
-    // MARK: - Inbox
+    private func person(in ids: Set<UUID>) -> FacePerson? {
+        guard ids.count == 1, let id = ids.first else { return nil }
+        return approved.first { $0.id == id } ?? inbox.first { $0.id == id }
+    }
 
-    private func inboxRow(_ person: FacePerson) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
+    // MARK: - Rows
+
+    /// One person or Inbox row: a disclosure for the member strip, one
+    /// visible action for Inbox rows, and everything else behind the
+    /// trailing actions menu (and the same menu on right-click).
+    private func personRow(_ person: FacePerson) -> some View {
+        DisclosureGroup(isExpanded: expandedBinding(person.id)) {
+            memberStrip(person)
+        } label: {
             HStack(spacing: 10) {
                 PersonCover(workspace: workspace, personID: person.id)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(displayName(person))
                         .font(.headline)
-                    Text(inboxSubtitle(person))
+                    Text(person.isRoster
+                        ? "\(person.faceCount) confirmed detection\(person.faceCount == 1 ? "" : "s")"
+                        : inboxSubtitle(person))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
-                Button {
-                    detail = person
+                if !person.isRoster {
+                    inboxPrimaryAction(person)
+                }
+                Menu {
+                    actionsMenu(for: person)
                 } label: {
-                    Image(systemName: "square.grid.2x2")
+                    Label("Actions", systemImage: "ellipsis.circle")
+                        .labelStyle(.iconOnly)
                 }
+                .menuStyle(.button)
+                .menuIndicator(.hidden)
                 .buttonStyle(.borderless)
-                .help("Review all \(person.faceCount) detections, weakest matches last")
-                Button {
-                    toggleExpanded(person.id)
-                } label: {
-                    Image(systemName: expanded.contains(person.id) ? "chevron.down" : "chevron.right")
-                }
-                .buttonStyle(.borderless)
-                .help("Show member faces, weakest matches last")
-                if let targetID = person.suggestedPersonID, let target = person.suggestedPersonName {
-                    Button("Merge into \(target)") {
-                        workspace.mergePerson(person.id, into: targetID)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
-                    .help("Confirms every face here onto \(target) — the faces move because you said so")
-                }
-                Menu("Merge Into") {
-                    ForEach(approved.filter { $0.id != person.suggestedPersonID }) { target in
-                        Button(target.name) { workspace.mergePerson(person.id, into: target.id) }
-                    }
-                }
-                .menuStyle(.borderlessButton)
                 .fixedSize()
-                .disabled(approved.isEmpty || (approved.count == 1 && person.suggestedPersonID != nil))
-                Button("Approve…") {
-                    naming = NamingRequest(
-                        person: person,
-                        title: "Approve \(displayName(person))",
-                        // A "Looks like X" pile starts blank — approving it
-                        // as "X" would just duplicate the approved person.
-                        initialName: person.suggestedPersonID == nil ? person.name : "",
-                        isApproval: true
-                    )
-                }
-                .help("Makes this an approved person and confirms just these faces — nothing else moves")
-                Button("Junk…", role: .destructive) {
-                    junkTarget = person
-                }
-                .help("Drop this row — statues, strangers, duplicates of nothing")
+                .help("Actions for \(displayName(person))")
             }
-            if expanded.contains(person.id) {
-                memberStrip(person)
-            }
+            .padding(.vertical, 4)
         }
-        .padding(.vertical, 4)
+        .tag(person.id)
+    }
+
+    /// The one inline action an Inbox row shows: merge into the approved
+    /// person it resembles, else approve it under a name.
+    @ViewBuilder
+    private func inboxPrimaryAction(_ person: FacePerson) -> some View {
+        if let targetID = person.suggestedPersonID, let target = person.suggestedPersonName {
+            Button("Merge into \(target)") {
+                workspace.mergePerson(person.id, into: targetID)
+            }
+            .buttonStyle(.bordered)
+            .help("Confirms every face here onto \(target) — the faces move because you said so")
+        } else {
+            Button("Approve…") {
+                approve(person)
+            }
+            .buttonStyle(.bordered)
+            .help("Makes this an approved person and confirms just these faces — nothing else moves")
+        }
+    }
+
+    private func actionsMenu(for person: FacePerson) -> PersonActionsMenu {
+        PersonActionsMenu(
+            person: person,
+            displayName: displayName(person),
+            approved: approved,
+            onShowGrid: { detail = person },
+            onToggleMembers: { toggleExpanded(person.id) },
+            membersShown: expanded.contains(person.id),
+            onMerge: { target in workspace.mergePerson(person.id, into: target) },
+            onRename: {
+                naming = NamingRequest(
+                    person: person,
+                    title: "Rename \(person.name)",
+                    initialName: person.name,
+                    isApproval: false
+                )
+            },
+            onMoveToInbox: { workspace.demotePerson(person.id) },
+            onApprove: { approve(person) },
+            onJunk: { junkTarget = person }
+        )
+    }
+
+    private func approve(_ person: FacePerson) {
+        naming = NamingRequest(
+            person: person,
+            title: "Approve \(displayName(person))",
+            // A "Looks like X" pile starts blank — approving it as "X" would
+            // just duplicate the approved person.
+            initialName: person.suggestedPersonID == nil ? person.name : "",
+            isApproval: true
+        )
+    }
+
+    private func expandedBinding(_ id: UUID) -> Binding<Bool> {
+        Binding(
+            get: { expanded.contains(id) },
+            set: { isExpanded in
+                if isExpanded {
+                    expanded.insert(id)
+                } else {
+                    expanded.remove(id)
+                }
+            }
+        )
     }
 
     private func inboxSubtitle(_ person: FacePerson) -> String {
@@ -456,7 +464,7 @@ private struct PeopleView: View {
                         .overlay {
                             if person.isRoster && face.id == person.coverFaceID {
                                 Image(systemName: "star.fill")
-                                    .font(.system(size: 9))
+                                    .font(.caption2)
                                     .padding(2)
                                     .background(.black.opacity(0.6), in: Circle())
                                     .foregroundStyle(.yellow)
@@ -491,7 +499,7 @@ private struct PeopleView: View {
     /// strongest instead of pretending to be a zero.
     private func scoreBadge(_ face: FaceRecord) -> some View {
         Text(face.matchScore.map { "\(Int($0 * 100))%" } ?? "seed")
-            .font(.system(size: 8, weight: .semibold))
+            .font(.caption2.weight(.semibold))
             .padding(.horizontal, 3)
             .padding(.vertical, 1)
             .background(.black.opacity(0.65), in: Capsule())
@@ -530,6 +538,59 @@ enum FaceScanSummaryText {
         let names = grades.compactMap(\.displayName)
         guard !names.isEmpty else { return "No face scan stored" }
         return "\(names.joined(separator: ", ")) quality"
+    }
+}
+
+/// Every action on one People row — the trailing actions menu and the
+/// row's context menu show the same items. All writes hit the catalog only.
+private struct PersonActionsMenu: View {
+    let person: FacePerson
+    let displayName: String
+    let approved: [FacePerson]
+    let onShowGrid: () -> Void
+    let onToggleMembers: () -> Void
+    let membersShown: Bool
+    let onMerge: (UUID) -> Void
+    let onRename: () -> Void
+    let onMoveToInbox: () -> Void
+    let onApprove: () -> Void
+    let onJunk: () -> Void
+
+    /// Approved people this row can merge into. An Inbox suggestion's own
+    /// target has its dedicated item, so it is left out of the submenu.
+    private var mergeTargets: [FacePerson] {
+        if person.isRoster {
+            return approved.filter { $0.id != person.id }
+        }
+        return approved.filter { $0.id != person.suggestedPersonID }
+    }
+
+    var body: some View {
+        Button(person.isRoster ? "Show All Detections" : "Review All Detections", systemImage: "square.grid.2x2", action: onShowGrid)
+        Button(membersShown ? "Hide Member Faces" : "Show Member Faces", systemImage: "person.crop.rectangle.stack", action: onToggleMembers)
+        Divider()
+        if !person.isRoster, let targetID = person.suggestedPersonID, let target = person.suggestedPersonName {
+            Button("Merge into \(target)", systemImage: "arrow.triangle.merge") {
+                onMerge(targetID)
+            }
+        }
+        Menu("Merge Into", systemImage: "arrow.triangle.merge") {
+            ForEach(mergeTargets) { target in
+                Button(target.name) { onMerge(target.id) }
+            }
+        }
+        .disabled(mergeTargets.isEmpty)
+        if person.isRoster {
+            Button("Rename…", systemImage: "pencil", action: onRename)
+            Button("Move to Inbox", systemImage: "tray", action: onMoveToInbox)
+                .help("Faces stay grouped as an unapproved Inbox cluster — confirmed faces keep their state")
+        } else {
+            Button("Approve…", systemImage: "checkmark.circle", action: onApprove)
+                .help("Makes this an approved person and confirms just these faces — nothing else moves")
+            Divider()
+            Button("Junk…", systemImage: "xmark.bin", role: .destructive, action: onJunk)
+                .help("Drop this row — statues, strangers, duplicates of nothing")
+        }
     }
 }
 
@@ -802,31 +863,17 @@ private struct PersonFacesGrid: View {
         .onChange(of: workspace.facesRevision) { reload() }
     }
 
-    /// What this row is called in the header: a suggestion row wears its
-    /// target's name under "Looks like".
-    private var title: String {
-        person.suggestedPersonName.map { "Looks like \($0)" } ?? person.name
-    }
-
     private var gridHeader: some View {
+        // The person's name is the window title and Back lives in the
+        // toolbar; this strip only says what the grid holds.
         HStack(spacing: 10) {
-            Button(action: onBack) {
-                Label("Back", systemImage: "chevron.left")
-            }
             PersonCover(workspace: workspace, personID: person.id)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(.headline)
-                Text(needle.isEmpty
-                    ? "\(faces.count) detection\(faces.count == 1 ? "" : "s") in \(photoCount) photo\(photoCount == 1 ? "" : "s")\(person.isRoster ? "" : " · weakest matches last")"
-                    : "\(visibleFaces.count) of \(faces.count) detections")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            Spacer()
-            Text("Double-click opens the photo · right-click for actions")
-                .font(.caption)
+            Text(needle.isEmpty
+                ? "\(faces.count) detection\(faces.count == 1 ? "" : "s") in \(photoCount) photo\(photoCount == 1 ? "" : "s")\(person.isRoster ? "" : " · weakest matches last")"
+                : "\(visibleFaces.count) of \(faces.count) detections")
+                .font(.callout)
                 .foregroundStyle(.secondary)
+            Spacer()
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
@@ -840,7 +887,7 @@ private struct PersonFacesGrid: View {
             .overlay(alignment: .bottomLeading) {
                 if !person.isRoster {
                     Text(face.matchScore.map { "\(Int($0 * 100))%" } ?? "seed")
-                        .font(.system(size: 9, weight: .semibold))
+                        .font(.caption2.weight(.semibold))
                         .padding(.horizontal, 4)
                         .padding(.vertical, 2)
                         .background(.black.opacity(0.65), in: Capsule())
@@ -851,7 +898,7 @@ private struct PersonFacesGrid: View {
             .overlay {
                 if face.id == person.coverFaceID {
                     Image(systemName: "star.fill")
-                        .font(.system(size: 11))
+                        .font(.caption)
                         .padding(3)
                         .background(.black.opacity(0.6), in: Circle())
                         .foregroundStyle(.yellow)
@@ -978,25 +1025,28 @@ private struct FacePhotoPreviewOverlay: View {
                 }
             }
             Spacer()
-            if let url {
-                Button("Reveal in Finder") {
-                    NSWorkspace.shared.activateFileViewerSelecting([url])
+            GlassEffectContainer {
+                HStack(spacing: 8) {
+                    if let url {
+                        Button("Reveal in Finder", systemImage: "folder") {
+                            NSWorkspace.shared.activateFileViewerSelecting([url])
+                        }
+                        Button("Open", systemImage: "arrow.up.forward.app") {
+                            PhotomatorLauncher.open(url)
+                        }
+                        .help("Open in Photomator, or the default app when it is not installed")
+                    }
+                    // Esc is handled by the overlay's key handler, so this
+                    // button carries no shortcut of its own.
+                    Button("Close", systemImage: "xmark") {
+                        onDismiss()
+                    }
+                    .labelStyle(.iconOnly)
+                    .buttonBorderShape(.circle)
+                    .help("Close the preview (Esc)")
                 }
-                Button {
-                    PhotomatorLauncher.open(url)
-                } label: {
-                    Label("Open", systemImage: "arrow.up.forward.app")
-                }
-                .help("Open in Photomator, or the default app when it is not installed")
+                .buttonStyle(.glass)
             }
-            Button {
-                onDismiss()
-            } label: {
-                Image(systemName: "xmark.circle.fill")
-                    .font(.title2)
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(.white.opacity(0.8))
         }
     }
 
