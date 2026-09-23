@@ -49,8 +49,8 @@ final class NativeUISnapshotTests: XCTestCase {
             workspace.selection = nil
             try await snapshot(window, size: NSSize(width: 1320, height: 840), name: "main-welcome-\(suffix)")
 
-            for (name, title, open) in secondaryWindows {
-                let secondary = try XCTUnwrap(SnapshotWindows.capture(title: title, open), "\(name) window")
+            for (name, identifier, open) in secondaryWindows {
+                let secondary = try XCTUnwrap(SnapshotWindows.capture(identifier: identifier, open), "\(name) window")
                 secondary.appearance = NSAppearance(named: appearance)
                 try await settle(1.5)
                 try await render(secondary, name: "\(name)-\(suffix)")
@@ -59,15 +59,16 @@ final class NativeUISnapshotTests: XCTestCase {
         }
     }
 
-    /// (file name, window title, opener) — the title finds the window
-    /// again on the second appearance pass, when the controller reuses it.
+    /// (file name, window identifier, opener) — the identifier finds the
+    /// window again on the second appearance pass, when the controller
+    /// reuses it.
     private var secondaryWindows: [(String, String, () -> Void)] {
         [
-            ("jobs", "Jobs", { TransferQueueWindowController.shared.show(model: self.model) }),
-            ("trash", "Trash", { TrashWindowController.shared.show(model: self.model) }),
-            ("settings", "Camera Toolkit Settings", { CameraToolkitConfigWindow.shared.show(model: self.model) }),
-            ("people", "People", { PeopleWindowController.shared.show(model: self.model, workspace: self.workspace) }),
-            ("event-library", "Event Library", { EventLibraryWindowController.shared.show(model: self.model) }),
+            ("jobs", "CameraToolkitTransferQueueWindow", { TransferQueueWindowController.shared.show(model: self.model) }),
+            ("trash", TrashWindowController.windowIdentifier, { TrashWindowController.shared.show(model: self.model) }),
+            ("settings", "CameraToolkitConfigWindow", { CameraToolkitConfigWindow.shared.show(model: self.model) }),
+            ("people", "CameraToolkitPeopleWindow", { PeopleWindowController.shared.show(model: self.model, workspace: self.workspace) }),
+            ("event-library", "CameraToolkitEventLibraryWindow", { EventLibraryWindowController.shared.show(model: self.model) }),
         ]
     }
 
@@ -257,11 +258,9 @@ enum SnapshotWindows {
 
     /// Opens a secondary window through its real controller and hides it
     /// before the run loop gets a chance to draw it on screen.
-    static func capture(title: String, _ open: () -> Void) -> NSWindow? {
-        let before = Set(NSApp.windows.map(ObjectIdentifier.init))
+    static func capture(identifier: String, _ open: () -> Void) -> NSWindow? {
         open()
-        let window = NSApp.windows.first { !before.contains(ObjectIdentifier($0)) }
-            ?? NSApp.windows.first { $0.title == title }
+        let window = NSApp.windows.first { $0.identifier?.rawValue == identifier }
         window.map(hide)
         return window
     }
