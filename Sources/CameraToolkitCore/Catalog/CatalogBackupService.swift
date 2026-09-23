@@ -171,12 +171,19 @@ public struct CatalogBackupService: Sendable {
     /// cannot be written or fails verification; the NAS side never throws
     /// and is reported in the result.
     @discardableResult
-    public func backupNow(reason: CatalogBackupReason, pinned: Bool = false) throws -> CatalogBackupResult {
+    ///
+    /// `mirrorToRemote: false` writes only the local set; the next launch
+    /// check (`backupIfStale` → `catchUpRemote`) copies it to the NAS.
+    public func backupNow(
+        reason: CatalogBackupReason,
+        pinned: Bool = false,
+        mirrorToRemote: Bool = true
+    ) throws -> CatalogBackupResult {
         Self.runLock.lock()
         defer { Self.runLock.unlock() }
         do {
             let manifest = try writeLocalSet(reason: reason, pinned: pinned)
-            let remote = mirror(manifest)
+            let remote = mirrorToRemote ? mirror(manifest) : (remoteFolder == nil ? .notConfigured : .offline)
             prune(folder: localFolder)
             if let remoteFolder, case .copied = remote {
                 prune(folder: remoteFolder)

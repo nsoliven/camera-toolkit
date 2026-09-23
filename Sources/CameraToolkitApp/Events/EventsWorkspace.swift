@@ -3376,6 +3376,8 @@ final class EventsWorkspace {
                 : "Turn on Send to Immich for \(eventTitle(event)) first."
             return
         }
+        // The Immich status rows reference the catalog's assignment rows.
+        model.persistCatalogStateNow()
         let catalogURL = URL(fileURLWithPath: DashboardModel.expandedPath(model.configuration.catalogDatabasePath))
         let configuration = model.configuration
 

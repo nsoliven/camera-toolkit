@@ -50,30 +50,9 @@ public struct CatalogStore {
         let folders = createLibraryFolders ? try ensureLibraryFolders(configuration: configuration) : []
         try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
 
-        var database: OpaquePointer?
-        guard sqlite3_open(url.path, &database) == SQLITE_OK, let database else {
-            let message = database.map { String(cString: sqlite3_errmsg($0)) } ?? "Unable to open database"
-            throw ToolkitError.commandFailed("Could not open catalog database: \(message)")
-        }
+        let database = try openConnection()
         defer { sqlite3_close(database) }
-        // Catalog work always runs away from the main actor. The shared
-        // pragmas give this short-lived handle the same busy timeout, WAL
-        // journal, and foreign keys as the app's shared connection, so a
-        // bootstrap waits briefly for another writer instead of failing.
-        CatalogDatabase.configureRawConnection(database, url: url)
-
-        // Schema creation and column grafts commit as one transaction: a
-        // crash part-way leaves the previous schema, never half of one.
-        try CatalogTransactionRetry.run(isTransient: Self.isTransientSQLiteError) {
-            try execute("BEGIN IMMEDIATE;", database: database)
-            do {
-                try createSchema(database: database)
-                try execute("COMMIT;", database: database)
-            } catch {
-                try? execute("ROLLBACK;", database: database)
-                throw error
-            }
-        }
+        try prepareSchema(database: database)
 
         // The whole bootstrap transaction — BEGIN IMMEDIATE through
         // COMMIT — retries a transient BUSY/IOERR with a short backoff:
@@ -98,7 +77,17 @@ public struct CatalogStore {
                     try upsertStorageLocation(location, selected: selected, database: database)
                 }
 
-                try synchronizeEvents(configuration: configuration, database: database)
+                // Once the catalog owns events and assignments
+                // (`CatalogStateStore`), they are written row by row as they
+                // change; mirroring a configuration snapshot here would
+                // overwrite newer rows with an older copy.
+                // A configuration without any event or assignment never
+                // empties the mirror either: that is what an unreadable or
+                // settings-only config.json looks like, not a user edit.
+                let hasEventState = !configuration.savedEvents.isEmpty || !configuration.photoEventAssignments.isEmpty
+                if hasEventState, try !Self.catalogOwnsEventState(database: database) {
+                    try synchronizeEvents(configuration: configuration, database: database)
+                }
                 try execute("COMMIT;", database: database)
             } catch {
                 try? execute("ROLLBACK;", database: database)
@@ -113,6 +102,68 @@ public struct CatalogStore {
             libraryFolders: folders.map(\.path),
             storageLocationCount: configuration.configuredLocations.count
         )
+    }
+
+    /// Creates or upgrades the catalog schema without writing any rows —
+    /// what `CatalogStateStore` needs before it reads or migrates.
+    public func prepareSchema() throws {
+        try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let database = try openConnection()
+        defer { sqlite3_close(database) }
+        try prepareSchema(database: database)
+    }
+
+    private func openConnection() throws -> OpaquePointer {
+        var database: OpaquePointer?
+        guard sqlite3_open(url.path, &database) == SQLITE_OK, let database else {
+            let message = database.map { String(cString: sqlite3_errmsg($0)) } ?? "Unable to open database"
+            sqlite3_close(database)
+            throw ToolkitError.commandFailed("Could not open catalog database: \(message)")
+        }
+        // Catalog work always runs away from the main actor. The shared
+        // pragmas give this short-lived handle the same busy timeout, WAL
+        // journal, and foreign keys as the app's shared connection, so a
+        // bootstrap waits briefly for another writer instead of failing.
+        CatalogDatabase.configureRawConnection(database, url: url)
+        return database
+    }
+
+    /// Schema creation and column grafts commit as one transaction: a
+    /// crash part-way leaves the previous schema, never half of one.
+    private func prepareSchema(database: OpaquePointer) throws {
+        try CatalogTransactionRetry.run(isTransient: Self.isTransientSQLiteError) {
+            try execute("BEGIN IMMEDIATE;", database: database)
+            do {
+                try createSchema(database: database)
+                try execute("COMMIT;", database: database)
+            } catch {
+                try? execute("ROLLBACK;", database: database)
+                throw error
+            }
+        }
+    }
+
+    /// True once `CatalogStateStore` migrated events and assignments into
+    /// the catalog and made it their only durable home.
+    static func catalogOwnsEventState(database: OpaquePointer) throws -> Bool {
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(
+            database,
+            "SELECT value FROM app_state WHERE key = '\(CatalogStateStore.ownershipKey)';",
+            -1,
+            &statement,
+            nil
+        ) == SQLITE_OK, let statement else {
+            throw SQLiteError(
+                code: sqlite3_errcode(database),
+                message: "Could not read catalog state: \(String(cString: sqlite3_errmsg(database)))"
+            )
+        }
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_step(statement) == SQLITE_ROW, let text = sqlite3_column_text(statement, 0) else {
+            return false
+        }
+        return String(cString: text) == CatalogStateStore.ownershipValue
     }
 
     /// Creates every catalog table and index and grafts the columns added
@@ -299,6 +350,31 @@ public struct CatalogStore {
             definition: "suggested_person_id TEXT REFERENCES people(id) ON DELETE SET NULL",
             database: database
         )
+
+        // Columns and tables for the catalog as the only durable home of
+        // events, assignments, display rotations, and burst splits
+        // (`CatalogStateStore`). `payload` is the event's full JSON, so
+        // every field round-trips exactly; `modified_at_ref` keeps the
+        // assignment's exact modification time; `ordinal` keeps insertion
+        // order.
+        try ensureColumn(table: "events", column: "payload", definition: "payload TEXT", database: database)
+        try ensureColumn(table: "events", column: "ordinal", definition: "ordinal INTEGER", database: database)
+        try ensureColumn(table: "event_assets", column: "modified_at_ref", definition: "modified_at_ref REAL", database: database)
+        try ensureColumn(table: "event_assets", column: "ordinal", definition: "ordinal INTEGER", database: database)
+        try execute("""
+        CREATE TABLE IF NOT EXISTS display_orientations (
+            file_key TEXT PRIMARY KEY,
+            quarter_turns INTEGER NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS burst_splits (
+            id TEXT PRIMARY KEY,
+            created_at_ref REAL NOT NULL,
+            member_path_keys TEXT NOT NULL,
+            ordinal INTEGER NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        """, database: database)
     }
 
     private func ensureLibraryFolders(configuration: AppConfiguration) throws -> [URL] {

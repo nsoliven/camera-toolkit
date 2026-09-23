@@ -128,6 +128,10 @@ final class DashboardModel {
     @ObservationIgnored private var lastStorageCapacityRefreshRequest = Date.distantPast
     /// The debounced after-writes backup (see `noteCatalogWrite`).
     @ObservationIgnored var catalogBackupDebounceTask: Task<Void, Never>?
+    /// Where events and assignments are durably saved (see
+    /// `CatalogStateStartup`). Tests and previews stay on `.legacy`, the
+    /// config.json path.
+    @ObservationIgnored var catalogStateMode: CatalogStateMode = .legacy
     @ObservationIgnored var lastCatalogBackupAt: Date?
 
     init(
@@ -195,8 +199,22 @@ final class DashboardModel {
     static func live() -> DashboardModel {
         let defaults = AppConfiguration.defaults(applicationSupport: defaultApplicationSupportURL)
         let store = ConfigurationStore(url: defaultConfigurationURL)
-        let configuration = (try? store.load(defaults: defaults)) ?? defaults
-        try? store.save(configuration)
+        // Events and assignments load from the catalog; the first launch
+        // after the upgrade migrates them there from config.json.
+        let backupsFolder = store.url.deletingLastPathComponent().appendingPathComponent("Backups", isDirectory: true)
+        let outcome = CatalogStateStartup.resolve(
+            configurationURL: store.url,
+            defaults: defaults,
+            backups: { catalogURL in
+                CatalogBackupService(
+                    catalogURL: catalogURL,
+                    configurationURL: store.url,
+                    localFolder: backupsFolder,
+                    remoteFolder: nil
+                )
+            }
+        )
+        let configuration = outcome.configuration
 
         let model = DashboardModel(
             jobs: [],
@@ -204,6 +222,7 @@ final class DashboardModel {
             configurationStore: store,
             loadActivityLog: true
         )
+        model.adoptCatalogState(outcome)
         model.scheduleCatalogSync(configuration: configuration)
         model.scheduleLaunchCatalogBackup()
         return model
@@ -426,6 +445,13 @@ extension DashboardModel {
     }
 
     func setConfigPath(_ keyPath: WritableKeyPath<AppConfiguration, String>, to value: String) {
+        if keyPath == \.catalogDatabasePath, !catalogStateMode.isLegacy,
+           Self.expandedPath(value) != Self.expandedPath(configuration.catalogDatabasePath) {
+            // Events live in this catalog now; pointing the app at another
+            // file would leave them behind.
+            statusMessage = "The photo list holds your events, so it can't be switched while Camera Toolkit is running. Quit, move catalog.sqlite and config.json together, then relaunch."
+            return
+        }
         if keyPath == \.importSourcePath {
             setSelectedLocationPath(role: .importSource, to: value)
             return
@@ -1009,10 +1035,15 @@ extension DashboardModel {
             }
         }
 
-        if let reloaded = disk.configuration {
+        if var reloaded = disk.configuration {
             // A mutation that landed while the disk pass ran is newer than
             // what was read — keep it; its own scheduled save will persist.
             if configurationRevision == revisionBefore {
+                if !catalogStateMode.isLegacy {
+                    // config.json holds settings only; events stay as the
+                    // catalog-backed memory has them.
+                    CatalogOwnedState(configuration: configuration).apply(to: &reloaded)
+                }
                 configuration = reloaded
                 configurationRevision &+= 1
                 configMessage = "Config reloaded at \(Self.defaultConfigurationURL.path)."
@@ -1615,18 +1646,97 @@ extension DashboardModel {
     func flushConfigurationSave() {
         configurationSaveTask?.cancel()
         configurationSaveTask = nil
-        guard configurationSaveIsDirty else { return }
-        saveConfigurationNow()
+        if configurationSaveIsDirty {
+            saveConfigurationNow()
+        }
+        if case .catalog(let writer) = catalogStateMode {
+            writer.flush()
+        }
     }
 
     private func saveConfigurationNow() {
-        do {
-            try configurationStore.save(configuration)
+        switch catalogStateMode {
+        case .legacy:
+            do {
+                try configurationStore.save(configuration)
+                configurationSaveIsDirty = false
+                configMessage = "Config saved at \(Self.defaultConfigurationURL.path)."
+            } catch {
+                configMessage = "Could not save config: \(error.localizedDescription)"
+            }
+        case .catalog(let writer):
+            // Events and assignments: only the changed rows, off the main
+            // actor. Settings: the small config.json.
+            writer.submit(CatalogOwnedState(configuration: configuration))
+            do {
+                try configurationStore.save(configuration, settingsOnly: true)
+                configurationSaveIsDirty = false
+                configMessage = "Settings saved at \(Self.defaultConfigurationURL.path); events are saved in the photo list."
+            } catch {
+                configMessage = "Could not save settings: \(error.localizedDescription)"
+            }
+        case .suspended:
             configurationSaveIsDirty = false
-            configMessage = "Config saved at \(Self.defaultConfigurationURL.path)."
-        } catch {
-            configMessage = "Could not save config: \(error.localizedDescription)"
+            configMessage = "Changes are not being saved until the photo list and config.json are restored. See the status message."
         }
+    }
+
+    /// Writes pending event and assignment changes to the catalog now,
+    /// without waiting for the debounced save. Callers that are about to
+    /// write rows referencing `event_assets` (presence, Immich status) call
+    /// this first so those rows exist. A no-op on the legacy path, where
+    /// the catalog sync mirrors the configuration instead.
+    func persistCatalogStateNow() {
+        guard case .catalog(let writer) = catalogStateMode else { return }
+        writer.submit(CatalogOwnedState(configuration: configuration))
+        writer.flush()
+    }
+
+    /// Takes the launch decision: which store is durable, and the
+    /// migration's message when one ran.
+    func adoptCatalogState(_ outcome: CatalogStateStartup.Outcome) {
+        switch outcome.mode {
+        case .legacy:
+            catalogStateMode = .legacy
+            try? configurationStore.save(configuration)
+        case .suspended:
+            catalogStateMode = .suspended
+        case .catalog(let baseline):
+            let catalogURL = URL(fileURLWithPath: Self.expandedPath(configuration.catalogDatabasePath))
+            let writer = CatalogStateWriter(
+                store: CatalogStateStore(url: catalogURL),
+                baseline: baseline,
+                emergencyFolder: localCatalogBackupFolder,
+                onResult: { [weak self] result in
+                    Task { @MainActor in self?.catalogStateWriteFinished(result) }
+                }
+            )
+            catalogStateMode = .catalog(writer)
+            if outcome.shouldRewriteConfiguration {
+                // The legacy copy (config.pre-sqlite-*.json) and the pinned
+                // migration backup both hold the old file.
+                try? configurationStore.save(configuration, settingsOnly: true)
+            }
+        }
+        if let message = outcome.message {
+            statusMessage = message
+            configMessage = message
+            recordActivity(
+                action: .verifyManifest,
+                state: outcome.mode.isSuspended ? .failed : .done,
+                title: outcome.migration != nil ? "Moved events into the photo list" : "Photo list needs attention",
+                summary: message,
+                detail: "No photo files were touched."
+            )
+        }
+    }
+
+    private func catalogStateWriteFinished(_ result: Result<CatalogStateChangeSummary, Error>) {
+        guard case .failure(let error) = result else { return }
+        let message = "Could not save event changes to the photo list: \(error.localizedDescription) "
+            + "They are kept in Backups/unsaved-events-*.json and will be retried with the next change."
+        statusMessage = message
+        configMessage = message
     }
 
     private func scheduleCatalogSync(configuration: AppConfiguration) {
@@ -1755,5 +1865,27 @@ private extension AppConfiguration {
             selectedBufferID = location.id
             bufferPath = location.path
         }
+    }
+}
+
+/// Where events and assignments are durably saved this session.
+enum CatalogStateMode {
+    /// Pre-migration: config.json holds everything; the catalog mirrors it.
+    case legacy
+    /// The catalog is the durable store, written through `writer`.
+    case catalog(CatalogStateWriter)
+    /// Nothing durable is written until the owner restores matching files.
+    case suspended
+
+    var isLegacy: Bool {
+        if case .legacy = self { return true }
+        return false
+    }
+}
+
+extension CatalogStateStartup.Mode {
+    var isSuspended: Bool {
+        if case .suspended = self { return true }
+        return false
     }
 }

@@ -124,7 +124,15 @@ photo library originals
 
 ## Catalog and configuration
 
-`AppConfiguration` is JSON-encoded local state. It stores selected locations, events with their storage policy, file assignments, integration endpoints, and policy—not API keys. `DashboardModel.updateConfiguration` coalesces mutations into a trailing-debounced JSON write (~250 ms) and flushes synchronously on `applicationWillTerminate`, so bursts cost one write and the last state is always durable. `CatalogStore` mirrors those relationships into SQLite for fast cross-drive event browsing — its bootstrap also owns the face-index tables (`face_photos`, `faces`, `people`, `face_templates`) that `FaceIndexStore` reads and writes. Catalog writes are serialized through GRDB, and the in-app inspector accepts bounded read-only queries only.
+`AppConfiguration` is the in-memory state the UI works on: selected locations, events with their storage policy, file assignments, display rotations, burst splits, integration endpoints, and policy—not API keys. Its durable homes are split:
+
+- **Settings** live in `config.json`. `DashboardModel.updateConfiguration` coalesces mutations into a trailing-debounced write (~250 ms) and flushes synchronously on `applicationWillTerminate`.
+- **Events, assignments, display rotations, and burst splits** (`CatalogOwnedState`) live only in the SQLite catalog. `CatalogStateWriter` writes the rows that changed since its last successful write — one transaction per save, off the main actor — through `CatalogStateStore`. A failed save writes nothing, keeps the unsaved state in `Backups/unsaved-events-*.json`, and retries the whole difference with the next change.
+- The first launch after the upgrade migrates a legacy `config.json` into the catalog (`CatalogStateStartup`): a pinned, verified backup first, then a byte-verified `config.pre-sqlite-<stamp>.json` copy, then one transaction that validates exact counts, an exact read-back, `integrity_check`, and no new foreign-key violations before it commits. Any mismatch rolls back and the session stays on the old `config.json` path. An unreadable config, or a settings-only config over a catalog that was never migrated, starts in a suspended mode that writes nothing durable.
+
+`CatalogStore.bootstrap` keeps the schema, settings mirror, and face-index tables (`face_photos`, `faces`, `people`, `face_templates`, `face_rejections`) that `FaceIndexStore` reads and writes; once the catalog owns the event state it no longer mirrors events from a configuration snapshot. Every catalog reader and writer shares one connection per file (`CatalogDatabase`: WAL on a local volume, `synchronous = NORMAL`, 5 s busy timeout, foreign keys on), checkpointed at quit. The in-app inspector accepts bounded read-only queries only.
+
+`CatalogBackupService` backs the catalog up with the SQLite online backup API — at launch when the newest backup is over a day old, after a burst of catalog writes, and from Settings — into `Application Support/CameraToolkit/Backups` and the configured NAS folder. Every set holds the catalog snapshot, the face labels (`FaceLabelExport`), `config.json`, and a manifest, and is verified before it counts. Retention keeps 7 daily and 4 weekly sets and only ever deletes files a manifest of its own lists.
 
 Integration API keys are stored separately by `KeychainSecretStore`. `ImmichClient` performs connection checks, checksum-presence reads, streamed multipart uploads, and album creation. `TrueNASClient` uses the secure JSON-RPC WebSocket API, optionally pins a self-signed TLS certificate, resolves a mounted SMB share to its deepest matching dataset, and reads dataset/pool capacity without changing NAS state.
 
@@ -136,7 +144,7 @@ Integration API keys are stored separately by `KeychainSecretStore`. `ImmichClie
 - Preview images are downsampled to a requested pixel budget before becoming `NSImage` instances.
 - Capture-time reads touch a bounded header block and are cached on disk.
 - Immich uploads stream file bytes through a bound stream pair instead of loading clips into memory.
-- SQLite sync is debounced and runs at utility priority.
+- SQLite sync is debounced and runs at utility priority; event and assignment saves write only changed rows on a background writer.
 - A machine-readable debug stream (`DebugLog`, Core/Diagnostics) appends one JSON line per event to `~/Library/Logs/CameraToolkit/debug.jsonl` — tile/preview decode start/finish/timeout, video probes, trash and job finishes — with duration, outcome, extension, size, and a sanitized error (`NSError` domain+code, never a path beyond the basename). Writes queue on a utility serial queue, failures are swallowed, and the file trims its oldest half in place past 4 MB so a `tail -F` survives.
 
 The test suite includes large-file hashing and decoded-image bounds so changes to these paths remain measurable.
