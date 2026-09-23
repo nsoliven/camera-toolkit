@@ -835,13 +835,17 @@ private struct TrashTileView: View {
     }
 }
 
-/// Permanent delete, behind the same typed DELETE confirmation the Settings
-/// row uses. Covers exactly the roots the browser lists — nothing outside a
-/// `_Trash` folder is touched.
-private struct EmptyTrashSheet: View {
+/// Permanent delete, behind a typed DELETE confirmation. The Trash window
+/// and Settings both present this one sheet. Covers exactly the roots the
+/// browser lists — nothing outside a `_Trash` folder is touched.
+struct EmptyTrashSheet: View {
     @Bindable var model: DashboardModel
-    let fileCount: Int
-    let byteCount: Int64
+    /// What the Trash window counted; nil when the caller (Settings) has
+    /// not listed the Trash.
+    let fileCount: Int?
+    let byteCount: Int64?
+    /// Receives the job's summary once the delete finishes.
+    var onFinished: ((String) -> Void)? = nil
 
     @Environment(\.dismiss) private var dismiss
     @State private var confirmation = ""
@@ -855,7 +859,7 @@ private struct EmptyTrashSheet: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Empty Trash?")
                         .font(.title2.bold())
-                    Text("\(fileCount) file\(fileCount == 1 ? "" : "s") · \(byteCount.formattedBytes) will be permanently deleted.")
+                    Text(countLine)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -883,6 +887,13 @@ private struct EmptyTrashSheet: View {
         }
         .padding(20)
         .frame(width: 480)
+    }
+
+    private var countLine: String {
+        guard let fileCount, let byteCount else {
+            return "Everything in the _Trash folders will be permanently deleted."
+        }
+        return "\(fileCount) file\(fileCount == 1 ? "" : "s") · \(byteCount.formattedBytes) will be permanently deleted."
     }
 
     private func empty() {
@@ -919,6 +930,7 @@ private struct EmptyTrashSheet: View {
                 let summary = parts.joined(separator: " ")
                 confirmation = ""
                 NotificationCenter.default.post(name: .cameraToolkitMediaTrashChanged, object: nil)
+                onFinished?(summary)
                 dismiss()
                 return summary
             }
