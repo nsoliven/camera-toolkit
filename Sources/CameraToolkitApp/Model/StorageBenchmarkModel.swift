@@ -17,6 +17,7 @@ struct StorageBenchmarkTarget: Identifiable, Hashable, Sendable {
     var access: StorageBenchmarkAccess
     var isAvailable: Bool
     var totalCapacity: Int64?
+    var volumeInfo: MountedVolumeInfo?
 
     var roleSummary: String {
         roleNames.joined(separator: " · ")
@@ -33,31 +34,25 @@ enum StorageBenchmarkTargetDiscovery {
         var writeDirectory: URL?
         var writePriority = Int.max
         var roleNames: Set<String> = []
-        var hasCameraSource = false
         var isAvailable = false
         var isReadOnly = false
         var totalCapacity: Int64?
+        var volumeInfo: MountedVolumeInfo?
     }
 
     static func discover(
         configuration: AppConfiguration,
         transferQueue: TransferQueueSnapshot?,
+        mountedVolumes: [MountedVolumeInfo],
         fileManager: FileManager = .default
     ) -> [StorageBenchmarkTarget] {
-        let keys: Set<URLResourceKey> = [
-            .volumeNameKey,
-            .volumeIsRemovableKey,
-            .volumeIsEjectableKey,
-            .volumeIsReadOnlyKey,
-            .volumeTotalCapacityKey
-        ]
-        let mountedVolumes = (fileManager.mountedVolumeURLs(
-            includingResourceValuesForKeys: Array(keys),
-            options: [.skipHiddenVolumes]
-        ) ?? [])
-            .map(\.standardizedFileURL)
-            .filter { $0.path != "/" }
-            .sorted { $0.path.count > $1.path.count }
+        let mountedVolumes = mountedVolumes
+            .filter {
+                $0.url.path != "/"
+                    && $0.isStorageLike
+                    && !$0.isDiskImage
+            }
+            .sorted { $0.url.path.count > $1.url.path.count }
 
         let configuredPaths = configuration.configuredLocations.map {
             URL(fileURLWithPath: DashboardModel.expandedPath($0.path), isDirectory: true)
@@ -70,22 +65,21 @@ enum StorageBenchmarkTargetDiscovery {
         ).standardizedFileURL
 
         for volume in mountedVolumes {
-            let values = try? volume.resourceValues(forKeys: keys)
-            let isConfigured = configuredPaths.contains { isInside($0, root: volume) }
-            let isExternal = volume.path.hasPrefix("/Volumes/")
-                && (values?.volumeIsRemovable == true || values?.volumeIsEjectable == true)
+            let isConfigured = configuredPaths.contains { isInside($0, root: volume.url) }
+            let isExternal = volume.url.path.hasPrefix("/Volumes/")
+                && (volume.isRemovable || volume.isEjectable || volume.isNetwork)
             guard isConfigured || isExternal else { continue }
 
-            let name = values?.volumeName ?? volume.lastPathComponent
-            builders[volume.path] = Builder(
-                id: volume.path,
-                name: name.isEmpty ? volume.lastPathComponent : name,
-                volumeRoot: volume,
-                searchRoots: isConfigured ? [] : [volume],
+            builders[volume.url.path] = Builder(
+                id: volume.url.path,
+                name: volume.name.isEmpty ? volume.url.lastPathComponent : volume.name,
+                volumeRoot: volume.url,
+                searchRoots: isConfigured ? [] : [volume.url],
                 roleNames: isConfigured ? [] : ["Connected Drive"],
                 isAvailable: true,
-                isReadOnly: values?.volumeIsReadOnly ?? false,
-                totalCapacity: values?.volumeTotalCapacity.map(Int64.init)
+                isReadOnly: volume.isReadOnly,
+                totalCapacity: volume.totalCapacity,
+                volumeInfo: volume
             )
         }
 
@@ -97,21 +91,21 @@ enum StorageBenchmarkTargetDiscovery {
             if location.role == .importSource, isInside(locationURL, root: demoRoot) {
                 continue
             }
-            let matchedVolume = mountedVolumes.first { isInside(locationURL, root: $0) }
-            let builderID = matchedVolume?.path ?? "offline:\(locationURL.path)"
+            let matchedVolume = mountedVolumes.first { isInside(locationURL, root: $0.url) }
+            let builderID = matchedVolume?.url.path ?? "offline:\(locationURL.path)"
             var builder = builders[builderID] ?? Builder(
                 id: builderID,
                 name: location.name,
-                volumeRoot: matchedVolume ?? locationURL,
+                volumeRoot: matchedVolume?.url ?? locationURL,
                 isAvailable: matchedVolume != nil && fileManager.fileExists(atPath: locationURL.path),
-                isReadOnly: false
+                isReadOnly: matchedVolume?.isReadOnly ?? false,
+                volumeInfo: matchedVolume
             )
 
             builder.roleNames.insert(roleName(location.role))
             builder.isAvailable = builder.isAvailable || fileManager.fileExists(atPath: locationURL.path)
             switch location.role {
             case .importSource:
-                builder.hasCameraSource = true
                 if !builder.searchRoots.contains(locationURL) {
                     builder.searchRoots.append(locationURL)
                 }
@@ -131,32 +125,42 @@ enum StorageBenchmarkTargetDiscovery {
 
         if let transferQueue {
             let source = URL(fileURLWithPath: transferQueue.sourcePath, isDirectory: true).standardizedFileURL
-            if let volume = mountedVolumes.first(where: { isInside(source, root: $0) }),
-               var builder = builders[volume.path] {
-                builder.hasCameraSource = true
+            if let volume = mountedVolumes.first(where: { isInside(source, root: $0.url) }),
+               var builder = builders[volume.url.path] {
                 builder.roleNames.insert("Camera Source")
                 if !builder.searchRoots.contains(source) {
                     builder.searchRoots.insert(source, at: 0)
                 }
-                builders[volume.path] = builder
+                builders[volume.url.path] = builder
             }
         }
 
         return builders.values.map { builder in
-            let canWrite = !builder.hasCameraSource
-                && !builder.isReadOnly
+            // Writing needs a configured Buffer or Photo Library folder on this
+            // volume. A camera-source role never grants one, so cards stay
+            // read-only — but a drive that is both the Buffer and a camera
+            // source still earns the temp-file write test.
+            let canWrite = !builder.isReadOnly
                 && builder.writeDirectory != nil
                 && builder.writeDirectory.map { fileManager.isWritableFile(atPath: $0.path) } == true
+            // The sampler first tries the configured source folders, then the
+            // volume itself, so a source path that is empty or missing cannot
+            // leave a drive full of media looking untestable.
+            var searchRoots = builder.searchRoots
+            if !searchRoots.contains(builder.volumeRoot) {
+                searchRoots.append(builder.volumeRoot)
+            }
             return StorageBenchmarkTarget(
                 id: builder.id,
                 name: builder.name,
                 volumeRoot: builder.volumeRoot,
-                searchRoots: builder.searchRoots.isEmpty ? [builder.volumeRoot] : builder.searchRoots,
+                searchRoots: searchRoots,
                 writeDirectory: canWrite ? builder.writeDirectory : nil,
                 roleNames: builder.roleNames.sorted(),
                 access: canWrite ? .readWrite : .readOnly,
                 isAvailable: builder.isAvailable,
-                totalCapacity: builder.totalCapacity
+                totalCapacity: builder.totalCapacity,
+                volumeInfo: builder.volumeInfo
             )
         }
         .sorted {
@@ -214,6 +218,13 @@ enum BenchmarkSampleSize: Int64, CaseIterable, Identifiable {
     var label: String { "\(rawValue) MB" }
 }
 
+/// One measurable direction. Reads sample existing media anywhere; writes use
+/// the hidden temporary file and only exist where writing is allowed.
+enum BenchmarkKind: String, Sendable {
+    case read
+    case write
+}
+
 @MainActor
 @Observable
 final class StorageBenchmarkViewModel {
@@ -221,7 +232,9 @@ final class StorageBenchmarkViewModel {
     var results: [String: StorageBenchmarkResult] = [:]
     var errors: [String: String] = [:]
     var connectedLinks: [USBLinkSnapshot] = []
+    var linkContexts: [String: StorageLinkContext] = [:]
     var activeTargetID: String?
+    var activeKind: BenchmarkKind?
     var phase = ""
     var progress = 0.0
     var liveBytesPerSecond = 0.0
@@ -229,27 +242,55 @@ final class StorageBenchmarkViewModel {
 
     @ObservationIgnored private weak var dashboardModel: DashboardModel?
     @ObservationIgnored private var task: Task<Void, Never>?
+    @ObservationIgnored private var refreshTask: Task<Void, Never>?
 
     var isRunning: Bool { activeTargetID != nil }
+
+    var pathVerdicts: [StoragePathVerdict] {
+        StorageBottleneckAnalysis.verdicts(
+            targets: targets,
+            results: results,
+            contexts: linkContexts,
+            transferQueue: dashboardModel?.transferQueue
+        )
+    }
 
     func refresh(from model: DashboardModel) {
         guard !isRunning else { return }
         dashboardModel = model
-        targets = StorageBenchmarkTargetDiscovery.discover(
-            configuration: model.configuration,
-            transferQueue: model.transferQueue
-        )
-        Task { [weak self] in
-            self?.connectedLinks = await USBLinkProbe.connectedStorageLinks()
+        let configuration = model.configuration
+        let transferQueue = model.transferQueue
+        refreshTask?.cancel()
+        refreshTask = Task { [weak self] in
+            let volumes = await MountedVolumeProbe.mountedVolumes()
+            guard !Task.isCancelled else { return }
+            let targets = StorageBenchmarkTargetDiscovery.discover(
+                configuration: configuration,
+                transferQueue: transferQueue,
+                mountedVolumes: volumes
+            )
+            self?.targets = targets
+            let contexts = await StorageLinkInspector.contexts(for: targets)
+            let links = await USBLinkProbe.connectedStorageLinks()
+            guard !Task.isCancelled else { return }
+            self?.linkContexts = contexts
+            self?.connectedLinks = links
         }
     }
 
-    func run(_ target: StorageBenchmarkTarget) {
-        start(targets: [target])
+    func run(_ target: StorageBenchmarkTarget, kind: BenchmarkKind) {
+        start(jobs: [(target, kind)])
     }
 
     func runAll() {
-        start(targets: targets.filter(\.isAvailable))
+        let jobs = targets.filter(\.isAvailable).flatMap { target -> [(StorageBenchmarkTarget, BenchmarkKind)] in
+            var jobs: [(StorageBenchmarkTarget, BenchmarkKind)] = [(target, .read)]
+            if target.access == .readWrite {
+                jobs.append((target, .write))
+            }
+            return jobs
+        }
+        start(jobs: jobs)
     }
 
     func cancel() {
@@ -257,8 +298,8 @@ final class StorageBenchmarkViewModel {
         phase = "Cancelling after the current I/O call…"
     }
 
-    private func start(targets selectedTargets: [StorageBenchmarkTarget]) {
-        guard !isRunning, !selectedTargets.isEmpty else { return }
+    private func start(jobs: [(StorageBenchmarkTarget, BenchmarkKind)]) {
+        guard !isRunning, !jobs.isEmpty else { return }
         guard let dashboardModel, !dashboardModel.isBusy else {
             errors["global"] = "Wait for the current copy or checksum job to finish before measuring storage speed."
             return
@@ -271,25 +312,27 @@ final class StorageBenchmarkViewModel {
             guard let self else { return }
             defer {
                 activeTargetID = nil
+                activeKind = nil
                 progress = 0
                 liveBytesPerSecond = 0
                 dashboardModel.isStorageBenchmarkRunning = false
                 dashboardModel.startNextPendingTransferIfPossible()
             }
 
-            for target in selectedTargets {
+            for (target, kind) in jobs {
                 if Task.isCancelled { break }
                 activeTargetID = target.id
-                phase = target.access == .readOnly
-                    ? "Preparing a read-only source test"
-                    : "Preparing a temporary destination test"
+                activeKind = kind
+                phase = kind == .read
+                    ? "Preparing a read test"
+                    : "Preparing a temporary write test"
                 progress = 0
                 liveBytesPerSecond = 0
                 errors[target.id] = nil
 
                 do {
-                    let result = try await execute(target: target, byteCount: byteCount)
-                    results[target.id] = result
+                    let result = try await execute(target: target, kind: kind, byteCount: byteCount)
+                    merge(result, into: target.id, kind: kind)
                     phase = "Complete"
                     progress = 1
                     liveBytesPerSecond = 0
@@ -300,11 +343,30 @@ final class StorageBenchmarkViewModel {
                     errors[target.id] = error.localizedDescription
                 }
             }
+            activeKind = nil
+        }
+    }
+
+    /// A read run replaces the read figure; a write run supplies both the write
+    /// figure and the uncached read-back of its temporary file.
+    private func merge(_ result: StorageBenchmarkResult, into targetID: String, kind: BenchmarkKind) {
+        switch kind {
+        case .read:
+            let existing = results[targetID]
+            results[targetID] = StorageBenchmarkResult(
+                read: result.read,
+                write: result.write ?? existing?.write,
+                sampledFileCount: result.sampledFileCount,
+                completedAt: result.completedAt
+            )
+        case .write:
+            results[targetID] = result
         }
     }
 
     private func execute(
         target: StorageBenchmarkTarget,
+        kind: BenchmarkKind,
         byteCount: Int64
     ) async throws -> StorageBenchmarkResult {
         let targetID = target.id
@@ -322,15 +384,15 @@ final class StorageBenchmarkViewModel {
                 continuation.yield(update)
             }
             let service = StorageBenchmarkService()
-            switch target.access {
-            case .readOnly:
+            switch kind {
+            case .read:
                 return try service.benchmarkReadOnly(
                     searchRoots: target.searchRoots,
                     byteLimit: byteCount,
                     progress: progressHandler
                 )
-            case .readWrite:
-                guard let directory = target.writeDirectory else {
+            case .write:
+                guard target.access == .readWrite, let directory = target.writeDirectory else {
                     throw ToolkitError.commandFailed("No writable benchmark folder is configured for this drive.")
                 }
                 return try service.benchmarkReadWrite(

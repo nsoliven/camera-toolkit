@@ -65,6 +65,60 @@ final class StorageBenchmarkServiceTests: XCTestCase {
             XCTAssertLessThan(phases.values.count, 16)
         }
     }
+
+    func testSamplerFindsMediaInsideNestedFolders() throws {
+        try withTemporaryDirectory { root in
+            let deep = root
+                .appendingPathComponent("2026", isDirectory: true)
+                .appendingPathComponent("09_September", isDirectory: true)
+                .appendingPathComponent("Wedding", isDirectory: true)
+                .appendingPathComponent("Card Copy", isDirectory: true)
+            try FileManager.default.createDirectory(at: deep, withIntermediateDirectories: true)
+            try writeFile(deep.appendingPathComponent("DSC_0001.ARW"), Data(repeating: 0x41, count: 2 * 1024 * 1024))
+            try writeFile(deep.appendingPathComponent("DSC_0002.ARW"), Data(repeating: 0x42, count: 2 * 1024 * 1024))
+            try writeFile(deep.appendingPathComponent("._DSC_0001.ARW"), Data(repeating: 0x43, count: 4096))
+
+            let result = try StorageBenchmarkService().benchmarkReadOnly(
+                searchRoots: [root],
+                byteLimit: 3 * 1024 * 1024
+            )
+
+            XCTAssertEqual(result.read.bytes, 3 * 1024 * 1024)
+            XCTAssertEqual(result.sampledFileCount, 2)
+        }
+    }
+
+    func testSamplerFallsBackToLaterRootsWhenAConfiguredSourceIsMissing() throws {
+        try withTemporaryDirectory { root in
+            try writeFile(root.appendingPathComponent("clip.mp4"), Data(repeating: 0x51, count: 2 * 1024 * 1024))
+            let missing = root.appendingPathComponent("Not There", isDirectory: true)
+
+            let result = try StorageBenchmarkService().benchmarkReadOnly(
+                searchRoots: [missing, root],
+                byteLimit: 1024 * 1024
+            )
+
+            XCTAssertEqual(result.read.bytes, 1024 * 1024)
+            XCTAssertEqual(result.sampledFileCount, 1)
+        }
+    }
+
+    func testOverlappingRootsDoNotSampleTheSameFileTwice() throws {
+        try withTemporaryDirectory { root in
+            let sub = root.appendingPathComponent("DCIM", isDirectory: true)
+            try FileManager.default.createDirectory(at: sub, withIntermediateDirectories: true)
+            try writeFile(sub.appendingPathComponent("a.raw"), Data(repeating: 0x61, count: 2 * 1024 * 1024))
+            try writeFile(root.appendingPathComponent("b.raw"), Data(repeating: 0x62, count: 2 * 1024 * 1024))
+
+            let result = try StorageBenchmarkService().benchmarkReadOnly(
+                searchRoots: [sub, root],
+                byteLimit: 4 * 1024 * 1024
+            )
+
+            XCTAssertEqual(result.sampledFileCount, 2)
+            XCTAssertEqual(result.read.bytes, 4 * 1024 * 1024)
+        }
+    }
 }
 
 private final class LockedStrings: @unchecked Sendable {
