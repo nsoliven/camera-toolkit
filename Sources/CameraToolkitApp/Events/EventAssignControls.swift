@@ -62,6 +62,9 @@ struct EventAssignControls: View {
                     } label: {
                         Label("Event…", systemImage: "calendar")
                     }
+                    // Glass reads on the preview's black backdrop in both
+                    // appearances; a bordered button vanished in light mode.
+                    .buttonStyle(.glass)
                     .help("Search every event by name, or create a new one")
                 }
             case .glass, .glassNumbers:

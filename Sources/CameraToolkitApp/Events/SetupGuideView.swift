@@ -410,7 +410,7 @@ struct SetupGuidePanel: View {
             Text("That’s the whole loop: sort, Apply, then archive each event when the NAS is connected.")
             GuideBullet(symbol: "keyboard", text: "Space previews · 1–3 sorts · N makes an event · Command-Z undoes.")
             GuideBullet(symbol: "externaldrive", text: "Settings › Where Things Live shows your Buffer, private folder, and NAS, and lets you change them.")
-            GuideBullet(symbol: "questionmark.circle", text: "Open this guide again any time with the Guide button in the sidebar or Help › Setup Guide.")
+            GuideBullet(symbol: "questionmark.circle", text: "Open this guide again any time from Help › Setup Guide or the gear menu at the bottom of the sidebar.")
         }
     }
 }

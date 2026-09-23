@@ -892,6 +892,8 @@ struct OrganizeGrid<MenuContent: View>: View {
                 handleKey(press, ordered: ordered, orderedIDs: orderedIDs, proxy: proxy)
             }
             .onAppear { isFocused = true }
+            // Return in the toolbar search field hands the keyboard back.
+            .onChange(of: workspace.boardFocusRequest) { isFocused = true }
             .onChange(of: workspace.focusedStackID) { _, id in
                 guard let id else { return }
                 withAnimation(.easeOut(duration: 0.15)) {

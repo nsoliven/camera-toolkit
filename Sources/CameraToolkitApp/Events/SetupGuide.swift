@@ -171,7 +171,7 @@ final class SetupGuide {
     func finish() {
         UserDefaults.standard.set(true, forKey: Self.completedKey)
         workspace.guide = nil
-        model.statusMessage = "Setup complete. Open the guide again any time with the Guide button."
+        model.statusMessage = "Setup complete. Open the guide again any time from Help › Setup Guide."
     }
 
     // MARK: Places
