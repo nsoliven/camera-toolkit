@@ -190,13 +190,18 @@ struct OrganizeDragPayload: Codable {
 struct TileThumbnail: View {
     let url: URL
     let kind: OrganizeMediaKind
-    let pixelSize: Int
+    /// Longest edge in points — the decode asks for `pointSize × displayScale`
+    /// pixels, so a 1× monitor never pays for a Retina-sized bitmap.
+    let pointSize: CGFloat
     /// Display rotation in quarter-turns clockwise; part of the task id so a
     /// "Rotate Burst" change re-decodes this tile without a rescan.
     var orientation: Int = 0
 
+    @Environment(\.displayScale) private var displayScale
     @State private var image: CGImage?
     @State private var failed = false
+
+    private var pixelSize: Int { Int(pointSize * displayScale) }
 
     var body: some View {
         ZStack {
@@ -226,6 +231,11 @@ struct TileThumbnail: View {
             guard !Task.isCancelled else { return }
             image = loaded
             failed = loaded == nil
+        }
+        .onDisappear {
+            // Scrolled off: drop the tile's own bitmap — the NSCache keeps a
+            // share for the scroll back, this copy is what ballooned memory.
+            image = nil
         }
     }
 
@@ -268,7 +278,7 @@ struct StackTileView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
             ZStack {
-                TileThumbnail(url: stack.coverItem.primary.url, kind: stack.kind, pixelSize: Int(width * 2), orientation: orientation)
+                TileThumbnail(url: stack.coverItem.primary.url, kind: stack.kind, pointSize: width, orientation: orientation)
                     .frame(width: width, height: width * 2 / 3)
                     .clipped()
                 VStack {
@@ -444,7 +454,7 @@ struct StackRowView: View {
 
     var body: some View {
         HStack(spacing: 10) {
-            TileThumbnail(url: stack.coverItem.primary.url, kind: stack.kind, pixelSize: 176)
+            TileThumbnail(url: stack.coverItem.primary.url, kind: stack.kind, pointSize: 88)
                 .frame(width: 88, height: 56)
                 .clipped()
                 .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
@@ -581,7 +591,7 @@ struct BurstExpansionView: View {
                 spacing: 6
             ) {
                 ForEach(Array(stack.items.enumerated()), id: \.element.id) { index, frame in
-                    TileThumbnail(url: frame.primary.url, kind: frame.kind, pixelSize: Int(frameSize * 2))
+                    TileThumbnail(url: frame.primary.url, kind: frame.kind, pointSize: frameSize)
                         .frame(width: frameSize, height: frameSize * 2 / 3)
                         .clipped()
                         .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
@@ -1514,7 +1524,7 @@ struct StackPreviewOverlay: View {
                     ForEach(Array(stack.items.enumerated()), id: \.element.id) { index, frame in
                         let isSelected = selectedIndexes.contains(index)
                         let isCurrent = index == frameIndex
-                        TileThumbnail(url: frame.primary.url, kind: frame.kind, pixelSize: 256, orientation: orientationForFile(frame.primary))
+                        TileThumbnail(url: frame.primary.url, kind: frame.kind, pointSize: 96, orientation: orientationForFile(frame.primary))
                             .frame(width: 96, height: 64)
                             .clipShape(RoundedRectangle(cornerRadius: 5))
                             .overlay {

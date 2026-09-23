@@ -715,7 +715,7 @@ private struct TrashTileView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
             ZStack {
-                TileThumbnail(url: item.fileURL, kind: kind, pixelSize: Int(width * 2))
+                TileThumbnail(url: item.fileURL, kind: kind, pointSize: width)
                 VStack {
                     HStack {
                         Spacer(minLength: 0)

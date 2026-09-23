@@ -45,6 +45,11 @@ final class TileImageLoader: @unchecked Sendable {
     }
 
     private let cache = NSCache<NSString, Box>()
+    /// The 4800-px zoom decodes live apart from the tile cache: one hero
+    /// bitmap costs as much as ~25 filmstrip tiles, and letting it evict
+    /// them — or letting filmstrip churn evict it — makes both feel broken.
+    /// A small separate limit keeps a couple of zoomed frames on hand.
+    private let previewCache = NSCache<NSString, Box>()
     private let queue: OperationQueue
     private let lock = NSLock()
     private var inFlight: [String: WaiterGroup] = [:]
@@ -56,29 +61,63 @@ final class TileImageLoader: @unchecked Sendable {
     /// each file landed. Only consulted while the asked-for path is really
     /// missing, so a name another file later reuses is never rerouted.
     private var redirects: [String: String] = [:]
+    /// Held for the lifetime of the loader — dispatch sources need a strong
+    /// reference to keep delivering.
+    private var memoryPressureSource: (any DispatchSourceMemoryPressure)?
 
     init(driveActivityGate: DriveActivityGate = .shared) {
         self.driveActivityGate = driveActivityGate
-        cache.totalCostLimit = 768 * 1_024 * 1_024
+        cache.totalCostLimit = 320 * 1_024 * 1_024
+        previewCache.totalCostLimit = 192 * 1_024 * 1_024
         queue = OperationQueue()
         queue.name = "CameraToolkit.TileImageLoader"
         queue.maxConcurrentOperationCount = 6
         queue.qualityOfService = .userInitiated
+        let source = DispatchSource.makeMemoryPressureSource(
+            eventMask: [.warning, .critical],
+            queue: .global(qos: .utility)
+        )
+        source.setEventHandler { [weak self] in
+            self?.purgeForMemoryPressure()
+        }
+        source.resume()
+        memoryPressureSource = source
     }
 
     /// Decode sizes are bucketed so tile and preview requests share cache
     /// entries. The 4800 bucket exists for the burst review overlay, which
     /// upgrades the displayed frame once the user zooms past fit — roughly
     /// 60–90 MB decoded per frame inside the cost-limited NSCache.
+    static let buckets: [Int] = [384, 512, 768, 1_280, 2_400, 4_800]
+
     static func bucket(for pixels: Int) -> Int {
         switch pixels {
         case ...384: 384
+        case ...512: 512
         case ...768: 768
         case ...1_280: 1_280
         case ...2_400: 2_400
         default: 4_800
         }
     }
+
+    /// The cache a bucket belongs to: the big zoom decodes get the small
+    /// preview cache, everything else shares the tile cache.
+    private func store(for bucket: Int) -> NSCache<NSString, Box> {
+        bucket >= 4_800 ? previewCache : cache
+    }
+
+    /// Drops every cached bitmap — called from the memory-pressure dispatch
+    /// source (and tests). On-screen tiles hold their own `@State` image, so
+    /// purging only re-decodes what scrolls back into view.
+    func purgeForMemoryPressure() {
+        cache.removeAllObjects()
+        previewCache.removeAllObjects()
+    }
+
+    /// Test/debug readouts of the configured limits.
+    var tileCacheCostLimit: Int { cache.totalCostLimit }
+    var previewCacheCostLimit: Int { previewCache.totalCostLimit }
 
     /// `orientation` is the display rotation in quarter-turns clockwise (see
     /// `DisplayRotation`). It is part of the cache key so a rotated decode
@@ -87,12 +126,12 @@ final class TileImageLoader: @unchecked Sendable {
     /// a miss.
     func cachedImage(for url: URL, maximumPixelSize: Int, orientation: Int = 0) -> CGImage? {
         let bucket = Self.bucket(for: maximumPixelSize)
-        if let hit = cache.object(forKey: key(url, bucket, orientation) as NSString) {
+        if let hit = store(for: bucket).object(forKey: key(url, bucket, orientation) as NSString) {
             return hit.image
         }
         let resolved = resolvedURL(for: url)
         guard resolved != url else { return nil }
-        return cache.object(forKey: key(resolved, bucket, orientation) as NSString)?.image
+        return store(for: bucket).object(forKey: key(resolved, bucket, orientation) as NSString)?.image
     }
 
     /// Wall-clock bound on a single decode wait. A read stuck on a dead or
@@ -116,14 +155,15 @@ final class TileImageLoader: @unchecked Sendable {
     ) async -> CGImage? {
         let bucket = Self.bucket(for: maximumPixelSize)
         let askedKey = key(url, bucket, orientation)
-        if let cached = cache.object(forKey: askedKey as NSString) {
+        let store = store(for: bucket)
+        if let cached = store.object(forKey: askedKey as NSString) {
             return cached.image
         }
         // Only a miss pays for `resolvedURL`'s existence check — a rename
         // redirect, or the asked-for path itself, decides the decode key.
         let resolved = resolvedURL(for: url)
         let cacheKey = resolved == url ? askedKey : key(resolved, bucket, orientation)
-        if cacheKey != askedKey, let cached = cache.object(forKey: cacheKey as NSString) {
+        if cacheKey != askedKey, let cached = store.object(forKey: cacheKey as NSString) {
             return cached.image
         }
 
@@ -245,11 +285,12 @@ final class TileImageLoader: @unchecked Sendable {
         group.finished = true
         let result = group.operation.isCancelled ? nil : group.operation.result
         group.result = result
-        if let result {
-            cache.setObject(Box(result), forKey: group.cacheKey as NSString, cost: result.bytesPerRow * result.height)
-        }
         if inFlight[group.cacheKey] === group {
             inFlight.removeValue(forKey: group.cacheKey)
+        }
+        if let result {
+            store(for: Self.bucket(for: group.operation.maximumPixelSize))
+                .setObject(Box(result), forKey: group.cacheKey as NSString, cost: result.bytesPerRow * result.height)
         }
         let continuations = Array(group.continuations.values)
         group.continuations.removeAll()
@@ -280,13 +321,14 @@ final class TileImageLoader: @unchecked Sendable {
             redirects[source] = destination
             let sourceURL = URL(filePath: source, directoryHint: .notDirectory)
             let destinationURL = URL(filePath: destination, directoryHint: .notDirectory)
-            for bucket in [384, 768, 1_280, 2_400, 4_800] {
+            for bucket in Self.buckets {
+                let store = store(for: bucket)
                 for orientation in 0..<4 {
                     let oldKey = key(sourceURL, bucket, orientation)
                     let newKey = key(destinationURL, bucket, orientation)
-                    if let box = cache.object(forKey: oldKey as NSString) {
-                        cache.setObject(box, forKey: newKey as NSString, cost: box.image.bytesPerRow * box.image.height)
-                        cache.removeObject(forKey: oldKey as NSString)
+                    if let box = store.object(forKey: oldKey as NSString) {
+                        store.setObject(box, forKey: newKey as NSString, cost: box.image.bytesPerRow * box.image.height)
+                        store.removeObject(forKey: oldKey as NSString)
                     }
                     if let group = inFlight.removeValue(forKey: oldKey) {
                         group.cacheKey = newKey
@@ -319,9 +361,10 @@ final class TileImageLoader: @unchecked Sendable {
     /// instead of waiting for the cost limit to evict them.
     func invalidate(url: URL) {
         let url = resolvedURL(for: url)
-        for bucket in [384, 768, 1_280, 2_400, 4_800] {
+        for bucket in Self.buckets {
+            let store = store(for: bucket)
             for orientation in 0..<4 {
-                cache.removeObject(forKey: key(url, bucket, orientation) as NSString)
+                store.removeObject(forKey: key(url, bucket, orientation) as NSString)
             }
         }
     }
