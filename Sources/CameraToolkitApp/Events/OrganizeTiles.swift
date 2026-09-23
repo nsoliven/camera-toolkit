@@ -57,6 +57,8 @@ struct EventChip: View {
 
 /// The owning subevent's tag on an event-board tile or row — a plain
 /// colored label, never a button, so it can't steal the tile's click.
+/// On a tile it sits in the bottom-right corner. A flexible width in the
+/// top row was compressed to nothing beside the burst count.
 struct EventTagCapsule: View {
     let event: SavedCameraEvent
 
@@ -64,10 +66,12 @@ struct EventTagCapsule: View {
         Text(event.name)
             .font(.caption2.weight(.semibold))
             .lineLimit(1)
-            .padding(.horizontal, 6)
-            .padding(.vertical, 2)
-            .background(EventPalette.color(for: event.id), in: Capsule())
+            .truncationMode(.tail)
             .foregroundStyle(.white)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 3)
+            .frame(maxWidth: 120, alignment: .trailing)
+            .background(EventPalette.color(for: event.id), in: Capsule())
             .help("Tagged \(event.name)")
     }
 }
@@ -236,9 +240,8 @@ struct StackTileView: View {
     /// Resolved private flag for `event` — a subevent can inherit the lock
     /// from a private parent, so the caller resolves it.
     var isPrivate: Bool? = nil
-    /// The owning subevent's tag, worn at the top right beside the burst
-    /// count on event boards. Nil hides it — unsorted boards already carry
-    /// the event chip below.
+    /// The owning subevent's color, drawn at the bottom right of the
+    /// photo. Nil hides it — unsorted boards already carry the event chip.
     var tag: SavedCameraEvent? = nil
     let isMixed: Bool
     let isDimmed: Bool
@@ -271,9 +274,6 @@ struct StackTileView: View {
                                 .background(.ultraThinMaterial, in: Capsule())
                         }
                         Spacer(minLength: 0)
-                        if let tag {
-                            EventTagCapsule(event: tag)
-                        }
                         if stack.isBurst {
                             Button {
                                 (onExpand ?? onOpen)?()
@@ -318,6 +318,14 @@ struct StackTileView: View {
                     }
                 }
                 .padding(6)
+            }
+            .overlay(alignment: .bottomTrailing) {
+                if let tag {
+                    EventTagCapsule(event: tag)
+                        .fixedSize()
+                        .padding(6)
+                        .allowsHitTesting(false)
+                }
             }
             .frame(width: width, height: width * 2 / 3)
             .background(Color.black.opacity(0.12))
