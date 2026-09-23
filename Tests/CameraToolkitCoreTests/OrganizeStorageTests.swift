@@ -389,6 +389,57 @@ final class OrganizeStorageTests: XCTestCase {
             XCTAssertNotNil(DateFormatter.yyyyMMdd.date(from: fallback.eventDate))
         }
     }
+
+    /// `joinedPathKey` stands in for `pathKey` under an already-standardized
+    /// root, so the index can join strings instead of constructing a URL
+    /// per file. The join must produce the same key `pathKey` and a scanned
+    /// file's `pathKey` produce — including when the root's path is spelled
+    /// through a symlinked ancestor (the temp root itself lives under
+    /// `/var`, and this test adds a symlink on top).
+    func testJoinedPathKeyMatchesThroughSymlinkedRoot() throws {
+        try withTemporaryDirectory { root in
+            let real = root.appendingPathComponent("Real", isDirectory: true)
+            try FileManager.default.createDirectory(at: real, withIntermediateDirectories: true)
+            let link = root.appendingPathComponent("Link")
+            try FileManager.default.createSymbolicLink(at: link, withDestinationURL: real)
+
+            let file = try writeFile(real.appendingPathComponent("Event/Card Copy/DCIM/DSC1.ARW"), "x")
+            // The roots the index joins were each standardized once — the
+            // same spelling `pathKey` standardizes to, so the join and the
+            // canonical key agree byte for byte.
+            let standardized = URL(
+                fileURLWithPath: real.appendingPathComponent("Event/Card Copy").path,
+                isDirectory: true
+            ).standardizedFileURL.path
+            let implied = try XCTUnwrap(
+                EventStorageLocations.joinedPathKey(rootPath: standardized, relativePath: "DCIM/DSC1.ARW")
+            )
+            XCTAssertEqual(implied, EventStorageLocations.pathKey(standardized + "/DCIM/DSC1.ARW"))
+            XCTAssertEqual(implied, OrganizeFile(path: file.path, size: 1, modifiedAt: .distantPast).pathKey)
+
+            // A root spelled through the symlink stays consistent end to
+            // end: the index's join and the file's own `pathKey` share the
+            // same spelling, so the keys still match.
+            let viaLink = URL(
+                fileURLWithPath: link.appendingPathComponent("Event/Card Copy").path,
+                isDirectory: true
+            ).standardizedFileURL.path
+            XCTAssertEqual(
+                try XCTUnwrap(EventStorageLocations.joinedPathKey(rootPath: viaLink, relativePath: "DCIM/DSC1.ARW")),
+                OrganizeFile(
+                    path: link.appendingPathComponent("Event/Card Copy/DCIM/DSC1.ARW").path,
+                    size: 1,
+                    modifiedAt: .distantPast
+                ).pathKey
+            )
+
+            // Unclean relative paths refuse the shortcut so callers fall
+            // back to `pathKey` for exactly the cases that would differ.
+            for rel in ["", "/abs", "./x", "a//b", "a/./b", "a/.", "a/", "a/../b", "..", "../x", "x/.."] {
+                XCTAssertNil(EventStorageLocations.joinedPathKey(rootPath: standardized, relativePath: rel), rel)
+            }
+        }
+    }
 }
 
 extension DateFormatter {

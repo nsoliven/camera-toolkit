@@ -235,12 +235,45 @@ public struct EventStorageLocations: Sendable {
     }
 
     /// Lower-cased standardized absolute path used to match files to
-    /// assignments on case-insensitive camera drives. Standardization resolves
-    /// symlinked ancestors (`/var` → `/private/var`), so there is no cheaper
-    /// string-only equivalent — hot loops use `OrganizeFile.pathKey`, which
-    /// computes this once per file.
+    /// assignments on case-insensitive camera drives. On current macOS
+    /// `standardizedFileURL` is lexical — it collapses `.`, `..`, and `//`
+    /// without resolving symlinks — but `URL(fileURLWithPath:)` still
+    /// stats an existing path to guess directory-ness, so repeating it
+    /// per file is not free. Hot loops use `OrganizeFile.pathKey`, which
+    /// computes this once per file, or `joinedPathKey` under a
+    /// pre-standardized root.
     public static func pathKey(_ path: String) -> String {
         URL(fileURLWithPath: path).standardizedFileURL.path.lowercased()
+    }
+
+    /// `relativePath` joins cleanly under a standardized root: no `//`, `.`,
+    /// or `..` segments for standardization to collapse and no leading or
+    /// trailing slash to trim. `validateRelativePath` already rejects `..`;
+    /// this is the stronger check a string join needs before it can stand
+    /// in for realpath.
+    public static func isLexicallyClean(_ relativePath: String) -> Bool {
+        !relativePath.isEmpty
+            && !relativePath.hasPrefix("/")
+            && !relativePath.hasPrefix("./")
+            && !relativePath.contains("//")
+            && !relativePath.contains("/./")
+            && !relativePath.hasSuffix("/.")
+            && !relativePath.hasSuffix("/")
+            && relativePath != "."
+            && relativePath != ".."
+            && !relativePath.hasPrefix("../")
+            && !relativePath.hasSuffix("/..")
+            && !relativePath.contains("/../")
+    }
+
+    /// `pathKey(rootPath + "/" + relativePath)` without paying realpath's
+    /// filesystem walk again: `rootPath` was already standardized, so for a
+    /// clean relative path the resolved key is the lowercased join. Returns
+    /// nil when `relativePath` still needs realpath — the caller falls back
+    /// to `pathKey` on the joined string.
+    public static func joinedPathKey(rootPath: String, relativePath: String) -> String? {
+        guard isLexicallyClean(relativePath) else { return nil }
+        return (rootPath + "/" + relativePath).lowercased()
     }
 }
 

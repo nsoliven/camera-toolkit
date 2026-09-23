@@ -789,10 +789,35 @@ final class EventsWorkspace {
         index.reserveCapacity(assignments.count * 2)
         var counts: [UUID: Int] = [:]
         var bytes: [UUID: Int64] = [:]
+        // `pathKey` walks the filesystem: realpath stats every component,
+        // and a NAS path answers in milliseconds. Every root joined below
+        // was already standardized once — the drive/staging roots at
+        // `EventStorageLocations.init` and the source roots here — so for
+        // a clean relative path the resolved key is a string join plus a
+        // lowercase. Only a rare unclean relative path pays for realpath.
+        var sourceRoots: [String: String] = [:]
+        func sourceRoot(_ raw: String) -> String {
+            if let cached = sourceRoots[raw] { return cached }
+            let built = URL(fileURLWithPath: DashboardModel.expandedPath(raw), isDirectory: true)
+                .standardizedFileURL.path
+            sourceRoots[raw] = built
+            return built
+        }
+        func insert(_ key: String?, _ assignment: PhotoEventAssignment) {
+            guard let key, index[key] == nil else { return }
+            index[key] = assignment
+        }
         for assignment in assignments {
-            index[Self.sourceKey(assignment)] = assignment
-            counts[assignment.eventID, default: 0] += 1
-            bytes[assignment.eventID, default: 0] += assignment.fileSize
+            autoreleasepool {
+                let rootPath = sourceRoot(assignment.sourceRootPath)
+                if let key = EventStorageLocations.joinedPathKey(rootPath: rootPath, relativePath: assignment.relativePath) {
+                    insert(key, assignment)
+                } else {
+                    insert(EventStorageLocations.pathKey(rootPath + "/" + assignment.relativePath), assignment)
+                }
+                counts[assignment.eventID, default: 0] += 1
+                bytes[assignment.eventID, default: 0] += assignment.fileSize
+            }
         }
         // The board's tiles point at Card Copy (or the other drive, or the
         // NAS), not at the path the file was imported from. Index those
@@ -800,39 +825,41 @@ final class EventsWorkspace {
         // belongs to a different assignment. One root per event and camera
         // — building it per file redoes the date formatting 13,000 times.
         let eventsByID = Dictionary(uniqueKeysWithValues: model.configuration.savedEvents.map { ($0.id, $0) })
-        var cardRoots: [String: URL] = [:]
+        var cardRoots: [String: String] = [:]
         var archiveLayouts: [String: OrganizedArchiveLayout] = [:]
         for assignment in assignments {
-            guard let owner = eventsByID[assignment.eventID],
-                  (try? PathSafety.validateRelativePath(assignment.relativePath)) != nil else { continue }
-            for policy in [EventStoragePolicy.buffer, .archiveOnly] {
-                let cacheKey = "\(owner.id.uuidString)\u{0}\(assignment.deviceID ?? "")\u{0}\(policy.rawValue)"
-                let root = cardRoots[cacheKey] ?? {
-                    let built = locations.cardCopyRoot(for: owner, deviceID: assignment.deviceID, policy: policy)
-                    cardRoots[cacheKey] = built
+            autoreleasepool {
+                guard let owner = eventsByID[assignment.eventID],
+                      (try? PathSafety.validateRelativePath(assignment.relativePath)) != nil else { return }
+                for policy in [EventStoragePolicy.buffer, .archiveOnly] {
+                    let cacheKey = "\(owner.id.uuidString)\u{0}\(assignment.deviceID ?? "")\u{0}\(policy.rawValue)"
+                    let rootPath = cardRoots[cacheKey] ?? {
+                        let built = locations.cardCopyRoot(for: owner, deviceID: assignment.deviceID, policy: policy).path
+                        cardRoots[cacheKey] = built
+                        return built
+                    }()
+                    if let key = EventStorageLocations.joinedPathKey(rootPath: rootPath, relativePath: assignment.relativePath) {
+                        insert(key, assignment)
+                    } else {
+                        insert(EventStorageLocations.pathKey(rootPath + "/" + assignment.relativePath), assignment)
+                    }
+                }
+                let layoutKey = "\(owner.id.uuidString)\u{0}\(assignment.deviceID ?? "")"
+                let layout = archiveLayouts[layoutKey] ?? {
+                    let built = locations.layout(for: owner, deviceID: assignment.deviceID)
+                    archiveLayouts[layoutKey] = built
                     return built
                 }()
-                let implied = root.appendingPathComponent(assignment.relativePath).path
-                if index[implied.lowercased()] == nil {
-                    index[implied.lowercased()] = assignment
-                }
-                let standardized = EventStorageLocations.pathKey(implied)
-                if index[standardized] == nil {
-                    index[standardized] = assignment
-                }
-            }
-            let layoutKey = "\(owner.id.uuidString)\u{0}\(assignment.deviceID ?? "")"
-            let layout = archiveLayouts[layoutKey] ?? {
-                let built = locations.layout(for: owner, deviceID: assignment.deviceID)
-                archiveLayouts[layoutKey] = built
-                return built
-            }()
-            if let relative = try? layout.destinationRelativePath(for: assignment.relativePath) {
-                let archived = EventStorageLocations.pathKey(
-                    locations.libraryRoot.appendingPathComponent(relative).path
-                )
-                if index[archived] == nil {
-                    index[archived] = assignment
+                if let relative = try? layout.destinationRelativePath(for: assignment.relativePath) {
+                    // `relative` is assembled from validated components and
+                    // sanitized folder names, and `libraryRoot` is
+                    // standardized — the archive key is a string join too.
+                    let joined = locations.libraryRoot.path + "/" + relative
+                    if let key = EventStorageLocations.joinedPathKey(rootPath: locations.libraryRoot.path, relativePath: relative) {
+                        insert(key, assignment)
+                    } else {
+                        insert(EventStorageLocations.pathKey(joined), assignment)
+                    }
                 }
             }
         }
@@ -1979,8 +2006,12 @@ final class EventsWorkspace {
                 var byPath: [String: EventAssetPresence] = [:]
                 for asset in assets {
                     guard let path = asset.bestLocalPath else { continue }
-                    sweptFiles.append(OrganizeFile(path: path, size: asset.assignment.fileSize, modifiedAt: asset.assignment.modifiedAt))
-                    byPath[EventStorageLocations.pathKey(path)] = asset
+                    // `bestLocalPath` came out of `standardizedFileURL` in
+                    // the sweep — re-standardizing it per file would be a
+                    // realpath walk for an identical result, so the literal
+                    // initializer + lowercase produce the same keys.
+                    sweptFiles.append(OrganizeFile(literalPath: path, size: asset.assignment.fileSize, modifiedAt: asset.assignment.modifiedAt))
+                    byPath[path.lowercased()] = asset
                 }
                 var immich: [String: ImmichCatalogStatus] = [:]
                 let inspector = CatalogInspector(url: catalogURL)
@@ -2151,13 +2182,18 @@ final class EventsWorkspace {
             guard let summary = EventPresenceScanner.scan(event: event, assignments: assignments, locations: locations, mountedVolumes: mounted, pauseGate: pauseGate) else { continue }
             var moves: [DriveMove] = []
             var copies: [String: OrganizeApplyPlan.CopyBatch] = [:]
+            var destinationRoots: [String: String] = [:]
+            var standardizedSourceRoots: [String: String] = [:]
             var alreadyThere = 0
             var unavailable = 0
             var bytes: Int64 = 0
 
             for asset in summary.assets {
                 if let rootPrefix {
-                    guard let source = asset.sourcePath, EventStorageLocations.pathKey(source).hasPrefix(rootPrefix) else { continue }
+                    // `sourcePath` came out of the sweep already
+                    // standardized — a lowercase is the same key `pathKey`
+                    // would produce, without another realpath walk.
+                    guard let source = asset.sourcePath, source.lowercased().hasPrefix(rootPrefix) else { continue }
                 }
                 guard let drivePath = asset.drivePath else { continue }
                 let size = asset.assignment.fileSize
@@ -2191,9 +2227,20 @@ final class EventsWorkspace {
                 if sameVolume {
                     moves.append(DriveMove(sourcePath: sourcePath, destinationPath: drivePath, byteCount: size))
                 } else {
-                    let destinationRoot = locations.cardCopyRoot(for: event, deviceID: asset.assignment.deviceID, policy: policy).path
-                    let sourceRoot = URL(fileURLWithPath: NSString(string: asset.assignment.sourceRootPath).expandingTildeInPath, isDirectory: true)
-                        .standardizedFileURL.path
+                    // Both roots depend only on the event/device/root
+                    // string — standardizing per file paid realpath for
+                    // every asset, so they are memoized per event.
+                    let destinationRoot = destinationRoots[asset.assignment.deviceID ?? ""] ?? {
+                        let built = locations.cardCopyRoot(for: event, deviceID: asset.assignment.deviceID, policy: policy).path
+                        destinationRoots[asset.assignment.deviceID ?? ""] = built
+                        return built
+                    }()
+                    let sourceRoot = standardizedSourceRoots[asset.assignment.sourceRootPath] ?? {
+                        let built = URL(fileURLWithPath: NSString(string: asset.assignment.sourceRootPath).expandingTildeInPath, isDirectory: true)
+                            .standardizedFileURL.path
+                        standardizedSourceRoots[asset.assignment.sourceRootPath] = built
+                        return built
+                    }()
                     let key = sourceRoot + "\u{0}" + destinationRoot
                     copies[key, default: OrganizeApplyPlan.CopyBatch(
                         sourceRoot: sourceRoot,
@@ -2722,6 +2769,26 @@ final class EventsWorkspace {
             return
         }
         var groups: [String: NASArchiveGroup] = [:]
+        // The root only varies with (owner, device, policy) — cardCopyRoot
+        // is already standardized and a source root standardizes once —
+        // so group keys reuse memoized paths instead of a realpath walk
+        // per asset.
+        var cardRoots: [String: URL] = [:]
+        var sourceRoots: [String: URL] = [:]
+        var standardizedKeys: [String: String] = [:]
+        func cardCopyRoot(_ owner: SavedCameraEvent, _ deviceID: String?, _ policy: EventStoragePolicy) -> URL {
+            let cacheKey = "\(owner.id)\u{0}\(deviceID ?? "")\u{0}\(policy.rawValue)"
+            if let cached = cardRoots[cacheKey] { return cached }
+            let built = locations.cardCopyRoot(for: owner, deviceID: deviceID, policy: policy)
+            cardRoots[cacheKey] = built
+            return built
+        }
+        func standardizedKey(for root: URL) -> String {
+            if let cached = standardizedKeys[root.path] { return cached }
+            let built = root.standardizedFileURL.path
+            standardizedKeys[root.path] = built
+            return built
+        }
         for asset in summary.assets where asset.archive != .present {
             // Family scope: the asset's own event resolves the folders —
             // a subevent's copies live in its nested Card Copy, and its
@@ -2730,15 +2797,19 @@ final class EventsWorkspace {
             let ownerPolicy = locations.resolvedPolicy(for: owner)
             let root: URL
             if asset.drive == .present {
-                root = locations.cardCopyRoot(for: owner, deviceID: asset.assignment.deviceID, policy: ownerPolicy)
+                root = cardCopyRoot(owner, asset.assignment.deviceID, ownerPolicy)
             } else if asset.otherDrive == .present {
-                root = locations.cardCopyRoot(for: owner, deviceID: asset.assignment.deviceID, policy: ownerPolicy == .buffer ? .archiveOnly : .buffer)
+                root = cardCopyRoot(owner, asset.assignment.deviceID, ownerPolicy == .buffer ? .archiveOnly : .buffer)
             } else if asset.source == .present {
-                root = URL(fileURLWithPath: DashboardModel.expandedPath(asset.assignment.sourceRootPath), isDirectory: true)
+                root = sourceRoots[asset.assignment.sourceRootPath] ?? {
+                    let built = URL(fileURLWithPath: DashboardModel.expandedPath(asset.assignment.sourceRootPath), isDirectory: true)
+                    sourceRoots[asset.assignment.sourceRootPath] = built
+                    return built
+                }()
             } else {
                 continue
             }
-            let key = root.standardizedFileURL.path + "\u{0}" + (asset.assignment.deviceID ?? "")
+            let key = standardizedKey(for: root) + "\u{0}" + (asset.assignment.deviceID ?? "")
             groups[key, default: NASArchiveGroup(owner: owner, root: root, deviceID: asset.assignment.deviceID, files: [])].files.append(
                 FileRecord(path: asset.assignment.relativePath, size: asset.assignment.fileSize, modifiedAt: asset.assignment.modifiedAt)
             )

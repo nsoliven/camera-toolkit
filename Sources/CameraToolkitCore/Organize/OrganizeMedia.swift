@@ -161,19 +161,28 @@ public enum OrganizeFileClassifier {
 public struct OrganizeFile: Codable, Hashable, Sendable {
     /// Absolute, standardized path.
     public var path: String {
-        didSet { pathKey = EventStorageLocations.pathKey(path) }
+        didSet {
+            pathKey = EventStorageLocations.pathKey(path)
+            url = Self.makeURL(path)
+        }
     }
     public var size: Int64
     public var modifiedAt: Date
     /// `EventStorageLocations.pathKey(path)`, computed once here instead of
     /// re-standardizing inside every lookup loop.
     public private(set) var pathKey: String
+    /// The file URL for `path`, built once. `URL(fileURLWithPath:)` stats
+    /// the path to guess directory-ness, so `filePath:directoryHint:`
+    /// constructs the same file URL without touching the filesystem —
+    /// tile bodies ask for this on every render.
+    public private(set) var url: URL
 
     public init(path: String, size: Int64, modifiedAt: Date) {
         self.path = path
         self.size = size
         self.modifiedAt = modifiedAt
         pathKey = EventStorageLocations.pathKey(path)
+        url = Self.makeURL(path)
     }
 
     /// A file whose path spelling is already final — such as the
@@ -187,6 +196,7 @@ public struct OrganizeFile: Codable, Hashable, Sendable {
         self.size = size
         self.modifiedAt = modifiedAt
         pathKey = path.lowercased()
+        url = Self.makeURL(path)
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -202,7 +212,10 @@ public struct OrganizeFile: Codable, Hashable, Sendable {
         )
     }
 
-    public var url: URL { URL(fileURLWithPath: path) }
+    private static func makeURL(_ path: String) -> URL {
+        URL(filePath: path, directoryHint: .notDirectory)
+    }
+
     public var name: String { (path as NSString).lastPathComponent }
     public var folderPath: String { (path as NSString).deletingLastPathComponent }
     public var fileExtension: String { (name as NSString).pathExtension.lowercased() }

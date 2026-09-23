@@ -82,10 +82,17 @@ final class TileImageLoader: @unchecked Sendable {
 
     /// `orientation` is the display rotation in quarter-turns clockwise (see
     /// `DisplayRotation`). It is part of the cache key so a rotated decode
-    /// never joins or reuses an unrotated one.
+    /// never joins or reuses an unrotated one. The asked-for path is checked
+    /// before `resolvedURL` — its `fileExists` stat is only worth paying on
+    /// a miss.
     func cachedImage(for url: URL, maximumPixelSize: Int, orientation: Int = 0) -> CGImage? {
-        let url = resolvedURL(for: url)
-        return cache.object(forKey: key(url, Self.bucket(for: maximumPixelSize), orientation) as NSString)?.image
+        let bucket = Self.bucket(for: maximumPixelSize)
+        if let hit = cache.object(forKey: key(url, bucket, orientation) as NSString) {
+            return hit.image
+        }
+        let resolved = resolvedURL(for: url)
+        guard resolved != url else { return nil }
+        return cache.object(forKey: key(resolved, bucket, orientation) as NSString)?.image
     }
 
     /// Wall-clock bound on a single decode wait. A read stuck on a dead or
@@ -107,19 +114,25 @@ final class TileImageLoader: @unchecked Sendable {
         priority: Operation.QueuePriority = .normal,
         timeout: Duration = TileImageLoader.waitTimeout
     ) async -> CGImage? {
-        let url = resolvedURL(for: url)
         let bucket = Self.bucket(for: maximumPixelSize)
-        let cacheKey = key(url, bucket, orientation)
-        if let cached = cache.object(forKey: cacheKey as NSString) {
+        let askedKey = key(url, bucket, orientation)
+        if let cached = cache.object(forKey: askedKey as NSString) {
+            return cached.image
+        }
+        // Only a miss pays for `resolvedURL`'s existence check — a rename
+        // redirect, or the asked-for path itself, decides the decode key.
+        let resolved = resolvedURL(for: url)
+        let cacheKey = resolved == url ? askedKey : key(resolved, bucket, orientation)
+        if cacheKey != askedKey, let cached = cache.object(forKey: cacheKey as NSString) {
             return cached.image
         }
 
-        let group = joinGroup(cacheKey: cacheKey, url: url, bucket: bucket, orientation: orientation, priority: priority)
+        let group = joinGroup(cacheKey: cacheKey, url: resolved, bucket: bucket, orientation: orientation, priority: priority)
         let id = UUID()
         let timeoutTask = Task.detached(priority: .utility) { [weak self] in
             try? await Task.sleep(for: timeout)
             guard !Task.isCancelled else { return }
-            self?.timeoutWaiter(id: id, url: url, bucket: bucket, in: group, after: timeout)
+            self?.timeoutWaiter(id: id, url: resolved, bucket: bucket, in: group, after: timeout)
         }
         defer { timeoutTask.cancel() }
         return await withTaskCancellationHandler {
@@ -265,8 +278,8 @@ final class TileImageLoader: @unchecked Sendable {
                 redirects[key] = destination
             }
             redirects[source] = destination
-            let sourceURL = URL(fileURLWithPath: source)
-            let destinationURL = URL(fileURLWithPath: destination)
+            let sourceURL = URL(filePath: source, directoryHint: .notDirectory)
+            let destinationURL = URL(filePath: destination, directoryHint: .notDirectory)
             for bucket in [384, 768, 1_280, 2_400, 4_800] {
                 for orientation in 0..<4 {
                     let oldKey = key(sourceURL, bucket, orientation)
@@ -298,7 +311,7 @@ final class TileImageLoader: @unchecked Sendable {
             hops += 1
         }
         lock.unlock()
-        return path == url.path ? url : URL(fileURLWithPath: path)
+        return path == url.path ? url : URL(filePath: path, directoryHint: .notDirectory)
     }
 
     /// Drops every cached decode of `url` — all size buckets and all

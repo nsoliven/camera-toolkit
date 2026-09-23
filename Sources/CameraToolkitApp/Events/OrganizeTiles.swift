@@ -970,8 +970,23 @@ enum OrganizeFolderLabel {
         return relative.isEmpty ? nil : String(relative)
     }
 
+    /// `standardizedFileURL` walks the filesystem — realpath stats each
+    /// component, and folder labels ask for the same few roots once per
+    /// stack per render or search keystroke. Resolved strings are cached
+    /// by input path, the same trade-off `OrganizeFile.pathKey` makes.
+    nonisolated(unsafe) private static let standardizedCache: NSCache<NSString, NSString> = {
+        let cache = NSCache<NSString, NSString>()
+        cache.countLimit = 4_096
+        return cache
+    }()
+
     private static func standardized(_ path: String) -> String {
-        URL(fileURLWithPath: path).standardizedFileURL.path
+        if let cached = standardizedCache.object(forKey: path as NSString) {
+            return cached as String
+        }
+        let resolved = URL(fileURLWithPath: path).standardizedFileURL.path
+        standardizedCache.setObject(resolved as NSString, forKey: path as NSString)
+        return resolved
     }
 
     private static func standardizedRoot(_ rootPath: String?) -> String? {
@@ -1752,7 +1767,7 @@ struct StackPreviewOverlay: View {
     /// bigger image to the exact point size the base decode was shown at.
     private func loadHiRes() async {
         guard let request = hiResRequest, request == currentHiResKey else { return }
-        let url = URL(fileURLWithPath: request.path)
+        let url = URL(filePath: request.path, directoryHint: .notDirectory)
         if let cached = TileImageLoader.shared.cachedImage(for: url, maximumPixelSize: 4_800, orientation: request.turns) {
             guard !Task.isCancelled else { return }
             storeHiRes(cached, key: request)
