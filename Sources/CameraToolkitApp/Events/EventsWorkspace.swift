@@ -1188,6 +1188,7 @@ final class EventsWorkspace {
         observeVolumeChanges()
         refreshLatestJournal()
         discoverDriveEvents()
+        scheduleRosterWarm()
     }
 
     func startGuide() {
@@ -3559,17 +3560,32 @@ final class EventsWorkspace {
     private(set) var facesRevision = 0 {
         // Face review writes only the catalog; let the debounced backup
         // know a session is under way.
-        didSet { model.noteCatalogWrite() }
+        didSet {
+            model.noteCatalogWrite()
+            scheduleRosterWarm()
+        }
     }
 
     @ObservationIgnored private var faceStoreInstance: FaceIndexStore?
     /// (facesRevision, configurationRevision, people by event) — rebuilt
     /// lazily so sidebar rows share one catalog pass.
     @ObservationIgnored private var eventPeopleCache: (Int, Int, [UUID: [FacePerson]])?
-    /// (facesRevision, file key → person/group names) — one catalog pass
-    /// feeds every stack the board filters, so person search never
-    /// re-queries per stack or touches the filesystem.
-    @ObservationIgnored private var faceNamesByFileKeyCache: (Int, [String: Set<String>])?
+    /// (mutationGeneration, facesRevision, roster rows, rows by file key)
+    /// — the one roster fetch every people derivation shares. Face rows
+    /// change only on a face write, so a file op's configurationRevision
+    /// bump never refetches them; `scheduleRosterWarm` refetches detached
+    /// after each bump so renders read memory, not SQLite.
+    @ObservationIgnored private var rosterFacesCache: (
+        generation: Int,
+        facesRevision: Int,
+        rows: [(personID: UUID, name: String, fileKey: String)],
+        byFileKey: [String: [(personID: UUID, name: String)]]
+    )?
+    @ObservationIgnored private var rosterWarmTask: Task<Void, Never>?
+    /// (mutationGeneration, facesRevision, file key → person/group names)
+    /// — one catalog pass feeds every stack the board filters, so person
+    /// search never re-queries per stack or touches the filesystem.
+    @ObservationIgnored private var faceNamesByFileKeyCache: (Int, Int, [String: Set<String>])?
 
     var faceStore: FaceIndexStore {
         if let faceStoreInstance { return faceStoreInstance }
@@ -3580,6 +3596,59 @@ final class EventsWorkspace {
 
     private var catalogDatabaseURL: URL {
         URL(fileURLWithPath: DashboardModel.expandedPath(model.configuration.catalogDatabasePath))
+    }
+
+    /// The confirmed-faces-on-roster-people pairs, grouped by file key —
+    /// one catalog fetch shared by the event chips, stack person names,
+    /// and the board People filter, parsed once per face revision instead
+    /// of once per event per render. The fetch still happens
+    /// synchronously when a caller cannot wait (a cold read racing the
+    /// warm); `scheduleRosterWarm` keeps it off the main actor after
+    /// every face change and at launch.
+    private func rosterFaces() -> (
+        rows: [(personID: UUID, name: String, fileKey: String)],
+        byFileKey: [String: [(personID: UUID, name: String)]]
+    ) {
+        let generation = faceStore.mutationGeneration
+        if let cache = rosterFacesCache,
+           cache.generation == generation,
+           cache.facesRevision == facesRevision {
+            return (cache.rows, cache.byFileKey)
+        }
+        let rows = (try? faceStore.rosterFaceFiles()) ?? []
+        let byFileKey = Self.groupRosterFaces(rows)
+        rosterFacesCache = (generation, facesRevision, rows, byFileKey)
+        return (rows, byFileKey)
+    }
+
+    /// Refetch the roster pairs detached and publish them while the face
+    /// revision is still current, so the post-change render reads memory
+    /// instead of running the roster query and its ISO date parsing on
+    /// the main actor.
+    private func scheduleRosterWarm() {
+        rosterWarmTask?.cancel()
+        let store = faceStore
+        let generation = store.mutationGeneration
+        let revision = facesRevision
+        rosterWarmTask = Task.detached(priority: .utility) { [weak self] in
+            let rows = (try? store.rosterFaceFiles()) ?? []
+            await MainActor.run {
+                guard let self,
+                      self.facesRevision == revision,
+                      self.faceStore.mutationGeneration == generation else { return }
+                self.rosterFacesCache = (generation, revision, rows, Self.groupRosterFaces(rows))
+            }
+        }
+    }
+
+    nonisolated private static func groupRosterFaces(
+        _ rows: [(personID: UUID, name: String, fileKey: String)]
+    ) -> [String: [(personID: UUID, name: String)]] {
+        var byFileKey: [String: [(personID: UUID, name: String)]] = [:]
+        for row in rows {
+            byFileKey[row.fileKey, default: []].append((row.personID, row.name))
+        }
+        return byFileKey
     }
 
     /// True once `scripts/setup-face-sidecar.sh` has installed the face
@@ -3847,9 +3916,36 @@ final class EventsWorkspace {
                 keysByEvent[ancestor.id, default: []].formUnion(keys)
             }
         }
+        // One roster snapshot serves every event's chips: the roster
+        // query and its ISO date parsing ran once (see `rosterFaceFiles`),
+        // so a miss here is set intersections and counting — no SQLite,
+        // no parsing, on any render trigger.
+        let roster = rosterFaces().byFileKey
         var people: [UUID: [FacePerson]] = [:]
         for (id, keys) in keysByEvent {
-            people[id] = (try? faceStore.eventPeople(fileKeys: keys)) ?? []
+            var seen: [UUID: FacePerson] = [:]
+            var counts: [UUID: Int] = [:]
+            for key in keys {
+                for face in roster[key] ?? [] {
+                    if seen[face.personID] == nil {
+                        seen[face.personID] = FacePerson(
+                            id: face.personID,
+                            name: face.name,
+                            isRoster: true,
+                            faceCount: 0
+                        )
+                    }
+                    counts[face.personID, default: 0] += 1
+                }
+            }
+            people[id] = seen.values.map { person in
+                var copy = person
+                copy.faceCount = counts[person.id] ?? 0
+                return copy
+            }.sorted {
+                if $0.faceCount != $1.faceCount { return $0.faceCount > $1.faceCount }
+                return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+            }
         }
         eventPeopleCache = (facesRevision, model.configurationRevision, people)
         return people[eventID] ?? []
@@ -3901,13 +3997,20 @@ final class EventsWorkspace {
     }
 
     /// The shared file key → person names map, rebuilt lazily when faces
-    /// change and otherwise served from memory.
+    /// change and otherwise served from memory. It projects the shared
+    /// roster fetch, so the names land without a second catalog pass.
     private func faceNamesByFileKey() -> [String: Set<String>] {
-        if let cache = faceNamesByFileKeyCache, cache.0 == facesRevision {
-            return cache.1
+        let generation = faceStore.mutationGeneration
+        if let cache = faceNamesByFileKeyCache,
+           cache.0 == generation,
+           cache.1 == facesRevision {
+            return cache.2
         }
-        let names = (try? faceStore.personNamesByFileKey()) ?? [:]
-        faceNamesByFileKeyCache = (facesRevision, names)
+        var names: [String: Set<String>] = [:]
+        for row in rosterFaces().rows {
+            names[row.fileKey, default: []].insert(row.name)
+        }
+        faceNamesByFileKeyCache = (generation, facesRevision, names)
         return names
     }
 
@@ -3945,21 +4048,43 @@ final class EventsWorkspace {
             keysByStack[stack.id] = keys
             allKeys.formUnion(keys)
         }
-        let byKey = (try? faceStore.peopleByFileKey(fileKeys: allKeys)) ?? [:]
+        // The shared roster fetch carries (person, file key) pairs; a
+        // person's `faceCount` is their matching-face total across the
+        // queried keys, exactly as `peopleByFileKey` counted it — counted
+        // once over the union, not per stack, so a file in two stacks
+        // still counts once.
+        let roster = rosterFaces().byFileKey
         var byStackID: [String: Set<UUID>] = [:]
         var seen: [UUID: FacePerson] = [:]
+        var counts: [UUID: Int] = [:]
+        for key in allKeys {
+            for face in roster[key] ?? [] {
+                counts[face.personID, default: 0] += 1
+                if seen[face.personID] == nil {
+                    seen[face.personID] = FacePerson(
+                        id: face.personID,
+                        name: face.name,
+                        isRoster: true,
+                        faceCount: 0
+                    )
+                }
+            }
+        }
         for (stackID, keys) in keysByStack {
             var ids = Set<UUID>()
             for key in keys {
-                for person in byKey[key] ?? [] {
-                    ids.insert(person.id)
-                    seen[person.id] = person
+                for face in roster[key] ?? [] {
+                    ids.insert(face.personID)
                 }
             }
             byStackID[stackID] = ids
         }
         let people = (
-            options: seen.values.sorted {
+            options: seen.values.map { person in
+                var copy = person
+                copy.faceCount = counts[person.id] ?? 0
+                return copy
+            }.sorted {
                 if $0.isRoster != $1.isRoster { return $0.isRoster }
                 return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
             },

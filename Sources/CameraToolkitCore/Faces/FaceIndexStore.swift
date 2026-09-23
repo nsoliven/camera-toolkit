@@ -43,11 +43,28 @@ public final class FaceIndexStore: @unchecked Sendable {
         try read(body)
     }
 
+    private let mutationLock = NSLock()
+    private var mutationCount = 0
+
+    /// Bumped after every committed write on this store so cached
+    /// derivations (the roster snapshot behind `event.people`) can tell
+    /// the face tables changed without trusting callers to route every
+    /// mutation through one object.
+    public var mutationGeneration: Int {
+        mutationLock.lock()
+        defer { mutationLock.unlock() }
+        return mutationCount
+    }
+
     /// Every single-statement write: one transaction, retried on a
     /// transient busy/IO refusal. Passes that mutate many rows use
     /// `inWriteTransaction` so their writes share one transaction instead.
     private func write<T>(_ body: (Database) throws -> T) throws -> T {
-        try CatalogTransactionRetry.run { try database().write(body) }
+        let result = try CatalogTransactionRetry.run { try database().write(body) }
+        mutationLock.lock()
+        mutationCount += 1
+        mutationLock.unlock()
+        return result
     }
 
     /// Runs `body` inside a single write transaction — one BEGIN
@@ -1192,8 +1209,10 @@ public final class FaceIndexStore: @unchecked Sendable {
     /// `event.people` — confirmed faces on approved people only. Inbox
     /// faces never name an event. File identity is name + size + mtime so
     /// a face found on an unsorted copy still attaches after the file
-    /// moves into an event folder.
-    private func rosterFaceFiles() throws -> [(personID: UUID, name: String, fileKey: String)] {
+    /// moves into an event folder. This is the one roster query; the
+    /// event chips, stack person names, and the board People filter all
+    /// derive from it so a render pays one fetch instead of three.
+    public func rosterFaceFiles() throws -> [(personID: UUID, name: String, fileKey: String)] {
         try read { database in
             let rows = try Row.fetchAll(
                 database,
