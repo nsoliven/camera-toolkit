@@ -625,6 +625,7 @@ struct OrganizeFilterHotLinks: View {
 struct FlowLayout: Layout {
     var horizontalSpacing: CGFloat = 6
     var verticalSpacing: CGFloat = 6
+    var alignment: HorizontalAlignment = .leading
 
     func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
         let limit = proposal.width ?? .infinity
@@ -647,23 +648,30 @@ struct FlowLayout: Layout {
     }
 
     func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
-        var x = bounds.minX
+        let sizes = subviews.map { $0.sizeThatFits(.unspecified) }
+        var index = 0
         var y = bounds.minY
-        var lineHeight: CGFloat = 0
-        for subview in subviews {
-            let size = subview.sizeThatFits(.unspecified)
-            if x > bounds.minX, x + size.width > bounds.maxX {
-                x = bounds.minX
-                y += lineHeight + verticalSpacing
-                lineHeight = 0
+        while index < subviews.count {
+            let lineStart = index
+            var lineWidth: CGFloat = 0
+            var lineHeight: CGFloat = 0
+            while index < subviews.count {
+                let next = lineWidth + (index == lineStart ? 0 : horizontalSpacing) + sizes[index].width
+                if index > lineStart, next > bounds.width { break }
+                lineWidth = next
+                lineHeight = max(lineHeight, sizes[index].height)
+                index += 1
             }
-            subview.place(
-                at: CGPoint(x: x, y: y),
-                anchor: .topLeading,
-                proposal: ProposedViewSize(size)
-            )
-            x += size.width + horizontalSpacing
-            lineHeight = max(lineHeight, size.height)
+            var x = alignment == .trailing ? bounds.maxX - lineWidth : bounds.minX
+            for i in lineStart..<index {
+                subviews[i].place(
+                    at: CGPoint(x: x, y: y),
+                    anchor: .topLeading,
+                    proposal: ProposedViewSize(sizes[i])
+                )
+                x += sizes[i].width + horizontalSpacing
+            }
+            y += lineHeight + verticalSpacing
         }
     }
 }
