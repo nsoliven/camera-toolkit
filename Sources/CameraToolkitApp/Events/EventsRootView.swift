@@ -32,8 +32,12 @@ struct EventsRootView: View {
                     accessibilityLabel: "Resize Sidebar"
                 )
             }
+            // minWidth 0 + clipped: a board too wide for the window is cut
+            // on its own right edge instead of pushing the whole window
+            // wider and cutting the sidebar off on the left.
             detail
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity)
+                .clipped()
                 .background(Color(nsColor: .windowBackgroundColor))
         }
         .overlay(alignment: panelAlignment) {

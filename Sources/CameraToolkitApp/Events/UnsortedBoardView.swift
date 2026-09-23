@@ -143,7 +143,11 @@ struct UnsortedBoardView: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
-            Spacer()
+            // The title keeps its room; the controls wrap onto a second row
+            // instead of pushing the window wider than the screen.
+            .frame(minWidth: 220, alignment: .leading)
+            .layoutPriority(1)
+            FlowLayout(horizontalSpacing: 12, verticalSpacing: 8, alignment: .trailing) {
             OrganizeSearchBar(
                 workspace: workspace,
                 stacks: result?.stacks ?? [],
@@ -245,6 +249,8 @@ struct UnsortedBoardView: View {
             }
             .menuStyle(.borderlessButton)
             .fixedSize()
+            }
+            .frame(maxWidth: .infinity, alignment: .trailing)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
