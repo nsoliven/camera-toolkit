@@ -82,4 +82,21 @@ final class MainMenuTests: XCTestCase {
         XCTAssertEqual(jobs.first { $0.isHidden }.flatMap(chord), "⌥⌘J")
         XCTAssertNil(items.first { $0.action == #selector(NSWindow.toggleToolbarShown(_:)) }.flatMap(chord))
     }
+
+    /// The View menu writes the same defaults the boards read through
+    /// @AppStorage; a renamed key would make those items silently inert.
+    func testViewMenuKeysMatchTheBoards() {
+        XCTAssertEqual(MainMenu.DefaultsKey.showInspector, EventInfoInspector.visibilityDefaultsKey)
+        let sources = ["Events/UnsortedBoardView.swift", "Events/EventBoardView.swift", "App/BoardChrome.swift"]
+            .compactMap { try? String(contentsOf: Self.sourceRoot.appendingPathComponent($0), encoding: .utf8) }
+            .joined()
+        XCTAssertFalse(sources.isEmpty)
+        for key in [MainMenu.DefaultsKey.boardMode, MainMenu.DefaultsKey.hideSorted, MainMenu.DefaultsKey.tileWidth] {
+            XCTAssertTrue(sources.contains("\"\(key)\""), "\(key) is not read by any board")
+        }
+    }
+
+    private static let sourceRoot = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        .appendingPathComponent("Sources/CameraToolkitApp")
 }
