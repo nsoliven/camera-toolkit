@@ -64,13 +64,12 @@ public struct StorageBenchmarkService: @unchecked Sendable {
     public static let writeChunkByteCount: Int64 = 8 * 1024 * 1024
     /// Abort a test that has not moved bytes to the device for this long.
     public static let defaultStallTimeout: TimeInterval = 15
-    /// How often the supervisor wakes to check cancellation and idle time.
-    private static let supervisionPollInterval: TimeInterval = 0.05
 
     private let fileManager: FileManager
     private let sinkFactory: @Sendable (URL, Int64) throws -> any SpeedTestDeviceSink
     private let uptime: @Sendable () -> TimeInterval
     private let stallTimeout: TimeInterval
+    private let supervisor: RunSupervisor
 
     /// `sinkFactory` and `uptime` are test seams — production callers use the
     /// defaults, which write real files and read the real clock.
@@ -88,8 +87,18 @@ public struct StorageBenchmarkService: @unchecked Sendable {
                 gentle: Self.needsGentleWrites(in: url.deletingLastPathComponent())
             )
         }
-        self.uptime = uptime ?? { ProcessInfo.processInfo.systemUptime }
+        let uptime = uptime ?? { ProcessInfo.processInfo.systemUptime }
+        self.uptime = uptime
         self.stallTimeout = stallTimeout
+        self.supervisor = RunSupervisor(
+            stallTimeout: stallTimeout,
+            uptime: uptime,
+            queueLabel: "CameraToolkit.StorageBenchmark.io",
+            stalledError: { Self.stalledDriveError() },
+            missingResultError: {
+                ToolkitError.commandFailed("The storage speed test did not produce a result.")
+            }
+        )
     }
 
     public func benchmarkReadOnly(
@@ -111,7 +120,7 @@ public struct StorageBenchmarkService: @unchecked Sendable {
 
         let availableBytes = samples.reduce(Int64(0)) { $0 + $1.size }
         let bytesToRead = min(byteLimit, availableBytes)
-        let measurement = try supervised { monitor in
+        let measurement = try supervisor.run { monitor in
             try self.read(
                 samples: samples,
                 byteLimit: bytesToRead,
@@ -147,7 +156,7 @@ public struct StorageBenchmarkService: @unchecked Sendable {
         do {
             // Preflight runs inside supervision too — on a dead mount even a
             // stat can block, and Stop must never hang.
-            let writeMeasurement = try supervised { monitor in
+            let writeMeasurement = try supervisor.run { monitor in
                 try FileScanner(fileManager: self.fileManager).assertDirectory(directory)
                 try self.requireFreeSpace(for: byteCount, at: directory)
                 let sink = try self.sinkFactory(temporaryURL, byteCount)
@@ -159,7 +168,7 @@ public struct StorageBenchmarkService: @unchecked Sendable {
                     progress: progress
                 )
             }
-            let readMeasurement = try supervised { monitor in
+            let readMeasurement = try supervisor.run { monitor in
                 try self.read(
                     samples: [(url: temporaryURL, size: byteCount)],
                     byteLimit: byteCount,
@@ -192,11 +201,13 @@ public struct StorageBenchmarkService: @unchecked Sendable {
         return result
     }
 
-    /// Deletes leftover `.CameraToolkit-SpeedTest-*.tmp` files — and any `._`
-    /// AppleDouble twins — sitting directly inside each folder. Only names
-    /// with the exact prefix are touched; everything else is left alone and
-    /// folders that cannot be listed are skipped. Returns the removed paths.
-    /// Called once per app launch so an interrupted test cannot litter.
+    /// Deletes leftover `.CameraToolkit-SpeedTest-*.tmp` and
+    /// `.CameraToolkit-Stability-*.tmp` files — and any `._` AppleDouble
+    /// twins — sitting directly inside each folder. Only names with an
+    /// exact known prefix are touched; everything else is left alone and
+    /// folders that cannot be listed are skipped. Returns the removed
+    /// paths. Called once per app launch so an interrupted test cannot
+    /// litter.
     ///
     /// A twin is probed by name rather than awaited from the listing:
     /// `._*` entries are filtered out of directory enumeration on
@@ -226,10 +237,13 @@ public struct StorageBenchmarkService: @unchecked Sendable {
         return removed
     }
 
-    /// `.CameraToolkit-SpeedTest-*.tmp`, or the `._` twin of such a name.
+    /// `.CameraToolkit-SpeedTest-*.tmp` / `.CameraToolkit-Stability-*.tmp`,
+    /// or the `._` twin of such a name.
     private static func isTemporaryFileName(_ name: String) -> Bool {
         func isMatch(_ candidate: some StringProtocol) -> Bool {
-            candidate.hasPrefix(temporaryFilePrefix) && candidate.hasSuffix(".tmp")
+            (candidate.hasPrefix(temporaryFilePrefix)
+                || candidate.hasPrefix(StabilityTestService.temporaryFilePrefix))
+                && candidate.hasSuffix(".tmp")
         }
         if isMatch(name) { return true }
         if name.hasPrefix("._") { return isMatch(name.dropFirst(2)) }
@@ -242,7 +256,7 @@ public struct StorageBenchmarkService: @unchecked Sendable {
     private func removeTemporaryFile(at url: URL) -> Error? {
         let twin = url.deletingLastPathComponent()
             .appendingPathComponent("._\(url.lastPathComponent)", isDirectory: false)
-        let monitor = RunMonitor<Void>(startedAt: uptime())
+        let monitor = RunLivenessMonitor<Void>(startedAt: uptime())
         DispatchQueue(label: "CameraToolkit.StorageBenchmark.cleanup", qos: .userInitiated).async {
             monitor.finish(Result(catching: {
                 for candidate in [url, twin]
@@ -267,93 +281,6 @@ public struct StorageBenchmarkService: @unchecked Sendable {
         .commandFailed(
             "The drive stopped responding — no data reached it for a while, so the speed test was abandoned and its temporary file removed. This can mean an overheating or underpowered enclosure or cable, or a drive that dropped off the bus. Unplug it, let it settle, reconnect it, and try again."
         )
-    }
-
-    /// Shared state between the benchmark caller and the I/O worker so a hung
-    /// syscall fails the run instead of pinning it: the worker reports each
-    /// completed chunk and checks `shouldStop` between chunks, while the
-    /// caller polls for completion and idle time.
-    private final class RunMonitor<Value>: @unchecked Sendable {
-        private let lock = NSLock()
-        private let finished = DispatchSemaphore(value: 0)
-        private var lastChunkCompletedAt: TimeInterval
-        private var stopRequested = false
-        private var outcome: Result<Value, Error>?
-
-        init(startedAt: TimeInterval) {
-            lastChunkCompletedAt = startedAt
-        }
-
-        var shouldStop: Bool {
-            lock.lock()
-            defer { lock.unlock() }
-            return stopRequested
-        }
-
-        func requestStop() {
-            lock.lock()
-            stopRequested = true
-            lock.unlock()
-        }
-
-        func markChunkCompleted(at uptime: TimeInterval) {
-            lock.lock()
-            lastChunkCompletedAt = uptime
-            lock.unlock()
-        }
-
-        func idleSeconds(at uptime: TimeInterval) -> TimeInterval {
-            lock.lock()
-            defer { lock.unlock() }
-            return uptime - lastChunkCompletedAt
-        }
-
-        func finish(_ outcome: Result<Value, Error>) {
-            lock.lock()
-            self.outcome = outcome
-            lock.unlock()
-            finished.signal()
-        }
-
-        func waitFinished(timeout: TimeInterval) -> Bool {
-            finished.wait(timeout: .now() + timeout) == .success
-        }
-
-        func result() -> Result<Value, Error>? {
-            lock.lock()
-            defer { lock.unlock() }
-            return outcome
-        }
-    }
-
-    /// Runs `work` on a private queue while this thread watches for stalls
-    /// and cancellation. POSIX `write`/`fsync` can block in ways Swift task
-    /// cancellation cannot interrupt, so on abort the caller stops waiting,
-    /// asks the worker to stand down between chunks, and reports the drive as
-    /// unresponsive. A worker parked inside a dead mount's syscall stays
-    /// contained on its queue — it owns its descriptor and closes it if the
-    /// kernel ever returns.
-    private func supervised<Value>(
-        _ work: @escaping @Sendable (RunMonitor<Value>) throws -> Value
-    ) throws -> Value {
-        let monitor = RunMonitor<Value>(startedAt: uptime())
-        DispatchQueue(label: "CameraToolkit.StorageBenchmark.io", qos: .userInitiated).async {
-            monitor.finish(Result(catching: { try work(monitor) }))
-        }
-        while !monitor.waitFinished(timeout: Self.supervisionPollInterval) {
-            if Task.isCancelled {
-                monitor.requestStop()
-                throw CancellationError()
-            }
-            if monitor.idleSeconds(at: uptime()) >= stallTimeout {
-                monitor.requestStop()
-                throw Self.stalledDriveError()
-            }
-        }
-        guard let outcome = monitor.result() else {
-            throw ToolkitError.commandFailed("The storage speed test did not produce a result.")
-        }
-        return try outcome.get()
     }
 
     private func sampleFiles(
@@ -424,7 +351,7 @@ public struct StorageBenchmarkService: @unchecked Sendable {
         sink: any SpeedTestDeviceSink,
         to url: URL,
         byteCount: Int64,
-        monitor: RunMonitor<StorageBenchmarkMeasurement>,
+        monitor: RunLivenessMonitor<StorageBenchmarkMeasurement>,
         progress: FileOperationProgressHandler?
     ) throws -> StorageBenchmarkMeasurement {
         defer { sink.close() }
@@ -473,7 +400,7 @@ public struct StorageBenchmarkService: @unchecked Sendable {
         progressOffset: Int64,
         progressTotal: Int64,
         phase: String,
-        monitor: RunMonitor<StorageBenchmarkMeasurement>,
+        monitor: RunLivenessMonitor<StorageBenchmarkMeasurement>,
         progress: FileOperationProgressHandler?
     ) throws -> StorageBenchmarkMeasurement {
         let startedAt = uptime()
