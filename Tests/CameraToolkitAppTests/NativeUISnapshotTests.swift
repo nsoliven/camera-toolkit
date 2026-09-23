@@ -1,6 +1,7 @@
 import AppKit
 import CameraToolkitCore
 import ImageIO
+import ScreenCaptureKit
 import SwiftUI
 import UniformTypeIdentifiers
 @testable import CameraToolkitApp
@@ -52,7 +53,7 @@ final class NativeUISnapshotTests: XCTestCase {
                 let secondary = try XCTUnwrap(SnapshotWindows.capture(title: title, open), "\(name) window")
                 secondary.appearance = NSAppearance(named: appearance)
                 try await settle(1.5)
-                try render(secondary, name: "\(name)-\(suffix)")
+                try await render(secondary, name: "\(name)-\(suffix)")
                 secondary.orderOut(nil)
             }
         }
@@ -75,20 +76,40 @@ final class NativeUISnapshotTests: XCTestCase {
     private func snapshot(_ window: NSWindow, size: NSSize, name: String) async throws {
         window.setContentSize(size)
         try await settle(1.2)
-        try render(window, name: name)
+        try await render(window, name: name)
     }
 
-    /// Draws the whole window — title bar and toolbar included — through
-    /// the theme frame, then writes it as a PNG.
-    private func render(_ window: NSWindow, name: String) throws {
+    /// Captures the window as the window server composites it, so
+    /// sidebar vibrancy and glass render as they do on screen. Falls back to
+    /// drawing the view tree — title bar and toolbar included, but without
+    /// vibrant glyphs — when screen capture is not allowed.
+    private func render(_ window: NSWindow, name: String) async throws {
         let frameView = try XCTUnwrap(window.contentView?.superview)
         frameView.layoutSubtreeIfNeeded()
         window.displayIfNeeded()
+        let url = outputFolder.appendingPathComponent("\(name).png")
+        if CGPreflightScreenCaptureAccess(), let image = try? await captureWindow(window) {
+            let bitmap = NSBitmapImageRep(cgImage: image)
+            try XCTUnwrap(bitmap.representation(using: .png, properties: [:])).write(to: url)
+            return
+        }
         let bounds = frameView.bounds
         let bitmap = try XCTUnwrap(frameView.bitmapImageRepForCachingDisplay(in: bounds))
         frameView.cacheDisplay(in: bounds, to: bitmap)
-        let data = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
-        try data.write(to: outputFolder.appendingPathComponent("\(name).png"))
+        try XCTUnwrap(bitmap.representation(using: .png, properties: [:])).write(to: url)
+    }
+
+    private func captureWindow(_ window: NSWindow) async throws -> CGImage? {
+        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+        guard let target = content.windows.first(where: { $0.windowID == CGWindowID(window.windowNumber) }) else { return nil }
+        let filter = SCContentFilter(desktopIndependentWindow: target)
+        let configuration = SCStreamConfiguration()
+        let scale = window.backingScaleFactor
+        configuration.width = Int(window.frame.width * scale)
+        configuration.height = Int(window.frame.height * scale)
+        configuration.showsCursor = false
+        configuration.ignoreShadowsSingleWindow = true
+        return try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration)
     }
 
     private func settle(_ seconds: Double) async throws {
@@ -210,8 +231,8 @@ final class NativeUISnapshotTests: XCTestCase {
     }
 }
 
-/// Windows for the harness, built invisibly: alpha 0 and no mouse events,
-/// so nothing flashes on the owner's screen.
+/// Windows for the harness, built off-screen with no mouse events, so
+/// nothing flashes on the owner's screen.
 @MainActor
 enum SnapshotWindows {
     static func main(model: DashboardModel, workspace: EventsWorkspace) -> NSWindow {
@@ -219,8 +240,8 @@ enum SnapshotWindows {
             rootView: AppShell(model: model, workspace: workspace)
                 .frame(minWidth: 1040, minHeight: 720)
         )
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 1320, height: 840),
+        let window = OffscreenWindow(
+            contentRect: NSRect(x: offscreen.x, y: offscreen.y, width: 1320, height: 840),
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
@@ -245,9 +266,22 @@ enum SnapshotWindows {
         return window
     }
 
+    private static let offscreen = NSPoint(x: -20_000, y: -20_000)
+
+    /// Parks the window far off every display. It stays opaque so screen
+    /// capture sees real pixels, but no screen ever shows it.
     private static func hide(_ window: NSWindow) {
-        window.alphaValue = 0
         window.ignoresMouseEvents = true
-        window.setFrameOrigin(NSPoint(x: -20_000, y: -20_000))
+        window.setFrameOrigin(offscreen)
     }
+}
+
+/// Keeps AppKit from pulling the harness window back onto a display, and
+/// draws with the active-window look without activating the test process
+/// and taking focus from whatever the owner is doing.
+private final class OffscreenWindow: NSWindow {
+    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect { frameRect }
+    override var isKeyWindow: Bool { true }
+    override var isMainWindow: Bool { true }
+    override var canBecomeKey: Bool { true }
 }
