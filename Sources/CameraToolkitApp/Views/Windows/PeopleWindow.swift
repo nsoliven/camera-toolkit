@@ -11,29 +11,20 @@ final class PeopleWindowController: NSObject, NSWindowDelegate {
 
     func show(model: DashboardModel, workspace: EventsWorkspace) {
         if let window {
-            window.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
+            CameraToolkitWindowFactory.present(window)
             return
         }
 
-        let controller = NSHostingController(rootView: PeopleView(model: model, workspace: workspace))
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 880, height: 620),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
-            backing: .buffered,
-            defer: false
+        let window = CameraToolkitWindowFactory.make(
+            .people,
+            identifier: "CameraToolkitPeopleWindow",
+            title: "People",
+            initialContentSize: NSSize(width: 880, height: 620),
+            rootView: PeopleView(model: model, workspace: workspace)
         )
-        window.title = "People"
-        window.identifier = NSUserInterfaceItemIdentifier("CameraToolkitPeopleWindow")
-        window.isReleasedWhenClosed = false
-        window.contentViewController = controller
-        window.setContentSize(NSSize(width: 880, height: 620))
-        window.minSize = NSSize(width: 640, height: 420)
         window.delegate = self
-        window.center()
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
         self.window = window
+        CameraToolkitWindowFactory.present(window)
     }
 }
 

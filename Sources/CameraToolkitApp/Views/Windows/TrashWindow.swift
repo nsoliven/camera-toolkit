@@ -15,29 +15,20 @@ final class TrashWindowController: NSObject, NSWindowDelegate {
 
     func show(model: DashboardModel) {
         if let window {
-            window.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
+            CameraToolkitWindowFactory.present(window)
             return
         }
 
-        let controller = NSHostingController(rootView: TrashBrowserView(model: model))
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 1_060, height: 700),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
-            backing: .buffered,
-            defer: false
+        let window = CameraToolkitWindowFactory.make(
+            .trash,
+            identifier: Self.windowIdentifier,
+            title: "Trash",
+            initialContentSize: NSSize(width: 1_060, height: 700),
+            rootView: TrashBrowserView(model: model)
         )
-        window.title = "Trash"
-        window.identifier = NSUserInterfaceItemIdentifier(Self.windowIdentifier)
-        window.isReleasedWhenClosed = false
-        window.contentViewController = controller
-        CameraToolkitWindowSizing.configure(window, as: .trash)
-        window.setContentSize(NSSize(width: 1_060, height: 700))
         window.delegate = self
-        window.center()
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
         self.window = window
+        CameraToolkitWindowFactory.present(window)
     }
 }
 

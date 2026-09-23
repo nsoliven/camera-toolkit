@@ -103,27 +103,21 @@ final class KeyboardShortcutsWindowController: NSObject, NSWindowDelegate {
 
     func show() {
         if let window {
-            window.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
+            CameraToolkitWindowFactory.present(window)
             return
         }
 
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 720, height: 650),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
-            backing: .buffered,
-            defer: false
+        let window = CameraToolkitWindowFactory.make(
+            .keyboardShortcuts,
+            identifier: "CameraToolkitKeyboardShortcutsWindow",
+            title: "Keyboard Shortcuts",
+            initialContentSize: NSSize(width: 720, height: 650),
+            toolbarStyle: .unifiedCompact,
+            rootView: KeyboardShortcutsReferenceView()
         )
-        window.title = "Camera Toolkit Keyboard Shortcuts"
-        window.identifier = NSUserInterfaceItemIdentifier("CameraToolkitKeyboardShortcutsWindow")
-        window.isReleasedWhenClosed = false
-        window.contentViewController = NSHostingController(rootView: KeyboardShortcutsReferenceView())
-        CameraToolkitWindowSizing.configure(window, as: .keyboardShortcuts)
         window.delegate = self
-        window.center()
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
         self.window = window
+        CameraToolkitWindowFactory.present(window)
     }
 }
 

@@ -11,30 +11,21 @@ final class CatalogInspectorWindowController: NSObject, NSWindowDelegate {
     func show(model: DashboardModel) {
         model.syncCatalogCache()
         if let window {
-            window.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
+            CameraToolkitWindowFactory.present(window)
             return
         }
 
         let catalogURL = URL(fileURLWithPath: DashboardModel.expandedPath(model.configuration.catalogDatabasePath))
-        let controller = NSHostingController(rootView: CatalogInspectorView(catalogURL: catalogURL))
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 1_120, height: 720),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
-            backing: .buffered,
-            defer: false
+        let window = CameraToolkitWindowFactory.make(
+            .photoDatabase,
+            identifier: "CameraToolkitCatalogInspectorWindow",
+            title: "Photo List SQL Inspector",
+            initialContentSize: NSSize(width: 1_120, height: 720),
+            rootView: CatalogInspectorView(catalogURL: catalogURL)
         )
-        window.title = "Photo List SQL Inspector"
-        window.identifier = NSUserInterfaceItemIdentifier("CameraToolkitCatalogInspectorWindow")
-        window.isReleasedWhenClosed = false
-        window.contentViewController = controller
-        CameraToolkitWindowSizing.configure(window, as: .photoDatabase)
-        window.setContentSize(NSSize(width: 1_120, height: 720))
         window.delegate = self
-        window.center()
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
         self.window = window
+        CameraToolkitWindowFactory.present(window)
     }
 }
 

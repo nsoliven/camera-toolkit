@@ -10,31 +10,20 @@ final class TransferQueueWindowController: NSObject, NSWindowDelegate {
 
     func show(model: DashboardModel) {
         if let window {
-            window.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
+            CameraToolkitWindowFactory.present(window)
             return
         }
 
-        let controller = NSHostingController(rootView: TransferQueueView(model: model))
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 840, height: 500),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
-            backing: .buffered,
-            defer: false
+        let window = CameraToolkitWindowFactory.make(
+            .transferQueue,
+            identifier: "CameraToolkitTransferQueueWindow",
+            title: "Jobs",
+            initialContentSize: NSSize(width: 840, height: 500),
+            rootView: TransferQueueView(model: model)
         )
-        window.title = "Jobs"
-        window.identifier = NSUserInterfaceItemIdentifier("CameraToolkitTransferQueueWindow")
-        window.isRestorable = false
-        window.isReleasedWhenClosed = false
-        window.tabbingMode = .disallowed
-        window.contentViewController = controller
-        CameraToolkitWindowSizing.configure(window, as: .transferQueue)
-        window.setContentSize(NSSize(width: 840, height: 500))
         window.delegate = self
-        window.center()
         self.window = window
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        CameraToolkitWindowFactory.present(window)
     }
 }
 

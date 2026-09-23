@@ -10,29 +10,20 @@ final class EventLibraryWindowController: NSObject, NSWindowDelegate {
 
     func show(model: DashboardModel) {
         if let window {
-            window.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
+            CameraToolkitWindowFactory.present(window)
             return
         }
 
-        let controller = NSHostingController(rootView: EventLibraryView(model: model))
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 1_260, height: 760),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
-            backing: .buffered,
-            defer: false
+        let window = CameraToolkitWindowFactory.make(
+            .eventLibrary,
+            identifier: "CameraToolkitEventLibraryWindow",
+            title: "Event Library",
+            initialContentSize: NSSize(width: 1_260, height: 760),
+            rootView: EventLibraryView(model: model)
         )
-        window.title = "Event Library"
-        window.identifier = NSUserInterfaceItemIdentifier("CameraToolkitEventLibraryWindow")
-        window.isReleasedWhenClosed = false
-        window.contentViewController = controller
-        CameraToolkitWindowSizing.configure(window, as: .eventLibrary)
-        window.setContentSize(NSSize(width: 1_260, height: 760))
         window.delegate = self
-        window.center()
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
         self.window = window
+        CameraToolkitWindowFactory.present(window)
     }
 }
 

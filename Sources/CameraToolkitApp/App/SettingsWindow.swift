@@ -10,7 +10,7 @@ final class CameraToolkitConfigWindow: NSObject, NSWindowDelegate {
     func show(model: DashboardModel) {
         if let window {
             window.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
+            NSApp.activate()
             return
         }
 
@@ -39,6 +39,6 @@ final class CameraToolkitConfigWindow: NSObject, NSWindowDelegate {
         window.center()
         self.window = window
         window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        NSApp.activate()
     }
 }
