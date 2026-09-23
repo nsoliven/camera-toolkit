@@ -752,7 +752,7 @@ private struct TrashTileView: View {
                 .padding(6)
             }
             .frame(width: width, height: width * 2 / 3)
-            .background(Color.black.opacity(0.12))
+            .background(.quaternary)
             .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
             .overlay {
                 RoundedRectangle(cornerRadius: 8, style: .continuous)

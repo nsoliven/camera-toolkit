@@ -473,6 +473,10 @@ private struct PeopleView: View {
                             }
                         }
                         .onTapGesture(count: 2) { previewFace = face }
+                        .accessibilityElement(children: .ignore)
+                        .accessibilityLabel(facePhotoName(face))
+                        .accessibilityAddTraits(.isButton)
+                        .accessibilityAction(named: "Open Photo") { previewFace = face }
                         .contextMenu {
                             FaceContextMenu(workspace: workspace, face: face, person: person, onOpenPhoto: { previewFace = $0 })
                         }
@@ -915,6 +919,12 @@ private struct PersonFacesGrid: View {
             }
             .onTapGesture { selectedID = face.id }
             .simultaneousGesture(TapGesture(count: 2).onEnded { onOpenPhoto(face) })
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(photoName(face))
+            .accessibilityValue(face.matchScore.map { "match \(Int($0 * 100)) percent" } ?? "")
+            .accessibilityAddTraits(face.id == selectedID ? [.isButton, .isSelected] : .isButton)
+            .accessibilityAction { selectedID = face.id }
+            .accessibilityAction(named: "Open Photo") { onOpenPhoto(face) }
             .contextMenu {
                 FaceContextMenu(workspace: workspace, face: face, person: person, onOpenPhoto: onOpenPhoto)
             }
