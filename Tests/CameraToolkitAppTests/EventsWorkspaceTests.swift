@@ -724,26 +724,21 @@ final class EventsWorkspaceTests: XCTestCase {
             XCTAssertEqual(rows([.events([child])]), [child, grandchild])
             XCTAssertEqual(rows([.events([grandchild])]), [grandchild])
 
-            // The parent's board shows its own stacks plus a "Matcha"
-            // section holding that subevent's whole subtree; the child
-            // board nests "Latte Art" the same way, and the grandchild
-            // board is just itself.
+            // Subevent photos stay in the day sections with everything
+            // else. The dot says which tag they belong to.
             await workspace.refreshEvent(parent)
             let parentStacks = try XCTUnwrap(workspace.eventStacks[parent])
             XCTAssertEqual(Set(parentStacks.map(\.id)), [ownStack.id, childStack.id, grandchildStack.id])
             let parentGroups = workspace.eventBoardGroups(parent, stacks: parentStacks, grouping: .day, order: .oldestFirst)
-            let matchaSection = try XCTUnwrap(parentGroups.last { $0.id == "subevent|\(child.uuidString)" })
-            XCTAssertEqual(matchaSection.title, "Matcha")
-            XCTAssertEqual(Set(matchaSection.stacks.map(\.id)), [childStack.id, grandchildStack.id])
-            XCTAssertEqual(Set(parentGroups.filter { $0.id != matchaSection.id }.flatMap(\.stacks).map(\.id)), [ownStack.id])
+            XCTAssertFalse(parentGroups.contains { $0.id.hasPrefix("subevent|") })
+            XCTAssertEqual(Set(parentGroups.flatMap(\.stacks).map(\.id)), [ownStack.id, childStack.id, grandchildStack.id])
 
             await workspace.refreshEvent(child)
             let childStacks = try XCTUnwrap(workspace.eventStacks[child])
             XCTAssertEqual(Set(childStacks.map(\.id)), [childStack.id, grandchildStack.id])
             let childGroups = workspace.eventBoardGroups(child, stacks: childStacks, grouping: .day, order: .oldestFirst)
-            let latteSection = try XCTUnwrap(childGroups.last { $0.id == "subevent|\(grandchild.uuidString)" })
-            XCTAssertEqual(latteSection.title, "Latte Art")
-            XCTAssertEqual(latteSection.stacks.map(\.id), [grandchildStack.id])
+            XCTAssertFalse(childGroups.contains { $0.id.hasPrefix("subevent|") })
+            XCTAssertEqual(Set(childGroups.flatMap(\.stacks).map(\.id)), [childStack.id, grandchildStack.id])
             XCTAssertFalse(childStacks.contains { $0.id == ownStack.id })
 
             await workspace.refreshEvent(grandchild)
@@ -820,10 +815,10 @@ final class EventsWorkspaceTests: XCTestCase {
             XCTAssertEqual(workspace.subevents(of: parent).map(\.id), [child])
             XCTAssertEqual(workspace.subevents(of: child).map(\.id), [grandchild])
 
-            // The tag a stack wears is its owning event — a grandchild's
-            // photos wear the grandchild's tag, not the direct child's, and
-            // the palette color is stable for that id. Stacks owned by the
-            // board's own event wear none.
+            // The dot is the owning subevent — a grandchild's photos wear
+            // the grandchild's color, not the direct child's. A top-level
+            // event's own photos wear none. A subevent's photos keep the
+            // dot on that subevent's own board.
             let boardByName = Dictionary(uniqueKeysWithValues: try XCTUnwrap(workspace.eventStacks[parent]).map {
                 ($0.coverItem.primary.name, $0)
             })
@@ -835,7 +830,8 @@ final class EventsWorkspaceTests: XCTestCase {
             // On the child's board the same stack is still a descendant;
             // on the grandchild's own board it wears no tag.
             XCTAssertEqual(workspace.subeventTag(for: try XCTUnwrap(boardByName["DSC00003.ARW"]), in: child)?.id, grandchild)
-            XCTAssertNil(workspace.subeventTag(for: try XCTUnwrap(boardByName["DSC00003.ARW"]), in: grandchild))
+            XCTAssertEqual(workspace.subeventTag(for: try XCTUnwrap(boardByName["DSC00003.ARW"]), in: grandchild)?.id, grandchild)
+            XCTAssertEqual(workspace.subeventTag(for: try XCTUnwrap(boardByName["DSC00002.ARW"]), in: child)?.id, child)
 
             // Applied photos sit in Card Copy, not the folder they were
             // imported from. The filter still has to see which subevent

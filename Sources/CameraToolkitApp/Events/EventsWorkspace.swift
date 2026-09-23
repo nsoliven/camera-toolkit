@@ -913,64 +913,27 @@ final class EventsWorkspace {
         EventHierarchy.children(of: eventID, in: model.configuration.savedEvents)
     }
 
-    /// The tag a stack wears on this event board: its owning event when
-    /// that is a subevent under `eventID` — a grandchild's photos wear the
-    /// grandchild's own tag, not the direct child's. Stacks owned by the
-    /// board's own event (or split across events) wear no tag.
+    /// The color dot a stack wears. Any photo that belongs to a subevent
+    /// keeps that subevent's color, including on the subevent's own board.
+    /// A photo owned by the open event, when that event is top-level, has
+    /// no dot. A grandchild wears its own color, not its parent's.
     func subeventTag(for stack: OrganizeStack, in eventID: UUID) -> SavedCameraEvent? {
         guard let owner = assignedEvent(for: stack).event,
-              owner.id != eventID,
+              owner.parentEventID != nil,
               scopeIDs(eventID).contains(owner.id) else { return nil }
         return owner
     }
 
-    /// The board's collapsible sections: the event's own stacks under the
-    /// chosen grouping, then one section per direct subevent holding that
-    /// subevent's whole subtree — titled with the subevent's name. A
-    /// depth-2 event has no subevents, so its board is just its own
-    /// stacks, the same as before.
+    /// The same day or kind sections as any other board. Subevent photos
+    /// stay in those sections; the dot on the tile says which tag they
+    /// belong to, instead of pulling them into a folder named after the tag.
     func eventBoardGroups(
         _ eventID: UUID,
         stacks: [OrganizeStack],
         grouping: OrganizeBoardGrouping,
         order: OrganizeBoardOrder
     ) -> [OrganizeBoardGroup] {
-        let children = subevents(of: eventID)
-        guard !children.isEmpty else {
-            return OrganizeBoardPlan.groups(for: stacks, grouping: grouping, order: order)
-        }
-        // Which direct child's section owns each descendant id.
-        var sectionByOwner: [UUID: UUID] = [:]
-        for child in children {
-            for id in scopeIDs(child.id) { sectionByOwner[id] = child.id }
-        }
-        var own: [OrganizeStack] = []
-        var byChild: [UUID: [OrganizeStack]] = [:]
-        for stack in stacks {
-            if let ownerID = assignedEvent(for: stack).event?.id,
-               let childID = sectionByOwner[ownerID] {
-                byChild[childID, default: []].append(stack)
-            } else {
-                own.append(stack)
-            }
-        }
-        var groups = OrganizeBoardPlan.groups(for: own, grouping: grouping, order: order)
-        let ascending = order == .oldestFirst
-        for child in children {
-            guard let childStacks = byChild[child.id], !childStacks.isEmpty else { continue }
-            groups.append(OrganizeBoardGroup(
-                id: "subevent|\(child.id.uuidString)",
-                title: child.name,
-                symbol: OrganizeBoardGrouping.event.symbol,
-                stacks: childStacks.sorted {
-                    if $0.captureDate != $1.captureDate {
-                        return ascending ? $0.captureDate < $1.captureDate : $0.captureDate > $1.captureDate
-                    }
-                    return $0.id < $1.id
-                }
-            ))
-        }
-        return groups
+        OrganizeBoardPlan.groups(for: stacks, grouping: grouping, order: order)
     }
 
     /// The stacks an event board shows after its search field filters —

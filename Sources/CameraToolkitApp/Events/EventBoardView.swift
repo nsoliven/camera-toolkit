@@ -31,8 +31,6 @@ struct EventBoardView: View {
     }
 
     private var boardGroups: [OrganizeBoardGroup] {
-        // The event's own stacks grouped as usual, then one section per
-        // direct subevent holding that subevent's subtree.
         workspace.eventBoardGroups(
             eventID,
             stacks: workspace.visibleEventStacks(eventID, search: workspace.search),

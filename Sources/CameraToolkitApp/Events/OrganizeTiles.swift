@@ -55,24 +55,21 @@ struct EventChip: View {
     }
 }
 
-/// The owning subevent's tag on an event-board tile or row — a plain
-/// colored label, never a button, so it can't steal the tile's click.
-/// On a tile it sits in the bottom-right corner. A flexible width in the
-/// top row was compressed to nothing beside the burst count.
+/// A subevent's color on a photo. Just the dot — the name is the hover
+/// label, not text on the picture.
 struct EventTagCapsule: View {
     let event: SavedCameraEvent
 
     var body: some View {
-        Text(event.name)
-            .font(.caption2.weight(.semibold))
-            .lineLimit(1)
-            .truncationMode(.tail)
-            .foregroundStyle(.white)
-            .padding(.horizontal, 6)
-            .padding(.vertical, 3)
-            .frame(maxWidth: 120, alignment: .trailing)
-            .background(EventPalette.color(for: event.id), in: Capsule())
-            .help("Tagged \(event.name)")
+        Circle()
+            .fill(EventPalette.color(for: event.id))
+            .frame(width: 12, height: 12)
+            .overlay {
+                Circle().strokeBorder(.white.opacity(0.95), lineWidth: 1.5)
+            }
+            .shadow(color: .black.opacity(0.45), radius: 1.5, y: 0.5)
+            .help(event.name)
+            .accessibilityLabel(event.name)
     }
 }
 
@@ -240,8 +237,8 @@ struct StackTileView: View {
     /// Resolved private flag for `event` — a subevent can inherit the lock
     /// from a private parent, so the caller resolves it.
     var isPrivate: Bool? = nil
-    /// The owning subevent's color, drawn at the bottom right of the
-    /// photo. Nil hides it — unsorted boards already carry the event chip.
+    /// The owning subevent's color dot, drawn at the bottom right of the
+    /// photo. Nil hides it.
     var tag: SavedCameraEvent? = nil
     let isMixed: Bool
     let isDimmed: Bool
@@ -429,8 +426,8 @@ struct StackRowView: View {
     let isExpanded: Bool
     let event: SavedCameraEvent?
     var isPrivate: Bool? = nil
-    /// The owning subevent's tag after the burst label on event boards —
-    /// the same capsule the tile wears. Nil hides it.
+    /// The owning subevent's color dot, after the burst label on a list
+    /// row. Nil hides it.
     var tag: SavedCameraEvent? = nil
     let isMixed: Bool
     let isDimmed: Bool
