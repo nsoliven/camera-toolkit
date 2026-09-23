@@ -28,9 +28,9 @@ final class TileImageLoader: @unchecked Sendable {
         var finished = false
         var result: CGImage?
 
-        init(url: URL, bucket: Int, orientation: Int, priority: Operation.QueuePriority, cacheKey: String) {
+        init(url: URL, bucket: Int, orientation: Int, priority: Operation.QueuePriority, cacheKey: String, gate: DriveActivityGate) {
             self.cacheKey = cacheKey
-            operation = TileDecodeOperation(url: url, maximumPixelSize: bucket, orientation: orientation)
+            operation = TileDecodeOperation(url: url, maximumPixelSize: bucket, orientation: orientation, gate: gate)
             operation.queuePriority = priority
             operation.qualityOfService = TileImageLoader.qos(for: priority)
         }
@@ -48,12 +48,17 @@ final class TileImageLoader: @unchecked Sendable {
     private let queue: OperationQueue
     private let lock = NSLock()
     private var inFlight: [String: WaiterGroup] = [:]
+    /// Decodes wait at this gate while a speed test is measuring the volume
+    /// the file lives on — a tile read should never contend with, or pile
+    /// onto, a drive the benchmark may be about to report as stalled.
+    private let driveActivityGate: DriveActivityGate
     /// Standardized paths a completed rename left vacant, mapped to where
     /// each file landed. Only consulted while the asked-for path is really
     /// missing, so a name another file later reuses is never rerouted.
     private var redirects: [String: String] = [:]
 
-    init() {
+    init(driveActivityGate: DriveActivityGate = .shared) {
+        self.driveActivityGate = driveActivityGate
         cache.totalCostLimit = 768 * 1_024 * 1_024
         queue = OperationQueue()
         queue.name = "CameraToolkit.TileImageLoader"
@@ -142,7 +147,7 @@ final class TileImageLoader: @unchecked Sendable {
             existing.boost(priority)
             return existing
         }
-        let group = WaiterGroup(url: url, bucket: bucket, orientation: orientation, priority: priority, cacheKey: cacheKey)
+        let group = WaiterGroup(url: url, bucket: bucket, orientation: orientation, priority: priority, cacheKey: cacheKey, gate: driveActivityGate)
         group.waiters = 1
         inFlight[cacheKey] = group
         group.operation.completionBlock = { [weak self] in
@@ -395,15 +400,21 @@ private final class TileDecodeOperation: Operation, @unchecked Sendable {
     let url: URL
     let maximumPixelSize: Int
     let orientation: Int
+    let gate: DriveActivityGate
     var result: CGImage?
 
-    init(url: URL, maximumPixelSize: Int, orientation: Int) {
+    init(url: URL, maximumPixelSize: Int, orientation: Int, gate: DriveActivityGate) {
         self.url = url
         self.maximumPixelSize = maximumPixelSize
         self.orientation = orientation
+        self.gate = gate
     }
 
     override func main() {
+        guard !isCancelled else { return }
+        // Wait out a speed test measuring this volume rather than reading
+        // through it; a cancelled decode returns instead of waiting.
+        guard gate.waitIfPaused(for: url, shouldStop: { [self] in isCancelled }) else { return }
         guard !isCancelled else { return }
         // Start is logged before any file I/O — including the size `stat` —
         // so a decode stuck on a dead volume still leaves a "started, never

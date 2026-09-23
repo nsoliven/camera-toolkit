@@ -32,17 +32,60 @@ public struct StorageBenchmarkResult: Equatable, Sendable {
     }
 }
 
+/// The device end of a write test: one synchronous write+flush quantum per
+/// call. The production sink writes through an `F_NOCACHE` descriptor and
+/// fsyncs every chunk; tests substitute a fake to simulate device latency or
+/// a stall without touching real storage.
+public protocol SpeedTestDeviceSink: AnyObject, Sendable {
+    /// Write the chunk and push it at the device (write + flush). Returns
+    /// only once the device accepted the bytes — that wait is the measured
+    /// time and the interval the watchdog bounds.
+    func writeChunk(_ bytes: UnsafeRawBufferPointer) throws
+    /// Release the descriptor. Never throws; must tolerate being called once
+    /// after an aborted run.
+    func close()
+}
+
 /// Runs bounded sequential storage checks without loading the sample into RAM.
 /// Camera/card sources use `benchmarkReadOnly`; writable destinations use a
-/// unique temporary file that is flushed, read uncached, and removed.
+/// unique temporary file that is written in bounded, uncached chunks, flushed
+/// after every chunk, read back, and removed.
+///
+/// Write and read work run on a private queue under a watchdog instead of on
+/// the caller's thread: a bus-powered enclosure can park a `write` or `fsync`
+/// call in ways Swift task cancellation cannot interrupt, so the caller polls
+/// for progress and abandons the run — reporting a stopped drive rather than
+/// hanging — when no chunk completes for `stallTimeout` seconds.
 public struct StorageBenchmarkService: @unchecked Sendable {
-    public static let defaultSampleByteCount: Int64 = 512 * 1024 * 1024
+    public static let defaultSampleByteCount: Int64 = 256 * 1024 * 1024
     public static let temporaryFilePrefix = ".CameraToolkit-SpeedTest-"
+    /// One supervised write+flush quantum — small enough that a stall is
+    /// detected quickly and no single flush has to push hundreds of MB.
+    public static let writeChunkByteCount: Int64 = 8 * 1024 * 1024
+    /// Abort a test that has not moved bytes to the device for this long.
+    public static let defaultStallTimeout: TimeInterval = 15
+    /// How often the supervisor wakes to check cancellation and idle time.
+    private static let supervisionPollInterval: TimeInterval = 0.05
 
     private let fileManager: FileManager
+    private let sinkFactory: @Sendable (URL, Int64) throws -> any SpeedTestDeviceSink
+    private let uptime: @Sendable () -> TimeInterval
+    private let stallTimeout: TimeInterval
 
-    public init(fileManager: FileManager = .default) {
+    /// `sinkFactory` and `uptime` are test seams — production callers use the
+    /// defaults, which write real files and read the real clock.
+    public init(
+        fileManager: FileManager = .default,
+        sinkFactory: (@Sendable (URL, Int64) throws -> any SpeedTestDeviceSink)? = nil,
+        uptime: (@Sendable () -> TimeInterval)? = nil,
+        stallTimeout: TimeInterval = StorageBenchmarkService.defaultStallTimeout
+    ) {
         self.fileManager = fileManager
+        self.sinkFactory = sinkFactory ?? { url, byteCount in
+            try UncachedSpeedTestSink(url: url, byteCount: byteCount)
+        }
+        self.uptime = uptime ?? { ProcessInfo.processInfo.systemUptime }
+        self.stallTimeout = stallTimeout
     }
 
     public func benchmarkReadOnly(
@@ -64,14 +107,17 @@ public struct StorageBenchmarkService: @unchecked Sendable {
 
         let availableBytes = samples.reduce(Int64(0)) { $0 + $1.size }
         let bytesToRead = min(byteLimit, availableBytes)
-        let measurement = try read(
-            samples: samples,
-            byteLimit: bytesToRead,
-            progressOffset: 0,
-            progressTotal: bytesToRead,
-            phase: "Testing source read speed",
-            progress: progress
-        )
+        let measurement = try supervised { monitor in
+            try self.read(
+                samples: samples,
+                byteLimit: bytesToRead,
+                progressOffset: 0,
+                progressTotal: bytesToRead,
+                phase: "Testing source read speed",
+                monitor: monitor,
+                progress: progress
+            )
+        }
         return StorageBenchmarkResult(
             read: measurement,
             sampledFileCount: samples.count
@@ -86,8 +132,6 @@ public struct StorageBenchmarkService: @unchecked Sendable {
         guard byteCount > 0 else {
             throw ToolkitError.commandFailed("The speed-test sample size must be greater than zero.")
         }
-        try FileScanner(fileManager: fileManager).assertDirectory(directory)
-        try requireFreeSpace(for: byteCount, at: directory)
 
         let temporaryURL = directory.appendingPathComponent(
             "\(Self.temporaryFilePrefix)\(UUID().uuidString).tmp",
@@ -97,19 +141,31 @@ public struct StorageBenchmarkService: @unchecked Sendable {
         var result: StorageBenchmarkResult?
 
         do {
-            let writeMeasurement = try writeTemporaryFile(
-                to: temporaryURL,
-                byteCount: byteCount,
-                progress: progress
-            )
-            let readMeasurement = try read(
-                samples: [(url: temporaryURL, size: byteCount)],
-                byteLimit: byteCount,
-                progressOffset: byteCount,
-                progressTotal: byteCount * 2,
-                phase: "Testing destination read speed",
-                progress: progress
-            )
+            // Preflight runs inside supervision too — on a dead mount even a
+            // stat can block, and Stop must never hang.
+            let writeMeasurement = try supervised { monitor in
+                try FileScanner(fileManager: self.fileManager).assertDirectory(directory)
+                try self.requireFreeSpace(for: byteCount, at: directory)
+                let sink = try self.sinkFactory(temporaryURL, byteCount)
+                return try self.writeTemporaryFile(
+                    sink: sink,
+                    to: temporaryURL,
+                    byteCount: byteCount,
+                    monitor: monitor,
+                    progress: progress
+                )
+            }
+            let readMeasurement = try supervised { monitor in
+                try self.read(
+                    samples: [(url: temporaryURL, size: byteCount)],
+                    byteLimit: byteCount,
+                    progressOffset: byteCount,
+                    progressTotal: byteCount * 2,
+                    phase: "Testing destination read speed",
+                    monitor: monitor,
+                    progress: progress
+                )
+            }
             result = StorageBenchmarkResult(
                 read: readMeasurement,
                 write: writeMeasurement,
@@ -119,16 +175,10 @@ public struct StorageBenchmarkService: @unchecked Sendable {
             operationError = error
         }
 
-        do {
-            if fileManager.fileExists(atPath: temporaryURL.path) {
-                try fileManager.removeItem(at: temporaryURL)
-            }
-        } catch {
-            throw ToolkitError.commandFailed(
-                "The speed test stopped, but its temporary file could not be removed: \(temporaryURL.path). \(error.localizedDescription)"
-            )
+        // Cleanup is bounded for the same reason the I/O is supervised.
+        if let cleanupError = removeTemporaryFile(at: temporaryURL) {
+            throw cleanupError
         }
-
         if let operationError {
             throw operationError
         }
@@ -136,6 +186,170 @@ public struct StorageBenchmarkService: @unchecked Sendable {
             throw ToolkitError.commandFailed("The storage speed test did not produce a result.")
         }
         return result
+    }
+
+    /// Deletes leftover `.CameraToolkit-SpeedTest-*.tmp` files — and any `._`
+    /// AppleDouble twins — sitting directly inside each folder. Only names
+    /// with the exact prefix are touched; everything else is left alone and
+    /// folders that cannot be listed are skipped. Returns the removed paths.
+    /// Called once per app launch so an interrupted test cannot litter.
+    ///
+    /// A twin is probed by name rather than awaited from the listing:
+    /// `._*` entries are filtered out of directory enumeration on
+    /// filesystems that present them synthetically, even though the file
+    /// itself is real and would otherwise be left behind.
+    @discardableResult
+    public func removeStaleTemporaryFiles(in directories: [URL]) -> [URL] {
+        var removed: [URL] = []
+        for directory in directories {
+            guard let names = try? fileManager.contentsOfDirectory(atPath: directory.path) else {
+                continue
+            }
+            for name in names where Self.isTemporaryFileName(name) {
+                for candidate in [name, "._" + name] {
+                    let url = directory.appendingPathComponent(candidate)
+                    var isDirectory: ObjCBool = false
+                    guard fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory),
+                          !isDirectory.boolValue else {
+                        continue
+                    }
+                    if (try? fileManager.removeItem(at: url)) != nil {
+                        removed.append(url)
+                    }
+                }
+            }
+        }
+        return removed
+    }
+
+    /// `.CameraToolkit-SpeedTest-*.tmp`, or the `._` twin of such a name.
+    private static func isTemporaryFileName(_ name: String) -> Bool {
+        func isMatch(_ candidate: some StringProtocol) -> Bool {
+            candidate.hasPrefix(temporaryFilePrefix) && candidate.hasSuffix(".tmp")
+        }
+        if isMatch(name) { return true }
+        if name.hasPrefix("._") { return isMatch(name.dropFirst(2)) }
+        return false
+    }
+
+    /// Removes the temp file and any `._` AppleDouble twin. Runs off-thread
+    /// with a bound: on a dead mount even unlink can block, and an aborted
+    /// test must report instead of hanging.
+    private func removeTemporaryFile(at url: URL) -> Error? {
+        let twin = url.deletingLastPathComponent()
+            .appendingPathComponent("._\(url.lastPathComponent)", isDirectory: false)
+        let monitor = RunMonitor<Void>(startedAt: uptime())
+        DispatchQueue(label: "CameraToolkit.StorageBenchmark.cleanup", qos: .userInitiated).async {
+            monitor.finish(Result(catching: {
+                for candidate in [url, twin]
+                where self.fileManager.fileExists(atPath: candidate.path) {
+                    try self.fileManager.removeItem(at: candidate)
+                }
+            }))
+        }
+        guard monitor.waitFinished(timeout: stallTimeout), let outcome = monitor.result() else {
+            return Self.stalledDriveError()
+        }
+        if case let .failure(error) = outcome {
+            return ToolkitError.commandFailed(
+                "The speed test stopped, but its temporary file could not be removed: \(url.path). \(error.localizedDescription)"
+            )
+        }
+        return nil
+    }
+
+    /// Plain-words failure for a test that stopped moving bytes to the device.
+    private static func stalledDriveError() -> ToolkitError {
+        .commandFailed(
+            "The drive stopped responding — no data reached it for a while, so the speed test was abandoned and its temporary file removed. This can mean an overheating or underpowered enclosure or cable, or a drive that dropped off the bus. Unplug it, let it settle, reconnect it, and try again."
+        )
+    }
+
+    /// Shared state between the benchmark caller and the I/O worker so a hung
+    /// syscall fails the run instead of pinning it: the worker reports each
+    /// completed chunk and checks `shouldStop` between chunks, while the
+    /// caller polls for completion and idle time.
+    private final class RunMonitor<Value>: @unchecked Sendable {
+        private let lock = NSLock()
+        private let finished = DispatchSemaphore(value: 0)
+        private var lastChunkCompletedAt: TimeInterval
+        private var stopRequested = false
+        private var outcome: Result<Value, Error>?
+
+        init(startedAt: TimeInterval) {
+            lastChunkCompletedAt = startedAt
+        }
+
+        var shouldStop: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return stopRequested
+        }
+
+        func requestStop() {
+            lock.lock()
+            stopRequested = true
+            lock.unlock()
+        }
+
+        func markChunkCompleted(at uptime: TimeInterval) {
+            lock.lock()
+            lastChunkCompletedAt = uptime
+            lock.unlock()
+        }
+
+        func idleSeconds(at uptime: TimeInterval) -> TimeInterval {
+            lock.lock()
+            defer { lock.unlock() }
+            return uptime - lastChunkCompletedAt
+        }
+
+        func finish(_ outcome: Result<Value, Error>) {
+            lock.lock()
+            self.outcome = outcome
+            lock.unlock()
+            finished.signal()
+        }
+
+        func waitFinished(timeout: TimeInterval) -> Bool {
+            finished.wait(timeout: .now() + timeout) == .success
+        }
+
+        func result() -> Result<Value, Error>? {
+            lock.lock()
+            defer { lock.unlock() }
+            return outcome
+        }
+    }
+
+    /// Runs `work` on a private queue while this thread watches for stalls
+    /// and cancellation. POSIX `write`/`fsync` can block in ways Swift task
+    /// cancellation cannot interrupt, so on abort the caller stops waiting,
+    /// asks the worker to stand down between chunks, and reports the drive as
+    /// unresponsive. A worker parked inside a dead mount's syscall stays
+    /// contained on its queue — it owns its descriptor and closes it if the
+    /// kernel ever returns.
+    private func supervised<Value>(
+        _ work: @escaping @Sendable (RunMonitor<Value>) throws -> Value
+    ) throws -> Value {
+        let monitor = RunMonitor<Value>(startedAt: uptime())
+        DispatchQueue(label: "CameraToolkit.StorageBenchmark.io", qos: .userInitiated).async {
+            monitor.finish(Result(catching: { try work(monitor) }))
+        }
+        while !monitor.waitFinished(timeout: Self.supervisionPollInterval) {
+            if Task.isCancelled {
+                monitor.requestStop()
+                throw CancellationError()
+            }
+            if monitor.idleSeconds(at: uptime()) >= stallTimeout {
+                monitor.requestStop()
+                throw Self.stalledDriveError()
+            }
+        }
+        guard let outcome = monitor.result() else {
+            throw ToolkitError.commandFailed("The storage speed test did not produce a result.")
+        }
+        return try outcome.get()
     }
 
     private func sampleFiles(
@@ -198,22 +412,20 @@ public struct StorageBenchmarkService: @unchecked Sendable {
         return samples
     }
 
+    /// Writes `byteCount` in bounded chunks, flushing after each one so the
+    /// reported rate is the pace the device accepts data — never page-cache
+    /// speed — and so no single flush has to push hundreds of MB. The final
+    /// measurement includes the last flush. Runs on the supervised worker.
     private func writeTemporaryFile(
+        sink: any SpeedTestDeviceSink,
         to url: URL,
         byteCount: Int64,
+        monitor: RunMonitor<StorageBenchmarkMeasurement>,
         progress: FileOperationProgressHandler?
     ) throws -> StorageBenchmarkMeasurement {
-        let descriptor = try openDescriptor(
-            url,
-            flags: O_CREAT | O_EXCL | O_WRONLY,
-            permissions: S_IRUSR | S_IWUSR
-        )
-        defer { Darwin.close(descriptor) }
-        guard Darwin.fcntl(descriptor, F_NOCACHE, 1) == 0 else {
-            throw Self.posixError(operation: "disable the file cache for", url: url)
-        }
+        defer { sink.close() }
 
-        let chunkSize = Int(min(Int64(4 * 1024 * 1024), byteCount))
+        let chunkSize = Int(min(Self.writeChunkByteCount, byteCount))
         var buffer = [UInt8](repeating: 0, count: max(chunkSize, 1))
         buffer.withUnsafeMutableBytes { rawBuffer in
             if let address = rawBuffer.baseAddress {
@@ -221,31 +433,19 @@ public struct StorageBenchmarkService: @unchecked Sendable {
             }
         }
 
-        let startedAt = ProcessInfo.processInfo.systemUptime
+        let startedAt = uptime()
         var processed: Int64 = 0
         var limiter = FileOperationProgressLimiter()
         while processed < byteCount {
-            try Task.checkCancellation()
+            if monitor.shouldStop { throw CancellationError() }
             let requested = Int(min(Int64(buffer.count), byteCount - processed))
             try buffer.withUnsafeBytes { rawBuffer in
-                guard let address = rawBuffer.baseAddress else { return }
-                var offset = 0
-                while offset < requested {
-                    let written = Darwin.write(
-                        descriptor,
-                        address.advanced(by: offset),
-                        requested - offset
-                    )
-                    if written < 0, errno == EINTR { continue }
-                    guard written > 0 else {
-                        throw Self.posixError(operation: "write speed-test data to", url: url)
-                    }
-                    offset += written
-                }
+                try sink.writeChunk(UnsafeRawBufferPointer(rebasing: rawBuffer.prefix(requested)))
             }
             processed += Int64(requested)
+            monitor.markChunkCompleted(at: uptime())
             if limiter.shouldEmit(force: processed == byteCount) {
-                let elapsed = max(ProcessInfo.processInfo.systemUptime - startedAt, 0.001)
+                let elapsed = max(uptime() - startedAt, 0.001)
                 progress?(FileOperationProgress(
                     phase: "Testing destination write speed",
                     currentPath: url.deletingLastPathComponent().path,
@@ -255,10 +455,7 @@ public struct StorageBenchmarkService: @unchecked Sendable {
                 ))
             }
         }
-        guard Darwin.fsync(descriptor) == 0 else {
-            throw Self.posixError(operation: "flush speed-test data on", url: url)
-        }
-        let duration = max(ProcessInfo.processInfo.systemUptime - startedAt, 0.001)
+        let duration = max(uptime() - startedAt, 0.001)
         return StorageBenchmarkMeasurement(
             bytes: processed,
             duration: duration,
@@ -272,15 +469,16 @@ public struct StorageBenchmarkService: @unchecked Sendable {
         progressOffset: Int64,
         progressTotal: Int64,
         phase: String,
+        monitor: RunMonitor<StorageBenchmarkMeasurement>,
         progress: FileOperationProgressHandler?
     ) throws -> StorageBenchmarkMeasurement {
-        let startedAt = ProcessInfo.processInfo.systemUptime
+        let startedAt = uptime()
         var totalRead: Int64 = 0
         var limiter = FileOperationProgressLimiter()
         var buffer = [UInt8](repeating: 0, count: 4 * 1024 * 1024)
 
         for sample in samples where totalRead < byteLimit {
-            try Task.checkCancellation()
+            if monitor.shouldStop { throw CancellationError() }
             let descriptor = try openDescriptor(sample.url, flags: O_RDONLY | O_NOFOLLOW)
             guard Darwin.fcntl(descriptor, F_NOCACHE, 1) == 0 else {
                 Darwin.close(descriptor)
@@ -288,7 +486,7 @@ public struct StorageBenchmarkService: @unchecked Sendable {
             }
             do {
                 while totalRead < byteLimit {
-                    try Task.checkCancellation()
+                    if monitor.shouldStop { throw CancellationError() }
                     let requested = Int(min(Int64(buffer.count), byteLimit - totalRead))
                     let count = buffer.withUnsafeMutableBytes { rawBuffer in
                         Darwin.read(descriptor, rawBuffer.baseAddress, requested)
@@ -299,8 +497,9 @@ public struct StorageBenchmarkService: @unchecked Sendable {
                     }
                     guard count > 0 else { break }
                     totalRead += Int64(count)
+                    monitor.markChunkCompleted(at: uptime())
                     if limiter.shouldEmit(force: totalRead == byteLimit) {
-                        let elapsed = max(ProcessInfo.processInfo.systemUptime - startedAt, 0.001)
+                        let elapsed = max(uptime() - startedAt, 0.001)
                         progress?(FileOperationProgress(
                             phase: phase,
                             currentPath: sample.url.path,
@@ -320,7 +519,7 @@ public struct StorageBenchmarkService: @unchecked Sendable {
         guard totalRead > 0 else {
             throw ToolkitError.commandFailed("The speed test could not read any sample bytes.")
         }
-        let duration = max(ProcessInfo.processInfo.systemUptime - startedAt, 0.001)
+        let duration = max(uptime() - startedAt, 0.001)
         return StorageBenchmarkMeasurement(
             bytes: totalRead,
             duration: duration,
@@ -357,10 +556,83 @@ public struct StorageBenchmarkService: @unchecked Sendable {
         return descriptor
     }
 
-    private static func posixError(operation: String, url: URL) -> ToolkitError {
+    static func posixError(operation: String, url: URL) -> ToolkitError {
         let code = errno
         return .commandFailed(
             "Could not \(operation) \(url.path): \(String(cString: strerror(code))) (errno \(code))"
         )
+    }
+}
+
+/// The production write sink: an `O_EXCL` temporary file opened uncached
+/// (`F_NOCACHE`) and preallocated when the filesystem allows it
+/// (`F_PREALLOCATE`, falling back to `ftruncate`, then to nothing). Each
+/// `writeChunk` ends in `fsync`, so it returns only once the device accepted
+/// the bytes.
+private final class UncachedSpeedTestSink: SpeedTestDeviceSink, @unchecked Sendable {
+    private let url: URL
+    private var descriptor: Int32 = -1
+
+    init(url: URL, byteCount: Int64) throws {
+        self.url = url
+        let descriptor = url.withUnsafeFileSystemRepresentation { path -> Int32 in
+            guard let path else { return -1 }
+            return Darwin.open(path, O_CREAT | O_EXCL | O_WRONLY, S_IRUSR | S_IWUSR)
+        }
+        guard descriptor >= 0 else {
+            throw StorageBenchmarkService.posixError(operation: "open", url: url)
+        }
+        self.descriptor = descriptor
+        guard Darwin.fcntl(descriptor, F_NOCACHE, 1) == 0 else {
+            let error = StorageBenchmarkService.posixError(
+                operation: "disable the file cache for", url: url
+            )
+            Darwin.close(descriptor)
+            self.descriptor = -1
+            throw error
+        }
+        preallocate(byteCount)
+    }
+
+    /// Best-effort preallocation so the write loop measures streaming into
+    /// real blocks instead of filesystem allocation. Unsupported on some
+    /// filesystems (fskit exFAT) — every step ignores failure.
+    private func preallocate(_ byteCount: Int64) {
+        var store = fstore_t()
+        store.fst_flags = UInt32(F_ALLOCATECONTIG) | UInt32(F_ALLOCATEALL)
+        store.fst_posmode = F_PEOFPOSMODE
+        store.fst_offset = 0
+        store.fst_length = off_t(byteCount)
+        store.fst_bytesalloc = 0
+        _ = Darwin.fcntl(descriptor, F_PREALLOCATE, &store)
+        _ = Darwin.ftruncate(descriptor, off_t(byteCount))
+    }
+
+    func writeChunk(_ bytes: UnsafeRawBufferPointer) throws {
+        guard descriptor >= 0 else { return }
+        if let address = bytes.baseAddress {
+            var offset = 0
+            while offset < bytes.count {
+                let written = Darwin.write(descriptor, address.advanced(by: offset), bytes.count - offset)
+                if written < 0, errno == EINTR { continue }
+                guard written > 0 else {
+                    throw StorageBenchmarkService.posixError(
+                        operation: "write speed-test data to", url: url
+                    )
+                }
+                offset += written
+            }
+        }
+        guard Darwin.fsync(descriptor) == 0 else {
+            throw StorageBenchmarkService.posixError(
+                operation: "flush speed-test data on", url: url
+            )
+        }
+    }
+
+    func close() {
+        guard descriptor >= 0 else { return }
+        Darwin.close(descriptor)
+        descriptor = -1
     }
 }

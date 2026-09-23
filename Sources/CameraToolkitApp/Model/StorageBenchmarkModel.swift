@@ -238,11 +238,25 @@ final class StorageBenchmarkViewModel {
     var phase = ""
     var progress = 0.0
     var liveBytesPerSecond = 0.0
-    var sampleSize: BenchmarkSampleSize = .standard
+    var sampleSize: BenchmarkSampleSize = .quick
 
-    @ObservationIgnored private weak var dashboardModel: DashboardModel?
+    /// Weak so the window's model never keeps the shell alive.
+    @ObservationIgnored weak var dashboardModel: DashboardModel?
+    /// Background disk work waits at this gate while a target's volume is
+    /// being measured — the same gate EventsWorkspace and TileImageLoader use.
+    @ObservationIgnored let driveActivityGate: DriveActivityGate
+    /// Test seam — production runs the real `StorageBenchmarkService`.
+    @ObservationIgnored private let makeService: () -> StorageBenchmarkService
     @ObservationIgnored private var task: Task<Void, Never>?
     @ObservationIgnored private var refreshTask: Task<Void, Never>?
+
+    init(
+        driveActivityGate: DriveActivityGate = .shared,
+        makeService: @escaping () -> StorageBenchmarkService = { StorageBenchmarkService() }
+    ) {
+        self.driveActivityGate = driveActivityGate
+        self.makeService = makeService
+    }
 
     var isRunning: Bool { activeTargetID != nil }
 
@@ -295,7 +309,7 @@ final class StorageBenchmarkViewModel {
 
     func cancel() {
         task?.cancel()
-        phase = "Cancelling after the current I/O call…"
+        phase = "Cancelling…"
     }
 
     private func start(jobs: [(StorageBenchmarkTarget, BenchmarkKind)]) {
@@ -370,6 +384,12 @@ final class StorageBenchmarkViewModel {
         byteCount: Int64
     ) async throws -> StorageBenchmarkResult {
         let targetID = target.id
+        // Park the app's own background disk work on this volume for the
+        // whole measurement so scans, sweeps, and decodes never contend —
+        // or pile onto a drive the test may be about to call unresponsive.
+        driveActivityGate.pause(target.volumeRoot)
+        defer { driveActivityGate.resume(target.volumeRoot) }
+
         let (updates, continuation) = AsyncStream<FileOperationProgress>.makeStream()
         let progressTask = Task { [weak self] in
             for await update in updates {
@@ -379,11 +399,11 @@ final class StorageBenchmarkViewModel {
                 self.liveBytesPerSecond = update.bytesPerSecond
             }
         }
+        let service = makeService()
         let worker = Task.detached(priority: .userInitiated) {
             let progressHandler: FileOperationProgressHandler = { update in
                 continuation.yield(update)
             }
-            let service = StorageBenchmarkService()
             switch kind {
             case .read:
                 return try service.benchmarkReadOnly(

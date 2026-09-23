@@ -219,13 +219,17 @@ enum StorageBottleneckAnalysis {
         case .wifi:
             headline = "\(title) is limited by Wi-Fi"
             let nasNote = nasElement.map {
-                ", while \(stripDirection(from: $0.name)) can take ~\(Int($0.megabytesPerSecond.rounded())) MB/s"
+                $0.isMeasured
+                    ? ", while \(stripDirection(from: $0.name)) measures ~\(Int($0.megabytesPerSecond.rounded())) MB/s"
+                    : ", while \(stripDirection(from: $0.name))'s ~\(Int($0.megabytesPerSecond.rounded())) MB/s is still an estimate until tested"
             } ?? ""
             detail = "This Mac is on Wi-Fi at ~\(rate) MB/s\(nasNote). Plug in Ethernet and the archive gets faster."
         case .network:
             headline = "\(title) is limited by the network"
             let nasNote = nasElement.map {
-                " \(stripDirection(from: $0.name)) can take ~\(Int($0.megabytesPerSecond.rounded())) MB/s, so the wire is the limit."
+                $0.isMeasured
+                    ? " \(stripDirection(from: $0.name)) measures ~\(Int($0.megabytesPerSecond.rounded())) MB/s, so the wire is the limit."
+                    : " \(stripDirection(from: $0.name)) is a ~\(Int($0.megabytesPerSecond.rounded())) MB/s estimate until tested, so the wire is the limit."
             } ?? ""
             let negotiated = bottleneck.detail == "typical" ? "is undetected" : "negotiates \(bottleneck.detail)"
             detail = "The link to the NAS \(negotiated), which tops out near \(rate) MB/s.\(nasNote) A faster Ethernet link would help."
