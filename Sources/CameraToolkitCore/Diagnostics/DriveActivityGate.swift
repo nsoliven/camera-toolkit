@@ -19,9 +19,10 @@ public final class DriveActivityGate: @unchecked Sendable {
 
     public init() {}
 
-    /// Lowercased, standardized path so case-insensitive volumes match.
+    /// Lowercased path so case-insensitive volumes match. Purely lexical:
+    /// `standardizedFileURL` stats the path, and scans call this per file.
     private static func key(for url: URL) -> String {
-        url.standardizedFileURL.path.lowercased()
+        url.path.lowercased()
     }
 
     /// True when `url` is the paused root or lives inside it.
@@ -56,6 +57,7 @@ public final class DriveActivityGate: @unchecked Sendable {
     public func isPaused(for url: URL) -> Bool {
         condition.lock()
         defer { condition.unlock() }
+        guard !pausedRoots.isEmpty else { return false }
         return isPausedLocked(key: Self.key(for: url))
     }
 
@@ -71,7 +73,7 @@ public final class DriveActivityGate: @unchecked Sendable {
     ) -> Bool {
         while true {
             condition.lock()
-            if !isPausedLocked(key: Self.key(for: url)) {
+            if pausedRoots.isEmpty || !isPausedLocked(key: Self.key(for: url)) {
                 condition.unlock()
                 return true
             }
