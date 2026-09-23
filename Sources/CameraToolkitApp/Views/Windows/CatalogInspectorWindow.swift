@@ -11,30 +11,21 @@ final class CatalogInspectorWindowController: NSObject, NSWindowDelegate {
     func show(model: DashboardModel) {
         model.syncCatalogCache()
         if let window {
-            window.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
+            CameraToolkitWindowFactory.present(window)
             return
         }
 
         let catalogURL = URL(fileURLWithPath: DashboardModel.expandedPath(model.configuration.catalogDatabasePath))
-        let controller = NSHostingController(rootView: CatalogInspectorView(catalogURL: catalogURL))
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 1_120, height: 720),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
-            backing: .buffered,
-            defer: false
+        let window = CameraToolkitWindowFactory.make(
+            .photoDatabase,
+            identifier: "CameraToolkitCatalogInspectorWindow",
+            title: "Photo List SQL Inspector",
+            initialContentSize: NSSize(width: 1_120, height: 720),
+            rootView: CatalogInspectorView(catalogURL: catalogURL)
         )
-        window.title = "Photo List SQL Inspector"
-        window.identifier = NSUserInterfaceItemIdentifier("CameraToolkitCatalogInspectorWindow")
-        window.isReleasedWhenClosed = false
-        window.contentViewController = controller
-        CameraToolkitWindowSizing.configure(window, as: .photoDatabase)
-        window.setContentSize(NSSize(width: 1_120, height: 720))
         window.delegate = self
-        window.center()
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
         self.window = window
+        CameraToolkitWindowFactory.present(window)
     }
 }
 
@@ -46,22 +37,19 @@ private enum CatalogInspectorMode: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
-private struct CatalogGridCell: View {
-    var text: String
-    var shaded: Bool = false
-    var isHeader: Bool = false
+/// One result row for the native `Table` — the row's position is its
+/// identity, since query results carry no key of their own.
+struct CatalogResultRow: Identifiable, Equatable {
+    let id: Int
+    let values: [String]
 
-    var body: some View {
-        Text(text)
-            .font(isHeader ? .caption.bold() : .system(.caption, design: .monospaced))
-            .lineLimit(isHeader ? 1 : 3)
-            .textSelection(.enabled)
-            .frame(width: 190, alignment: .leading)
-            .frame(minHeight: isHeader ? 0 : 30, alignment: .leading)
-            .padding(.horizontal, 8)
-            .padding(.vertical, isHeader ? 8 : 4)
-            .background(isHeader ? Color(nsColor: .windowBackgroundColor) : (shaded ? Color.primary.opacity(0.035) : Color.clear))
-            .overlay(alignment: .trailing) { Rectangle().fill(Color.primary.opacity(0.10)).frame(width: 1) }
+    static func rows(from result: CatalogQueryResult) -> [CatalogResultRow] {
+        result.rows.enumerated().map { CatalogResultRow(id: $0.offset, values: $0.element) }
+    }
+
+    /// The cell for one column, empty when a ragged row is short.
+    func value(at column: Int) -> String {
+        column < values.count ? values[column] : ""
     }
 }
 
@@ -100,14 +88,13 @@ private struct CatalogInspectorView: View {
             }
             .navigationSplitViewColumnWidth(min: 190, ideal: 230, max: 300)
         } detail: {
-            VStack(spacing: 0) {
-                header
-                Divider()
-                content
-            }
-            .background(Color(nsColor: .controlBackgroundColor))
+            content
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .navigationSplitViewStyle(.balanced)
+        .navigationTitle(selectedObjectName ?? "SQLite Catalog")
+        .navigationSubtitle(subtitle)
+        .toolbar { toolbar }
         .task { await reloadObjects() }
         .onChange(of: selectedObjectName) { _, _ in
             guard mode == .rows else { return }
@@ -118,44 +105,52 @@ private struct CatalogInspectorView: View {
         }
     }
 
-    private var header: some View {
-        HStack(spacing: 12) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(selectedObjectName ?? "SQLite Catalog")
-                    .font(.title2.bold())
-                Text(catalogURL.path)
-                    .font(.caption.monospaced())
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-            }
-            Spacer()
-            Label("GRDB · Read only", systemImage: "lock.fill")
-                .font(.caption.weight(.medium))
-                .foregroundStyle(.green)
-                .padding(.horizontal, 9)
-                .padding(.vertical, 5)
-                .background(Color.green.opacity(0.12), in: Capsule())
+    /// "Read only · catalog.sqlite · 42 rows" — the full path is the
+    /// Reveal button's tooltip.
+    private var subtitle: String {
+        var parts = ["Read only", catalogURL.lastPathComponent]
+        if mode != .schema, !result.columns.isEmpty {
+            parts.append("\(result.rows.count) row\(result.rows.count == 1 ? "" : "s")")
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    @ToolbarContentBuilder
+    private var toolbar: some ToolbarContent {
+        ToolbarItem(placement: .principal) {
             Picker("View", selection: $mode) {
                 ForEach(CatalogInspectorMode.allCases) { Text($0.rawValue).tag($0) }
             }
-            .labelsHidden()
             .pickerStyle(.segmented)
-            .frame(width: 250)
-            Button {
+            .labelsHidden()
+            .fixedSize()
+        }
+        ToolbarItem {
+            Button("Reveal in Finder", systemImage: "folder") {
                 NSWorkspace.shared.activateFileViewerSelecting([catalogURL])
-            } label: {
-                Image(systemName: "folder")
             }
-            .help("Reveal catalog in Finder")
-            Button {
+            .help("Reveal catalog in Finder — \(catalogURL.path)")
+        }
+        ToolbarItem {
+            Button("Reload", systemImage: "arrow.clockwise") {
                 Task { await reloadObjects() }
-            } label: {
-                Image(systemName: "arrow.clockwise")
             }
             .help("Reload tables and rows")
         }
-        .padding(14)
+        if mode == .sql {
+            ToolbarSpacer(.fixed)
+            ToolbarItem {
+                Button {
+                    Task { await runSQL() }
+                } label: {
+                    Label("Run", systemImage: "play.fill")
+                        .labelStyle(.titleAndIcon)
+                }
+                .buttonStyle(.glassProminent)
+                .keyboardShortcut(.return, modifiers: [.command])
+                .help("Run the read-only query (⌘↩)")
+            }
+        }
     }
 
     @ViewBuilder
@@ -166,13 +161,13 @@ private struct CatalogInspectorView: View {
         } else if let errorMessage {
             ContentUnavailableView(
                 "Couldn’t Read Catalog",
-                systemImage: "exclamationmark.triangle",
+                systemImage: "exclamationmark.triangle.fill",
                 description: Text(errorMessage)
             )
         } else {
             switch mode {
             case .rows:
-                resultGrid
+                resultTable
             case .schema:
                 schemaView
             case .sql:
@@ -207,9 +202,6 @@ private struct CatalogInspectorView: View {
                     Text("SELECT · WITH · PRAGMA · EXPLAIN")
                         .font(.caption.monospaced())
                         .foregroundStyle(.secondary)
-                    Button("Run") { Task { await runSQL() } }
-                        .keyboardShortcut(.return, modifiers: [.command])
-                        .buttonStyle(.borderedProminent)
                 }
                 TextEditor(text: $sql)
                     .font(.system(.body, design: .monospaced))
@@ -218,55 +210,40 @@ private struct CatalogInspectorView: View {
                     .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
                     .overlay {
                         RoundedRectangle(cornerRadius: 8)
-                            .stroke(Color.primary.opacity(0.12), lineWidth: 1)
+                            .stroke(.separator, lineWidth: 1)
                     }
             }
             .padding(14)
             Divider()
-            resultGrid
+            resultTable
         }
     }
 
-    private var resultGrid: some View {
-        Group {
-            if result.columns.isEmpty {
-                ContentUnavailableView(
-                    mode == .rows ? "Choose a Table" : "Run a Query",
-                    systemImage: "tablecells",
-                    description: Text(mode == .rows ? "Select a SQLite table or view from the sidebar." : "Results appear here. Queries are capped at 500 rows.")
-                )
-            } else {
-                ScrollView([.horizontal, .vertical]) {
-                    LazyVStack(alignment: .leading, spacing: 0, pinnedViews: [.sectionHeaders]) {
-                        Section {
-                            ForEach(Array(result.rows.enumerated()), id: \.offset) { index, row in
-                                HStack(spacing: 0) {
-                                    ForEach(Array(row.enumerated()), id: \.offset) { _, value in
-                                        CatalogGridCell(text: value, shaded: !index.isMultiple(of: 2))
-                                    }
-                                }
-                                Divider()
-                            }
-                        } header: {
-                            HStack(spacing: 0) {
-                                ForEach(Array(result.columns.enumerated()), id: \.offset) { _, column in
-                                    CatalogGridCell(text: column, isHeader: true)
-                                }
-                            }
-                            Divider()
-                        }
+    /// Query results as a native table: resizable columns, row selection,
+    /// and ⌘C. Keyed on the column set so a query with different columns
+    /// rebuilds the table instead of reusing stale column identities.
+    @ViewBuilder
+    private var resultTable: some View {
+        if result.columns.isEmpty {
+            ContentUnavailableView(
+                mode == .rows ? "Choose a Table" : "Run a Query",
+                systemImage: "tablecells",
+                description: Text(mode == .rows ? "Select a SQLite table or view from the sidebar." : "Results appear here. Queries are capped at 500 rows.")
+            )
+        } else {
+            let columns = result.columns
+            Table(CatalogResultRow.rows(from: result)) {
+                TableColumnForEach(columns.indices, id: \.self) { index in
+                    TableColumn(columns[index]) { row in
+                        Text(row.value(at: index))
+                            .font(.caption.monospaced())
+                            .lineLimit(3)
+                            .help(row.value(at: index))
                     }
-                }
-                .defaultScrollAnchor(.topLeading)
-                .overlay(alignment: .bottomTrailing) {
-                    Text("\(result.rows.count) row\(result.rows.count == 1 ? "" : "s")")
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(.secondary)
-                        .padding(8)
-                        .background(.ultraThinMaterial, in: Capsule())
-                        .padding(10)
+                    .width(min: 60, ideal: 180)
                 }
             }
+            .id(columns)
         }
     }
 

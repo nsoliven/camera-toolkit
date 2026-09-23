@@ -10,29 +10,20 @@ final class EventLibraryWindowController: NSObject, NSWindowDelegate {
 
     func show(model: DashboardModel) {
         if let window {
-            window.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
+            CameraToolkitWindowFactory.present(window)
             return
         }
 
-        let controller = NSHostingController(rootView: EventLibraryView(model: model))
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 1_260, height: 760),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
-            backing: .buffered,
-            defer: false
+        let window = CameraToolkitWindowFactory.make(
+            .eventLibrary,
+            identifier: "CameraToolkitEventLibraryWindow",
+            title: "Event Library",
+            initialContentSize: NSSize(width: 1_260, height: 760),
+            rootView: EventLibraryView(model: model)
         )
-        window.title = "Event Library"
-        window.identifier = NSUserInterfaceItemIdentifier("CameraToolkitEventLibraryWindow")
-        window.isReleasedWhenClosed = false
-        window.contentViewController = controller
-        CameraToolkitWindowSizing.configure(window, as: .eventLibrary)
-        window.setContentSize(NSSize(width: 1_260, height: 760))
         window.delegate = self
-        window.center()
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
         self.window = window
+        CameraToolkitWindowFactory.present(window)
     }
 }
 
@@ -91,31 +82,43 @@ private struct EventLibraryView: View {
                 .navigationSplitViewColumnWidth(min: 210, ideal: 250, max: 320)
         } detail: {
             VStack(spacing: 0) {
-                eventHeader
-                Divider()
+                if let event = selectedEvent {
+                    eventControls(event)
+                    Divider()
+                }
                 if selectedEvent == nil {
                     ContentUnavailableView(
                         "Choose an Event",
                         systemImage: "calendar",
                         description: Text("Events collect photos from multiple folders and camera cards without moving the originals.")
                     )
+                    .frame(maxHeight: .infinity)
                 } else if rows.isEmpty && !isScanningLocations {
                     ContentUnavailableView(
                         "No Photos Assigned",
                         systemImage: "photo.on.rectangle.angled",
                         description: Text("Use the + selection basket in the main browser, then assign those photos to this event.")
                     )
+                    .frame(maxHeight: .infinity)
                 } else {
                     assetTable
                 }
-                Divider()
-                selectionInspector
-                Divider()
-                statusBar
             }
-            .background(Color(nsColor: .controlBackgroundColor))
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                VStack(spacing: 0) {
+                    Divider()
+                    selectionInspector
+                    Divider()
+                    statusBar
+                }
+                .background(.bar)
+            }
         }
         .navigationSplitViewStyle(.balanced)
+        .navigationTitle(selectedEvent.map { EventHierarchy.displayName(of: $0, in: model.configuration.savedEvents) } ?? "Event Library")
+        .navigationSubtitle(windowSubtitle)
+        .toolbar { toolbar }
         .task(id: selectedEventID) {
             guard selectedEventID != nil else {
                 selectedEventID = model.configuration.selectedEventID ?? model.savedEvents.first?.id
@@ -126,19 +129,49 @@ private struct EventLibraryView: View {
         }
     }
 
-    private var eventSidebar: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Label("Events", systemImage: "calendar")
-                    .font(.headline)
-                Spacer()
-                Text("\(model.savedEvents.count)")
-                    .font(.caption.bold().monospacedDigit())
-                    .foregroundStyle(.secondary)
+    private var windowSubtitle: String {
+        guard let event = selectedEvent else {
+            return "\(model.savedEvents.count) event\(model.savedEvents.count == 1 ? "" : "s")"
+        }
+        return "\(event.eventDate.formatted(date: .long, time: .omitted)) · \(rows.count) assigned item\(rows.count == 1 ? "" : "s")"
+    }
+
+    @ToolbarContentBuilder
+    private var toolbar: some ToolbarContent {
+        if isScanningLocations || isCheckingImmich {
+            ToolbarItem {
+                ProgressView()
+                    .controlSize(.small)
+                    .help(isCheckingImmich ? "Checking Immich…" : "Checking drives…")
             }
-            .padding(12)
-            Divider()
-            List(selection: $selectedEventID) {
+        }
+        ToolbarItem {
+            Button("Refresh", systemImage: "arrow.clockwise") {
+                Task { await refreshEvent() }
+            }
+            .disabled(selectedEvent == nil)
+            .help("Re-check every saved location of this event's photos")
+        }
+        ToolbarItem {
+            Button {
+                Task { await checkImmich() }
+            } label: {
+                Label(isCheckingImmich ? "Checking…" : "Check Immich", systemImage: "checkmark.icloud")
+            }
+            .disabled(isCheckingImmich || rows.isEmpty)
+            .help("Hash local files in bounded chunks and ask Immich whether that exact content already exists. No upload is performed.")
+        }
+        ToolbarItem {
+            Button("SQL Inspector", systemImage: "cylinder.split.1x2") {
+                CatalogInspectorWindowController.shared.show(model: model)
+            }
+            .help("Browse the SQLite photo list, schema, and read-only SQL queries (⇧⌘I)")
+        }
+    }
+
+    private var eventSidebar: some View {
+        List(selection: $selectedEventID) {
+            Section("Events") {
                 ForEach(EventHierarchy.flattened(model.configuration.savedEvents), id: \.event.id) { row in
                     VStack(alignment: .leading, spacing: 4) {
                         HStack {
@@ -165,86 +198,58 @@ private struct EventLibraryView: View {
                     .tag(Optional(row.event.id))
                 }
             }
-            .listStyle(.sidebar)
         }
+        .listStyle(.sidebar)
     }
 
-    @ViewBuilder
-    private var eventHeader: some View {
-        if let event = selectedEvent {
-            VStack(spacing: 10) {
-                HStack(spacing: 12) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(EventHierarchy.displayName(of: event, in: model.configuration.savedEvents))
-                            .font(.title2.bold())
-                        Text("\(event.eventDate.formatted(date: .long, time: .omitted)) · \(rows.count) assigned item\(rows.count == 1 ? "" : "s")")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+    /// The selected event's Immich routing and its folders — settings of
+    /// the event itself, above the table of its photos.
+    private func eventControls(_ event: SavedCameraEvent) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 12) {
+                Toggle("Send to Immich", isOn: Binding(
+                    get: { selectedEvent?.sendsToImmich ?? false },
+                    set: { model.setEventImmichUploadEnabled(event.id, enabled: $0) }
+                ))
+                .toggleStyle(.switch)
+
+                Divider().frame(height: 24)
+
+                Picker("Album", selection: Binding(
+                    get: { selectedEvent?.resolvedImmichAlbumPolicy ?? .none },
+                    set: { model.setEventImmichAlbumPolicy(event.id, policy: $0) }
+                )) {
+                    ForEach(ImmichAlbumPolicy.allCases) { policy in
+                        Text(policy.displayName).tag(policy)
                     }
-                    Spacer()
-                    if isScanningLocations {
-                        ProgressView().controlSize(.small)
-                        Text("Checking drives…").font(.caption).foregroundStyle(.secondary)
-                    }
-                    Button {
-                        Task { await refreshEvent() }
-                    } label: {
-                        Label("Refresh", systemImage: "arrow.clockwise")
-                    }
-                    Button {
-                        Task { await checkImmich() }
-                    } label: {
-                        Label(isCheckingImmich ? "Checking…" : "Check Immich", systemImage: "cloud.magnifyingglass")
-                    }
-                    .disabled(isCheckingImmich || rows.isEmpty)
-                    .help("Hash local files in bounded chunks and ask Immich whether that exact content already exists. No upload is performed.")
+                }
+                .frame(width: 210)
+                .disabled(!event.sendsToImmich)
+
+                if event.resolvedImmichAlbumPolicy == .custom {
+                    TextField("Album name", text: $customAlbumName)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 210)
+                        .onSubmit { model.setEventImmichAlbumName(event.id, name: customAlbumName) }
                 }
 
-                HStack(spacing: 12) {
-                    Toggle("Send to Immich", isOn: Binding(
-                        get: { selectedEvent?.sendsToImmich ?? false },
-                        set: { model.setEventImmichUploadEnabled(event.id, enabled: $0) }
-                    ))
-                    .toggleStyle(.switch)
-
-                    Divider().frame(height: 24)
-
-                    Picker("Album", selection: Binding(
-                        get: { selectedEvent?.resolvedImmichAlbumPolicy ?? .none },
-                        set: { model.setEventImmichAlbumPolicy(event.id, policy: $0) }
-                    )) {
-                        ForEach(ImmichAlbumPolicy.allCases) { policy in
-                            Text(policy.displayName).tag(policy)
-                        }
-                    }
-                    .frame(width: 210)
-                    .disabled(!event.sendsToImmich)
-
-                    if event.resolvedImmichAlbumPolicy == .custom {
-                        TextField("Album name", text: $customAlbumName)
-                            .textFieldStyle(.roundedBorder)
-                            .frame(width: 210)
-                            .onSubmit { model.setEventImmichAlbumName(event.id, name: customAlbumName) }
-                    }
-
-                    Spacer()
-                    Text("Routing preference only · uploads remain locked")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-
-                HStack(spacing: 10) {
-                    Text("Event folders")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                    eventFolderButton("Photomator", systemImage: "slider.horizontal.3", url: eventFolderURLs(event).photomator)
-                    eventFolderButton("Exports", systemImage: "square.and.arrow.up", url: eventFolderURLs(event).exports)
-                    eventFolderButton("Library Edited", systemImage: "externaldrive", url: eventFolderURLs(event).libraryEdited)
-                    Spacer()
-                }
+                Spacer()
+                Text("Routing preference only · uploads remain locked")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
-            .padding(14)
+
+            HStack(spacing: 10) {
+                Text("Event folders")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                eventFolderButton("Photomator", systemImage: "slider.horizontal.3", url: eventFolderURLs(event).photomator)
+                eventFolderButton("Exports", systemImage: "square.and.arrow.up", url: eventFolderURLs(event).exports)
+                eventFolderButton("Library Edited", systemImage: "externaldrive", url: eventFolderURLs(event).libraryEdited)
+                Spacer()
+            }
         }
+        .padding(14)
     }
 
     private var assetTable: some View {
@@ -318,7 +323,6 @@ private struct EventLibraryView: View {
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
-            .background(.bar)
         } else {
             Text("Select a photo to inspect and reveal its exact paths.")
                 .font(.caption)
@@ -326,26 +330,17 @@ private struct EventLibraryView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.horizontal, 14)
                 .padding(.vertical, 10)
-                .background(.bar)
         }
     }
 
     private var statusBar: some View {
-        HStack {
-            Text(statusText)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-            Spacer()
-            Button {
-                CatalogInspectorWindowController.shared.show(model: model)
-            } label: {
-                Label("SQL Inspector…", systemImage: "cylinder.split.1x2")
-            }
-            .buttonStyle(.borderless)
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 7)
+        Text(statusText)
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 7)
     }
 
     private func assignmentCount(for eventID: UUID) -> Int {
@@ -378,7 +373,8 @@ private struct EventLibraryView: View {
                     .foregroundStyle(.secondary)
             }
         }
-        .menuStyle(.borderlessButton)
+        .menuStyle(.button)
+        .buttonStyle(.borderless)
     }
 
     @ViewBuilder
@@ -409,7 +405,10 @@ private struct EventLibraryView: View {
             if exists { NSWorkspace.shared.activateFileViewerSelecting([url]) }
         } label: {
             HStack(spacing: 5) {
-                Circle().fill(exists ? Color.green : Color.secondary.opacity(0.4)).frame(width: 7, height: 7)
+                Image(systemName: exists ? "checkmark.circle.fill" : "circle.dashed")
+                    .foregroundStyle(exists ? Color.green : Color.secondary)
+                    .imageScale(.small)
+                    .accessibilityLabel(exists ? "Present" : "Not present")
                 Text("\(title): \(url.path)")
                     .font(.caption.monospaced())
                     .lineLimit(1)
