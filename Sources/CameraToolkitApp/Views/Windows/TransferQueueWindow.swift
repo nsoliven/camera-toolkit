@@ -59,7 +59,9 @@ private struct TransferQueueView: View {
             minHeight: CameraToolkitPopOutWindow.transferQueue.minimumContentSize.height,
             maxHeight: .infinity
         )
-        .background(Color(nsColor: .controlBackgroundColor))
+        .navigationTitle("Jobs")
+        .navigationSubtitle(windowSubtitle)
+        .toolbar { toolbar }
         .onChange(of: firstLiveJobID) { _, newID in
             // Follow the job that is actually running; a finished job's
             // pane collapses and stays reachable by tapping its row.
@@ -69,6 +71,75 @@ private struct TransferQueueView: View {
             }
         }
     }
+
+    // MARK: - Title and toolbar
+
+    /// The transfer's phase and counts while one exists, else what the
+    /// window is waiting on.
+    private var windowSubtitle: String {
+        if let queue = model.transferQueue {
+            return "\(queue.phase) · \(queueSummary(queue))"
+        }
+        if !model.pendingTransferBatches.isEmpty {
+            return "Transfers waiting — the list is saved. Start it when the camera and Buffer are connected."
+        }
+        if let job = model.jobs.first(where: { $0.state == .running || $0.state == .queued }) {
+            return job.note
+        }
+        return ""
+    }
+
+    @ToolbarContentBuilder
+    private var toolbar: some ToolbarContent {
+        if let queue = model.transferQueue {
+            ToolbarItem {
+                Button("Speed Guide", systemImage: "gauge.with.dots.needle.50percent") {
+                    showingSpeedGuide.toggle()
+                }
+                .help("Compare this transfer with USB, Thunderbolt, camera, and SD card speeds")
+                .popover(isPresented: $showingSpeedGuide, arrowEdge: .bottom) {
+                    TransferSpeedGuideView(queue: queue, model: model)
+                }
+            }
+            ToolbarItem {
+                Menu("Show in Finder", systemImage: "folder") {
+                    Button("Show Camera") {
+                        revealFolder(queue.sourcePath)
+                    }
+                    Button("Show Buffer") {
+                        revealFolder(queue.destinationPath)
+                    }
+                }
+                .help("Open the camera or Buffer folder of this transfer in Finder")
+            }
+            if queue.state != .running {
+                ToolbarItem {
+                    Button("Clear", systemImage: "xmark.circle") {
+                        model.dismissTransferQueue()
+                    }
+                    .help("Clear this finished transfer from the queue")
+                }
+            }
+        }
+        if !model.pendingTransferBatches.isEmpty {
+            ToolbarSpacer(.fixed)
+            ToolbarItem {
+                Button {
+                    model.resumePendingTransfers()
+                } label: {
+                    Label("Start Next Transfer", systemImage: "play.fill")
+                        .labelStyle(.titleAndIcon)
+                }
+                .buttonStyle(.glassProminent)
+                .disabled(model.isBusy || model.isStorageBenchmarkRunning)
+                .help(model.isBusy
+                    ? "Starts automatically after the current job"
+                    : "Copy the next waiting batch to the Buffer")
+            }
+        }
+    }
+
+    // MARK: - Layout
 
     private func queueContent(_ queue: TransferQueueSnapshot) -> some View {
         VStack(spacing: 0) {
@@ -93,9 +164,14 @@ private struct TransferQueueView: View {
             }
 
             Divider()
-            queueList(queue)
-            Divider()
-            locationFooter(queue)
+            queueTable(queue)
+        }
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            VStack(spacing: 0) {
+                Divider()
+                locationFooter(queue)
+            }
+            .background(.bar)
         }
         .sheet(isPresented: $showingSourceCleanup) {
             SourceCleanupSheet(model: model, queue: queue)
@@ -104,33 +180,11 @@ private struct TransferQueueView: View {
 
     /// No transfer in flight: waiting batches on top, the shared job list
     /// filling the rest — this is the window's whole story when a face scan
-    /// or regroup runs without a copy queued.
+    /// or regroup runs without a copy queued. Start Next Transfer lives in
+    /// the toolbar.
     private var idleContent: some View {
         VStack(spacing: 0) {
             if !model.pendingTransferBatches.isEmpty {
-                HStack(spacing: 12) {
-                    Image(systemName: "clock.arrow.circlepath")
-                        .font(.system(size: 22, weight: .medium))
-                        .foregroundStyle(.blue)
-                        .frame(width: 36, height: 36)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Transfers Waiting")
-                            .font(.headline)
-                        Text("The list is saved. Start it when the camera and Buffer are connected.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    Button("Start Next Transfer") {
-                        model.resumePendingTransfers()
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(model.isBusy || model.isStorageBenchmarkRunning)
-                }
-                .padding(16)
-                .background(.bar)
-
-                Divider()
                 pendingBatchesSection
                 Divider()
             }
@@ -138,44 +192,45 @@ private struct TransferQueueView: View {
         }
     }
 
+    private func sectionHeader(_ title: String, detail: String? = nil) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(title)
+                .font(.headline)
+            if let detail {
+                Text(detail)
+                    .font(.callout.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 10)
+        .padding(.bottom, 4)
+    }
+
+    // MARK: - Jobs
+
     /// Every background job this session — transfers, organize work, burst
     /// regrouping, face scans — newest first. The single-job gate keeps at
     /// most one running; that job's row opens into the activity pane on
-    /// its own, and any row can be tapped open for its final counters.
+    /// its own, and any row can be opened for its final counters.
     private var jobsSection: some View {
         let jobs = Array(model.jobs.prefix(30))
         let anyExpanded = jobs.contains(where: isExpanded)
         return VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 8) {
-                Text("JOBS")
-                    .font(.caption2.weight(.bold))
-                    .foregroundStyle(.secondary)
-                if let step = jobs.first(where: isExpanded)?.telemetry?.step {
-                    Text(step.uppercased())
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(.tertiary)
-                }
-                Spacer(minLength: 0)
-            }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 8)
-
-            ScrollView {
-                LazyVStack(spacing: 0) {
-                    ForEach(jobs) { job in
+            sectionHeader("Jobs", detail: jobs.first(where: isExpanded)?.telemetry?.step)
+            List {
+                ForEach(jobs) { job in
+                    DisclosureGroup(isExpanded: expansionBinding(job)) {
+                        JobActivityDetail(job: job, monitor: monitor)
+                    } label: {
                         jobRow(job)
-                        if isExpanded(job) {
-                            JobActivityDetail(job: job, monitor: monitor)
-                        }
-                        if job.id != jobs.last?.id {
-                            Divider().padding(.leading, 48)
-                        }
                     }
                 }
             }
+            .listStyle(.inset)
             .frame(maxHeight: model.transferQueue == nil ? .infinity : (anyExpanded ? 340 : 150))
         }
-        .background(Color(nsColor: .textBackgroundColor))
     }
 
     private var firstLiveJobID: UUID? {
@@ -199,58 +254,58 @@ private struct TransferQueueView: View {
         }
     }
 
-    private func jobRow(_ job: JobSnapshot) -> some View {
-        Button {
-            toggleJob(job)
-        } label: {
-            HStack(spacing: 12) {
-                Image(systemName: jobSymbol(job))
-                    .font(.system(size: 15, weight: .medium))
-                    .foregroundStyle(job.state.tint)
-                    .frame(width: 24, height: 24)
-
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(job.action.displayName)
-                        .font(.subheadline.weight(.medium))
-                        .lineLimit(1)
-                    Text(jobSubtitle(job))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
+    /// One open job at a time: opening a row inspects it, closing it
+    /// dismisses the live default — the same rules the chevron row used.
+    private func expansionBinding(_ job: JobSnapshot) -> Binding<Bool> {
+        Binding(
+            get: { isExpanded(job) },
+            set: { open in
+                if open != isExpanded(job) {
+                    toggleJob(job)
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
-
-                VStack(alignment: .trailing, spacing: 4) {
-                    if job.state == .running || job.state == .queued {
-                        ProgressView(value: job.progress)
-                            .frame(width: 110)
-                        Text(job.progress.formatted(.percent.precision(.fractionLength(0))))
-                            .font(.caption2.monospacedDigit())
-                            .foregroundStyle(.secondary)
-                    } else {
-                        Text(job.state.displayName)
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(job.state.tint)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 4)
-                            .background(job.state.tint.opacity(0.10), in: Capsule())
-                        Text(job.finishedAt ?? job.createdAt, style: .time)
-                            .font(.caption2.monospacedDigit())
-                            .foregroundStyle(.secondary)
-                    }
-                }
-                .frame(width: 130, alignment: .trailing)
-
-                Image(systemName: "chevron.right")
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(.tertiary)
-                    .rotationEffect(.degrees(isExpanded(job) ? 90 : 0))
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 7)
-            .contentShape(Rectangle())
+        )
+    }
+
+    private func jobRow(_ job: JobSnapshot) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: jobSymbol(job))
+                .font(.title3)
+                .symbolRenderingMode(.hierarchical)
+                .foregroundStyle(job.state.tint)
+                .frame(width: 24, height: 24)
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(job.action.displayName)
+                    .font(.subheadline.weight(.medium))
+                    .lineLimit(1)
+                Text(jobSubtitle(job))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            VStack(alignment: .trailing, spacing: 4) {
+                if job.state == .running || job.state == .queued {
+                    ProgressView(value: job.progress)
+                        .frame(width: 110)
+                    Text(job.progress.formatted(.percent.precision(.fractionLength(0))))
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text(job.state.displayName)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(job.state.tint)
+                    Text(job.finishedAt ?? job.createdAt, style: .time)
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .frame(width: 130, alignment: .trailing)
         }
-        .buttonStyle(.plain)
+        .padding(.vertical, 3)
+        .contentShape(Rectangle())
         .help(job.detail.isEmpty ? job.note : job.detail)
     }
 
@@ -280,57 +335,53 @@ private struct TransferQueueView: View {
             case .immichScan, .immichUpload: return "square.and.arrow.up"
             case .verifyManifest: return "checkmark.shield"
             case .diskSpeed, .networkSpeed: return "gauge.with.dots.needle.33percent"
-            default: return "arrow.triangle.2.circlepath"
+            default: return "arrow.trianglehead.2.clockwise.rotate.90"
             }
         }
     }
 
+    // MARK: - Up Next
+
     private var pendingBatchesSection: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 8) {
-                Text("UP NEXT")
-                    .font(.caption2.weight(.bold))
-                    .foregroundStyle(.secondary)
-                Text("\(model.pendingTransferFileCount) file\(model.pendingTransferFileCount == 1 ? "" : "s") · \(model.pendingTransferByteCount.formattedBytes)")
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
-                Spacer()
+            HStack(alignment: .firstTextBaseline) {
+                sectionHeader(
+                    "Up Next",
+                    detail: "\(model.pendingTransferFileCount) file\(model.pendingTransferFileCount == 1 ? "" : "s") · \(model.pendingTransferByteCount.formattedBytes)"
+                )
                 if model.isBusy {
                     Text("Starts automatically after the current job")
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                } else {
-                    Button("Start Next") {
-                        model.resumePendingTransfers()
-                    }
-                    .buttonStyle(.borderless)
+                        .padding(.trailing, 16)
                 }
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 8)
 
-            ScrollView {
-                LazyVStack(spacing: 0) {
-                    ForEach(Array(model.pendingTransferBatches.enumerated()), id: \.element.id) { index, batch in
-                        pendingBatchRow(batch, position: index + 1)
-                        if batch.id != model.pendingTransferBatches.last?.id {
-                            Divider().padding(.leading, 48)
-                        }
-                    }
+            List {
+                ForEach(Array(model.pendingTransferBatches.enumerated()), id: \.element.id) { index, batch in
+                    pendingBatchRow(batch, position: index + 1)
                 }
             }
+            .listStyle(.inset)
             .frame(maxHeight: model.transferQueue == nil && model.jobs.isEmpty ? .infinity : 116)
         }
-        .background(Color(nsColor: .textBackgroundColor))
     }
 
     private func pendingBatchRow(_ batch: PendingTransferBatch, position: Int) -> some View {
         HStack(spacing: 12) {
-            Text("\(position)")
-                .font(.caption.weight(.semibold).monospacedDigit())
-                .foregroundStyle(.blue)
-                .frame(width: 24, height: 24)
-                .background(Color.blue.opacity(0.10), in: Circle())
+            Group {
+                if position <= 50 {
+                    Image(systemName: "\(position).circle.fill")
+                        .symbolRenderingMode(.hierarchical)
+                } else {
+                    Text("\(position)")
+                        .font(.caption.weight(.semibold).monospacedDigit())
+                }
+            }
+            .font(.title3)
+            .foregroundStyle(.blue)
+            .frame(width: 24, height: 24)
+            .accessibilityLabel("Position \(position)")
 
             VStack(alignment: .leading, spacing: 3) {
                 Text(batch.eventName.isEmpty ? "Queued Transfer" : batch.eventName)
@@ -353,94 +404,59 @@ private struct TransferQueueView: View {
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.secondary)
 
-            Button {
+            Button("Remove Batch", systemImage: "xmark.circle") {
                 model.removePendingTransferBatch(batch.id)
-            } label: {
-                Image(systemName: "xmark.circle")
             }
+            .labelStyle(.iconOnly)
             .buttonStyle(.borderless)
             .help("Remove this waiting batch. No files will be changed.")
         }
-        .padding(.horizontal, 16)
-        .frame(height: 50)
+        .padding(.vertical, 4)
     }
 
+    // MARK: - Transfer summary
+
+    /// The transfer's progress. Its phase and file counts are the window
+    /// subtitle, so this strip carries only the numbers and the bar.
     private func summary(_ queue: TransferQueueSnapshot) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(alignment: .center, spacing: 12) {
-                ZStack {
-                    Circle()
-                        .fill(queueColor(queue.state).opacity(0.12))
-                    Image(systemName: queueSymbol(queue.state))
-                        .font(.system(size: 18, weight: .semibold))
-                        .foregroundStyle(queueColor(queue.state))
-                }
-                .frame(width: 36, height: 36)
-
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(queue.phase)
-                        .font(.headline)
-                    Text(queueSummary(queue))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
-
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                Image(systemName: queueSymbol(queue.state))
+                    .font(.title2)
+                    .symbolRenderingMode(.hierarchical)
+                    .foregroundStyle(queueColor(queue.state))
+                    .accessibilityHidden(true)
+                Text(phaseProgressLabel(queue))
+                    .font(.headline)
                 Spacer(minLength: 16)
-
-                VStack(alignment: .trailing, spacing: 2) {
-                    Text(phaseByteSummary(queue))
-                        .font(.subheadline.weight(.semibold).monospacedDigit())
-                        .lineLimit(1)
-                    HStack(spacing: 5) {
-                        if queue.state == .running, queue.bytesPerSecond > 0 {
-                            Text("\(Int64(queue.bytesPerSecond).formattedBytes)/s avg")
-                                .monospacedDigit()
-                                .help("Average for this copy or verification job. Verification alternates between camera and Buffer reads, so this is not an instantaneous camera-link measurement.")
-                        } else {
-                            Text(queueStateNote(queue.state))
-                        }
-                        Button {
-                            showingSpeedGuide.toggle()
-                        } label: {
-                            Image(systemName: "info.circle")
-                        }
-                        .buttonStyle(.plain)
-                        .help("Compare this transfer with USB, Thunderbolt, camera, and SD card speeds")
-                        .popover(isPresented: $showingSpeedGuide, arrowEdge: .bottom) {
-                            TransferSpeedGuideView(queue: queue, model: model)
-                        }
+                Text(phaseByteSummary(queue))
+                    .font(.subheadline.weight(.semibold).monospacedDigit())
+                    .lineLimit(1)
+                Group {
+                    if queue.state == .running, queue.bytesPerSecond > 0 {
+                        Text("\(Int64(queue.bytesPerSecond).formattedBytes)/s avg")
+                            .monospacedDigit()
+                            .help("Average for this copy or verification job. Verification alternates between camera and Buffer reads, so this is not an instantaneous camera-link measurement.")
+                    } else {
+                        Text(queueStateNote(queue.state))
                     }
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
                 }
-
-                if queue.state != .running {
-                    Button("Clear") {
-                        model.dismissTransferQueue()
-                    }
-                    .help("Clear this finished transfer from the queue")
-                }
+                .font(.callout)
+                .foregroundStyle(.secondary)
             }
 
-            VStack(alignment: .leading, spacing: 5) {
-                HStack {
-                    Text(phaseProgressLabel(queue))
-                    Spacer()
-                    Text(queue.progress.formatted(.percent.precision(.fractionLength(0))))
-                        .monospacedDigit()
-                }
-                .font(.caption)
-                .foregroundStyle(.secondary)
-
+            HStack(spacing: 10) {
                 ProgressView(value: queue.progress)
                     .tint(queueColor(queue.state))
                     .progressViewStyle(.linear)
+                Text(queue.progress.formatted(.percent.precision(.fractionLength(0))))
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .frame(minWidth: 34, alignment: .trailing)
             }
         }
         .padding(.horizontal, 16)
-        .padding(.vertical, 14)
-        .background(.bar)
+        .padding(.vertical, 12)
     }
 
     /// "This source folder → this destination" — the same readable route the
@@ -450,8 +466,8 @@ private struct TransferQueueView: View {
         let videos = queue.items.count { fileKind($0.relativePath) == .video }
         return HStack(spacing: 10) {
             VStack(alignment: .leading, spacing: 2) {
-                Text("FROM")
-                    .font(.caption2.weight(.bold))
+                Text("From")
+                    .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
                 routeEndpoint(path: queue.sourcePath, symbol: "sdcard")
             }
@@ -459,8 +475,8 @@ private struct TransferQueueView: View {
                 .font(.title3)
                 .foregroundStyle(.secondary)
             VStack(alignment: .leading, spacing: 2) {
-                Text("TO")
-                    .font(.caption2.weight(.bold))
+                Text("To")
+                    .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
                 routeEndpoint(path: queue.destinationPath, symbol: "externaldrive")
             }
@@ -486,7 +502,6 @@ private struct TransferQueueView: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 9)
-        .background(Color(nsColor: .textBackgroundColor))
     }
 
     private func routeEndpoint(path: String, symbol: String) -> some View {
@@ -517,79 +532,72 @@ private struct TransferQueueView: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 9)
-        .background(queueColor(queue.state).opacity(0.08))
+        .background(queueColor(queue.state).quinary)
         .help(queue.technicalDetail ?? message)
     }
 
-    private func queueList(_ queue: TransferQueueSnapshot) -> some View {
-        ScrollView {
-            LazyVStack(spacing: 0) {
-                ForEach(queue.items) { item in
-                    queueRow(item, queue: queue)
-                    if item.id != queue.items.last?.id {
-                        Divider().padding(.leading, 54)
-                    }
+    // MARK: - File queue
+
+    /// Every file in the transfer as a native table: resizable columns,
+    /// row selection, and ⌘C come with it.
+    private func queueTable(_ queue: TransferQueueSnapshot) -> some View {
+        Table(queue.items) {
+            TableColumn("Name") { item in
+                HStack(spacing: 8) {
+                    Image(systemName: itemSymbol(item.state))
+                        .symbolRenderingMode(.hierarchical)
+                        .foregroundStyle(itemColor(item.state))
+                        .frame(width: 18)
+                    Text(URL(fileURLWithPath: item.relativePath).lastPathComponent)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
                 }
+                .help(item.detail ?? item.state.label)
             }
-        }
-        .background(Color(nsColor: .textBackgroundColor))
-    }
+            .width(min: 160, ideal: 240)
 
-    private func queueRow(_ item: TransferQueueItem, queue: TransferQueueSnapshot) -> some View {
-        HStack(spacing: 12) {
-            Image(systemName: itemSymbol(item.state))
-                .font(.system(size: 16, weight: .medium))
-                .foregroundStyle(itemColor(item.state))
-                .frame(width: 24, height: 24)
-
-            VStack(alignment: .leading, spacing: 3) {
-                Text(URL(fileURLWithPath: item.relativePath).lastPathComponent)
-                    .font(.subheadline.weight(.medium))
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+            TableColumn("Folder") { item in
                 Text(shortParentPath(item.relativePath))
                     .font(.caption.monospaced())
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .truncationMode(.head)
+                    .help(item.relativePath)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .width(min: 100, ideal: 170)
 
-            VStack(alignment: .trailing, spacing: 5) {
+            TableColumn("Progress") { item in
                 if showsItemProgress(item) {
-                    ProgressView(value: Double(item.copiedBytes), total: Double(max(item.size, 1)))
-                        .tint(itemColor(item.state))
-                        .frame(width: 150)
-                    Text("\(item.copiedBytes.formattedBytes) / \(item.size.formattedBytes)")
-                        .font(.caption2.monospacedDigit())
-                        .foregroundStyle(.secondary)
+                    HStack(spacing: 8) {
+                        ProgressView(value: Double(item.copiedBytes), total: Double(max(item.size, 1)))
+                            .tint(itemColor(item.state))
+                        Text("\(item.copiedBytes.formattedBytes) / \(item.size.formattedBytes)")
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                            .fixedSize()
+                    }
                 } else {
                     Text(item.size.formattedBytes)
                         .font(.caption.monospacedDigit())
                         .foregroundStyle(.secondary)
                 }
             }
-            .frame(width: 168, alignment: .trailing)
+            .width(min: 90, ideal: 190)
 
-            statusColumn(item, queue: queue)
-                .frame(width: 112, alignment: .trailing)
+            TableColumn("Status") { item in
+                statusColumn(item, queue: queue)
+            }
+            .width(min: 90, ideal: 130)
         }
-        .padding(.horizontal, 16)
-        .frame(height: 62)
-        .help(item.detail ?? item.state.label)
     }
 
     private func statusColumn(_ item: TransferQueueItem, queue: TransferQueueSnapshot) -> some View {
         let status = queue.statusText(for: item)
-        return VStack(alignment: .trailing, spacing: 2) {
+        return HStack(spacing: 4) {
             Text(status.label)
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(statusColor(item, queue: queue))
                 .lineLimit(1)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-                .background(statusColor(item, queue: queue).opacity(0.10), in: Capsule())
-
             if let detail = status.detail {
                 Text(detail)
                     .font(.caption2)
@@ -597,6 +605,7 @@ private struct TransferQueueView: View {
                     .lineLimit(1)
             }
         }
+        .help(status.detail ?? status.label)
     }
 
     private func statusColor(_ item: TransferQueueItem, queue: TransferQueueSnapshot) -> Color {
@@ -625,25 +634,18 @@ private struct TransferQueueView: View {
 
             Spacer(minLength: 12)
 
+            // A permanent camera cleanup stays in the window, never a
+            // prominent toolbar item.
             if canFreeUpCamera(queue) {
                 Button("Free Up Camera…", role: .destructive) {
                     model.prepareSourceCleanup()
                     showingSourceCleanup = true
                 }
-                .tint(.red)
                 .help("Permanently remove only these checksum-matched files from the camera after one fresh recheck")
-            }
-
-            Button("Show Camera") {
-                revealFolder(queue.sourcePath)
-            }
-            Button("Show Buffer") {
-                revealFolder(queue.destinationPath)
             }
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
-        .background(.bar)
     }
 
     private func revealFolder(_ path: String) {
@@ -740,10 +742,10 @@ private struct TransferQueueView: View {
 
     private func queueSymbol(_ state: TransferQueueState) -> String {
         switch state {
-        case .running: "arrow.down"
-        case .completed: "checkmark"
-        case .failed: "exclamationmark"
-        case .cancelled: "xmark"
+        case .running: "arrow.down.circle.fill"
+        case .completed: "checkmark.circle.fill"
+        case .failed: "exclamationmark.circle.fill"
+        case .cancelled: "xmark.circle.fill"
         }
     }
 
@@ -760,7 +762,7 @@ private struct TransferQueueView: View {
         switch state {
         case .waiting: "clock"
         case .copying: "arrow.down.circle.fill"
-        case .copied: "doc.badge.clock"
+        case .copied: "document.badge.clock"
         case .verifying: "checkmark.circle.badge.questionmark"
         case .verified, .alreadyPresent: "checkmark.circle.fill"
         case .sourceRemoved: "externaldrive.badge.minus"
