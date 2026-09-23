@@ -47,11 +47,144 @@ final class StorageBenchmarkModelTests: XCTestCase {
 
         let targets = StorageBenchmarkTargetDiscovery.discover(
             configuration: configuration,
-            transferQueue: nil
+            transferQueue: nil,
+            mountedVolumes: []
         )
 
         XCTAssertFalse(targets.contains { $0.roleNames.contains("Camera Source") })
         XCTAssertTrue(targets.contains { $0.roleNames.contains("Buffer") })
+    }
+
+    func testBufferThatIsAlsoACameraSourceGetsReadAndWrite() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CameraToolkitBenchmark-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent("Card Drop", isDirectory: true)
+        let buffer = root.appendingPathComponent("Toolkit Buffer", isDirectory: true)
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: buffer, withIntermediateDirectories: true)
+
+        let volume = MountedVolumeInfo(
+            url: root,
+            name: "Buffer",
+            fileSystemType: "exfat",
+            mountSource: "/dev/disk8s2",
+            isRemovable: true,
+            isEjectable: true,
+            isReadOnly: false,
+            isDiskImage: false,
+            totalCapacity: 1_000_000_000_000
+        )
+        let configuration = AppConfiguration(
+            demoRootPath: root.appendingPathComponent("Safety Test").path,
+            importSourcePath: source.path,
+            archivePath: root.appendingPathComponent("Library").path,
+            bufferPath: buffer.path,
+            configuredLocations: [
+                ConfiguredLocation(role: .importSource, name: "Card Drop", path: source.path),
+                ConfiguredLocation(role: .buffer, name: "Buffer", path: buffer.path)
+            ],
+            activityLogPath: root.appendingPathComponent("activity.jsonl").path
+        )
+
+        let targets = StorageBenchmarkTargetDiscovery.discover(
+            configuration: configuration,
+            transferQueue: nil,
+            mountedVolumes: [volume]
+        )
+
+        let drive = try XCTUnwrap(targets.first { $0.roleNames.contains("Buffer") })
+        XCTAssertEqual(drive.id, root.path)
+        XCTAssertEqual(drive.access, .readWrite)
+        XCTAssertEqual(drive.writeDirectory?.standardizedFileURL, buffer.standardizedFileURL)
+        XCTAssertTrue(drive.roleNames.contains("Camera Source"))
+        // The sampler falls back to the whole volume so a configured source
+        // folder with no media cannot make the drive look untestable.
+        XCTAssertTrue(drive.searchRoots.contains(source.standardizedFileURL))
+        XCTAssertTrue(drive.searchRoots.contains(root.standardizedFileURL))
+    }
+
+    func testCameraCardNeverGetsAWriteTest() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CameraToolkitBenchmark-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let card = root.appendingPathComponent("LEXAR", isDirectory: true)
+        try FileManager.default.createDirectory(at: card, withIntermediateDirectories: true)
+
+        let volume = MountedVolumeInfo(
+            url: card,
+            name: "LEXAR",
+            fileSystemType: "exfat",
+            mountSource: "/dev/disk9s1",
+            isRemovable: true,
+            isEjectable: true,
+            isReadOnly: false,
+            isDiskImage: false,
+            totalCapacity: 256_000_000_000
+        )
+        let configuration = AppConfiguration(
+            demoRootPath: root.appendingPathComponent("Safety Test").path,
+            importSourcePath: card.path,
+            archivePath: root.appendingPathComponent("Library").path,
+            bufferPath: root.appendingPathComponent("Buffer").path,
+            configuredLocations: [
+                ConfiguredLocation(role: .importSource, name: "LEXAR", path: card.path)
+            ],
+            activityLogPath: root.appendingPathComponent("activity.jsonl").path
+        )
+
+        let targets = StorageBenchmarkTargetDiscovery.discover(
+            configuration: configuration,
+            transferQueue: nil,
+            mountedVolumes: [volume]
+        )
+
+        let drive = try XCTUnwrap(targets.first { $0.roleNames.contains("Camera Source") })
+        XCTAssertEqual(drive.access, .readOnly)
+        XCTAssertNil(drive.writeDirectory)
+    }
+
+    func testMountedDiskImagesAndVirtualVolumesAreHidden() throws {
+        let dmg = MountedVolumeInfo(
+            url: URL(fileURLWithPath: "/Volumes/GatherV2 0.54.0-universal", isDirectory: true),
+            name: "GatherV2 0.54.0-universal",
+            fileSystemType: "hfs",
+            mountSource: "/dev/disk11s1",
+            isRemovable: true,
+            isEjectable: true,
+            isReadOnly: true,
+            isDiskImage: true,
+            totalCapacity: 18_000_000
+        )
+        let virtual = MountedVolumeInfo(
+            url: URL(fileURLWithPath: "/Volumes/SyntheticThing", isDirectory: true),
+            name: "SyntheticThing",
+            fileSystemType: "autofs",
+            mountSource: "map auto",
+            isRemovable: false,
+            isEjectable: false,
+            isReadOnly: true,
+            isDiskImage: false,
+            totalCapacity: nil
+        )
+        let configuration = AppConfiguration(
+            demoRootPath: "/tmp/ct-demo",
+            importSourcePath: "/tmp/ct-demo/From Folder",
+            archivePath: "/tmp/ct-lib/Originals",
+            bufferPath: "/tmp/ct-buf",
+            configuredLocations: [],
+            activityLogPath: "/tmp/ct-activity.jsonl"
+        )
+
+        let targets = StorageBenchmarkTargetDiscovery.discover(
+            configuration: configuration,
+            transferQueue: nil,
+            mountedVolumes: [dmg, virtual]
+        )
+
+        XCTAssertFalse(targets.contains { $0.volumeInfo?.isDiskImage == true })
+        XCTAssertFalse(targets.contains { $0.name == "GatherV2 0.54.0-universal" })
+        XCTAssertFalse(targets.contains { $0.name == "SyntheticThing" })
     }
 
     private func target(id: String, root: String) -> StorageBenchmarkTarget {

@@ -1,12 +1,5 @@
 import SwiftUI
 
-private struct SpeedReferenceRow: Identifiable {
-    var id: String { title }
-    var title: String
-    var detail: String
-    var result: String
-}
-
 struct TransferSpeedGuideView: View {
     let queue: TransferQueueSnapshot
     @Bindable var model: DashboardModel
@@ -14,21 +7,8 @@ struct TransferSpeedGuideView: View {
     @State private var connectedLinks: [USBLinkSnapshot] = []
     @State private var isLoadingLinks = true
 
-    private let connectionRows = [
-        SpeedReferenceRow(title: "USB 2.0", detail: "480 Mb/s · 60 MB/s wire ceiling", result: "30–45 MB/s typical"),
-        SpeedReferenceRow(title: "USB 3.2 Gen 1", detail: "5 Gb/s · formerly USB 3.0", result: "350–500 MB/s"),
-        SpeedReferenceRow(title: "USB 3.2 Gen 2", detail: "10 Gb/s · USB NVMe enclosure", result: "700–1,050 MB/s"),
-        SpeedReferenceRow(title: "USB 3.2 Gen 2x2", detail: "20 Gb/s · host must support 2x2", result: "1,500–2,100 MB/s"),
-        SpeedReferenceRow(title: "Thunderbolt 3 / 4", detail: "40 Gb/s · NVMe enclosure", result: "2,000–3,200 MB/s")
-    ]
-
-    private let mediaRows = [
-        SpeedReferenceRow(title: "DJI Osmo 360 internal", detail: "USB 3.1 direct to Mac", result: "up to 600 MB/s"),
-        SpeedReferenceRow(title: "UHS-I SD / microSD", detail: "standard bus ceiling", result: "up to 104 MB/s"),
-        SpeedReferenceRow(title: "UHS-II SD", detail: "extra contact row required", result: "up to 312 MB/s"),
-        SpeedReferenceRow(title: "Samsung EVO Plus (light blue)", detail: "U3 · A2 · V30 · compatible reader", result: "up to 160 MB/s read"),
-        SpeedReferenceRow(title: "Samsung PRO Plus", detail: "U3 · A2 · V30 · compatible reader", result: "up to 180 / 130 MB/s")
-    ]
+    private let connectionRows = TransferSpeedReference.connectionRows
+    private let mediaRows = TransferSpeedReference.mediaRows
 
     var body: some View {
         VStack(spacing: 0) {

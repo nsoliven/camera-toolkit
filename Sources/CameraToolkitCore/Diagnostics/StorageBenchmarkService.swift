@@ -145,6 +145,7 @@ public struct StorageBenchmarkService: @unchecked Sendable {
         var samples: [(url: URL, size: Int64)] = []
         var discoveredBytes: Int64 = 0
         var seen: Set<String> = []
+        var seenFiles: Set<String> = []
 
         for root in searchRoots.map(\.standardizedFileURL) where seen.insert(root.path).inserted {
             try Task.checkCancellation()
@@ -156,7 +157,7 @@ public struct StorageBenchmarkService: @unchecked Sendable {
             ])
             if values?.isRegularFile == true, values?.isSymbolicLink != true {
                 let size = Int64(values?.fileSize ?? 0)
-                if size > 0 {
+                if size > 0, seenFiles.insert(root.path).inserted {
                     samples.append((root, size))
                     discoveredBytes += size
                 }
@@ -187,6 +188,7 @@ public struct StorageBenchmarkService: @unchecked Sendable {
                 }
                 let size = Int64(fileValues?.fileSize ?? 0)
                 guard size > 0 else { continue }
+                guard seenFiles.insert(fileURL.standardizedFileURL.path).inserted else { continue }
                 samples.append((fileURL, size))
                 discoveredBytes += size
                 if discoveredBytes >= byteLimit { break }

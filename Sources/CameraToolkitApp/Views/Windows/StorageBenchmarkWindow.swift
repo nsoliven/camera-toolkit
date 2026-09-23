@@ -74,6 +74,9 @@ private struct StorageBenchmarkView: View {
                         ForEach(benchmark.targets) { target in
                             targetCard(target)
                         }
+                        if !benchmark.results.isEmpty, !benchmark.pathVerdicts.isEmpty {
+                            verdictSection
+                        }
                     }
                 }
                 .padding(16)
@@ -145,6 +148,8 @@ private struct StorageBenchmarkView: View {
         let isActive = benchmark.activeTargetID == target.id
         let result = benchmark.results[target.id]
         let error = benchmark.errors[target.id]
+        let context = benchmark.linkContexts[target.id]
+        let canWrite = target.access == .readWrite && target.isAvailable
 
         return VStack(alignment: .leading, spacing: 11) {
             HStack(alignment: .center, spacing: 12) {
@@ -174,29 +179,66 @@ private struct StorageBenchmarkView: View {
                         .lineLimit(1)
                         .truncationMode(.middle)
                         .textSelection(.enabled)
+                    if let context {
+                        Text(context.headline + (context.detected ? "" : " · typical"))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        if let detail = context.detail {
+                            Text(detail)
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                        }
+                    } else if let capacity = target.totalCapacity {
+                        Text(capacity.formattedBytes)
+                            .font(.caption)
+                            .foregroundStyle(.tertiary)
+                    }
                 }
 
                 Spacer(minLength: 12)
 
-                if let result {
-                    resultColumns(result)
-                } else if !isActive {
-                    Text(accessLabel(target))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.trailing)
+                VStack(alignment: .trailing, spacing: 8) {
+                    HStack(spacing: 16) {
+                        resultValue(
+                            title: "READ",
+                            measurement: result?.read,
+                            typical: context?.typicalRead
+                        )
+                        if target.access == .readWrite {
+                            resultValue(
+                                title: "WRITE",
+                                measurement: result?.write,
+                                typical: context?.typicalWrite
+                            )
+                        }
+                    }
+                    HStack(spacing: 8) {
+                        Button("Read") {
+                            benchmark.run(target, kind: .read)
+                        }
+                        .disabled(benchmark.isRunning || model.isBusy || !target.isAvailable)
+                        if target.access == .readWrite {
+                            Button("Write") {
+                                benchmark.run(target, kind: .write)
+                            }
+                            .disabled(benchmark.isRunning || model.isBusy || !canWrite)
+                        }
+                    }
+                    .controlSize(.small)
                 }
-
-                Button(buttonTitle(target)) {
-                    benchmark.run(target)
-                }
-                .disabled(benchmark.isRunning || model.isBusy || !target.isAvailable)
-                .frame(width: 132)
             }
 
             if isActive {
                 VStack(alignment: .leading, spacing: 6) {
                     HStack {
+                        if let kind = benchmark.activeKind {
+                            Text(kind == .read ? "Read test" : "Write test")
+                                .font(.caption2.weight(.semibold))
+                                .foregroundStyle(targetColor(target))
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(targetColor(target).opacity(0.10), in: Capsule())
+                        }
                         Text(benchmark.phase)
                             .lineLimit(1)
                         Spacer()
@@ -219,12 +261,6 @@ private struct StorageBenchmarkView: View {
                     .foregroundStyle(.orange)
                     .fixedSize(horizontal: false, vertical: true)
             }
-
-            if let diagnosis = diagnosis(target: target, result: result) {
-                Label(diagnosis, systemImage: "lightbulb.fill")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
         }
         .padding(14)
         .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
@@ -234,23 +270,81 @@ private struct StorageBenchmarkView: View {
         }
     }
 
-    private func resultColumns(_ result: StorageBenchmarkResult) -> some View {
-        HStack(spacing: 16) {
-            resultValue(title: "READ", value: speed(result.read.bytesPerSecond))
-            if let write = result.write {
-                resultValue(title: "WRITE", value: speed(write.bytesPerSecond))
-            }
-        }
-    }
-
-    private func resultValue(title: String, value: String) -> some View {
+    private func resultValue(
+        title: String,
+        measurement: StorageBenchmarkMeasurement?,
+        typical: ClosedRange<Double>?
+    ) -> some View {
         VStack(alignment: .trailing, spacing: 2) {
             Text(title)
                 .font(.caption2.weight(.semibold))
                 .foregroundStyle(.tertiary)
-            Text(value)
+            Text(measurement.map { speed($0.bytesPerSecond) } ?? "–")
                 .font(.subheadline.weight(.semibold).monospacedDigit())
                 .lineLimit(1)
+            if let typical {
+                Text("typ. \(TransferSpeedReference.formattedRange(typical))")
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.tertiary)
+            }
+        }
+    }
+
+    private var verdictSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("WHERE THE BOTTLENECK IS")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.secondary)
+            ForEach(benchmark.pathVerdicts) { verdict in
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 6) {
+                        Text(verdict.title)
+                            .font(.caption.weight(.semibold))
+                        Spacer(minLength: 4)
+                        chainView(verdict)
+                    }
+                    Text(verdict.headline)
+                        .font(.caption.weight(.semibold))
+                    Text(verdict.detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(.vertical, 2)
+            }
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Color.primary.opacity(0.07), lineWidth: 1)
+        }
+    }
+
+    private func chainView(_ verdict: StoragePathVerdict) -> some View {
+        HStack(spacing: 4) {
+            ForEach(Array(verdict.links.enumerated()), id: \.element.id) { index, link in
+                if index > 0 {
+                    Image(systemName: "arrow.right")
+                        .font(.system(size: 7, weight: .bold))
+                        .foregroundStyle(.tertiary)
+                }
+                let isBottleneck = index == verdict.bottleneckIndex
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(link.name)
+                        .font(.caption2.weight(isBottleneck ? .semibold : .regular))
+                    Text("\(Int(link.megabytesPerSecond.rounded())) MB/s · \(link.isMeasured ? "measured" : link.detail)")
+                        .font(.system(size: 9).monospacedDigit())
+                        .foregroundStyle(isBottleneck ? .orange : .secondary)
+                }
+                .padding(.horizontal, 6)
+                .padding(.vertical, 4)
+                .background(
+                    (isBottleneck ? Color.orange : Color.primary).opacity(isBottleneck ? 0.14 : 0.05),
+                    in: RoundedRectangle(cornerRadius: 6)
+                )
+            }
         }
     }
 
@@ -287,7 +381,7 @@ private struct StorageBenchmarkView: View {
         HStack(alignment: .top, spacing: 9) {
             Image(systemName: "checkmark.shield.fill")
                 .foregroundStyle(.green)
-            Text("Camera and card sources are read-only: the app samples existing media and writes nothing. Buffer and library tests create one hidden temporary file, flush it, read it uncached, and remove it. Tests run one drive at a time and cannot start during a transfer.")
+            Text("Camera cards stay read-only: the app samples existing media and writes nothing on them. Buffer and library destinations get a hidden temporary file that is written, flushed, read back uncached, and removed — including a Buffer drive that is also a camera source. Tests run one at a time and cannot start during a transfer.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -302,44 +396,8 @@ private struct StorageBenchmarkView: View {
         benchmark.connectedLinks.first { $0.name.localizedCaseInsensitiveContains("Osmo") }
     }
 
-    private func diagnosis(
-        target: StorageBenchmarkTarget,
-        result: StorageBenchmarkResult?
-    ) -> String? {
-        guard let result else { return nil }
-        if target.name.localizedCaseInsensitiveContains("Osmo"),
-           let osmoLink,
-           osmoLink.bitsPerSecond <= 500_000_000 {
-            return "This read result is constrained by the current USB 2.0 negotiation; retest after the link shows USB 3.x."
-        }
-        guard target.roleNames.contains("Buffer"),
-              let sourceResult = StorageBenchmarkTargetDiscovery
-                .currentSourceTarget(in: benchmark.targets, transferQueue: model.transferQueue)
-                .flatMap({ benchmark.results[$0.id] }) else {
-            return nil
-        }
-        let destinationRate = result.write?.bytesPerSecond ?? result.read.bytesPerSecond
-        if destinationRate > sourceResult.read.bytesPerSecond * 1.5 {
-            let ratio = destinationRate / max(sourceResult.read.bytesPerSecond, 1)
-            return "About \(ratio.formatted(.number.precision(.fractionLength(1))))× faster than the source—the Buffer is not the bottleneck."
-        }
-        return "Close to the source rate; this drive may also limit the copy."
-    }
-
     private func speed(_ bytesPerSecond: Double) -> String {
         "\(Int64(max(bytesPerSecond, 0)).formattedBytes)/s"
-    }
-
-    private func buttonTitle(_ target: StorageBenchmarkTarget) -> String {
-        guard target.isAvailable else { return "Offline" }
-        return target.access == .readOnly ? "Test Read" : "Test Read + Write"
-    }
-
-    private func accessLabel(_ target: StorageBenchmarkTarget) -> String {
-        if let capacity = target.totalCapacity {
-            return "\(capacity.formattedBytes)\n\(target.access == .readOnly ? "Read-only test" : "Temporary-file test")"
-        }
-        return target.access == .readOnly ? "Read-only test" : "Temporary-file test"
     }
 
     private func targetSymbol(_ target: StorageBenchmarkTarget) -> String {
