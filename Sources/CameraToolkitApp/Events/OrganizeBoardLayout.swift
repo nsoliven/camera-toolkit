@@ -1,5 +1,45 @@
+import AppKit
 import CameraToolkitCore
 import Foundation
+
+/// Board geometry in one place, so tiles, rows, burst frames, and the
+/// expansion card share a single radius scale.
+enum BoardMetrics {
+    static let tileRadius: CGFloat = 10
+    static let listThumbRadius: CGFloat = 6
+    static let frameRadius: CGFloat = 6
+    static let expansionRadius: CGFloat = 12
+    static let rowSelectionRadius: CGFloat = 6
+    /// Selection ring around a tile. It sits `selectionRingGap` outside the
+    /// photo so it never covers pixels.
+    static let selectionRingWidth: CGFloat = 3
+    static let selectionRingGap: CGFloat = 1
+    static let focusRingWidth: CGFloat = 2
+    /// Flat scrim behind badges drawn on photos. Tiles carry no material or
+    /// glass: hundreds of live blurs are what the perf audit flagged.
+    static let badgeScrimOpacity: Double = 0.55
+    /// Smallest hit target for a badge button on a tile.
+    static let badgeMinHitSize: CGFloat = 22
+}
+
+/// Finder/Photos selection colour: the accent-coloured highlight only while
+/// the board has keyboard focus in the active window, the grey
+/// "unemphasized" highlight otherwise.
+enum BoardSelectionStyle {
+    static func isEmphasized(windowIsActive: Bool, boardHasFocus: Bool) -> Bool {
+        windowIsActive && boardHasFocus
+    }
+
+    static func selectionNSColor(isEmphasized: Bool) -> NSColor {
+        isEmphasized ? .selectedContentBackgroundColor : .unemphasizedSelectedContentBackgroundColor
+    }
+
+    /// Text on a selected row: white on the accent highlight, the normal
+    /// label colour on the grey one.
+    static func selectedTextNSColor(isEmphasized: Bool) -> NSColor {
+        isEmphasized ? .alternateSelectedControlTextColor : .labelColor
+    }
+}
 
 /// How a board draws its stacks: the classic tile grid or a denser
 /// file-list of rows.
@@ -165,7 +205,7 @@ enum OrganizeBoardPlan {
                 ("burst", "Bursts", "square.stack.3d.down.right.fill", { $0.isBurst }),
                 ("video", "Videos", "video.fill", { !$0.isBurst && $0.kind == .video }),
                 ("photo", "Photos", "photo", { !$0.isBurst && ($0.kind == .raw || $0.kind == .photo) }),
-                ("other", "Other Files", "doc", { !$0.isBurst && $0.kind == .other })
+                ("other", "Other Files", "document", { !$0.isBurst && $0.kind == .other })
             ]
             groups = buckets.compactMap { bucket in
                 let members = sortStacks(stacks.filter(bucket.match))

@@ -1,27 +1,46 @@
 import AppKit
 import AVFoundation
 import CameraToolkitCore
+import Observation
 import SwiftUI
 
 enum EventPalette {
     private static let colors: [Color] = [.blue, .purple, .pink, .orange, .teal, .indigo, .green, .red, .brown, .cyan, .mint]
+    /// Entries too light for white caption text (orange, teal, green, cyan,
+    /// mint): chips filled with them use dark text instead.
+    private static let lightEntries: Set<Int> = [3, 4, 6, 9, 10]
+
+    static func index(for id: UUID) -> Int {
+        index(hashing: id.uuidString)
+    }
 
     static func color(for id: UUID) -> Color {
-        var hash = 0
-        for scalar in id.uuidString.unicodeScalars {
-            hash = (hash &* 31 &+ Int(scalar.value)) & 0x7fff_ffff
-        }
-        return colors[hash % colors.count]
+        colors[index(for: id)]
     }
 
     /// Stable color for a name string — the Trash browser tags people and
     /// events that may no longer exist, so it hashes the name itself.
     static func color(forName name: String) -> Color {
+        colors[index(hashing: name)]
+    }
+
+    /// True when text on a solid fill of this id's color must be dark to
+    /// stay legible.
+    static func prefersDarkText(for id: UUID) -> Bool {
+        lightEntries.contains(index(for: id))
+    }
+
+    /// Legible text color on a solid fill of this id's color.
+    static func textColor(for id: UUID) -> Color {
+        prefersDarkText(for: id) ? .black.opacity(0.85) : .white
+    }
+
+    private static func index(hashing value: String) -> Int {
         var hash = 0
-        for scalar in name.unicodeScalars {
+        for scalar in value.unicodeScalars {
             hash = (hash &* 31 &+ Int(scalar.value)) & 0x7fff_ffff
         }
-        return colors[hash % colors.count]
+        return hash % colors.count
     }
 }
 
@@ -34,33 +53,51 @@ struct LazyContextMenu<Content: View>: View {
     var body: some View { content() }
 }
 
+/// An event's name capsule. `.filled` is the event's own color with text
+/// picked for contrast; `.onPhoto` is a flat dark scrim with a color dot,
+/// legible over any photo and quiet across hundreds of tiles.
 struct EventChip: View {
+    enum Style {
+        case filled
+        case onPhoto
+    }
+
     let event: SavedCameraEvent
     var number: Int?
     /// Resolved private flag. Pass it when the event's own `storagePolicy`
     /// can be nil — a subevent inherits the lock from a private parent.
     var isPrivate: Bool?
+    var style: Style = .filled
 
     var body: some View {
+        let color = EventPalette.color(for: event.id)
+        let text = style == .onPhoto ? Color.white : EventPalette.textColor(for: event.id)
         HStack(spacing: 4) {
+            if style == .onPhoto {
+                Circle()
+                    .fill(color)
+                    .frame(width: 7, height: 7)
+            }
             if let number {
                 Text("\(number)")
                     .font(.caption2.weight(.bold).monospacedDigit())
                     .padding(.horizontal, 4)
-                    .background(Color.white.opacity(0.25), in: RoundedRectangle(cornerRadius: 3))
+                    .background(text.opacity(0.22), in: RoundedRectangle(cornerRadius: 3))
             }
             if isPrivate ?? (event.resolvedStoragePolicy == .archiveOnly) {
                 Image(systemName: "lock.fill")
-                    .font(.caption2)
+                    .imageScale(.small)
+                    .accessibilityLabel("Private")
             }
             Text(event.name)
                 .lineLimit(1)
         }
         .font(.caption.weight(.semibold))
-        .foregroundStyle(.white)
+        .foregroundStyle(text)
         .padding(.horizontal, 7)
         .padding(.vertical, 3)
-        .background(EventPalette.color(for: event.id), in: Capsule())
+        .background(style == .onPhoto ? Color.black.opacity(BoardMetrics.badgeScrimOpacity) : color, in: Capsule())
+        .accessibilityElement(children: .combine)
     }
 }
 
@@ -83,59 +120,59 @@ struct EventTagCapsule: View {
     }
 }
 
-/// A direct subevent's filter chip in the event header — solid while its
-/// photos show, an outline while an "is none of" row hides them. Tapping
-/// toggles the exclusion.
+/// A direct subevent's filter chip in the event header: a standard toggle
+/// button that is on while its photos show and off (struck through) while
+/// an "is none of" row hides them. The color dot keeps the subevent's
+/// identity without putting text on its color.
 struct SubeventChip: View {
     let event: SavedCameraEvent
     let isFiltering: Bool
     let onToggle: () -> Void
 
     var body: some View {
-        Button(action: onToggle) {
-            Text(event.name)
-                .lineLimit(1)
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(isFiltering ? EventPalette.color(for: event.id) : .white)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 5)
-                .background {
-                    if isFiltering {
-                        Capsule()
-                            .fill(EventPalette.color(for: event.id).opacity(0.15))
-                            .overlay(Capsule().strokeBorder(EventPalette.color(for: event.id), lineWidth: 1.5))
-                    } else {
-                        Capsule().fill(EventPalette.color(for: event.id))
-                    }
-                }
-                .fixedSize()
+        Toggle(isOn: Binding(get: { !isFiltering }, set: { _ in onToggle() })) {
+            HStack(spacing: 5) {
+                Circle()
+                    .fill(EventPalette.color(for: event.id))
+                    .frame(width: 8, height: 8)
+                Text(event.name)
+                    .lineLimit(1)
+                    .strikethrough(isFiltering)
+            }
         }
-        .buttonStyle(.plain)
+        .toggleStyle(.button)
+        .buttonBorderShape(.capsule)
+        .controlSize(.small)
+        .fixedSize()
         .help(isFiltering
-            ? "\(event.name) is filtered out — tap to bring its photos back"
+            ? "\(event.name) is filtered out — click to bring its photos back"
             : "Hide \(event.name)'s photos")
+        .accessibilityLabel(event.name)
+        .accessibilityValue(isFiltering ? "Hidden" : "Shown")
     }
 }
 
-/// A named person detected on an event's photos. Shares the event-chip
-/// capsule look; the color is stable per person.
+/// A named person detected on an event's photos: a neutral capsule with
+/// the person's stable color on the symbol, so the name reads in both
+/// appearances whatever the color.
 struct PersonChip: View {
     let person: FacePerson
 
     var body: some View {
-        HStack(spacing: 3) {
+        HStack(spacing: 4) {
             Image(systemName: "person.fill")
-                .font(.caption2)
+                .imageScale(.small)
+                .foregroundStyle(EventPalette.color(for: person.id))
             Text(person.name)
                 .lineLimit(1)
         }
-        .font(.caption.weight(.semibold))
-        .foregroundStyle(.white)
-        .padding(.horizontal, 10)
-        .padding(.vertical, 5)
-        .background(EventPalette.color(for: person.id), in: Capsule())
+        .font(.caption.weight(.medium))
+        .padding(.horizontal, 9)
+        .padding(.vertical, 4)
+        .background(.quaternary, in: Capsule())
         .fixedSize()
         .help("\(person.faceCount) detection\(person.faceCount == 1 ? "" : "s") in this event")
+        .accessibilityElement(children: .combine)
     }
 }
 
@@ -158,7 +195,7 @@ enum TileLocationBadge {
         switch self {
         case .onSource: "sdcard"
         case .inBuffer: "externaldrive"
-        case .inPrivate: "lock"
+        case .inPrivate: "lock.fill"
         case .nasOnly: "server.rack"
         }
     }
@@ -211,7 +248,7 @@ struct TileThumbnail: View {
                     .scaledToFill()
             } else if failed {
                 Image(systemName: symbol)
-                    .font(.system(size: 26))
+                    .font(.title)
                     .foregroundStyle(.secondary)
             } else {
                 ProgressView()
@@ -242,10 +279,52 @@ struct TileThumbnail: View {
     private var symbol: String {
         switch kind {
         case .video: "video"
-        case .other: "doc"
+        case .other: "document"
         default: "photo"
         }
     }
+}
+
+private extension View {
+    /// A flat dark capsule for labels drawn on a photo — no material, so a
+    /// board of hundreds of tiles never runs hundreds of live blurs.
+    func photoBadgeScrim() -> some View {
+        font(.caption2.weight(.semibold))
+            .foregroundStyle(.white)
+            .padding(.horizontal, 7)
+            .frame(minHeight: BoardMetrics.badgeMinHitSize)
+            .background(Color.black.opacity(BoardMetrics.badgeScrimOpacity), in: Capsule())
+    }
+}
+
+/// Selection colour as a SwiftUI colour for `isEmphasized`.
+private func boardSelectionColor(isEmphasized: Bool) -> Color {
+    Color(nsColor: BoardSelectionStyle.selectionNSColor(isEmphasized: isEmphasized))
+}
+
+private func stackTitle(_ stack: OrganizeStack) -> String {
+    if let label = stack.burstLabel, stack.isBurst {
+        return "\(label) · \(stack.items.count) frames"
+    }
+    if stack.isBurst {
+        return "Burst · \(stack.items.count) frames"
+    }
+    return stack.coverItem.primary.name
+}
+
+/// VoiceOver name for a tile or row: what it is, when, and where it went.
+private func stackAccessibilityLabel(
+    _ stack: OrganizeStack,
+    event: SavedCameraEvent?,
+    isMixed: Bool,
+    badge: TileLocationBadge?
+) -> String {
+    var parts = [stackTitle(stack), stack.captureDate.formatted(date: .abbreviated, time: .shortened)]
+    if stack.kind == .video, !stack.isBurst { parts.append("Video") }
+    if let event { parts.append(event.name) }
+    if isMixed { parts.append("Mixed events") }
+    if let badge { parts.append(badge.label) }
+    return parts.joined(separator: ", ")
 }
 
 struct StackTileView: View {
@@ -253,6 +332,9 @@ struct StackTileView: View {
     let width: CGFloat
     let isSelected: Bool
     let isFocused: Bool
+    /// True while the board holds focus in the active window: selection
+    /// draws in the accent colour, otherwise in the grey unemphasized one.
+    var isEmphasized: Bool = true
     let event: SavedCameraEvent?
     /// Resolved private flag for `event` — a subevent can inherit the lock
     /// from a private parent, so the caller resolves it.
@@ -276,19 +358,17 @@ struct StackTileView: View {
     var onOpen: (() -> Void)? = nil
 
     var body: some View {
+        let shape = RoundedRectangle(cornerRadius: BoardMetrics.tileRadius, style: .continuous)
         VStack(alignment: .leading, spacing: 5) {
             ZStack {
                 TileThumbnail(url: stack.coverItem.primary.url, kind: stack.kind, pointSize: width, orientation: orientation)
                     .frame(width: width, height: width * 2 / 3)
                     .clipped()
                 VStack {
-                    HStack(spacing: 4) {
+                    HStack(alignment: .top, spacing: 4) {
                         if let badge {
                             Label(badge.label, systemImage: badge.symbol)
-                                .font(.caption2.weight(.semibold))
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 2)
-                                .background(.ultraThinMaterial, in: Capsule())
+                                .photoBadgeScrim()
                         }
                         Spacer(minLength: 0)
                         if stack.isBurst {
@@ -297,10 +377,8 @@ struct StackTileView: View {
                             } label: {
                                 Label("\(stack.items.count)", systemImage: "square.stack.3d.down.right.fill")
                                     .font(.caption.weight(.bold).monospacedDigit())
-                                    .padding(.horizontal, 6)
-                                    .padding(.vertical, 2)
-                                    .background(.black.opacity(0.6), in: Capsule())
-                                    .foregroundStyle(.white)
+                                    .photoBadgeScrim()
+                                    .contentShape(.capsule)
                             }
                             .buttonStyle(.plain)
                             .help("Show every frame of this burst in the board")
@@ -310,9 +388,10 @@ struct StackTileView: View {
                             } label: {
                                 Image(systemName: "play.fill")
                                     .font(.caption)
-                                    .padding(5)
-                                    .background(.black.opacity(0.6), in: Circle())
                                     .foregroundStyle(.white)
+                                    .frame(width: BoardMetrics.badgeMinHitSize, height: BoardMetrics.badgeMinHitSize)
+                                    .background(Color.black.opacity(BoardMetrics.badgeScrimOpacity), in: Circle())
+                                    .contentShape(.circle)
                             }
                             .buttonStyle(.plain)
                             .help("Play this video")
@@ -321,15 +400,16 @@ struct StackTileView: View {
                     Spacer(minLength: 0)
                     HStack(spacing: 4) {
                         if let event {
-                            EventChip(event: event, isPrivate: isPrivate)
+                            EventChip(event: event, isPrivate: isPrivate, style: .onPhoto)
                         }
                         if isMixed {
-                            Label("Mixed", systemImage: "square.split.2x1")
-                                .font(.caption2.weight(.semibold))
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 2)
-                                .background(.orange, in: Capsule())
-                                .foregroundStyle(.white)
+                            Label {
+                                Text("Mixed")
+                            } icon: {
+                                Image(systemName: "square.split.2x1")
+                                    .foregroundStyle(.orange)
+                            }
+                            .photoBadgeScrim()
                         }
                         Spacer(minLength: 0)
                     }
@@ -337,17 +417,17 @@ struct StackTileView: View {
                 .padding(6)
             }
             .frame(width: width, height: width * 2 / 3)
-            .background(Color.black.opacity(0.12))
-            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .background(.quaternary)
+            .clipShape(shape)
             .overlay {
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .strokeBorder(borderColor, lineWidth: isSelected ? 3 : (isFocused ? 2 : 0.5))
+                shape.strokeBorder(Color.primary.opacity(0.1), lineWidth: 0.5)
             }
+            .overlay { selectionRing }
 
             HStack(spacing: 6) {
                 Text(stack.captureDate.formatted(date: .omitted, time: .shortened))
                     .monospacedDigit()
-                Text(title)
+                Text(stackTitle(stack))
                     .lineLimit(1)
                     .truncationMode(.middle)
                 Spacer(minLength: 0)
@@ -362,28 +442,40 @@ struct StackTileView: View {
         .opacity(isDimmed ? 0.45 : 1)
         .contentShape(Rectangle())
         .help(originFolder.map { "In \($0)" } ?? stack.coverItem.primary.name)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(stackAccessibilityLabel(stack, event: event, isMixed: isMixed, badge: badge))
+        .accessibilityValue(isDimmed ? "Sorted" : "")
+        .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)
+        .accessibilityActions {
+            if stack.isBurst {
+                Button("Show All Frames") { (onExpand ?? onOpen)?() }
+            } else if stack.kind == .video {
+                Button("Play") { (onPlay ?? onOpen)?() }
+            }
+        }
     }
 
-    private var borderColor: Color {
-        if isSelected { return .accentColor }
-        if isFocused { return .accentColor.opacity(0.6) }
-        return .primary.opacity(0.1)
-    }
-
-    private var title: String {
-        if let label = stack.burstLabel, stack.isBurst {
-            return "\(label) · \(stack.items.count) frames"
+    /// The selection ring sits just outside the photo — a gap, then the
+    /// ring — so it never covers pixels. Focus without selection (the
+    /// keyboard cursor after a ⌘-click) gets a thinner, lighter ring.
+    @ViewBuilder
+    private var selectionRing: some View {
+        let gap = BoardMetrics.selectionRingGap
+        if isSelected || isFocused {
+            let lineWidth = isSelected ? BoardMetrics.selectionRingWidth : BoardMetrics.focusRingWidth
+            let color = boardSelectionColor(isEmphasized: isEmphasized)
+            RoundedRectangle(cornerRadius: BoardMetrics.tileRadius + gap + lineWidth, style: .continuous)
+                .strokeBorder(isSelected ? color : color.opacity(0.6), lineWidth: lineWidth)
+                .padding(-(gap + lineWidth))
+                .allowsHitTesting(false)
         }
-        if stack.isBurst {
-            return "Burst · \(stack.items.count) frames"
-        }
-        return stack.coverItem.primary.name
     }
 }
 
 /// Header of one board section — a day, folder, kind, or event group.
-/// The whole bar opens and closes the group. Select stays its own button
-/// so it does not toggle the section.
+/// The whole bar opens and closes the group, with the disclosure chevron
+/// leading as in the sidebar's sections. Select stays its own button so it
+/// does not toggle the section.
 struct BoardGroupHeader: View {
     let group: OrganizeBoardGroup
     let isCollapsed: Bool
@@ -397,20 +489,22 @@ struct BoardGroupHeader: View {
                     onToggleCollapse()
                 }
             } label: {
-                HStack(alignment: .firstTextBaseline, spacing: 10) {
-                    Image(systemName: isCollapsed ? "chevron.right" : "chevron.down")
-                        .font(.callout.weight(.semibold))
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Image(systemName: "chevron.right")
+                        .font(.caption.weight(.bold))
                         .foregroundStyle(.secondary)
+                        .rotationEffect(.degrees(isCollapsed ? 0 : 90))
                         .frame(width: 14)
                     if let symbol = group.symbol {
                         Image(systemName: symbol)
                             .foregroundStyle(.secondary)
                     }
                     Text(group.title)
-                        .font(.title3.weight(.semibold))
+                        .font(.headline)
                     Text(group.subtitle)
-                        .font(.callout)
+                        .font(.subheadline)
                         .foregroundStyle(.secondary)
+                        .monospacedDigit()
                     Spacer(minLength: 8)
                 }
                 .padding(.vertical, 8)
@@ -419,11 +513,14 @@ struct BoardGroupHeader: View {
             }
             .buttonStyle(.plain)
             .help(isCollapsed ? "Expand this group" : "Collapse this group")
+            .accessibilityLabel(group.title)
+            .accessibilityValue(isCollapsed ? "Collapsed" : "Expanded")
             Button("Select", action: onSelect)
                 .buttonStyle(.borderless)
-                .font(.callout)
+                .controlSize(.small)
                 .disabled(group.stacks.isEmpty)
                 .help("Select everything in this group")
+                .accessibilityLabel("Select All in \(group.title)")
                 .padding(.vertical, 8)
                 .padding(.trailing, 6)
         }
@@ -432,12 +529,62 @@ struct BoardGroupHeader: View {
     }
 }
 
+/// Which list row shows its `···` menu. The grid owns one instance; only
+/// the small menu slots read it, so a hover change re-renders those slots
+/// and never the grid or the rows.
+@MainActor
+@Observable
+final class BoardHoverState {
+    var rowID: String?
+
+    func set(_ id: String, hovering: Bool) {
+        if hovering {
+            rowID = id
+        } else if rowID == id {
+            rowID = nil
+        }
+    }
+}
+
+/// The trailing `···` slot of a list row. It holds a real menu only on the
+/// hovered or keyboard-focused row, so at most a couple of `Menu`s exist
+/// at once; the menu's items stay in a `LazyContextMenu` and build when it
+/// opens. The slot keeps its width either way so columns never jump.
+struct BoardRowMoreMenu<Content: View>: View {
+    let hover: BoardHoverState
+    let stackID: String
+    let isFocused: Bool
+    @ViewBuilder let content: () -> Content
+
+    var body: some View {
+        ZStack {
+            if isFocused || hover.rowID == stackID {
+                Menu {
+                    content()
+                } label: {
+                    Label("More", systemImage: "ellipsis")
+                        .labelStyle(.iconOnly)
+                }
+                .menuStyle(.button)
+                .buttonStyle(.borderless)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .help("More actions for this item")
+            }
+        }
+        .frame(width: 24)
+    }
+}
+
 /// One row of the board's list mode — the same stack as a tile, compressed
-/// into a single line so hundreds of bursts fit on screen.
-struct StackRowView: View {
+/// into a single line so hundreds of bursts fit on screen. Leading thumb
+/// and title; trailing columns for capture time, size, event, and the
+/// burst/play control; then the `···` slot.
+struct StackRowView<MoreMenu: View>: View {
     let stack: OrganizeStack
     let isSelected: Bool
     let isFocused: Bool
+    var isEmphasized: Bool = true
     let isExpanded: Bool
     let event: SavedCameraEvent?
     var isPrivate: Bool? = nil
@@ -451,19 +598,22 @@ struct StackRowView: View {
     var onExpand: (() -> Void)? = nil
     var onPlay: (() -> Void)? = nil
     var onOpen: (() -> Void)? = nil
+    @ViewBuilder var moreMenu: () -> MoreMenu
+
+    private var isProminent: Bool { isSelected && isEmphasized }
 
     var body: some View {
         HStack(spacing: 10) {
             TileThumbnail(url: stack.coverItem.primary.url, kind: stack.kind, pointSize: 88)
-                .frame(width: 88, height: 56)
+                .frame(width: 72, height: 48)
                 .clipped()
-                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                .clipShape(RoundedRectangle(cornerRadius: BoardMetrics.listThumbRadius, style: .continuous))
                 .overlay {
-                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    RoundedRectangle(cornerRadius: BoardMetrics.listThumbRadius, style: .continuous)
                         .strokeBorder(Color.primary.opacity(0.1), lineWidth: 0.5)
                 }
 
-            VStack(alignment: .leading, spacing: 3) {
+            VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
                     if let tag {
                         EventTagCapsule(event: tag)
@@ -472,93 +622,103 @@ struct StackRowView: View {
                         Image(systemName: "square.stack.3d.down.right.fill")
                             .foregroundStyle(.secondary)
                     }
-                    Text(title)
-                        .font(.callout.weight(.medium))
+                    Text(stackTitle(stack))
+                        .fontWeight(.medium)
                         .lineLimit(1)
                         .truncationMode(.middle)
-                    if isMixed {
-                        Label("Mixed", systemImage: "square.split.2x1")
-                            .font(.caption2.weight(.semibold))
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 1)
-                            .background(.orange, in: Capsule())
-                            .foregroundStyle(.white)
-                    }
-                    if let badge {
-                        Label(badge.label, systemImage: badge.symbol)
-                            .font(.caption2.weight(.semibold))
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 1)
-                            .background(.quaternary, in: Capsule())
-                            .foregroundStyle(.secondary)
-                    }
                 }
-                HStack(spacing: 5) {
-                    Text(stack.captureDate.formatted(date: .abbreviated, time: .shortened))
+                HStack(spacing: 10) {
                     if let originFolder {
-                        Text("·")
-                        Text(originFolder)
+                        Label(originFolder, systemImage: "folder")
                             .lineLimit(1)
                             .truncationMode(.middle)
                     }
-                    Text("·")
-                    Text(stack.byteCount.formattedBytes)
+                    if isMixed {
+                        Label("Mixed", systemImage: "square.split.2x1")
+                            .foregroundStyle(isProminent ? AnyShapeStyle(.secondary) : AnyShapeStyle(Color.orange))
+                    }
+                    if let badge {
+                        Label(badge.label, systemImage: badge.symbol)
+                    }
                 }
                 .font(.caption)
                 .foregroundStyle(.secondary)
+                .labelStyle(.titleAndIcon)
             }
+            .layoutPriority(1)
 
-            Spacer(minLength: 6)
+            Spacer(minLength: 8)
 
-            if let event {
-                EventChip(event: event, isPrivate: isPrivate)
+            Text(stack.captureDate.formatted(date: .numeric, time: .shortened))
+                .font(.callout)
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .frame(width: 128, alignment: .leading)
+            Text(stack.byteCount.formattedBytes)
+                .font(.callout)
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .frame(width: 64, alignment: .trailing)
+            // ZStack, not Group: an empty Group drops its frame and the
+            // columns would shift on rows without an event or burst.
+            ZStack(alignment: .leading) {
+                if let event {
+                    EventChip(event: event, isPrivate: isPrivate)
+                }
             }
-            if stack.isBurst {
-                Button {
-                    (onExpand ?? onOpen)?()
-                } label: {
-                    Label("\(stack.items.count)", systemImage: isExpanded ? "chevron.down" : "chevron.right")
-                        .font(.caption.weight(.bold).monospacedDigit())
-                        .padding(.horizontal, 7)
-                        .padding(.vertical, 3)
-                        .background(.quaternary, in: Capsule())
+            .frame(width: 132, alignment: .leading)
+            ZStack(alignment: .leading) {
+                if stack.isBurst {
+                    Button {
+                        (onExpand ?? onOpen)?()
+                    } label: {
+                        Label("\(stack.items.count)", systemImage: isExpanded ? "chevron.down" : "chevron.right")
+                            .monospacedDigit()
+                    }
+                    .buttonStyle(.borderless)
+                    .help(isExpanded ? "Collapse this burst" : "Show every frame in the board")
+                    .accessibilityLabel(isExpanded ? "Collapse Burst" : "Show All \(stack.items.count) Frames")
+                } else if stack.kind == .video {
+                    Button("Play", systemImage: "play.fill") {
+                        (onPlay ?? onOpen)?()
+                    }
+                    .labelStyle(.iconOnly)
+                    .buttonStyle(.borderless)
+                    .help("Play this video")
                 }
-                .buttonStyle(.plain)
-                .help(isExpanded ? "Collapse this burst" : "Show every frame in the board")
-            } else if stack.kind == .video {
-                Button {
-                    (onPlay ?? onOpen)?()
-                } label: {
-                    Image(systemName: "play.fill")
-                        .font(.caption)
-                        .padding(6)
-                        .background(.quaternary, in: Circle())
-                }
-                .buttonStyle(.plain)
-                .help("Play this video")
+            }
+            .frame(width: 48, alignment: .leading)
+            moreMenu()
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .foregroundStyle(Color(nsColor: isSelected
+            ? BoardSelectionStyle.selectedTextNSColor(isEmphasized: isEmphasized)
+            : .labelColor))
+        .background {
+            let shape = RoundedRectangle(cornerRadius: BoardMetrics.rowSelectionRadius, style: .continuous)
+            if isSelected {
+                shape.fill(boardSelectionColor(isEmphasized: isEmphasized))
+            } else if isFocused {
+                shape.strokeBorder(boardSelectionColor(isEmphasized: isEmphasized).opacity(0.6), lineWidth: 1)
             }
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 5)
-        .background(isSelected ? Color.accentColor.opacity(0.18) : (isFocused ? Color.accentColor.opacity(0.07) : Color.clear))
+        .environment(\.backgroundProminence, isProminent ? .increased : .standard)
         .opacity(isDimmed ? 0.45 : 1)
         .contentShape(Rectangle())
+        .padding(.horizontal, 8)
         .help(originFolder.map { "In \($0)" } ?? stack.coverItem.primary.name)
-    }
-
-    private var title: String {
-        if let label = stack.burstLabel, stack.isBurst {
-            return "\(label) · \(stack.items.count) frames"
-        }
-        if stack.isBurst {
-            return "Burst · \(stack.items.count) frames"
-        }
-        return stack.coverItem.primary.name
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(stackAccessibilityLabel(stack, event: event, isMixed: isMixed, badge: badge))
+        .accessibilityValue(isDimmed ? "Sorted" : "")
+        .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)
     }
 }
 
 /// Every frame of a burst laid out inside the board — what the count badge
-/// expands into. Tapping a frame opens the full preview at that frame.
+/// expands into. Clicking a frame opens the full preview at that frame.
 struct BurstExpansionView: View {
     let stack: OrganizeStack
     /// Edge length of the small frame thumbnails.
@@ -567,23 +727,22 @@ struct BurstExpansionView: View {
     var onCollapse: (() -> Void)? = nil
 
     var body: some View {
+        let card = RoundedRectangle(cornerRadius: BoardMetrics.expansionRadius, style: .continuous)
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
                 Image(systemName: "square.stack.3d.down.right.fill")
                     .foregroundStyle(.secondary)
                 Text(stack.burstLabel.map { "\($0) · \(stack.items.count) frames" } ?? "\(stack.items.count) frames")
-                    .font(.callout.weight(.semibold))
+                    .font(.headline)
                 Text("\(stack.captureDate.formatted(date: .omitted, time: .shortened)) – \(stack.endDate.formatted(date: .omitted, time: .shortened))")
-                    .font(.caption)
+                    .font(.subheadline)
                     .foregroundStyle(.secondary)
                 Spacer(minLength: 6)
-                Button {
+                Button("Collapse", systemImage: "chevron.up") {
                     onCollapse?()
-                } label: {
-                    Label("Collapse", systemImage: "chevron.up")
-                        .font(.caption)
                 }
                 .buttonStyle(.borderless)
+                .controlSize(.small)
             }
             LazyVGrid(
                 columns: [GridItem(.adaptive(minimum: frameSize, maximum: frameSize * 1.4), spacing: 6)],
@@ -591,34 +750,39 @@ struct BurstExpansionView: View {
                 spacing: 6
             ) {
                 ForEach(Array(stack.items.enumerated()), id: \.element.id) { index, frame in
+                    let shape = RoundedRectangle(cornerRadius: BoardMetrics.frameRadius, style: .continuous)
                     TileThumbnail(url: frame.primary.url, kind: frame.kind, pointSize: frameSize)
                         .frame(width: frameSize, height: frameSize * 2 / 3)
                         .clipped()
-                        .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
+                        .clipShape(shape)
                         .overlay(alignment: .bottomTrailing) {
                             if frame.kind == .video {
                                 Image(systemName: "video.fill")
-                                    .font(.system(size: 9))
-                                    .padding(3)
-                                    .background(.black.opacity(0.6), in: Circle())
+                                    .font(.caption2)
+                                    .imageScale(.small)
                                     .foregroundStyle(.white)
+                                    .padding(4)
+                                    .background(Color.black.opacity(BoardMetrics.badgeScrimOpacity), in: Circle())
                                     .padding(3)
                             }
                         }
                         .overlay {
-                            RoundedRectangle(cornerRadius: 5, style: .continuous)
-                                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5)
+                            shape.strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5)
                         }
+                        .contentShape(shape)
                         .onTapGesture { onOpenFrame?(index) }
                         .help(frame.primary.name)
+                        .accessibilityElement(children: .ignore)
+                        .accessibilityLabel("Frame \(index + 1) of \(stack.items.count), \(frame.primary.name)")
+                        .accessibilityAddTraits(.isButton)
+                        .accessibilityAction { onOpenFrame?(index) }
                 }
             }
         }
         .padding(10)
-        .background(Color.accentColor.opacity(0.06), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .background(.tint.quinary, in: card)
         .overlay {
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .strokeBorder(Color.accentColor.opacity(0.25), lineWidth: 1)
+            card.strokeBorder(.tint.quaternary, lineWidth: 1)
         }
     }
 }
@@ -690,6 +854,17 @@ struct OrganizeGrid<MenuContent: View>: View {
 
     @FocusState private var isFocused: Bool
     @State private var columns = 1
+    /// One grid-level read of the window's active state — tiles get the
+    /// result as a plain Bool rather than each reading the environment.
+    @Environment(\.appearsActive) private var appearsActive
+    /// Which list row shows its `···` menu; only the menu slots observe it.
+    @State private var hover = BoardHoverState()
+
+    /// Accent selection while the board has focus in the active window,
+    /// grey selection otherwise — the Finder and Photos rule.
+    private var isEmphasized: Bool {
+        BoardSelectionStyle.isEmphasized(windowIsActive: appearsActive, boardHasFocus: isFocused)
+    }
 
     /// One section per group — collapsing hides a group's rows, never the
     /// group itself, so headers keep their real counts and Select still
@@ -709,6 +884,7 @@ struct OrganizeGrid<MenuContent: View>: View {
                     listBoard(orderedIDs: orderedIDs)
                 }
             }
+            .scrollEdgeEffectStyle(.soft, for: .top)
             .focusable()
             .focused($isFocused)
             .focusEffectDisabled()
@@ -768,17 +944,16 @@ struct OrganizeGrid<MenuContent: View>: View {
     }
 
     private func listBoard(orderedIDs: [String]) -> some View {
-        LazyVStack(spacing: 0, pinnedViews: [.sectionHeaders]) {
+        LazyVStack(spacing: 2, pinnedViews: [.sectionHeaders]) {
             ForEach(sections) { section in
                 Section {
                     ForEach(section.visibleStacks) { stack in
                         row(stack, orderedIDs: orderedIDs)
                         if workspace.expandedStackIDs.contains(stack.id), stack.isBurst {
                             expansion(stack, compact: true)
-                                .padding(.horizontal, 10)
-                                .padding(.bottom, 8)
+                                .padding(.horizontal, 16)
+                                .padding(.vertical, 6)
                         }
-                        Divider().padding(.leading, 108)
                     }
                 } header: {
                     BoardGroupHeader(
@@ -815,6 +990,7 @@ struct OrganizeGrid<MenuContent: View>: View {
             width: tileWidth,
             isSelected: workspace.selectedStackIDs.contains(stack.id),
             isFocused: workspace.focusedStackID == stack.id,
+            isEmphasized: isEmphasized,
             event: assigned.event,
             isPrivate: assigned.event.map { workspace.resolvedPolicy(for: $0) == .archiveOnly },
             tag: tagForStack(stack),
@@ -835,6 +1011,8 @@ struct OrganizeGrid<MenuContent: View>: View {
             select(stack, orderedIDs: orderedIDs)
         }
         .simultaneousGesture(TapGesture(count: 2).onEnded { onOpen(stack, 0) })
+        .accessibilityAction { select(stack, orderedIDs: orderedIDs) }
+        .accessibilityAction(named: "Preview") { onOpen(stack, 0) }
         .draggable(workspace.dragPayload(for: stack.id, origin: origin, containerID: containerID)) {
             dragPreview(for: stack)
         }
@@ -843,10 +1021,12 @@ struct OrganizeGrid<MenuContent: View>: View {
 
     private func row(_ stack: OrganizeStack, orderedIDs: [String]) -> some View {
         let assigned = eventForStack(stack)
+        let isFocusedRow = workspace.focusedStackID == stack.id
         return StackRowView(
             stack: stack,
             isSelected: workspace.selectedStackIDs.contains(stack.id),
-            isFocused: workspace.focusedStackID == stack.id,
+            isFocused: isFocusedRow,
+            isEmphasized: isEmphasized,
             isExpanded: workspace.expandedStackIDs.contains(stack.id),
             event: assigned.event,
             isPrivate: assigned.event.map { workspace.resolvedPolicy(for: $0) == .archiveOnly },
@@ -860,13 +1040,21 @@ struct OrganizeGrid<MenuContent: View>: View {
             ),
             onExpand: { workspace.toggleExpanded(stack.id) },
             onPlay: { onOpen(stack, 0) },
-            onOpen: { onOpen(stack, 0) }
+            onOpen: { onOpen(stack, 0) },
+            moreMenu: {
+                BoardRowMoreMenu(hover: hover, stackID: stack.id, isFocused: isFocusedRow) {
+                    menu(stack)
+                }
+            }
         )
+        .onHover { hover.set(stack.id, hovering: $0) }
         .id(stack.id)
         .onTapGesture {
             select(stack, orderedIDs: orderedIDs)
         }
         .simultaneousGesture(TapGesture(count: 2).onEnded { onOpen(stack, 0) })
+        .accessibilityAction { select(stack, orderedIDs: orderedIDs) }
+        .accessibilityAction(named: "Preview") { onOpen(stack, 0) }
         .draggable(workspace.dragPayload(for: stack.id, origin: origin, containerID: containerID)) {
             dragPreview(for: stack)
         }
