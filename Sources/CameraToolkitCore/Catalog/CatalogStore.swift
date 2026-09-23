@@ -486,68 +486,72 @@ public struct CatalogStore {
         }
 
         for event in configuration.savedEvents {
-            try runUpsert(
-                """
-                INSERT INTO events(
-                    id, name, event_date, immich_upload_enabled, immich_album_policy,
-                    immich_album_name, parent_event_id, created_at, last_used_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    name = excluded.name,
-                    event_date = excluded.event_date,
-                    immich_upload_enabled = excluded.immich_upload_enabled,
-                    immich_album_policy = excluded.immich_album_policy,
-                    immich_album_name = excluded.immich_album_name,
-                    parent_event_id = excluded.parent_event_id,
-                    last_used_at = excluded.last_used_at,
-                    updated_at = excluded.updated_at;
-                """,
-                values: [
-                    event.id.uuidString,
-                    event.name,
-                    Self.isoTimestamp(event.eventDate),
-                    event.sendsToImmich ? "1" : "0",
-                    event.resolvedImmichAlbumPolicy.rawValue,
-                    event.immichAlbumName ?? "",
-                    event.parentEventID?.uuidString,
-                    Self.isoTimestamp(event.createdAt),
-                    Self.isoTimestamp(event.lastUsedAt),
-                    now
-                ],
-                database: database
-            )
+            try autoreleasepool {
+                try runUpsert(
+                    """
+                    INSERT INTO events(
+                        id, name, event_date, immich_upload_enabled, immich_album_policy,
+                        immich_album_name, parent_event_id, created_at, last_used_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        name = excluded.name,
+                        event_date = excluded.event_date,
+                        immich_upload_enabled = excluded.immich_upload_enabled,
+                        immich_album_policy = excluded.immich_album_policy,
+                        immich_album_name = excluded.immich_album_name,
+                        parent_event_id = excluded.parent_event_id,
+                        last_used_at = excluded.last_used_at,
+                        updated_at = excluded.updated_at;
+                    """,
+                    values: [
+                        event.id.uuidString,
+                        event.name,
+                        Self.isoTimestamp(event.eventDate),
+                        event.sendsToImmich ? "1" : "0",
+                        event.resolvedImmichAlbumPolicy.rawValue,
+                        event.immichAlbumName ?? "",
+                        event.parentEventID?.uuidString,
+                        Self.isoTimestamp(event.createdAt),
+                        Self.isoTimestamp(event.lastUsedAt),
+                        now
+                    ],
+                    database: database
+                )
+            }
         }
 
         for assignment in configuration.photoEventAssignments where eventsByID[assignment.eventID] != nil {
-            try runUpsert(
-                """
-                INSERT INTO event_assets(
-                    id, event_id, source_root_path, relative_path, byte_count,
-                    modified_at, device_id, immich_upload_override, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    event_id = excluded.event_id,
-                    source_root_path = excluded.source_root_path,
-                    relative_path = excluded.relative_path,
-                    byte_count = excluded.byte_count,
-                    modified_at = excluded.modified_at,
-                    device_id = excluded.device_id,
-                    immich_upload_override = excluded.immich_upload_override,
-                    updated_at = excluded.updated_at;
-                """,
-                values: [
-                    Self.eventAssetID(assignment),
-                    assignment.eventID.uuidString,
-                    assignment.sourceRootPath,
-                    assignment.relativePath,
-                    String(assignment.fileSize),
-                    Self.isoTimestamp(assignment.modifiedAt),
-                    assignment.deviceID ?? "",
-                    assignment.immichUploadOverride.map { $0 ? "1" : "0" } ?? "",
-                    now
-                ],
-                database: database
-            )
+            try autoreleasepool {
+                try runUpsert(
+                    """
+                    INSERT INTO event_assets(
+                        id, event_id, source_root_path, relative_path, byte_count,
+                        modified_at, device_id, immich_upload_override, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        event_id = excluded.event_id,
+                        source_root_path = excluded.source_root_path,
+                        relative_path = excluded.relative_path,
+                        byte_count = excluded.byte_count,
+                        modified_at = excluded.modified_at,
+                        device_id = excluded.device_id,
+                        immich_upload_override = excluded.immich_upload_override,
+                        updated_at = excluded.updated_at;
+                    """,
+                    values: [
+                        Self.eventAssetID(assignment),
+                        assignment.eventID.uuidString,
+                        assignment.sourceRootPath,
+                        assignment.relativePath,
+                        String(assignment.fileSize),
+                        Self.isoTimestamp(assignment.modifiedAt),
+                        assignment.deviceID ?? "",
+                        assignment.immichUploadOverride.map { $0 ? "1" : "0" } ?? "",
+                        now
+                    ],
+                    database: database
+                )
+            }
         }
 
         try deleteRowsNotIn(
@@ -637,14 +641,20 @@ public struct CatalogStore {
 
     private static let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
+    /// One formatter for every timestamp a bootstrap or mirror write stamps
+    /// — minting one per upserted row was measurable on large libraries.
+    nonisolated(unsafe) private static let isoFormatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+
     private static func isoTimestamp() -> String {
         isoTimestamp(Date())
     }
 
     private static func isoTimestamp(_ date: Date) -> String {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter.string(from: date)
+        isoFormatter.string(from: date)
     }
 
     public static func eventAssetID(_ assignment: PhotoEventAssignment) -> String {

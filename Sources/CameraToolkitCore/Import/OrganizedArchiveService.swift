@@ -182,13 +182,20 @@ public struct OrganizedArchiveLayout: Sendable {
         return folders.sorted()
     }
 
-    private static func safeDate(_ value: String) -> String {
-        let prefix = String(value.prefix(10))
+    /// Shared `yyyy-MM-dd` validator: a layout is built once per file in
+    /// the presence sweep, so the formatter must not be per call.
+    /// `en_US_POSIX` + Gregorian keep folder names byte-identical.
+    private static let dayFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.calendar = Calendar(identifier: .gregorian)
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.dateFormat = "yyyy-MM-dd"
-        return formatter.date(from: prefix) == nil ? formatter.string(from: Date()) : prefix
+        return formatter
+    }()
+
+    private static func safeDate(_ value: String) -> String {
+        let prefix = String(value.prefix(10))
+        return dayFormatter.date(from: prefix) == nil ? dayFormatter.string(from: Date()) : prefix
     }
 
     private static func pathComponent(_ value: String, fallback: String) -> String {

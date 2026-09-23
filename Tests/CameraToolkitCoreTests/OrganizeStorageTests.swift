@@ -300,6 +300,95 @@ final class OrganizeStorageTests: XCTestCase {
             OrganizeFile(path: "/Volumes/Card/DCIM/DSC00001.ARW", size: 1, modifiedAt: .distantPast).pathKey
         )
     }
+
+    /// The folder names the presence sweep, card-copy roots, and archive
+    /// layout emit are on-disk identity — a single changed byte would move
+    /// every file. The sweep now shares formatters, so this pins every
+    /// component: the `yyyy-MM-dd` date, device folder, media folder,
+    /// subevent nesting, and `Card Copy` suffix.
+    func testEventFolderNamesStayPinned() throws {
+        try withTemporaryDirectory { root in
+            let configuration = testConfiguration(root: root)
+            let locations = EventStorageLocations(configuration: configuration)
+            let date = try XCTUnwrap(DateFormatter.yyyyMMdd.date(from: "2026-08-26"))
+            let event = SavedCameraEvent(name: "Mountain Trip", eventDate: date)
+
+            XCTAssertEqual(EventStorageLocations.eventDateString(date), "2026-08-26")
+
+            let layout = locations.layout(for: event, deviceID: "sony-a7v")
+            XCTAssertEqual(layout.eventDate, "2026-08-26")
+            XCTAssertEqual(layout.eventName, "Mountain Trip")
+            XCTAssertEqual(layout.year, "2026")
+            XCTAssertEqual(layout.eventFolder, "2026-08-26 Mountain Trip")
+            XCTAssertEqual(layout.eventFolderPath, "2026-08-26 Mountain Trip")
+            XCTAssertEqual(layout.deviceFolder, "Sony A7V")
+
+            // Every device folder name.
+            func deviceFolder(_ id: String) -> String {
+                OrganizedArchiveLayout(eventDate: "2026-08-26", eventName: "E", deviceID: id).deviceFolder
+            }
+            XCTAssertEqual(deviceFolder("sony-a7v"), "Sony A7V")
+            XCTAssertEqual(deviceFolder("osmo-360"), "DJI Osmo 360")
+            XCTAssertEqual(deviceFolder("dji-mini-2"), "DJI Mini 2")
+            XCTAssertEqual(deviceFolder("dji-nano"), "DJI Nano")
+            XCTAssertEqual(deviceFolder("action-6"), "DJI Action 6")
+            XCTAssertEqual(deviceFolder("iphone"), "iPhone")
+            XCTAssertEqual(deviceFolder(""), "Camera")
+
+            // Full on-disk roots for both policies.
+            XCTAssertEqual(
+                locations.cardCopyRoot(for: event, deviceID: "sony-a7v", policy: .buffer).path,
+                root.appendingPathComponent("Buffer/2026/2026-08-26 Mountain Trip/Sony A7V/Card Copy")
+                    .standardizedFileURL.path
+            )
+            XCTAssertEqual(
+                locations.eventFolder(for: event, policy: .archiveOnly).path,
+                root.appendingPathComponent(".Camera Toolkit/Private/2026/2026-08-26 Mountain Trip")
+                    .standardizedFileURL.path
+            )
+
+            // Media-folder routing inside the archive.
+            XCTAssertEqual(
+                try layout.destinationRelativePath(for: "DCIM/100MSDCF/DSC00001.ARW"),
+                "Originals/2026/2026-08-26 Mountain Trip/Sony A7V/RAW/DSC00001.ARW"
+            )
+            XCTAssertEqual(
+                try layout.destinationRelativePath(for: "DCIM/100MSDCF/DSC00001.XMP"),
+                "Originals/2026/2026-08-26 Mountain Trip/Sony A7V/RAW/DSC00001.XMP"
+            )
+            XCTAssertEqual(
+                try layout.destinationRelativePath(for: "DCIM/100MSDCF/DSC00002.JPG"),
+                "Originals/2026/2026-08-26 Mountain Trip/Sony A7V/JPEG/DSC00002.JPG"
+            )
+            XCTAssertEqual(
+                try layout.destinationRelativePath(for: "PRIVATE/M4ROOT/CLIP/C0001.MP4"),
+                "Originals/2026/2026-08-26 Mountain Trip/Sony A7V/Video/C0001.MP4"
+            )
+            XCTAssertEqual(
+                try layout.destinationRelativePath(for: "DCIM/100MSDCF/THMBNL.DAT"),
+                "Originals/2026/2026-08-26 Mountain Trip/Sony A7V/Camera Support/THMBNL.DAT"
+            )
+
+            // A subevent nests inside its parent's folder under the
+            // parent's year.
+            let parent = SavedCameraEvent(
+                name: "Summer 2026",
+                eventDate: try XCTUnwrap(DateFormatter.yyyyMMdd.date(from: "2026-08-01"))
+            )
+            let child = SavedCameraEvent(name: "Beach Day", eventDate: date, parentEventID: parent.id)
+            var nested = configuration
+            nested.savedEvents = [parent, child]
+            let childLayout = EventStorageLocations(configuration: nested)
+                .layout(for: child, deviceID: nil)
+            XCTAssertEqual(childLayout.parentEventFolders, ["2026-08-01 Summer 2026"])
+            XCTAssertEqual(childLayout.eventFolderPath, "2026-08-01 Summer 2026/2026-08-26 Beach Day")
+            XCTAssertEqual(childLayout.year, "2026")
+
+            // An unparseable date falls back to today, still `yyyy-MM-dd`.
+            let fallback = OrganizedArchiveLayout(eventDate: "not-a-date", eventName: "E", deviceID: "x")
+            XCTAssertNotNil(DateFormatter.yyyyMMdd.date(from: fallback.eventDate))
+        }
+    }
 }
 
 extension DateFormatter {

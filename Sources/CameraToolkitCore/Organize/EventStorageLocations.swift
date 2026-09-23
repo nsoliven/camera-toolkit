@@ -127,13 +127,21 @@ public struct EventStorageLocations: Sendable {
         return buffer.deletingLastPathComponent().appendingPathComponent(toolkitFolderName, isDirectory: true)
     }
 
-    public static func eventDateString(_ date: Date) -> String {
+    /// One formatter for every `yyyy-MM-dd` event folder name in the app.
+    /// The presence sweep and drive discovery used to mint one per call —
+    /// several per file — and formatter construction dominated the sweep.
+    /// `en_US_POSIX` + Gregorian keep the names byte-identical everywhere.
+    private static let eventDateFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.calendar = Calendar(identifier: .gregorian)
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.timeZone = .current
         formatter.dateFormat = "yyyy-MM-dd"
-        return formatter.string(from: date)
+        return formatter
+    }()
+
+    public static func eventDateString(_ date: Date) -> String {
+        eventDateFormatter.string(from: date)
     }
 
     /// Ancestors of `event`, root first. Unknown or looping parent links end

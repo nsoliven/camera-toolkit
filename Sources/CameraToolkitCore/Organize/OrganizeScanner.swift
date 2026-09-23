@@ -164,15 +164,17 @@ public struct OrganizeScanner: Sendable {
                 }
             },
             transform: { index in
-                let file = pairings[readable[index]].primary
-                if let cached = cache?.lookup(path: file.path, size: file.size, modifiedAt: file.modifiedAt) {
-                    return (cached, false)
+                autoreleasepool {
+                    let file = pairings[readable[index]].primary
+                    if let cached = cache?.lookup(path: file.path, size: file.size, modifiedAt: file.modifiedAt) {
+                        return (cached, false)
+                    }
+                    guard readMissingCaptureDates else { return (nil, true) }
+                    pauseGate?.waitIfPaused(for: file.url)
+                    let timestamp = timestampProbe?(file.url) ?? CaptureDateReader.timestamp(of: file.url)
+                    cache?.store(path: file.path, size: file.size, modifiedAt: file.modifiedAt, timestamp: timestamp)
+                    return (timestamp, true)
                 }
-                guard readMissingCaptureDates else { return (nil, true) }
-                pauseGate?.waitIfPaused(for: file.url)
-                let timestamp = timestampProbe?(file.url) ?? CaptureDateReader.timestamp(of: file.url)
-                cache?.store(path: file.path, size: file.size, modifiedAt: file.modifiedAt, timestamp: timestamp)
-                return (timestamp, true)
             }
         )
         try? cache?.save()
@@ -226,11 +228,12 @@ public struct OrganizeScanner: Sendable {
         "$recycle.bin", "system volume information", "_trash", ".camera toolkit"
     ]
 
+    private static let listedKeys: [URLResourceKey] = [.isDirectoryKey, .isRegularFileKey, .fileSizeKey, .contentModificationDateKey, .isPackageKey]
+
     static func listFiles(root: URL, progress: ((Int) -> Void)? = nil) throws -> [OrganizeFile] {
-        let keys: [URLResourceKey] = [.isDirectoryKey, .isRegularFileKey, .fileSizeKey, .contentModificationDateKey, .isPackageKey]
         guard let enumerator = FileManager.default.enumerator(
             at: root,
-            includingPropertiesForKeys: keys,
+            includingPropertiesForKeys: listedKeys,
             options: [.skipsHiddenFiles, .skipsPackageDescendants],
             errorHandler: { _, _ in true }
         ) else {
@@ -239,27 +242,41 @@ public struct OrganizeScanner: Sendable {
 
         var files: [OrganizeFile] = []
         for case let url as URL in enumerator {
-            guard let values = try? url.resourceValues(forKeys: Set(keys)) else { continue }
-            let name = url.lastPathComponent
-            if values.isDirectory == true {
-                if skippedDirectoryNames.contains(name.lowercased()) {
-                    enumerator.skipDescendants()
-                }
-                continue
+            autoreleasepool {
+                appendFile(url, enumerator: enumerator, root: root, into: &files)
             }
-            guard values.isRegularFile == true, values.isPackage != true else { continue }
-            let relative = FileScanner.relativePath(for: url, under: root)
-            guard !ExclusionMatcher.isExcluded(relative) else { continue }
-            files.append(OrganizeFile(
-                path: url.standardizedFileURL.path,
-                size: Int64(values.fileSize ?? 0),
-                modifiedAt: values.contentModificationDate ?? .distantPast
-            ))
             if files.count % 500 == 0 {
                 progress?(files.count)
             }
         }
         return files
+    }
+
+    /// One enumerator row: skip excluded/non-regular entries, keep the rest
+    /// as `OrganizeFile`s. Split out so the per-file `autoreleasepool` in
+    /// `listFiles` wraps exactly this work.
+    private static func appendFile(
+        _ url: URL,
+        enumerator: FileManager.DirectoryEnumerator,
+        root: URL,
+        into files: inout [OrganizeFile]
+    ) {
+        guard let values = try? url.resourceValues(forKeys: Set(listedKeys)) else { return }
+        let name = url.lastPathComponent
+        if values.isDirectory == true {
+            if skippedDirectoryNames.contains(name.lowercased()) {
+                enumerator.skipDescendants()
+            }
+            return
+        }
+        guard values.isRegularFile == true, values.isPackage != true else { return }
+        let relative = FileScanner.relativePath(for: url, under: root)
+        guard !ExclusionMatcher.isExcluded(relative) else { return }
+        files.append(OrganizeFile(
+            path: url.standardizedFileURL.path,
+            size: Int64(values.fileSize ?? 0),
+            modifiedAt: values.contentModificationDate ?? .distantPast
+        ))
     }
 
     static func roundedMedianOffset(_ deltas: [TimeInterval]) -> TimeInterval? {

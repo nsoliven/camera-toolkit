@@ -422,11 +422,7 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
 
     public var archiveEventDate: String {
         let candidate = String(batchID.prefix(10))
-        let formatter = DateFormatter()
-        formatter.calendar = Calendar(identifier: .gregorian)
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "yyyy-MM-dd"
-        return formatter.date(from: candidate) == nil ? Self.dayFormatter.string(from: Date()) : candidate
+        return Self.dayFormatter.date(from: candidate) == nil ? Self.dayFormatter.string(from: Date()) : candidate
     }
 
     public func libraryBatchFolderPath(_ folder: CameraLibraryFolder) -> String {

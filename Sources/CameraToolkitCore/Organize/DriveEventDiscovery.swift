@@ -50,16 +50,55 @@ public enum DriveEventDiscovery {
             events[event.id] = event
         }
 
+        // The covered set needs every candidate path's `pathKey`, but the
+        // roots only depend on (event, device, policy): rebuilding them per
+        // assignment minted date formatters by the thousand, so they are
+        // memoized and each file contributes a join + standardize — the
+        // same work `driveURL`/`sourceURL` do.
+        var cardRoots: [String: URL] = [:]
+        var sourceRoots: [String: URL] = [:]
+        var validRelative: [String: Bool] = [:]
+        func cardCopyRoot(_ policy: EventStoragePolicy, _ event: SavedCameraEvent, _ deviceID: String?) -> URL {
+            let key = "\(event.id)\u{0}\(policy.rawValue)\u{0}\(deviceID ?? "")"
+            if let cached = cardRoots[key] { return cached }
+            let root = locations.cardCopyRoot(for: event, deviceID: deviceID, policy: policy)
+            cardRoots[key] = root
+            return root
+        }
+        func isValidRelative(_ path: String) -> Bool {
+            if let cached = validRelative[path] { return cached }
+            let valid = (try? PathSafety.validateRelativePath(path)) != nil
+            validRelative[path] = valid
+            return valid
+        }
+
         var covered: Set<String> = []
         for assignment in configuration.photoEventAssignments {
             guard let event = events[assignment.eventID] else { continue }
-            for candidatePolicy in EventStoragePolicy.allCases {
-                if let url = locations.driveURL(for: assignment, event: event, policy: candidatePolicy) {
+            autoreleasepool {
+                for candidatePolicy in EventStoragePolicy.allCases {
+                    guard isValidRelative(assignment.relativePath) else { continue }
+                    let url = cardCopyRoot(candidatePolicy, event, assignment.deviceID)
+                        .appendingPathComponent(assignment.relativePath)
+                        .standardizedFileURL
                     covered.insert(EventStorageLocations.pathKey(url.path))
                 }
-            }
-            if let source = locations.sourceURL(for: assignment) {
-                covered.insert(EventStorageLocations.pathKey(source.path))
+                if isValidRelative(assignment.relativePath) {
+                    let sourceRoot: URL
+                    if let cached = sourceRoots[assignment.sourceRootPath] {
+                        sourceRoot = cached
+                    } else {
+                        sourceRoot = URL(
+                            fileURLWithPath: NSString(string: assignment.sourceRootPath).expandingTildeInPath,
+                            isDirectory: true
+                        )
+                        sourceRoots[assignment.sourceRootPath] = sourceRoot
+                    }
+                    let source = sourceRoot
+                        .appendingPathComponent(assignment.relativePath)
+                        .standardizedFileURL
+                    covered.insert(EventStorageLocations.pathKey(source.path))
+                }
             }
         }
 
@@ -120,7 +159,9 @@ public enum DriveEventDiscovery {
                 continue
             }
             let files = try FileScanner(fileManager: fileManager).scan(root: cardCopy).filter { file in
-                !covered.contains(EventStorageLocations.pathKey(cardCopy.appendingPathComponent(file.path).path))
+                autoreleasepool {
+                    !covered.contains(EventStorageLocations.pathKey(cardCopy.appendingPathComponent(file.path).path))
+                }
             }
             guard !files.isEmpty else { continue }
             let components = relativeComponents(of: eventFolder, under: driveRoot)
