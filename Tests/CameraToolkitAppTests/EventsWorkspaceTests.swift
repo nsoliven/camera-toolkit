@@ -663,14 +663,9 @@ final class EventsWorkspaceTests: XCTestCase {
             XCTAssertNil(workspace.newEventRequest)
             XCTAssertTrue(model.statusMessage.contains("two levels"), model.statusMessage)
 
-            // The file-browser path refuses through DashboardModel too.
-            XCTAssertFalse(model.createEvent(named: "Too Deep", on: organizerDay("2026-08-25"), parentEventID: grandchild))
-            XCTAssertTrue(model.statusMessage.contains("two levels"), model.statusMessage)
-
             // The Inside-event picker never offers a depth-2 parent; the
             // grandchild still lists and its own link survives a rename.
             XCTAssertFalse(workspace.parentCandidates(excluding: nil).contains { $0.event.id == grandchild })
-            XCTAssertFalse(model.parentEventCandidates.contains { $0.event.id == grandchild })
             XCTAssertEqual(workspace.sidebarEvents.map(\.event.id), [parent, child, grandchild])
             XCTAssertNil(workspace.validParentEventID(grandchild, for: nil))
             XCTAssertEqual(workspace.validParentEventID(child, for: grandchild), child)
@@ -2804,7 +2799,6 @@ final class EventsWorkspaceTests: XCTestCase {
             selectedDeviceID: "sony-a7v"
         )
         let model = DashboardModel(
-            activePlan: CopyPlan(),
             jobs: [],
             configuration: configuration,
             configurationStore: ConfigurationStore(url: resolvedRoot.appendingPathComponent("config.json"))

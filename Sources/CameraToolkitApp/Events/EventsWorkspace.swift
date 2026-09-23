@@ -1134,7 +1134,6 @@ final class EventsWorkspace {
     }
 
     func startGuide() {
-        AppShellMode.show(.events)
         if guide == nil {
             guide = SetupGuide(workspace: self)
         }

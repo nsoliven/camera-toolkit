@@ -2,22 +2,12 @@ import AppKit
 import SwiftUI
 
 enum BrowserCommand: String, Sendable, CaseIterable {
-    case copySelection
     case moveSelectionToTrash
     case selectAll
     case openSelection
     case previewSelection
     case revealSelection
-    case createFolder
-    case goBack
-    case goForward
-    case goUp
-    case previousSource
-    case nextSource
-    case increaseThumbnailSize
-    case decreaseThumbnailSize
     case reload
-    case showSelectedLocationInformation
     /// Focus the search field of whichever board supports it (the organize
     /// board today). Boards without a search field ignore it.
     case find
@@ -33,103 +23,6 @@ enum BrowserCommand: String, Sendable, CaseIterable {
     @MainActor
     static func post(_ command: BrowserCommand) {
         NotificationCenter.default.post(name: notification, object: command.rawValue)
-    }
-}
-
-enum BrowserThumbnailSizing {
-    static let defaultHeight = 32.0
-    static let presets = [16.0, 24.0, 32.0, 44.0, 60.0, 80.0, 104.0]
-
-    static func larger(than current: Double) -> Double {
-        presets.first(where: { $0 > current + 0.5 }) ?? presets.last ?? defaultHeight
-    }
-
-    static func smaller(than current: Double) -> Double {
-        presets.last(where: { $0 < current - 0.5 }) ?? presets.first ?? defaultHeight
-    }
-
-    static func width(for height: Double) -> Double {
-        height * 4 / 3
-    }
-
-    static func maximumPixelSize(for height: Double) -> Int {
-        max(128, Int((height * 2).rounded(.up)))
-    }
-}
-
-enum BrowserTreeProjection {
-    static func flattened<Item>(
-        roots: [Item],
-        childrenByParentID: [String: [Item]],
-        expandedParentIDs: Set<String>,
-        id: (Item) -> String
-    ) -> [Item] {
-        var result: [Item] = []
-        var visited: Set<String> = []
-
-        func append(_ items: [Item]) {
-            for item in items {
-                let itemID = id(item)
-                guard visited.insert(itemID).inserted else { continue }
-                result.append(item)
-                if expandedParentIDs.contains(itemID),
-                   let children = childrenByParentID[itemID] {
-                    append(children)
-                }
-            }
-        }
-
-        append(roots)
-        return result
-    }
-}
-
-enum BrowserTreeMutationState {
-    static func isInsideSubtree(_ id: String, rootedAt subtreeRoots: [String]) -> Bool {
-        subtreeRoots.contains { root in
-            id == root || id.hasPrefix(root.hasSuffix("/") ? root : root + "/")
-        }
-    }
-
-    static func removingSubtrees(
-        from ids: Set<String>,
-        rootedAt subtreeRoots: [String]
-    ) -> Set<String> {
-        ids.filter { !isInsideSubtree($0, rootedAt: subtreeRoots) }
-    }
-}
-
-enum BrowserThumbnailShortcut {
-    static func command(
-        for charactersIgnoringModifiers: String?,
-        modifierFlags: NSEvent.ModifierFlags
-    ) -> BrowserCommand? {
-        let relevantFlags = modifierFlags.intersection([.command, .control, .option])
-        guard relevantFlags == [.command] else { return nil }
-
-        switch charactersIgnoringModifiers {
-        case "=", "+":
-            return .increaseThumbnailSize
-        case "-", "_":
-            return .decreaseThumbnailSize
-        default:
-            return nil
-        }
-    }
-}
-
-enum BrowserItemNamePolicy {
-    static func normalizedName(_ rawValue: String) -> String? {
-        let name = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !name.isEmpty,
-              name != ".",
-              name != "..",
-              !name.contains("/"),
-              !name.contains(":"),
-              !name.contains("\0") else {
-            return nil
-        }
-        return name
     }
 }
 
@@ -150,114 +43,56 @@ struct KeyboardShortcutSection: Identifiable, Equatable, Sendable {
 enum CameraToolkitShortcutCatalog {
     static let sections: [KeyboardShortcutSection] = [
         KeyboardShortcutSection(
-            title: "Files and Folders",
-            symbol: "folder",
+            title: "Organize",
+            symbol: "rectangle.3.group",
             shortcuts: [
-                .init(action: "Previous or next item", keys: "↑  ↓", detail: "Moves the file selection and updates the side preview."),
-                .init(action: "Expand or collapse a folder", keys: "→  ←", detail: "Shows or hides a folder’s contents inline without navigating away."),
-                .init(action: "Open selected item", keys: "Return  /  ⌘O  /  ⌘↓", detail: "Opens a folder or the selected file in its default app."),
-                .init(action: "Preview selected photos", keys: "Space  /  ⌘Y", detail: "Opens Camera Toolkit's large preview without decoding the full RAW."),
-                .init(action: "Copy selected files", keys: "⌘C", detail: "Copies Finder-compatible file references to the clipboard."),
-                .init(action: "Copy file paths", keys: "Right-click", detail: "Copies each selected file or folder path as plain text, one path per line."),
-                .init(action: "Rename selected item", keys: "Right-click", detail: "Renames one item without reading or rewriting its file contents."),
-                .init(action: "Move selected items to Trash", keys: "⌘Delete / Right-click", detail: "Confirms, then uses macOS Trash for files, non-empty folders, or a multi-selection. Configured locations and drive roots stay protected."),
-                .init(action: "Delete an empty folder", keys: "Right-click", detail: "Confirms, then removes only a truly empty folder. Hidden files make the operation fail safely."),
-                .init(action: "Select all", keys: "⌘A", detail: "Selects every visible row, including contents from expanded folders."),
-                .init(action: "Larger or smaller thumbnails", keys: "⌘+  ⌘−", detail: "Resizes browser thumbnails and remembers the chosen size."),
-                .init(action: "Select across folders", keys: "+ button", detail: "Starts an event-selection basket that stays with you while browsing folders or camera sources."),
-                .init(action: "Open Event Library", keys: "⌥⌘E", detail: "Shows event photos across their camera, buffer, library, and Immich locations."),
-                .init(action: "Open Jobs", keys: "⌥⌘T", detail: "Shows transfers, burst regrouping, face scans, and other background jobs with progress and any problem."),
-                .init(action: "Open SQL Inspector", keys: "⇧⌘I", detail: "Browses the SQLite photo list, schema, and read-only SQL queries."),
-                .init(action: "New folder", keys: "⇧⌘N", detail: "Creates a folder in the location currently being browsed."),
+                .init(action: "Select all", keys: "⌘A", detail: "Selects every stack on the current board."),
+                .init(action: "Search the board", keys: "⌘F", detail: "Focuses the board's search field; the popover filters by people, date, event, and media kind."),
+                .init(action: "Sort into a recent event", keys: "1  2  3", detail: "Assigns selected stacks to one of the three most recently used events."),
+                .init(action: "New event", keys: "N", detail: "Creates an event and assigns the selected stacks to it."),
+                .init(action: "Rotate selected frames", keys: "[  ]", detail: "Rotates the selection 90° left or right; R and ⇧R also work."),
+                .init(action: "Undo a sort", keys: "⌘Z", detail: "Reverts the last sort or move before it was applied."),
+                .init(action: "Open in Photomator", keys: "⌘O", detail: "Opens the selected files in Photomator, or the default app when it is not installed."),
                 .init(action: "Reveal in Finder", keys: "⇧⌘R", detail: "Shows the selected files in Finder."),
-                .init(action: "Get drive information", keys: "⌘I / Right-click", detail: "Shows live capacity, model, connection, filesystem, and available SMART health for the selected sidebar location."),
-            ]
-        ),
-        KeyboardShortcutSection(
-            title: "Navigation",
-            symbol: "arrow.triangle.turn.up.right.diamond",
-            shortcuts: [
-                .init(action: "Back or forward", keys: "⌘[  ⌘]", detail: "Moves through folder history."),
-                .init(action: "Enclosing folder", keys: "⌘↑", detail: "Opens the folder containing the current folder."),
-                .init(action: "Previous or next camera", keys: "⇧⌃Tab  ⌃Tab", detail: "Moves between configured camera sources."),
-                .init(action: "Show or hide sidebar", keys: "⌘B", detail: "Toggles the Locations sidebar."),
-                .init(action: "Refresh", keys: "⌘R", detail: "Refreshes locations and the current browser state."),
-                .init(action: "Keyboard shortcuts", keys: "⇧⌘K", detail: "Opens this shortcut reference window."),
+                .init(action: "Move to Trash", keys: "⌘Delete", detail: "Confirms, then moves the selected files to macOS Trash. Camera originals and configured locations stay protected."),
+                .init(action: "Refresh", keys: "⌘R", detail: "Reloads the configuration and re-checks connectivity."),
             ]
         ),
         KeyboardShortcutSection(
             title: "Preview",
             symbol: "photo",
             shortcuts: [
-                .init(action: "Previous or next photo", keys: "←  →", detail: "Moves through previewable photos in the current folder."),
-                .init(action: "Zoom in or out", keys: "Zoom buttons / pinch", detail: "Zooms the embedded preview without changing thumbnail size."),
-                .init(action: "Zoom to fit", keys: "⌘0", detail: "Fits the whole photo inside the preview."),
-                .init(action: "Actual size", keys: "⌘1", detail: "Shows one image pixel per display point."),
-                .init(action: "Pan a zoomed photo", keys: "Drag", detail: "Click and drag the photo after zooming in."),
-                .init(action: "Open in Photomator", keys: "↗ button", detail: "The side preview's expand button opens the RAW in Photomator."),
-                .init(action: "Close large preview", keys: "Space  /  Esc", detail: "Returns to the file browser."),
+                .init(action: "Open preview", keys: "Space  /  ⌘Y", detail: "Opens the large preview for the focused stack."),
+                .init(action: "Previous or next frame", keys: "←  →", detail: "Steps through a burst's frames; ⇧ extends the selected range."),
+                .init(action: "Previous or next stack", keys: "↑  ↓", detail: "Moves the preview to the neighboring stack."),
+                .init(action: "Zoom to fit or actual size", keys: "⌘0  ⌘1", detail: "Fits the whole photo, or shows one image pixel per display point."),
+                .init(action: "Play or pause a video", keys: "Space", detail: "While a video preview is open, Space toggles playback instead of closing."),
+                .init(action: "Close preview", keys: "Space  /  Esc", detail: "Returns to the board."),
+            ]
+        ),
+        KeyboardShortcutSection(
+            title: "Windows",
+            symbol: "macwindow",
+            shortcuts: [
+                .init(action: "Show or hide the sidebar", keys: "⌘B", detail: "Toggles the Organize sidebar."),
+                .init(action: "Main window", keys: "⌘0", detail: "Brings the organizer forward."),
+                .init(action: "Event Library", keys: "⌥⌘E", detail: "Shows event photos across their camera, buffer, library, and Immich locations."),
+                .init(action: "People", keys: "⌥⌘P", detail: "Shows the people the face index found and their events."),
+                .init(action: "Photo List SQL Inspector", keys: "⇧⌘I", detail: "Browses the SQLite photo list, schema, and read-only SQL queries."),
+                .init(action: "Jobs", keys: "⌥⌘T", detail: "Shows transfers, face scans, and other background jobs with progress and any problem."),
+                .init(action: "Settings", keys: "⌘,", detail: "Opens storage locations, cameras, and service settings."),
+                .init(action: "Keyboard shortcuts", keys: "⇧⌘K", detail: "Opens this shortcut reference window."),
             ]
         ),
         KeyboardShortcutSection(
             title: "Safety",
             symbol: "lock.shield",
             shortcuts: [
-                .init(action: "Move files to Trash", keys: "Always confirms", detail: "Camera Toolkit uses macOS Trash, refuses configured locations and drive roots, and reports partial failures honestly."),
-                .init(action: "Paste or permanently delete files", keys: "Disabled", detail: "Permanent source cleanup remains a separate verified workflow and never runs from a normal browser shortcut."),
+                .init(action: "Move files to Trash", keys: "Always confirms", detail: "Camera Toolkit uses macOS Trash and refuses configured locations and drive roots."),
+                .init(action: "Free Up Source / Take Off Drive", keys: "Separate buttons", detail: "Permanent cleanup only runs from the event storage strip after its own confirmation — never from a stray click or shortcut."),
             ]
         ),
     ]
-}
-
-@MainActor
-enum FileClipboardWriter {
-    @discardableResult
-    static func copy(_ urls: [URL], to pasteboard: NSPasteboard = .general) -> Bool {
-        let fileURLs = urls.filter(\.isFileURL)
-        guard !fileURLs.isEmpty else { return false }
-        pasteboard.clearContents()
-        return pasteboard.writeObjects(fileURLs as [NSURL])
-    }
-
-    @discardableResult
-    static func copyPaths(_ urls: [URL], to pasteboard: NSPasteboard = .general) -> Bool {
-        let paths = urls.filter(\.isFileURL).map(\.path)
-        guard !paths.isEmpty else { return false }
-        pasteboard.clearContents()
-        return pasteboard.setString(paths.joined(separator: "\n"), forType: .string)
-    }
-}
-
-enum FinderItemActions {
-    static let informationWindowScript = """
-    on run itemPaths
-        tell application "Finder"
-            activate
-            repeat with itemPath in itemPaths
-                try
-                    open information window of ((POSIX file itemPath) as alias)
-                end try
-            end repeat
-        end tell
-    end run
-    """
-
-    static func informationArguments(for urls: [URL]) -> [String] {
-        ["-e", informationWindowScript, "--"] + urls.filter(\.isFileURL).map(\.path)
-    }
-
-    @MainActor
-    static func showInfo(for urls: [URL]) {
-        let arguments = informationArguments(for: urls)
-        guard arguments.count > 3 else { return }
-
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        process.arguments = arguments
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        try? process.run()
-    }
 }
 
 @MainActor
@@ -299,7 +134,7 @@ private struct KeyboardShortcutsReferenceView: View {
                 VStack(alignment: .leading, spacing: 5) {
                     Text("Keyboard Shortcuts")
                         .font(.largeTitle.bold())
-                    Text("Finder-style browsing, fast camera switching, and Photomator-style preview controls.")
+                    Text("Sorting bursts into events, moving files between locations, and previewing without leaving the board.")
                         .foregroundStyle(.secondary)
                 }
 

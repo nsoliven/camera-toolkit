@@ -646,15 +646,21 @@ private struct TransferQueueView: View {
             }
 
             Button("Show Camera") {
-                model.openEventFolder(queue.sourcePath)
+                revealFolder(queue.sourcePath)
             }
             Button("Show Buffer") {
-                model.openEventFolder(queue.destinationPath)
+                revealFolder(queue.destinationPath)
             }
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
         .background(.bar)
+    }
+
+    private func revealFolder(_ path: String) {
+        let url = URL(fileURLWithPath: DashboardModel.expandedPath(path), isDirectory: true)
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        NSWorkspace.shared.open(url)
     }
 
     private func canFreeUpCamera(_ queue: TransferQueueSnapshot) -> Bool {

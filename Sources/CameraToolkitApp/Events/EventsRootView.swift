@@ -440,9 +440,6 @@ struct EventsSidebar: View {
             footerButton("Trash…", detail: nil, symbol: "trash") {
                 TrashWindowController.shared.show(model: model)
             }
-            footerButton("File Browser", detail: nil, symbol: "folder") {
-                AppShellMode.show(.files)
-            }
             footerButton("Settings…", detail: nil, symbol: "gearshape") {
                 CameraToolkitConfigWindow.shared.show(model: model)
             }

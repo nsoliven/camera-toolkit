@@ -23,7 +23,7 @@ New here? Press **Start Guided Setup** on the welcome screen, or **Guide** in th
 
 ## What the app does
 
-- Opens on **Events**: unsorted folders and cards on the left, events below them, and a burst board or event view on the right. The original Finder-style browser is still one click away as **File Browser**.
+- Opens on **Events**: unsorted folders and cards on the left, events below them, and a burst board or event view on the right.
 - Reads capture times from a small block of each RAW header, remembers them, pairs sidecars and RAW+JPEG twins, trusts existing `B0001_` burst prefixes, and chains still frames shot within a second.
 - Shows every capture day as its own section with large thumbnails, a burst count badge, and a full-size preview with a filmstrip for every frame.
 - Sorts with number keys, drag and drop, or a context menu, with Command-Z undo. Nothing moves until Apply shows its plan.
@@ -138,7 +138,6 @@ Photo Library/Originals/<year>/<yyyy-MM-dd event>/<camera>/
 | Space | Preview the selected burst; ← → step frames, ↑ ↓ move between items |
 | Command-Z | Undo the last sort |
 | Command-A | Select everything shown |
-| Option-Command-1 / Option-Command-2 | Switch between Events and File Browser |
 | Command-R | Refresh |
 | Option-Command-E | Open Event Library |
 | Shift-Command-I | Open the SQLite inspector |
