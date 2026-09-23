@@ -836,6 +836,32 @@ final class EventsWorkspaceTests: XCTestCase {
             // on the grandchild's own board it wears no tag.
             XCTAssertEqual(workspace.subeventTag(for: try XCTUnwrap(boardByName["DSC00003.ARW"]), in: child)?.id, grandchild)
             XCTAssertNil(workspace.subeventTag(for: try XCTUnwrap(boardByName["DSC00003.ARW"]), in: grandchild))
+
+            // Applied photos sit in Card Copy, not the folder they were
+            // imported from. The filter still has to see which subevent
+            // owns them, or "is none of" leaves the count unchanged.
+            let childEvent = try XCTUnwrap(workspace.event(child))
+            let childAssignment = try XCTUnwrap(model.configuration.photoEventAssignments.first { $0.eventID == child })
+            let implied = try XCTUnwrap(workspace.locations.impliedDrivePath(
+                for: childAssignment,
+                event: childEvent,
+                policy: workspace.locations.resolvedPolicy(for: childEvent)
+            ))
+            let atCardCopy = OrganizeFile(
+                literalPath: implied,
+                size: childAssignment.fileSize,
+                modifiedAt: childAssignment.modifiedAt
+            )
+            XCTAssertEqual(workspace.assignment(for: atCardCopy)?.eventID, child)
+            var standardized = atCardCopy
+            standardized.path = implied
+            XCTAssertEqual(workspace.assignment(for: standardized)?.eventID, child)
+            var hidden = workspace.search
+            hidden.groups = [OrganizeFilterGroup(rows: [.events([child], exclude: true)])]
+            var cardCopyStack = try XCTUnwrap(boardByName["DSC00002.ARW"])
+            cardCopyStack.items[0].primary = atCardCopy
+            workspace.eventStacks[parent] = [cardCopyStack]
+            XCTAssertTrue(workspace.visibleEventStacks(parent, search: hidden).isEmpty)
         }
     }
 

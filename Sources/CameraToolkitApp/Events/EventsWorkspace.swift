@@ -761,13 +761,55 @@ final class EventsWorkspace {
         let assignments = model.configuration.photoEventAssignments
         guard indexRevision != model.configurationRevision || indexCount != assignments.count else { return }
         var index: [String: PhotoEventAssignment] = [:]
-        index.reserveCapacity(assignments.count)
+        index.reserveCapacity(assignments.count * 2)
         var counts: [UUID: Int] = [:]
         var bytes: [UUID: Int64] = [:]
         for assignment in assignments {
             index[Self.sourceKey(assignment)] = assignment
             counts[assignment.eventID, default: 0] += 1
             bytes[assignment.eventID, default: 0] += assignment.fileSize
+        }
+        // The board's tiles point at Card Copy (or the other drive, or the
+        // NAS), not at the path the file was imported from. Index those
+        // too, without letting them steal a source path that already
+        // belongs to a different assignment. One root per event and camera
+        // — building it per file redoes the date formatting 13,000 times.
+        let eventsByID = Dictionary(uniqueKeysWithValues: model.configuration.savedEvents.map { ($0.id, $0) })
+        var cardRoots: [String: URL] = [:]
+        var archiveLayouts: [String: OrganizedArchiveLayout] = [:]
+        for assignment in assignments {
+            guard let owner = eventsByID[assignment.eventID],
+                  (try? PathSafety.validateRelativePath(assignment.relativePath)) != nil else { continue }
+            for policy in [EventStoragePolicy.buffer, .archiveOnly] {
+                let cacheKey = "\(owner.id.uuidString)\u{0}\(assignment.deviceID ?? "")\u{0}\(policy.rawValue)"
+                let root = cardRoots[cacheKey] ?? {
+                    let built = locations.cardCopyRoot(for: owner, deviceID: assignment.deviceID, policy: policy)
+                    cardRoots[cacheKey] = built
+                    return built
+                }()
+                let implied = root.appendingPathComponent(assignment.relativePath).path
+                if index[implied.lowercased()] == nil {
+                    index[implied.lowercased()] = assignment
+                }
+                let standardized = EventStorageLocations.pathKey(implied)
+                if index[standardized] == nil {
+                    index[standardized] = assignment
+                }
+            }
+            let layoutKey = "\(owner.id.uuidString)\u{0}\(assignment.deviceID ?? "")"
+            let layout = archiveLayouts[layoutKey] ?? {
+                let built = locations.layout(for: owner, deviceID: assignment.deviceID)
+                archiveLayouts[layoutKey] = built
+                return built
+            }()
+            if let relative = try? layout.destinationRelativePath(for: assignment.relativePath) {
+                let archived = EventStorageLocations.pathKey(
+                    locations.libraryRoot.appendingPathComponent(relative).path
+                )
+                if index[archived] == nil {
+                    index[archived] = assignment
+                }
+            }
         }
         assignmentsByPathKey = index
         assignmentCounts = counts
