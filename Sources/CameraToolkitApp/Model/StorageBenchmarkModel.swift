@@ -222,10 +222,15 @@ enum BenchmarkSampleSize: Int64, CaseIterable, Identifiable {
     case quick = 256
     case standard = 512
     case thorough = 1024
+    /// Past a drive's fast cache: sustained speed shows up at several GB.
+    case gb2 = 2048
+    case gb4 = 4096
+    case gb8 = 8192
+    case gb16 = 16384
 
     var id: Int64 { rawValue }
     var bytes: Int64 { rawValue * 1024 * 1024 }
-    var label: String { "\(rawValue) MB" }
+    var label: String { rawValue >= 1024 ? "\(rawValue / 1024) GB" : "\(rawValue) MB" }
 }
 
 /// One measurable direction. Reads sample existing media anywhere; writes use
