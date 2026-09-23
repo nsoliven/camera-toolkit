@@ -95,7 +95,7 @@ enum CameraToolkitShortcutCatalog {
                 .init(action: "Event Library", keys: "⌥⌘E", detail: "Shows event photos across their camera, buffer, library, and Immich locations."),
                 .init(action: "People", keys: "⌥⌘P", detail: "Shows the people the face index found and their events."),
                 .init(action: "Photo List SQL Inspector", keys: "⇧⌘I", detail: "Browses the SQLite photo list, schema, and read-only SQL queries."),
-                .init(action: "Jobs", keys: "⌥⌘J", detail: "Shows transfers, face scans, and other background jobs with progress and any problem."),
+                .init(action: "Jobs", keys: "⌥⌘T", detail: "Shows transfers, face scans, and other background jobs with progress and any problem."),
                 .init(action: "Settings", keys: "⌘,", detail: "Opens storage locations, cameras, and service settings."),
                 .init(action: "Keyboard shortcuts", keys: "⇧⌘K", detail: "Opens this shortcut reference window."),
             ]

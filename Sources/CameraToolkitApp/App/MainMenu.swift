@@ -128,7 +128,8 @@ enum MainMenu {
         legacySidebar.isHidden = true
         legacySidebar.allowsKeyEquivalentWhenHidden = true
         menu.addItem(legacySidebar)
-        menu.addItem(item("Hide Toolbar", #selector(NSWindow.toggleToolbarShown(_:)), "t", [.command, .option]))
+        // No shortcut: ⌥⌘T has long opened Jobs, and the owner relies on it.
+        menu.addItem(item("Hide Toolbar", #selector(NSWindow.toggleToolbarShown(_:))))
         menu.addItem(item("Show Inspector", #selector(MainMenuActions.toggleInspector(_:)), "i", [.command, .option], to: target))
         menu.addItem(.separator())
         menu.addItem(item("as Tiles", #selector(MainMenuActions.showTiles(_:)), to: target))
@@ -149,7 +150,11 @@ enum MainMenu {
         menu.addItem(.separator())
         menu.addItem(item(appName, #selector(MainMenuActions.openMainWindow(_:)), "0", to: target))
         menu.addItem(.separator())
-        menu.addItem(item("Jobs", #selector(MainMenuActions.openTransferQueue(_:)), "j", [.command, .option], to: target))
+        menu.addItem(item("Jobs", #selector(MainMenuActions.openTransferQueue(_:)), "t", [.command, .option], to: target))
+        let jobsAlternate = item("Jobs", #selector(MainMenuActions.openTransferQueue(_:)), "j", [.command, .option], to: target)
+        jobsAlternate.isHidden = true
+        jobsAlternate.allowsKeyEquivalentWhenHidden = true
+        menu.addItem(jobsAlternate)
         menu.addItem(item("Event Library", #selector(MainMenuActions.openEventLibrary(_:)), "e", [.command, .option], to: target))
         menu.addItem(item("People", #selector(MainMenuActions.openPeople(_:)), "p", [.command, .option], to: target))
         menu.addItem(item("Trash", #selector(MainMenuActions.openTrash(_:)), to: target))

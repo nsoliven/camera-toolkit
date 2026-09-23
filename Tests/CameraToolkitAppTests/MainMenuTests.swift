@@ -36,7 +36,7 @@ final class MainMenuTests: XCTestCase {
             (#selector(NSWindow.performClose(_:)), "⌘W"),
             (#selector(NSApplication.hide(_:)), "⌘H"),
             (#selector(NSApplication.hideOtherApplications(_:)), "⌥⌘H"),
-            (#selector(NSWindow.toggleToolbarShown(_:)), "⌥⌘T"),
+            (#selector(NSWindow.toggleToolbarShown(_:)), nil),
             (#selector(NSApplication.arrangeInFront(_:)), nil),
         ]
         for (action, expected) in standard {
@@ -72,5 +72,14 @@ final class MainMenuTests: XCTestCase {
         XCTAssertEqual(MainMenu.steppedTileWidth(220, by: 1), 264)
         XCTAssertEqual(MainMenu.steppedTileWidth(450, by: 1), 460)
         XCTAssertEqual(MainMenu.steppedTileWidth(100, by: -1), 88)
+    }
+
+    /// ⌥⌘T has opened Jobs since before the menu was rebuilt; ⌥⌘J is only
+    /// a hidden alternate.
+    func testJobsKeepsItsOriginalShortcut() {
+        let jobs = items.filter { $0.action == #selector(MainMenuActions.openTransferQueue(_:)) }
+        XCTAssertEqual(jobs.first { !$0.isHidden }.flatMap(chord), "⌥⌘T")
+        XCTAssertEqual(jobs.first { $0.isHidden }.flatMap(chord), "⌥⌘J")
+        XCTAssertNil(items.first { $0.action == #selector(NSWindow.toggleToolbarShown(_:)) }.flatMap(chord))
     }
 }
