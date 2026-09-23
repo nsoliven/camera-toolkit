@@ -23,6 +23,7 @@ struct EventsRootView: View {
     /// narrows the sidebar's folders and events.
     @State private var searchScope: OrganizeSearchScope
     @State private var sidebarQuery = ""
+    @AppStorage(EventInfoInspector.visibilityDefaultsKey) private var showInspector = false
     @FocusState private var searchFocused: Bool
 
     init(model: DashboardModel, workspace: EventsWorkspace) {
@@ -93,6 +94,13 @@ struct EventsRootView: View {
                     Text("Events & Folders").tag(OrganizeSearchScope.sidebar)
                 }
                 .searchFocused($searchFocused)
+        }
+        // On the split view rather than the board: inside the detail column
+        // the inspector dropped the floating sidebar's safe-area inset and
+        // laid the board out beneath the sidebar.
+        .inspector(isPresented: inspectorPresented) {
+            inspector
+                .inspectorColumnWidth(min: 260, ideal: 300, max: 380)
         }
         // Return hands the keyboard back to the board.
         .onSubmit(of: .search) {
@@ -241,6 +249,24 @@ struct EventsRootView: View {
                     )
                 }
             }
+        }
+    }
+
+    /// The Event Info inspector exists only for an open event.
+    private var inspectorPresented: Binding<Bool> {
+        Binding(
+            get: {
+                guard showInspector, case .event(let id) = workspace.selection else { return false }
+                return workspace.event(id) != nil
+            },
+            set: { showInspector = $0 }
+        )
+    }
+
+    @ViewBuilder
+    private var inspector: some View {
+        if case .event(let id) = workspace.selection, let event = workspace.event(id) {
+            EventInfoInspector(model: model, workspace: workspace, event: event)
         }
     }
 

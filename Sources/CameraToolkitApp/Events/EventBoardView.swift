@@ -16,6 +16,9 @@ struct EventBoardView: View {
     @State private var previewStackID: String?
     @State private var previewFrameIndex = 0
     @State private var showAllPeople = false
+    /// Shared with the View menu's Show Inspector item (⌥⌘I); the
+    /// inspector itself hangs off the split view in EventsRootView.
+    @AppStorage(EventInfoInspector.visibilityDefaultsKey) private var showInspector = false
 
     /// People chips kept on the first row. The rest sit behind Show more,
     /// ordered by how many confirmed faces each person has on this event.
@@ -50,8 +53,6 @@ struct EventBoardView: View {
             let matched = groups.reduce(0) { $0 + $1.stacks.count }
             let title = workspace.eventTitle(event)
             VStack(spacing: 0) {
-                StorageStrip(model: model, workspace: workspace, event: event, summary: workspace.presence[eventID])
-                    .guideHighlight(.storageStrip, in: workspace)
                 if stacks != nil {
                     if groups.isEmpty {
                         if workspace.search.isEmpty {
@@ -125,7 +126,8 @@ struct EventBoardView: View {
                     title: title,
                     count: countText(total: stacks?.count, matched: matched),
                     countHelp: countHelp(total: stacks?.count, matched: matched),
-                    help: summaryText(event)
+                    help: summaryText(event),
+                    showInspector: $showInspector
                 )
             }
             // The task keys on the event and its storage policy only —
@@ -194,50 +196,52 @@ struct EventBoardView: View {
         )
     }
 
-    /// People and subevent chips plus the active filters, pinned under the
-    /// toolbar. Hidden when there is nothing to show.
-    @ViewBuilder
+    /// Pinned under the toolbar: where the originals are (one menu per
+    /// place), subevent and people chips, and the active filters.
     private func titleAccessory(_ event: SavedCameraEvent) -> some View {
         let people = workspace.eventPeople(eventID)
         let subevents = workspace.subevents(of: eventID)
-        let hasFilters = !workspace.search.rowsWithValues.isEmpty
-        if !people.isEmpty || !subevents.isEmpty || hasFilters {
-            VStack(alignment: .leading, spacing: 8) {
-                if !people.isEmpty || !subevents.isEmpty {
-                    let shown = showAllPeople ? people : Array(people.prefix(Self.collapsedPeopleCount))
-                    FlowLayout(horizontalSpacing: 8, verticalSpacing: 8) {
-                        ForEach(subevents) { subevent in
-                            SubeventChip(
-                                event: subevent,
-                                isFiltering: workspace.search.excludedEventIDs.contains(subevent.id),
-                                onToggle: { workspace.search.toggleEventExclusion(subevent.id) }
-                            )
-                        }
-                        ForEach(shown) { person in
-                            PersonChip(person: person)
-                        }
-                        if people.count > Self.collapsedPeopleCount {
-                            Button(showAllPeople ? "Show Less" : "Show \(people.count - Self.collapsedPeopleCount) More") {
-                                showAllPeople.toggle()
-                            }
-                            .buttonStyle(.borderless)
-                            .controlSize(.small)
-                        }
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                if hasFilters {
-                    OrganizeFilterHotLinks(
-                        workspace: workspace,
-                        stacks: workspace.eventStacks[eventID] ?? [],
-                        search: $workspace.search
+        let shown = showAllPeople ? people : Array(people.prefix(Self.collapsedPeopleCount))
+        return VStack(alignment: .leading, spacing: 8) {
+            EventStorageSummary(slots: EventStorageSlots(
+                model: model,
+                workspace: workspace,
+                event: event,
+                summary: workspace.presence[eventID]
+            ))
+            .guideHighlight(.storageStrip, in: workspace)
+            FlowLayout(horizontalSpacing: 8, verticalSpacing: 8) {
+                ForEach(subevents) { subevent in
+                    SubeventChip(
+                        event: subevent,
+                        isFiltering: workspace.search.excludedEventIDs.contains(subevent.id),
+                        onToggle: { workspace.search.toggleEventExclusion(subevent.id) }
                     )
                 }
+                ForEach(shown) { person in
+                    PersonChip(person: person)
+                }
+                if people.count > Self.collapsedPeopleCount {
+                    Button(showAllPeople ? "Show Less" : "Show \(people.count - Self.collapsedPeopleCount) More") {
+                        showAllPeople.toggle()
+                    }
+                    .buttonStyle(.borderless)
+                    .controlSize(.small)
+                }
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 8)
-            .onChange(of: eventID) { _, _ in showAllPeople = false }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            if !workspace.search.rowsWithValues.isEmpty {
+                OrganizeFilterHotLinks(
+                    workspace: workspace,
+                    stacks: workspace.eventStacks[eventID] ?? [],
+                    search: $workspace.search
+                )
+            }
         }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .onChange(of: eventID) { _, _ in showAllPeople = false }
     }
 
     private func emptyState(_ event: SavedCameraEvent) -> some View {
@@ -430,6 +434,7 @@ private struct EventBoardToolbar: ToolbarContent {
     let count: String
     let countHelp: String
     let help: String
+    @Binding var showInspector: Bool
 
     var body: some ToolbarContent {
         ToolbarItem(placement: .principal) {
@@ -450,6 +455,15 @@ private struct EventBoardToolbar: ToolbarContent {
             }
             .menuIndicator(.hidden)
             .help("New subevent, rename, storage, faces, and more")
+        }
+        ToolbarSpacer(.fixed, placement: .primaryAction)
+        ToolbarItem(placement: .primaryAction) {
+            Button {
+                showInspector.toggle()
+            } label: {
+                Label(showInspector ? "Hide Event Info" : "Show Event Info", systemImage: "sidebar.trailing")
+            }
+            .help(showInspector ? "Hide Event Info (⌥⌘I)" : "Show Event Info — storage, people, and the event's details (⌥⌘I)")
         }
     }
 }
@@ -520,8 +534,8 @@ private struct EventActionsMenu: View {
 }
 
 /// One place the event's originals can live — card, drive, NAS, or Immich —
-/// as the numbers and actions both the compact strip pills and the full
-/// cards draw from.
+/// as the numbers and actions both the compact summary and the inspector
+/// draw from.
 struct StorageSlot<Actions: View> {
     let title: String
     let symbol: String
@@ -533,115 +547,14 @@ struct StorageSlot<Actions: View> {
 }
 
 /// Source, drive, NAS, and Immich: where this event's originals are and the
-/// one action that moves each place forward. Rests as a one-line summary
-/// bar so the photo board gets the window; the bottom edge drags open into
-/// the four full cards, and the size is remembered.
-struct StorageStrip: View {
-    @Bindable var model: DashboardModel
-    @Bindable var workspace: EventsWorkspace
+/// one action that moves each place forward. Plain data, so the summary in
+/// the board and the inspector show the same numbers and actions.
+@MainActor
+struct EventStorageSlots {
+    let model: DashboardModel
+    let workspace: EventsWorkspace
     let event: SavedCameraEvent
     let summary: EventPresenceSummary?
-
-    @AppStorage(OrganizeChromeSizing.storageStripDefaultsKey)
-    private var stripHeight = OrganizeChromeSizing.collapsedStorageStripHeight
-
-    private var isCollapsed: Bool {
-        OrganizeChromeSizing.storageStripIsCollapsed(stripHeight)
-    }
-
-    var body: some View {
-        VStack(spacing: 0) {
-            if isCollapsed {
-                compactBar
-                    .padding(.horizontal, 16)
-                    .frame(maxWidth: .infinity)
-                    .frame(height: OrganizeChromeSizing.collapsedStorageStripHeight)
-            } else {
-                cardsRow
-                    .padding(.horizontal, 16)
-                    .padding(.bottom, 10)
-                    .frame(maxWidth: .infinity)
-                    .frame(height: OrganizeChromeSizing.coercedStorageStripHeight(stripHeight))
-            }
-            ChromeResizeHandle(
-                orientation: .horizontal,
-                value: $stripHeight,
-                transform: OrganizeChromeSizing.coercedStorageStripHeight,
-                onDoubleClick: toggleCollapsed,
-                help: isCollapsed
-                    ? "Drag down for the full storage cards — double-click toggles"
-                    : "Drag to resize the storage cards — double-click collapses",
-                accessibilityLabel: "Resize Storage Summary"
-            )
-        }
-        .frame(maxWidth: .infinity)
-    }
-
-    private func toggleCollapsed() {
-        withAnimation(.easeOut(duration: 0.15)) {
-            stripHeight = isCollapsed
-                ? OrganizeChromeSizing.defaultExpandedStorageStripHeight
-                : OrganizeChromeSizing.collapsedStorageStripHeight
-        }
-    }
-
-    /// The collapsed strip: one tinted count per place, each a menu holding
-    /// that place's actions, so Free Up, Put on Buffer, Check Again, and the
-    /// Immich send switch stay reachable without the tall cards.
-    private var compactBar: some View {
-        HStack(spacing: 8) {
-            compactSlot(sourceSlot)
-            compactSlot(driveSlot)
-            compactSlot(nasSlot)
-            compactSlot(immichSlot)
-            Spacer(minLength: 8)
-            Button {
-                withAnimation(.easeOut(duration: 0.15)) {
-                    stripHeight = OrganizeChromeSizing.defaultExpandedStorageStripHeight
-                }
-            } label: {
-                Image(systemName: "chevron.down")
-                    .font(.caption.weight(.semibold))
-            }
-            .buttonStyle(.borderless)
-            .foregroundStyle(.secondary)
-            .help("Show the full storage cards — or drag the bottom edge down")
-        }
-    }
-
-    private func compactSlot<Actions: View>(_ slot: StorageSlot<Actions>) -> some View {
-        Menu {
-            Text("\(slot.title) — \(slot.detail)")
-            Divider()
-            slot.actions()
-        } label: {
-            HStack(spacing: 5) {
-                Image(systemName: slot.symbol)
-                    .foregroundStyle(slot.tint)
-                Text(slot.value)
-                    .font(.callout.monospacedDigit())
-                    .lineLimit(1)
-                StorageSlotStateIcon(state: slot.state)
-                    .font(.caption2)
-            }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
-        }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
-        .fixedSize()
-        .help("\(slot.title) — \(slot.detail)")
-    }
-
-    private var cardsRow: some View {
-        HStack(alignment: .top, spacing: 10) {
-            StorageSlotCard(slot: sourceSlot)
-            StorageSlotCard(slot: driveSlot)
-            StorageSlotCard(slot: nasSlot)
-            StorageSlotCard(slot: immichSlot)
-        }
-    }
 
     private var assets: [EventAssetPresence] { summary?.assets ?? [] }
 
@@ -655,7 +568,7 @@ struct StorageStrip: View {
         .help("Re-check this connection right now")
     }
 
-    private var sourceSlot: StorageSlot<some View> {
+    var source: StorageSlot<some View> {
         let separate = assets.filter { !$0.sourceIsDriveCopy }
         let onSource = separate.count { $0.source == .present }
         let offline = separate.count { $0.source == .unavailable }
@@ -693,7 +606,7 @@ struct StorageStrip: View {
         }
     }
 
-    private var driveSlot: StorageSlot<some View> {
+    var drive: StorageSlot<some View> {
         let policy = workspace.resolvedPolicy(for: event)
         let total = assets.count
         let onDrive = assets.count { $0.drive == .present }
@@ -725,9 +638,9 @@ struct StorageStrip: View {
         ) {
             if needsDrive > 0 {
                 Button(policy == .buffer ? "Put on Buffer…" : "Move to Private…") {
-                    // The strip's counts cover the whole family, so the
-                    // apply does too — each subevent's files land in its
-                    // own nested folder.
+                    // The counts cover the whole family, so the apply does
+                    // too — each subevent's files land in its own nested
+                    // folder.
                     workspace.prepareApply(
                         eventIDs: workspace.eventFamily(event.id).map(\.id),
                         title: policy == .buffer ? "Put \(event.name) on the Buffer" : "Move \(event.name) to Private staging"
@@ -746,7 +659,7 @@ struct StorageStrip: View {
         }
     }
 
-    private var nasSlot: StorageSlot<some View> {
+    var nas: StorageSlot<some View> {
         let total = assets.count
         let onNAS = assets.count { $0.archive == .present }
         let offline = summary?.archiveOffline ?? false
@@ -772,7 +685,7 @@ struct StorageStrip: View {
         }
     }
 
-    private var immichSlot: StorageSlot<some View> {
+    var immich: StorageSlot<some View> {
         let statuses = workspace.eventImmichStatuses[event.id] ?? [:]
         let present = statuses.values.count { $0.status == "present" && !$0.isTrashed }
         let albumText: String = switch event.resolvedImmichAlbumPolicy {
@@ -792,7 +705,6 @@ struct StorageStrip: View {
                 get: { event.sendsToImmich },
                 set: { model.setEventImmichUploadEnabled(event.id, enabled: $0) }
             ))
-            .controlSize(.mini)
             if event.sendsToImmich {
                 Menu("Album") {
                     ForEach(ImmichAlbumPolicy.allCases) { policy in
@@ -804,6 +716,50 @@ struct StorageStrip: View {
                     .disabled(model.isBusy || summary == nil)
             }
         }
+    }
+}
+
+/// The storage status in the board itself: one small capsule per place,
+/// each a menu with that place's actions — so Free Up, Put on Buffer,
+/// Archive, and Check Again stay one click away with the inspector closed.
+struct EventStorageSummary: View {
+    let slots: EventStorageSlots
+
+    var body: some View {
+        HStack(spacing: 6) {
+            item(slots.source)
+            item(slots.drive)
+            item(slots.nas)
+            item(slots.immich)
+        }
+        .fixedSize()
+    }
+
+    private func item<Actions: View>(_ slot: StorageSlot<Actions>) -> some View {
+        Menu {
+            Text("\(slot.title) — \(slot.detail)")
+            Divider()
+            slot.actions()
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: slot.symbol)
+                    .foregroundStyle(slot.tint)
+                Text(slot.value)
+                    .monospacedDigit()
+                    .lineLimit(1)
+                StorageSlotStateIcon(state: slot.state)
+                    .imageScale(.small)
+            }
+            .padding(.horizontal, 9)
+            .padding(.vertical, 4)
+            .background(.quinary, in: Capsule())
+            .contentShape(Capsule())
+        }
+        .menuStyle(.button)
+        .buttonStyle(.borderless)
+        .menuIndicator(.hidden)
+        .help("\(slot.title) — \(slot.detail)")
+        .accessibilityLabel("\(slot.title), \(slot.value)")
     }
 }
 
@@ -820,53 +776,108 @@ struct StorageSlotStateIcon: View {
     var body: some View {
         switch state {
         case .complete:
-            Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+            Image(systemName: "checkmark.circle.fill")
+                .foregroundStyle(.green)
+                .accessibilityLabel("Complete")
         case .partial:
-            Image(systemName: "circle.lefthalf.filled").foregroundStyle(.secondary)
+            Image(systemName: "circle.lefthalf.filled")
+                .foregroundStyle(.secondary)
+                .accessibilityLabel("Partial")
         case .offline:
-            Image(systemName: "bolt.horizontal.circle").foregroundStyle(.orange)
+            Image(systemName: "bolt.horizontal.circle")
+                .foregroundStyle(.orange)
+                .accessibilityLabel("Offline")
         case .unknown:
             EmptyView()
         }
     }
 }
 
-struct StorageSlotCard<Actions: View>: View {
+/// The event board's inspector: where the originals are with each place's
+/// actions, the storage policy, Immich, people, and the event's own facts.
+struct EventInfoInspector: View {
+    /// Whether the inspector is open — the toolbar button and the View
+    /// menu's Show Inspector item (⌥⌘I) both toggle it.
+    static let visibilityDefaultsKey = "CameraToolkit.organize.showInspector"
+
+    @Bindable var model: DashboardModel
+    @Bindable var workspace: EventsWorkspace
+    let event: SavedCameraEvent
+
+    var body: some View {
+        let slots = EventStorageSlots(model: model, workspace: workspace, event: event, summary: workspace.presence[event.id])
+        let files = workspace.assignmentCount(for: event.id)
+        let people = workspace.eventPeople(event.id)
+        Form {
+            Section {
+                LabeledContent("Date", value: event.eventDate.formatted(date: .complete, time: .omitted))
+                LabeledContent("Files", value: files.formatted())
+                LabeledContent("Size", value: workspace.assignmentBytes(for: event.id).formattedBytes)
+                Button("Rename or Change Date…") {
+                    workspace.renameRequest = RenameEventRequest(eventID: event.id)
+                }
+            } header: {
+                Text(workspace.eventTitle(event))
+            }
+            Section("Keep on Drive") {
+                Picker("Keep on Drive", selection: Binding(
+                    get: { workspace.resolvedPolicy(for: event) },
+                    set: { workspace.setPolicy(event.id, $0) }
+                )) {
+                    Text("Shared Buffer").tag(EventStoragePolicy.buffer)
+                    Text("Private · NAS Only").tag(EventStoragePolicy.archiveOnly)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .help("Shared events live in the Buffer everyone browses. Private events stay hidden on the drive until they are archived to the NAS.")
+            }
+            Section("Where It Is") {
+                StorageSlotRow(slot: slots.source)
+                StorageSlotRow(slot: slots.drive)
+                StorageSlotRow(slot: slots.nas)
+                StorageSlotRow(slot: slots.immich)
+            }
+            if !people.isEmpty {
+                Section("People") {
+                    ForEach(people) { person in
+                        Label(person.name, systemImage: "person.crop.circle")
+                    }
+                }
+            }
+        }
+        .formStyle(.grouped)
+    }
+}
+
+/// One storage place in the inspector: title and count, what that means,
+/// and its actions.
+private struct StorageSlotRow<Actions: View>: View {
     let slot: StorageSlot<Actions>
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
-                Image(systemName: slot.symbol)
-                    .foregroundStyle(slot.tint)
-                Text(slot.title)
-                    .font(.headline)
-                    .lineLimit(1)
-                Spacer(minLength: 0)
+                Label {
+                    Text(slot.title)
+                } icon: {
+                    Image(systemName: slot.symbol)
+                        .foregroundStyle(slot.tint)
+                }
+                Spacer(minLength: 8)
+                Text(slot.value)
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
                 StorageSlotStateIcon(state: slot.state)
             }
-            Text(slot.value)
-                .font(.title3.weight(.semibold).monospacedDigit())
             Text(slot.detail)
                 .font(.caption)
                 .foregroundStyle(.secondary)
-                .lineLimit(2)
                 .fixedSize(horizontal: false, vertical: true)
-            Spacer(minLength: 0)
             HStack(spacing: 6) {
                 slot.actions()
             }
             .controlSize(.small)
         }
-        .padding(12)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(Color(nsColor: .controlBackgroundColor))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .strokeBorder(slot.state == .complete ? slot.tint.opacity(0.6) : Color.primary.opacity(0.08), lineWidth: slot.state == .complete ? 1.5 : 1)
-        )
+        .padding(.vertical, 2)
     }
 }

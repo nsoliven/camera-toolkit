@@ -28,6 +28,12 @@ final class NativeUISnapshotTests: XCTestCase {
         outputFolder = URL(fileURLWithPath: out, isDirectory: true)
         try FileManager.default.createDirectory(at: outputFolder, withIntermediateDirectories: true)
         try await makeSampleLibrary()
+        // The scratch defaults are shared between runs; start every run from
+        // the same view settings.
+        for key in ["CameraToolkit.organize.mode", "CameraToolkit.organize.tileWidth", "CameraToolkit.organize.hideSorted",
+                    "CameraToolkit.organize.showInspector", "CameraToolkit.organize.sidebarWidth"] {
+            UserDefaults.standard.removeObject(forKey: key)
+        }
 
         let window = SnapshotWindows.main(model: model, workspace: workspace)
         defer { window.orderOut(nil) }
@@ -45,6 +51,16 @@ final class NativeUISnapshotTests: XCTestCase {
             workspace.search.text = "DSC0000"
             try await snapshot(window, size: NSSize(width: 1320, height: 840), name: "main-event-board-search-\(suffix)")
             workspace.search.text = ""
+
+            UserDefaults.standard.set("list", forKey: "CameraToolkit.organize.mode")
+            try await snapshot(window, size: NSSize(width: 1320, height: 840), name: "main-event-board-list-\(suffix)")
+            UserDefaults.standard.removeObject(forKey: "CameraToolkit.organize.mode")
+
+            // The Event Info inspector, wide and at the narrowest window.
+            UserDefaults.standard.set(true, forKey: "CameraToolkit.organize.showInspector")
+            try await snapshot(window, size: NSSize(width: 1320, height: 840), name: "main-event-board-inspector-\(suffix)")
+            try await snapshot(window, size: NSSize(width: 1040, height: 720), name: "main-event-board-inspector-narrow-\(suffix)")
+            UserDefaults.standard.removeObject(forKey: "CameraToolkit.organize.showInspector")
 
             workspace.selection = .unsorted(unsorted.id)
             try await waitUntil { self.workspace.sources[self.unsorted.id]?.result != nil }
