@@ -2,6 +2,58 @@ import AppKit
 import CameraToolkitCore
 import SwiftUI
 
+/// The one layout every organizer sheet shares: an optional leading SF
+/// Symbol, a bold title (and subtitle), the content, then a trailing
+/// button row — Cancel left of the confirm button, as macOS sheets do.
+/// Buttons are standard push buttons: the sheet is already the glass layer
+/// on macOS 26, and `.keyboardShortcut(.defaultAction)` alone gives the
+/// default button its accent fill, so there is no glass or explicit
+/// prominent style inside sheet content.
+struct SheetScaffold<Content: View, Actions: View>: View {
+    let title: String
+    var subtitle: String? = nil
+    var systemImage: String? = nil
+    var iconTint: Color = .accentColor
+    var width: CGFloat = 520
+    /// Fixed height for sheets whose content scrolls (the apply plan);
+    /// nil lets the sheet fit its content.
+    var height: CGFloat? = nil
+    @ViewBuilder var content: () -> Content
+    @ViewBuilder var actions: () -> Actions
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(alignment: .top, spacing: 12) {
+                if let systemImage {
+                    Image(systemName: systemImage)
+                        .font(.largeTitle)
+                        .symbolRenderingMode(.hierarchical)
+                        .foregroundStyle(iconTint)
+                        .accessibilityHidden(true)
+                }
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(title)
+                        .font(.title3.bold())
+                        .fixedSize(horizontal: false, vertical: true)
+                    if let subtitle {
+                        Text(subtitle)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+            content()
+            HStack {
+                Spacer()
+                actions()
+            }
+        }
+        .padding(20)
+        .frame(width: width, height: height)
+        .presentationSizing(.fitted)
+    }
+}
+
 struct EventDetailsSheet: View {
     let title: String
     let confirmTitle: String
@@ -46,63 +98,64 @@ struct EventDetailsSheet: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text(title)
-                .font(.title2.bold())
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Name")
-                    .font(.headline)
-                EventNameField(text: $name, isFocused: $isNameFocused, onSubmit: save)
-                    .frame(height: 24)
-            }
-            if !name.isEmpty, let error = validation.errorMessage {
-                Label(error, systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption)
-                    .foregroundStyle(.red)
-            }
+        SheetScaffold(title: title) {
+            // One grouped Form for every field, so the name sits in the same
+            // visual system as the date and pickers.
             Form {
-                DatePicker("Date", selection: $date, displayedComponents: .date)
-                Picker("Inside event", selection: $parentEventID) {
-                    Text("None — top level").tag(UUID?.none)
-                    ForEach(parents, id: \.event.id) { row in
-                        Text(String(repeating: "    ", count: row.depth) + row.event.name)
-                            .tag(UUID?.some(row.event.id))
+                Section {
+                    LabeledContent("Name") {
+                        EventNameField(text: $name, isFocused: $isNameFocused, onSubmit: save)
+                            .frame(height: 24)
+                    }
+                    DatePicker("Date", selection: $date, displayedComponents: .date)
+                    Picker("Inside event", selection: $parentEventID) {
+                        Text("None — top level").tag(UUID?.none)
+                        ForEach(parents, id: \.event.id) { row in
+                            Text(String(repeating: "    ", count: row.depth) + row.event.name)
+                                .tag(UUID?.some(row.event.id))
+                        }
+                    }
+                    .help("A subevent's folder lives inside its parent event's folder.")
+                } footer: {
+                    if !name.isEmpty, let error = validation.errorMessage {
+                        Label(error, systemImage: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.red)
                     }
                 }
-                .help("A subevent's folder lives inside its parent event's folder.")
-                if parentEventID == nil {
-                    Picker("Keep on drive", selection: Binding(
-                        get: { policy ?? .buffer },
-                        set: { policy = $0 }
-                    )) {
-                        Text("Shared Buffer").tag(EventStoragePolicy.buffer)
-                        Text("Private · NAS only").tag(EventStoragePolicy.archiveOnly)
+                Section {
+                    if parentEventID == nil {
+                        Picker("Keep on drive", selection: Binding(
+                            get: { policy ?? .buffer },
+                            set: { policy = $0 }
+                        )) {
+                            Text("Shared Buffer").tag(EventStoragePolicy.buffer)
+                            Text("Private · NAS only").tag(EventStoragePolicy.archiveOnly)
+                        }
+                        .pickerStyle(.radioGroup)
+                    } else {
+                        Picker("Keep on drive", selection: $policy) {
+                            Text("Same as parent").tag(EventStoragePolicy?.none)
+                            Text("Shared Buffer").tag(EventStoragePolicy?.some(.buffer))
+                            Text("Private · NAS only").tag(EventStoragePolicy?.some(.archiveOnly))
+                        }
+                        .pickerStyle(.radioGroup)
                     }
-                    .pickerStyle(.radioGroup)
-                } else {
-                    Picker("Keep on drive", selection: $policy) {
-                        Text("Same as parent").tag(EventStoragePolicy?.none)
-                        Text("Shared Buffer").tag(EventStoragePolicy?.some(.buffer))
-                        Text("Private · NAS only").tag(EventStoragePolicy?.some(.archiveOnly))
-                    }
-                    .pickerStyle(.radioGroup)
+                } footer: {
+                    Text(policyHelp)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
-                Text(policyHelp)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
             }
             .formStyle(.grouped)
-            HStack {
-                Spacer()
-                Button("Cancel", action: onCancel)
-                    .keyboardShortcut(.cancelAction)
-                Button(confirmTitle, action: save)
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(!validation.isValid)
-            }
+            .scrollDisabled(true)
+            .fixedSize(horizontal: false, vertical: true)
+        } actions: {
+            Button("Cancel", action: onCancel)
+                .keyboardShortcut(.cancelAction)
+            Button(confirmTitle, action: save)
+                .keyboardShortcut(.defaultAction)
+                .disabled(!validation.isValid)
         }
-        .padding(20)
-        .frame(width: 520)
         .onAppear { isNameFocused = true }
     }
 
@@ -186,15 +239,10 @@ struct ApplyPlanSheet: View {
     let onApply: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text(plan.title)
-                .font(.title2.bold())
-            Text(summary)
-                .foregroundStyle(.secondary)
+        SheetScaffold(title: plan.title, subtitle: summary, width: 680, height: 580) {
             ApplyPlanSummaryCard(plan: plan)
             Text("Where each folder lands")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
+                .font(.headline)
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 10) {
                     ForEach(plan.groups) { group in
@@ -208,20 +256,19 @@ struct ApplyPlanSheet: View {
                 "Moves on the same drive are instant renames. Copies from another drive are checksum-verified and leave the originals in place. Nothing is overwritten, and Undo can move files back.",
                 systemImage: "checkmark.shield"
             )
-            .font(.caption)
+            .font(.callout)
             .foregroundStyle(.secondary)
-            HStack {
-                Spacer()
-                Button("Cancel", action: onCancel)
-                    .keyboardShortcut(.cancelAction)
-                Button("Apply", action: onApply)
-                    .buttonStyle(.borderedProminent)
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(plan.isEmpty)
-            }
+            .fixedSize(horizontal: false, vertical: true)
+        } actions: {
+            Button("Cancel", action: onCancel)
+                .keyboardShortcut(.cancelAction)
+            // Non-destructive (nothing is overwritten, Undo moves files
+            // back), so Return confirms; the default-button fill is the
+            // system's, not an explicit prominent style.
+            Button("Apply", action: onApply)
+                .keyboardShortcut(.defaultAction)
+                .disabled(plan.isEmpty)
         }
-        .padding(20)
-        .frame(width: 680, height: 560)
     }
 
     private var summary: String {
@@ -245,29 +292,46 @@ struct RemovalConfirmSheet: View {
 
     @State private var confirmation = ""
 
+    /// The destructive button unlocks only on the exact token — no
+    /// trimming, no case folding. The service checks it again.
+    static func isConfirmed(_ typed: String) -> Bool {
+        typed == VerifiedRemovalService.confirmationToken
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text(request.kind == .drive ? "Take \(eventName) off the drive?" : "Free up the source for \(eventName)?")
-                .font(.title2.bold())
+        SheetScaffold(
+            title: request.kind == .drive ? "Take \(eventName) off the drive?" : "Free up the source for \(eventName)?",
+            systemImage: "externaldrive.badge.minus",
+            // Red for the permanent source delete, orange for the drive
+            // copies that stay recoverable in _Trash.
+            iconTint: request.kind == .source ? .red : .orange
+        ) {
             Text(explanation)
                 .fixedSize(horizontal: false, vertical: true)
             Text("\(request.fileCount) file\(request.fileCount == 1 ? "" : "s") · \(request.byteCount.formattedBytes)")
                 .font(.callout.monospacedDigit())
                 .foregroundStyle(.secondary)
-            TextField("Type \(VerifiedRemovalService.confirmationToken) to continue", text: $confirmation)
+            LabeledContent("Type \(VerifiedRemovalService.confirmationToken) to continue") {
+                TextField(
+                    "Type \(VerifiedRemovalService.confirmationToken) to continue",
+                    text: $confirmation,
+                    prompt: Text(VerifiedRemovalService.confirmationToken)
+                )
                 .textFieldStyle(.roundedBorder)
-            HStack {
-                Spacer()
-                Button("Cancel", action: onCancel)
-                    .keyboardShortcut(.cancelAction)
-                Button(request.kind == .drive ? "Verify and Take Off Drive" : "Verify and Remove from Source", role: .destructive) {
-                    onConfirm(confirmation)
-                }
-                .disabled(confirmation != VerifiedRemovalService.confirmationToken)
+                .labelsHidden()
+                .autocorrectionDisabled()
+                .frame(width: 180)
             }
+        } actions: {
+            Button("Cancel", action: onCancel)
+                .keyboardShortcut(.cancelAction)
+            // Deliberately not the default button: Return must never run a
+            // verified removal. Only the typed token unlocks it.
+            Button(request.kind == .drive ? "Verify and Take Off Drive" : "Verify and Remove from Source", role: .destructive) {
+                onConfirm(confirmation)
+            }
+            .disabled(!Self.isConfirmed(confirmation))
         }
-        .padding(20)
-        .frame(width: 520)
     }
 
     private var explanation: String {
@@ -281,30 +345,22 @@ struct RemovalConfirmSheet: View {
 }
 
 /// Organizer Trash confirmation. Count and source sit in the header, each
-/// volume's `_Trash` folder gets its own boxed row — the line the owner must
-/// not miss — and a note keeps it distinct from Finder Trash. Esc cancels;
-/// Move to Trash is the red default button.
+/// volume's `_Trash` folder gets its own row in a tinted group box — the
+/// line the owner must not miss — and a note keeps it distinct from Finder
+/// Trash. Esc cancels; Move to Trash is the red default button (the move
+/// is recoverable from the Trash window, which is why Return may run it).
 struct TrashConfirmSheet: View {
     let request: PendingTrashRequest
     let onCancel: () -> Void
     let onConfirm: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            HStack(alignment: .top, spacing: 12) {
-                Image(systemName: "trash.fill")
-                    .font(.title)
-                    .foregroundStyle(.orange)
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Move \(request.fileCount) file\(request.fileCount == 1 ? "" : "s") to Trash?")
-                        .font(.title2.bold())
-                        .fixedSize(horizontal: false, vertical: true)
-                    Text("\(request.byteCount.formattedBytes) · from \(request.locationName)")
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
-            }
-
+        SheetScaffold(
+            title: "Move \(request.fileCount) file\(request.fileCount == 1 ? "" : "s") to Trash?",
+            subtitle: "\(request.byteCount.formattedBytes) · from \(request.locationName)",
+            systemImage: "trash.fill",
+            iconTint: .orange
+        ) {
             destinationCard
 
             if !request.sampleNames.isEmpty {
@@ -319,71 +375,62 @@ struct TrashConfirmSheet: View {
                 Text("\(Text("Not the Finder Trash.").fontWeight(.semibold)) Restore from the Trash window — nothing is permanently deleted until you empty it.")
             } icon: {
                 Image(systemName: "exclamationmark.triangle.fill")
-                    .foregroundStyle(.orange)
+                    .symbolRenderingMode(.multicolor)
             }
             .font(.callout)
             .fixedSize(horizontal: false, vertical: true)
-
-            HStack {
-                Spacer()
-                Button("Cancel", action: onCancel)
-                    .keyboardShortcut(.cancelAction)
-                Button("Move to Trash", role: .destructive, action: onConfirm)
-                    .buttonStyle(.borderedProminent)
-                    .tint(.red)
-                    .keyboardShortcut(.defaultAction)
-            }
+        } actions: {
+            Button("Cancel", action: onCancel)
+                .keyboardShortcut(.cancelAction)
+            Button("Move to Trash", role: .destructive, action: onConfirm)
+                .buttonStyle(.borderedProminent)
+                .tint(.red)
+                .keyboardShortcut(.defaultAction)
         }
-        .padding(20)
-        .frame(width: 520)
     }
 
-    /// The "where they go" card: one row per volume's `_Trash` folder so the
+    /// The "where they go" box: one row per volume's `_Trash` folder so the
     /// destination reads as a destination, not a bullet inside a paragraph.
     private var destinationCard: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 6) {
             Text("Where they go")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
-            if request.destinations.isEmpty {
-                Text("No reachable files to move.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-            } else {
-                ForEach(request.destinations, id: \.trashFolderPath) { destination in
-                    HStack(alignment: .top, spacing: 10) {
-                        Image(systemName: "externaldrive.fill")
-                            .font(.title3)
-                            .foregroundStyle(.orange)
-                        VStack(alignment: .leading, spacing: 2) {
-                            HStack(alignment: .firstTextBaseline) {
-                                Text(destination.volumeLabel)
-                                    .font(.headline)
-                                if request.destinations.count > 1 {
-                                    Spacer(minLength: 8)
-                                    Text("\(destination.fileCount) file\(destination.fileCount == 1 ? "" : "s") · \(destination.byteCount.formattedBytes)")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
+                .font(.headline)
+            VStack(alignment: .leading, spacing: 10) {
+                if request.destinations.isEmpty {
+                    Text("No reachable files to move.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(request.destinations, id: \.trashFolderPath) { destination in
+                        HStack(alignment: .top, spacing: 10) {
+                            Image(systemName: "externaldrive.fill")
+                                .font(.title3)
+                                .foregroundStyle(.orange)
+                            VStack(alignment: .leading, spacing: 2) {
+                                HStack(alignment: .firstTextBaseline) {
+                                    Text(destination.volumeLabel)
+                                        .font(.headline)
+                                    if request.destinations.count > 1 {
+                                        Spacer(minLength: 8)
+                                        Text("\(destination.fileCount) file\(destination.fileCount == 1 ? "" : "s") · \(destination.byteCount.formattedBytes)")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
                                 }
+                                Text(destination.trashFolderPath)
+                                    .font(.system(.callout, design: .monospaced))
+                                    .textSelection(.enabled)
+                                    .fixedSize(horizontal: false, vertical: true)
                             }
-                            Text(destination.trashFolderPath)
-                                .font(.system(.callout, design: .monospaced))
-                                .textSelection(.enabled)
-                                .fixedSize(horizontal: false, vertical: true)
                         }
                     }
                 }
             }
-        }
-        .padding(12)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background {
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(Color.orange.opacity(0.08))
-        }
-        .overlay {
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .strokeBorder(Color.orange.opacity(0.3), lineWidth: 1)
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            // A hierarchical orange fill (tracks dark mode and Increase
+            // Contrast) keeps the destination the line nobody misses.
+            .background(.orange.quinary, in: .rect(cornerRadius: 10, style: .continuous))
         }
     }
 
@@ -413,51 +460,48 @@ struct FaceScanSheet: View {
     @State private var fast = true
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text("Scan for Faces")
-                .font(.title2.bold())
-            Text(name)
-                .foregroundStyle(.secondary)
+        SheetScaffold(title: "Scan for Faces", subtitle: name, width: 460) {
             Form {
-                Picker("Quality", selection: $mode) {
-                    Text("Low").tag(FaceScanGrade.low)
-                    Text("Medium").tag(FaceScanGrade.med)
-                    Text("High").tag(FaceScanGrade.high)
-                    Text("Extra High").tag(FaceScanGrade.xhigh)
+                Section {
+                    Picker("Quality", selection: $mode) {
+                        Text("Low").tag(FaceScanGrade.low)
+                        Text("Medium").tag(FaceScanGrade.med)
+                        Text("High").tag(FaceScanGrade.high)
+                        Text("Extra High").tag(FaceScanGrade.xhigh)
+                    }
+                    .pickerStyle(.segmented)
+                    Toggle("Fast — pin the Mac", isOn: $fast)
+                        .help("Uses every core it can and will run hot. Turn off to keep the machine quiet; same quality, longer wait.")
+                } footer: {
+                    Text(modeHelp)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
-                .pickerStyle(.segmented)
-                Toggle("Fast — pin the Mac", isOn: $fast)
-                    .help("Uses every core it can and will run hot. Turn off to keep the machine quiet; same quality, longer wait.")
+                if !engineInstalled {
+                    Section {
+                        Label {
+                            Text("Face scans need the face engine installed — run \(FaceSidecarInstallation.setupCommand) once on this Mac.")
+                                .fixedSize(horizontal: false, vertical: true)
+                        } icon: {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundStyle(.orange)
+                        }
+                    }
+                }
             }
             .formStyle(.grouped)
-            Text(modeHelp)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-            if !engineInstalled {
-                Label(
-                    "Face scans need the face engine installed — run \(FaceSidecarInstallation.setupCommand) once on this Mac.",
-                    systemImage: "exclamationmark.triangle.fill"
-                )
-                .font(.caption)
-                .foregroundStyle(.orange)
-                .fixedSize(horizontal: false, vertical: true)
+            .scrollDisabled(true)
+            .fixedSize(horizontal: false, vertical: true)
+        } actions: {
+            Button("Cancel", action: onCancel)
+                .keyboardShortcut(.cancelAction)
+            Button("Scan") {
+                onScan(FaceScanOptions(mode: mode, fast: fast))
             }
-            HStack {
-                Spacer()
-                Button("Cancel", action: onCancel)
-                    .keyboardShortcut(.cancelAction)
-                Button("Scan") {
-                    onScan(FaceScanOptions(mode: mode, fast: fast))
-                }
-                .keyboardShortcut(.defaultAction)
-                .disabled(!engineInstalled)
-            }
+            .keyboardShortcut(.defaultAction)
+            .disabled(!engineInstalled)
         }
-        .padding(20)
-        .frame(width: 460)
     }
-
 
     private var modeHelp: String {
         switch mode {

@@ -231,7 +231,7 @@ private struct ApplyMethodBadge: View {
             .font(.caption2.weight(.semibold))
             .padding(.horizontal, 7)
             .padding(.vertical, 2)
-            .background(method == .verifiedCopy ? Color.blue.opacity(0.14) : Color.secondary.opacity(0.12), in: Capsule())
+            .background((method == .verifiedCopy ? Color.blue : Color.secondary).quinary, in: Capsule())
             .foregroundStyle(method == .verifiedCopy ? Color.blue : Color.secondary)
             .help(method.detail)
     }
@@ -318,7 +318,7 @@ struct ApplyRouteRowView: View {
         switch OrganizeFileClassifier.kind(forExtension: (name as NSString).pathExtension) {
         case .video: "video.fill"
         case .raw, .photo: "photo"
-        case .other: "doc"
+        case .other: "document"
         }
     }
 }
@@ -330,53 +330,51 @@ struct ApplyEventGroupCard: View {
 
     var body: some View {
         let routes = ApplyRouteDiagram.routes(for: group)
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 8) {
-                EventChip(event: group.event, isPrivate: group.isPrivate)
-                Text(group.event.eventDate.formatted(date: .abbreviated, time: .omitted))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Spacer(minLength: 6)
-                Text("\(fileCount) file\(fileCount == 1 ? "" : "s") · \(group.byteCount.formattedBytes)")
-                    .font(.callout.monospacedDigit())
-                    .foregroundStyle(.secondary)
-            }
+        GroupBox {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 8) {
+                    EventChip(event: group.event, isPrivate: group.isPrivate)
+                    Text(group.event.eventDate.formatted(date: .abbreviated, time: .omitted))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer(minLength: 6)
+                    Text("\(fileCount) file\(fileCount == 1 ? "" : "s") · \(group.byteCount.formattedBytes)")
+                        .font(.callout.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
 
-            Label {
-                Text(OrganizeRouteLabel.breadcrumb(for: group.destinationFolder))
-                    .font(.caption.monospaced())
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-            } icon: {
-                Image(systemName: group.isPrivate ? "lock.fill" : "folder.fill")
-            }
-            .foregroundStyle(.secondary)
-            .help("The event folder these files land in: \(group.destinationFolder)")
+                Label {
+                    Text(OrganizeRouteLabel.breadcrumb(for: group.destinationFolder))
+                        .font(.caption.monospaced())
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                } icon: {
+                    Image(systemName: group.isPrivate ? "lock.fill" : "folder.fill")
+                }
+                .foregroundStyle(.secondary)
+                .help("The event folder these files land in: \(group.destinationFolder)")
 
-            if !routes.isEmpty {
-                Divider()
-                VStack(alignment: .leading, spacing: 8) {
-                    ForEach(routes) { route in
-                        ApplyRouteRowView(route: route)
+                if !routes.isEmpty {
+                    Divider()
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(routes) { route in
+                            ApplyRouteRowView(route: route)
+                        }
                     }
                 }
-            }
 
-            let footnotes = [
-                group.alreadyThere == 0 ? nil : "\(group.alreadyThere) already in place",
-                group.unavailable == 0 ? nil : "\(group.unavailable) on a disconnected drive"
-            ].compactMap { $0 }
-            if !footnotes.isEmpty {
-                Text(footnotes.joined(separator: " · "))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                let footnotes = [
+                    group.alreadyThere == 0 ? nil : "\(group.alreadyThere) already in place",
+                    group.unavailable == 0 ? nil : "\(group.unavailable) on a disconnected drive"
+                ].compactMap { $0 }
+                if !footnotes.isEmpty {
+                    Text(footnotes.joined(separator: " · "))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
-        }
-        .padding(12)
-        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5)
+            .padding(4)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 
@@ -395,67 +393,64 @@ struct ApplyPlanSummaryCard: View {
 
     var body: some View {
         let summaries = ApplyRouteDiagram.eventSummaries(for: plan)
-        ScrollView {
-            Grid(alignment: .trailing, horizontalSpacing: 16, verticalSpacing: 8) {
-                GridRow {
-                    Text("Event")
-                        .gridColumnAlignment(.leading)
-                    Text("Files")
-                    Text("Images")
-                    Text("Videos")
-                    Text("Sidecars")
-                    Text("Size")
-                }
-                .font(.caption2.weight(.semibold))
-                .foregroundStyle(.secondary)
-                Divider()
-                ForEach(summaries) { row in
+        GroupBox {
+            ScrollView {
+                Grid(alignment: .trailing, horizontalSpacing: 16, verticalSpacing: 8) {
                     GridRow {
-                        VStack(alignment: .leading, spacing: 2) {
-                            HStack(spacing: 8) {
-                                EventChip(event: row.event, isPrivate: row.isPrivate)
-                                Text(row.event.eventDate.formatted(date: .abbreviated, time: .omitted))
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                            if let footnote = row.footnote {
-                                Text(footnote)
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-                        .frame(maxWidth: 260, alignment: .leading)
-                        .gridColumnAlignment(.leading)
-                        Text(row.fileCount.formatted())
-                        Text(row.imageCount.formatted())
-                        Text(row.videoCount.formatted())
-                        Text(row.otherCount.formatted())
-                        Text(row.byteCount.formattedBytes)
-                    }
-                    .font(.callout.monospacedDigit())
-                }
-                if summaries.count > 1 {
-                    Divider()
-                    GridRow {
-                        Text("Total")
+                        Text("Event")
                             .gridColumnAlignment(.leading)
-                        Text(summaries.reduce(0) { $0 + $1.fileCount }.formatted())
-                        Text(summaries.reduce(0) { $0 + $1.imageCount }.formatted())
-                        Text(summaries.reduce(0) { $0 + $1.videoCount }.formatted())
-                        Text(summaries.reduce(0) { $0 + $1.otherCount }.formatted())
-                        Text(summaries.reduce(Int64(0)) { $0 + $1.byteCount }.formattedBytes)
+                        Text("Files")
+                        Text("Images")
+                        Text("Videos")
+                        Text("Sidecars")
+                        Text("Size")
                     }
-                    .font(.callout.monospacedDigit().weight(.semibold))
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    Divider()
+                    ForEach(summaries) { row in
+                        GridRow {
+                            VStack(alignment: .leading, spacing: 2) {
+                                HStack(spacing: 8) {
+                                    EventChip(event: row.event, isPrivate: row.isPrivate)
+                                    Text(row.event.eventDate.formatted(date: .abbreviated, time: .omitted))
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                if let footnote = row.footnote {
+                                    Text(footnote)
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                            .frame(maxWidth: 260, alignment: .leading)
+                            .gridColumnAlignment(.leading)
+                            Text(row.fileCount.formatted())
+                            Text(row.imageCount.formatted())
+                            Text(row.videoCount.formatted())
+                            Text(row.otherCount.formatted())
+                            Text(row.byteCount.formattedBytes)
+                        }
+                        .font(.callout.monospacedDigit())
+                    }
+                    if summaries.count > 1 {
+                        Divider()
+                        GridRow {
+                            Text("Total")
+                                .gridColumnAlignment(.leading)
+                            Text(summaries.reduce(0) { $0 + $1.fileCount }.formatted())
+                            Text(summaries.reduce(0) { $0 + $1.imageCount }.formatted())
+                            Text(summaries.reduce(0) { $0 + $1.videoCount }.formatted())
+                            Text(summaries.reduce(0) { $0 + $1.otherCount }.formatted())
+                            Text(summaries.reduce(Int64(0)) { $0 + $1.byteCount }.formattedBytes)
+                        }
+                        .font(.callout.monospacedDigit().weight(.semibold))
+                    }
                 }
+                .padding(4)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .padding(12)
-            .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .frame(maxHeight: 170)
-        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5)
+            .frame(maxHeight: 170)
         }
     }
 }
@@ -471,7 +466,7 @@ struct ApplyProgressBanner: View {
         VStack(alignment: .leading, spacing: 5) {
             HStack(spacing: 6) {
                 ProgressView()
-                    .controlSize(.mini)
+                    .controlSize(.small)
                 Text("Applying — \(running.title)")
                     .font(.caption.weight(.semibold))
                 Text("nothing is overwritten")
@@ -503,6 +498,6 @@ struct ApplyProgressBanner: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 8)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.accentColor.opacity(0.08))
+        .background(.tint.quinary)
     }
 }
