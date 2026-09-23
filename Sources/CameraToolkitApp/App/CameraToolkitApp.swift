@@ -259,25 +259,8 @@ private final class CameraToolkitMainWindow: NSObject, NSWindowDelegate {
             return
         }
 
-        let hostingController = NSHostingController(
-            rootView: AppShell(model: model, workspace: CameraToolkitRuntime.workspace)
-                .frame(minWidth: 1040, minHeight: 720)
-        )
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 1320, height: 840),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
-            backing: .buffered,
-            defer: false
-        )
-        window.title = "Camera Toolkit"
-        window.identifier = NSUserInterfaceItemIdentifier(BrowserCommand.mainWindowIdentifier)
-        window.isRestorable = false
-        window.contentViewController = hostingController
-        window.minSize = NSSize(width: 1040, height: 720)
-        window.setContentSize(NSSize(width: 1320, height: 840))
-        window.isReleasedWhenClosed = false
+        let window = MainWindowFactory.make(model: model, workspace: CameraToolkitRuntime.workspace)
         window.delegate = self
-        window.center()
         self.window = window
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)

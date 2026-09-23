@@ -8,43 +8,148 @@ import SwiftUI
 struct EventsRootView: View {
     @Bindable var model: DashboardModel
     @Bindable var workspace: EventsWorkspace
-    @AppStorage(OrganizeChromeSizing.sidebarWidthDefaultsKey)
-    private var sidebarWidth = OrganizeChromeSizing.defaultSidebarWidth
+
+    /// The column's opening width, read once — a live AppStorage value here
+    /// would move `ideal` during a drag and make the divider jump.
+    @State private var initialSidebarWidth = OrganizeChromeSizing.storedSidebarWidth()
+    @State private var measuredSidebarWidth: Double?
+    /// Measured content width vs. the column width asked for: the glass
+    /// sidebar can inset its content, so the first measurement sets the
+    /// offset that turns later measurements back into column widths.
+    @State private var sidebarWidthInset: Double?
+
+    /// The window's one search field. In the board scope its text is the
+    /// open board's `workspace.search.text`; in the sidebar scope it
+    /// narrows the sidebar's folders and events.
+    @State private var searchScope: OrganizeSearchScope
+    @State private var sidebarQuery = ""
+    @AppStorage(EventInfoInspector.visibilityDefaultsKey) private var showInspector = false
+    @FocusState private var searchFocused: Bool
+
+    init(model: DashboardModel, workspace: EventsWorkspace) {
+        self.model = model
+        self.workspace = workspace
+        _searchScope = State(initialValue: .defaultScope(hasBoard: workspace.selection != nil))
+    }
+
+    private var searchText: Binding<String> {
+        Binding(
+            get: { searchScope == .board ? workspace.search.text : sidebarQuery },
+            set: { text in
+                if searchScope == .board {
+                    workspace.search.text = text
+                } else {
+                    sidebarQuery = text
+                }
+            }
+        )
+    }
+
+    private var searchPrompt: String {
+        guard searchScope == .board else { return "Search Events & Folders" }
+        switch workspace.selection {
+        case .event(let id):
+            return workspace.event(id).map { "Search \(workspace.eventTitle($0))" } ?? "Search"
+        case .unsorted(let id):
+            return workspace.location(id).map { "Search \($0.name)" } ?? "Search"
+        case nil:
+            return "Search"
+        }
+    }
+
+    /// ⌘B, the View menu, and the toolbar's sidebar button all flow through
+    /// `isSidebarCollapsed`, so the menu stays deterministic.
+    private var columnVisibility: Binding<NavigationSplitViewVisibility> {
+        Binding(
+            get: { model.isSidebarCollapsed ? .detailOnly : .all },
+            set: { model.isSidebarCollapsed = ($0 == .detailOnly) }
+        )
+    }
 
     var body: some View {
         let panelAlignment: Alignment = (workspace.guide?.step.prefersTop ?? false) ? .topTrailing : .bottomTrailing
-        HStack(spacing: 0) {
-            if !model.isSidebarCollapsed {
-                EventsSidebar(model: model, workspace: workspace)
-                    .frame(width: OrganizeChromeSizing.clampedSidebarWidth(sidebarWidth))
-                    .frame(maxHeight: .infinity)
-                    .background(OrganizeSidebarMaterial())
-                ChromeResizeHandle(
-                    orientation: .vertical,
-                    value: $sidebarWidth,
-                    transform: OrganizeChromeSizing.clampedSidebarWidth,
-                    onDoubleClick: {
-                        withAnimation(.easeOut(duration: 0.15)) {
-                            sidebarWidth = OrganizeChromeSizing.defaultSidebarWidth
-                        }
-                    },
-                    help: "Drag to resize the sidebar — double-click resets",
-                    accessibilityLabel: "Resize Sidebar"
+        NavigationSplitView(columnVisibility: columnVisibility) {
+            EventsSidebar(model: model, workspace: workspace, query: searchScope == .sidebar ? sidebarQuery : "")
+                .onGeometryChange(for: Double.self) { $0.size.width.rounded() } action: { width in
+                    measuredSidebarWidth = width
+                }
+                .navigationSplitViewColumnWidth(
+                    min: OrganizeChromeSizing.sidebarWidthRange.lowerBound,
+                    ideal: initialSidebarWidth,
+                    max: OrganizeChromeSizing.sidebarWidthRange.upperBound
                 )
-            }
+        } detail: {
             // minWidth 0 + clipped: a board too wide for the window is cut
             // on its own right edge instead of pushing the whole window
             // wider and cutting the sidebar off on the left.
             detail
                 .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity)
                 .clipped()
-                .background(Color(nsColor: .windowBackgroundColor))
+                // On the detail column, outside the per-board `.id`, so the
+                // field keeps its text and focus across selection changes
+                // and each board's toolbar can place it.
+                .searchable(text: searchText, placement: .toolbar, prompt: Text(searchPrompt))
+                .searchScopes($searchScope, activation: .onSearchPresentation) {
+                    Text("This Board").tag(OrganizeSearchScope.board)
+                    Text("Events & Folders").tag(OrganizeSearchScope.sidebar)
+                }
+                .searchFocused($searchFocused)
+        }
+        // On the split view rather than the board: inside the detail column
+        // the inspector dropped the floating sidebar's safe-area inset and
+        // laid the board out beneath the sidebar.
+        .inspector(isPresented: inspectorPresented) {
+            inspector
+                .inspectorColumnWidth(min: 260, ideal: 300, max: 380)
+        }
+        // Return hands the keyboard back to the board.
+        .onSubmit(of: .search) {
+            searchFocused = false
+            workspace.requestBoardFocus()
+        }
+        // Switching scope carries the typed text over to the new target.
+        .onChange(of: searchScope) { oldScope, newScope in
+            let text = oldScope == .board ? workspace.search.text : sidebarQuery
+            if newScope == .board {
+                sidebarQuery = ""
+                workspace.search.text = text
+            } else {
+                workspace.search.text = ""
+                sidebarQuery = text
+            }
+        }
+        // No board open: search the sidebar. Opening a board with an empty
+        // field returns to searching the board.
+        .onChange(of: workspace.selection) { _, selection in
+            if selection == nil {
+                searchScope = .sidebar
+            } else if searchText.wrappedValue.isEmpty {
+                searchScope = .board
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: BrowserCommand.notification)) { notification in
+            guard notification.object as? String == BrowserCommand.find.rawValue,
+                  BrowserCommand.targetsMainWindow() else { return }
+            searchFocused = true
+        }
+        // Debounced write-back of a dragged width — never a body side effect.
+        .task(id: measuredSidebarWidth) {
+            guard let measured = measuredSidebarWidth, measured > 0 else { return }
+            if sidebarWidthInset == nil {
+                sidebarWidthInset = initialSidebarWidth - measured
+                return
+            }
+            try? await Task.sleep(for: .milliseconds(400))
+            guard !Task.isCancelled,
+                  let width = OrganizeChromeSizing.persistableSidebarWidth(measured + (sidebarWidthInset ?? 0)) else { return }
+            UserDefaults.standard.set(width, forKey: OrganizeChromeSizing.sidebarWidthDefaultsKey)
         }
         .overlay(alignment: panelAlignment) {
             if let guide = workspace.guide {
                 SetupGuidePanel(guide: guide, workspace: workspace, model: model)
                     .padding(.horizontal, 20)
-                    .padding(.vertical, guide.step.prefersTop ? 70 : 40)
+                    .padding(.top, 16)
+                    .padding(.bottom, 72)
             }
         }
         .onAppear { workspace.start() }
@@ -147,6 +252,24 @@ struct EventsRootView: View {
         }
     }
 
+    /// The Event Info inspector exists only for an open event.
+    private var inspectorPresented: Binding<Bool> {
+        Binding(
+            get: {
+                guard showInspector, case .event(let id) = workspace.selection else { return false }
+                return workspace.event(id) != nil
+            },
+            set: { showInspector = $0 }
+        )
+    }
+
+    @ViewBuilder
+    private var inspector: some View {
+        if case .event(let id) = workspace.selection, let event = workspace.event(id) {
+            EventInfoInspector(model: model, workspace: workspace, event: event)
+        }
+    }
+
     @ViewBuilder
     private var detail: some View {
         switch workspace.selection {
@@ -169,62 +292,47 @@ struct EventsRootView: View {
 struct EventsSidebar: View {
     @Bindable var model: DashboardModel
     @Bindable var workspace: EventsWorkspace
+    /// The window search's text while it is scoped to Events & Folders.
+    var query: String = ""
     @State private var targetedEventID: UUID?
-    @State private var searchText = ""
+    @AppStorage("CameraToolkit.organize.sidebar.unsortedExpanded") private var unsortedExpanded = true
+    @AppStorage("CameraToolkit.organize.sidebar.eventsExpanded") private var eventsExpanded = true
 
-    /// Explicit binding instead of `$workspace.selection`: AppKit-backed
-    /// `List(selection:)` does not reliably write through `@Bindable` into an
-    /// `@Observable` model, which left sidebar clicks dead. Rows also set the
-    /// selection on tap as a fallback.
-    private var sidebarSelection: Binding<EventsSidebarSelection?> {
-        Binding(
-            get: { workspace.selection },
-            set: { workspace.selection = $0 }
-        )
-    }
+    /// A local mirror of `workspace.selection`, synced both ways with
+    /// `onChange`. Binding the AppKit-backed List straight to the model
+    /// dropped writes in both directions: clicks did not always reach the
+    /// model, and a selection made in the model (the guide, New Event) did
+    /// not move the highlight, because nothing in the sidebar body read it.
+    /// Rows also set the selection on tap as a fallback.
+    @State private var listSelection: EventsSidebarSelection?
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 8) {
-                Image(systemName: "rectangle.3.group")
-                    .foregroundStyle(.blue)
-                Text("Organize")
-                    .font(.headline)
-                Spacer()
-                Button {
-                    workspace.startGuide()
-                } label: {
-                    Label("Guide…", systemImage: "questionmark.circle")
+        let locations = workspace.unsortedLocations(matching: query)
+        let hasLocations = !workspace.unsortedLocations.isEmpty
+        List(selection: $listSelection) {
+            let discovered = workspace.discoveredDriveEvents(matching: query)
+            if !discovered.isEmpty {
+                Section("Found on Your Drive") {
+                    discoveryBanner(discovered)
+                        .guideHighlight(.discovered, in: workspace)
                 }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .help("Open the step-by-step setup guide")
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 10)
-            Divider()
 
-            List(selection: sidebarSelection) {
-                let discovered = workspace.discoveredDriveEvents(matching: searchText)
-                if !discovered.isEmpty {
-                    Section("Found on Your Drive") {
-                        discoveryBanner(discovered)
-                            .guideHighlight(.discovered, in: workspace)
-                    }
+            Section(isExpanded: $unsortedExpanded) {
+                ForEach(locations) { location in
+                    unsortedRow(location)
+                        .tag(EventsSidebarSelection.unsorted(location.id))
+                        .contentShape(Rectangle())
+                        .simultaneousGesture(TapGesture().onEnded {
+                            workspace.selection = .unsorted(location.id)
+                        })
+                        .contextMenu {
+                            UnsortedSidebarMenu(location: location, workspace: workspace, model: model)
+                        }
                 }
-
-                Section("Unsorted Photos") {
-                    ForEach(workspace.unsortedLocations(matching: searchText)) { location in
-                        unsortedRow(location)
-                            .tag(EventsSidebarSelection.unsorted(location.id) as EventsSidebarSelection?)
-                            .contentShape(Rectangle())
-                            .simultaneousGesture(TapGesture().onEnded {
-                                workspace.selection = .unsorted(location.id)
-                            })
-                            .contextMenu {
-                                UnsortedSidebarMenu(location: location, workspace: workspace, model: model)
-                            }
-                    }
+                // First run: a full-width row is a stronger guide target
+                // than the header's small +.
+                if !hasLocations {
                     Button {
                         workspace.addUnsortedFolder()
                     } label: {
@@ -233,68 +341,74 @@ struct EventsSidebar: View {
                     .buttonStyle(.borderless)
                     .guideHighlight(.addFolder, in: workspace)
                 }
-
-                Section {
-                    if workspace.events.isEmpty {
-                        Text("No events yet")
-                            .foregroundStyle(.secondary)
-                    }
-                    // A board popover's condition rows narrow this list —
-                    // events are tested against the same OR-of-AND groups.
-                    if workspace.search.hasActiveConditions {
-                        Button {
-                            workspace.search.groups = []
-                        } label: {
-                            Label("Filtered — clear", systemImage: "line.3.horizontal.decrease.circle.fill")
-                                .font(.caption)
-                        }
-                        .buttonStyle(.borderless)
-                        .foregroundStyle(Color.accentColor)
-                        .help("A board's filter is hiding events that don't match — click to show every event")
-                    }
-                    // Parents newest-first; each subevent sits indented under
-                    // its parent — the flat row style stays the same.
-                    ForEach(workspace.sidebarRows(matching: searchText, applying: workspace.search), id: \.event.id) { row in
-                        eventRow(row.event, depth: row.depth)
-                            .tag(EventsSidebarSelection.event(row.event.id) as EventsSidebarSelection?)
-                            .contentShape(Rectangle())
-                            .simultaneousGesture(TapGesture().onEnded {
-                                workspace.selection = .event(row.event.id)
-                            })
-                            .dropDestination(for: String.self) { items, _ in
-                                workspace.handleDrop(items, onto: row.event.id)
-                            } isTargeted: { targeted in
-                                if targeted {
-                                    targetedEventID = row.event.id
-                                } else if targetedEventID == row.event.id {
-                                    targetedEventID = nil
-                                }
-                            }
-                            .contextMenu {
-                                EventSidebarMenu(event: row.event, workspace: workspace)
-                            }
-                    }
-                } header: {
-                    HStack {
-                        Text("Events")
-                        Spacer()
-                        Button {
-                            workspace.requestNewEvent(from: nil)
-                        } label: {
-                            Label("New Event…", systemImage: "plus")
-                                .font(.caption)
-                        }
-                        .buttonStyle(.borderless)
-                        .help("Make a new event")
-                    }
-                }
+            } header: {
+                SidebarSectionHeader(
+                    title: "Unsorted",
+                    addLabel: "Add Folder or Card…",
+                    forceVisible: hasLocations && workspace.guide?.step.highlight == .addFolder,
+                    action: { workspace.addUnsortedFolder() }
+                )
+                .modifier(GuideHighlightModifier(isActive: hasLocations && workspace.guide?.step.highlight == .addFolder))
             }
-            .listStyle(.sidebar)
 
-            Divider()
-            footer
+            Section(isExpanded: $eventsExpanded) {
+                if workspace.events.isEmpty {
+                    Text("No Events Yet")
+                        .foregroundStyle(.secondary)
+                }
+                // A board popover's condition rows narrow this list —
+                // events are tested against the same OR-of-AND groups.
+                if workspace.search.hasActiveConditions {
+                    Button {
+                        workspace.search.groups = []
+                    } label: {
+                        Label("Filtered — Clear", systemImage: "line.3.horizontal.decrease.circle.fill")
+                    }
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(.tint)
+                    .help("A board's filter is hiding events that don't match — click to show every event")
+                }
+                // Parents newest-first; each subevent sits indented under
+                // its parent.
+                ForEach(workspace.sidebarRows(matching: query, applying: workspace.search), id: \.event.id) { row in
+                    eventRow(row.event, depth: row.depth)
+                        .tag(EventsSidebarSelection.event(row.event.id))
+                        .contentShape(Rectangle())
+                        .simultaneousGesture(TapGesture().onEnded {
+                            workspace.selection = .event(row.event.id)
+                        })
+                        .dropDestination(for: String.self) { items, _ in
+                            workspace.handleDrop(items, onto: row.event.id)
+                        } isTargeted: { targeted in
+                            if targeted {
+                                targetedEventID = row.event.id
+                            } else if targetedEventID == row.event.id {
+                                targetedEventID = nil
+                            }
+                        }
+                        .contextMenu {
+                            EventSidebarMenu(event: row.event, workspace: workspace)
+                        }
+                }
+            } header: {
+                SidebarSectionHeader(
+                    title: "Events",
+                    addLabel: "New Event…",
+                    action: { workspace.requestNewEvent(from: nil) }
+                )
+            }
         }
-        .searchable(text: $searchText, placement: .sidebar, prompt: "Search")
+        .listStyle(.sidebar)
+        .onAppear { listSelection = workspace.selection }
+        .onChange(of: listSelection) { _, selection in
+            if workspace.selection != selection { workspace.selection = selection }
+        }
+        .onChange(of: workspace.selection) { _, selection in
+            if listSelection != selection { listSelection = selection }
+        }
+        .safeAreaBar(edge: .bottom) {
+            SidebarFooter(model: model, workspace: workspace)
+        }
     }
 
     private func discoveryBanner(_ found: [DiscoveredDriveEvent]) -> some View {
@@ -321,129 +435,190 @@ struct EventsSidebar: View {
     }
 
     private func unsortedRow(_ location: ConfiguredLocation) -> some View {
+        let state = workspace.sources[location.id]
         let connected = workspace.isConnected(location)
-        return HStack(spacing: 8) {
-            Image(systemName: connected ? "tray.full" : "externaldrive.badge.xmark")
-                .foregroundStyle(connected ? Color.orange : .secondary)
-                .frame(width: 18)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(location.name)
-                    .lineLimit(1)
-                Text(workspace.unsortedDetail(for: location))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-            Spacer(minLength: 0)
-            if workspace.sources[location.id]?.isScanning == true {
-                ProgressView()
-                    .controlSize(.mini)
-            } else if !connected {
-                Button {
-                    workspace.refreshConnectivity()
-                } label: {
-                    Image(systemName: "arrow.clockwise")
-                }
-                .buttonStyle(.borderless)
-                .controlSize(.small)
-                .foregroundStyle(.secondary)
-                .help("Check again — the drive or card may have just connected")
-            }
-        }
-        .padding(.vertical, 2)
+        let leftToSort = state?.result.map { result in result.stacks.count { !workspace.isSorted($0) } }
+        return UnsortedSidebarRow(
+            name: location.name,
+            isConnected: connected,
+            isScanning: state?.isScanning == true,
+            leftToSort: leftToSort ?? 0,
+            help: "\(workspace.unsortedDetail(for: location)) · \(DashboardModel.expandedPath(location.path))"
+        )
     }
 
-    private func eventRow(_ event: SavedCameraEvent, depth: Int = 0) -> some View {
+    private func eventRow(_ event: SavedCameraEvent, depth: Int) -> some View {
         let count = workspace.assignmentCount(for: event.id)
         let summary = workspace.presence[event.id]
         let names = workspace.eventPeople(event.id).map(\.name).joined(separator: ", ")
-        return HStack(spacing: 8) {
-            Circle()
-                .fill(EventPalette.color(for: event.id))
-                .frame(width: 9, height: 9)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(event.name)
-                    .lineLimit(1)
-                Text("\(event.eventDate.formatted(date: .abbreviated, time: .omitted)) · \(count) file\(count == 1 ? "" : "s")\(names.isEmpty ? "" : " · \(names)")")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+        let isPrivate = workspace.resolvedPolicy(for: event) == .archiveOnly
+        var details = [
+            event.eventDate.formatted(date: .abbreviated, time: .omitted),
+            "\(count.formatted()) file\(count == 1 ? "" : "s")",
+        ]
+        if !names.isEmpty { details.append(names) }
+        if let summary, summary.total > 0 {
+            details.append("Drive \(summary.onDrive) of \(summary.total)")
+            details.append("NAS \(summary.onArchive) of \(summary.total)")
+        }
+        if isPrivate { details.append("Private · NAS only") }
+        return EventSidebarRow(
+            name: event.name,
+            color: EventPalette.color(for: event.id),
+            isPrivate: isPrivate,
+            fileCount: count,
+            depth: depth,
+            isDropTarget: targetedEventID == event.id,
+            help: details.joined(separator: " · ")
+        )
+    }
+}
+
+/// A sidebar section title with a + that shows on hover — where Finder and
+/// Music put "add" for a section.
+private struct SidebarSectionHeader: View {
+    let title: String
+    let addLabel: String
+    /// Keeps the + visible while the setup guide points at it.
+    var forceVisible = false
+    let action: () -> Void
+    @State private var isHovering = false
+
+    var body: some View {
+        HStack {
+            Text(title)
+            Spacer()
+            Button(action: action) {
+                Label(addLabel, systemImage: "plus")
+                    .labelStyle(.iconOnly)
             }
-            Spacer(minLength: 0)
-            if workspace.resolvedPolicy(for: event) == .archiveOnly {
-                Image(systemName: "lock.fill")
-                    .font(.caption)
-                    .foregroundStyle(.purple)
-                    .help("Private · NAS only")
+            .buttonStyle(.borderless)
+            .opacity(isHovering || forceVisible ? 1 : 0)
+            .help(addLabel)
+            .accessibilityLabel(addLabel)
+        }
+        .contentShape(Rectangle())
+        .onHover { isHovering = $0 }
+    }
+}
+
+/// One unsorted folder or card: its name, and the count still to sort as
+/// the row's badge. Values only, so a row re-renders only when they change.
+private struct UnsortedSidebarRow: View {
+    let name: String
+    let isConnected: Bool
+    let isScanning: Bool
+    let leftToSort: Int
+    let help: String
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Label {
+                Text(name)
+                    .lineLimit(1)
+            } icon: {
+                Image(systemName: isConnected ? "tray.full" : "externaldrive.badge.xmark")
+                    .foregroundStyle(isConnected ? Color.orange : Color.secondary)
             }
-            if let summary, summary.total > 0 {
-                HStack(spacing: 3) {
-                    Image(systemName: "externaldrive.fill")
-                        .foregroundStyle(summary.onDrive == summary.total ? Color.green : Color.secondary.opacity(0.5))
-                    Image(systemName: "server.rack")
-                        .foregroundStyle(summary.onArchive == summary.total ? Color.green : Color.secondary.opacity(0.5))
-                }
-                .font(.caption2)
-                .help("Drive \(summary.onDrive) of \(summary.total) · NAS \(summary.onArchive) of \(summary.total)")
+            .foregroundStyle(isConnected ? Color.primary : Color.secondary)
+            if isScanning {
+                Spacer(minLength: 0)
+                ProgressView()
+                    .controlSize(.small)
             }
         }
-        .padding(.vertical, 2)
-        .padding(.horizontal, 4)
-        .padding(.leading, CGFloat(depth) * 16)
+        .badge(isScanning || !isConnected ? 0 : leftToSort)
+        .help(help)
+    }
+}
+
+/// One event: its palette color (a lock for private events), its name, and
+/// its file count as the badge. Date, people, and drive/NAS status are in
+/// the tooltip and the board's inspector.
+private struct EventSidebarRow: View {
+    let name: String
+    let color: Color
+    let isPrivate: Bool
+    let fileCount: Int
+    let depth: Int
+    let isDropTarget: Bool
+    let help: String
+
+    var body: some View {
+        Label {
+            Text(name)
+                .lineLimit(1)
+        } icon: {
+            Image(systemName: isPrivate ? "lock.fill" : "circle.fill")
+                .imageScale(isPrivate ? .medium : .small)
+                .foregroundStyle(color)
+        }
+        .badge(fileCount)
+        .padding(.leading, CGFloat(depth) * 14)
         .background {
             RoundedRectangle(cornerRadius: 6)
-                .fill(targetedEventID == event.id ? Color.accentColor.opacity(0.25) : Color.clear)
+                .fill(isDropTarget ? Color.accentColor.opacity(0.25) : Color.clear)
+                .padding(.horizontal, -4)
                 .allowsHitTesting(false)
         }
+        .help(help)
     }
+}
 
-    private var footer: some View {
-        VStack(spacing: 2) {
-            footerButton(
-                "Jobs…",
-                detail: model.activeJob?.note
-                    ?? model.transferQueue?.sidebarSummary.detail
-                    ?? (model.pendingTransferFileCount > 0 ? "\(model.pendingTransferFileCount) waiting" : nil),
-                symbol: model.activeJob != nil ? "list.bullet.clipboard.fill" : "list.bullet.clipboard"
-            ) {
-                TransferQueueWindowController.shared.show(model: model)
-            }
-            footerButton(
-                "People…",
-                detail: workspace.faceEngineInstalled ? nil : "engine missing",
-                symbol: "person.2"
-            ) {
-                PeopleWindowController.shared.show(model: model, workspace: workspace)
-            }
-            footerButton("Trash…", detail: nil, symbol: "trash") {
-                TrashWindowController.shared.show(model: model)
-            }
-            footerButton("Speed Tests…", detail: nil, symbol: "gauge.with.dots.needle.50percent") {
-                StorageBenchmarkWindowController.shared.show(model: model)
-            }
-            footerButton("Settings…", detail: nil, symbol: "gearshape") {
-                CameraToolkitConfigWindow.shared.show(model: model)
-            }
-        }
-        .buttonStyle(.plain)
-        .padding(12)
-    }
+/// The sidebar's footer: Jobs (with the running job's progress) and one
+/// gear menu for the windows that used to be five stacked buttons. Every
+/// entry is also in the menu bar.
+private struct SidebarFooter: View {
+    @Bindable var model: DashboardModel
+    let workspace: EventsWorkspace
 
-    private func footerButton(_ title: String, detail: String?, symbol: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            HStack {
-                Label(title, systemImage: symbol)
-                Spacer()
-                if let detail {
-                    Text(detail)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
+    var body: some View {
+        let job = model.activeJob
+        let detail = job?.note
+            ?? model.transferQueue?.sidebarSummary.detail
+            ?? (model.pendingTransferFileCount > 0 ? "\(model.pendingTransferFileCount) waiting" : nil)
+        GlassEffectContainer(spacing: 8) {
+            HStack(spacing: 8) {
+                Button {
+                    TransferQueueWindowController.shared.show(model: model)
+                } label: {
+                    HStack(spacing: 6) {
+                        Label("Jobs", systemImage: "list.bullet.clipboard")
+                            .symbolVariant(job != nil ? .fill : .none)
+                        if let job {
+                            ProgressView(value: job.progress)
+                                .frame(width: 44)
+                        } else if let detail {
+                            Text(detail)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                    }
                 }
+                .buttonStyle(.glass)
+                .help(detail.map { "Jobs — \($0)" } ?? "Show copy, archive, and scan jobs")
+                Spacer(minLength: 0)
+                Menu {
+                    Button(workspace.faceEngineInstalled ? "People…" : "People… (Face Engine Missing)") {
+                        PeopleWindowController.shared.show(model: model, workspace: workspace)
+                    }
+                    Button("Trash…") { TrashWindowController.shared.show(model: model) }
+                    Button("Storage Speed Tests…") { StorageBenchmarkWindowController.shared.show(model: model) }
+                    Divider()
+                    Button("Setup Guide…") { workspace.startGuide() }
+                    Button("Settings…") { CameraToolkitConfigWindow.shared.show(model: model) }
+                } label: {
+                    Label("More", systemImage: "gearshape")
+                        .labelStyle(.iconOnly)
+                }
+                .menuIndicator(.hidden)
+                .buttonStyle(.glass)
+                .buttonBorderShape(.circle)
+                .help("People, Trash, Speed Tests, the setup guide, and Settings")
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .contentShape(Rectangle())
         }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
     }
 }
 
@@ -455,8 +630,10 @@ struct EventsWelcomeView: View {
         ScrollView {
             VStack(spacing: 20) {
                 Image(systemName: "rectangle.3.group")
-                    .font(.system(size: 52))
-                    .foregroundStyle(.blue)
+                    .font(.largeTitle)
+                    .imageScale(.large)
+                    .symbolRenderingMode(.hierarchical)
+                    .foregroundStyle(.tint)
                     .padding(.top, 40)
                 Text("Welcome to Camera Toolkit")
                     .font(.largeTitle.bold())
@@ -469,13 +646,10 @@ struct EventsWelcomeView: View {
                 Button {
                     workspace.startGuide()
                 } label: {
-                    Label("Start Guided Setup…", systemImage: "play.circle.fill")
-                        .font(.title3.weight(.semibold))
-                        .padding(.horizontal, 20)
-                        .padding(.vertical, 8)
+                    Label("Start Guided Setup…", systemImage: "play.fill")
                 }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.large)
+                .buttonStyle(.glassProminent)
+                .controlSize(.extraLarge)
 
                 Text("It checks your drives, finds your unsorted photos, and walks you through sorting your first burst. Nothing moves or gets deleted without a plan you confirm.")
                     .font(.callout)
@@ -494,31 +668,25 @@ struct EventsWelcomeView: View {
                 }
                 .frame(maxWidth: 600)
 
-                HStack {
-                    Button("Add Folder or Card…") { workspace.addUnsortedFolder() }
-                    Button("New Event…") { workspace.requestNewEvent(from: nil) }
+                GlassEffectContainer(spacing: 12) {
+                    HStack(spacing: 12) {
+                        Button("Add Folder or Card…", systemImage: "plus.rectangle.on.folder") {
+                            workspace.addUnsortedFolder()
+                        }
+                        Button("New Event…", systemImage: "calendar.badge.plus") {
+                            workspace.requestNewEvent(from: nil)
+                        }
+                    }
+                    .buttonStyle(.glass)
+                    .controlSize(.large)
                 }
                 .padding(.bottom, 40)
             }
             .padding(.horizontal, 40)
             .frame(maxWidth: .infinity)
         }
+        .navigationTitle("Camera Toolkit")
     }
-}
-
-/// The translucent material NavigationSplitView used to paint behind the
-/// sidebar column — kept so the hand-sized sidebar still looks like a
-/// macOS sidebar.
-private struct OrganizeSidebarMaterial: NSViewRepresentable {
-    func makeNSView(context: Context) -> NSVisualEffectView {
-        let view = NSVisualEffectView()
-        view.material = .sidebar
-        view.blendingMode = .behindWindow
-        view.state = .followsWindowActiveState
-        return view
-    }
-
-    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {}
 }
 
 /// The Unsorted row's context menu, in its own view so its buttons are
@@ -530,6 +698,11 @@ private struct UnsortedSidebarMenu: View {
     let model: DashboardModel
 
     var body: some View {
+        if !workspace.isConnected(location) {
+            Button("Check Again") { workspace.refreshConnectivity() }
+                .help("Check again — the drive or card may have just connected")
+            Divider()
+        }
         Button("Rescan") { workspace.scan(location, force: true) }
             .disabled(workspace.sources[location.id]?.isScanning == true || model.isBusy)
         Button("Regroup Bursts") { workspace.regroupBursts(location) }

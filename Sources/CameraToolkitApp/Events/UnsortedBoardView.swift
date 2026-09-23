@@ -15,7 +15,6 @@ struct UnsortedBoardView: View {
     @AppStorage("CameraToolkit.organize.order") private var sortOrder: OrganizeBoardOrder = .oldestFirst
     @State private var previewStackID: String?
     @State private var previewFrameIndex = 0
-    @FocusState private var searchFocused: Bool
 
     private var state: UnsortedSourceState {
         workspace.sources[location.id] ?? UnsortedSourceState()
@@ -43,36 +42,48 @@ struct UnsortedBoardView: View {
 
     var body: some View {
         let result = state.result
-        // One grouping pass per render — the header, board, and counts all
-        // share it, so collapsing a group never re-plans the whole board.
+        // One grouping pass per render — the board, toolbar count, and
+        // bottom bar all share it, so collapsing a group never re-plans
+        // the whole board.
         let groups = self.groups
         let ordered = orderedStacks(in: groups)
         let searching = !workspace.search.isEmpty
+        let matched = groups.reduce(0) { $0 + $1.stacks.count }
 
         VStack(spacing: 0) {
-            header(result, groups: groups)
-            Divider()
-            if let result {
-                assignBar(orderedIDs: ordered.map(\.id))
-                    .guideHighlight(.assignBar, in: workspace)
-                Divider()
+            if result != nil {
                 if groups.isEmpty {
-                    ContentUnavailableView(
-                        searching ? "No Matches" : (hideSorted ? "Everything here is sorted" : "No photos or videos"),
-                        systemImage: searching ? "magnifyingglass" : (hideSorted ? "checkmark.circle" : "photo"),
-                        description: Text(searching
-                            ? "Nothing in \(location.name) matches the current search and filters — Clear All resets them."
-                            : hideSorted
-                                ? "Turn off Hide Sorted to review, or press Apply to move the files into their events."
-                                : "This folder has no camera files.")
-                    )
-                    .frame(maxHeight: .infinity)
+                    if searching {
+                        NoMatchesView(workspace: workspace, boardName: location.name)
+                    } else if hideSorted {
+                        ContentUnavailableView {
+                            Label("Everything Here Is Sorted", systemImage: "checkmark.circle")
+                        } description: {
+                            Text("Show sorted items to review them, or Apply to move the files into their events.")
+                        } actions: {
+                            Button("Show Sorted") { hideSorted = false }
+                            if let result, workspace.sortedFiles(in: result).files > 0 {
+                                Button("Apply…") { workspace.prepareApply(sourceLocationID: location.id) }
+                                    .buttonStyle(.borderedProminent)
+                                    .disabled(model.isBusy)
+                            }
+                        }
+                        .frame(maxHeight: .infinity)
+                    } else {
+                        ContentUnavailableView {
+                            Label("No Photos or Videos", systemImage: "photo")
+                        } description: {
+                            Text("This folder has no camera files.")
+                        } actions: {
+                            Button("Rescan") { workspace.scan(location, force: true) }
+                                .disabled(state.isScanning || model.isBusy)
+                        }
+                        .frame(maxHeight: .infinity)
+                    }
                 } else {
                     board(groups: groups)
                         .guideHighlight(.grid, in: workspace)
                 }
-                Divider()
-                applyBar(result)
             } else if state.isScanning {
                 scanningView
             } else if let error = state.error {
@@ -89,7 +100,17 @@ struct UnsortedBoardView: View {
                 ProgressView()
                     .frame(maxHeight: .infinity)
             }
-            OrganizeStatusLine(model: model, workspace: workspace)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        // A firm edge under the bottom bar keeps its caption legible over
+        // tiles scrolling beneath it.
+        .scrollEdgeEffectStyle(.hard, for: .bottom)
+        .safeAreaBar(edge: .bottom) {
+            if let result {
+                bottomBar(result, groups: groups, ordered: ordered, matched: matched)
+            } else {
+                BoardBottomBar(model: model, workspace: workspace) { EmptyView() }
+            }
         }
         .overlay {
             if previewStackID != nil {
@@ -119,6 +140,21 @@ struct UnsortedBoardView: View {
                 )
             }
         }
+        .navigationTitle(location.name)
+        .toolbar(removing: .title)
+        .toolbar {
+            UnsortedBoardToolbar(
+                model: model,
+                workspace: workspace,
+                location: location,
+                title: location.name,
+                count: countText(result, matched: matched),
+                countHelp: countHelp(result, matched: matched),
+                help: summaryLine(result),
+                isScanning: state.isScanning,
+                hasResult: result != nil
+            )
+        }
         .task(id: location.id) {
             workspace.scan(location)
         }
@@ -128,132 +164,23 @@ struct UnsortedBoardView: View {
         }
     }
 
-    private func header(_ result: OrganizeScanResult?, groups: [OrganizeBoardGroup]) -> some View {
-        HStack(spacing: 12) {
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 8) {
-                    Image(systemName: "tray.full.fill")
-                        .foregroundStyle(.orange)
-                    Text(location.name)
-                        .font(.title2.bold())
-                        .lineLimit(1)
-                }
-                Text(summaryLine(result))
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-            // The title keeps its room; the controls wrap onto a second row
-            // instead of pushing the window wider than the screen.
-            .frame(minWidth: 220, alignment: .leading)
-            .layoutPriority(1)
-            FlowLayout(horizontalSpacing: 12, verticalSpacing: 8, alignment: .trailing) {
-            OrganizeSearchBar(
-                workspace: workspace,
-                stacks: result?.stacks ?? [],
-                search: $workspace.search,
-                focused: $searchFocused,
-                matchedCount: groups.reduce(0) { $0 + $1.stacks.count }
-            )
-            Picker("Camera", selection: Binding(
-                get: { workspace.deviceID(for: location) },
-                set: { workspace.setDevice($0, for: location.id) }
-            )) {
-                ForEach(DeviceChoice.all) { choice in
-                    Text(choice.name).tag(choice.id)
-                }
-            }
-            .frame(width: 190)
-            .help("Camera folder name used when these files go into an event")
-            Toggle("Hide Sorted", isOn: $hideSorted)
-                .toggleStyle(.switch)
-                .controlSize(.small)
-            Picker("View", selection: $boardMode) {
-                ForEach(OrganizeBoardMode.allCases) { mode in
-                    Image(systemName: mode.symbol).tag(mode)
-                }
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .frame(width: 64)
-            .help("Tiles or a dense list")
-            Menu {
-                Section("Group By") {
-                    ForEach(OrganizeBoardGrouping.allCases) { option in
-                        Toggle(option.title, isOn: Binding(
-                            get: { grouping == option },
-                            set: { _ in grouping = option }
-                        ))
-                    }
-                }
-                Section("Order") {
-                    ForEach(OrganizeBoardOrder.allCases) { option in
-                        Toggle(option.title, isOn: Binding(
-                            get: { sortOrder == option },
-                            set: { _ in sortOrder = option }
-                        ))
-                    }
-                }
-                Divider()
-                let anyCollapsed = groups.contains { workspace.collapsedGroupIDs.contains($0.id) }
-                Button(anyCollapsed ? "Expand All Groups" : "Collapse All Groups") {
-                    workspace.setAllGroupsCollapsed(!anyCollapsed, groups: groups)
-                }
-            } label: {
-                Image(systemName: "arrow.up.arrow.down.square")
-            }
-            .menuStyle(.borderlessButton)
-            .fixedSize()
-            .help("Group, sort, and collapse the board")
-            if boardMode == .tiles {
-                Slider(value: $tileWidth, in: 88...460)
-                    .frame(width: 110)
-                    .help("Tile size — smaller fits more bursts on screen")
-            }
-            Button {
-                workspace.scan(location, force: true)
-            } label: {
-                Label("Rescan", systemImage: "arrow.clockwise")
-            }
-            .disabled(state.isScanning || model.isBusy)
-            .help("Re-read every file and rebuild the board. Disabled while a scan or job is running.")
-            Button {
-                workspace.regroupBursts(location)
-            } label: {
-                Label("Regroup Bursts", systemImage: "square.stack.3d.up")
-            }
-            .disabled(state.isScanning || model.isBusy || result == nil)
-            .help("Re-run burst grouping on the scanned files with the current Settings sliders — Sony prefixes, the time gap, then the Vision check. Files are not re-read and nothing moves.")
-            Menu {
-                Button("Scan for Faces…") {
-                    workspace.requestFaceScan(location)
-                }
-                .disabled(workspace.faceScanBlocker(for: location) != nil)
-                .help(workspace.faceScanBlocker(for: location)
-                    ?? "Detect and match faces on a sample of each burst — not every frame — plus single stills and, at MED and above, video frames. Writes only to the catalog — media is read, never touched.")
-                Divider()
-                Button("Reveal in Finder") {
-                    NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: DashboardModel.expandedPath(location.path))])
-                }
-                Button("Move to Trash…") {
-                    workspace.trash(stackIDs: workspace.targetStackIDs(), from: location.id)
-                }
-                .disabled(workspace.targetStackIDs().isEmpty)
-                .help("Move the selected items to the drive's Trash folder. Restorable from the Trash window.")
-                Divider()
-                Button("Remove from Unsorted List") {
-                    workspace.removeUnsortedFolder(location.id)
-                }
-            } label: {
-                Image(systemName: "ellipsis.circle")
-            }
-            .menuStyle(.borderlessButton)
-            .fixedSize()
-            }
-            .frame(maxWidth: .infinity, alignment: .trailing)
+    /// The capsule: how many items are left to sort, or "N of M" items
+    /// while a search or filter narrows the board.
+    private func countText(_ result: OrganizeScanResult?, matched: Int) -> String {
+        guard let result else { return state.isScanning ? "…" : "—" }
+        if !workspace.search.isEmpty {
+            return "\(matched.formatted()) of \(result.stacks.count.formatted())"
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 12)
+        return result.stacks.count { !workspace.isSorted($0) }.formatted()
+    }
+
+    private func countHelp(_ result: OrganizeScanResult?, matched: Int) -> String {
+        guard let result else { return state.isScanning ? "Reading the folder" : "Not read yet" }
+        if !workspace.search.isEmpty {
+            return "\(matched) of \(result.stacks.count) items match the search and filters"
+        }
+        let left = result.stacks.count { !workspace.isSorted($0) }
+        return "\(left) item\(left == 1 ? "" : "s") left to sort"
     }
 
     private func summaryLine(_ result: OrganizeScanResult?) -> String {
@@ -266,37 +193,107 @@ struct UnsortedBoardView: View {
         return "\(result.stacks.count) items · \(bursts) bursts · \(result.fileCount) files · \(result.byteCount.formattedBytes) · \(result.days.count) day\(result.days.count == 1 ? "" : "s") · \(left) left to sort"
     }
 
-    private func assignBar(orderedIDs: [String]) -> some View {
+    /// One bottom bar for the sorting workflow: sort-into on the leading
+    /// side, view controls in the middle, Undo and Apply trailing. Narrow
+    /// windows fall back to numbered chips, then to a Sort Into menu.
+    private func bottomBar(_ result: OrganizeScanResult, groups: [OrganizeBoardGroup], ordered: [OrganizeStack], matched: Int) -> some View {
+        let sorted = workspace.sortedFiles(in: result)
         let targets = workspace.targetStackIDs()
-        return HStack(spacing: 8) {
-            Text(targets.isEmpty ? "Select items to sort" : "\(targets.count) selected")
-                .font(.callout.weight(.semibold))
-                .frame(minWidth: 120, alignment: .leading)
-            EventAssignControls(
-                workspace: workspace,
-                verb: "Sort into",
-                canAssign: !targets.isEmpty,
-                onAssign: { workspace.assign(stackIDs: targets, from: location.id, to: $0.id, orderedIDs: orderedIDs) },
-                onNewEvent: { workspace.requestNewEvent(from: location.id) }
-            )
-            Spacer(minLength: 0)
-            Button {
-                workspace.unassign(stackIDs: targets, from: location.id)
-            } label: {
-                Label("Unsort", systemImage: "arrow.uturn.backward")
+        let orderedIDs = ordered.map(\.id)
+        let hint = sorted.files > 0
+            ? "\(sorted.files) sorted file\(sorted.files == 1 ? "" : "s") (\(sorted.bytes.formattedBytes)) still here — nothing moves until you Apply"
+            : "Select items, then press 1–3, drag onto an event, or press N for a new event"
+        return BoardBottomBar(model: model, workspace: workspace, hint: hint) {
+            ViewThatFits(in: .horizontal) {
+                bottomBarRow(result, groups: groups, orderedIDs: orderedIDs, matched: matched, targets: targets, sorted: sorted, assignStyle: .glass, compactControls: false)
+                bottomBarRow(result, groups: groups, orderedIDs: orderedIDs, matched: matched, targets: targets, sorted: sorted, assignStyle: .glass, compactControls: true)
+                bottomBarRow(result, groups: groups, orderedIDs: orderedIDs, matched: matched, targets: targets, sorted: sorted, assignStyle: .glassNumbers, compactControls: true)
+                bottomBarRow(result, groups: groups, orderedIDs: orderedIDs, matched: matched, targets: targets, sorted: sorted, assignStyle: .menu, compactControls: true)
             }
-            .disabled(targets.isEmpty)
-            .help("Remove the selection from its event (Delete)")
-            Button {
-                workspace.undoLastSort()
-            } label: {
-                Label("Undo", systemImage: "arrow.uturn.left")
-            }
-            .disabled(!workspace.canUndoSort)
-            .help("Undo the last sort (Command-Z)")
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 8)
+    }
+
+    private func bottomBarRow(
+        _ result: OrganizeScanResult,
+        groups: [OrganizeBoardGroup],
+        orderedIDs: [String],
+        matched: Int,
+        targets: Set<String>,
+        sorted: (files: Int, bytes: Int64),
+        assignStyle: EventAssignControls.Style,
+        compactControls: Bool
+    ) -> some View {
+        HStack(spacing: 10) {
+            // Leading: put the selection into an event.
+            HStack(spacing: 6) {
+                Text(targets.isEmpty ? "No Selection" : "\(targets.count) Selected")
+                    .font(.callout.weight(.semibold))
+                    .monospacedDigit()
+                    .foregroundStyle(targets.isEmpty ? .secondary : .primary)
+                    .lineLimit(1)
+                    .fixedSize()
+                    .help(targets.isEmpty ? "Select items, then press 1–3, drag onto an event, or press N for a new event." : "")
+                EventAssignControls(
+                    workspace: workspace,
+                    verb: "Sort into",
+                    canAssign: !targets.isEmpty,
+                    style: assignStyle,
+                    onAssign: { workspace.assign(stackIDs: targets, from: location.id, to: $0.id, orderedIDs: orderedIDs) },
+                    onNewEvent: { workspace.requestNewEvent(from: location.id) }
+                )
+                Button {
+                    workspace.unassign(stackIDs: targets, from: location.id)
+                } label: {
+                    Label("Unsort", systemImage: "tray.and.arrow.up")
+                }
+                .labelStyle(.iconOnly)
+                .buttonStyle(.glass)
+                .disabled(targets.isEmpty)
+                .help("Remove the selection from its event (Delete)")
+            }
+            .fixedSize()
+            .guideHighlight(.assignBar, in: workspace)
+            Spacer(minLength: 0)
+            BoardViewControls(
+                workspace: workspace,
+                stacks: result.stacks,
+                matchedCount: matched,
+                groups: groups,
+                mode: $boardMode,
+                grouping: $grouping,
+                groupings: OrganizeBoardGrouping.allCases,
+                order: $sortOrder,
+                tileWidth: $tileWidth,
+                hideSorted: $hideSorted,
+                compact: compactControls
+            )
+            .fixedSize()
+            Spacer(minLength: 0)
+            // Trailing: undo, and the one commit step.
+            HStack(spacing: 6) {
+                Button {
+                    workspace.undoLastSort()
+                } label: {
+                    Label("Undo", systemImage: "arrow.uturn.backward")
+                }
+                .labelStyle(.iconOnly)
+                .buttonStyle(.glass)
+                .disabled(!workspace.canUndoSort)
+                .help("Undo the last sort (⌘Z)")
+                // Apply only opens the plan sheet; nothing moves until the
+                // plan is confirmed there.
+                Button("Apply…") {
+                    workspace.prepareApply(sourceLocationID: location.id)
+                }
+                .buttonStyle(.glassProminent)
+                .disabled(sorted.files == 0 || model.isBusy)
+                .help(sorted.files > 0
+                    ? "\(sorted.files) sorted file\(sorted.files == 1 ? "" : "s") (\(sorted.bytes.formattedBytes)) still in \(location.name). Review the plan — nothing moves until you confirm it."
+                    : "Sort items into events first — Apply moves sorted files into their event folders")
+                .guideHighlight(.applyButton, in: workspace)
+            }
+            .fixedSize()
+        }
     }
 
     private func board(groups: [OrganizeBoardGroup]) -> some View {
@@ -410,50 +407,20 @@ struct UnsortedBoardView: View {
         return .handled
     }
 
-    private func applyBar(_ result: OrganizeScanResult) -> some View {
-        let sorted = workspace.sortedFiles(in: result)
-        return HStack(spacing: 12) {
-            Image(systemName: sorted.files > 0 ? "arrow.down.doc" : "keyboard")
-                .foregroundStyle(sorted.files > 0 ? Color.accentColor : .secondary)
-            Text(sorted.files > 0
-                ? "\(sorted.files) sorted file\(sorted.files == 1 ? "" : "s") (\(sorted.bytes.formattedBytes)) still in \(location.name). Nothing moves until you press Apply."
-                : "Select items, then press 1–3, drag onto an event, or press N for a new event. Space previews a burst, E or the count badge expands it in place.")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .lineLimit(2)
-            Spacer()
-            if let title = workspace.latestMoveJournalTitle {
-                Button("Undo “\(title)”") { workspace.undoLastMove() }
-                    .disabled(model.isBusy)
-            }
-            Button("Apply…") {
-                workspace.prepareApply(sourceLocationID: location.id)
-            }
-            .buttonStyle(.borderedProminent)
-            .disabled(sorted.files == 0 || model.isBusy)
-            .guideHighlight(.applyButton, in: workspace)
-        }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 10)
-        .background(.bar)
-    }
-
     private var scanningView: some View {
-        VStack(spacing: 12) {
+        ContentUnavailableView {
             if let progress = state.progress, progress.total > 0 {
                 ProgressView(value: progress.fraction)
-                    .frame(width: 320)
+                    .frame(width: 280)
                 Text("\(progress.phase) · \(progress.processed.formatted()) of \(progress.total.formatted())")
             } else {
                 ProgressView()
                 Text(state.progress.map { "\($0.phase)\($0.processed > 0 ? " · \($0.processed.formatted()) found" : "")…" } ?? "Reading \(location.name)…")
             }
+        } description: {
             Text("Capture times are read from each RAW header and remembered, so reopening is fast.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
         }
-        .font(.callout)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .frame(maxHeight: .infinity)
     }
 
     private func handleKey(_ press: KeyPress, orderedIDs: [String]) -> KeyPress.Result {
@@ -489,6 +456,9 @@ struct UnsortedBoardView: View {
     }
 
     private func handle(_ command: BrowserCommand, ordered: [OrganizeStack]) {
+        // Commands are app-wide notifications — act only while the main
+        // window is key, not with Trash or People in front of it.
+        guard BrowserCommand.targetsMainWindow() else { return }
         guard command.isAllowedWhileTyping || !KeyboardTextFocus.isTypingInTextField() else { return }
         switch command {
         case .selectAll:
@@ -504,9 +474,111 @@ struct UnsortedBoardView: View {
         case .reload:
             workspace.scan(location, force: true)
         case .find:
-            searchFocused = true
+            // The window's toolbar search field takes ⌘F (EventsRootView).
+            break
         case .moveSelectionToTrash:
             workspace.trash(stackIDs: workspace.targetStackIDs(), from: location.id)
         }
+    }
+}
+
+/// The unsorted board's toolbar: centered title with the count left to
+/// sort, then search, Rescan, New Event, and the ··· menu.
+private struct UnsortedBoardToolbar: ToolbarContent {
+    let model: DashboardModel
+    let workspace: EventsWorkspace
+    let location: ConfiguredLocation
+    let title: String
+    let count: String
+    let countHelp: String
+    let help: String
+    let isScanning: Bool
+    let hasResult: Bool
+
+    var body: some ToolbarContent {
+        ToolbarItem(placement: .principal) {
+            BoardToolbarTitle(
+                title: title,
+                symbol: "tray.full",
+                count: count,
+                countHelp: countHelp,
+                help: help
+            )
+        }
+        .sharedBackgroundVisibility(.hidden)
+        ToolbarItemGroup(placement: .primaryAction) {
+            Button {
+                workspace.scan(location, force: true)
+            } label: {
+                Label("Rescan", systemImage: "arrow.clockwise")
+            }
+            .disabled(isScanning || model.isBusy)
+            .help("Re-read every file and rebuild the board. Disabled while a scan or job is running.")
+            Button {
+                workspace.requestNewEvent(from: location.id)
+            } label: {
+                Label("New Event", systemImage: "calendar.badge.plus")
+            }
+            .help("Make a new event from the selection (N)")
+            Menu {
+                UnsortedActionsMenu(model: model, workspace: workspace, location: location, isScanning: isScanning, hasResult: hasResult)
+            } label: {
+                Label("Folder Actions", systemImage: "ellipsis")
+            }
+            .menuIndicator(.hidden)
+            .help("Camera folder, bursts, faces, and more")
+        }
+    }
+}
+
+/// The unsorted board's ··· menu, in its own view so toolbar rebuilds do
+/// not evaluate it; nothing here starts work until an item is chosen.
+private struct UnsortedActionsMenu: View {
+    let model: DashboardModel
+    let workspace: EventsWorkspace
+    let location: ConfiguredLocation
+    let isScanning: Bool
+    let hasResult: Bool
+
+    var body: some View {
+        Picker("Camera Folder", selection: Binding(
+            get: { workspace.deviceID(for: location) },
+            set: { workspace.setDevice($0, for: location.id) }
+        )) {
+            ForEach(DeviceChoice.all) { choice in
+                Text(choice.name).tag(choice.id)
+            }
+        }
+        .pickerStyle(.menu)
+        .help("Camera folder name used when these files go into an event")
+        Button("Regroup Bursts") {
+            workspace.regroupBursts(location)
+        }
+        .disabled(isScanning || model.isBusy || !hasResult)
+        .help("Re-run burst grouping on the scanned files with the current Settings sliders — Sony prefixes, the time gap, then the Vision check. Files are not re-read and nothing moves.")
+        Button("Scan for Faces…") {
+            workspace.requestFaceScan(location)
+        }
+        .disabled(workspace.faceScanBlocker(for: location) != nil)
+        .help(workspace.faceScanBlocker(for: location)
+            ?? "Detect and match faces on a sample of each burst — not every frame — plus single stills and, at MED and above, video frames. Writes only to the catalog — media is read, never touched.")
+        Divider()
+        Button("Reveal in Finder") {
+            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: DashboardModel.expandedPath(location.path))])
+        }
+        Button(workspace.latestMoveJournalTitle.map { "Undo “\($0)”" } ?? "Undo Last Move") {
+            workspace.undoLastMove()
+        }
+        .disabled(workspace.latestMoveJournalTitle == nil || model.isBusy)
+        Divider()
+        Button("Move to Trash…", role: .destructive) {
+            workspace.trash(stackIDs: workspace.targetStackIDs(), from: location.id)
+        }
+        .disabled(workspace.targetStackIDs().isEmpty)
+        .help("Move the selected items to the drive's Trash folder. Restorable from the Trash window.")
+        Button("Remove from Unsorted List", role: .destructive) {
+            workspace.removeUnsortedFolder(location.id)
+        }
+        .help("Stop listing this folder here — no files change")
     }
 }

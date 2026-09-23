@@ -16,7 +16,9 @@ struct EventBoardView: View {
     @State private var previewStackID: String?
     @State private var previewFrameIndex = 0
     @State private var showAllPeople = false
-    @FocusState private var searchFocused: Bool
+    /// Shared with the View menu's Show Inspector item (⌥⌘I); the
+    /// inspector itself hangs off the split view in EventsRootView.
+    @AppStorage(EventInfoInspector.visibilityDefaultsKey) private var showInspector = false
 
     /// People chips kept on the first row. The rest sit behind Show more,
     /// ordered by how many confirmed faces each person has on this event.
@@ -42,51 +44,21 @@ struct EventBoardView: View {
     var body: some View {
         if let event = workspace.event(eventID) {
             let stacks = workspace.eventStacks[eventID]
+            // One grouping pass per render — the board, the toolbar count,
+            // and the bottom bar all share it.
             let groups = boardGroups
             let ordered = groups
                 .filter { !workspace.collapsedGroupIDs.contains($0.id) }
                 .flatMap(\.stacks)
+            let matched = groups.reduce(0) { $0 + $1.stacks.count }
+            let title = workspace.eventTitle(event)
             VStack(spacing: 0) {
-                header(event, groups: groups)
-                StorageStrip(model: model, workspace: workspace, event: event, summary: workspace.presence[eventID])
-                    .guideHighlight(.storageStrip, in: workspace)
-                if let remaining = workspace.eventBuildRemainders[eventID], remaining > 0 {
-                    HStack(spacing: 8) {
-                        ProgressView()
-                            .controlSize(.small)
-                        Text("First photos are up — the remaining \(remaining.formatted()) files are still loading.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        Spacer()
-                    }
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 5)
-                    .background(.bar)
-                }
-                if let pending = workspace.eventDateReadRemainders[eventID], pending > 0 {
-                    HStack(spacing: 8) {
-                        ProgressView()
-                            .controlSize(.small)
-                        Text("Reading capture dates… \(pending.formatted()) left.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        Spacer()
-                    }
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 5)
-                    .background(.bar)
-                }
                 if stacks != nil {
                     if groups.isEmpty {
                         if workspace.search.isEmpty {
                             emptyState(event)
                         } else {
-                            ContentUnavailableView(
-                                "No Matches",
-                                systemImage: "magnifyingglass",
-                                description: Text("Nothing in \(workspace.eventTitle(event)) matches the current search and filters — Clear All resets them.")
-                            )
-                            .frame(maxHeight: .infinity)
+                            NoMatchesView(workspace: workspace, boardName: title)
                         }
                     } else {
                         board(groups: groups)
@@ -95,7 +67,20 @@ struct EventBoardView: View {
                     ProgressView("Loading \(event.name)…")
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
-                OrganizeStatusLine(model: model, workspace: workspace)
+            }
+            .safeAreaBar(edge: .top) {
+                titleAccessory(event)
+            }
+            // A firm edge under the bottom bar keeps its caption legible
+            // over tiles scrolling beneath it.
+            .scrollEdgeEffectStyle(.hard, for: .bottom)
+            .safeAreaBar(edge: .bottom) {
+                BoardBottomBar(model: model, workspace: workspace, loadingNote: loadingNote) {
+                    ViewThatFits(in: .horizontal) {
+                        viewControls(stacks: stacks ?? [], groups: groups, matched: matched, compact: false)
+                        viewControls(stacks: stacks ?? [], groups: groups, matched: matched, compact: true)
+                    }
+                }
             }
             .overlay {
                 if previewStackID != nil {
@@ -126,6 +111,20 @@ struct EventBoardView: View {
                     )
                 }
             }
+            .navigationTitle(title)
+            .toolbar(removing: .title)
+            .toolbar {
+                EventBoardToolbar(
+                    model: model,
+                    workspace: workspace,
+                    event: event,
+                    title: title,
+                    count: countText(total: stacks?.count, matched: matched),
+                    countHelp: countHelp(total: stacks?.count, matched: matched),
+                    help: summaryText(event),
+                    showInspector: $showInspector
+                )
+            }
             // The task keys on the event and its storage policy only —
             // assignment writes patch the open board in place, so a count
             // change must not tear the grid down and rebuild it.
@@ -138,151 +137,75 @@ struct EventBoardView: View {
             }
         } else {
             ContentUnavailableView("Event Not Found", systemImage: "calendar.badge.exclamationmark")
+                .navigationTitle("Camera Toolkit")
         }
     }
 
-    private func header(_ event: SavedCameraEvent, groups: [OrganizeBoardGroup]) -> some View {
+    /// The capsule: the event's file count, or "N of M" items while a
+    /// search or filter narrows the board.
+    private func countText(total: Int?, matched: Int) -> String {
+        if let total, !workspace.search.isEmpty {
+            return "\(matched.formatted()) of \(total.formatted())"
+        }
+        return workspace.assignmentCount(for: eventID).formatted()
+    }
+
+    private func countHelp(total: Int?, matched: Int) -> String {
+        if let total, !workspace.search.isEmpty {
+            return "\(matched) of \(total) item\(total == 1 ? "" : "s") match the search and filters"
+        }
+        let files = workspace.assignmentCount(for: eventID)
+        return "\(files) file\(files == 1 ? "" : "s")"
+    }
+
+    private func summaryText(_ event: SavedCameraEvent) -> String {
+        let files = workspace.assignmentCount(for: eventID)
+        return "\(event.eventDate.formatted(date: .complete, time: .omitted)) · \(files) file\(files == 1 ? "" : "s") · \(workspace.assignmentBytes(for: eventID).formattedBytes)"
+    }
+
+    /// Loading progress for the status caption — the board fills in first
+    /// and keeps loading files and capture dates behind it.
+    private var loadingNote: String? {
+        if let remaining = workspace.eventBuildRemainders[eventID], remaining > 0 {
+            return "First photos are up — the remaining \(remaining.formatted()) files are still loading."
+        }
+        if let pending = workspace.eventDateReadRemainders[eventID], pending > 0 {
+            return "Reading capture dates… \(pending.formatted()) left."
+        }
+        return nil
+    }
+
+    private func viewControls(stacks: [OrganizeStack], groups: [OrganizeBoardGroup], matched: Int, compact: Bool) -> some View {
+        BoardViewControls(
+            workspace: workspace,
+            stacks: stacks,
+            eventScope: workspace.scopeIDs(eventID),
+            matchedCount: matched,
+            groups: groups,
+            mode: $boardMode,
+            grouping: Binding(get: { effectiveGrouping }, set: { grouping = $0 }),
+            groupings: Self.groupings,
+            order: $sortOrder,
+            tileWidth: $tileWidth,
+            compact: compact
+        )
+    }
+
+    /// Pinned under the toolbar: where the originals are (one menu per
+    /// place), subevent and people chips, and the active filters.
+    private func titleAccessory(_ event: SavedCameraEvent) -> some View {
         let people = workspace.eventPeople(eventID)
         let subevents = workspace.subevents(of: eventID)
-        return VStack(alignment: .leading, spacing: 10) {
-        HStack(alignment: .center, spacing: 12) {
-            Circle()
-                .fill(EventPalette.color(for: event.id))
-                .frame(width: 12, height: 12)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(workspace.eventTitle(event))
-                    .font(.title2.bold())
-                    .lineLimit(1)
-                Text("\(event.eventDate.formatted(date: .complete, time: .omitted)) · \(workspace.assignmentCount(for: eventID)) files · \(workspace.assignmentBytes(for: eventID).formattedBytes)")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-            .frame(minWidth: 300, alignment: .leading)
-            .layoutPriority(1)
-            FlowLayout(horizontalSpacing: 12, verticalSpacing: 8, alignment: .trailing) {
-                OrganizeSearchBar(
-                    workspace: workspace,
-                    stacks: workspace.eventStacks[eventID] ?? [],
-                    eventScope: workspace.scopeIDs(eventID),
-                    search: $workspace.search,
-                    focused: $searchFocused,
-                    matchedCount: groups.reduce(0) { $0 + $1.stacks.count }
-                )
-                Picker("Keep on drive", selection: Binding(
-                    get: { workspace.resolvedPolicy(for: event) },
-                    set: { workspace.setPolicy(eventID, $0) }
-                )) {
-                    Label("Shared Buffer", systemImage: "externaldrive").tag(EventStoragePolicy.buffer)
-                    Label("Private · NAS only", systemImage: "lock.fill").tag(EventStoragePolicy.archiveOnly)
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .frame(width: 320)
-                .help("Shared events live in the Buffer everyone browses. Private events stay hidden on the drive until they are archived to the NAS.")
-                Picker("View", selection: $boardMode) {
-                    ForEach(OrganizeBoardMode.allCases) { mode in
-                        Image(systemName: mode.symbol).tag(mode)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .frame(width: 64)
-                .help("Tiles or a dense list")
-                Menu {
-                    Section("Group By") {
-                        ForEach(Self.groupings) { option in
-                            Toggle(option.title, isOn: Binding(
-                                get: { effectiveGrouping == option },
-                                set: { _ in grouping = option }
-                            ))
-                        }
-                    }
-                    Section("Order") {
-                        ForEach(OrganizeBoardOrder.allCases) { option in
-                            Toggle(option.title, isOn: Binding(
-                                get: { sortOrder == option },
-                                set: { _ in sortOrder = option }
-                            ))
-                        }
-                    }
-                    Divider()
-                    let anyCollapsed = groups.contains { workspace.collapsedGroupIDs.contains($0.id) }
-                    Button(anyCollapsed ? "Expand All Groups" : "Collapse All Groups") {
-                        workspace.setAllGroupsCollapsed(!anyCollapsed, groups: groups)
-                    }
-                } label: {
-                    Image(systemName: "arrow.up.arrow.down.square")
-                }
-                .menuStyle(.borderlessButton)
-                .fixedSize()
-                .help("Group, sort, and collapse the board")
-                if boardMode == .tiles {
-                    Slider(value: $tileWidth, in: 88...460)
-                        .frame(width: 110)
-                        .help("Tile size — smaller fits more bursts on screen")
-                }
-                Button {
-                    Task { await workspace.refreshEvent(eventID) }
-                } label: {
-                    Label("Refresh", systemImage: "arrow.clockwise")
-                }
-                Menu {
-                    Button("New Subevent…") {
-                        workspace.requestNewEvent(from: nil, parentEventID: eventID)
-                    }
-                    Button("Rename or Change Date…") {
-                        workspace.renameRequest = RenameEventRequest(eventID: eventID)
-                    }
-                    Button("Reveal Drive Folder") {
-                        reveal(workspace.locations.eventFolder(for: event, policy: workspace.resolvedPolicy(for: event)))
-                    }
-                    Button("Reveal NAS Folder") {
-                        let layout = workspace.locations.layout(for: event, deviceID: nil)
-                        var url = workspace.locations.libraryRoot
-                            .appendingPathComponent("Originals", isDirectory: true)
-                            .appendingPathComponent(layout.year, isDirectory: true)
-                        for folder in layout.parentEventFolders {
-                            url.appendPathComponent(folder, isDirectory: true)
-                        }
-                        reveal(url.appendingPathComponent(layout.eventFolder, isDirectory: true))
-                    }
-                    Divider()
-                    Button("Scan for Faces…") {
-                        workspace.requestFaceScan(event)
-                    }
-                    .disabled(workspace.faceScanBlocker(for: event) != nil)
-                    .help(workspace.faceScanBlocker(for: event)
-                        ?? "Detect and match faces on a sample of each burst — not every frame — plus single stills and, at MED and above, video frames. Writes only to the catalog — media is read, never touched.")
-                    Divider()
-                    Button("Undo Last Move") { workspace.undoLastMove() }
-                        .disabled(workspace.latestMoveJournalTitle == nil || model.isBusy)
-                    Button("Delete Empty Event", role: .destructive) { workspace.deleteEmptyEvent(eventID) }
-                        .disabled(workspace.assignmentCount(for: eventID) > 0)
-                } label: {
-                    Image(systemName: "ellipsis.circle")
-                }
-                .menuStyle(.borderlessButton)
-                .fixedSize()
-            }
-            .frame(minWidth: 340, maxWidth: .infinity, alignment: .trailing)
-        }
-        if !people.isEmpty || !subevents.isEmpty {
-            let shown = showAllPeople ? people : Array(people.prefix(Self.collapsedPeopleCount))
+        let shown = showAllPeople ? people : Array(people.prefix(Self.collapsedPeopleCount))
+        return VStack(alignment: .leading, spacing: 8) {
+            EventStorageSummary(slots: EventStorageSlots(
+                model: model,
+                workspace: workspace,
+                event: event,
+                summary: workspace.presence[eventID]
+            ))
+            .guideHighlight(.storageStrip, in: workspace)
             FlowLayout(horizontalSpacing: 8, verticalSpacing: 8) {
-                ForEach(shown) { person in
-                    PersonChip(person: person)
-                }
-                if people.count > Self.collapsedPeopleCount {
-                    Button(showAllPeople ? "Show less" : "Show more") {
-                        showAllPeople.toggle()
-                    }
-                    .buttonStyle(.plain)
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 5)
-                }
                 ForEach(subevents) { subevent in
                     SubeventChip(
                         event: subevent,
@@ -290,18 +213,29 @@ struct EventBoardView: View {
                         onToggle: { workspace.search.toggleEventExclusion(subevent.id) }
                     )
                 }
+                ForEach(shown) { person in
+                    PersonChip(person: person)
+                }
+                if people.count > Self.collapsedPeopleCount {
+                    Button(showAllPeople ? "Show Less" : "Show \(people.count - Self.collapsedPeopleCount) More") {
+                        showAllPeople.toggle()
+                    }
+                    .buttonStyle(.borderless)
+                    .controlSize(.small)
+                }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
+            if !workspace.search.rowsWithValues.isEmpty {
+                OrganizeFilterHotLinks(
+                    workspace: workspace,
+                    stacks: workspace.eventStacks[eventID] ?? [],
+                    search: $workspace.search
+                )
+            }
         }
-        if !workspace.search.rowsWithValues.isEmpty {
-            OrganizeFilterHotLinks(
-                workspace: workspace,
-                stacks: workspace.eventStacks[eventID] ?? [],
-                search: $workspace.search
-            )
-        }
-        }
-        .padding(16)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .onChange(of: eventID) { _, _ in showAllPeople = false }
     }
 
@@ -457,6 +391,9 @@ struct EventBoardView: View {
     }
 
     private func handle(_ command: BrowserCommand, ordered: [OrganizeStack]) {
+        // Commands are app-wide notifications — act only while the main
+        // window is key, not with Trash or People in front of it.
+        guard BrowserCommand.targetsMainWindow() else { return }
         guard command.isAllowedWhileTyping || !KeyboardTextFocus.isTypingInTextField() else { return }
         switch command {
         case .selectAll:
@@ -472,10 +409,114 @@ struct EventBoardView: View {
         case .reload:
             Task { await workspace.refreshEvent(eventID) }
         case .find:
-            searchFocused = true
+            // The window's toolbar search field takes ⌘F (EventsRootView).
+            break
         case .moveSelectionToTrash:
             workspace.requestTrash(stackIDs: workspace.targetStackIDs(), fromEvent: eventID)
         }
+    }
+}
+
+/// The event board's toolbar: centered title with its count, then the
+/// window's search field and the event's actions. Its own ToolbarContent
+/// so a board re-render does not rebuild the NSToolbar items it did not
+/// change.
+private struct EventBoardToolbar: ToolbarContent {
+    let model: DashboardModel
+    let workspace: EventsWorkspace
+    let event: SavedCameraEvent
+    let title: String
+    let count: String
+    let countHelp: String
+    let help: String
+    @Binding var showInspector: Bool
+
+    var body: some ToolbarContent {
+        ToolbarItem(placement: .principal) {
+            BoardToolbarTitle(
+                title: title,
+                color: EventPalette.color(for: event.id),
+                count: count,
+                countHelp: countHelp,
+                help: help
+            )
+        }
+        .sharedBackgroundVisibility(.hidden)
+        ToolbarItem(placement: .primaryAction) {
+            Menu {
+                EventActionsMenu(model: model, workspace: workspace, event: event)
+            } label: {
+                Label("Event Actions", systemImage: "ellipsis")
+            }
+            .menuIndicator(.hidden)
+            .help("New subevent, rename, storage, faces, and more")
+        }
+        ToolbarSpacer(.fixed, placement: .primaryAction)
+        ToolbarItem(placement: .primaryAction) {
+            Button {
+                showInspector.toggle()
+            } label: {
+                Label(showInspector ? "Hide Event Info" : "Show Event Info", systemImage: "sidebar.trailing")
+            }
+            .help(showInspector ? "Hide Event Info (⌥⌘I)" : "Show Event Info — storage, people, and the event's details (⌥⌘I)")
+        }
+    }
+}
+
+/// The event's ··· menu. Its own view: toolbar menu content can be built
+/// eagerly, so nothing here starts work — Scan for Faces reads the status
+/// the open board already loaded.
+private struct EventActionsMenu: View {
+    let model: DashboardModel
+    let workspace: EventsWorkspace
+    let event: SavedCameraEvent
+
+    var body: some View {
+        let eventID = event.id
+        Button("New Subevent…") {
+            workspace.requestNewEvent(from: nil, parentEventID: eventID)
+        }
+        Button("Rename or Change Date…") {
+            workspace.renameRequest = RenameEventRequest(eventID: eventID)
+        }
+        Picker("Keep on Drive", selection: Binding(
+            get: { workspace.resolvedPolicy(for: event) },
+            set: { workspace.setPolicy(eventID, $0) }
+        )) {
+            Label("Shared Buffer", systemImage: "externaldrive").tag(EventStoragePolicy.buffer)
+            Label("Private · NAS Only", systemImage: "lock.fill").tag(EventStoragePolicy.archiveOnly)
+        }
+        .pickerStyle(.menu)
+        .help("Shared events live in the Buffer everyone browses. Private events stay hidden on the drive until they are archived to the NAS.")
+        Divider()
+        Button("Reveal Drive Folder") {
+            reveal(workspace.locations.eventFolder(for: event, policy: workspace.resolvedPolicy(for: event)))
+        }
+        Button("Reveal NAS Folder") {
+            let layout = workspace.locations.layout(for: event, deviceID: nil)
+            var url = workspace.locations.libraryRoot
+                .appendingPathComponent("Originals", isDirectory: true)
+                .appendingPathComponent(layout.year, isDirectory: true)
+            for folder in layout.parentEventFolders {
+                url.appendPathComponent(folder, isDirectory: true)
+            }
+            reveal(url.appendingPathComponent(layout.eventFolder, isDirectory: true))
+        }
+        Divider()
+        Button("Scan for Faces…") {
+            workspace.requestFaceScan(event)
+        }
+        .disabled(workspace.faceScanBlocker(for: event) != nil)
+        .help(workspace.faceScanBlocker(for: event)
+            ?? "Detect and match faces on a sample of each burst — not every frame — plus single stills and, at MED and above, video frames. Writes only to the catalog — media is read, never touched.")
+        Button("Refresh") {
+            Task { await workspace.refreshEvent(eventID) }
+        }
+        Divider()
+        Button("Undo Last Move") { workspace.undoLastMove() }
+            .disabled(workspace.latestMoveJournalTitle == nil || model.isBusy)
+        Button("Delete Empty Event", role: .destructive) { workspace.deleteEmptyEvent(eventID) }
+            .disabled(workspace.assignmentCount(for: eventID) > 0)
     }
 
     private func reveal(_ url: URL) {
@@ -488,8 +529,8 @@ struct EventBoardView: View {
 }
 
 /// One place the event's originals can live — card, drive, NAS, or Immich —
-/// as the numbers and actions both the compact strip pills and the full
-/// cards draw from.
+/// as the numbers and actions both the compact summary and the inspector
+/// draw from.
 struct StorageSlot<Actions: View> {
     let title: String
     let symbol: String
@@ -501,115 +542,14 @@ struct StorageSlot<Actions: View> {
 }
 
 /// Source, drive, NAS, and Immich: where this event's originals are and the
-/// one action that moves each place forward. Rests as a one-line summary
-/// bar so the photo board gets the window; the bottom edge drags open into
-/// the four full cards, and the size is remembered.
-struct StorageStrip: View {
-    @Bindable var model: DashboardModel
-    @Bindable var workspace: EventsWorkspace
+/// one action that moves each place forward. Plain data, so the summary in
+/// the board and the inspector show the same numbers and actions.
+@MainActor
+struct EventStorageSlots {
+    let model: DashboardModel
+    let workspace: EventsWorkspace
     let event: SavedCameraEvent
     let summary: EventPresenceSummary?
-
-    @AppStorage(OrganizeChromeSizing.storageStripDefaultsKey)
-    private var stripHeight = OrganizeChromeSizing.collapsedStorageStripHeight
-
-    private var isCollapsed: Bool {
-        OrganizeChromeSizing.storageStripIsCollapsed(stripHeight)
-    }
-
-    var body: some View {
-        VStack(spacing: 0) {
-            if isCollapsed {
-                compactBar
-                    .padding(.horizontal, 16)
-                    .frame(maxWidth: .infinity)
-                    .frame(height: OrganizeChromeSizing.collapsedStorageStripHeight)
-            } else {
-                cardsRow
-                    .padding(.horizontal, 16)
-                    .padding(.bottom, 10)
-                    .frame(maxWidth: .infinity)
-                    .frame(height: OrganizeChromeSizing.coercedStorageStripHeight(stripHeight))
-            }
-            ChromeResizeHandle(
-                orientation: .horizontal,
-                value: $stripHeight,
-                transform: OrganizeChromeSizing.coercedStorageStripHeight,
-                onDoubleClick: toggleCollapsed,
-                help: isCollapsed
-                    ? "Drag down for the full storage cards — double-click toggles"
-                    : "Drag to resize the storage cards — double-click collapses",
-                accessibilityLabel: "Resize Storage Summary"
-            )
-        }
-        .frame(maxWidth: .infinity)
-    }
-
-    private func toggleCollapsed() {
-        withAnimation(.easeOut(duration: 0.15)) {
-            stripHeight = isCollapsed
-                ? OrganizeChromeSizing.defaultExpandedStorageStripHeight
-                : OrganizeChromeSizing.collapsedStorageStripHeight
-        }
-    }
-
-    /// The collapsed strip: one tinted count per place, each a menu holding
-    /// that place's actions, so Free Up, Put on Buffer, Check Again, and the
-    /// Immich send switch stay reachable without the tall cards.
-    private var compactBar: some View {
-        HStack(spacing: 8) {
-            compactSlot(sourceSlot)
-            compactSlot(driveSlot)
-            compactSlot(nasSlot)
-            compactSlot(immichSlot)
-            Spacer(minLength: 8)
-            Button {
-                withAnimation(.easeOut(duration: 0.15)) {
-                    stripHeight = OrganizeChromeSizing.defaultExpandedStorageStripHeight
-                }
-            } label: {
-                Image(systemName: "chevron.down")
-                    .font(.caption.weight(.semibold))
-            }
-            .buttonStyle(.borderless)
-            .foregroundStyle(.secondary)
-            .help("Show the full storage cards — or drag the bottom edge down")
-        }
-    }
-
-    private func compactSlot<Actions: View>(_ slot: StorageSlot<Actions>) -> some View {
-        Menu {
-            Text("\(slot.title) — \(slot.detail)")
-            Divider()
-            slot.actions()
-        } label: {
-            HStack(spacing: 5) {
-                Image(systemName: slot.symbol)
-                    .foregroundStyle(slot.tint)
-                Text(slot.value)
-                    .font(.callout.monospacedDigit())
-                    .lineLimit(1)
-                StorageSlotStateIcon(state: slot.state)
-                    .font(.caption2)
-            }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
-        }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
-        .fixedSize()
-        .help("\(slot.title) — \(slot.detail)")
-    }
-
-    private var cardsRow: some View {
-        HStack(alignment: .top, spacing: 10) {
-            StorageSlotCard(slot: sourceSlot)
-            StorageSlotCard(slot: driveSlot)
-            StorageSlotCard(slot: nasSlot)
-            StorageSlotCard(slot: immichSlot)
-        }
-    }
 
     private var assets: [EventAssetPresence] { summary?.assets ?? [] }
 
@@ -623,7 +563,7 @@ struct StorageStrip: View {
         .help("Re-check this connection right now")
     }
 
-    private var sourceSlot: StorageSlot<some View> {
+    var source: StorageSlot<some View> {
         let separate = assets.filter { !$0.sourceIsDriveCopy }
         let onSource = separate.count { $0.source == .present }
         let offline = separate.count { $0.source == .unavailable }
@@ -661,7 +601,7 @@ struct StorageStrip: View {
         }
     }
 
-    private var driveSlot: StorageSlot<some View> {
+    var drive: StorageSlot<some View> {
         let policy = workspace.resolvedPolicy(for: event)
         let total = assets.count
         let onDrive = assets.count { $0.drive == .present }
@@ -693,9 +633,9 @@ struct StorageStrip: View {
         ) {
             if needsDrive > 0 {
                 Button(policy == .buffer ? "Put on Buffer…" : "Move to Private…") {
-                    // The strip's counts cover the whole family, so the
-                    // apply does too — each subevent's files land in its
-                    // own nested folder.
+                    // The counts cover the whole family, so the apply does
+                    // too — each subevent's files land in its own nested
+                    // folder.
                     workspace.prepareApply(
                         eventIDs: workspace.eventFamily(event.id).map(\.id),
                         title: policy == .buffer ? "Put \(event.name) on the Buffer" : "Move \(event.name) to Private staging"
@@ -714,7 +654,7 @@ struct StorageStrip: View {
         }
     }
 
-    private var nasSlot: StorageSlot<some View> {
+    var nas: StorageSlot<some View> {
         let total = assets.count
         let onNAS = assets.count { $0.archive == .present }
         let offline = summary?.archiveOffline ?? false
@@ -740,7 +680,7 @@ struct StorageStrip: View {
         }
     }
 
-    private var immichSlot: StorageSlot<some View> {
+    var immich: StorageSlot<some View> {
         let statuses = workspace.eventImmichStatuses[event.id] ?? [:]
         let present = statuses.values.count { $0.status == "present" && !$0.isTrashed }
         let albumText: String = switch event.resolvedImmichAlbumPolicy {
@@ -760,7 +700,6 @@ struct StorageStrip: View {
                 get: { event.sendsToImmich },
                 set: { model.setEventImmichUploadEnabled(event.id, enabled: $0) }
             ))
-            .controlSize(.mini)
             if event.sendsToImmich {
                 Menu("Album") {
                     ForEach(ImmichAlbumPolicy.allCases) { policy in
@@ -772,6 +711,50 @@ struct StorageStrip: View {
                     .disabled(model.isBusy || summary == nil)
             }
         }
+    }
+}
+
+/// The storage status in the board itself: one small capsule per place,
+/// each a menu with that place's actions — so Free Up, Put on Buffer,
+/// Archive, and Check Again stay one click away with the inspector closed.
+struct EventStorageSummary: View {
+    let slots: EventStorageSlots
+
+    var body: some View {
+        HStack(spacing: 6) {
+            item(slots.source)
+            item(slots.drive)
+            item(slots.nas)
+            item(slots.immich)
+        }
+        .fixedSize()
+    }
+
+    private func item<Actions: View>(_ slot: StorageSlot<Actions>) -> some View {
+        Menu {
+            Text("\(slot.title) — \(slot.detail)")
+            Divider()
+            slot.actions()
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: slot.symbol)
+                    .foregroundStyle(slot.tint)
+                Text(slot.value)
+                    .monospacedDigit()
+                    .lineLimit(1)
+                StorageSlotStateIcon(state: slot.state)
+                    .imageScale(.small)
+            }
+            .padding(.horizontal, 9)
+            .padding(.vertical, 4)
+            .background(.quinary, in: Capsule())
+            .contentShape(Capsule())
+        }
+        .menuStyle(.button)
+        .buttonStyle(.borderless)
+        .menuIndicator(.hidden)
+        .help("\(slot.title) — \(slot.detail)")
+        .accessibilityLabel("\(slot.title), \(slot.value)")
     }
 }
 
@@ -788,53 +771,134 @@ struct StorageSlotStateIcon: View {
     var body: some View {
         switch state {
         case .complete:
-            Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+            Image(systemName: "checkmark.circle.fill")
+                .foregroundStyle(.green)
+                .accessibilityLabel("Complete")
         case .partial:
-            Image(systemName: "circle.lefthalf.filled").foregroundStyle(.secondary)
+            Image(systemName: "circle.lefthalf.filled")
+                .foregroundStyle(.secondary)
+                .accessibilityLabel("Partial")
         case .offline:
-            Image(systemName: "bolt.horizontal.circle").foregroundStyle(.orange)
+            Image(systemName: "bolt.horizontal.circle")
+                .foregroundStyle(.orange)
+                .accessibilityLabel("Offline")
         case .unknown:
             EmptyView()
         }
     }
 }
 
-struct StorageSlotCard<Actions: View>: View {
+/// The event board's inspector: where the originals are with each place's
+/// actions, the storage policy, Immich, people, and the event's own facts.
+struct EventInfoInspector: View {
+    /// Whether the inspector is open — the toolbar button and the View
+    /// menu's Show Inspector item (⌥⌘I) both toggle it.
+    static let visibilityDefaultsKey = "CameraToolkit.organize.showInspector"
+
+    @Bindable var model: DashboardModel
+    @Bindable var workspace: EventsWorkspace
+    let event: SavedCameraEvent
+
+    var body: some View {
+        let slots = EventStorageSlots(model: model, workspace: workspace, event: event, summary: workspace.presence[event.id])
+        let files = workspace.assignmentCount(for: event.id)
+        let people = workspace.eventPeople(event.id)
+        Form {
+            Section {
+                LabeledContent("Date", value: event.eventDate.formatted(date: .complete, time: .omitted))
+                LabeledContent("Files", value: files.formatted())
+                LabeledContent("Size", value: workspace.assignmentBytes(for: event.id).formattedBytes)
+                Button("Rename or Change Date…") {
+                    workspace.renameRequest = RenameEventRequest(eventID: event.id)
+                }
+            } header: {
+                Text(workspace.eventTitle(event))
+            }
+            Section("Keep on Drive") {
+                Picker("Keep on Drive", selection: Binding(
+                    get: { workspace.resolvedPolicy(for: event) },
+                    set: { workspace.setPolicy(event.id, $0) }
+                )) {
+                    Text("Shared Buffer").tag(EventStoragePolicy.buffer)
+                    Text("Private · NAS Only").tag(EventStoragePolicy.archiveOnly)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .help("Shared events live in the Buffer everyone browses. Private events stay hidden on the drive until they are archived to the NAS.")
+            }
+            Section("Where It Is") {
+                StorageSlotRow(slot: slots.source)
+                StorageSlotRow(slot: slots.drive)
+                StorageSlotRow(slot: slots.nas)
+                StorageSlotRow(slot: slots.immich)
+            }
+            if !people.isEmpty {
+                Section("People") {
+                    ForEach(people) { person in
+                        Label(person.name, systemImage: "person.crop.circle")
+                    }
+                }
+            }
+        }
+        .formStyle(.grouped)
+    }
+}
+
+/// One storage place in the inspector: title and count, what that means,
+/// and its actions.
+private struct StorageSlotRow<Actions: View>: View {
     let slot: StorageSlot<Actions>
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
-                Image(systemName: slot.symbol)
-                    .foregroundStyle(slot.tint)
-                Text(slot.title)
-                    .font(.headline)
-                    .lineLimit(1)
-                Spacer(minLength: 0)
+                Label {
+                    Text(slot.title)
+                } icon: {
+                    Image(systemName: slot.symbol)
+                        .foregroundStyle(slot.tint)
+                }
+                Spacer(minLength: 8)
+                Text(slot.value)
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
                 StorageSlotStateIcon(state: slot.state)
             }
-            Text(slot.value)
-                .font(.title3.weight(.semibold).monospacedDigit())
             Text(slot.detail)
                 .font(.caption)
                 .foregroundStyle(.secondary)
-                .lineLimit(2)
                 .fixedSize(horizontal: false, vertical: true)
-            Spacer(minLength: 0)
             HStack(spacing: 6) {
                 slot.actions()
             }
             .controlSize(.small)
         }
-        .padding(12)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(Color(nsColor: .controlBackgroundColor))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .strokeBorder(slot.state == .complete ? slot.tint.opacity(0.6) : Color.primary.opacity(0.08), lineWidth: slot.state == .complete ? 1.5 : 1)
-        )
+        .padding(.vertical, 2)
+    }
+}
+
+/// A board with nothing left after its search and filters, with the one
+/// action that fixes it.
+struct NoMatchesView: View {
+    let workspace: EventsWorkspace
+    let boardName: String
+
+    var body: some View {
+        Group {
+            if workspace.search.hasActiveConditions {
+                ContentUnavailableView {
+                    Label("No Matches", systemImage: "line.3.horizontal.decrease.circle")
+                } description: {
+                    Text("Nothing in \(boardName) matches the current search and filters.")
+                } actions: {
+                    Button("Clear Search and Filters") {
+                        workspace.search = OrganizeSearchFilter()
+                    }
+                }
+            } else {
+                ContentUnavailableView.search(text: workspace.search.text)
+            }
+        }
+        .frame(maxHeight: .infinity)
     }
 }
