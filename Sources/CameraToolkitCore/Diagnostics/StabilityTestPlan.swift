@@ -67,9 +67,9 @@ public enum StabilityProfile: String, Codable, CaseIterable, Sendable, Identifia
     public var detail: String {
         switch self {
         case .quick:
-            "One minute of sustained writing, then a sustained read of what was written, then a mixed burst. A smoke check, not proof."
+            "One minute of sustained writing, then a sustained read of media already on the drive, then a mixed burst. A smoke check, not proof."
         case .standard:
-            "Three minutes of sustained writing, three minutes reading it back uncached, two minutes of parallel mixed reads plus a writer, then two minutes of idle watch to catch a link that drops after load."
+            "Three minutes of sustained writing, three minutes reading existing media uncached, two minutes of parallel mixed reads plus a writer, then two minutes of idle watch to catch a link that drops after load."
         case .soak:
             "The Standard cycle repeated three times — half an hour of pressure for a drive that only fails when hot or worn in."
         }
@@ -130,14 +130,21 @@ public struct StabilityStall: Equatable, Codable, Sendable {
     }
 }
 
-/// Per-phase throughput stats built from the ~1 Hz byte samples.
+/// Per-phase throughput stats built from windowed ~3 s byte samples.
 public struct StabilityPhaseMetrics: Equatable, Codable, Sendable {
     public var kind: StabilityPhaseKind
     /// How long the phase actually ran.
     public var seconds: TimeInterval
     public var bytesMoved: Int64
-    /// Per-sample bytes/second observed during the phase.
+    /// Windowed bytes/second figures that stayed under the link ceiling —
+    /// min/typical/max quote these.
     public var samplesBytesPerSecond: [Double]
+    /// Windows dropped for beating the link ceiling — cache reads or
+    /// buffered writes, not device speed.
+    public var cacheAffectedSamples: Int
+    /// The phase's reads came from the test's own temp file because the
+    /// drive offered no readable media — they may include cache.
+    public var readsMayIncludeCache: Bool
     /// False when the run ended mid-phase.
     public var completed: Bool
 
@@ -146,13 +153,17 @@ public struct StabilityPhaseMetrics: Equatable, Codable, Sendable {
         seconds: TimeInterval,
         bytesMoved: Int64,
         samplesBytesPerSecond: [Double],
-        completed: Bool
+        completed: Bool,
+        cacheAffectedSamples: Int = 0,
+        readsMayIncludeCache: Bool = false
     ) {
         self.kind = kind
         self.seconds = seconds
         self.bytesMoved = bytesMoved
         self.samplesBytesPerSecond = samplesBytesPerSecond
         self.completed = completed
+        self.cacheAffectedSamples = cacheAffectedSamples
+        self.readsMayIncludeCache = readsMayIncludeCache
     }
 
     public var minBytesPerSecond: Double { samplesBytesPerSecond.min() ?? 0 }
@@ -418,6 +429,13 @@ public struct StabilityPhaseRecord: Codable, Equatable, Sendable {
     public var minBytesPerSecond: Double
     public var typicalBytesPerSecond: Double
     public var maxBytesPerSecond: Double
+    /// Windowed samples left out of min/typical/max for beating the
+    /// link's ceiling — cache reads or buffered writes, not device speed.
+    public var cacheAffectedSamples: Int
+    /// How many windowed samples fed min/typical/max.
+    public var windowedSamples: Int
+    /// Reads fell back to the test's own temp file — may include cache.
+    public var readsMayIncludeCache: Bool
     public var completed: Bool
 
     public init(metrics: StabilityPhaseMetrics) {
@@ -428,6 +446,9 @@ public struct StabilityPhaseRecord: Codable, Equatable, Sendable {
         typicalBytesPerSecond = metrics.typicalBytesPerSecond
         maxBytesPerSecond = metrics.maxBytesPerSecond
         completed = metrics.completed
+        cacheAffectedSamples = metrics.cacheAffectedSamples
+        windowedSamples = metrics.samplesBytesPerSecond.count
+        readsMayIncludeCache = metrics.readsMayIncludeCache
     }
 
     public init(
@@ -437,7 +458,10 @@ public struct StabilityPhaseRecord: Codable, Equatable, Sendable {
         minBytesPerSecond: Double,
         typicalBytesPerSecond: Double,
         maxBytesPerSecond: Double,
-        completed: Bool
+        completed: Bool,
+        cacheAffectedSamples: Int = 0,
+        windowedSamples: Int = 0,
+        readsMayIncludeCache: Bool = false
     ) {
         self.kind = kind
         self.seconds = seconds
@@ -446,6 +470,25 @@ public struct StabilityPhaseRecord: Codable, Equatable, Sendable {
         self.typicalBytesPerSecond = typicalBytesPerSecond
         self.maxBytesPerSecond = maxBytesPerSecond
         self.completed = completed
+        self.cacheAffectedSamples = cacheAffectedSamples
+        self.windowedSamples = windowedSamples
+        self.readsMayIncludeCache = readsMayIncludeCache
+    }
+
+    /// Records written before the cache accounting fields existed decode
+    /// with zeroed counts rather than failing the whole history file.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        kind = try container.decode(StabilityPhaseKind.self, forKey: .kind)
+        seconds = try container.decode(TimeInterval.self, forKey: .seconds)
+        bytesMoved = try container.decode(Int64.self, forKey: .bytesMoved)
+        minBytesPerSecond = try container.decode(Double.self, forKey: .minBytesPerSecond)
+        typicalBytesPerSecond = try container.decode(Double.self, forKey: .typicalBytesPerSecond)
+        maxBytesPerSecond = try container.decode(Double.self, forKey: .maxBytesPerSecond)
+        completed = try container.decode(Bool.self, forKey: .completed)
+        cacheAffectedSamples = try container.decodeIfPresent(Int.self, forKey: .cacheAffectedSamples) ?? 0
+        windowedSamples = try container.decodeIfPresent(Int.self, forKey: .windowedSamples) ?? 0
+        readsMayIncludeCache = try container.decodeIfPresent(Bool.self, forKey: .readsMayIncludeCache) ?? false
     }
 }
 
@@ -540,6 +583,10 @@ public struct StabilityTestRecord: Codable, Equatable, Sendable, Identifiable {
 
 /// The Copy Report summary — plain text, no paths, no machine names.
 public enum StabilityReportFormatter {
+    /// When this share of a run's throughput windows was dropped for
+    /// beating the link ceiling, the report adds a plain-words note.
+    private static let cacheExcludedNoteFraction = 0.25
+
     public static func text(for record: StabilityTestRecord) -> String {
         var lines: [String] = []
         lines.append("Cable & Enclosure Stability Test")
@@ -574,10 +621,37 @@ public enum StabilityReportFormatter {
             lines.append("  • \(reason)")
         }
         for phase in record.phases {
-            let stats = phase.kind.movesBytes
-                ? "min \(mbps(phase.minBytesPerSecond)) · typical \(mbps(phase.typicalBytesPerSecond)) · max \(mbps(phase.maxBytesPerSecond)) MB/s"
-                : "no I/O by design"
-            lines.append("  \(phase.kind.title) — \(formattedDuration(phase.seconds)) — \(stats)\(phase.completed ? "" : " (cut short)")")
+            let stats: String
+            var notes: [String] = []
+            if !phase.kind.movesBytes {
+                stats = "no I/O by design"
+            } else if phase.windowedSamples == 0, phase.cacheAffectedSamples > 0 {
+                stats = "every window ran faster than the link — cache, not device speed"
+            } else if phase.windowedSamples == 0 {
+                stats = "too short for a steady figure"
+            } else {
+                stats = "min \(mbps(phase.minBytesPerSecond)) · typical \(mbps(phase.typicalBytesPerSecond)) · max \(mbps(phase.maxBytesPerSecond)) MB/s"
+            }
+            if phase.cacheAffectedSamples > 0 {
+                notes.append(
+                    "\(phase.cacheAffectedSamples) above-link window\(phase.cacheAffectedSamples == 1 ? "" : "s") excluded"
+                )
+            }
+            if phase.readsMayIncludeCache {
+                notes.append("may include cache")
+            }
+            let suffix = notes.isEmpty ? "" : " — \(notes.joined(separator: " · "))"
+            lines.append("  \(phase.kind.title) — \(formattedDuration(phase.seconds)) — \(stats)\(phase.completed ? "" : " (cut short)")\(suffix)")
+        }
+        let windowTotal = record.phases.reduce(0) {
+            $0 + $1.windowedSamples + $1.cacheAffectedSamples
+        }
+        let excluded = record.phases.reduce(0) { $0 + $1.cacheAffectedSamples }
+        if windowTotal > 0,
+           Double(excluded) / Double(windowTotal) >= Self.cacheExcludedNoteFraction {
+            lines.append(
+                "Note: \(excluded) of \(windowTotal) throughput windows ran faster than the negotiated link allows — cache or buffered data, not device speed — so they were left out of the min/typical/max figures."
+            )
         }
         if !record.counterDeltas.isEmpty {
             lines.append("")

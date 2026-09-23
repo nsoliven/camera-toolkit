@@ -302,10 +302,20 @@ struct StabilityTestView: View {
                     HStack(spacing: 6) {
                         Text(phase.kind.title)
                             .frame(width: 108, alignment: .leading)
-                        if phase.kind.movesBytes {
-                            Text("min \(mbps(phase.minBytesPerSecond)) · typical \(mbps(phase.typicalBytesPerSecond)) · max \(mbps(phase.maxBytesPerSecond)) MB/s")
-                        } else {
+                        if !phase.kind.movesBytes {
                             Text("no I/O by design")
+                        } else if phase.windowedSamples == 0, phase.cacheAffectedSamples > 0 {
+                            Text("all windows beat the link — cache, not device speed")
+                        } else if phase.windowedSamples == 0 {
+                            Text("too short for a steady figure")
+                        } else {
+                            Text("min \(mbps(phase.minBytesPerSecond)) · typical \(mbps(phase.typicalBytesPerSecond)) · max \(mbps(phase.maxBytesPerSecond)) MB/s")
+                        }
+                        if phase.cacheAffectedSamples > 0 {
+                            Text("· \(phase.cacheAffectedSamples) above-link excluded")
+                        }
+                        if phase.readsMayIncludeCache {
+                            Text("· may include cache")
                         }
                         if !phase.completed {
                             Text("(cut short)")
