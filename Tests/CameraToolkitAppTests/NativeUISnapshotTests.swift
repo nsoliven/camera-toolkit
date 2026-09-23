@@ -94,6 +94,7 @@ final class NativeUISnapshotTests: XCTestCase {
             try XCTUnwrap(bitmap.representation(using: .png, properties: [:])).write(to: url)
             return
         }
+        print("Snapshot: \(name) drawn from the view tree (no screen capture)")
         let bounds = frameView.bounds
         let bitmap = try XCTUnwrap(frameView.bitmapImageRepForCachingDisplay(in: bounds))
         frameView.cacheDisplay(in: bounds, to: bitmap)
@@ -108,10 +109,20 @@ final class NativeUISnapshotTests: XCTestCase {
     private func captureWindow(_ window: NSWindow, timeout: Double = 10) async -> CGImage? {
         let image: CGImage? = await withCheckedContinuation { continuation in
             let once = ResumeOnce(continuation)
-            Task { @MainActor in once.resume(try? await self.captureWindowNow(window)) }
+            Task { @MainActor in
+                do {
+                    once.resume(try await self.captureWindowNow(window))
+                } catch {
+                    print("Snapshot: screen capture failed: \(error)")
+                    once.resume(nil)
+                }
+            }
             Task { @MainActor in
                 try? await Task.sleep(for: .seconds(timeout))
-                if once.resume(nil) { self.screenCaptureStalled = true }
+                if once.resume(nil) {
+                    self.screenCaptureStalled = true
+                    print("Snapshot: screen capture stalled; drawing the view tree from here on")
+                }
             }
         }
         return image
@@ -119,7 +130,10 @@ final class NativeUISnapshotTests: XCTestCase {
 
     private func captureWindowNow(_ window: NSWindow) async throws -> CGImage? {
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-        guard let target = content.windows.first(where: { $0.windowID == CGWindowID(window.windowNumber) }) else { return nil }
+        guard let target = content.windows.first(where: { $0.windowID == CGWindowID(window.windowNumber) }) else {
+            print("Snapshot: window \(window.windowNumber) is not in the shareable content")
+            return nil
+        }
         let filter = SCContentFilter(desktopIndependentWindow: target)
         let configuration = SCStreamConfiguration()
         let scale = window.backingScaleFactor

@@ -191,6 +191,8 @@ struct EventsSidebar: View {
     @Bindable var workspace: EventsWorkspace
     @State private var targetedEventID: UUID?
     @State private var searchText = ""
+    @AppStorage("CameraToolkit.organize.sidebar.unsortedExpanded") private var unsortedExpanded = true
+    @AppStorage("CameraToolkit.organize.sidebar.eventsExpanded") private var eventsExpanded = true
 
     /// A local mirror of `workspace.selection`, synced both ways with
     /// `onChange`. Binding the AppKit-backed List straight to the model
@@ -201,47 +203,32 @@ struct EventsSidebar: View {
     @State private var listSelection: EventsSidebarSelection?
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 8) {
-                Image(systemName: "rectangle.3.group")
-                    .foregroundStyle(.blue)
-                Text("Organize")
-                    .font(.headline)
-                Spacer()
-                Button {
-                    workspace.startGuide()
-                } label: {
-                    Label("Guide…", systemImage: "questionmark.circle")
+        let locations = workspace.unsortedLocations(matching: searchText)
+        let hasLocations = !workspace.unsortedLocations.isEmpty
+        List(selection: $listSelection) {
+            let discovered = workspace.discoveredDriveEvents(matching: searchText)
+            if !discovered.isEmpty {
+                Section("Found on Your Drive") {
+                    discoveryBanner(discovered)
+                        .guideHighlight(.discovered, in: workspace)
                 }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .help("Open the step-by-step setup guide")
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 10)
-            Divider()
 
-            List(selection: $listSelection) {
-                let discovered = workspace.discoveredDriveEvents(matching: searchText)
-                if !discovered.isEmpty {
-                    Section("Found on Your Drive") {
-                        discoveryBanner(discovered)
-                            .guideHighlight(.discovered, in: workspace)
-                    }
+            Section(isExpanded: $unsortedExpanded) {
+                ForEach(locations) { location in
+                    unsortedRow(location)
+                        .tag(EventsSidebarSelection.unsorted(location.id))
+                        .contentShape(Rectangle())
+                        .simultaneousGesture(TapGesture().onEnded {
+                            workspace.selection = .unsorted(location.id)
+                        })
+                        .contextMenu {
+                            UnsortedSidebarMenu(location: location, workspace: workspace, model: model)
+                        }
                 }
-
-                Section("Unsorted Photos") {
-                    ForEach(workspace.unsortedLocations(matching: searchText)) { location in
-                        unsortedRow(location)
-                            .tag(EventsSidebarSelection.unsorted(location.id))
-                            .contentShape(Rectangle())
-                            .simultaneousGesture(TapGesture().onEnded {
-                                workspace.selection = .unsorted(location.id)
-                            })
-                            .contextMenu {
-                                UnsortedSidebarMenu(location: location, workspace: workspace, model: model)
-                            }
-                    }
+                // First run: a full-width row is a stronger guide target
+                // than the header's small +.
+                if !hasLocations {
                     Button {
                         workspace.addUnsortedFolder()
                     } label: {
@@ -250,73 +237,73 @@ struct EventsSidebar: View {
                     .buttonStyle(.borderless)
                     .guideHighlight(.addFolder, in: workspace)
                 }
+            } header: {
+                SidebarSectionHeader(
+                    title: "Unsorted",
+                    addLabel: "Add Folder or Card…",
+                    forceVisible: hasLocations && workspace.guide?.step.highlight == .addFolder,
+                    action: { workspace.addUnsortedFolder() }
+                )
+                .modifier(GuideHighlightModifier(isActive: hasLocations && workspace.guide?.step.highlight == .addFolder))
+            }
 
-                Section {
-                    if workspace.events.isEmpty {
-                        Text("No events yet")
-                            .foregroundStyle(.secondary)
-                    }
-                    // A board popover's condition rows narrow this list —
-                    // events are tested against the same OR-of-AND groups.
-                    if workspace.search.hasActiveConditions {
-                        Button {
-                            workspace.search.groups = []
-                        } label: {
-                            Label("Filtered — clear", systemImage: "line.3.horizontal.decrease.circle.fill")
-                                .font(.caption)
-                        }
-                        .buttonStyle(.borderless)
-                        .foregroundStyle(Color.accentColor)
-                        .help("A board's filter is hiding events that don't match — click to show every event")
-                    }
-                    // Parents newest-first; each subevent sits indented under
-                    // its parent — the flat row style stays the same.
-                    ForEach(workspace.sidebarRows(matching: searchText, applying: workspace.search), id: \.event.id) { row in
-                        eventRow(row.event, depth: row.depth)
-                            .tag(EventsSidebarSelection.event(row.event.id))
-                            .contentShape(Rectangle())
-                            .simultaneousGesture(TapGesture().onEnded {
-                                workspace.selection = .event(row.event.id)
-                            })
-                            .dropDestination(for: String.self) { items, _ in
-                                workspace.handleDrop(items, onto: row.event.id)
-                            } isTargeted: { targeted in
-                                if targeted {
-                                    targetedEventID = row.event.id
-                                } else if targetedEventID == row.event.id {
-                                    targetedEventID = nil
-                                }
-                            }
-                            .contextMenu {
-                                EventSidebarMenu(event: row.event, workspace: workspace)
-                            }
-                    }
-                } header: {
-                    HStack {
-                        Text("Events")
-                        Spacer()
-                        Button {
-                            workspace.requestNewEvent(from: nil)
-                        } label: {
-                            Label("New Event…", systemImage: "plus")
-                                .font(.caption)
-                        }
-                        .buttonStyle(.borderless)
-                        .help("Make a new event")
-                    }
+            Section(isExpanded: $eventsExpanded) {
+                if workspace.events.isEmpty {
+                    Text("No Events Yet")
+                        .foregroundStyle(.secondary)
                 }
+                // A board popover's condition rows narrow this list —
+                // events are tested against the same OR-of-AND groups.
+                if workspace.search.hasActiveConditions {
+                    Button {
+                        workspace.search.groups = []
+                    } label: {
+                        Label("Filtered — Clear", systemImage: "line.3.horizontal.decrease.circle.fill")
+                    }
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(.tint)
+                    .help("A board's filter is hiding events that don't match — click to show every event")
+                }
+                // Parents newest-first; each subevent sits indented under
+                // its parent.
+                ForEach(workspace.sidebarRows(matching: searchText, applying: workspace.search), id: \.event.id) { row in
+                    eventRow(row.event, depth: row.depth)
+                        .tag(EventsSidebarSelection.event(row.event.id))
+                        .contentShape(Rectangle())
+                        .simultaneousGesture(TapGesture().onEnded {
+                            workspace.selection = .event(row.event.id)
+                        })
+                        .dropDestination(for: String.self) { items, _ in
+                            workspace.handleDrop(items, onto: row.event.id)
+                        } isTargeted: { targeted in
+                            if targeted {
+                                targetedEventID = row.event.id
+                            } else if targetedEventID == row.event.id {
+                                targetedEventID = nil
+                            }
+                        }
+                        .contextMenu {
+                            EventSidebarMenu(event: row.event, workspace: workspace)
+                        }
+                }
+            } header: {
+                SidebarSectionHeader(
+                    title: "Events",
+                    addLabel: "New Event…",
+                    action: { workspace.requestNewEvent(from: nil) }
+                )
             }
-            .listStyle(.sidebar)
-            .onAppear { listSelection = workspace.selection }
-            .onChange(of: listSelection) { _, selection in
-                if workspace.selection != selection { workspace.selection = selection }
-            }
-            .onChange(of: workspace.selection) { _, selection in
-                if listSelection != selection { listSelection = selection }
-            }
-
-            Divider()
-            footer
+        }
+        .listStyle(.sidebar)
+        .onAppear { listSelection = workspace.selection }
+        .onChange(of: listSelection) { _, selection in
+            if workspace.selection != selection { workspace.selection = selection }
+        }
+        .onChange(of: workspace.selection) { _, selection in
+            if listSelection != selection { listSelection = selection }
+        }
+        .safeAreaBar(edge: .bottom) {
+            SidebarFooter(model: model, workspace: workspace)
         }
         .searchable(text: $searchText, placement: .sidebar, prompt: "Search")
     }
@@ -345,129 +332,190 @@ struct EventsSidebar: View {
     }
 
     private func unsortedRow(_ location: ConfiguredLocation) -> some View {
+        let state = workspace.sources[location.id]
         let connected = workspace.isConnected(location)
-        return HStack(spacing: 8) {
-            Image(systemName: connected ? "tray.full" : "externaldrive.badge.xmark")
-                .foregroundStyle(connected ? Color.orange : .secondary)
-                .frame(width: 18)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(location.name)
-                    .lineLimit(1)
-                Text(workspace.unsortedDetail(for: location))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-            Spacer(minLength: 0)
-            if workspace.sources[location.id]?.isScanning == true {
-                ProgressView()
-                    .controlSize(.mini)
-            } else if !connected {
-                Button {
-                    workspace.refreshConnectivity()
-                } label: {
-                    Image(systemName: "arrow.clockwise")
-                }
-                .buttonStyle(.borderless)
-                .controlSize(.small)
-                .foregroundStyle(.secondary)
-                .help("Check again — the drive or card may have just connected")
-            }
-        }
-        .padding(.vertical, 2)
+        let leftToSort = state?.result.map { result in result.stacks.count { !workspace.isSorted($0) } }
+        return UnsortedSidebarRow(
+            name: location.name,
+            isConnected: connected,
+            isScanning: state?.isScanning == true,
+            leftToSort: leftToSort ?? 0,
+            help: "\(workspace.unsortedDetail(for: location)) · \(DashboardModel.expandedPath(location.path))"
+        )
     }
 
-    private func eventRow(_ event: SavedCameraEvent, depth: Int = 0) -> some View {
+    private func eventRow(_ event: SavedCameraEvent, depth: Int) -> some View {
         let count = workspace.assignmentCount(for: event.id)
         let summary = workspace.presence[event.id]
         let names = workspace.eventPeople(event.id).map(\.name).joined(separator: ", ")
-        return HStack(spacing: 8) {
-            Circle()
-                .fill(EventPalette.color(for: event.id))
-                .frame(width: 9, height: 9)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(event.name)
-                    .lineLimit(1)
-                Text("\(event.eventDate.formatted(date: .abbreviated, time: .omitted)) · \(count) file\(count == 1 ? "" : "s")\(names.isEmpty ? "" : " · \(names)")")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+        let isPrivate = workspace.resolvedPolicy(for: event) == .archiveOnly
+        var details = [
+            event.eventDate.formatted(date: .abbreviated, time: .omitted),
+            "\(count.formatted()) file\(count == 1 ? "" : "s")",
+        ]
+        if !names.isEmpty { details.append(names) }
+        if let summary, summary.total > 0 {
+            details.append("Drive \(summary.onDrive) of \(summary.total)")
+            details.append("NAS \(summary.onArchive) of \(summary.total)")
+        }
+        if isPrivate { details.append("Private · NAS only") }
+        return EventSidebarRow(
+            name: event.name,
+            color: EventPalette.color(for: event.id),
+            isPrivate: isPrivate,
+            fileCount: count,
+            depth: depth,
+            isDropTarget: targetedEventID == event.id,
+            help: details.joined(separator: " · ")
+        )
+    }
+}
+
+/// A sidebar section title with a + that shows on hover — where Finder and
+/// Music put "add" for a section.
+private struct SidebarSectionHeader: View {
+    let title: String
+    let addLabel: String
+    /// Keeps the + visible while the setup guide points at it.
+    var forceVisible = false
+    let action: () -> Void
+    @State private var isHovering = false
+
+    var body: some View {
+        HStack {
+            Text(title)
+            Spacer()
+            Button(action: action) {
+                Label(addLabel, systemImage: "plus")
+                    .labelStyle(.iconOnly)
             }
-            Spacer(minLength: 0)
-            if workspace.resolvedPolicy(for: event) == .archiveOnly {
-                Image(systemName: "lock.fill")
-                    .font(.caption)
-                    .foregroundStyle(.purple)
-                    .help("Private · NAS only")
+            .buttonStyle(.borderless)
+            .opacity(isHovering || forceVisible ? 1 : 0)
+            .help(addLabel)
+            .accessibilityLabel(addLabel)
+        }
+        .contentShape(Rectangle())
+        .onHover { isHovering = $0 }
+    }
+}
+
+/// One unsorted folder or card: its name, and the count still to sort as
+/// the row's badge. Values only, so a row re-renders only when they change.
+private struct UnsortedSidebarRow: View {
+    let name: String
+    let isConnected: Bool
+    let isScanning: Bool
+    let leftToSort: Int
+    let help: String
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Label {
+                Text(name)
+                    .lineLimit(1)
+            } icon: {
+                Image(systemName: isConnected ? "tray.full" : "externaldrive.badge.xmark")
+                    .foregroundStyle(isConnected ? Color.orange : Color.secondary)
             }
-            if let summary, summary.total > 0 {
-                HStack(spacing: 3) {
-                    Image(systemName: "externaldrive.fill")
-                        .foregroundStyle(summary.onDrive == summary.total ? Color.green : Color.secondary.opacity(0.5))
-                    Image(systemName: "server.rack")
-                        .foregroundStyle(summary.onArchive == summary.total ? Color.green : Color.secondary.opacity(0.5))
-                }
-                .font(.caption2)
-                .help("Drive \(summary.onDrive) of \(summary.total) · NAS \(summary.onArchive) of \(summary.total)")
+            .foregroundStyle(isConnected ? Color.primary : Color.secondary)
+            if isScanning {
+                Spacer(minLength: 0)
+                ProgressView()
+                    .controlSize(.small)
             }
         }
-        .padding(.vertical, 2)
-        .padding(.horizontal, 4)
-        .padding(.leading, CGFloat(depth) * 16)
+        .badge(isScanning || !isConnected ? 0 : leftToSort)
+        .help(help)
+    }
+}
+
+/// One event: its palette color (a lock for private events), its name, and
+/// its file count as the badge. Date, people, and drive/NAS status are in
+/// the tooltip and the board's inspector.
+private struct EventSidebarRow: View {
+    let name: String
+    let color: Color
+    let isPrivate: Bool
+    let fileCount: Int
+    let depth: Int
+    let isDropTarget: Bool
+    let help: String
+
+    var body: some View {
+        Label {
+            Text(name)
+                .lineLimit(1)
+        } icon: {
+            Image(systemName: isPrivate ? "lock.fill" : "circle.fill")
+                .imageScale(isPrivate ? .medium : .small)
+                .foregroundStyle(color)
+        }
+        .badge(fileCount)
+        .padding(.leading, CGFloat(depth) * 14)
         .background {
             RoundedRectangle(cornerRadius: 6)
-                .fill(targetedEventID == event.id ? Color.accentColor.opacity(0.25) : Color.clear)
+                .fill(isDropTarget ? Color.accentColor.opacity(0.25) : Color.clear)
+                .padding(.horizontal, -4)
                 .allowsHitTesting(false)
         }
+        .help(help)
     }
+}
 
-    private var footer: some View {
-        VStack(spacing: 2) {
-            footerButton(
-                "Jobs…",
-                detail: model.activeJob?.note
-                    ?? model.transferQueue?.sidebarSummary.detail
-                    ?? (model.pendingTransferFileCount > 0 ? "\(model.pendingTransferFileCount) waiting" : nil),
-                symbol: model.activeJob != nil ? "list.bullet.clipboard.fill" : "list.bullet.clipboard"
-            ) {
-                TransferQueueWindowController.shared.show(model: model)
-            }
-            footerButton(
-                "People…",
-                detail: workspace.faceEngineInstalled ? nil : "engine missing",
-                symbol: "person.2"
-            ) {
-                PeopleWindowController.shared.show(model: model, workspace: workspace)
-            }
-            footerButton("Trash…", detail: nil, symbol: "trash") {
-                TrashWindowController.shared.show(model: model)
-            }
-            footerButton("Speed Tests…", detail: nil, symbol: "gauge.with.dots.needle.50percent") {
-                StorageBenchmarkWindowController.shared.show(model: model)
-            }
-            footerButton("Settings…", detail: nil, symbol: "gearshape") {
-                CameraToolkitConfigWindow.shared.show(model: model)
-            }
-        }
-        .buttonStyle(.plain)
-        .padding(12)
-    }
+/// The sidebar's footer: Jobs (with the running job's progress) and one
+/// gear menu for the windows that used to be five stacked buttons. Every
+/// entry is also in the menu bar.
+private struct SidebarFooter: View {
+    @Bindable var model: DashboardModel
+    let workspace: EventsWorkspace
 
-    private func footerButton(_ title: String, detail: String?, symbol: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            HStack {
-                Label(title, systemImage: symbol)
-                Spacer()
-                if let detail {
-                    Text(detail)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
+    var body: some View {
+        let job = model.activeJob
+        let detail = job?.note
+            ?? model.transferQueue?.sidebarSummary.detail
+            ?? (model.pendingTransferFileCount > 0 ? "\(model.pendingTransferFileCount) waiting" : nil)
+        GlassEffectContainer(spacing: 8) {
+            HStack(spacing: 8) {
+                Button {
+                    TransferQueueWindowController.shared.show(model: model)
+                } label: {
+                    HStack(spacing: 6) {
+                        Label("Jobs", systemImage: "list.bullet.clipboard")
+                            .symbolVariant(job != nil ? .fill : .none)
+                        if let job {
+                            ProgressView(value: job.progress)
+                                .frame(width: 44)
+                        } else if let detail {
+                            Text(detail)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                    }
                 }
+                .buttonStyle(.glass)
+                .help(detail.map { "Jobs — \($0)" } ?? "Show copy, archive, and scan jobs")
+                Spacer(minLength: 0)
+                Menu {
+                    Button(workspace.faceEngineInstalled ? "People…" : "People… (Face Engine Missing)") {
+                        PeopleWindowController.shared.show(model: model, workspace: workspace)
+                    }
+                    Button("Trash…") { TrashWindowController.shared.show(model: model) }
+                    Button("Storage Speed Tests…") { StorageBenchmarkWindowController.shared.show(model: model) }
+                    Divider()
+                    Button("Setup Guide…") { workspace.startGuide() }
+                    Button("Settings…") { CameraToolkitConfigWindow.shared.show(model: model) }
+                } label: {
+                    Label("More", systemImage: "gearshape")
+                        .labelStyle(.iconOnly)
+                }
+                .menuIndicator(.hidden)
+                .buttonStyle(.glass)
+                .buttonBorderShape(.circle)
+                .help("People, Trash, Speed Tests, the setup guide, and Settings")
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .contentShape(Rectangle())
         }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
     }
 }
 
@@ -539,6 +587,11 @@ private struct UnsortedSidebarMenu: View {
     let model: DashboardModel
 
     var body: some View {
+        if !workspace.isConnected(location) {
+            Button("Check Again") { workspace.refreshConnectivity() }
+                .help("Check again — the drive or card may have just connected")
+            Divider()
+        }
         Button("Rescan") { workspace.scan(location, force: true) }
             .disabled(workspace.sources[location.id]?.isScanning == true || model.isBusy)
         Button("Regroup Bursts") { workspace.regroupBursts(location) }
