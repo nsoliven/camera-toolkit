@@ -121,57 +121,65 @@ final class KeyboardShortcutsWindowController: NSObject, NSWindowDelegate {
     }
 }
 
-private struct KeyboardShortcutsReferenceView: View {
-    var body: some View {
-        ScrollView {
-            LazyVStack(alignment: .leading, spacing: 22) {
-                VStack(alignment: .leading, spacing: 5) {
-                    Text("Keyboard Shortcuts")
-                        .font(.largeTitle.bold())
-                    Text("Sorting bursts into events, moving files between locations, and previewing without leaving the board.")
-                        .foregroundStyle(.secondary)
-                }
+/// Narrows the shortcut reference to a search: a shortcut matches on its
+/// action, keys, or explanation; a section matches as a whole on its title.
+enum KeyboardShortcutFilter {
+    static func sections(
+        _ sections: [KeyboardShortcutSection],
+        matching query: String
+    ) -> [KeyboardShortcutSection] {
+        let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !needle.isEmpty else { return sections }
+        return sections.compactMap { section in
+            if section.title.localizedCaseInsensitiveContains(needle) { return section }
+            let shortcuts = section.shortcuts.filter {
+                $0.action.localizedCaseInsensitiveContains(needle)
+                    || $0.keys.localizedCaseInsensitiveContains(needle)
+                    || $0.detail.localizedCaseInsensitiveContains(needle)
+            }
+            guard !shortcuts.isEmpty else { return nil }
+            var filtered = section
+            filtered.shortcuts = shortcuts
+            return filtered
+        }
+    }
+}
 
-                ForEach(CameraToolkitShortcutCatalog.sections) { section in
-                    VStack(alignment: .leading, spacing: 8) {
-                        Label(section.title, systemImage: section.symbol)
-                            .font(.headline)
-                        VStack(spacing: 0) {
-                            ForEach(Array(section.shortcuts.enumerated()), id: \.element.id) { index, shortcut in
-                                HStack(alignment: .firstTextBaseline, spacing: 14) {
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(shortcut.action)
-                                            .fontWeight(.medium)
-                                        Text(shortcut.detail)
-                                            .font(.caption)
-                                            .foregroundStyle(.secondary)
-                                    }
-                                    Spacer(minLength: 16)
-                                    Text(shortcut.keys)
-                                        .font(.system(.body, design: .rounded).weight(.semibold))
-                                        .monospacedDigit()
-                                        .foregroundStyle(.primary)
-                                        .padding(.horizontal, 9)
-                                        .padding(.vertical, 5)
-                                        .background(.quaternary, in: RoundedRectangle(cornerRadius: 7))
-                                }
-                                .padding(11)
-                                if index + 1 < section.shortcuts.count {
-                                    Divider().padding(.leading, 11)
-                                }
-                            }
-                        }
-                        .background(.background, in: RoundedRectangle(cornerRadius: 10))
-                        .overlay {
-                            RoundedRectangle(cornerRadius: 10)
-                                .stroke(Color.primary.opacity(0.09), lineWidth: 1)
+private struct KeyboardShortcutsReferenceView: View {
+    @State private var query = ""
+
+    private var sections: [KeyboardShortcutSection] {
+        KeyboardShortcutFilter.sections(CameraToolkitShortcutCatalog.sections, matching: query)
+    }
+
+    var body: some View {
+        Form {
+            ForEach(sections) { section in
+                Section {
+                    ForEach(section.shortcuts) { shortcut in
+                        LabeledContent {
+                            Text(shortcut.keys)
+                                .monospaced()
+                                .foregroundStyle(.primary)
+                        } label: {
+                            Text(shortcut.action)
+                            Text(shortcut.detail)
                         }
                     }
+                } header: {
+                    Label(section.title, systemImage: section.symbol)
                 }
             }
-            .padding(24)
+        }
+        .formStyle(.grouped)
+        .overlay {
+            if sections.isEmpty {
+                ContentUnavailableView.search(text: query)
+            }
         }
         .frame(minWidth: 620, minHeight: 480)
-        .background(Color(nsColor: .windowBackgroundColor))
+        .navigationTitle("Keyboard Shortcuts")
+        .navigationSubtitle("Sort, move, and preview without leaving the board")
+        .searchable(text: $query, placement: .toolbar, prompt: "Search shortcuts")
     }
 }
