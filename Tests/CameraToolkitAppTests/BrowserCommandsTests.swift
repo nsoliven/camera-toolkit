@@ -40,4 +40,11 @@ final class BrowserCommandsTests: XCTestCase {
             ]
         )
     }
+
+    func testBoardCommandsOnlyTargetTheMainWindowWhenItIsKey() {
+        XCTAssertTrue(BrowserCommand.targetsMainWindow(keyWindowIdentifier: BrowserCommand.mainWindowIdentifier))
+        XCTAssertFalse(BrowserCommand.targetsMainWindow(keyWindowIdentifier: TrashWindowController.windowIdentifier))
+        XCTAssertFalse(BrowserCommand.targetsMainWindow(keyWindowIdentifier: "CameraToolkitPeopleWindow"))
+        XCTAssertFalse(BrowserCommand.targetsMainWindow(keyWindowIdentifier: nil))
+    }
 }

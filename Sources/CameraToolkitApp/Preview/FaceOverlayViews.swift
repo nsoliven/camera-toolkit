@@ -186,7 +186,8 @@ struct FaceBoxesOverlay: View {
         case .confirmed:
             HStack(spacing: 3) {
                 Image(systemName: "person.fill")
-                    .font(.system(size: 8))
+                    .font(.caption2)
+                    .imageScale(.small)
                 Text(name ?? "Confirmed")
                     .lineLimit(1)
             }
@@ -206,7 +207,8 @@ struct FaceBoxesOverlay: View {
                 Button {
                     onConfirm(face)
                 } label: {
-                    Image(systemName: "checkmark.circle.fill")
+                    Label("Confirm", systemImage: "checkmark.circle.fill")
+                        .labelStyle(.iconOnly)
                         .foregroundStyle(.green)
                 }
                 .buttonStyle(.plain)
@@ -240,7 +242,8 @@ struct FaceBoxesOverlay: View {
         Button {
             onTag(face, boxRect)
         } label: {
-            Image(systemName: "plus.circle.fill")
+            Label("Tag Face", systemImage: "plus.circle.fill")
+                .labelStyle(.iconOnly)
                 .foregroundStyle(.white.opacity(0.9))
         }
         .buttonStyle(.plain)
@@ -271,9 +274,11 @@ struct FaceTagRequest: Identifiable {
     var anchor: CGRect
 }
 
-/// The person picker that slides over the photo when a face is tagged:
-/// pick an existing roster person, or type a name to create one. All
-/// writes land in the face catalog — the photo file is never touched.
+/// The person picker the burst overlay shows in a native popover anchored
+/// on the face being tagged: pick an existing roster person, or type a
+/// name to create one. The popover supplies the chrome and dismisses on
+/// Esc or a click outside. All writes land in the face catalog — the
+/// photo file is never touched.
 struct FaceTagPicker: View {
     let people: [FacePerson]
     var onPick: (FacePerson) -> Void = { _ in }
@@ -300,19 +305,8 @@ struct FaceTagPicker: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text("Tag this face")
-                    .font(.callout.weight(.semibold))
-                Spacer()
-                Button {
-                    onCancel()
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .foregroundStyle(.secondary)
-                }
-                .buttonStyle(.plain)
-                .help("Cancel (Esc)")
-            }
+            Text("Tag This Face")
+                .font(.headline)
             TextField("Person name", text: $query)
                 .textFieldStyle(.roundedBorder)
                 .focused($queryFocused)
@@ -337,24 +331,17 @@ struct FaceTagPicker: View {
                 Button {
                     onCreate(trimmedQuery)
                 } label: {
-                    Label("New person “\(trimmedQuery)”", systemImage: "plus.circle.fill")
+                    Label("New Person “\(trimmedQuery)”", systemImage: "plus.circle.fill")
                         .lineLimit(1)
                 }
-                .buttonStyle(.plain)
-                .foregroundStyle(Color.accentColor)
+                .buttonStyle(.borderless)
             }
             Text("Catalog only — the photo file is never modified.")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
         }
-        .padding(10)
-        .frame(width: 240)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .strokeBorder(.white.opacity(0.15), lineWidth: 1)
-        }
-        .shadow(color: .black.opacity(0.4), radius: 12, y: 4)
+        .padding(12)
+        .frame(width: 260)
         .onAppear { queryFocused = true }
         .onKeyPress(.escape) {
             onCancel()
@@ -402,7 +389,7 @@ private struct FaceTagPersonRow: View {
             .contentShape(Rectangle())
             .background(
                 RoundedRectangle(cornerRadius: 5)
-                    .fill(Color.white.opacity(hovered ? 0.12 : 0))
+                    .fill(.quaternary.opacity(hovered ? 1 : 0))
             )
         }
         .buttonStyle(.plain)
@@ -412,7 +399,8 @@ private struct FaceTagPersonRow: View {
 
 /// The trailing inspector that `i` slides out on the burst preview: people
 /// on the frame, capture time, camera and exposure when EXIF carries them,
-/// and the file's own name and size.
+/// and the file's own name and size. It draws no background of its own —
+/// the host puts it on glass.
 struct FrameInspectorPanel: View {
     let item: OrganizeItem
     /// nil = the file was never face-scanned.
@@ -431,10 +419,9 @@ struct FrameInspectorPanel: View {
                 cameraSection
                 fileSection
             }
-            .padding(12)
+            .padding(14)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .frame(width: 252)
-        .background(.ultraThinMaterial)
     }
 
     // MARK: - Sections
@@ -532,7 +519,7 @@ struct FrameInspectorPanel: View {
 
     @ViewBuilder
     private var fileSection: some View {
-        inspectorSection("File", icon: "doc") {
+        inspectorSection("File", icon: "document") {
             VStack(alignment: .leading, spacing: 6) {
                 row("Name", item.primary.name)
                 let size = item.primary.size.formattedBytes

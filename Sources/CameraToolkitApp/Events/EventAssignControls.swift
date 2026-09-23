@@ -9,6 +9,17 @@ import SwiftUI
 /// strip and flat "All Events" menu, which did not scale past a handful
 /// of events.
 struct EventAssignControls: View {
+    /// How the targets draw. `.chips` is the palette capsules the preview
+    /// overlay uses; the glass styles are for the board's bottom bar —
+    /// `.glass` with names, `.glassNumbers` as numbered dots for narrow
+    /// windows, `.menu` as one "Sort Into" menu for the narrowest.
+    enum Style {
+        case chips
+        case glass
+        case glassNumbers
+        case menu
+    }
+
     let workspace: EventsWorkspace
     /// Verb in tooltips and the sheet title — "Sort into" on an unsorted
     /// board, "Move to" on an event board.
@@ -19,34 +30,90 @@ struct EventAssignControls: View {
     /// False when there is nothing to assign: chips dim and the picker's
     /// event rows deactivate, while "New Event…" stays reachable.
     var canAssign = true
+    var style: Style = .chips
     let onAssign: (SavedCameraEvent) -> Void
     let onNewEvent: () -> Void
 
     @State private var isPickerPresented = false
 
     var body: some View {
-        HStack(spacing: 8) {
-            ForEach(Array(workspace.assignableRecents(excluding: excludedEventID).enumerated()), id: \.element.id) { index, event in
-                Button {
-                    onAssign(event)
-                } label: {
-                    EventChip(
-                        event: event,
-                        number: index + 1,
-                        isPrivate: workspace.resolvedPolicy(for: event) == .archiveOnly
-                    )
+        let recents = Array(workspace.assignableRecents(excluding: excludedEventID).enumerated())
+        Group {
+            switch style {
+            case .chips:
+                HStack(spacing: 8) {
+                    ForEach(recents, id: \.element.id) { index, event in
+                        Button {
+                            onAssign(event)
+                        } label: {
+                            EventChip(
+                                event: event,
+                                number: index + 1,
+                                isPrivate: workspace.resolvedPolicy(for: event) == .archiveOnly
+                            )
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(!canAssign)
+                        .opacity(canAssign ? 1 : 0.5)
+                        .help(help(for: event, index: index))
+                    }
+                    Button {
+                        isPickerPresented = true
+                    } label: {
+                        Label("Event…", systemImage: "calendar")
+                    }
+                    // Glass reads on the preview's black backdrop in both
+                    // appearances; a bordered button vanished in light mode.
+                    .buttonStyle(.glass)
+                    .help("Search every event by name, or create a new one")
                 }
-                .buttonStyle(.plain)
-                .disabled(!canAssign)
-                .opacity(canAssign ? 1 : 0.5)
-                .help("\(verb) \(workspace.eventTitle(event)) (press \(index + 1))")
+            case .glass, .glassNumbers:
+                HStack(spacing: 6) {
+                    ForEach(recents, id: \.element.id) { index, event in
+                        Button {
+                            onAssign(event)
+                        } label: {
+                            Label {
+                                Text(event.name)
+                                    .lineLimit(1)
+                            } icon: {
+                                Image(systemName: "\(index + 1).circle.fill")
+                                    .foregroundStyle(EventPalette.color(for: event.id))
+                            }
+                        }
+                        .labelStyle(style == .glassNumbers ? AnyLabelStyle(.iconOnly) : AnyLabelStyle(.titleAndIcon))
+                        .buttonStyle(.glass)
+                        .disabled(!canAssign)
+                        .help(help(for: event, index: index))
+                    }
+                    Button {
+                        isPickerPresented = true
+                    } label: {
+                        Label("Event…", systemImage: "calendar")
+                    }
+                    .labelStyle(style == .glassNumbers ? AnyLabelStyle(.iconOnly) : AnyLabelStyle(.titleAndIcon))
+                    .buttonStyle(.glass)
+                    .help("Search every event by name, or create a new one")
+                }
+            case .menu:
+                Menu {
+                    ForEach(recents, id: \.element.id) { index, event in
+                        Button("\(index + 1)  \(workspace.eventTitle(event))") { onAssign(event) }
+                            .disabled(!canAssign)
+                    }
+                    if !recents.isEmpty {
+                        Divider()
+                    }
+                    Button("Choose Event…") { isPickerPresented = true }
+                    Button("New Event…") { onNewEvent() }
+                } label: {
+                    Label(verb.capitalizedFirstWord, systemImage: "tray.and.arrow.down")
+                }
+                .menuIndicator(.hidden)
+                .buttonStyle(.glass)
+                .fixedSize()
+                .help("\(verb) a recent event (1–3), or pick any event")
             }
-            Button {
-                isPickerPresented = true
-            } label: {
-                Label("Event…", systemImage: "calendar")
-            }
-            .help("Search every event by name, or create a new one")
         }
         .sheet(isPresented: $isPickerPresented) {
             EventPickerSheet(
@@ -58,6 +125,30 @@ struct EventAssignControls: View {
                 onNewEvent: onNewEvent
             )
         }
+    }
+
+    private func help(for event: SavedCameraEvent, index: Int) -> String {
+        "\(verb) \(workspace.eventTitle(event)) (press \(index + 1))"
+    }
+}
+
+/// Picks between two label styles at runtime.
+private struct AnyLabelStyle: LabelStyle {
+    private let make: (Configuration) -> AnyView
+
+    init(_ style: some LabelStyle) {
+        make = { AnyView(style.makeBody(configuration: $0)) }
+    }
+
+    func makeBody(configuration: Configuration) -> some View {
+        make(configuration)
+    }
+}
+
+private extension String {
+    /// "sort into" → "Sort Into"-style title case for a menu label.
+    var capitalizedFirstWord: String {
+        split(separator: " ").map { $0.prefix(1).uppercased() + $0.dropFirst() }.joined(separator: " ")
     }
 }
 

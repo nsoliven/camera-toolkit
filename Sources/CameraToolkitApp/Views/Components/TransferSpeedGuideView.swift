@@ -11,93 +11,78 @@ struct TransferSpeedGuideView: View {
     private let mediaRows = TransferSpeedReference.mediaRows
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 10) {
-                Image(systemName: "gauge.with.dots.needle.50percent")
-                    .font(.title2)
-                    .foregroundStyle(.blue)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Transfer Speed Guide")
+        Form {
+            Section {
+                bottleneckCallout
+            } header: {
+                HStack(alignment: .firstTextBaseline) {
+                    Label("Transfer Speed Guide", systemImage: "gauge.with.dots.needle.50percent")
                         .font(.headline)
-                    Text("Find the slowest link in the chain")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-                VStack(alignment: .trailing, spacing: 2) {
+                    Spacer()
                     Text(liveSpeed)
                         .font(.headline.monospacedDigit())
                     Text("job average")
-                        .font(.caption2)
+                        .font(.caption)
                         .foregroundStyle(.secondary)
                 }
             }
-            .padding(16)
 
-            Divider()
-
-            ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    bottleneckCallout
-
-                    if isLoadingLinks || !connectedLinks.isEmpty {
-                        speedSection(title: "Connected USB links") {
-                            if isLoadingLinks {
-                                HStack(spacing: 8) {
-                                    ProgressView().controlSize(.small)
-                                    Text("Reading negotiated link speeds…")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
-                                .padding(.vertical, 6)
-                            } else {
-                                ForEach(connectedLinks) { link in
-                                    speedRow(
-                                        title: link.name,
-                                        detail: link.interfaceName,
-                                        result: "\(link.formattedLinkRate) → \(link.theoreticalMegabytesPerSecond) MB/s max"
-                                    )
-                                }
-                            }
+            if isLoadingLinks || !connectedLinks.isEmpty {
+                Section("Connected USB links") {
+                    if isLoadingLinks {
+                        LabeledContent("Reading negotiated link speeds…") {
+                            ProgressView().controlSize(.small)
+                        }
+                    } else {
+                        ForEach(connectedLinks) { link in
+                            speedRow(
+                                title: link.name,
+                                detail: link.interfaceName,
+                                result: "\(link.formattedLinkRate) → \(link.theoreticalMegabytesPerSecond) MB/s max"
+                            )
                         }
                     }
+                }
+            }
 
-                    speedSection(title: "Connections and enclosures") {
-                        ForEach(connectionRows) { row in
-                            speedRow(title: row.title, detail: row.detail, result: row.result)
-                        }
-                    }
+            Section("Connections and enclosures") {
+                ForEach(connectionRows) { row in
+                    speedRow(title: row.title, detail: row.detail, result: row.result)
+                }
+            }
 
-                    speedSection(title: "Cameras and cards") {
-                        ForEach(mediaRows) { row in
-                            speedRow(title: row.title, detail: row.detail, result: row.result)
-                        }
-                    }
+            Section {
+                ForEach(mediaRows) { row in
+                    speedRow(title: row.title, detail: row.detail, result: row.result)
+                }
+            } header: {
+                Text("Cameras and cards")
+            } footer: {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("USB labels use bits per second; file copies use bytes per second. Eight bits equal one byte, and protocol overhead lowers real transfers. The speed above is a whole-job average; verification alternates between the camera and Buffer, so the negotiated USB links are the better bottleneck evidence. The slowest source, cable, reader, enclosure, or destination sets the final speed.")
+                    Text("U3 and V30 guarantee at least 30 MB/s sustained write. A2 is an app-performance rating—there is no A3 SD class.")
+                    Text("Published ceilings: USB-IF, Intel, SD Association, DJI, and Samsung. Typical large-file ranges are approximate.")
+                        .foregroundStyle(.tertiary)
+                }
+            }
 
-                    VStack(alignment: .leading, spacing: 5) {
-                        Text("How to read these numbers")
-                            .font(.caption.weight(.semibold))
-                        Text("USB labels use bits per second; file copies use bytes per second. Eight bits equal one byte, and protocol overhead lowers real transfers. The speed above is a whole-job average; verification alternates between the camera and Buffer, so the negotiated USB links are the better bottleneck evidence. The slowest source, cable, reader, enclosure, or destination sets the final speed.")
-                        Text("U3 and V30 guarantee at least 30 MB/s sustained write. A2 is an app-performance rating—there is no A3 SD class.")
-                        Text("Published ceilings: USB-IF, Intel, SD Association, DJI, and Samsung. Typical large-file ranges are approximate.")
-                            .foregroundStyle(.tertiary)
-                    }
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-
+            Section {
+                HStack {
+                    Spacer()
                     Button {
                         StorageBenchmarkWindowController.shared.show(model: model)
                     } label: {
                         Label("Run Storage Speed Tests…", systemImage: "gauge.with.dots.needle.50percent")
-                            .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.borderedProminent)
                 }
-                .padding(16)
             }
         }
-        .frame(width: 490, height: 620)
-        .background(Color(nsColor: .windowBackgroundColor))
+        .formStyle(.grouped)
+        // The popover supplies its own glass background.
+        .scrollContentBackground(.hidden)
+        .frame(width: 490)
+        .frame(minHeight: 360, idealHeight: 620, maxHeight: 620)
         .task {
             connectedLinks = await USBLinkProbe.connectedStorageLinks()
             isLoadingLinks = false
@@ -110,11 +95,7 @@ struct TransferSpeedGuideView: View {
     }
 
     private var bottleneckCallout: some View {
-        HStack(alignment: .top, spacing: 10) {
-            Image(systemName: bottleneckSymbol)
-                .font(.system(size: 17, weight: .semibold))
-                .foregroundStyle(bottleneckColor)
-                .frame(width: 22)
+        Label {
             VStack(alignment: .leading, spacing: 4) {
                 Text(bottleneckTitle)
                     .font(.subheadline.weight(.semibold))
@@ -123,10 +104,12 @@ struct TransferSpeedGuideView: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            Spacer(minLength: 0)
+        } icon: {
+            Image(systemName: bottleneckSymbol)
+                .symbolRenderingMode(.hierarchical)
+                .foregroundStyle(bottleneckColor)
+                .font(.title3)
         }
-        .padding(12)
-        .background(bottleneckColor.opacity(0.09), in: RoundedRectangle(cornerRadius: 10))
     }
 
     private var osmoLink: USBLinkSnapshot? {
@@ -176,40 +159,14 @@ struct TransferSpeedGuideView: View {
         return queue.bytesPerSecond > 0 && queue.bytesPerSecond < 55_000_000
     }
 
-    private func speedSection<Content: View>(
-        title: String,
-        @ViewBuilder content: () -> Content
-    ) -> some View {
-        VStack(alignment: .leading, spacing: 7) {
-            Text(title.uppercased())
-                .font(.caption2.weight(.semibold))
-                .foregroundStyle(.secondary)
-            VStack(spacing: 0) {
-                content()
-            }
-            .padding(.horizontal, 11)
-            .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 9))
-        }
-    }
-
     private func speedRow(title: String, detail: String, result: String) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 12) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(.caption.weight(.medium))
-                Text(detail)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
-            Spacer(minLength: 8)
+        LabeledContent {
             Text(result)
                 .font(.caption.monospacedDigit())
-                .foregroundStyle(.secondary)
                 .multilineTextAlignment(.trailing)
-        }
-        .padding(.vertical, 8)
-        .overlay(alignment: .bottom) {
-            Divider()
+        } label: {
+            Text(title)
+            Text(detail)
         }
     }
 }

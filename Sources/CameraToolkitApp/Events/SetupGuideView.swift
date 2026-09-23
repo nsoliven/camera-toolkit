@@ -3,27 +3,48 @@ import CameraToolkitCore
 import SwiftUI
 
 /// The floating guide card. It stays open while you use the window, and it
-/// can shrink to a small button.
+/// can shrink to a small button. Both are Liquid Glass — the guide floats
+/// over the board — and share a glass identity, so shrinking and expanding
+/// morph into each other.
 struct SetupGuidePanel: View {
     @Bindable var guide: SetupGuide
     @Bindable var workspace: EventsWorkspace
     @Bindable var model: DashboardModel
+    @Namespace private var glassNamespace
 
     var body: some View {
-        if guide.isCollapsed {
-            Button {
-                guide.isCollapsed = false
-            } label: {
-                Label("Setup Guide · \(guide.progressText)", systemImage: "questionmark.circle.fill")
-                    .font(.callout.weight(.semibold))
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 9)
-                    .background(.regularMaterial, in: Capsule())
-                    .shadow(color: .black.opacity(0.2), radius: 8, y: 3)
+        GlassEffectContainer {
+            if guide.isCollapsed {
+                Button {
+                    setCollapsed(false)
+                } label: {
+                    Label("Setup Guide · \(guide.progressText)", systemImage: "questionmark.circle.fill")
+                }
+                .buttonStyle(.glass)
+                .controlSize(.large)
+                .help("Show the setup guide")
+                .glassEffectID("setupGuide", in: glassNamespace)
+            } else {
+                expanded
+                    .glassEffectID("setupGuide", in: glassNamespace)
             }
-            .buttonStyle(.plain)
-        } else {
-            expanded
+        }
+    }
+
+    private func setCollapsed(_ collapsed: Bool) {
+        withAnimation(.smooth(duration: 0.3)) {
+            guide.isCollapsed = collapsed
+        }
+    }
+
+    /// The footer's Next is the step's primary action only when the step
+    /// has no forward button of its own — one prominent button per step.
+    private var nextIsPrimary: Bool {
+        switch guide.step {
+        case .buffer, .library: true
+        case .existingEvents: workspace.discoveredDriveEvents.isEmpty
+        case .browse: guide.browseChoices.isEmpty
+        default: false
         }
     }
 
@@ -36,19 +57,16 @@ struct SetupGuidePanel: View {
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
                 Spacer()
-                Button {
-                    guide.isCollapsed = true
-                } label: {
-                    Image(systemName: "chevron.down.circle")
+                Button("Shrink Guide", systemImage: "chevron.down") {
+                    setCollapsed(true)
                 }
                 .help("Shrink the guide")
-                Button {
+                Button("Close Guide", systemImage: "xmark") {
                     guide.close()
-                } label: {
-                    Image(systemName: "xmark.circle")
                 }
                 .help("Close the guide")
             }
+            .labelStyle(.iconOnly)
             .buttonStyle(.borderless)
             .padding(.horizontal, 16)
             .padding(.top, 14)
@@ -90,15 +108,22 @@ struct SetupGuidePanel: View {
                     Button("Finish") { guide.finish() }
                         .buttonStyle(.borderedProminent)
                 default:
-                    Button("Next") { guide.next() }
+                    // No Return shortcut: the panel floats over the board
+                    // and must not take Return from it.
+                    if nextIsPrimary {
+                        Button("Next") { guide.next() }
+                            .buttonStyle(.borderedProminent)
+                    } else {
+                        Button("Next") { guide.next() }
+                    }
                 }
             }
             .padding(14)
         }
         .frame(width: 420)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).strokeBorder(Color.primary.opacity(0.1)))
-        .shadow(color: .black.opacity(0.25), radius: 20, y: 8)
+        // Glass supplies its own edge and shadow; controls inside stay
+        // standard bordered buttons (no glass on glass).
+        .glassEffect(.regular, in: .rect(cornerRadius: 20))
     }
 
     @ViewBuilder
@@ -142,12 +167,9 @@ struct SetupGuidePanel: View {
                     guide.useBuffer(suggestion)
                 }
             }
-            HStack {
-                Button("This Is Right") { guide.next() }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(!status.exists)
-                Button("Choose a Different Folder…") { guide.chooseBuffer() }
-            }
+            // Next in the footer confirms this folder; no second forward
+            // button here.
+            Button("Choose a Different Folder…") { guide.chooseBuffer() }
             Text("You can change this later in Settings, under Where Things Live.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -192,11 +214,7 @@ struct SetupGuidePanel: View {
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
-            HStack {
-                Button("This Is Right") { guide.next() }
-                    .buttonStyle(.borderedProminent)
-                Button("Choose a Different Folder…") { guide.chooseLibrary() }
-            }
+            Button("Choose a Different Folder…") { guide.chooseLibrary() }
         }
     }
 
@@ -392,7 +410,7 @@ struct SetupGuidePanel: View {
             Text("That’s the whole loop: sort, Apply, then archive each event when the NAS is connected.")
             GuideBullet(symbol: "keyboard", text: "Space previews · 1–3 sorts · N makes an event · Command-Z undoes.")
             GuideBullet(symbol: "externaldrive", text: "Settings › Where Things Live shows your Buffer, private folder, and NAS, and lets you change them.")
-            GuideBullet(symbol: "questionmark.circle", text: "Open this guide again any time with the Guide button in the sidebar or Help › Setup Guide.")
+            GuideBullet(symbol: "questionmark.circle", text: "Open this guide again any time from Help › Setup Guide or the gear menu at the bottom of the sidebar.")
         }
     }
 }
@@ -433,36 +451,37 @@ struct PlaceStatusCard: View {
     var onRefresh: (() -> Void)?
 
     var body: some View {
-        HStack(alignment: .top, spacing: 10) {
-            Image(systemName: symbol)
-                .foregroundStyle(tint)
-                .frame(width: 20)
-            VStack(alignment: .leading, spacing: 3) {
-                HStack {
-                    Text(title).font(.headline)
-                    Spacer()
-                    stateLabel
-                    if !status.isConnected, let onRefresh {
-                        Button(action: onRefresh) {
-                            Image(systemName: "arrow.clockwise")
+        GroupBox {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: symbol)
+                    .foregroundStyle(tint)
+                    .frame(width: 20)
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack {
+                        Text(title).font(.headline)
+                        Spacer()
+                        stateLabel
+                        if !status.isConnected, let onRefresh {
+                            Button("Check Again", systemImage: "arrow.clockwise", action: onRefresh)
+                                .labelStyle(.iconOnly)
+                                .buttonStyle(.borderless)
+                                .help("Check again — the drive or share may have just connected")
                         }
-                        .buttonStyle(.borderless)
-                        .help("Check again — the drive or share may have just connected")
                     }
+                    Text(status.url.path)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .lineLimit(2)
+                        .truncationMode(.middle)
+                    Text(detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
-                Text(status.url.path)
-                    .font(.caption.monospaced())
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
-                    .lineLimit(2)
-                    .truncationMode(.middle)
-                Text(detail)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
             }
+            .padding(4)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .padding(10)
-        .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.05)))
     }
 
     private var detail: String {
@@ -515,11 +534,10 @@ struct PlaceRow: View {
             }
             Spacer(minLength: 4)
             if !status.isConnected, let onRefresh {
-                Button(action: onRefresh) {
-                    Image(systemName: "arrow.clockwise")
-                }
-                .buttonStyle(.borderless)
-                .font(.caption)
+                Button("Check Again", systemImage: "arrow.clockwise", action: onRefresh)
+                    .labelStyle(.iconOnly)
+                    .buttonStyle(.borderless)
+                    .font(.caption)
                 .help("Check again — the drive or share may have just connected")
             }
             Button("Change…", action: change)

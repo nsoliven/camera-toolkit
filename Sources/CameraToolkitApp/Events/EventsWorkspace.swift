@@ -323,6 +323,14 @@ final class EventsWorkspace {
         }
     }
     var guide: SetupGuide?
+    /// Bumped when keyboard focus should return to the open board's grid —
+    /// Return in the toolbar search field. The grid re-focuses itself when
+    /// it sees a new value.
+    private(set) var boardFocusRequest = 0
+
+    func requestBoardFocus() {
+        boardFocusRequest &+= 1
+    }
     var sources: [UUID: UnsortedSourceState] = [:]
     var selectedStackIDs: Set<String> = []
     var focusedStackID: String?
@@ -411,6 +419,8 @@ final class EventsWorkspace {
     /// Mounted-volume set for `isConnected`, rebuilt once per connectivity
     /// revision instead of once per sidebar row.
     @ObservationIgnored private var mountedVolumesCache: (revision: Int, paths: Set<String>)?
+    /// Folder path → reachable, per connectivity revision, for `isConnected`.
+    @ObservationIgnored private var connectedPathsCache: (revision: Int, paths: [String: Bool])?
     /// The mounted-volume set as of the last connectivity refresh — the
     /// activation check diffs a fresh mount-table read against it so a
     /// wake where nothing mounted or unmounted does no work at all.
@@ -773,7 +783,16 @@ final class EventsWorkspace {
         // `refreshConnectivity()` bumps `connectivityRevision`.
         _ = connectivityRevision
         let url = URL(fileURLWithPath: DashboardModel.expandedPath(location.path), isDirectory: true)
-        return VolumeInfo.isAvailable(url, mountedVolumes: mountedVolumePaths()) && FileManager.default.fileExists(atPath: url.path)
+        // One filesystem check per folder per connectivity revision — a
+        // sidebar re-render between refreshes answers from the cache.
+        if let cached = connectedPathsCache, cached.revision == connectivityRevision, let connected = cached.paths[url.path] {
+            return connected
+        }
+        let connected = VolumeInfo.isAvailable(url, mountedVolumes: mountedVolumePaths()) && FileManager.default.fileExists(atPath: url.path)
+        var paths = connectedPathsCache?.revision == connectivityRevision ? connectedPathsCache?.paths ?? [:] : [:]
+        paths[url.path] = connected
+        connectedPathsCache = (connectivityRevision, paths)
+        return connected
     }
 
     /// The mounted volume set, read once per connectivity revision instead of

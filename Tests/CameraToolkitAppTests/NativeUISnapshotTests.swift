@@ -1,0 +1,354 @@
+import AppKit
+import CameraToolkitCore
+import ImageIO
+import ScreenCaptureKit
+import SwiftUI
+import UniformTypeIdentifiers
+@testable import CameraToolkitApp
+import XCTest
+
+/// Renders the real windows off-screen against generated sample media and
+/// writes PNGs, so UI changes can be reviewed without launching the app
+/// against the owner's live state. Runs only when `CT_SNAPSHOT_OUT` names
+/// an output folder; run it under a write-denying `sandbox-exec` profile
+/// with `CFFIXED_USER_HOME` pointing at a scratch home.
+@MainActor
+final class NativeUISnapshotTests: XCTestCase {
+    private var outputFolder: URL!
+    private var root: URL!
+    private var model: DashboardModel!
+    private var workspace: EventsWorkspace!
+    private var unsorted: ConfiguredLocation!
+    private var beachID: UUID!
+
+    func testRenderWindows() async throws {
+        guard let out = ProcessInfo.processInfo.environment["CT_SNAPSHOT_OUT"] else {
+            throw XCTSkip("Snapshot harness runs only with CT_SNAPSHOT_OUT set.")
+        }
+        outputFolder = URL(fileURLWithPath: out, isDirectory: true)
+        try FileManager.default.createDirectory(at: outputFolder, withIntermediateDirectories: true)
+        try await makeSampleLibrary()
+        // The scratch defaults are shared between runs; start every run from
+        // the same view settings.
+        for key in ["CameraToolkit.organize.mode", "CameraToolkit.organize.tileWidth", "CameraToolkit.organize.hideSorted",
+                    "CameraToolkit.organize.showInspector", "CameraToolkit.organize.sidebarWidth"] {
+            UserDefaults.standard.removeObject(forKey: key)
+        }
+
+        let window = SnapshotWindows.main(model: model, workspace: workspace)
+        defer { window.orderOut(nil) }
+
+        for appearance in [NSAppearance.Name.aqua, .darkAqua] {
+            let suffix = appearance == .aqua ? "light" : "dark"
+            window.appearance = NSAppearance(named: appearance)
+
+            workspace.selection = .event(beachID)
+            try await waitUntil { self.workspace.eventStacks[self.beachID] != nil && self.workspace.presence[self.beachID] != nil }
+            try await snapshot(window, size: NSSize(width: 1320, height: 840), name: "main-event-board-\(suffix)")
+            try await snapshot(window, size: NSSize(width: 1040, height: 720), name: "main-event-board-narrow-\(suffix)")
+
+            // A search narrowing the board: "N of M" in the title capsule.
+            workspace.search.text = "DSC0000"
+            try await snapshot(window, size: NSSize(width: 1320, height: 840), name: "main-event-board-search-\(suffix)")
+            workspace.search.text = ""
+
+            UserDefaults.standard.set("list", forKey: "CameraToolkit.organize.mode")
+            try await snapshot(window, size: NSSize(width: 1320, height: 840), name: "main-event-board-list-\(suffix)")
+            UserDefaults.standard.removeObject(forKey: "CameraToolkit.organize.mode")
+
+            // The Event Info inspector, wide and at the narrowest window.
+            UserDefaults.standard.set(true, forKey: "CameraToolkit.organize.showInspector")
+            try await snapshot(window, size: NSSize(width: 1320, height: 840), name: "main-event-board-inspector-\(suffix)")
+            try await snapshot(window, size: NSSize(width: 1040, height: 720), name: "main-event-board-inspector-narrow-\(suffix)")
+            UserDefaults.standard.removeObject(forKey: "CameraToolkit.organize.showInspector")
+
+            workspace.selection = .unsorted(unsorted.id)
+            try await waitUntil { self.workspace.sources[self.unsorted.id]?.result != nil }
+            try await snapshot(window, size: NSSize(width: 1320, height: 840), name: "main-unsorted-board-\(suffix)")
+            try await snapshot(window, size: NSSize(width: 1040, height: 720), name: "main-unsorted-board-narrow-\(suffix)")
+
+            workspace.selection = nil
+            try await snapshot(window, size: NSSize(width: 1320, height: 840), name: "main-welcome-\(suffix)")
+
+            for (name, identifier, open) in secondaryWindows {
+                let secondary = try XCTUnwrap(SnapshotWindows.capture(identifier: identifier, open), "\(name) window")
+                secondary.appearance = NSAppearance(named: appearance)
+                try await settle(1.5)
+                try await render(secondary, name: "\(name)-\(suffix)")
+                secondary.orderOut(nil)
+            }
+        }
+    }
+
+    /// (file name, window identifier, opener) — the identifier finds the
+    /// window again on the second appearance pass, when the controller
+    /// reuses it.
+    private var secondaryWindows: [(String, String, () -> Void)] {
+        [
+            ("jobs", "CameraToolkitTransferQueueWindow", { TransferQueueWindowController.shared.show(model: self.model) }),
+            ("trash", TrashWindowController.windowIdentifier, { TrashWindowController.shared.show(model: self.model) }),
+            ("settings", "CameraToolkitConfigWindow", { CameraToolkitConfigWindow.shared.show(model: self.model) }),
+            ("people", "CameraToolkitPeopleWindow", { PeopleWindowController.shared.show(model: self.model, workspace: self.workspace) }),
+            ("event-library", "CameraToolkitEventLibraryWindow", { EventLibraryWindowController.shared.show(model: self.model) }),
+        ]
+    }
+
+    // MARK: - Rendering
+
+    private func snapshot(_ window: NSWindow, size: NSSize, name: String) async throws {
+        window.setContentSize(size)
+        try await settle(1.2)
+        try await render(window, name: name)
+    }
+
+    /// Captures the window as the window server composites it, so
+    /// sidebar vibrancy and glass render as they do on screen. Falls back to
+    /// drawing the view tree — title bar and toolbar included, but without
+    /// vibrant glyphs — when screen capture is not allowed.
+    private func render(_ window: NSWindow, name: String) async throws {
+        let frameView = try XCTUnwrap(window.contentView?.superview)
+        frameView.layoutSubtreeIfNeeded()
+        window.displayIfNeeded()
+        let url = outputFolder.appendingPathComponent("\(name).png")
+        if CGPreflightScreenCaptureAccess(), !screenCaptureStalled, let image = await captureWindow(window) {
+            let bitmap = NSBitmapImageRep(cgImage: image)
+            try XCTUnwrap(bitmap.representation(using: .png, properties: [:])).write(to: url)
+            return
+        }
+        print("Snapshot: \(name) drawn from the view tree (no screen capture)")
+        let bounds = frameView.bounds
+        let bitmap = try XCTUnwrap(frameView.bitmapImageRepForCachingDisplay(in: bounds))
+        frameView.cacheDisplay(in: bounds, to: bitmap)
+        try XCTUnwrap(bitmap.representation(using: .png, properties: [:])).write(to: url)
+    }
+
+    /// Set once a capture times out — ScreenCaptureKit can stall while
+    /// other processes capture at the same time, and a stalled call never
+    /// returns, so the rest of the run draws the view tree instead.
+    private var screenCaptureStalled = false
+
+    private func captureWindow(_ window: NSWindow, timeout: Double = 10) async -> CGImage? {
+        let image: CGImage? = await withCheckedContinuation { continuation in
+            let once = ResumeOnce(continuation)
+            Task { @MainActor in
+                do {
+                    once.resume(try await self.captureWindowNow(window))
+                } catch {
+                    print("Snapshot: screen capture failed: \(error)")
+                    once.resume(nil)
+                }
+            }
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(timeout))
+                if once.resume(nil) {
+                    self.screenCaptureStalled = true
+                    print("Snapshot: screen capture stalled; drawing the view tree from here on")
+                }
+            }
+        }
+        return image
+    }
+
+    private func captureWindowNow(_ window: NSWindow) async throws -> CGImage? {
+        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+        guard let target = content.windows.first(where: { $0.windowID == CGWindowID(window.windowNumber) }) else {
+            print("Snapshot: window \(window.windowNumber) is not in the shareable content")
+            return nil
+        }
+        let filter = SCContentFilter(desktopIndependentWindow: target)
+        let configuration = SCStreamConfiguration()
+        let scale = window.backingScaleFactor
+        configuration.width = Int(window.frame.width * scale)
+        configuration.height = Int(window.frame.height * scale)
+        configuration.showsCursor = false
+        configuration.ignoreShadowsSingleWindow = true
+        return try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration)
+    }
+
+    private func settle(_ seconds: Double) async throws {
+        try await Task.sleep(for: .milliseconds(Int(seconds * 1_000)))
+    }
+
+    private func waitUntil(timeout: TimeInterval = 30, _ condition: () -> Bool) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !condition() {
+            guard Date() < deadline else {
+                XCTFail("Timed out waiting for the sample library")
+                return
+            }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+    }
+
+    // MARK: - Sample library
+
+    private func makeSampleLibrary() async throws {
+        root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CameraToolkitSnapshots-\(UUID().uuidString)", isDirectory: true)
+            .resolvingSymlinksInPath()
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let configuration = AppConfiguration(
+            demoRootPath: root.appendingPathComponent("Safety Test").path,
+            importSourcePath: root.appendingPathComponent("Card").path,
+            archivePath: root.appendingPathComponent("Library/Originals").path,
+            bufferPath: root.appendingPathComponent("Drive/Camera Buffer").path,
+            cameraLibraryRootPath: root.appendingPathComponent("Library").path,
+            catalogDatabasePath: root.appendingPathComponent("catalog.sqlite").path,
+            activityLogPath: root.appendingPathComponent("activity.jsonl").path,
+            selectedDeviceID: "sony-a7v"
+        )
+        model = DashboardModel(
+            jobs: [],
+            configuration: configuration,
+            configurationStore: ConfigurationStore(url: root.appendingPathComponent("config.json"))
+        )
+        workspace = EventsWorkspace(model: model, supportFolder: root.appendingPathComponent("Support", isDirectory: true))
+
+        let folder = root.appendingPathComponent("Drive/Unsorted A7V", isDirectory: true)
+        let palette: [(CGFloat, CGFloat, CGFloat)] = [
+            (0.95, 0.62, 0.30), (0.25, 0.55, 0.85), (0.35, 0.72, 0.45), (0.80, 0.35, 0.50),
+            (0.55, 0.45, 0.85), (0.90, 0.80, 0.35), (0.30, 0.70, 0.75), (0.65, 0.40, 0.30),
+        ]
+        var index = 1
+        for (day, hour) in [("2026:08:26", 10), ("2026:08:26", 17), ("2026:08:27", 9), ("2026:08:28", 14)] {
+            for shot in 0..<9 {
+                let burst = shot < 4
+                let seconds = burst ? shot : shot * 40
+                let time = String(format: "%@ %02d:%02d:%02d", day, hour, seconds / 60, seconds % 60)
+                let prefix = burst ? String(format: "B%04d_", index / 10 + 1) : ""
+                try writeJPEG(
+                    folder.appendingPathComponent(String(format: "Transfer 1/%@DSC%05d.JPG", prefix, index)),
+                    captured: time,
+                    color: palette[(index + shot) % palette.count],
+                    portrait: shot % 5 == 3
+                )
+                index += 1
+            }
+        }
+        unsorted = ConfiguredLocation(role: .importSource, name: "Unsorted A7V", path: folder.path, deviceID: "sony-a7v")
+        model.updateConfiguration { $0.configuredLocations.append(self.unsorted) }
+
+        workspace.scan(unsorted)
+        try await waitUntil { self.workspace.sources[self.unsorted.id]?.result != nil }
+        let result = try XCTUnwrap(workspace.sources[unsorted.id]?.result)
+
+        beachID = try XCTUnwrap(workspace.createEvent(name: "Beach Day", date: day("2026-08-26"), policy: .buffer))
+        let sunset = try XCTUnwrap(workspace.createEvent(name: "Sunset", date: day("2026-08-26"), policy: nil, parentEventID: beachID))
+        let birthday = try XCTUnwrap(workspace.createEvent(name: "Birthday", date: day("2026-08-27"), policy: .buffer))
+        _ = workspace.createEvent(name: "Client Shoot", date: day("2026-08-28"), policy: .archiveOnly)
+
+        let stacks = result.stacks.sorted { $0.captureDate < $1.captureDate }
+        let calendar = Calendar.current
+        let first = stacks.filter { calendar.component(.day, from: $0.captureDate) == 26 }
+        workspace.assign(stackIDs: Set(first.prefix(4).map(\.id)), from: unsorted.id, to: beachID)
+        workspace.assign(stackIDs: Set(first.dropFirst(4).prefix(3).map(\.id)), from: unsorted.id, to: sunset)
+        let second = stacks.filter { calendar.component(.day, from: $0.captureDate) == 27 }
+        workspace.assign(stackIDs: Set(second.prefix(2).map(\.id)), from: unsorted.id, to: birthday)
+    }
+
+    private func day(_ value: String) -> Date {
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = .current
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter.date(from: value)!
+    }
+
+    /// A small gradient JPEG with an EXIF capture time, so the board has
+    /// real thumbnails, days, and bursts to lay out.
+    private func writeJPEG(_ url: URL, captured: String, color: (CGFloat, CGFloat, CGFloat), portrait: Bool) throws {
+        let width = portrait ? 400 : 600
+        let height = portrait ? 600 : 400
+        let space = CGColorSpaceCreateDeviceRGB()
+        let context = try XCTUnwrap(CGContext(
+            data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+            space: space, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ))
+        let top = CGColor(red: color.0, green: color.1, blue: color.2, alpha: 1)
+        let bottom = CGColor(red: color.0 * 0.35, green: color.1 * 0.35, blue: color.2 * 0.45, alpha: 1)
+        let gradient = try XCTUnwrap(CGGradient(colorsSpace: space, colors: [top, bottom] as CFArray, locations: [0, 1]))
+        context.drawLinearGradient(gradient, start: CGPoint(x: 0, y: CGFloat(height)), end: CGPoint(x: CGFloat(width), y: 0), options: [])
+        context.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 0.35))
+        context.fillEllipse(in: CGRect(x: width / 3, y: height / 3, width: width / 3, height: width / 3))
+        let image = try XCTUnwrap(context.makeImage())
+
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let destination = try XCTUnwrap(CGImageDestinationCreateWithURL(url as CFURL, UTType.jpeg.identifier as CFString, 1, nil))
+        let properties: [CFString: Any] = [
+            kCGImagePropertyExifDictionary: [kCGImagePropertyExifDateTimeOriginal: captured],
+            kCGImagePropertyTIFFDictionary: [kCGImagePropertyTIFFModel: "ILCE-7M5"],
+        ]
+        CGImageDestinationAddImage(destination, image, properties as CFDictionary)
+        XCTAssertTrue(CGImageDestinationFinalize(destination))
+    }
+}
+
+/// Resumes a continuation from whichever of two racing tasks finishes
+/// first; the loser's call does nothing.
+@MainActor
+private final class ResumeOnce {
+    private var continuation: CheckedContinuation<CGImage?, Never>?
+
+    init(_ continuation: CheckedContinuation<CGImage?, Never>) {
+        self.continuation = continuation
+    }
+
+    /// True when this call resumed the continuation.
+    @discardableResult
+    func resume(_ value: CGImage?) -> Bool {
+        guard let continuation else { return false }
+        self.continuation = nil
+        continuation.resume(returning: value)
+        return true
+    }
+}
+
+/// Windows for the harness, built off-screen with no mouse events, so
+/// nothing flashes on the owner's screen.
+@MainActor
+enum SnapshotWindows {
+    /// The real main window from `MainWindowFactory`, built as an
+    /// `OffscreenWindow` and parked off every display.
+    static func main(model: DashboardModel, workspace: EventsWorkspace) -> NSWindow {
+        let window = MainWindowFactory.make(model: model, workspace: workspace, restoresFrame: false) { rect, style in
+            OffscreenWindow(
+                contentRect: NSRect(origin: offscreen, size: rect.size),
+                styleMask: style,
+                backing: .buffered,
+                defer: false
+            )
+        }
+        hide(window)
+        window.orderFrontRegardless()
+        return window
+    }
+
+    /// Opens a secondary window through its real controller and hides it
+    /// before the run loop gets a chance to draw it on screen.
+    static func capture(identifier: String, _ open: () -> Void) -> NSWindow? {
+        open()
+        let window = NSApp.windows.first { $0.identifier?.rawValue == identifier }
+        window.map(hide)
+        return window
+    }
+
+    static let offscreen = NSPoint(x: -20_000, y: -20_000)
+
+    /// Parks the window far off every display. It stays opaque so screen
+    /// capture sees real pixels, but no screen ever shows it.
+    static func hide(_ window: NSWindow) {
+        window.ignoresMouseEvents = true
+        window.setFrameOrigin(offscreen)
+    }
+}
+
+/// Keeps AppKit from pulling the harness window back onto a display, and
+/// draws with the active-window look without activating the test process
+/// and taking focus from whatever the owner is doing.
+final class OffscreenWindow: NSWindow {
+    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect { frameRect }
+    override var isKeyWindow: Bool { true }
+    override var isMainWindow: Bool { true }
+    override var canBecomeKey: Bool { true }
+}

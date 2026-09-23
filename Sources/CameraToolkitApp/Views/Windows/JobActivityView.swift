@@ -27,11 +27,10 @@ struct JobActivityDetail: View {
             throughputAndHardware
             debugLines
         }
-        .padding(.leading, 48)
-        .padding(.trailing, 16)
-        .padding(.vertical, 10)
+        .padding(.leading, 36)
+        .padding(.trailing, 8)
+        .padding(.vertical, 6)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color(nsColor: .controlBackgroundColor))
     }
 
     // MARK: - What is running right now
@@ -329,7 +328,7 @@ struct JobActivityDetail: View {
             .foregroundStyle(stepColor(step))
             .padding(.horizontal, 7)
             .padding(.vertical, 3)
-            .background(stepColor(step).opacity(0.12), in: Capsule())
+            .background(stepColor(step).quinary, in: Capsule())
     }
 
     private func stepColor(_ step: String) -> Color {

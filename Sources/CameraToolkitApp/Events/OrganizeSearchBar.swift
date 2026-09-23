@@ -1,9 +1,8 @@
 import CameraToolkitCore
 import SwiftUI
 
-/// The board's search field plus its filter-builder popover. The field
-/// keeps the free-text match (file name, burst, origin folder, event
-/// title); focusing it or tapping the funnel opens a panel of condition
+/// The board's filter button and its filter-builder popover. The search
+/// text lives in the window's toolbar field; this panel holds condition
 /// rows — People, Date, Event, Media — ANDed inside a group, with groups
 /// ORed. Both AND with the text. Clear All resets it all.
 ///
@@ -12,7 +11,7 @@ import SwiftUI
 /// pickers default to the board's own day range, and on an event board the
 /// Event picker narrows to the board's family — the event plus its
 /// subevents — since picks outside it cannot match there.
-struct OrganizeSearchBar: View {
+struct OrganizeFilterButton: View {
     let workspace: EventsWorkspace
     /// The unfiltered board's stacks — the People picker's options and the
     /// date picker's fallback bounds come from these.
@@ -22,9 +21,6 @@ struct OrganizeSearchBar: View {
     /// Nil on unsorted boards, where every event is a valid pick.
     var eventScope: Set<UUID>? = nil
     @Binding var search: OrganizeSearchFilter
-    /// The parent's ⌘F focus state — the field stays the find target, and
-    /// gaining focus opens the panel.
-    var focused: FocusState<Bool>.Binding
     /// Stacks the current search keeps — the footer's "N of M" readout.
     var matchedCount: Int? = nil
 
@@ -49,44 +45,19 @@ struct OrganizeSearchBar: View {
     }
 
     var body: some View {
-        HStack(spacing: 5) {
-            Image(systemName: "magnifyingglass")
-                .foregroundStyle(.secondary)
-            TextField("Search", text: $search.text)
-                .textFieldStyle(.plain)
-                .frame(width: 130)
-                .focused(focused)
-            if !search.text.isEmpty {
-                Button {
-                    search.text = ""
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .foregroundStyle(.secondary)
-                }
-                .buttonStyle(.plain)
-                .help("Clear search")
-            }
-            Button {
-                showFilters.toggle()
-            } label: {
-                Image(systemName: search.activeRowCount > 0
-                    ? "line.3.horizontal.decrease.circle.fill"
-                    : "line.3.horizontal.decrease.circle")
-                    .foregroundStyle(search.activeRowCount > 0 ? Color.accentColor : Color.secondary)
-            }
-            .buttonStyle(.plain)
-            .help("Filter by people, date, event, or media kind")
+        let active = search.activeRowCount
+        Button {
+            showFilters.toggle()
+        } label: {
+            Label(active > 0 ? "Filters On" : "Filter", systemImage: "line.3.horizontal.decrease")
+                .symbolVariant(active > 0 ? .circle.fill : .none)
+                .foregroundStyle(active > 0 ? AnyShapeStyle(.tint) : AnyShapeStyle(.primary))
         }
-        .font(.callout)
-        .padding(.horizontal, 7)
-        .padding(.vertical, 4)
-        .background(.quaternary, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
-        .help("Filter by file name, burst, folder, or event (⌘F)")
-        .popover(isPresented: $showFilters, arrowEdge: .bottom) {
+        .help(active > 0
+            ? "\(active) filter\(active == 1 ? "" : "s") on — people, date, event, or media kind"
+            : "Filter by people, date, event, or media kind")
+        .popover(isPresented: $showFilters, arrowEdge: .top) {
             filterPanel
-        }
-        .onChange(of: focused.wrappedValue) { _, isFocused in
-            if isFocused { showFilters = true }
         }
     }
 
@@ -571,7 +542,7 @@ struct OrganizeFilterHotLinks: View {
     /// The Media row's picks as "Stills, RAW" — the picker's titles, with
     /// "Other" for a kind the picker does not offer.
     private func mediaLabel(for row: OrganizeFilterRow) -> String {
-        var titles = OrganizeSearchBar.mediaOptions
+        var titles = OrganizeFilterButton.mediaOptions
             .filter { row.mediaKinds.contains($0.kind) }
             .map(\.title)
         if row.mediaKinds.contains(.other) { titles.append("Other") }
@@ -621,20 +592,49 @@ struct OrganizeFilterHotLinks: View {
 }
 
 /// Left-to-right wrapping layout — chips flow onto the next line instead
-/// of clipping.
+/// of clipping. A child wider than the container is offered the container's
+/// width, so it truncates instead of pushing the layout wider.
 struct FlowLayout: Layout {
     var horizontalSpacing: CGFloat = 6
     var verticalSpacing: CGFloat = 6
     var alignment: HorizontalAlignment = .leading
 
-    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+    /// Each child's size, measured once per width limit.
+    struct Cache {
+        var limit: CGFloat?
+        var sizes: [CGSize] = []
+    }
+
+    func makeCache(subviews: Subviews) -> Cache {
+        Cache()
+    }
+
+    func updateCache(_ cache: inout Cache, subviews: Subviews) {
+        cache = Cache()
+    }
+
+    private func sizes(for subviews: Subviews, limit: CGFloat, cache: inout Cache) -> [CGSize] {
+        if cache.limit == limit, cache.sizes.count == subviews.count {
+            return cache.sizes
+        }
+        let sizes = subviews.map { subview -> CGSize in
+            let ideal = subview.sizeThatFits(.unspecified)
+            guard ideal.width > limit, limit.isFinite else { return ideal }
+            let clamped = subview.sizeThatFits(ProposedViewSize(width: limit, height: nil))
+            return CGSize(width: min(clamped.width, limit), height: clamped.height)
+        }
+        cache = Cache(limit: limit, sizes: sizes)
+        return sizes
+    }
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout Cache) -> CGSize {
         let limit = proposal.width ?? .infinity
+        let sizes = sizes(for: subviews, limit: limit, cache: &cache)
         var x: CGFloat = 0
         var height: CGFloat = 0
         var lineHeight: CGFloat = 0
         var usedWidth: CGFloat = 0
-        for subview in subviews {
-            let size = subview.sizeThatFits(.unspecified)
+        for size in sizes {
             if x > 0, x + size.width > limit {
                 x = 0
                 height += lineHeight + verticalSpacing
@@ -647,8 +647,8 @@ struct FlowLayout: Layout {
         return CGSize(width: usedWidth, height: height + lineHeight)
     }
 
-    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
-        let sizes = subviews.map { $0.sizeThatFits(.unspecified) }
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout Cache) {
+        let sizes = sizes(for: subviews, limit: bounds.width, cache: &cache)
         var index = 0
         var y = bounds.minY
         while index < subviews.count {

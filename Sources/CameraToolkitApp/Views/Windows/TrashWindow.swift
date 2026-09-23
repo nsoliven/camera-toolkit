@@ -15,29 +15,20 @@ final class TrashWindowController: NSObject, NSWindowDelegate {
 
     func show(model: DashboardModel) {
         if let window {
-            window.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
+            CameraToolkitWindowFactory.present(window)
             return
         }
 
-        let controller = NSHostingController(rootView: TrashBrowserView(model: model))
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 1_060, height: 700),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
-            backing: .buffered,
-            defer: false
+        let window = CameraToolkitWindowFactory.make(
+            .trash,
+            identifier: Self.windowIdentifier,
+            title: "Trash",
+            initialContentSize: NSSize(width: 1_060, height: 700),
+            rootView: TrashBrowserView(model: model)
         )
-        window.title = "Trash"
-        window.identifier = NSUserInterfaceItemIdentifier(Self.windowIdentifier)
-        window.isReleasedWhenClosed = false
-        window.contentViewController = controller
-        CameraToolkitWindowSizing.configure(window, as: .trash)
-        window.setContentSize(NSSize(width: 1_060, height: 700))
         window.delegate = self
-        window.center()
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
         self.window = window
+        CameraToolkitWindowFactory.present(window)
     }
 }
 
@@ -89,6 +80,7 @@ struct TrashBrowserView: View {
     @State private var anchorID: String?
     @State private var focusedID: String?
     @State private var showEmptyTrash = false
+    @State private var showDateRange = false
     @State private var message: String?
     @State private var columns = 1
     @FocusState private var gridFocused: Bool
@@ -150,146 +142,121 @@ struct TrashBrowserView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            header
-            Divider()
-            actionBar
-            Divider()
-            content
-            Divider()
-            footerLine
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color(nsColor: .windowBackgroundColor))
-        .sheet(isPresented: $showEmptyTrash) {
-            EmptyTrashSheet(
-                model: model,
-                fileCount: items.count,
-                byteCount: items.reduce(Int64(0)) { $0 + $1.size }
-            )
-        }
-        .task(id: eventNames) { reload() }
-        .onReceive(NotificationCenter.default.publisher(for: .cameraToolkitMediaTrashChanged)) { _ in
-            reload()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .cameraToolkitStorageLocationsChanged)) { _ in
-            reload()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: BrowserCommand.notification)) { notification in
-            guard let raw = notification.object as? String, let command = BrowserCommand(rawValue: raw) else { return }
-            handle(command)
-        }
+        content
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                VStack(spacing: 0) {
+                    Divider()
+                    if let message {
+                        Text(message)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 16)
+                            .padding(.top, 6)
+                    }
+                    footerLine
+                }
+                .background(.bar)
+            }
+            .navigationTitle("Trash")
+            .navigationSubtitle(subtitle)
+            .searchable(text: $query.text, placement: .toolbar, prompt: "Name, event, or person")
+            .searchFocused($searchFocused)
+            .toolbar { toolbar }
+            .sheet(isPresented: $showEmptyTrash) {
+                EmptyTrashSheet(
+                    model: model,
+                    fileCount: items.count,
+                    byteCount: items.reduce(Int64(0)) { $0 + $1.size }
+                )
+            }
+            .task(id: eventNames) { reload() }
+            .onReceive(NotificationCenter.default.publisher(for: .cameraToolkitMediaTrashChanged)) { _ in
+                reload()
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .cameraToolkitStorageLocationsChanged)) { _ in
+                reload()
+            }
+            .onReceive(NotificationCenter.default.publisher(for: BrowserCommand.notification)) { notification in
+                guard let raw = notification.object as? String, let command = BrowserCommand(rawValue: raw) else { return }
+                handle(command)
+            }
     }
 
-    // MARK: - Header
+    // MARK: - Toolbar
 
-    private var header: some View {
-        HStack(spacing: 12) {
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 8) {
-                    Image(systemName: "trash.fill")
-                        .foregroundStyle(.orange)
-                    Text("Trash")
-                        .font(.title2.bold())
-                        .lineLimit(1)
-                }
-                Text(summaryLine)
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+    /// The window subtitle: the selection while there is one, else what the
+    /// Trash holds.
+    private var subtitle: String {
+        selectedIDs.isEmpty ? summaryLine : "\(selectedIDs.count) selected · \(summaryLine)"
+    }
+
+    @ToolbarContentBuilder
+    private var toolbar: some ToolbarContent {
+        ToolbarItem(placement: .navigation) {
+            dateRangeButton
+        }
+        ToolbarItem {
+            Slider(value: $tileWidth, in: 96...360) {
+                Text("Tile Size")
+            } minimumValueLabel: {
+                Image(systemName: "photo")
+                    .imageScale(.small)
+            } maximumValueLabel: {
+                Image(systemName: "photo")
+                    .imageScale(.large)
             }
-            Spacer(minLength: 8)
-            searchField
-            dateRange
-            Slider(value: $tileWidth, in: 96...360)
-                .frame(width: 90)
-                .help("Tile size — smaller fits more files on screen")
-            Button {
+            .frame(width: 130)
+            .help("Tile size — smaller fits more files on screen")
+        }
+        ToolbarItem {
+            Button("Reload", systemImage: "arrow.clockwise") {
                 reload()
-            } label: {
-                Image(systemName: "arrow.clockwise")
             }
             .help("Re-read the Trash folders — the board already refreshes itself after every Trash, restore, or Empty")
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 12)
-    }
-
-    private var searchField: some View {
-        HStack(spacing: 5) {
-            Image(systemName: "magnifyingglass")
-                .foregroundStyle(.secondary)
-            TextField("Name, event, or person", text: $query.text)
-                .textFieldStyle(.plain)
-                .frame(width: 150)
-                .focused($searchFocused)
-            if !query.text.isEmpty {
-                Button {
-                    query.text = ""
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .foregroundStyle(.secondary)
-                }
-                .buttonStyle(.plain)
-                .help("Clear search")
-            }
+        ToolbarSpacer(.fixed)
+        ToolbarItem {
+            batchMenu
         }
-        .font(.callout)
-        .padding(.horizontal, 7)
-        .padding(.vertical, 4)
-        .background(.quaternary, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
-        .help("Filter by file name, event, or confirmed person (⌘F)")
+        ToolbarItem {
+            Button("Empty Trash…", systemImage: "trash", role: .destructive) {
+                showEmptyTrash = true
+            }
+            .disabled(items.isEmpty || model.isBusy)
+            .help("Permanently delete everything inside the _Trash folders — a typed DELETE confirmation is required")
+        }
+        ToolbarSpacer(.fixed)
+        ToolbarItem {
+            Button {
+                restore(selectionItems())
+            } label: {
+                Label("Restore", systemImage: "arrow.uturn.backward")
+                    .labelStyle(.titleAndIcon)
+            }
+            .buttonStyle(.glassProminent)
+            .disabled(selectedIDs.isEmpty || model.isBusy)
+            .help("Rename the selected files back to the paths they were trashed from. Existing files are never replaced.")
+        }
     }
 
     /// From/Through pickers over each item's `sortDate` — the capture date
-    /// the board recorded at trash time, else the day it was trashed.
-    private var dateRange: some View {
-        let bounds = dayBounds
-        return HStack(spacing: 6) {
-            Text("From")
-            DatePicker(
-                "From",
-                selection: Binding(
-                    get: { query.dayStart ?? bounds.first },
-                    set: { day in
-                        query.dayStart = day
-                        if let end = query.dayEnd, day > end { query.dayEnd = day }
-                    }
-                ),
-                displayedComponents: .date
-            )
-            .labelsHidden()
-            if query.dayStart != nil {
-                clearDateButton { query.dayStart = nil }
-            }
-            Text("Through")
-            DatePicker(
-                "Through",
-                selection: Binding(
-                    get: { query.dayEnd ?? bounds.last },
-                    set: { day in
-                        query.dayEnd = day
-                        if let start = query.dayStart, day < start { query.dayStart = day }
-                    }
-                ),
-                displayedComponents: .date
-            )
-            .labelsHidden()
-            if query.dayEnd != nil {
-                clearDateButton { query.dayEnd = nil }
-            }
+    /// the board recorded at trash time, else the day it was trashed. A
+    /// popover, because a toolbar menu cannot host date pickers.
+    private var dateRangeButton: some View {
+        let isFiltering = query.dayStart != nil || query.dayEnd != nil
+        return Button {
+            showDateRange.toggle()
+        } label: {
+            Label("Dates", systemImage: isFiltering ? "calendar.badge.checkmark" : "calendar")
         }
-        .font(.callout)
-        .foregroundStyle(.secondary)
-        .help("Keep only files shot (or trashed) inside this day range")
-    }
-
-    private func clearDateButton(_ action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Image(systemName: "xmark.circle.fill")
-                .foregroundStyle(.secondary)
+        .help("Keep only files shot (or trashed) inside a day range")
+        .popover(isPresented: $showDateRange, arrowEdge: .bottom) {
+            TrashDateRangeForm(query: $query, bounds: dayBounds)
         }
-        .buttonStyle(.plain)
     }
 
     /// The pickers' fallback bounds — the Trash's own day span so an unset
@@ -297,42 +264,6 @@ struct TrashBrowserView: View {
     private var dayBounds: (first: Date, last: Date) {
         let dates = items.map(\.sortDate)
         return (dates.min() ?? Date(), dates.max() ?? Date())
-    }
-
-    // MARK: - Action bar
-
-    private var actionBar: some View {
-        HStack(spacing: 10) {
-            Text(selectedIDs.isEmpty ? "Select files to restore them" : "\(selectedIDs.count) selected")
-                .font(.callout.weight(.semibold))
-                .frame(minWidth: 140, alignment: .leading)
-            Button {
-                restore(selectionItems())
-            } label: {
-                Label("Restore", systemImage: "arrow.uturn.backward")
-            }
-            .buttonStyle(.borderedProminent)
-            .disabled(selectedIDs.isEmpty || model.isBusy)
-            .help("Rename the selected files back to the paths they were trashed from. Existing files are never replaced.")
-            if let message {
-                Text(message)
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-            }
-            Spacer(minLength: 0)
-            batchMenu
-            Button(role: .destructive) {
-                showEmptyTrash = true
-            } label: {
-                Label("Empty Trash…", systemImage: "trash.slash")
-            }
-            .disabled(items.isEmpty || model.isBusy)
-            .help("Permanently delete everything inside the _Trash folders — a typed DELETE confirmation is required")
-        }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 8)
     }
 
     /// Whole-batch restore, kept reachable now that Settings no longer lists
@@ -356,10 +287,8 @@ struct TrashBrowserView: View {
                 }
             }
         } label: {
-            Label("Batches", systemImage: "square.stack.3d.up")
+            Label("Batches", systemImage: "square.stack")
         }
-        .menuStyle(.borderlessButton)
-        .fixedSize()
         .disabled(model.isBusy)
         .help("Restore an entire Trash batch — every file back to its recorded location")
     }
@@ -457,6 +386,13 @@ struct TrashBrowserView: View {
         .onTapGesture {
             select(item, orderedIDs: orderedIDs)
             gridFocused = true
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(item.fileName)
+        .accessibilityValue(item.eventName ?? "")
+        .accessibilityAddTraits(selectedIDs.contains(item.id) ? [.isButton, .isSelected] : .isButton)
+        .accessibilityAction {
+            select(item, orderedIDs: orderedIDs)
         }
         .contextMenu { contextMenu(item) }
     }
@@ -670,6 +606,80 @@ struct TrashBrowserView: View {
     }
 }
 
+/// The Trash's day-range filter, shown in a popover from the toolbar. An
+/// unset end shows the Trash's own first or last day instead of today.
+private struct TrashDateRangeForm: View {
+    @Binding var query: MediaTrashQuery
+    let bounds: (first: Date, last: Date)
+
+    var body: some View {
+        Form {
+            Section {
+                LabeledContent("From") {
+                    HStack(spacing: 6) {
+                        DatePicker(
+                            "From",
+                            selection: Binding(
+                                get: { query.dayStart ?? bounds.first },
+                                set: { day in
+                                    query.dayStart = day
+                                    if let end = query.dayEnd, day > end { query.dayEnd = day }
+                                }
+                            ),
+                            displayedComponents: .date
+                        )
+                        .labelsHidden()
+                        clearButton("Clear From Date", isSet: query.dayStart != nil) { query.dayStart = nil }
+                    }
+                }
+                LabeledContent("Through") {
+                    HStack(spacing: 6) {
+                        DatePicker(
+                            "Through",
+                            selection: Binding(
+                                get: { query.dayEnd ?? bounds.last },
+                                set: { day in
+                                    query.dayEnd = day
+                                    if let start = query.dayStart, day < start { query.dayStart = day }
+                                }
+                            ),
+                            displayedComponents: .date
+                        )
+                        .labelsHidden()
+                        clearButton("Clear Through Date", isSet: query.dayEnd != nil) { query.dayEnd = nil }
+                    }
+                }
+            } footer: {
+                HStack {
+                    Text("Shot, or trashed when no capture date is known.")
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Show All Dates") {
+                        query.dayStart = nil
+                        query.dayEnd = nil
+                    }
+                    .disabled(query.dayStart == nil && query.dayEnd == nil)
+                }
+            }
+        }
+        .formStyle(.grouped)
+        .frame(width: 380)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
+    /// Clears one end of the range. Kept in the layout while unset (just
+    /// hidden) so the pickers do not jump.
+    private func clearButton(_ title: String, isSet: Bool, action: @escaping () -> Void) -> some View {
+        Button(title, systemImage: "xmark.circle.fill", action: action)
+            .labelStyle(.iconOnly)
+            .buttonStyle(.borderless)
+            .foregroundStyle(.secondary)
+            .help(title)
+            .opacity(isSet ? 1 : 0)
+            .disabled(!isSet)
+    }
+}
+
 /// One pinned day row in the Trash board — same rhythm as the board's group
 /// headers, with a Select that picks the whole day.
 private struct TrashDayHeader: View {
@@ -742,7 +752,7 @@ private struct TrashTileView: View {
                 .padding(6)
             }
             .frame(width: width, height: width * 2 / 3)
-            .background(Color.black.opacity(0.12))
+            .background(.quaternary)
             .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
             .overlay {
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
@@ -825,13 +835,17 @@ private struct TrashTileView: View {
     }
 }
 
-/// Permanent delete, behind the same typed DELETE confirmation the Settings
-/// row uses. Covers exactly the roots the browser lists — nothing outside a
-/// `_Trash` folder is touched.
-private struct EmptyTrashSheet: View {
+/// Permanent delete, behind a typed DELETE confirmation. The Trash window
+/// and Settings both present this one sheet. Covers exactly the roots the
+/// browser lists — nothing outside a `_Trash` folder is touched.
+struct EmptyTrashSheet: View {
     @Bindable var model: DashboardModel
-    let fileCount: Int
-    let byteCount: Int64
+    /// What the Trash window counted; nil when the caller (Settings) has
+    /// not listed the Trash.
+    let fileCount: Int?
+    let byteCount: Int64?
+    /// Receives the job's summary once the delete finishes.
+    var onFinished: ((String) -> Void)? = nil
 
     @Environment(\.dismiss) private var dismiss
     @State private var confirmation = ""
@@ -839,13 +853,13 @@ private struct EmptyTrashSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack(alignment: .top, spacing: 12) {
-                Image(systemName: "trash.slash.fill")
+                Image(systemName: "trash.fill")
                     .font(.title)
                     .foregroundStyle(.red)
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Empty Trash?")
                         .font(.title2.bold())
-                    Text("\(fileCount) file\(fileCount == 1 ? "" : "s") · \(byteCount.formattedBytes) will be permanently deleted.")
+                    Text(countLine)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -873,6 +887,13 @@ private struct EmptyTrashSheet: View {
         }
         .padding(20)
         .frame(width: 480)
+    }
+
+    private var countLine: String {
+        guard let fileCount, let byteCount else {
+            return "Everything in the _Trash folders will be permanently deleted."
+        }
+        return "\(fileCount) file\(fileCount == 1 ? "" : "s") · \(byteCount.formattedBytes) will be permanently deleted."
     }
 
     private func empty() {
@@ -909,6 +930,7 @@ private struct EmptyTrashSheet: View {
                 let summary = parts.joined(separator: " ")
                 confirmation = ""
                 NotificationCenter.default.post(name: .cameraToolkitMediaTrashChanged, object: nil)
+                onFinished?(summary)
                 dismiss()
                 return summary
             }
