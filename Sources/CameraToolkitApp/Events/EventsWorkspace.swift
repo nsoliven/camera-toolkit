@@ -430,9 +430,19 @@ final class EventsWorkspace {
     /// Holds move journals and the capture-time cache.
     let supportFolder: URL
 
-    init(model: DashboardModel, supportFolder: URL = EventsWorkspace.defaultSupportFolder) {
+    /// Background disk work waits at this gate while a speed test is
+    /// measuring the volume it would touch — scans, sweeps, capture-date
+    /// reads, and tile decodes resume by themselves when the test ends.
+    let driveActivityGate: DriveActivityGate
+
+    init(
+        model: DashboardModel,
+        supportFolder: URL = EventsWorkspace.defaultSupportFolder,
+        driveActivityGate: DriveActivityGate = .shared
+    ) {
         self.model = model
         self.supportFolder = supportFolder
+        self.driveActivityGate = driveActivityGate
     }
 
     deinit {
@@ -1277,10 +1287,11 @@ final class EventsWorkspace {
             }
         }
 
+        let gate = driveActivityGate
         Task { @MainActor [weak self] in
             let outcome: Result<OrganizeScanResult, any Error> = await Task.detached(priority: .userInitiated) {
                 Result {
-                    try OrganizeScanner().scan(root: root, cache: cache, burstGrouping: BurstGroupingConfiguration.resolved(), burstSplits: burstSplits, progress: reportProgress)
+                    try OrganizeScanner().scan(root: root, cache: cache, burstGrouping: BurstGroupingConfiguration.resolved(), burstSplits: burstSplits, pauseGate: gate, progress: reportProgress)
                 }
             }.value
             guard let self else { return }
@@ -1727,13 +1738,16 @@ final class EventsWorkspace {
     func discoverDriveEvents() {
         let configuration = model.configuration
         let locations = self.locations
+        let gate = driveActivityGate
         Task { @MainActor [weak self] in
             let found = await Task.detached(priority: .utility) { () -> [DiscoveredDriveEvent] in
                 var all: [DiscoveredDriveEvent] = []
-                if VolumeInfo.isAvailable(locations.bufferRoot) {
+                if VolumeInfo.isAvailable(locations.bufferRoot),
+                   gate.waitIfPaused(for: locations.bufferRoot, shouldStop: { Task.isCancelled }) {
                     all += (try? DriveEventDiscovery.discover(driveRoot: locations.bufferRoot, policy: .buffer, configuration: configuration)) ?? []
                 }
-                if VolumeInfo.isAvailable(locations.privateStagingRoot) {
+                if VolumeInfo.isAvailable(locations.privateStagingRoot),
+                   gate.waitIfPaused(for: locations.privateStagingRoot, shouldStop: { Task.isCancelled }) {
                     all += (try? DriveEventDiscovery.discover(driveRoot: locations.privateStagingRoot, policy: .archiveOnly, configuration: configuration)) ?? []
                 }
                 return all
@@ -1805,6 +1819,7 @@ final class EventsWorkspace {
         let catalogURL = URL(fileURLWithPath: DashboardModel.expandedPath(model.configuration.catalogDatabasePath))
         let probe = presenceProbe
         let dateReadProbe = captureDateReadProbe
+        let gate = driveActivityGate
 
         // The board shows each direct subevent as its own section, so
         // the family is this event plus every descendant. Each member's
@@ -1853,7 +1868,7 @@ final class EventsWorkspace {
                     guard let path = resolve(assignment) else { return nil }
                     return OrganizeFile(literalPath: path, size: assignment.fileSize, modifiedAt: assignment.modifiedAt)
                 }
-                let items = OrganizeScanner.items(for: files, cache: cache).items
+                let items = OrganizeScanner.items(for: files, cache: cache, pauseGate: gate).items
                 return EventImpliedGrid(
                     files: files,
                     stacks: OrganizeStacker.stacks(for: items, splits: burstSplits)
@@ -1892,7 +1907,7 @@ final class EventsWorkspace {
                 // waiting out the remaining capture-date reads. The count
                 // of those reads rides the apply so the board can say
                 // dates are still coming without saying files are.
-                let undated = OrganizeScanner.items(for: files, cache: cache, readMissingCaptureDates: false)
+                let undated = OrganizeScanner.items(for: files, cache: cache, readMissingCaptureDates: false, pauseGate: gate)
                 await applyEventBuild(
                     eventID: eventID,
                     generation: generation,
@@ -1909,7 +1924,7 @@ final class EventsWorkspace {
                 // means "after the provisional publish".
                 let previousProbe = cache.timestampProbe
                 cache.timestampProbe = dateReadProbe
-                let dated = OrganizeScanner.items(for: files, cache: cache)
+                let dated = OrganizeScanner.items(for: files, cache: cache, pauseGate: gate)
                 cache.timestampProbe = previousProbe
                 built = EventImpliedGrid(
                     files: files,
@@ -1926,7 +1941,8 @@ final class EventsWorkspace {
                     event: member,
                     assignments: assignmentsByEvent[member.id] ?? [],
                     locations: locations,
-                    probe: probe
+                    probe: probe,
+                    pauseGate: gate
                 ) else { cancelled = true; break }
                 memberSummaries[member.id] = memberSummary
             }
@@ -2030,7 +2046,7 @@ final class EventsWorkspace {
         let rebuilt = await withCheckedContinuation { (cc: CheckedContinuation<[OrganizeStack], Never>) in
             Task.detached(priority: .utility) {
                 cc.resume(returning: OrganizeStacker.stacks(
-                    for: OrganizeScanner.items(for: files, cache: cache).items,
+                    for: OrganizeScanner.items(for: files, cache: cache, pauseGate: self.driveActivityGate).items,
                     splits: splits
                 ))
             }
@@ -2072,6 +2088,7 @@ final class EventsWorkspace {
         let unsortedRoots = unsortedLocations.map {
             URL(fileURLWithPath: DashboardModel.expandedPath($0.path), isDirectory: true).standardizedFileURL
         }
+        let gate = driveActivityGate
         model.statusMessage = "Checking where every sorted file is…"
         Task { @MainActor [weak self] in
             let plan = await Task.detached(priority: .userInitiated) {
@@ -2081,7 +2098,8 @@ final class EventsWorkspace {
                     locations: locations,
                     onlyUnder: root,
                     title: title,
-                    unsortedRoots: unsortedRoots
+                    unsortedRoots: unsortedRoots,
+                    pauseGate: gate
                 )
             }.value
             guard let self else { return }
@@ -2103,7 +2121,8 @@ final class EventsWorkspace {
         locations: EventStorageLocations,
         onlyUnder root: String?,
         title: String,
-        unsortedRoots: [URL]
+        unsortedRoots: [URL],
+        pauseGate: DriveActivityGate? = nil
     ) -> OrganizeApplyPlan {
         let mounted = VolumeInfo.mountedVolumePaths()
         let rootPrefix = root.map { EventStorageLocations.pathKey($0) + "/" }
@@ -2114,7 +2133,7 @@ final class EventsWorkspace {
             let policy = locations.resolvedPolicy(for: event)
             let driveRoot = locations.driveRoot(for: policy)
             let assignments = configuration.photoEventAssignments.filter { $0.eventID == event.id }
-            guard let summary = EventPresenceScanner.scan(event: event, assignments: assignments, locations: locations, mountedVolumes: mounted) else { continue }
+            guard let summary = EventPresenceScanner.scan(event: event, assignments: assignments, locations: locations, mountedVolumes: mounted, pauseGate: pauseGate) else { continue }
             var moves: [DriveMove] = []
             var copies: [String: OrganizeApplyPlan.CopyBatch] = [:]
             var alreadyThere = 0

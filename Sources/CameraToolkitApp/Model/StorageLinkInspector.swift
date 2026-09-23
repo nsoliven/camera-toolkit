@@ -245,7 +245,7 @@ enum StorageLinkInspector {
         usbDevices: [USBDeviceLink],
         isCameraSource: Bool
     ) -> StorageLinkContext {
-        let mediaTypical = mediaTypical(volume: volume, diskInfo: diskInfo, isCameraSource: isCameraSource)
+        let media = mediaTypical(volume: volume, diskInfo: diskInfo, isCameraSource: isCameraSource)
         let bus = diskInfo?.busProtocol?.lowercased() ?? ""
 
         if bus.contains("usb") {
@@ -258,23 +258,23 @@ enum StorageLinkInspector {
                 return StorageLinkContext(
                     medium: .usb,
                     headline: "\(linkName) · negotiated \(formattedBitsPerSecond(device.bitsPerSecond))",
-                    detail: deviceDetail(product: device.productName, vendor: device.vendorName, diskInfo: diskInfo),
+                    detail: joinedDetail(deviceDetail(product: device.productName, vendor: device.vendorName, diskInfo: diskInfo), media.note),
                     detected: true,
                     negotiatedBitsPerSecond: device.bitsPerSecond,
                     linkTypicalMBps: TransferSpeedReference.usbTypical(bitsPerSecond: device.bitsPerSecond),
-                    mediaTypicalReadMBps: mediaTypical,
-                    mediaTypicalWriteMBps: mediaTypical,
+                    mediaTypicalReadMBps: media.range,
+                    mediaTypicalWriteMBps: media.range,
                     isSolidState: diskInfo?.solidState
                 )
             }
             return StorageLinkContext(
                 medium: .usb,
                 headline: "USB storage",
-                detail: "Negotiated speed not detected — typical range shown",
+                detail: joinedDetail("Negotiated speed not detected — typical range shown", media.note),
                 detected: false,
                 linkTypicalMBps: nil,
-                mediaTypicalReadMBps: mediaTypical,
-                mediaTypicalWriteMBps: mediaTypical,
+                mediaTypicalReadMBps: media.range,
+                mediaTypicalWriteMBps: media.range,
                 isSolidState: diskInfo?.solidState
             )
         }
@@ -283,12 +283,12 @@ enum StorageLinkInspector {
             return StorageLinkContext(
                 medium: .thunderbolt,
                 headline: "Thunderbolt storage",
-                detail: deviceDetail(product: nil, vendor: nil, diskInfo: diskInfo),
+                detail: joinedDetail(deviceDetail(product: nil, vendor: nil, diskInfo: diskInfo), media.note),
                 detected: true,
                 negotiatedBitsPerSecond: nil,
                 linkTypicalMBps: TransferSpeedReference.thunderboltTypical,
-                mediaTypicalReadMBps: mediaTypical,
-                mediaTypicalWriteMBps: mediaTypical,
+                mediaTypicalReadMBps: media.range,
+                mediaTypicalWriteMBps: media.range,
                 isSolidState: diskInfo?.solidState
             )
         }
@@ -297,11 +297,11 @@ enum StorageLinkInspector {
             return StorageLinkContext(
                 medium: .internalStorage,
                 headline: "SATA storage",
-                detail: deviceDetail(product: nil, vendor: nil, diskInfo: diskInfo),
+                detail: joinedDetail(deviceDetail(product: nil, vendor: nil, diskInfo: diskInfo), media.note),
                 detected: true,
                 linkTypicalMBps: TransferSpeedReference.sataSSD,
-                mediaTypicalReadMBps: mediaTypical,
-                mediaTypicalWriteMBps: mediaTypical,
+                mediaTypicalReadMBps: media.range,
+                mediaTypicalWriteMBps: media.range,
                 isSolidState: diskInfo?.solidState
             )
         }
@@ -310,11 +310,11 @@ enum StorageLinkInspector {
             return StorageLinkContext(
                 medium: .internalStorage,
                 headline: "Internal storage",
-                detail: deviceDetail(product: nil, vendor: nil, diskInfo: diskInfo),
+                detail: joinedDetail(deviceDetail(product: nil, vendor: nil, diskInfo: diskInfo), media.note),
                 detected: true,
                 linkTypicalMBps: TransferSpeedReference.internalNVMe,
-                mediaTypicalReadMBps: mediaTypical,
-                mediaTypicalWriteMBps: mediaTypical,
+                mediaTypicalReadMBps: media.range,
+                mediaTypicalWriteMBps: media.range,
                 isSolidState: diskInfo?.solidState ?? true
             )
         }
@@ -322,29 +322,40 @@ enum StorageLinkInspector {
         return StorageLinkContext(
             medium: .unknown,
             headline: "External storage",
-            detail: "Connection not detected — typical range shown",
+            detail: joinedDetail("Connection not detected — typical range shown", media.note),
             detected: false,
-            mediaTypicalReadMBps: mediaTypical,
-            mediaTypicalWriteMBps: mediaTypical,
+            mediaTypicalReadMBps: media.range,
+            mediaTypicalWriteMBps: media.range,
             isSolidState: diskInfo?.solidState
         )
     }
 
+    /// Where a media range came from — `note` is set when the range is a
+    /// published product spec rather than anything this Mac measured.
     private static func mediaTypical(
         volume: MountedVolumeInfo,
         diskInfo: DiskVolumeInfo?,
         isCameraSource: Bool
-    ) -> ClosedRange<Double> {
+    ) -> (range: ClosedRange<Double>, note: String?) {
         if isCameraSource {
-            return volume.name.localizedCaseInsensitiveContains("osmo")
-                ? TransferSpeedReference.osmoInternalTypical
-                : TransferSpeedReference.cameraCardTypical
+            if volume.name.localizedCaseInsensitiveContains("osmo") {
+                return (
+                    TransferSpeedReference.osmoInternalTypical,
+                    "Up to 600 MB/s is DJI's published figure for the Osmo 360 — a spec sheet number, not a measurement"
+                )
+            }
+            return (TransferSpeedReference.cameraCardTypical, nil)
         }
         switch diskInfo?.solidState {
-        case true: return TransferSpeedReference.internalNVMe
-        case false: return 100...180
-        case nil: return TransferSpeedReference.usbSSDUndetected
+        case true: return (TransferSpeedReference.internalNVMe, nil)
+        case false: return (100...180, nil)
+        case nil: return (TransferSpeedReference.usbSSDUndetected, nil)
         }
+    }
+
+    private static func joinedDetail(_ parts: String?...) -> String? {
+        let joined = parts.compactMap { $0 }.joined(separator: " · ")
+        return joined.isEmpty ? nil : joined
     }
 
     // MARK: Network volumes
@@ -377,7 +388,7 @@ enum StorageLinkInspector {
             return StorageLinkContext(
                 medium: .wifi,
                 headline: "Wi-Fi · negotiated \(Int(wifiMegabitsPerSecond.rounded())) Mb/s",
-                detail: "Share\(host.map { " on \($0)" } ?? "")\(via.map { " via \($0)" } ?? "") — Wi-Fi goodput varies with signal",
+                detail: "Share\(host.map { " on \($0)" } ?? "")\(via.map { " via \($0)" } ?? "") — Wi-Fi goodput varies with signal; NAS media figures are estimates until a write test measures them",
                 detected: true,
                 negotiatedBitsPerSecond: Int64(wifiMegabitsPerSecond * 1_000_000),
                 linkTypicalMBps: range,
@@ -404,7 +415,7 @@ enum StorageLinkInspector {
         return StorageLinkContext(
             medium: .networkShare,
             headline: "Network share\(host.map { " on \($0)" } ?? "")",
-            detail: "Link rate not detected — typical range shown",
+            detail: "Link rate not detected — typical range shown; NAS media figures are estimates until a write test measures them",
             detected: false,
             linkTypicalMBps: TransferSpeedReference.genericNetworkTypical,
             mediaTypicalReadMBps: TransferSpeedReference.nasPoolReadTypical,
@@ -502,7 +513,7 @@ enum StorageLinkInspector {
         return String(address).lowercased()
     }
 
-    /// `//nasuser@192.0.2.2/nas_share` → `192.0.2.2`; `//nas/share` → `nas`.
+    /// `//user@nas.local/share` → `nas.local`; `//nas/share` → `nas`.
     static func parseMountHost(_ mountSource: String) -> String? {
         guard mountSource.hasPrefix("//") else { return nil }
         let withoutSlashes = mountSource.dropFirst(2)

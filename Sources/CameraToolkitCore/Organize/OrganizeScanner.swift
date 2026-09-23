@@ -74,14 +74,18 @@ public struct OrganizeScanner: Sendable {
         self.concurrency = max(1, concurrency)
     }
 
+    /// `pauseGate` makes the scan wait — rather than read — while a speed
+    /// test is measuring the volume under `root`.
     public func scan(
         root: URL,
         cache: CaptureDateCache? = nil,
         burstGrouping: BurstGroupingConfiguration = BurstGroupingConfiguration(),
         burstSplits: [BurstSplit] = [],
+        pauseGate: DriveActivityGate? = nil,
         progress: (@Sendable (OrganizeScanProgress) -> Void)? = nil
     ) throws -> OrganizeScanResult {
         let rootURL = root.standardizedFileURL
+        pauseGate?.waitIfPaused(for: rootURL)
         try FileScanner().assertDirectory(rootURL)
         progress?(OrganizeScanProgress(phase: "Listing files", processed: 0, total: 0))
 
@@ -94,7 +98,13 @@ public struct OrganizeScanner: Sendable {
         }
         let duplicateNames = Set(nameCounts.filter { $0.value > 1 }.keys)
 
-        let built = Self.items(for: files, cache: cache, concurrency: concurrency, progress: progress)
+        let built = Self.items(
+            for: files,
+            cache: cache,
+            concurrency: concurrency,
+            pauseGate: pauseGate,
+            progress: progress
+        )
         // Fingerprints run only for pairs in the visual-recovery band; when
         // recovery is off or no pair qualifies this returns immediately.
         let visualLinks = BurstVisualLinker.links(
@@ -126,12 +136,14 @@ public struct OrganizeScanner: Sendable {
     /// `readMissingCaptureDates: false` turns a cache miss into "no camera
     /// date" — no header read, and the miss is not stored — so a caller can
     /// publish a board before paying for the reads. `missingCaptureDates`
-    /// counts the cache misses either way.
+    /// counts the cache misses either way. `pauseGate` parks each worker
+    /// right before a header read while a speed test owns the file's volume.
     public static func items(
         for files: [OrganizeFile],
         cache: CaptureDateCache?,
         concurrency: Int = 8,
         readMissingCaptureDates: Bool = true,
+        pauseGate: DriveActivityGate? = nil,
         progress: (@Sendable (OrganizeScanProgress) -> Void)? = nil
     ) -> (items: [OrganizeItem], clockOffset: TimeInterval, missingCaptureDates: Int) {
         let pairings = OrganizeFileClassifier.pair(files)
@@ -157,6 +169,7 @@ public struct OrganizeScanner: Sendable {
                     return (cached, false)
                 }
                 guard readMissingCaptureDates else { return (nil, true) }
+                pauseGate?.waitIfPaused(for: file.url)
                 let timestamp = timestampProbe?(file.url) ?? CaptureDateReader.timestamp(of: file.url)
                 cache?.store(path: file.path, size: file.size, modifiedAt: file.modifiedAt, timestamp: timestamp)
                 return (timestamp, true)

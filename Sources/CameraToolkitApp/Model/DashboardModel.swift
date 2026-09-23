@@ -199,6 +199,7 @@ final class DashboardModel {
             loadActivityLog: true
         )
         model.scheduleCatalogSync(configuration: configuration)
+        model.removeStaleSpeedTestFiles()
         return model
     }
 
@@ -1611,6 +1612,19 @@ extension DashboardModel {
             configMessage = "Config saved at \(Self.defaultConfigurationURL.path)."
         } catch {
             configMessage = "Could not save config: \(error.localizedDescription)"
+        }
+    }
+
+    /// Deletes speed-test temp files left behind by an interrupted run —
+    /// `.CameraToolkit-SpeedTest-*.tmp` names inside configured Buffer and
+    /// Photo Library folders only, nothing else. Runs off the main actor.
+    func removeStaleSpeedTestFiles() {
+        let directories = configuration.configuredLocations
+            .filter { $0.role == .buffer || $0.role == .archive }
+            .map { URL(fileURLWithPath: Self.expandedPath($0.path), isDirectory: true) }
+        guard !directories.isEmpty else { return }
+        Task.detached(priority: .utility) {
+            StorageBenchmarkService().removeStaleTemporaryFiles(in: directories)
         }
     }
 

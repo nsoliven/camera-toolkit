@@ -2799,9 +2799,59 @@ final class EventsWorkspaceTests: XCTestCase {
         }
     }
 
+    /// While a speed test owns the volume, the workspace's background work
+    /// — drive-event discovery, the refresh pipeline's capture-date reads,
+    /// and the presence sweep — waits at the gate instead of touching the
+    /// drive, then proceeds once the gate resumes.
+    func testBackgroundDriveWorkWaitsWhileTheVolumeIsUnderTest() async throws {
+        let gate = DriveActivityGate()
+        try await withOrganizerSandbox(driveActivityGate: gate) { root, model, workspace in
+            let drive = root.appendingPathComponent("Drive", isDirectory: true)
+            // A hand-organized event folder for discovery to find, and an
+            // assignable drop so the presence sweep has work too.
+            try writeOrganizerARW(
+                drive.appendingPathComponent("Camera Buffer/2026/2026-08-26 Harbor/Sony A7V/Card Copy/DSC00001.ARW"),
+                "2026:08:26 10:00:00",
+                "000"
+            )
+            let unsorted = drive.appendingPathComponent("Unsorted A7V", isDirectory: true)
+            try writeOrganizerARW(unsorted.appendingPathComponent("Transfer 1/DSC00002.ARW"), "2026:08:26 11:00:00", "000")
+            let location = addUnsorted(unsorted, to: model)
+            workspace.scan(location)
+            try await waitUntil { workspace.sources[location.id]?.result != nil }
+            let eventID = try XCTUnwrap(workspace.createEvent(name: "Beach Day", date: organizerDay("2026-08-26"), policy: .buffer))
+            let stack = try XCTUnwrap(workspace.sources[location.id]?.result?.stacks.first)
+            workspace.assign(stackIDs: [stack.id], from: location.id, to: eventID)
+
+            let probed = ProbePathBox()
+            workspace.presenceProbe = { url, size, mounted in
+                if let url { probed.note(url.path) }
+                return EventPresenceScanner.state(url, size: size, mounted: mounted)
+            }
+
+            gate.pause(drive)
+            defer { gate.resume(drive) }
+
+            workspace.discoverDriveEvents()
+            let refresh = Task { await workspace.refreshEvent(eventID) }
+            try await Task.sleep(for: .milliseconds(400))
+            // Parked: no discovery results and not a single sweep probe —
+            // nothing touched the gated volume while the test owned it.
+            XCTAssertTrue(workspace.discoveredDriveEvents.isEmpty)
+            XCTAssertTrue(probed.paths.isEmpty)
+
+            gate.resume(drive)
+            await refresh.value
+            try await waitUntil { !workspace.discoveredDriveEvents.isEmpty }
+            try await waitUntil { workspace.presence[eventID] != nil }
+            XCTAssertFalse(probed.paths.isEmpty)
+        }
+    }
+
     // MARK: - Helpers
 
     private func withOrganizerSandbox(
+        driveActivityGate: DriveActivityGate = DriveActivityGate(),
         _ body: (URL, DashboardModel, EventsWorkspace) async throws -> Void
     ) async throws {
         let root = FileManager.default.temporaryDirectory
@@ -2825,7 +2875,11 @@ final class EventsWorkspaceTests: XCTestCase {
             configuration: configuration,
             configurationStore: ConfigurationStore(url: resolvedRoot.appendingPathComponent("config.json"))
         )
-        let workspace = EventsWorkspace(model: model, supportFolder: resolvedRoot.appendingPathComponent("Support", isDirectory: true))
+        let workspace = EventsWorkspace(
+            model: model,
+            supportFolder: resolvedRoot.appendingPathComponent("Support", isDirectory: true),
+            driveActivityGate: driveActivityGate
+        )
         try await body(resolvedRoot, model, workspace)
     }
 
@@ -2939,6 +2993,19 @@ private final class PresenceProbeBox: @unchecked Sendable {
 
     func noteArchiveCall() {
         lock.withLock { _archiveCalls += 1 }
+    }
+}
+
+/// Paths the injected presence probe touched — the pause test asserts the
+/// sweep never stats the volume while it is gated.
+private final class ProbePathBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _paths: [String] = []
+
+    var paths: [String] { lock.withLock { _paths } }
+
+    func note(_ path: String) {
+        lock.withLock { _paths.append(path) }
     }
 }
 

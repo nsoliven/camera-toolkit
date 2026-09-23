@@ -5,8 +5,8 @@ import XCTest
 final class StorageLinkInspectorTests: XCTestCase {
     func testMountHostParsingHandlesUserInfoAndPlainHosts() {
         XCTAssertEqual(
-            StorageLinkInspector.parseMountHost("//nasuser@192.0.2.2/nas_share"),
-            "192.0.2.2"
+            StorageLinkInspector.parseMountHost("//user@192.0.2.10/share"),
+            "192.0.2.10"
         )
         XCTAssertEqual(
             StorageLinkInspector.parseMountHost("//nas.local/photos"),
@@ -17,8 +17,8 @@ final class StorageLinkInspectorTests: XCTestCase {
 
     func testRouteInterfaceParsing() {
         let route = """
-          route to: 192.0.2.2
-        destination: 192.0.2.2
+          route to: 192.0.2.10
+        destination: 192.0.2.10
             interface: en7
               flags: <UP,HOST,DONE,LLSTATIC,CLONING>
         """
@@ -29,8 +29,8 @@ final class StorageLinkInspectorTests: XCTestCase {
     func testIfconfigMediaRateParsing() {
         let ethernet = """
         en7: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
-        \tether 80:69:1a:a1:c3:d1
-        \tinet 192.0.2.230 netmask 0xfffffe00 broadcast 192.0.2.255
+        \tether 02:00:00:00:00:07
+        \tinet 192.0.2.20 netmask 0xffffff00 broadcast 192.0.2.255
         \tmedia: autoselect (1000baseT <full-duplex>)
         \tstatus: active
         """
@@ -51,11 +51,11 @@ final class StorageLinkInspectorTests: XCTestCase {
 
         Hardware Port: USB 10/100/1000 LAN
         Device: en7
-        Ethernet Address: 80:69:1a:a1:c3:d1
+        Ethernet Address: 02:00:00:00:00:07
 
         Hardware Port: Wi-Fi
         Device: en0
-        Ethernet Address: 84:2f:57:a3:6a:d1
+        Ethernet Address: 02:00:00:00:00:01
         """
         let map = StorageLinkInspector.parseHardwarePorts(output)
         XCTAssertEqual(map["en7"], "USB 10/100/1000 LAN")
@@ -184,7 +184,7 @@ final class StorageLinkInspectorTests: XCTestCase {
 
     func testEthernetContextUsesTheNegotiatedLinkRate() {
         let context = StorageLinkInspector.networkContext(
-            host: "192.0.2.2",
+            host: "192.0.2.10",
             interfaceName: "en7",
             interfaceHardwareName: "USB 10/100/1000 LAN",
             mediaMegabitsPerSecond: 1_000,
@@ -199,7 +199,7 @@ final class StorageLinkInspectorTests: XCTestCase {
 
     func testWiFiContextUsesTheTransmitRate() {
         let context = StorageLinkInspector.networkContext(
-            host: "192.0.2.2",
+            host: "192.0.2.10",
             interfaceName: "en0",
             interfaceHardwareName: "Wi-Fi",
             mediaMegabitsPerSecond: nil,

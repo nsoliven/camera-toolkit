@@ -252,6 +252,9 @@ private struct StorageBenchmarkView: View {
                     ProgressView(value: benchmark.progress)
                         .progressViewStyle(.linear)
                         .tint(targetColor(target))
+                    Text("Other Camera Toolkit work on this drive is paused while the test runs.")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
                 }
             }
 
@@ -381,7 +384,7 @@ private struct StorageBenchmarkView: View {
         HStack(alignment: .top, spacing: 9) {
             Image(systemName: "checkmark.shield.fill")
                 .foregroundStyle(.green)
-            Text("Camera cards stay read-only: the app samples existing media and writes nothing on them. Buffer and library destinations get a hidden temporary file that is written, flushed, read back uncached, and removed — including a Buffer drive that is also a camera source. Tests run one at a time and cannot start during a transfer.")
+            Text("Camera cards stay read-only: the app samples existing media and writes nothing on them. Buffer and library destinations get a hidden temporary file written in small flushed chunks, read back uncached, and removed — including a Buffer drive that is also a camera source. Other app work on the drive is paused while a test runs, tests cannot start during a transfer, and a drive that stops responding ends the test instead of hanging it.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)

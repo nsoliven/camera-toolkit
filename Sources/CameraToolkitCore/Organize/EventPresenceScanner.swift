@@ -63,13 +63,15 @@ public enum EventPresenceScanner {
     /// assignment order — sequential, never fanned out, so a slow share is
     /// poked once at a time rather than stampeded. Returns nil when the
     /// surrounding task is cancelled mid-sweep so a stale pass can be
-    /// dropped instead of published.
+    /// dropped instead of published. When `pauseGate` is set the sweep waits
+    /// at it before touching a volume that a speed test is measuring.
     public static func scan(
         event: SavedCameraEvent,
         assignments: [PhotoEventAssignment],
         locations: EventStorageLocations,
         mountedVolumes: Set<String>? = nil,
-        probe: PresenceProbe? = nil
+        probe: PresenceProbe? = nil,
+        pauseGate: DriveActivityGate? = nil
     ) -> EventPresenceSummary? {
         let mounted = mountedVolumes ?? VolumeInfo.mountedVolumePaths()
         let policy = locations.resolvedPolicy(for: event)
@@ -84,6 +86,14 @@ public enum EventPresenceScanner {
             let drive = locations.driveURL(for: assignment, event: event, policy: policy)
             let other = locations.driveURL(for: assignment, event: event, policy: otherPolicy)
             let archive = locations.archiveURL(for: assignment, event: event)
+            if let pauseGate {
+                for url in [source, drive, other, archive].compactMap({ $0 }) {
+                    guard pauseGate.waitIfPaused(
+                        for: url,
+                        shouldStop: { Task<Never, Never>.isCancelled }
+                    ) else { return nil }
+                }
+            }
             let sourceIsDrive = [drive, other].contains { candidate in
                 guard let candidate, let source else { return false }
                 return EventStorageLocations.pathKey(candidate.path) == EventStorageLocations.pathKey(source.path)
