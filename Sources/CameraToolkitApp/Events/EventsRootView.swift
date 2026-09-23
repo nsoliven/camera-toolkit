@@ -8,43 +8,63 @@ import SwiftUI
 struct EventsRootView: View {
     @Bindable var model: DashboardModel
     @Bindable var workspace: EventsWorkspace
-    @AppStorage(OrganizeChromeSizing.sidebarWidthDefaultsKey)
-    private var sidebarWidth = OrganizeChromeSizing.defaultSidebarWidth
+
+    /// The column's opening width, read once — a live AppStorage value here
+    /// would move `ideal` during a drag and make the divider jump.
+    @State private var initialSidebarWidth = OrganizeChromeSizing.storedSidebarWidth()
+    @State private var measuredSidebarWidth: Double?
+    /// Measured content width vs. the column width asked for: the glass
+    /// sidebar can inset its content, so the first measurement sets the
+    /// offset that turns later measurements back into column widths.
+    @State private var sidebarWidthInset: Double?
+
+    /// ⌘B, the View menu, and the toolbar's sidebar button all flow through
+    /// `isSidebarCollapsed`, so the menu stays deterministic.
+    private var columnVisibility: Binding<NavigationSplitViewVisibility> {
+        Binding(
+            get: { model.isSidebarCollapsed ? .detailOnly : .all },
+            set: { model.isSidebarCollapsed = ($0 == .detailOnly) }
+        )
+    }
 
     var body: some View {
         let panelAlignment: Alignment = (workspace.guide?.step.prefersTop ?? false) ? .topTrailing : .bottomTrailing
-        HStack(spacing: 0) {
-            if !model.isSidebarCollapsed {
-                EventsSidebar(model: model, workspace: workspace)
-                    .frame(width: OrganizeChromeSizing.clampedSidebarWidth(sidebarWidth))
-                    .frame(maxHeight: .infinity)
-                    .background(OrganizeSidebarMaterial())
-                ChromeResizeHandle(
-                    orientation: .vertical,
-                    value: $sidebarWidth,
-                    transform: OrganizeChromeSizing.clampedSidebarWidth,
-                    onDoubleClick: {
-                        withAnimation(.easeOut(duration: 0.15)) {
-                            sidebarWidth = OrganizeChromeSizing.defaultSidebarWidth
-                        }
-                    },
-                    help: "Drag to resize the sidebar — double-click resets",
-                    accessibilityLabel: "Resize Sidebar"
+        NavigationSplitView(columnVisibility: columnVisibility) {
+            EventsSidebar(model: model, workspace: workspace)
+                .onGeometryChange(for: Double.self) { $0.size.width.rounded() } action: { width in
+                    measuredSidebarWidth = width
+                }
+                .navigationSplitViewColumnWidth(
+                    min: OrganizeChromeSizing.sidebarWidthRange.lowerBound,
+                    ideal: initialSidebarWidth,
+                    max: OrganizeChromeSizing.sidebarWidthRange.upperBound
                 )
-            }
+        } detail: {
             // minWidth 0 + clipped: a board too wide for the window is cut
             // on its own right edge instead of pushing the whole window
             // wider and cutting the sidebar off on the left.
             detail
                 .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity)
                 .clipped()
-                .background(Color(nsColor: .windowBackgroundColor))
+        }
+        // Debounced write-back of a dragged width — never a body side effect.
+        .task(id: measuredSidebarWidth) {
+            guard let measured = measuredSidebarWidth, measured > 0 else { return }
+            if sidebarWidthInset == nil {
+                sidebarWidthInset = initialSidebarWidth - measured
+                return
+            }
+            try? await Task.sleep(for: .milliseconds(400))
+            guard !Task.isCancelled,
+                  let width = OrganizeChromeSizing.persistableSidebarWidth(measured + (sidebarWidthInset ?? 0)) else { return }
+            UserDefaults.standard.set(width, forKey: OrganizeChromeSizing.sidebarWidthDefaultsKey)
         }
         .overlay(alignment: panelAlignment) {
             if let guide = workspace.guide {
                 SetupGuidePanel(guide: guide, workspace: workspace, model: model)
                     .padding(.horizontal, 20)
-                    .padding(.vertical, guide.step.prefersTop ? 70 : 40)
+                    .padding(.top, 16)
+                    .padding(.bottom, 72)
             }
         }
         .onAppear { workspace.start() }
@@ -172,16 +192,13 @@ struct EventsSidebar: View {
     @State private var targetedEventID: UUID?
     @State private var searchText = ""
 
-    /// Explicit binding instead of `$workspace.selection`: AppKit-backed
-    /// `List(selection:)` does not reliably write through `@Bindable` into an
-    /// `@Observable` model, which left sidebar clicks dead. Rows also set the
-    /// selection on tap as a fallback.
-    private var sidebarSelection: Binding<EventsSidebarSelection?> {
-        Binding(
-            get: { workspace.selection },
-            set: { workspace.selection = $0 }
-        )
-    }
+    /// A local mirror of `workspace.selection`, synced both ways with
+    /// `onChange`. Binding the AppKit-backed List straight to the model
+    /// dropped writes in both directions: clicks did not always reach the
+    /// model, and a selection made in the model (the guide, New Event) did
+    /// not move the highlight, because nothing in the sidebar body read it.
+    /// Rows also set the selection on tap as a fallback.
+    @State private var listSelection: EventsSidebarSelection?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -204,7 +221,7 @@ struct EventsSidebar: View {
             .padding(.vertical, 10)
             Divider()
 
-            List(selection: sidebarSelection) {
+            List(selection: $listSelection) {
                 let discovered = workspace.discoveredDriveEvents(matching: searchText)
                 if !discovered.isEmpty {
                     Section("Found on Your Drive") {
@@ -216,7 +233,7 @@ struct EventsSidebar: View {
                 Section("Unsorted Photos") {
                     ForEach(workspace.unsortedLocations(matching: searchText)) { location in
                         unsortedRow(location)
-                            .tag(EventsSidebarSelection.unsorted(location.id) as EventsSidebarSelection?)
+                            .tag(EventsSidebarSelection.unsorted(location.id))
                             .contentShape(Rectangle())
                             .simultaneousGesture(TapGesture().onEnded {
                                 workspace.selection = .unsorted(location.id)
@@ -256,7 +273,7 @@ struct EventsSidebar: View {
                     // its parent — the flat row style stays the same.
                     ForEach(workspace.sidebarRows(matching: searchText, applying: workspace.search), id: \.event.id) { row in
                         eventRow(row.event, depth: row.depth)
-                            .tag(EventsSidebarSelection.event(row.event.id) as EventsSidebarSelection?)
+                            .tag(EventsSidebarSelection.event(row.event.id))
                             .contentShape(Rectangle())
                             .simultaneousGesture(TapGesture().onEnded {
                                 workspace.selection = .event(row.event.id)
@@ -290,6 +307,13 @@ struct EventsSidebar: View {
                 }
             }
             .listStyle(.sidebar)
+            .onAppear { listSelection = workspace.selection }
+            .onChange(of: listSelection) { _, selection in
+                if workspace.selection != selection { workspace.selection = selection }
+            }
+            .onChange(of: workspace.selection) { _, selection in
+                if listSelection != selection { listSelection = selection }
+            }
 
             Divider()
             footer
@@ -504,21 +528,6 @@ struct EventsWelcomeView: View {
             .frame(maxWidth: .infinity)
         }
     }
-}
-
-/// The translucent material NavigationSplitView used to paint behind the
-/// sidebar column — kept so the hand-sized sidebar still looks like a
-/// macOS sidebar.
-private struct OrganizeSidebarMaterial: NSViewRepresentable {
-    func makeNSView(context: Context) -> NSVisualEffectView {
-        let view = NSVisualEffectView()
-        view.material = .sidebar
-        view.blendingMode = .behindWindow
-        view.state = .followsWindowActiveState
-        return view
-    }
-
-    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {}
 }
 
 /// The Unsorted row's context menu, in its own view so its buttons are

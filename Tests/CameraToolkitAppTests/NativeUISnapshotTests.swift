@@ -89,7 +89,7 @@ final class NativeUISnapshotTests: XCTestCase {
         frameView.layoutSubtreeIfNeeded()
         window.displayIfNeeded()
         let url = outputFolder.appendingPathComponent("\(name).png")
-        if CGPreflightScreenCaptureAccess(), let image = try? await captureWindow(window) {
+        if CGPreflightScreenCaptureAccess(), !screenCaptureStalled, let image = await captureWindow(window) {
             let bitmap = NSBitmapImageRep(cgImage: image)
             try XCTUnwrap(bitmap.representation(using: .png, properties: [:])).write(to: url)
             return
@@ -100,7 +100,24 @@ final class NativeUISnapshotTests: XCTestCase {
         try XCTUnwrap(bitmap.representation(using: .png, properties: [:])).write(to: url)
     }
 
-    private func captureWindow(_ window: NSWindow) async throws -> CGImage? {
+    /// Set once a capture times out — ScreenCaptureKit can stall while
+    /// other processes capture at the same time, and a stalled call never
+    /// returns, so the rest of the run draws the view tree instead.
+    private var screenCaptureStalled = false
+
+    private func captureWindow(_ window: NSWindow, timeout: Double = 10) async -> CGImage? {
+        let image: CGImage? = await withCheckedContinuation { continuation in
+            let once = ResumeOnce(continuation)
+            Task { @MainActor in once.resume(try? await self.captureWindowNow(window)) }
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(timeout))
+                if once.resume(nil) { self.screenCaptureStalled = true }
+            }
+        }
+        return image
+    }
+
+    private func captureWindowNow(_ window: NSWindow) async throws -> CGImage? {
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
         guard let target = content.windows.first(where: { $0.windowID == CGWindowID(window.windowNumber) }) else { return nil }
         let filter = SCContentFilter(desktopIndependentWindow: target)
@@ -232,25 +249,41 @@ final class NativeUISnapshotTests: XCTestCase {
     }
 }
 
+/// Resumes a continuation from whichever of two racing tasks finishes
+/// first; the loser's call does nothing.
+@MainActor
+private final class ResumeOnce {
+    private var continuation: CheckedContinuation<CGImage?, Never>?
+
+    init(_ continuation: CheckedContinuation<CGImage?, Never>) {
+        self.continuation = continuation
+    }
+
+    /// True when this call resumed the continuation.
+    @discardableResult
+    func resume(_ value: CGImage?) -> Bool {
+        guard let continuation else { return false }
+        self.continuation = nil
+        continuation.resume(returning: value)
+        return true
+    }
+}
+
 /// Windows for the harness, built off-screen with no mouse events, so
 /// nothing flashes on the owner's screen.
 @MainActor
 enum SnapshotWindows {
+    /// The real main window from `MainWindowFactory`, built as an
+    /// `OffscreenWindow` and parked off every display.
     static func main(model: DashboardModel, workspace: EventsWorkspace) -> NSWindow {
-        let hostingController = NSHostingController(
-            rootView: AppShell(model: model, workspace: workspace)
-                .frame(minWidth: 1040, minHeight: 720)
-        )
-        let window = OffscreenWindow(
-            contentRect: NSRect(x: offscreen.x, y: offscreen.y, width: 1320, height: 840),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
-            backing: .buffered,
-            defer: false
-        )
-        window.title = "Camera Toolkit"
-        window.isRestorable = false
-        window.contentViewController = hostingController
-        window.isReleasedWhenClosed = false
+        let window = MainWindowFactory.make(model: model, workspace: workspace, restoresFrame: false) { rect, style in
+            OffscreenWindow(
+                contentRect: NSRect(origin: offscreen, size: rect.size),
+                styleMask: style,
+                backing: .buffered,
+                defer: false
+            )
+        }
         hide(window)
         window.orderFrontRegardless()
         return window
@@ -265,11 +298,11 @@ enum SnapshotWindows {
         return window
     }
 
-    private static let offscreen = NSPoint(x: -20_000, y: -20_000)
+    static let offscreen = NSPoint(x: -20_000, y: -20_000)
 
     /// Parks the window far off every display. It stays opaque so screen
     /// capture sees real pixels, but no screen ever shows it.
-    private static func hide(_ window: NSWindow) {
+    static func hide(_ window: NSWindow) {
         window.ignoresMouseEvents = true
         window.setFrameOrigin(offscreen)
     }
@@ -278,7 +311,7 @@ enum SnapshotWindows {
 /// Keeps AppKit from pulling the harness window back onto a display, and
 /// draws with the active-window look without activating the test process
 /// and taking focus from whatever the owner is doing.
-private final class OffscreenWindow: NSWindow {
+final class OffscreenWindow: NSWindow {
     override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect { frameRect }
     override var isKeyWindow: Bool { true }
     override var isMainWindow: Bool { true }

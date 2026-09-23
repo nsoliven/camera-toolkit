@@ -28,6 +28,22 @@ enum OrganizeChromeSizing {
         min(max(requested, sidebarWidthRange.lowerBound), sidebarWidthRange.upperBound)
     }
 
+    /// The width the split view opens with — read once when the window is
+    /// built, so a write during a drag never moves the column's ideal width
+    /// under the pointer.
+    static func storedSidebarWidth(in defaults: UserDefaults = .standard) -> Double {
+        guard defaults.object(forKey: sidebarWidthDefaultsKey) != nil else { return defaultSidebarWidth }
+        return clampedSidebarWidth(defaults.double(forKey: sidebarWidthDefaultsKey))
+    }
+
+    /// What a measured column width should store, or nil when it should not
+    /// be stored at all: a width below the range is the column collapsing
+    /// or animating closed, not a size the owner picked.
+    static func persistableSidebarWidth(_ measured: Double) -> Double? {
+        guard measured.isFinite, measured >= sidebarWidthRange.lowerBound else { return nil }
+        return clampedSidebarWidth(measured.rounded())
+    }
+
     static func storageStripIsCollapsed(_ height: Double) -> Bool {
         height < storageStripSnapThreshold
     }
