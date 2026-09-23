@@ -82,7 +82,11 @@ public struct StorageBenchmarkService: @unchecked Sendable {
     ) {
         self.fileManager = fileManager
         self.sinkFactory = sinkFactory ?? { url, byteCount in
-            try UncachedSpeedTestSink(url: url, byteCount: byteCount)
+            try UncachedSpeedTestSink(
+                url: url,
+                byteCount: byteCount,
+                gentle: Self.needsGentleWrites(in: url.deletingLastPathComponent())
+            )
         }
         self.uptime = uptime ?? { ProcessInfo.processInfo.systemUptime }
         self.stallTimeout = stallTimeout
@@ -564,17 +568,37 @@ public struct StorageBenchmarkService: @unchecked Sendable {
     }
 }
 
+extension StorageBenchmarkService {
+    /// exFAT and FAT volumes get uncached writes with no preallocation and
+    /// no `fsync`. On the owner's USB NVMe Buffer (exFAT through fskit) an
+    /// `fsync` of the speed-test file knocked the enclosure off the bus
+    /// twice, and `ftruncate` there zero-fills the whole file up front.
+    static func needsGentleWrites(in directory: URL) -> Bool {
+        var info = Darwin.statfs()
+        guard directory.withUnsafeFileSystemRepresentation({ path in
+            path.map { statfs($0, &info) == 0 } ?? false
+        }) else { return false }
+        let type = withUnsafeBytes(of: info.f_fstypename) { raw in
+            String(decoding: raw.prefix { $0 != 0 }, as: UTF8.self)
+        }
+        return ["exfat", "msdos"].contains(type.lowercased())
+    }
+}
+
 /// The production write sink: an `O_EXCL` temporary file opened uncached
-/// (`F_NOCACHE`) and preallocated when the filesystem allows it
-/// (`F_PREALLOCATE`, falling back to `ftruncate`, then to nothing). Each
+/// (`F_NOCACHE`). Normally it is preallocated when the filesystem allows it
+/// (`F_PREALLOCATE`, falling back to `ftruncate`, then to nothing) and each
 /// `writeChunk` ends in `fsync`, so it returns only once the device accepted
-/// the bytes.
+/// the bytes. A `gentle` sink (exFAT/FAT) skips both and relies on the
+/// uncached writes alone.
 private final class UncachedSpeedTestSink: SpeedTestDeviceSink, @unchecked Sendable {
     private let url: URL
+    private let gentle: Bool
     private var descriptor: Int32 = -1
 
-    init(url: URL, byteCount: Int64) throws {
+    init(url: URL, byteCount: Int64, gentle: Bool = false) throws {
         self.url = url
+        self.gentle = gentle
         let descriptor = url.withUnsafeFileSystemRepresentation { path -> Int32 in
             guard let path else { return -1 }
             return Darwin.open(path, O_CREAT | O_EXCL | O_WRONLY, S_IRUSR | S_IWUSR)
@@ -591,7 +615,9 @@ private final class UncachedSpeedTestSink: SpeedTestDeviceSink, @unchecked Senda
             self.descriptor = -1
             throw error
         }
-        preallocate(byteCount)
+        if !gentle {
+            preallocate(byteCount)
+        }
     }
 
     /// Best-effort preallocation so the write loop measures streaming into
@@ -623,6 +649,7 @@ private final class UncachedSpeedTestSink: SpeedTestDeviceSink, @unchecked Senda
                 offset += written
             }
         }
+        guard !gentle else { return }
         guard Darwin.fsync(descriptor) == 0 else {
             throw StorageBenchmarkService.posixError(
                 operation: "flush speed-test data on", url: url
