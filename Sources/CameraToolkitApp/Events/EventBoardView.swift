@@ -153,111 +153,116 @@ struct EventBoardView: View {
                 Text("\(event.eventDate.formatted(date: .complete, time: .omitted)) · \(workspace.assignmentCount(for: eventID)) files · \(workspace.assignmentBytes(for: eventID).formattedBytes)")
                     .font(.callout)
                     .foregroundStyle(.secondary)
+                    .lineLimit(1)
             }
-            Spacer()
-            OrganizeSearchBar(
-                workspace: workspace,
-                stacks: workspace.eventStacks[eventID] ?? [],
-                eventScope: workspace.scopeIDs(eventID),
-                search: $workspace.search,
-                focused: $searchFocused,
-                matchedCount: groups.reduce(0) { $0 + $1.stacks.count }
-            )
-            Picker("Keep on drive", selection: Binding(
-                get: { workspace.resolvedPolicy(for: event) },
-                set: { workspace.setPolicy(eventID, $0) }
-            )) {
-                Label("Shared Buffer", systemImage: "externaldrive").tag(EventStoragePolicy.buffer)
-                Label("Private · NAS only", systemImage: "lock.fill").tag(EventStoragePolicy.archiveOnly)
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .frame(width: 320)
-            .help("Shared events live in the Buffer everyone browses. Private events stay hidden on the drive until they are archived to the NAS.")
-            Picker("View", selection: $boardMode) {
-                ForEach(OrganizeBoardMode.allCases) { mode in
-                    Image(systemName: mode.symbol).tag(mode)
+            .frame(minWidth: 300, alignment: .leading)
+            .layoutPriority(1)
+            FlowLayout(horizontalSpacing: 12, verticalSpacing: 8, alignment: .trailing) {
+                OrganizeSearchBar(
+                    workspace: workspace,
+                    stacks: workspace.eventStacks[eventID] ?? [],
+                    eventScope: workspace.scopeIDs(eventID),
+                    search: $workspace.search,
+                    focused: $searchFocused,
+                    matchedCount: groups.reduce(0) { $0 + $1.stacks.count }
+                )
+                Picker("Keep on drive", selection: Binding(
+                    get: { workspace.resolvedPolicy(for: event) },
+                    set: { workspace.setPolicy(eventID, $0) }
+                )) {
+                    Label("Shared Buffer", systemImage: "externaldrive").tag(EventStoragePolicy.buffer)
+                    Label("Private · NAS only", systemImage: "lock.fill").tag(EventStoragePolicy.archiveOnly)
                 }
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .frame(width: 64)
-            .help("Tiles or a dense list")
-            Menu {
-                Section("Group By") {
-                    ForEach(Self.groupings) { option in
-                        Toggle(option.title, isOn: Binding(
-                            get: { effectiveGrouping == option },
-                            set: { _ in grouping = option }
-                        ))
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(width: 320)
+                .help("Shared events live in the Buffer everyone browses. Private events stay hidden on the drive until they are archived to the NAS.")
+                Picker("View", selection: $boardMode) {
+                    ForEach(OrganizeBoardMode.allCases) { mode in
+                        Image(systemName: mode.symbol).tag(mode)
                     }
                 }
-                Section("Order") {
-                    ForEach(OrganizeBoardOrder.allCases) { option in
-                        Toggle(option.title, isOn: Binding(
-                            get: { sortOrder == option },
-                            set: { _ in sortOrder = option }
-                        ))
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(width: 64)
+                .help("Tiles or a dense list")
+                Menu {
+                    Section("Group By") {
+                        ForEach(Self.groupings) { option in
+                            Toggle(option.title, isOn: Binding(
+                                get: { effectiveGrouping == option },
+                                set: { _ in grouping = option }
+                            ))
+                        }
                     }
-                }
-                Divider()
-                let anyCollapsed = groups.contains { workspace.collapsedGroupIDs.contains($0.id) }
-                Button(anyCollapsed ? "Expand All Groups" : "Collapse All Groups") {
-                    workspace.setAllGroupsCollapsed(!anyCollapsed, groups: groups)
-                }
-            } label: {
-                Image(systemName: "arrow.up.arrow.down.square")
-            }
-            .menuStyle(.borderlessButton)
-            .fixedSize()
-            .help("Group, sort, and collapse the board")
-            if boardMode == .tiles {
-                Slider(value: $tileWidth, in: 88...460)
-                    .frame(width: 110)
-                    .help("Tile size — smaller fits more bursts on screen")
-            }
-            Button {
-                Task { await workspace.refreshEvent(eventID) }
-            } label: {
-                Label("Refresh", systemImage: "arrow.clockwise")
-            }
-            Menu {
-                Button("New Subevent…") {
-                    workspace.requestNewEvent(from: nil, parentEventID: eventID)
-                }
-                Button("Rename or Change Date…") {
-                    workspace.renameRequest = RenameEventRequest(eventID: eventID)
-                }
-                Button("Reveal Drive Folder") {
-                    reveal(workspace.locations.eventFolder(for: event, policy: workspace.resolvedPolicy(for: event)))
-                }
-                Button("Reveal NAS Folder") {
-                    let layout = workspace.locations.layout(for: event, deviceID: nil)
-                    var url = workspace.locations.libraryRoot
-                        .appendingPathComponent("Originals", isDirectory: true)
-                        .appendingPathComponent(layout.year, isDirectory: true)
-                    for folder in layout.parentEventFolders {
-                        url.appendPathComponent(folder, isDirectory: true)
+                    Section("Order") {
+                        ForEach(OrganizeBoardOrder.allCases) { option in
+                            Toggle(option.title, isOn: Binding(
+                                get: { sortOrder == option },
+                                set: { _ in sortOrder = option }
+                            ))
+                        }
                     }
-                    reveal(url.appendingPathComponent(layout.eventFolder, isDirectory: true))
+                    Divider()
+                    let anyCollapsed = groups.contains { workspace.collapsedGroupIDs.contains($0.id) }
+                    Button(anyCollapsed ? "Expand All Groups" : "Collapse All Groups") {
+                        workspace.setAllGroupsCollapsed(!anyCollapsed, groups: groups)
+                    }
+                } label: {
+                    Image(systemName: "arrow.up.arrow.down.square")
                 }
-                Divider()
-                Button("Scan for Faces…") {
-                    workspace.requestFaceScan(event)
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .help("Group, sort, and collapse the board")
+                if boardMode == .tiles {
+                    Slider(value: $tileWidth, in: 88...460)
+                        .frame(width: 110)
+                        .help("Tile size — smaller fits more bursts on screen")
                 }
-                .disabled(workspace.faceScanBlocker(for: event) != nil)
-                .help(workspace.faceScanBlocker(for: event)
-                    ?? "Detect and match faces on a sample of each burst — not every frame — plus single stills and, at MED and above, video frames. Writes only to the catalog — media is read, never touched.")
-                Divider()
-                Button("Undo Last Move") { workspace.undoLastMove() }
-                    .disabled(workspace.latestMoveJournalTitle == nil || model.isBusy)
-                Button("Delete Empty Event", role: .destructive) { workspace.deleteEmptyEvent(eventID) }
-                    .disabled(workspace.assignmentCount(for: eventID) > 0)
-            } label: {
-                Image(systemName: "ellipsis.circle")
+                Button {
+                    Task { await workspace.refreshEvent(eventID) }
+                } label: {
+                    Label("Refresh", systemImage: "arrow.clockwise")
+                }
+                Menu {
+                    Button("New Subevent…") {
+                        workspace.requestNewEvent(from: nil, parentEventID: eventID)
+                    }
+                    Button("Rename or Change Date…") {
+                        workspace.renameRequest = RenameEventRequest(eventID: eventID)
+                    }
+                    Button("Reveal Drive Folder") {
+                        reveal(workspace.locations.eventFolder(for: event, policy: workspace.resolvedPolicy(for: event)))
+                    }
+                    Button("Reveal NAS Folder") {
+                        let layout = workspace.locations.layout(for: event, deviceID: nil)
+                        var url = workspace.locations.libraryRoot
+                            .appendingPathComponent("Originals", isDirectory: true)
+                            .appendingPathComponent(layout.year, isDirectory: true)
+                        for folder in layout.parentEventFolders {
+                            url.appendPathComponent(folder, isDirectory: true)
+                        }
+                        reveal(url.appendingPathComponent(layout.eventFolder, isDirectory: true))
+                    }
+                    Divider()
+                    Button("Scan for Faces…") {
+                        workspace.requestFaceScan(event)
+                    }
+                    .disabled(workspace.faceScanBlocker(for: event) != nil)
+                    .help(workspace.faceScanBlocker(for: event)
+                        ?? "Detect and match faces on a sample of each burst — not every frame — plus single stills and, at MED and above, video frames. Writes only to the catalog — media is read, never touched.")
+                    Divider()
+                    Button("Undo Last Move") { workspace.undoLastMove() }
+                        .disabled(workspace.latestMoveJournalTitle == nil || model.isBusy)
+                    Button("Delete Empty Event", role: .destructive) { workspace.deleteEmptyEvent(eventID) }
+                        .disabled(workspace.assignmentCount(for: eventID) > 0)
+                } label: {
+                    Image(systemName: "ellipsis.circle")
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
             }
-            .menuStyle(.borderlessButton)
-            .fixedSize()
+            .frame(minWidth: 340, maxWidth: .infinity, alignment: .trailing)
         }
         if !people.isEmpty || !subevents.isEmpty {
             let shown = showAllPeople ? people : Array(people.prefix(Self.collapsedPeopleCount))
