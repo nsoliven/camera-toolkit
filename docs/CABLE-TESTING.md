@@ -23,19 +23,29 @@ and swept on the next launch if a crash ever strands it. Read-only drives
 | Profile | Length | Phases |
 | --- | --- | --- |
 | Quick | 2 min | sustained write, sustained read, mixed burst |
-| **Standard** | 10 min | 3 min write, 3 min uncached read-back, 2 min mixed burst, 2 min idle watch |
+| **Standard** | 10 min | 3 min write, 3 min uncached media read, 2 min mixed burst, 2 min idle watch |
 | Soak | 30 min | the Standard cycle repeated three times |
 
 - **Sustained write** — sequential 8 MB chunks through the bounded temp area.
   This is the load that made the bad cable drop.
-- **Sustained read** — the written area read back uncached (`F_NOCACHE`), so
-  the figure is device truth, not page cache.
-- **Mixed burst** — several parallel readers plus one writer mixing small
-  (64 KB) and large (4 MB) requests. This mimics the app's own launch burst —
-  a drive walk, stats, header reads, and thumbnail decodes at once — which
-  was one of the real-world drop triggers.
+- **Sustained read** — existing media on the drive read uncached
+  (`F_NOCACHE`), rotating across files so nothing is re-read while it could
+  still be cached. Reading back the just-written temp file would quote page
+  cache, not the device — that file is only a fallback when the drive has no
+  readable media, and then the phase is labelled *may include cache*.
+- **Mixed burst** — several parallel readers on existing media plus one
+  writer on the temp area, mixing small (64 KB) and large (4 MB) requests.
+  This mimics the app's own launch burst — a drive walk, stats, header
+  reads, and thumbnail decodes at once — which was one of the real-world
+  drop triggers.
 - **Idle watch** — no I/O by design. A weak link sometimes drops *after* the
   load stops, when power management kicks in.
+
+Reported min / typical / max figures are measured over rolling ~3 s
+windows, not raw per-second deltas, so a single bursty tick cannot pose as
+a peak or a dip. Any window faster than the negotiated link can physically
+carry (about 88% of the wire rate on USB 3.x) is treated as cache- or
+buffer-served, counted on the report, and left out of the figures.
 
 Run **Standard** on every new cable or enclosure before trusting it with
 Buffer work. Use Quick for a smoke check, Soak when you suspect heat.

@@ -510,6 +510,80 @@ final class StabilityTestServiceTests: XCTestCase {
         XCTAssertEqual(record.grade, .warning)
         XCTAssertTrue(record.reasons.contains { $0.contains("No data moved") })
     }
+
+    /// Cache-speed bursts must not become the reported max: a window that
+    /// beats the negotiated link's ceiling is counted as cache-affected
+    /// and left out of min/typical/max. The fake answers every fifth step
+    /// at 10 GB/s — memory speed — while the link is 10 Gb/s (~1.1 GB/s).
+    func testCachedBurstWindowsAreExcludedFromTheFigures() throws {
+        let clock = StabilityFakeClock()
+        let workload = FakeStabilityWorkload(clock: clock)
+        workload.bytesForStep = { step in
+            step.isMultiple(of: 5) ? 10_000_000_000 : 800_000_000
+        }
+        let service = StabilityTestService(
+            probe: FakeUSBProbe(baseline: baselineSample()),
+            workloadFactory: { _, _ in workload },
+            uptime: { clock.now },
+            isMounted: { _ in true }
+        )
+
+        let record = try service.run(request())
+
+        for phase in record.phases where phase.kind.movesBytes {
+            XCTAssertGreaterThan(phase.cacheAffectedSamples, 0)
+            XCTAssertGreaterThan(phase.windowedSamples, 0)
+            XCTAssertEqual(phase.typicalBytesPerSecond, 800_000_000, accuracy: 10_000_000)
+            XCTAssertLessThanOrEqual(phase.maxBytesPerSecond, 1_100_000_000)
+        }
+        let report = StabilityReportFormatter.text(for: record)
+        XCTAssertTrue(report.contains("above-link"), report)
+        XCTAssertTrue(report.contains("faster than the negotiated link"), report)
+    }
+
+    /// A single empty second is not a "min 0" — the ~3 s window turns it
+    /// into a sustained low. Under the 2 s stall threshold it stays a pass.
+    func testASingleEmptySecondBecomesAWindowedLowNotZero() throws {
+        try withTemporaryDirectory { root in
+            let clock = StabilityFakeClock()
+            let workload = FakeStabilityWorkload(clock: clock)
+            workload.bytesForStep = { step in step == 30 ? 0 : 1_000_000 }
+            let service = StabilityTestService(
+                probe: FakeUSBProbe(baseline: baselineSample()),
+                workloadFactory: { _, _ in workload },
+                uptime: { clock.now },
+                isMounted: { _ in true }
+            )
+
+            let record = try service.run(request(writeDirectory: root))
+
+            let write = try XCTUnwrap(record.phases.first { $0.kind == .sustainedWrite })
+            XCTAssertGreaterThan(write.minBytesPerSecond, 0)
+            XCTAssertLessThan(write.minBytesPerSecond, 1_000_000)
+            XCTAssertEqual(record.grade, .pass)
+            XCTAssertFalse(record.reasons.contains { $0.contains("No data moved") })
+        }
+    }
+
+    /// A workload whose reads fell back to the temp file gets the phase
+    /// flagged, and the report labels those figures "may include cache".
+    func testTempFileReadFallbackIsLabelledMayIncludeCache() throws {
+        let clock = StabilityFakeClock()
+        let workload = FakeStabilityWorkload(clock: clock)
+        workload.readsMayIncludeCache = true
+        let service = StabilityTestService(
+            probe: FakeUSBProbe(baseline: baselineSample()),
+            workloadFactory: { _, _ in workload },
+            uptime: { clock.now },
+            isMounted: { _ in true }
+        )
+
+        let record = try service.run(request())
+
+        let read = try XCTUnwrap(record.phases.first { $0.kind == .sustainedRead })
+        XCTAssertTrue(read.readsMayIncludeCache)
+        XCTAssertTrue(StabilityReportFormatter.text(for: record).contains("may include cache"))
+    }
 }
 
 final class FileStabilityWorkloadTests: XCTestCase {
@@ -550,9 +624,10 @@ final class FileStabilityWorkloadTests: XCTestCase {
         }
     }
 
-    /// After a write phase, the read phase reads back the temp area —
-    /// the writable path never touches existing media.
-    func testReadPhaseReadsBackTheWrittenArea() throws {
+    /// With no readable media on a writable drive the read phase falls
+    /// back to the temp area — flagged so the report labels the figures
+    /// "may include cache".
+    func testReadPhaseFallsBackToTheTempFileWhenNoMediaExists() throws {
         try withTemporaryDirectory { root in
             let workload = FileStabilityWorkload(
                 request: writableRequest(root),
@@ -563,10 +638,52 @@ final class FileStabilityWorkloadTests: XCTestCase {
             workload.end(phase: .sustainedWrite)
 
             try workload.begin(phase: .sustainedRead)
+            XCTAssertTrue(workload.readsMayIncludeCache)
             let read = try workload.step(phase: .sustainedRead) { false }
             workload.end(phase: .sustainedRead)
 
             XCTAssertGreaterThan(read, 0)
+            XCTAssertFalse(workload.readsMayIncludeCache)
+            workload.cleanup()
+        }
+    }
+
+    /// When the drive has readable media the read phase samples it and
+    /// never opens the test's own temp file — just-written data can answer
+    /// from cache. The temp file is made unreadable to prove the point:
+    /// any attempt to open it would fail the phase.
+    func testReadPhasePrefersExistingMediaOverTheTempFile() throws {
+        try withTemporaryDirectory { root in
+            try writeFile(root.appendingPathComponent("clip.mov"), Data(count: 2 * 1024 * 1024))
+            let workload = FileStabilityWorkload(
+                request: writableRequest(root),
+                areaBytes: 16 * 1024 * 1024
+            )
+            try workload.begin(phase: .sustainedWrite)
+            _ = try workload.step(phase: .sustainedWrite) { false }
+            workload.end(phase: .sustainedWrite)
+
+            let names = try FileManager.default.contentsOfDirectory(atPath: root.path)
+            let temp = try XCTUnwrap(
+                names.first { $0.hasPrefix(StabilityTestService.temporaryFilePrefix) }
+            )
+            let tempURL = root.appendingPathComponent(temp)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o000], ofItemAtPath: tempURL.path
+            )
+
+            try workload.begin(phase: .sustainedRead)
+            XCTAssertFalse(workload.readsMayIncludeCache)
+            var moved: Int64 = 0
+            for _ in 0..<4 {
+                moved += try workload.step(phase: .sustainedRead) { false }
+            }
+            workload.end(phase: .sustainedRead)
+
+            XCTAssertGreaterThan(moved, 0)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o600], ofItemAtPath: tempURL.path
+            )
             workload.cleanup()
         }
     }
@@ -592,6 +709,7 @@ final class FileStabilityWorkloadTests: XCTestCase {
             workload.end(phase: .sustainedRead)
 
             XCTAssertGreaterThan(moved, 0)
+            XCTAssertFalse(workload.readsMayIncludeCache)
             XCTAssertEqual(
                 try FileManager.default.contentsOfDirectory(atPath: root.path),
                 ["clip.mov"],
@@ -614,7 +732,9 @@ final class FileStabilityWorkloadTests: XCTestCase {
     }
 
     /// The burst phase runs parallel readers plus a writer; a short real
-    /// burst on a real temp folder must move bytes and stop cleanly.
+    /// burst on a real temp folder must move bytes and stop cleanly. With
+    /// no media on the drive the readers fall back to the temp file —
+    /// flagged "may include cache".
     func testMixedBurstMovesBytesAndStops() throws {
         try withTemporaryDirectory { root in
             let workload = FileStabilityWorkload(
@@ -626,6 +746,7 @@ final class FileStabilityWorkloadTests: XCTestCase {
             workload.end(phase: .sustainedWrite)
 
             try workload.begin(phase: .mixedBurst)
+            XCTAssertTrue(workload.readsMayIncludeCache)
             var moved: Int64 = 0
             let deadline = Date().addingTimeInterval(2)
             while moved == 0, Date() < deadline {
@@ -636,6 +757,37 @@ final class FileStabilityWorkloadTests: XCTestCase {
             XCTAssertGreaterThan(moved, 0)
             workload.cleanup()
             XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.path), [])
+        }
+    }
+
+    /// With media on the drive the burst phase reads it — not the temp
+    /// file — while its writer keeps cycling the temp area.
+    func testMixedBurstReadsMediaWhenTheDriveHasIt() throws {
+        try withTemporaryDirectory { root in
+            try writeFile(root.appendingPathComponent("clip.mov"), Data(count: 4 * 1024 * 1024))
+            let workload = FileStabilityWorkload(
+                request: writableRequest(root),
+                areaBytes: 32 * 1024 * 1024
+            )
+            try workload.begin(phase: .sustainedWrite)
+            _ = try workload.step(phase: .sustainedWrite) { false }
+            workload.end(phase: .sustainedWrite)
+
+            try workload.begin(phase: .mixedBurst)
+            XCTAssertFalse(workload.readsMayIncludeCache)
+            var moved: Int64 = 0
+            let deadline = Date().addingTimeInterval(2)
+            while moved == 0, Date() < deadline {
+                moved += try workload.step(phase: .mixedBurst) { false }
+            }
+            workload.end(phase: .mixedBurst)
+
+            XCTAssertGreaterThan(moved, 0)
+            workload.cleanup()
+            XCTAssertEqual(
+                try FileManager.default.contentsOfDirectory(atPath: root.path),
+                ["clip.mov"]
+            )
         }
     }
 
@@ -745,6 +897,23 @@ final class StabilityHistoryStoreTests: XCTestCase {
             try writeFile(url, "{ not json")
             XCTAssertTrue(store.load().records.isEmpty)
         }
+    }
+
+    /// Phase records written before cache accounting existed must still
+    /// decode — the new fields fall back to zero/false.
+    func testPhaseRecordDecodesWithoutCacheFields() throws {
+        let json = """
+            {"kind":"sustainedRead","seconds":40,"bytesMoved":1000,\
+            "minBytesPerSecond":1,"typicalBytesPerSecond":2,\
+            "maxBytesPerSecond":3,"completed":true}
+            """
+        let record = try JSONDecoder().decode(
+            StabilityPhaseRecord.self, from: Data(json.utf8)
+        )
+        XCTAssertEqual(record.kind, .sustainedRead)
+        XCTAssertEqual(record.cacheAffectedSamples, 0)
+        XCTAssertEqual(record.windowedSamples, 0)
+        XCTAssertFalse(record.readsMayIncludeCache)
     }
 
     /// A finished run persists through the store so history shows it.
@@ -890,6 +1059,12 @@ private final class FakeStabilityWorkload: StabilityWorkload, @unchecked Sendabl
     var parkSteps = false
     var throwOnPhase: StabilityPhaseKind?
     var afterSteps: ((Int) -> Void)?
+    /// Bytes a moving step reports — defaults to 1 MB. Scripted steps can
+    /// emit cache-speed bursts or empty seconds mid-phase.
+    var bytesForStep: ((Int) -> Int64)?
+    /// Claims the phase's reads hit the temp file — the service records it
+    /// so the report can label the figures "may include cache".
+    var readsMayIncludeCache = false
 
     init(clock: StabilityFakeClock?) {
         self.clock = clock
@@ -927,7 +1102,7 @@ private final class FakeStabilityWorkload: StabilityWorkload, @unchecked Sendabl
         clock?.advance(by: 1)
         afterSteps?(step)
         if phase.movesBytes, step > idleSteps {
-            return 1_000_000
+            return bytesForStep?(step) ?? 1_000_000
         }
         return 0
     }

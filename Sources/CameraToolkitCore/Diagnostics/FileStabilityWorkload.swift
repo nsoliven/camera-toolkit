@@ -4,10 +4,17 @@ import Foundation
 /// The production workload: one hidden temp file inside the allowed write
 /// folder, written sequentially in bounded chunks and *cycled* — the write
 /// offset wraps at the area cap instead of growing — so a 30-minute soak
-/// never owns more than `areaBytes` on disk. Reads are uncached
+/// never owns more than `areaBytes` on disk. Writes are uncached
 /// (`F_NOCACHE`) and exFAT/FAT drives get the same gentle treatment as the
-/// speed test: no fsync, no preallocation. Read-only drives sample
-/// existing media and never open a write descriptor.
+/// speed test: no fsync, no preallocation.
+///
+/// Reads always sample *existing* media on the drive — the same approach
+/// as `StorageBenchmarkService`'s read sampler — never the temp file the
+/// test just wrote: that data is still in memory (the page cache, or
+/// FSKit's own cache, which `F_NOCACHE` does not defeat on exFAT), so
+/// read-back figures would quote memory speed. Only a drive with no
+/// readable media at all falls back to the temp file, and then the phase
+/// is flagged `readsMayIncludeCache` so the report labels it.
 public final class FileStabilityWorkload: StabilityWorkload, @unchecked Sendable {
     private let request: StabilityTestRequest
     private let areaBytes: Int64
@@ -30,6 +37,10 @@ public final class FileStabilityWorkload: StabilityWorkload, @unchecked Sendable
     private var mediaIndex = 0
     private var burst: BurstRunner?
 
+    /// True while a phase's reads hit the temp file because the drive has
+    /// no readable media — those figures may come from cache.
+    public private(set) var readsMayIncludeCache = false
+
     public init(request: StabilityTestRequest, areaBytes: Int64, fileManager: FileManager = .default) {
         self.request = request
         self.areaBytes = areaBytes
@@ -50,6 +61,7 @@ public final class FileStabilityWorkload: StabilityWorkload, @unchecked Sendable
     }
 
     public func begin(phase: StabilityPhaseKind) throws {
+        readsMayIncludeCache = false
         switch phase {
         case .sustainedWrite:
             try beginWrite()
@@ -83,6 +95,7 @@ public final class FileStabilityWorkload: StabilityWorkload, @unchecked Sendable
     }
 
     public func end(phase: StabilityPhaseKind) {
+        readsMayIncludeCache = false
         switch phase {
         case .sustainedWrite:
             closeDescriptor(&writeFD)
@@ -171,37 +184,41 @@ public final class FileStabilityWorkload: StabilityWorkload, @unchecked Sendable
 
     // MARK: - Sustained read
 
-    /// Writable drives read back what the write phase laid down; read-only
-    /// drives sample existing media — never the other way around.
+    /// Every drive samples existing media first — the same uncached,
+    /// rotating selection the speed test reads — because the temp file
+    /// the write phase just filled can still answer from cache. Only a
+    /// drive with no readable media falls back to the temp file, and the
+    /// phase is flagged so the report labels those figures.
     private func beginRead() throws {
-        if let url = tempURL, highWater > 0 {
-            let fd = try openDescriptor(url, flags: O_RDONLY | O_NOFOLLOW)
-            do {
-                guard Darwin.fcntl(fd, F_NOCACHE, 1) == 0 else {
-                    throw posixError(operation: "disable the file cache for", url: url)
-                }
-            } catch {
-                Darwin.close(fd)
-                throw error
-            }
-            readFD = fd
-            readOffset = 0
+        let media = mediaFiles.isEmpty ? discoverMediaFiles() : mediaFiles
+        if !media.isEmpty {
+            mediaFiles = media
+            mediaIndex = 0
             return
         }
-        mediaFiles = discoverMediaFiles()
-        guard !mediaFiles.isEmpty else {
+        guard let url = tempURL, highWater > 0 else {
             throw ToolkitError.commandFailed(
                 "No readable media found on this drive — the stability test samples existing files and writes nothing."
             )
         }
-        mediaIndex = 0
+        readsMayIncludeCache = true
+        let fd = try openDescriptor(url, flags: O_RDONLY | O_NOFOLLOW)
+        do {
+            guard Darwin.fcntl(fd, F_NOCACHE, 1) == 0 else {
+                throw posixError(operation: "disable the file cache for", url: url)
+            }
+        } catch {
+            Darwin.close(fd)
+            throw error
+        }
+        readFD = fd
+        readOffset = 0
     }
 
     private func readStep() throws -> Int64 {
-        // The source is chosen the same way `beginRead` chose: a written
-        // temp area means read-back; otherwise media sampling. `readFD`
-        // alone cannot decide — media reads hold a descriptor too.
-        if tempURL != nil, highWater > 0 {
+        // The source is whichever `beginRead` opened: the temp-file
+        // fallback, or media sampling.
+        if readsMayIncludeCache {
             return try readStepFromTempFile()
         }
         return try readStepFromMedia()
@@ -272,35 +289,38 @@ public final class FileStabilityWorkload: StabilityWorkload, @unchecked Sendable
     /// Several parallel readers plus — on writable drives — one writer,
     /// with a mix of small header-sized and large sequential requests.
     /// This mimics the app's own launch burst: a drive walk, stats, header
-    /// reads, and thumbnail decodes at once.
+    /// reads, and thumbnail decodes at once. Readers walk existing media
+    /// for the same reason the sustained read does; the temp file is the
+    /// labelled fallback when the drive has nothing readable.
     private func beginBurst() throws {
         let runner = BurstRunner()
-        let readerCount = request.writeDirectory == nil ? 4 : 3
-        if highWater > 0, let url = tempURL {
-            for _ in 0..<readerCount {
-                runner.add { self.tempFileReaderLoop(runner: $0, url: url) }
-            }
-            if request.writeDirectory != nil {
-                runner.add { self.tempFileWriterLoop(runner: $0) }
-            }
-        } else {
-            let media = mediaFiles.isEmpty ? discoverMediaFiles() : mediaFiles
-            guard !media.isEmpty else {
-                throw ToolkitError.commandFailed(
-                    "No readable media found on this drive — the stability test samples existing files and writes nothing."
-                )
-            }
+        let media = mediaFiles.isEmpty ? discoverMediaFiles() : mediaFiles
+        if !media.isEmpty {
             mediaFiles = media
+            let readerCount = request.writeDirectory == nil ? 4 : 3
             for index in 0..<readerCount {
                 runner.add { self.mediaReaderLoop(runner: $0, startIndex: index) }
             }
+        } else if highWater > 0, let url = tempURL {
+            readsMayIncludeCache = true
+            for _ in 0..<3 {
+                runner.add { self.tempFileReaderLoop(runner: $0, url: url) }
+            }
+        } else {
+            throw ToolkitError.commandFailed(
+                "No readable media found on this drive — the stability test samples existing files and writes nothing."
+            )
+        }
+        if request.writeDirectory != nil, tempURL != nil {
+            runner.add { self.tempFileWriterLoop(runner: $0) }
         }
         runner.start()
         burst = runner
     }
 
     /// Random small (64 KB) and large (4 MB) uncached reads over the
-    /// written region of the temp file.
+    /// written region of the temp file — the fallback read source when
+    /// the drive has no readable media.
     private func tempFileReaderLoop(runner: BurstRunner, url: URL) {
         guard let fd = try? openDescriptor(url, flags: O_RDONLY | O_NOFOLLOW) else { return }
         defer { Darwin.close(fd) }
@@ -414,15 +434,23 @@ public final class FileStabilityWorkload: StabilityWorkload, @unchecked Sendable
     // MARK: - Helpers
 
     /// Bounded discovery of readable media under the search roots: regular
-    /// files only, hidden entries and our own temp files skipped, capped at
-    /// `mediaSampleFileLimit` so a huge tree cannot stall the phase start.
-    /// The enumerator stays lazy — `break` stops the walk.
+    /// files only, hidden entries and the test's own temp files skipped,
+    /// capped at `mediaSampleFileLimit` examined entries so a huge tree
+    /// cannot stall the phase start. Files at least
+    /// `mediaReadMinimumBytes` are preferred — sequential reads off tiny
+    /// files measure open/seek churn more than the link — with smaller
+    /// files used only when nothing bigger exists. The enumerator stays
+    /// lazy — `break` stops the walk.
     private func discoverMediaFiles() -> [(url: URL, size: Int64)] {
-        var files: [(url: URL, size: Int64)] = []
+        var large: [(url: URL, size: Int64)] = []
+        var small: [(url: URL, size: Int64)] = []
         var seen: Set<String> = []
+        var examined = 0
+        let limit = StabilityTestService.mediaSampleFileLimit
 
         func consider(_ url: URL) {
-            guard files.count < StabilityTestService.mediaSampleFileLimit else { return }
+            guard examined < limit else { return }
+            examined += 1
             let name = url.lastPathComponent
             if name.hasPrefix(StabilityTestService.temporaryFilePrefix)
                 || name.hasPrefix(StorageBenchmarkService.temporaryFilePrefix) {
@@ -436,11 +464,15 @@ public final class FileStabilityWorkload: StabilityWorkload, @unchecked Sendable
             let size = Int64(fileValues?.fileSize ?? 0)
             guard size > 0,
                   seen.insert(url.standardizedFileURL.path).inserted else { return }
-            files.append((url, size))
+            if size >= StabilityTestService.mediaReadMinimumBytes {
+                if large.count < limit { large.append((url, size)) }
+            } else if small.count < limit {
+                small.append((url, size))
+            }
         }
 
         for root in request.searchRoots.map(\.standardizedFileURL) {
-            guard files.count < StabilityTestService.mediaSampleFileLimit else { break }
+            guard examined < limit else { break }
             let values = try? root.resourceValues(forKeys: [.isRegularFileKey, .isDirectoryKey])
             if values?.isRegularFile == true {
                 consider(root)
@@ -457,7 +489,7 @@ public final class FileStabilityWorkload: StabilityWorkload, @unchecked Sendable
                 consider(url)
             }
         }
-        return files
+        return large.isEmpty ? small : large
     }
 
     private func openDescriptor(

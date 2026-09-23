@@ -11,11 +11,14 @@ public struct StabilityTestRequest: Sendable {
     /// The Buffer or library folder writes are allowed in. Nil means the
     /// drive is read-only and only read/burst phases run.
     public var writeDirectory: URL?
-    /// Existing media to sample for read phases on read-only drives.
+    /// Existing media to sample for read phases. Read phases always
+    /// prefer this media over the test's own temp file — reads of
+    /// just-written data can come back from cache instead of the device.
     public var searchRoots: [URL]
     public var profile: StabilityProfile
     /// The detected link's typical MB/s range — feeds the
-    /// "under about half of typical" warning.
+    /// "under about half of typical" warning and, when the negotiated
+    /// link rate is unknown, the above-ceiling sample exclusion.
     public var typicalRangeMBps: ClosedRange<Double>?
     /// Distinguishes units that share a placeholder serial.
     public var volumeUUID: String?
@@ -51,7 +54,8 @@ public struct StabilityTestUpdate: Equatable, Sendable {
     public var phaseCount: Int
     public var phaseRemaining: TimeInterval
     public var runRemaining: TimeInterval
-    /// Bytes moved in the last sample interval.
+    /// Throughput over the recent rolling window (about
+    /// `throughputWindowSeconds`), for the live graph.
     public var bytesPerSecond: Double
     public var mounted: Bool
     /// False → the UI says "USB counters not available on this connection".
@@ -109,6 +113,14 @@ public protocol StabilityWorkload: AnyObject, Sendable {
     /// Remove the temp area and release whatever is left. Called on every
     /// exit path — success, failure, cancel, drop.
     func cleanup()
+    /// True when the running phase reads the test's own temp file because
+    /// the drive offered no readable media — those bytes can come back
+    /// from cache, so the report labels the phase "may include cache".
+    var readsMayIncludeCache: Bool { get }
+}
+
+extension StabilityWorkload {
+    public var readsMayIncludeCache: Bool { false }
 }
 
 // MARK: - Service
@@ -136,9 +148,17 @@ public struct StabilityTestService: @unchecked Sendable {
     public static let defaultStallTimeout: TimeInterval = 15
     /// Port counters and mount state are re-read about this often.
     public static let defaultSampleInterval: TimeInterval = 1
-    /// Cap on enumeration while looking for media to read on a read-only
-    /// drive — discovery must stay bounded.
+    /// Reported throughput is measured over a rolling window this long —
+    /// per-second deltas alias bursty completions into fake peaks and
+    /// dips, so min/typical/max quote windowed rates instead.
+    public static let throughputWindowSeconds: TimeInterval = 3
+    /// Cap on enumeration while looking for media to read — discovery
+    /// must stay bounded.
     static let mediaSampleFileLimit = 512
+    /// Media files at least this big are preferred for read phases —
+    /// sequential reads off tiny files measure seeking more than the
+    /// link. Smaller files are used only when nothing bigger exists.
+    static let mediaReadMinimumBytes: Int64 = 8 * 1024 * 1024
 
     private let fileManager: FileManager
     private let probe: any USBPortHealthProbing
@@ -307,6 +327,9 @@ public struct StabilityTestService: @unchecked Sendable {
             let phaseEnd = phaseStart + phase.seconds
             var phaseBytes: Int64 = 0
             var phaseSamples: [Double] = []
+            var cacheAffectedSamples = 0
+            var window = ThroughputWindow(span: Self.throughputWindowSeconds)
+            var phaseReadsMayIncludeCache = false
             var intervalBytes: Int64 = 0
             var lastProgressAt = phaseStart
             var lastSampleAt = phaseStart
@@ -316,6 +339,7 @@ public struct StabilityTestService: @unchecked Sendable {
 
             do {
                 try workload.begin(phase: phase.kind)
+                phaseReadsMayIncludeCache = workload.readsMayIncludeCache
             } catch {
                 box.noteFailure(error.localizedDescription)
                 completed = false
@@ -360,12 +384,29 @@ public struct StabilityTestService: @unchecked Sendable {
                 }
                 if now >= nextSampleAt {
                     let interval = max(now - lastSampleAt, 0.001)
-                    let rate = Double(intervalBytes) / interval
+                    let moved = intervalBytes
                     intervalBytes = 0
                     lastSampleAt = now
                     nextSampleAt = now + sampleInterval
+                    var rate = Double(moved) / interval
                     if phase.kind.movesBytes {
-                        phaseSamples.append(rate)
+                        window.append(bytes: moved, seconds: interval)
+                        rate = window.rate
+                        // Only a full window feeds min/typical/max — a
+                        // lone fast tick is not a sustained figure. A
+                        // window faster than the link can physically
+                        // carry came from cache or a buffer, so it is
+                        // counted and left out.
+                        if window.isFull {
+                            if let ceiling = Self.linkCeilingBytesPerSecond(
+                                linkBitsPerSecond: box.currentLinkBitsPerSecond,
+                                typicalRangeMBps: request.typicalRangeMBps
+                            ), window.rate > ceiling {
+                                cacheAffectedSamples += 1
+                            } else {
+                                phaseSamples.append(window.rate)
+                            }
+                        }
                     }
                     let sample = samplePort(entryID: portEntryID, volumeRoot: request.volumeRoot)
                     if let newID = sample?.portEntryID { portEntryID = newID }
@@ -390,11 +431,32 @@ public struct StabilityTestService: @unchecked Sendable {
                 seconds: uptime() - phaseStart,
                 bytesMoved: phaseBytes,
                 samplesBytesPerSecond: phaseSamples,
-                completed: completed && uptime() >= phaseEnd - 0.001
+                completed: completed && uptime() >= phaseEnd - 0.001,
+                cacheAffectedSamples: cacheAffectedSamples,
+                readsMayIncludeCache: phaseReadsMayIncludeCache
             ))
             if !completed || box.hasFailure { break }
         }
         box.finished(at: uptime())
+    }
+
+    /// Above this rate a window cannot be device truth — the bytes came
+    /// from a cache or a buffer. USB 3.x goodput tops out near 88% of the
+    /// negotiated wire rate; slower links use the wire rate itself (their
+    /// real ceiling sits under it anyway). When the negotiated rate is
+    /// unknown, the caller's typical range supplies a softer ceiling.
+    private static func linkCeilingBytesPerSecond(
+        linkBitsPerSecond: Int64?,
+        typicalRangeMBps: ClosedRange<Double>?
+    ) -> Double? {
+        if let bits = linkBitsPerSecond, bits > 0 {
+            let wire = Double(bits) / 8
+            return bits >= 5_000_000_000 ? wire * 0.88 : wire
+        }
+        if let upper = typicalRangeMBps?.upperBound, upper > 0 {
+            return upper * 1_000_000 * 1.2
+        }
+        return nil
     }
 
     /// Re-read the port by entry id first — it survives the device dropping
@@ -438,6 +500,40 @@ public struct StabilityTestService: @unchecked Sendable {
     }
 }
 
+/// A rolling ~3 s view of bytes moved. Per-interval deltas alias bursty
+/// completions into fake peaks and dips (an 8 MB write landing in one tick
+/// looks like 8 GB/s), so min/typical/max quote windowed rates. The sample
+/// that tips the window past the span stays in, so a window always covers
+/// at least `span` seconds before it is quoted.
+private struct ThroughputWindow {
+    let span: TimeInterval
+    private var entries: [(bytes: Int64, seconds: TimeInterval)] = []
+    private(set) var totalBytes: Int64 = 0
+    private(set) var totalSeconds: TimeInterval = 0
+
+    init(span: TimeInterval) {
+        self.span = span
+    }
+
+    mutating func append(bytes: Int64, seconds: TimeInterval) {
+        entries.append((bytes: bytes, seconds: seconds))
+        totalBytes += bytes
+        totalSeconds += seconds
+        while entries.count > 1, totalSeconds - entries[0].seconds >= span {
+            totalBytes -= entries[0].bytes
+            totalSeconds -= entries[0].seconds
+            entries.removeFirst()
+        }
+    }
+
+    var rate: Double {
+        totalSeconds > 0 ? Double(totalBytes) / totalSeconds : 0
+    }
+
+    /// Only a full-span window is a sustained figure worth recording.
+    var isFull: Bool { totalSeconds >= span }
+}
+
 // MARK: - Run state shared between worker and caller
 
 /// Locked accumulation the supervised worker writes and `run` reads back —
@@ -460,6 +556,12 @@ final class RunStateBox: @unchecked Sendable {
 
     var summary: StabilityRunSummary {
         lock.withLock { state }
+    }
+
+    /// Locked read of the negotiated link rate for the worker's
+    /// per-window ceiling checks — `noteSample` can refresh it mid-run.
+    var currentLinkBitsPerSecond: Int64? {
+        lock.withLock { linkBitsPerSecond }
     }
 
     var counterDelta: [String: Int64] {
