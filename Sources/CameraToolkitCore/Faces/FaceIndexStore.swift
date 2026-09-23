@@ -4,36 +4,31 @@ import GRDB
 /// Read/write access to the face tables inside the app's catalog database.
 ///
 /// The tables are created by `CatalogStore.bootstrap`; this store only works
-/// with rows. All writes go through one GRDB queue so callers on background
-/// threads serialize safely, and foreign keys are on so deleted people drop
-/// their template links and free their faces.
+/// with rows. All access goes through the catalog's shared connection
+/// (`CatalogDatabase.writer(for:)`), so every store over the same file —
+/// the board's, each scan's, the People window's — serializes writes on one
+/// writer and reads from WAL snapshots, with foreign keys on so deleted
+/// people drop their template links and free their faces.
 public final class FaceIndexStore: @unchecked Sendable {
     public let url: URL
-    private let queueLock = NSLock()
-    private var queue: DatabaseQueue?
+    private let injectedWriter: (any DatabaseWriter)?
 
     public init(url: URL) {
         self.url = url
+        self.injectedWriter = nil
     }
 
     /// A store over a prebuilt queue — the test seam for a trace hook
     /// counting BEGINs or a busy handler that refuses the first attempts,
-    /// instead of the configuration `database()` builds.
+    /// instead of the shared catalog connection.
     init(url: URL, queue: DatabaseQueue) {
         self.url = url
-        self.queue = queue
+        self.injectedWriter = queue
     }
 
-    private func database() throws -> DatabaseQueue {
-        queueLock.lock()
-        defer { queueLock.unlock() }
-        if let queue { return queue }
-        var configuration = Configuration()
-        configuration.busyMode = .timeout(5)
-        configuration.foreignKeysEnabled = true
-        let queue = try DatabaseQueue(path: url.path, configuration: configuration)
-        self.queue = queue
-        return queue
+    private func database() throws -> any DatabaseWriter {
+        if let injectedWriter { return injectedWriter }
+        return try CatalogDatabase.writer(for: url)
     }
 
     /// Every read goes through the shared transient retry — a stuttering

@@ -1,4 +1,5 @@
 import AppKit
+import CameraToolkitCore
 import SwiftUI
 
 @main
@@ -35,6 +36,9 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate, NSMenuIte
     func applicationWillTerminate(_ notification: Notification) {
         NotificationCenter.default.removeObserver(self)
         model.flushConfigurationSave()
+        // Fold the catalog's WAL back into the main file so the database
+        // on disk is complete on its own after quit.
+        CatalogDatabase.checkpointAndCloseAll()
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {

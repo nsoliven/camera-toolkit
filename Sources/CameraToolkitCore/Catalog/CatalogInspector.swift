@@ -103,8 +103,8 @@ public struct ImmichCatalogStatus: Equatable, Sendable {
     }
 }
 
-/// Bounded catalog access backed by GRDB. Arbitrary inspector SQL stays
-/// read-only; the explicit write methods persist only Camera Toolkit's own
+/// Bounded catalog access over the shared catalog connection. Arbitrary
+/// inspector SQL stays read-only; the explicit write methods persist only Camera Toolkit's own
 /// presence and Immich cache records.
 public struct CatalogInspector: Sendable {
     public let url: URL
@@ -212,12 +212,9 @@ public struct CatalogInspector: Sendable {
 
     public func savePresenceObservations(_ observations: [CatalogPresenceObservation]) throws {
         guard !observations.isEmpty else { return }
-        var configuration = Configuration()
-        configuration.busyMode = .timeout(5)
-        configuration.foreignKeysEnabled = true
-        let queue = try DatabaseQueue(path: url.path, configuration: configuration)
+        let queue = try CatalogDatabase.writer(for: url)
         let formatter = Self.isoFormatter()
-        try queue.write { database in
+        try CatalogTransactionRetry.run { try queue.write { database in
             for observation in observations {
                 try database.execute(
                     sql: """
@@ -235,7 +232,7 @@ public struct CatalogInspector: Sendable {
                     ]
                 )
             }
-        }
+        } }
     }
 
     public func immichStatuses(eventID: UUID) throws -> [String: ImmichCatalogStatus] {
@@ -273,13 +270,10 @@ public struct CatalogInspector: Sendable {
 
     public func saveImmichStatuses(_ statuses: [ImmichCatalogStatus]) throws {
         guard !statuses.isEmpty else { return }
-        var configuration = Configuration()
-        configuration.busyMode = .timeout(5)
-        configuration.foreignKeysEnabled = true
-        let queue = try DatabaseQueue(path: url.path, configuration: configuration)
+        let queue = try CatalogDatabase.writer(for: url)
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        try queue.write { database in
+        try CatalogTransactionRetry.run { try queue.write { database in
             for status in statuses {
                 try database.execute(
                     sql: """
@@ -304,7 +298,7 @@ public struct CatalogInspector: Sendable {
                     ]
                 )
             }
-        }
+        } }
     }
 
     public static func isReadOnlyQuery(_ sql: String) -> Bool {
@@ -320,12 +314,10 @@ public struct CatalogInspector: Sendable {
         guard FileManager.default.fileExists(atPath: url.path) else {
             throw ToolkitError.commandFailed("The catalog does not exist yet. Prepare the Photo List first.")
         }
-        var configuration = Configuration()
-        configuration.readonly = true
-        configuration.busyMode = .timeout(2.5)
-        configuration.foreignKeysEnabled = true
-        let queue = try DatabaseQueue(path: url.path, configuration: configuration)
-        return try queue.read(body)
+        // Reads share the catalog's connection: a read-only WAL snapshot
+        // that never waits on a writer.
+        let reader = try CatalogDatabase.writer(for: url)
+        return try CatalogTransactionRetry.run { try reader.read(body) }
     }
 
     private static func quotedIdentifier(_ value: String) -> String {

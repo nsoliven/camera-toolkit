@@ -56,13 +56,70 @@ public struct CatalogStore {
             throw ToolkitError.commandFailed("Could not open catalog database: \(message)")
         }
         defer { sqlite3_close(database) }
-        // Catalog work always runs away from the main actor. A short wait is
-        // preferable to dropping a cache update when a read-only inspector has
-        // the local database open for a moment.
-        sqlite3_busy_timeout(database, 5_000)
+        // Catalog work always runs away from the main actor. The shared
+        // pragmas give this short-lived handle the same busy timeout, WAL
+        // journal, and foreign keys as the app's shared connection, so a
+        // bootstrap waits briefly for another writer instead of failing.
+        CatalogDatabase.configureRawConnection(database, url: url)
 
+        // Schema creation and column grafts commit as one transaction: a
+        // crash part-way leaves the previous schema, never half of one.
+        try CatalogTransactionRetry.run(isTransient: Self.isTransientSQLiteError) {
+            try execute("BEGIN IMMEDIATE;", database: database)
+            do {
+                try createSchema(database: database)
+                try execute("COMMIT;", database: database)
+            } catch {
+                try? execute("ROLLBACK;", database: database)
+                throw error
+            }
+        }
+
+        // The whole bootstrap transaction — BEGIN IMMEDIATE through
+        // COMMIT — retries a transient BUSY/IOERR with a short backoff:
+        // on a network volume a lock stutter surfaces as SQLITE_IOERR
+        // (10), not a clean busy. A failure that outlasts the retries is
+        // rethrown with the real SQLite message. Every attempt starts
+        // clean because the previous one rolled back.
+        try CatalogTransactionRetry.run(isTransient: Self.isTransientSQLiteError) {
+            try execute("BEGIN IMMEDIATE;", database: database)
+            do {
+                try upsertAppState("cameraLibraryRootPath", value: configuration.cameraLibraryRootPath, database: database)
+                try upsertAppState("archivePath", value: configuration.archivePath, database: database)
+                try upsertAppState("bufferPath", value: configuration.bufferPath, database: database)
+                try upsertAppState("catalogBackupFolderPath", value: configuration.catalogBackupFolderPath, database: database)
+
+                for folder in CameraLibraryFolder.allCases {
+                    try upsertLibraryFolder(folder, path: configuration.libraryFolderPath(folder).path, database: database)
+                }
+
+                for location in configuration.configuredLocations {
+                    let selected = configuration.selectedLocationID(for: location.role) == location.id
+                    try upsertStorageLocation(location, selected: selected, database: database)
+                }
+
+                try synchronizeEvents(configuration: configuration, database: database)
+                try execute("COMMIT;", database: database)
+            } catch {
+                try? execute("ROLLBACK;", database: database)
+                throw error
+            }
+        }
+
+        let backupURL = createBackup ? try backupIfConfigured(configuration: configuration) : nil
+        return CatalogBootstrapReport(
+            databasePath: url.path,
+            backupPath: backupURL?.path,
+            libraryFolders: folders.map(\.path),
+            storageLocationCount: configuration.configuredLocations.count
+        )
+    }
+
+    /// Creates every catalog table and index and grafts the columns added
+    /// after the first catalogs shipped. Runs inside bootstrap's schema
+    /// transaction.
+    private func createSchema(database: OpaquePointer) throws {
         try execute("""
-        PRAGMA foreign_keys = ON;
         CREATE TABLE IF NOT EXISTS app_state (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL,
@@ -241,45 +298,6 @@ public struct CatalogStore {
             column: "suggested_person_id",
             definition: "suggested_person_id TEXT REFERENCES people(id) ON DELETE SET NULL",
             database: database
-        )
-
-        // The whole bootstrap transaction — BEGIN IMMEDIATE through
-        // COMMIT — retries a transient BUSY/IOERR with a short backoff:
-        // on a network volume a lock stutter surfaces as SQLITE_IOERR
-        // (10), not a clean busy. A failure that outlasts the retries is
-        // rethrown with the real SQLite message. Every attempt starts
-        // clean because the previous one rolled back.
-        try CatalogTransactionRetry.run(isTransient: Self.isTransientSQLiteError) {
-            try execute("BEGIN IMMEDIATE;", database: database)
-            do {
-                try upsertAppState("cameraLibraryRootPath", value: configuration.cameraLibraryRootPath, database: database)
-                try upsertAppState("archivePath", value: configuration.archivePath, database: database)
-                try upsertAppState("bufferPath", value: configuration.bufferPath, database: database)
-                try upsertAppState("catalogBackupFolderPath", value: configuration.catalogBackupFolderPath, database: database)
-
-                for folder in CameraLibraryFolder.allCases {
-                    try upsertLibraryFolder(folder, path: configuration.libraryFolderPath(folder).path, database: database)
-                }
-
-                for location in configuration.configuredLocations {
-                    let selected = configuration.selectedLocationID(for: location.role) == location.id
-                    try upsertStorageLocation(location, selected: selected, database: database)
-                }
-
-                try synchronizeEvents(configuration: configuration, database: database)
-                try execute("COMMIT;", database: database)
-            } catch {
-                try? execute("ROLLBACK;", database: database)
-                throw error
-            }
-        }
-
-        let backupURL = createBackup ? try backupIfConfigured(configuration: configuration) : nil
-        return CatalogBootstrapReport(
-            databasePath: url.path,
-            backupPath: backupURL?.path,
-            libraryFolders: folders.map(\.path),
-            storageLocationCount: configuration.configuredLocations.count
         )
     }
 

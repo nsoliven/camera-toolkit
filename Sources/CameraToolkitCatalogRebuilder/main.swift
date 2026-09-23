@@ -294,6 +294,9 @@ private func run() throws {
     let inspector = CatalogInspector(url: arguments.outputCatalog)
     try inspector.savePresenceObservations(sourceObservations)
     try inspector.savePresenceObservations(bufferObservations)
+    // The candidate must be complete as a single file before anything
+    // validates or installs it: fold the WAL back and close.
+    CatalogDatabase.checkpointAndClose(url: arguments.outputCatalog)
 
     let summary = RebuildSummary(
         outputConfigurationPath: arguments.outputConfiguration.path,
