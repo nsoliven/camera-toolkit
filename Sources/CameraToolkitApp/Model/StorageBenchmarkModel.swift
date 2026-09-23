@@ -26,6 +26,13 @@ struct StorageBenchmarkTarget: Identifiable, Hashable, Sendable {
 
 @MainActor
 enum StorageBenchmarkTargetDiscovery {
+    /// exFAT and FAT volumes get read tests only.
+    nonisolated static func isFlushUnsafeFileSystem(_ directory: URL?) -> Bool {
+        guard let directory,
+              let info = MountedVolumeProbe.statFSInfo(directory.path) else { return false }
+        return ["exfat", "msdos"].contains(info.fileSystemType.lowercased())
+    }
+
     private struct Builder {
         var id: String
         var name: String
@@ -140,9 +147,12 @@ enum StorageBenchmarkTargetDiscovery {
             // volume. A camera-source role never grants one, so cards stay
             // read-only — but a drive that is both the Buffer and a camera
             // source still earns the temp-file write test.
+            // No write test on exFAT/FAT: flushing a speed-test file there
+            // twice knocked a USB NVMe enclosure off the bus.
             let canWrite = !builder.isReadOnly
                 && builder.writeDirectory != nil
                 && builder.writeDirectory.map { fileManager.isWritableFile(atPath: $0.path) } == true
+                && !Self.isFlushUnsafeFileSystem(builder.writeDirectory)
             // The sampler first tries the configured source folders, then the
             // volume itself, so a source path that is empty or missing cannot
             // leave a drive full of media looking untestable.
