@@ -630,8 +630,8 @@ private struct ClearFaceScanSheet: View {
                 Spacer()
                 Button("Cancel", action: onCancel)
                     .keyboardShortcut(.cancelAction)
+                // A catalog wipe is never the Return key's default.
                 Button("Clear Face Scan", role: .destructive, action: onClear)
-                    .keyboardShortcut(.defaultAction)
             }
         }
         .padding(20)
@@ -662,12 +662,14 @@ private struct NamePersonSheet: View {
             TextField("Name", text: $name, prompt: Text("Who is this?"))
                 .textFieldStyle(.roundedBorder)
                 .focused($focused)
-                .onSubmit(save)
             HStack {
                 Spacer()
                 Button("Cancel", action: onCancel)
+                    .keyboardShortcut(.cancelAction)
+                // Return presses Save as the default button; the field has no
+                // onSubmit of its own so one Return can't save twice.
                 Button("Save", action: save)
-                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
                     .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }

@@ -857,8 +857,9 @@ private struct SourceCleanupSheet: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            .padding(12)
-            .background(Color.green.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(4)
+            .groupBoxed()
 
             VStack(alignment: .leading, spacing: 6) {
                 Label("Permanent removal", systemImage: "exclamationmark.triangle.fill")
@@ -874,8 +875,9 @@ private struct SourceCleanupSheet: View {
                     .textFieldStyle(.roundedBorder)
                     .disabled(model.isSourceCleanupRunning || model.sourceCleanupMessage != nil)
             }
-            .padding(12)
-            .background(Color.red.opacity(0.07), in: RoundedRectangle(cornerRadius: 10))
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(4)
+            .groupBoxed()
 
             if model.isSourceCleanupRunning {
                 VStack(alignment: .leading, spacing: 7) {
@@ -911,6 +913,7 @@ private struct SourceCleanupSheet: View {
                 Button(model.sourceCleanupMessage == nil ? "Cancel" : "Done") {
                     dismiss()
                 }
+                .keyboardShortcut(.cancelAction)
                 .disabled(model.isSourceCleanupRunning)
 
                 if model.sourceCleanupMessage == nil {
@@ -921,7 +924,8 @@ private struct SourceCleanupSheet: View {
                             confirmation: confirmation
                         )
                     }
-                    .keyboardShortcut(.defaultAction)
+                    // Permanent camera deletion is never the Return key's
+                    // default — it takes a click after typing REMOVE.
                     .disabled(
                         confirmation != SourceCleanupService.confirmationToken
                             || model.isSourceCleanupRunning
@@ -931,7 +935,6 @@ private struct SourceCleanupSheet: View {
         }
         .padding(20)
         .frame(width: 520)
-        .background(Color(nsColor: .windowBackgroundColor))
         .interactiveDismissDisabled(model.isSourceCleanupRunning)
     }
 
@@ -944,5 +947,12 @@ private struct SourceCleanupSheet: View {
             return nil
         }
         return model.sourceCleanupJob?.note
+    }
+}
+
+private extension View {
+    /// Wraps a sheet callout in the native macOS group box.
+    func groupBoxed() -> some View {
+        GroupBox { self }
     }
 }
