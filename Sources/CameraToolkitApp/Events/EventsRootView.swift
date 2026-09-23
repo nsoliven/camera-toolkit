@@ -630,8 +630,10 @@ struct EventsWelcomeView: View {
         ScrollView {
             VStack(spacing: 20) {
                 Image(systemName: "rectangle.3.group")
-                    .font(.system(size: 52))
-                    .foregroundStyle(.blue)
+                    .font(.largeTitle)
+                    .imageScale(.large)
+                    .symbolRenderingMode(.hierarchical)
+                    .foregroundStyle(.tint)
                     .padding(.top, 40)
                 Text("Welcome to Camera Toolkit")
                     .font(.largeTitle.bold())
@@ -644,13 +646,10 @@ struct EventsWelcomeView: View {
                 Button {
                     workspace.startGuide()
                 } label: {
-                    Label("Start Guided Setup…", systemImage: "play.circle.fill")
-                        .font(.title3.weight(.semibold))
-                        .padding(.horizontal, 20)
-                        .padding(.vertical, 8)
+                    Label("Start Guided Setup…", systemImage: "play.fill")
                 }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.large)
+                .buttonStyle(.glassProminent)
+                .controlSize(.extraLarge)
 
                 Text("It checks your drives, finds your unsorted photos, and walks you through sorting your first burst. Nothing moves or gets deleted without a plan you confirm.")
                     .font(.callout)
@@ -669,9 +668,17 @@ struct EventsWelcomeView: View {
                 }
                 .frame(maxWidth: 600)
 
-                HStack {
-                    Button("Add Folder or Card…") { workspace.addUnsortedFolder() }
-                    Button("New Event…") { workspace.requestNewEvent(from: nil) }
+                GlassEffectContainer(spacing: 12) {
+                    HStack(spacing: 12) {
+                        Button("Add Folder or Card…", systemImage: "plus.rectangle.on.folder") {
+                            workspace.addUnsortedFolder()
+                        }
+                        Button("New Event…", systemImage: "calendar.badge.plus") {
+                            workspace.requestNewEvent(from: nil)
+                        }
+                    }
+                    .buttonStyle(.glass)
+                    .controlSize(.large)
                 }
                 .padding(.bottom, 40)
             }

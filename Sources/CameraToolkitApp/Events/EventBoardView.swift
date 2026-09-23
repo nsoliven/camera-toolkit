@@ -58,12 +58,7 @@ struct EventBoardView: View {
                         if workspace.search.isEmpty {
                             emptyState(event)
                         } else {
-                            ContentUnavailableView(
-                                "No Matches",
-                                systemImage: "magnifyingglass",
-                                description: Text("Nothing in \(title) matches the current search and filters — Clear All resets them.")
-                            )
-                            .frame(maxHeight: .infinity)
+                            NoMatchesView(workspace: workspace, boardName: title)
                         }
                     } else {
                         board(groups: groups)
@@ -879,5 +874,31 @@ private struct StorageSlotRow<Actions: View>: View {
             .controlSize(.small)
         }
         .padding(.vertical, 2)
+    }
+}
+
+/// A board with nothing left after its search and filters, with the one
+/// action that fixes it.
+struct NoMatchesView: View {
+    let workspace: EventsWorkspace
+    let boardName: String
+
+    var body: some View {
+        Group {
+            if workspace.search.hasActiveConditions {
+                ContentUnavailableView {
+                    Label("No Matches", systemImage: "line.3.horizontal.decrease.circle")
+                } description: {
+                    Text("Nothing in \(boardName) matches the current search and filters.")
+                } actions: {
+                    Button("Clear Search and Filters") {
+                        workspace.search = OrganizeSearchFilter()
+                    }
+                }
+            } else {
+                ContentUnavailableView.search(text: workspace.search.text)
+            }
+        }
+        .frame(maxHeight: .infinity)
     }
 }

@@ -53,16 +53,33 @@ struct UnsortedBoardView: View {
         VStack(spacing: 0) {
             if result != nil {
                 if groups.isEmpty {
-                    ContentUnavailableView(
-                        searching ? "No Matches" : (hideSorted ? "Everything Here Is Sorted" : "No Photos or Videos"),
-                        systemImage: searching ? "magnifyingglass" : (hideSorted ? "checkmark.circle" : "photo"),
-                        description: Text(searching
-                            ? "Nothing in \(location.name) matches the current search and filters — Clear All resets them."
-                            : hideSorted
-                                ? "Turn off Hide Sorted to review, or press Apply to move the files into their events."
-                                : "This folder has no camera files.")
-                    )
-                    .frame(maxHeight: .infinity)
+                    if searching {
+                        NoMatchesView(workspace: workspace, boardName: location.name)
+                    } else if hideSorted {
+                        ContentUnavailableView {
+                            Label("Everything Here Is Sorted", systemImage: "checkmark.circle")
+                        } description: {
+                            Text("Show sorted items to review them, or Apply to move the files into their events.")
+                        } actions: {
+                            Button("Show Sorted") { hideSorted = false }
+                            if let result, workspace.sortedFiles(in: result).files > 0 {
+                                Button("Apply…") { workspace.prepareApply(sourceLocationID: location.id) }
+                                    .buttonStyle(.borderedProminent)
+                                    .disabled(model.isBusy)
+                            }
+                        }
+                        .frame(maxHeight: .infinity)
+                    } else {
+                        ContentUnavailableView {
+                            Label("No Photos or Videos", systemImage: "photo")
+                        } description: {
+                            Text("This folder has no camera files.")
+                        } actions: {
+                            Button("Rescan") { workspace.scan(location, force: true) }
+                                .disabled(state.isScanning || model.isBusy)
+                        }
+                        .frame(maxHeight: .infinity)
+                    }
                 } else {
                     board(groups: groups)
                         .guideHighlight(.grid, in: workspace)
@@ -391,21 +408,19 @@ struct UnsortedBoardView: View {
     }
 
     private var scanningView: some View {
-        VStack(spacing: 12) {
+        ContentUnavailableView {
             if let progress = state.progress, progress.total > 0 {
                 ProgressView(value: progress.fraction)
-                    .frame(width: 320)
+                    .frame(width: 280)
                 Text("\(progress.phase) · \(progress.processed.formatted()) of \(progress.total.formatted())")
             } else {
                 ProgressView()
                 Text(state.progress.map { "\($0.phase)\($0.processed > 0 ? " · \($0.processed.formatted()) found" : "")…" } ?? "Reading \(location.name)…")
             }
+        } description: {
             Text("Capture times are read from each RAW header and remembered, so reopening is fast.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
         }
-        .font(.callout)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .frame(maxHeight: .infinity)
     }
 
     private func handleKey(_ press: KeyPress, orderedIDs: [String]) -> KeyPress.Result {
