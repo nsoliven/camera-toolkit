@@ -126,7 +126,10 @@ struct EventBoardView: View {
                     )
                 }
             }
-            .task(id: "\(eventID.uuidString)-\(workspace.assignmentCount(for: eventID))-\(workspace.resolvedPolicy(for: event).rawValue)") {
+            // The task keys on the event and its storage policy only —
+            // assignment writes patch the open board in place, so a count
+            // change must not tear the grid down and rebuild it.
+            .task(id: "\(eventID.uuidString)-\(workspace.resolvedPolicy(for: event).rawValue)") {
                 await workspace.refreshEvent(eventID)
             }
             .onReceive(NotificationCenter.default.publisher(for: BrowserCommand.notification)) { notification in
@@ -341,7 +344,7 @@ struct EventBoardView: View {
                 previewStackID = stack.id
             },
             onKey: { press, _ in handleKey(press) },
-            menu: { stack in contextMenu(stack) }
+            menu: { stack in LazyContextMenu { contextMenu(stack) } }
         )
     }
 

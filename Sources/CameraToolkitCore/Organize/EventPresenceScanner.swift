@@ -78,14 +78,61 @@ public enum EventPresenceScanner {
         let otherPolicy: EventStoragePolicy = policy == .buffer ? .archiveOnly : .buffer
         let probe = probe ?? { url, size, mounted in state(url, size: size, mounted: mounted) }
 
+        // Every candidate path is (a root that depends only on the event,
+        // the assignment's device, and the policy) joined with the file's
+        // relative path. The sweep used to rebuild each root per file —
+        // and each rebuild minted several DateFormatters — so they are
+        // memoized here and per-file work is a string join plus the same
+        // validation and standardization the public helpers apply.
+        var cardRoots: [String: URL] = [:]
+        var layouts: [String: OrganizedArchiveLayout] = [:]
+        var validRelative: [String: Bool] = [:]
+
+        func cardCopyRoot(_ policy: EventStoragePolicy, _ deviceID: String?) -> URL {
+            let key = "\(policy.rawValue)\u{0}\(deviceID ?? "")"
+            if let cached = cardRoots[key] { return cached }
+            let root = locations.cardCopyRoot(for: event, deviceID: deviceID, policy: policy)
+            cardRoots[key] = root
+            return root
+        }
+        func layout(_ deviceID: String?) -> OrganizedArchiveLayout {
+            let key = deviceID ?? ""
+            if let cached = layouts[key] { return cached }
+            let built = locations.layout(for: event, deviceID: deviceID)
+            layouts[key] = built
+            return built
+        }
+        // Mirrors `driveURL`/`archiveURL`/`sourceURL`: validate once per
+        // relative path, then append + standardize exactly as they do.
+        func isValidRelative(_ path: String) -> Bool {
+            if let cached = validRelative[path] { return cached }
+            let valid = (try? PathSafety.validateRelativePath(path)) != nil
+            validRelative[path] = valid
+            return valid
+        }
+
         var assets: [EventAssetPresence] = []
         assets.reserveCapacity(assignments.count)
         for assignment in assignments {
             if Task<Never, Never>.isCancelled { return nil }
-            let source = locations.sourceURL(for: assignment)
-            let drive = locations.driveURL(for: assignment, event: event, policy: policy)
-            let other = locations.driveURL(for: assignment, event: event, policy: otherPolicy)
-            let archive = locations.archiveURL(for: assignment, event: event)
+            let (source, drive, other, archive) = autoreleasepool { () -> (URL?, URL?, URL?, URL?) in
+                let valid = isValidRelative(assignment.relativePath)
+                let source = locations.sourceURL(for: assignment)
+                let drive = valid ? cardCopyRoot(policy, assignment.deviceID)
+                    .appendingPathComponent(assignment.relativePath)
+                    .standardizedFileURL : nil
+                let other = valid ? cardCopyRoot(otherPolicy, assignment.deviceID)
+                    .appendingPathComponent(assignment.relativePath)
+                    .standardizedFileURL : nil
+                let archive = try? layout(assignment.deviceID)
+                    .destinationRelativePath(for: assignment.relativePath)
+                return (
+                    source,
+                    drive,
+                    other,
+                    archive.map { locations.libraryRoot.appendingPathComponent($0).standardizedFileURL }
+                )
+            }
             if let pauseGate {
                 for url in [source, drive, other, archive].compactMap({ $0 }) {
                     guard pauseGate.waitIfPaused(
@@ -94,9 +141,12 @@ public enum EventPresenceScanner {
                     ) else { return nil }
                 }
             }
-            let sourceIsDrive = [drive, other].contains { candidate in
-                guard let candidate, let source else { return false }
-                return EventStorageLocations.pathKey(candidate.path) == EventStorageLocations.pathKey(source.path)
+            // Both candidates are already `standardizedFileURL` paths, so
+            // `pathKey` on them reduces to a lowercase compare — no extra
+            // standardize (or stat) per file.
+            let sourceKey = source?.path.lowercased()
+            let sourceIsDrive = sourceKey != nil && [drive, other].contains {
+                $0?.path.lowercased() == sourceKey
             }
             assets.append(EventAssetPresence(
                 id: CatalogStore.eventAssetID(assignment),

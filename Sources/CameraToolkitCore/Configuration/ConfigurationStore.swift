@@ -422,11 +422,7 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
 
     public var archiveEventDate: String {
         let candidate = String(batchID.prefix(10))
-        let formatter = DateFormatter()
-        formatter.calendar = Calendar(identifier: .gregorian)
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "yyyy-MM-dd"
-        return formatter.date(from: candidate) == nil ? Self.dayFormatter.string(from: Date()) : candidate
+        return Self.dayFormatter.date(from: candidate) == nil ? Self.dayFormatter.string(from: Date()) : candidate
     }
 
     public func libraryBatchFolderPath(_ folder: CameraLibraryFolder) -> String {
@@ -852,6 +848,16 @@ public struct ConfigurationStore {
 
         let data = try Data(contentsOf: url)
         return try JSONDecoder().decode(AppConfiguration.self, from: data)
+    }
+
+    /// The config file's modification date and size — the cheap "did the
+    /// file change on disk" fingerprint an activation check compares
+    /// before paying for a decode. Nil when the file is absent.
+    public func fileStamp() -> (modifiedAt: Date, byteCount: Int64)? {
+        guard let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey]),
+              let modified = values.contentModificationDate,
+              let size = values.fileSize else { return nil }
+        return (modified, Int64(size))
     }
 
     /// Writes the configuration atomically. `settingsOnly` leaves out the

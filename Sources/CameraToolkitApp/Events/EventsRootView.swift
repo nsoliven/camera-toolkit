@@ -218,20 +218,7 @@ struct EventsSidebar: View {
                                 workspace.selection = .unsorted(location.id)
                             })
                             .contextMenu {
-                                Button("Rescan") { workspace.scan(location, force: true) }
-                                    .disabled(workspace.sources[location.id]?.isScanning == true || model.isBusy)
-                                Button("Regroup Bursts") { workspace.regroupBursts(location) }
-                                    .disabled(workspace.sources[location.id]?.isScanning == true || model.isBusy || workspace.sources[location.id]?.result == nil)
-                                    .help("Re-run burst grouping on the scanned files with the current Settings sliders — files are not re-read.")
-                                Button("Scan for Faces…") { workspace.requestFaceScan(location) }
-                                    .disabled(workspace.faceScanBlocker(for: location) != nil)
-                                    .help(workspace.faceScanBlocker(for: location)
-                                        ?? "Detect and match faces on a sample of each burst — not every frame. Writes only to the catalog — media is read, never touched.")
-                                Button("Reveal in Finder") {
-                                    NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: DashboardModel.expandedPath(location.path))])
-                                }
-                                Divider()
-                                Button("Remove from Unsorted List") { workspace.removeUnsortedFolder(location.id) }
+                                UnsortedSidebarMenu(location: location, workspace: workspace, model: model)
                             }
                     }
                     Button {
@@ -280,20 +267,7 @@ struct EventsSidebar: View {
                                 }
                             }
                             .contextMenu {
-                                Button("New Subevent…") {
-                                    workspace.requestNewEvent(from: nil, parentEventID: row.event.id)
-                                }
-                                Button("Rename or Change Date…") {
-                                    workspace.renameRequest = RenameEventRequest(eventID: row.event.id)
-                                }
-                                Button("Scan for Faces…") { workspace.requestFaceScan(row.event) }
-                                    .disabled(workspace.faceScanBlocker(for: row.event) != nil)
-                                    .help(workspace.faceScanBlocker(for: row.event)
-                                        ?? "Detect and match faces on a sample of each burst — not every frame. Writes only to the catalog — media is read, never touched.")
-                                Button("Delete Empty Event", role: .destructive) {
-                                    workspace.deleteEmptyEvent(row.event.id)
-                                }
-                                .disabled(workspace.assignmentCount(for: row.event.id) > 0)
+                                EventSidebarMenu(event: row.event, workspace: workspace)
                             }
                     }
                 } header: {
@@ -1013,5 +987,58 @@ struct FaceScanSheet: View {
         default:
             "The quick pass: still photos only, faces large enough to matter. Videos are skipped."
         }
+    }
+}
+
+/// The Unsorted row's context menu, in its own view so its buttons are
+/// built when the menu opens instead of on every sidebar render — a row
+/// that never gets right-clicked never pays for them.
+private struct UnsortedSidebarMenu: View {
+    let location: ConfiguredLocation
+    let workspace: EventsWorkspace
+    let model: DashboardModel
+
+    var body: some View {
+        Button("Rescan") { workspace.scan(location, force: true) }
+            .disabled(workspace.sources[location.id]?.isScanning == true || model.isBusy)
+        Button("Regroup Bursts") { workspace.regroupBursts(location) }
+            .disabled(workspace.sources[location.id]?.isScanning == true || model.isBusy || workspace.sources[location.id]?.result == nil)
+            .help("Re-run burst grouping on the scanned files with the current Settings sliders — files are not re-read.")
+        Button("Scan for Faces…") { workspace.requestFaceScan(location) }
+            .disabled(workspace.faceScanBlocker(for: location) != nil)
+            .help(workspace.faceScanBlocker(for: location)
+                ?? "Detect and match faces on a sample of each burst — not every frame. Writes only to the catalog — media is read, never touched.")
+        Button("Reveal in Finder") {
+            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: DashboardModel.expandedPath(location.path))])
+        }
+        Divider()
+        Button("Remove from Unsorted List") { workspace.removeUnsortedFolder(location.id) }
+    }
+}
+
+/// The event row's context menu — same deferral, plus the one legitimate
+/// Face Scan kick: opening the menu is when the check that unlocks the
+/// item should start, so `prepareFaceScanStatus` runs here and never on
+/// a row render (at launch that swept every event just to draw the list).
+private struct EventSidebarMenu: View {
+    let event: SavedCameraEvent
+    let workspace: EventsWorkspace
+
+    var body: some View {
+        Button("New Subevent…") {
+            workspace.requestNewEvent(from: nil, parentEventID: event.id)
+        }
+        Button("Rename or Change Date…") {
+            workspace.renameRequest = RenameEventRequest(eventID: event.id)
+        }
+        Button("Scan for Faces…") { workspace.requestFaceScan(event) }
+            .disabled(workspace.faceScanBlocker(for: event) != nil)
+            .help(workspace.faceScanBlocker(for: event)
+                ?? "Detect and match faces on a sample of each burst — not every frame. Writes only to the catalog — media is read, never touched.")
+        Button("Delete Empty Event", role: .destructive) {
+            workspace.deleteEmptyEvent(event.id)
+        }
+        .disabled(workspace.assignmentCount(for: event.id) > 0)
+        .task { workspace.prepareFaceScanStatus(for: event) }
     }
 }

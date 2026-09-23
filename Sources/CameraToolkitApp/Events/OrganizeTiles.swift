@@ -25,6 +25,15 @@ enum EventPalette {
     }
 }
 
+/// A context menu whose items live in a view body: `.contextMenu` runs
+/// its content closure while the row renders, but a nested view's body
+/// only runs when the menu actually opens — so per-tile menus stop
+/// paying their build cost on every board render.
+struct LazyContextMenu<Content: View>: View {
+    @ViewBuilder var content: () -> Content
+    var body: some View { content() }
+}
+
 struct EventChip: View {
     let event: SavedCameraEvent
     var number: Int?
@@ -181,13 +190,18 @@ struct OrganizeDragPayload: Codable {
 struct TileThumbnail: View {
     let url: URL
     let kind: OrganizeMediaKind
-    let pixelSize: Int
+    /// Longest edge in points — the decode asks for `pointSize × displayScale`
+    /// pixels, so a 1× monitor never pays for a Retina-sized bitmap.
+    let pointSize: CGFloat
     /// Display rotation in quarter-turns clockwise; part of the task id so a
     /// "Rotate Burst" change re-decodes this tile without a rescan.
     var orientation: Int = 0
 
+    @Environment(\.displayScale) private var displayScale
     @State private var image: CGImage?
     @State private var failed = false
+
+    private var pixelSize: Int { Int(pointSize * displayScale) }
 
     var body: some View {
         ZStack {
@@ -217,6 +231,11 @@ struct TileThumbnail: View {
             guard !Task.isCancelled else { return }
             image = loaded
             failed = loaded == nil
+        }
+        .onDisappear {
+            // Scrolled off: drop the tile's own bitmap — the NSCache keeps a
+            // share for the scroll back, this copy is what ballooned memory.
+            image = nil
         }
     }
 
@@ -259,7 +278,7 @@ struct StackTileView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
             ZStack {
-                TileThumbnail(url: stack.coverItem.primary.url, kind: stack.kind, pixelSize: Int(width * 2), orientation: orientation)
+                TileThumbnail(url: stack.coverItem.primary.url, kind: stack.kind, pointSize: width, orientation: orientation)
                     .frame(width: width, height: width * 2 / 3)
                     .clipped()
                 VStack {
@@ -435,7 +454,7 @@ struct StackRowView: View {
 
     var body: some View {
         HStack(spacing: 10) {
-            TileThumbnail(url: stack.coverItem.primary.url, kind: stack.kind, pixelSize: 176)
+            TileThumbnail(url: stack.coverItem.primary.url, kind: stack.kind, pointSize: 88)
                 .frame(width: 88, height: 56)
                 .clipped()
                 .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
@@ -572,7 +591,7 @@ struct BurstExpansionView: View {
                 spacing: 6
             ) {
                 ForEach(Array(stack.items.enumerated()), id: \.element.id) { index, frame in
-                    TileThumbnail(url: frame.primary.url, kind: frame.kind, pixelSize: Int(frameSize * 2))
+                    TileThumbnail(url: frame.primary.url, kind: frame.kind, pointSize: frameSize)
                         .frame(width: frameSize, height: frameSize * 2 / 3)
                         .clipped()
                         .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
@@ -970,8 +989,23 @@ enum OrganizeFolderLabel {
         return relative.isEmpty ? nil : String(relative)
     }
 
+    /// `standardizedFileURL` walks the filesystem — realpath stats each
+    /// component, and folder labels ask for the same few roots once per
+    /// stack per render or search keystroke. Resolved strings are cached
+    /// by input path, the same trade-off `OrganizeFile.pathKey` makes.
+    nonisolated(unsafe) private static let standardizedCache: NSCache<NSString, NSString> = {
+        let cache = NSCache<NSString, NSString>()
+        cache.countLimit = 4_096
+        return cache
+    }()
+
     private static func standardized(_ path: String) -> String {
-        URL(fileURLWithPath: path).standardizedFileURL.path
+        if let cached = standardizedCache.object(forKey: path as NSString) {
+            return cached as String
+        }
+        let resolved = URL(fileURLWithPath: path).standardizedFileURL.path
+        standardizedCache.setObject(resolved as NSString, forKey: path as NSString)
+        return resolved
     }
 
     private static func standardizedRoot(_ rootPath: String?) -> String? {
@@ -1408,7 +1442,7 @@ struct StackPreviewOverlay: View {
             }
         }
         .contextMenu {
-            frameContextMenu(stack, index: min(max(frameIndex, 0), stack.items.count - 1))
+            LazyContextMenu { frameContextMenu(stack, index: min(max(frameIndex, 0), stack.items.count - 1)) }
         }
     }
 
@@ -1474,7 +1508,7 @@ struct StackPreviewOverlay: View {
         }
         .contextMenu {
             if let stack {
-                frameContextMenu(stack, index: min(max(frameIndex, 0), stack.items.count - 1))
+                LazyContextMenu { frameContextMenu(stack, index: min(max(frameIndex, 0), stack.items.count - 1)) }
             }
         }
         .onDisappear {
@@ -1490,7 +1524,7 @@ struct StackPreviewOverlay: View {
                     ForEach(Array(stack.items.enumerated()), id: \.element.id) { index, frame in
                         let isSelected = selectedIndexes.contains(index)
                         let isCurrent = index == frameIndex
-                        TileThumbnail(url: frame.primary.url, kind: frame.kind, pixelSize: 256, orientation: orientationForFile(frame.primary))
+                        TileThumbnail(url: frame.primary.url, kind: frame.kind, pointSize: 96, orientation: orientationForFile(frame.primary))
                             .frame(width: 96, height: 64)
                             .clipShape(RoundedRectangle(cornerRadius: 5))
                             .overlay {
@@ -1506,7 +1540,7 @@ struct StackPreviewOverlay: View {
                             }
                             .id(index)
                             .onTapGesture { selectFrame(index, in: stack) }
-                            .contextMenu { frameContextMenu(stack, index: index) }
+                            .contextMenu { LazyContextMenu { frameContextMenu(stack, index: index) } }
                     }
                 }
             }
@@ -1752,7 +1786,7 @@ struct StackPreviewOverlay: View {
     /// bigger image to the exact point size the base decode was shown at.
     private func loadHiRes() async {
         guard let request = hiResRequest, request == currentHiResKey else { return }
-        let url = URL(fileURLWithPath: request.path)
+        let url = URL(filePath: request.path, directoryHint: .notDirectory)
         if let cached = TileImageLoader.shared.cachedImage(for: url, maximumPixelSize: 4_800, orientation: request.turns) {
             guard !Task.isCancelled else { return }
             storeHiRes(cached, key: request)

@@ -43,11 +43,28 @@ public final class FaceIndexStore: @unchecked Sendable {
         try read(body)
     }
 
+    private let mutationLock = NSLock()
+    private var mutationCount = 0
+
+    /// Bumped after every committed write on this store so cached
+    /// derivations (the roster snapshot behind `event.people`) can tell
+    /// the face tables changed without trusting callers to route every
+    /// mutation through one object.
+    public var mutationGeneration: Int {
+        mutationLock.lock()
+        defer { mutationLock.unlock() }
+        return mutationCount
+    }
+
     /// Every single-statement write: one transaction, retried on a
     /// transient busy/IO refusal. Passes that mutate many rows use
     /// `inWriteTransaction` so their writes share one transaction instead.
     private func write<T>(_ body: (Database) throws -> T) throws -> T {
-        try CatalogTransactionRetry.run { try database().write(body) }
+        let result = try CatalogTransactionRetry.run { try database().write(body) }
+        mutationLock.lock()
+        mutationCount += 1
+        mutationLock.unlock()
+        return result
     }
 
     /// Runs `body` inside a single write transaction — one BEGIN
@@ -78,11 +95,14 @@ public final class FaceIndexStore: @unchecked Sendable {
         }
     }
 
-    private static func formatter() -> ISO8601DateFormatter {
+    /// One formatter/parser for every row the store maps — roster joins
+    /// decode tens of thousands of ISO stamps per event, and minting a
+    /// formatter per row (or per call) was the dominant cost.
+    nonisolated(unsafe) private static let formatter: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return formatter
-    }
+    }()
 
     private static func timestamp(_ date: Date, _ formatter: ISO8601DateFormatter) -> String {
         formatter.string(from: date)
@@ -135,7 +155,7 @@ public final class FaceIndexStore: @unchecked Sendable {
         faces: [FaceRecord],
         confirmedOverlap: Double = 0.5
     ) throws {
-        let formatter = Self.formatter()
+        let formatter = Self.formatter
         let now = formatter.string(from: Date())
         try write { database in
             let confirmed = try Row.fetchAll(
@@ -228,7 +248,7 @@ public final class FaceIndexStore: @unchecked Sendable {
     /// describe other bytes and are dropped. Confirmed faces are never
     /// touched, and the stamped grade keeps the file out of later scans.
     public func markCovered(photo: FacePhotoRecord) throws {
-        let formatter = Self.formatter()
+        let formatter = Self.formatter
         let now = formatter.string(from: Date())
         try write { database in
             let stale = try Row.fetchOne(
@@ -382,7 +402,7 @@ public final class FaceIndexStore: @unchecked Sendable {
         personID: UUID,
         crop: Data? = nil
     ) throws -> FaceRecord {
-        let formatter = Self.formatter()
+        let formatter = Self.formatter
         let now = formatter.string(from: Date())
         return try write { database -> FaceRecord in
             let stale = try Row.fetchOne(
@@ -614,7 +634,7 @@ public final class FaceIndexStore: @unchecked Sendable {
                 """,
                 arguments: [
                     faceID.uuidString,
-                    Self.formatter().string(from: Date()),
+                    Self.formatter.string(from: Date()),
                     personID.uuidString,
                     faceID.uuidString,
                 ]
@@ -752,7 +772,7 @@ public final class FaceIndexStore: @unchecked Sendable {
         database: Database
     ) throws -> FacePerson {
         let person = FacePerson(name: name, isRoster: isRoster, suggestedPersonID: suggestedPersonID)
-        let now = Self.formatter().string(from: Date())
+        let now = Self.formatter.string(from: Date())
         try database.execute(
             sql: """
             INSERT INTO people(id, name, is_roster, face_count, suggested_person_id, created_at, updated_at)
@@ -796,7 +816,7 @@ public final class FaceIndexStore: @unchecked Sendable {
     /// the person used to be called.
     public func renamePerson(_ id: UUID, name: String) throws {
         try write { database in
-            let now = Self.formatter().string(from: Date())
+            let now = Self.formatter.string(from: Date())
             try database.execute(
                 sql: "UPDATE people SET name = ?, updated_at = ? WHERE id = ?",
                 arguments: [name, now, id.uuidString]
@@ -832,7 +852,7 @@ public final class FaceIndexStore: @unchecked Sendable {
                 personID.uuidString,
                 state.rawValue,
                 score,
-                Self.formatter().string(from: Date()),
+                Self.formatter.string(from: Date()),
                 faceID.uuidString,
             ]
         )
@@ -850,7 +870,7 @@ public final class FaceIndexStore: @unchecked Sendable {
             UPDATE faces SET person_id = NULL, state = 'cached', match_score = NULL, updated_at = ?
             WHERE id = ? AND state != 'confirmed'
             """,
-            arguments: [Self.formatter().string(from: Date()), faceID.uuidString]
+            arguments: [Self.formatter.string(from: Date()), faceID.uuidString]
         )
         try database.execute(
             sql: "DELETE FROM face_templates WHERE face_id = ?",
@@ -891,7 +911,7 @@ public final class FaceIndexStore: @unchecked Sendable {
                 UPDATE faces SET state = 'confirmed', updated_at = ?
                 WHERE id = ? AND person_id IS NOT NULL AND state != 'confirmed'
                 """,
-                arguments: [Self.formatter().string(from: Date()), faceID.uuidString]
+                arguments: [Self.formatter.string(from: Date()), faceID.uuidString]
             )
         }
     }
@@ -908,7 +928,7 @@ public final class FaceIndexStore: @unchecked Sendable {
             INSERT OR IGNORE INTO face_templates(person_id, face_id, created_at)
             VALUES (?, ?, ?)
             """,
-            arguments: [personID.uuidString, faceID.uuidString, Self.formatter().string(from: Date())]
+            arguments: [personID.uuidString, faceID.uuidString, Self.formatter.string(from: Date())]
         )
     }
 
@@ -928,7 +948,7 @@ public final class FaceIndexStore: @unchecked Sendable {
     /// `templateCap` distinct-photo members become templates. Nothing
     /// outside this cluster moves; no catalog-wide re-match runs.
     public func promoteGroup(_ personID: UUID, name: String, templateCap: Int) throws {
-        let formatter = Self.formatter()
+        let formatter = Self.formatter
         let now = formatter.string(from: Date())
         try write { database in
             try database.execute(
@@ -980,7 +1000,7 @@ public final class FaceIndexStore: @unchecked Sendable {
     /// keep their frozen state either way, and Inbox rows that pointed at
     /// the source now point at the target.
     public func mergePerson(_ sourceID: UUID, into targetID: UUID) throws {
-        let now = Self.formatter().string(from: Date())
+        let now = Self.formatter.string(from: Date())
         try write { database in
             let targetRoster = try Int64.fetchOne(
                 database,
@@ -1035,7 +1055,7 @@ public final class FaceIndexStore: @unchecked Sendable {
             arguments: [
                 personID.uuidString,
                 faceID.uuidString,
-                Self.formatter().string(from: Date()),
+                Self.formatter.string(from: Date()),
             ]
         )
     }
@@ -1100,7 +1120,7 @@ public final class FaceIndexStore: @unchecked Sendable {
     /// Takes a person off the roster: the row and its faces become an Other
     /// group again instead of disappearing.
     public func demoteFromRoster(_ personID: UUID) throws {
-        let now = Self.formatter().string(from: Date())
+        let now = Self.formatter.string(from: Date())
         try write { database in
             try database.execute(
                 sql: "UPDATE people SET is_roster = 0, updated_at = ? WHERE id = ?",
@@ -1189,8 +1209,10 @@ public final class FaceIndexStore: @unchecked Sendable {
     /// `event.people` — confirmed faces on approved people only. Inbox
     /// faces never name an event. File identity is name + size + mtime so
     /// a face found on an unsorted copy still attaches after the file
-    /// moves into an event folder.
-    private func rosterFaceFiles() throws -> [(personID: UUID, name: String, fileKey: String)] {
+    /// moves into an event folder. This is the one roster query; the
+    /// event chips, stack person names, and the board People filter all
+    /// derive from it so a render pays one fetch instead of three.
+    public func rosterFaceFiles() throws -> [(personID: UUID, name: String, fileKey: String)] {
         try read { database in
             let rows = try Row.fetchAll(
                 database,
@@ -1202,19 +1224,20 @@ public final class FaceIndexStore: @unchecked Sendable {
                 WHERE p.is_roster = 1 AND f.state = 'confirmed'
                 """
             )
-            let formatter = Self.formatter()
             return rows.compactMap { row in
-                let fileName: String = row["file_name"]
-                let byteCount: Int64 = row["byte_count"]
-                let modifiedAt: String = row["modified_at"]
-                guard let personID = UUID(uuidString: row["id"] as String? ?? ""),
-                      let modified = formatter.date(from: modifiedAt)
-                else { return nil }
-                return (
-                    personID,
-                    row["name"],
-                    Self.fileKey(fileName: fileName, byteCount: byteCount, modifiedAt: modified)
-                )
+                autoreleasepool { () -> (personID: UUID, name: String, fileKey: String)? in
+                    let fileName: String = row["file_name"]
+                    let byteCount: Int64 = row["byte_count"]
+                    let modifiedAt: String = row["modified_at"]
+                    guard let personID = UUID(uuidString: row["id"] as String? ?? ""),
+                          let modified = Self.formatter.date(from: modifiedAt)
+                    else { return nil }
+                    return (
+                        personID,
+                        row["name"],
+                        Self.fileKey(fileName: fileName, byteCount: byteCount, modifiedAt: modified)
+                    )
+                }
             }
         }
     }
@@ -1236,16 +1259,17 @@ public final class FaceIndexStore: @unchecked Sendable {
                 WHERE p.is_roster = 1 AND f.state = 'confirmed'
                 """
             )
-            let formatter = Self.formatter()
             var names: [String: Set<String>] = [:]
             for row in rows {
-                let fileName: String = row["file_name"]
-                let byteCount: Int64 = row["byte_count"]
-                let modifiedAt: String = row["modified_at"]
-                let name: String = row["name"]
-                guard let modified = formatter.date(from: modifiedAt) else { continue }
-                names[Self.fileKey(fileName: fileName, byteCount: byteCount, modifiedAt: modified), default: []]
-                    .insert(name)
+                autoreleasepool {
+                    let fileName: String = row["file_name"]
+                    let byteCount: Int64 = row["byte_count"]
+                    let modifiedAt: String = row["modified_at"]
+                    let name: String = row["name"]
+                    guard let modified = Self.formatter.date(from: modifiedAt) else { return }
+                    names[Self.fileKey(fileName: fileName, byteCount: byteCount, modifiedAt: modified), default: []]
+                        .insert(name)
+                }
             }
             return names
         }
@@ -1271,29 +1295,30 @@ public final class FaceIndexStore: @unchecked Sendable {
                 WHERE p.is_roster = 1 AND f.state = 'confirmed'
                 """
             )
-            let formatter = Self.formatter()
             var persons: [UUID: FacePerson] = [:]
             var counts: [UUID: Int] = [:]
             var idsByKey: [String: Set<UUID>] = [:]
             for row in rows {
-                let fileName: String = row["file_name"]
-                let byteCount: Int64 = row["byte_count"]
-                let modifiedAt: String = row["modified_at"]
-                guard let personID = UUID(uuidString: row["id"] as String? ?? ""),
-                      let modified = formatter.date(from: modifiedAt)
-                else { continue }
-                let key = Self.fileKey(fileName: fileName, byteCount: byteCount, modifiedAt: modified)
-                guard fileKeys.contains(key) else { continue }
-                if persons[personID] == nil {
-                    persons[personID] = FacePerson(
-                        id: personID,
-                        name: row["name"],
-                        isRoster: (row["is_roster"] as Int64? ?? 0) != 0,
-                        faceCount: 0
-                    )
+                autoreleasepool {
+                    let fileName: String = row["file_name"]
+                    let byteCount: Int64 = row["byte_count"]
+                    let modifiedAt: String = row["modified_at"]
+                    guard let personID = UUID(uuidString: row["id"] as String? ?? ""),
+                          let modified = Self.formatter.date(from: modifiedAt)
+                    else { return }
+                    let key = Self.fileKey(fileName: fileName, byteCount: byteCount, modifiedAt: modified)
+                    guard fileKeys.contains(key) else { return }
+                    if persons[personID] == nil {
+                        persons[personID] = FacePerson(
+                            id: personID,
+                            name: row["name"],
+                            isRoster: (row["is_roster"] as Int64? ?? 0) != 0,
+                            faceCount: 0
+                        )
+                    }
+                    counts[personID, default: 0] += 1
+                    idsByKey[key, default: []].insert(personID)
                 }
-                counts[personID, default: 0] += 1
-                idsByKey[key, default: []].insert(personID)
             }
             var result: [String: [FacePerson]] = [:]
             for (key, ids) in idsByKey {
@@ -1375,7 +1400,6 @@ public final class FaceIndexStore: @unchecked Sendable {
     }
 
     private static func photoRecord(_ row: Row) -> FacePhotoRecord {
-        let formatter = formatter()
         let modified: String = row["modified_at"]
         let taken: String? = row["taken_at"]
         return FacePhotoRecord(

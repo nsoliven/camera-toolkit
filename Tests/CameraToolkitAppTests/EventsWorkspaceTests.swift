@@ -1343,10 +1343,11 @@ final class EventsWorkspaceTests: XCTestCase {
                 workspace.assign(stackIDs: [stack.id], from: location.id, to: beach)
             }
             let beachEvent = try XCTUnwrap(workspace.event(beach))
-            // Before any refresh the blocker warms presence itself; once
-            // that pass lands the gate lifts.
+            // The blocker only reports now — the menu's explicit kick
+            // starts the check, and once that pass lands the gate lifts.
             let warming = try XCTUnwrap(workspace.faceScanBlocker(for: beachEvent))
             XCTAssertTrue(warming.contains("checking"))
+            workspace.prepareFaceScanStatus(for: beachEvent)
             try await waitUntil { workspace.eventStacks[beach] != nil }
             XCTAssertEqual(workspace.eventStacks[beach]?.count, 1)
             XCTAssertNil(workspace.faceScanBlocker(for: beachEvent))
@@ -2099,6 +2100,142 @@ final class EventsWorkspaceTests: XCTestCase {
             XCTAssertNil(try store.face(id: junk.id))
             XCTAssertEqual(try store.face(id: keep.id)?.personID, group.id)
             XCTAssertEqual(try store.photos(pathKeys: [photo.pathKey])[photo.pathKey]?.scanGrade, .med)
+        }
+    }
+
+    /// The sidebar's Face Scan item used to start `refreshEvent` as a
+    /// side effect of `faceScanBlocker` — every unopened event's row
+    /// swept its files at launch just by drawing the menu. The blocker
+    /// is pure now; the explicit kick the menu calls on open is the only
+    /// thing that starts the check.
+    func testFaceScanBlockerReportsWithoutStartingTheSweep() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let unsorted = root.appendingPathComponent("Card", isDirectory: true)
+            try writeOrganizerARW(unsorted.appendingPathComponent("DSC00001.ARW"), "2026:08:26 10:00:00", "000")
+            let location = addUnsorted(unsorted, to: model)
+            workspace.scan(location)
+            try await waitUntil {
+                workspace.sources[location.id]?.result != nil
+                    && workspace.sources[location.id]?.isScanning == false
+            }
+            let result = try XCTUnwrap(workspace.sources[location.id]?.result)
+            let beach = try XCTUnwrap(workspace.createEvent(name: "Beach Day", date: organizerDay("2026-08-26"), policy: .buffer))
+            workspace.assign(stackIDs: [try XCTUnwrap(result.stacks.first).id], from: location.id, to: beach)
+            let event = try XCTUnwrap(workspace.event(beach))
+
+            XCTAssertNil(workspace.eventStacks[beach])
+            XCTAssertNotNil(workspace.faceScanBlocker(for: event))
+            try await Task.sleep(nanoseconds: 200_000_000)
+            XCTAssertFalse(workspace.isCheckingFiles(for: beach))
+            XCTAssertNil(workspace.eventStacks[beach])
+
+            workspace.prepareFaceScanStatus(for: event)
+            try await waitUntil { workspace.eventStacks[beach] != nil }
+            XCTAssertNil(workspace.faceScanBlocker(for: event))
+        }
+    }
+
+    /// Reopening an event whose board is already current must not shrink
+    /// the grid to the first screen: the revisit keeps every stack and
+    /// only the sweep re-verifies. 260 files stand in for the events that
+    /// used to drop to the 240-file first paint on every revisit.
+    func testRevisitingAnEventKeepsTheFullGrid() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let eventID = try XCTUnwrap(workspace.createEvent(name: "Big Trip", date: organizerDay("2026-08-26"), policy: .buffer))
+            let event = try XCTUnwrap(workspace.event(eventID))
+            let cardCopy = workspace.locations.cardCopyRoot(for: event, deviceID: "sony-a7v", policy: .buffer)
+            let fileCount = 260
+            var assignments: [PhotoEventAssignment] = []
+            for index in 0..<fileCount {
+                let name = String(format: "DSC%05d.ARW", index)
+                let url = try writeOrganizerARW(cardCopy.appendingPathComponent(name), "2026:08:26 10:00:00", "000")
+                let size = Int64(try XCTUnwrap(try url.resourceValues(forKeys: [.fileSizeKey]).fileSize))
+                assignments.append(PhotoEventAssignment(
+                    sourceRootPath: "/Volumes/MissingCard/DCIM",
+                    relativePath: name,
+                    fileSize: size,
+                    modifiedAt: Date(),
+                    eventID: eventID,
+                    deviceID: "sony-a7v"
+                ))
+            }
+            model.updateConfiguration { $0.photoEventAssignments.append(contentsOf: assignments) }
+            await workspace.refreshEvent(eventID)
+            try await waitUntil { workspace.presence[eventID] != nil }
+            XCTAssertEqual(workspace.eventStacks[eventID]?.flatMap(\.files).count, fileCount)
+            XCTAssertGreaterThan(fileCount, 240)
+            let checkedAt = try XCTUnwrap(workspace.presence[eventID]?.checkedAt)
+
+            // The revisit: no first paint, no shrink — the grid stays
+            // whole while the sweep re-verifies it.
+            await workspace.refreshEvent(eventID)
+            XCTAssertEqual(workspace.eventStacks[eventID]?.flatMap(\.files).count, fileCount)
+            try await waitUntil { (workspace.presence[eventID]?.checkedAt ?? .distantPast) > checkedAt }
+            XCTAssertEqual(workspace.eventStacks[eventID]?.flatMap(\.files).count, fileCount)
+        }
+    }
+
+    /// An assign into an event whose board is open gains the new stacks
+    /// in place — the items land on the board in the same call that
+    /// records the assignments, no refresh or rebuild in between.
+    func testAssignPatchesTheOpenEventBoardInPlace() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let unsorted = root.appendingPathComponent("Card", isDirectory: true)
+            try writeOrganizerARW(unsorted.appendingPathComponent("DSC00001.ARW"), "2026:08:26 10:00:00", "000")
+            try writeOrganizerARW(unsorted.appendingPathComponent("IMG00002.ARW"), "2026:08:26 12:00:00", "000")
+            let location = addUnsorted(unsorted, to: model)
+            workspace.scan(location)
+            try await waitUntil {
+                workspace.sources[location.id]?.result != nil
+                    && workspace.sources[location.id]?.isScanning == false
+            }
+            let result = try XCTUnwrap(workspace.sources[location.id]?.result)
+            let beach = try XCTUnwrap(workspace.createEvent(name: "Beach Day", date: organizerDay("2026-08-26"), policy: .buffer))
+            let stacks = result.stacks
+            XCTAssertEqual(stacks.count, 2)
+
+            workspace.assign(stackIDs: [stacks[0].id], from: location.id, to: beach)
+            await workspace.refreshEvent(beach)
+            try await waitUntil { (workspace.eventStacks[beach]?.flatMap(\.files).count ?? 0) == 1 }
+
+            workspace.assign(stackIDs: [stacks[1].id], from: location.id, to: beach)
+            XCTAssertEqual(workspace.eventStacks[beach]?.flatMap(\.files).count, 2)
+        }
+    }
+
+    /// An activation check where nothing mounted or unmounted does no
+    /// work: the connectivity revision holds and no event re-verifies.
+    func testActivationWithUnchangedMountsDoesNothing() async throws {
+        try await withOrganizerSandbox { _, _, workspace in
+            workspace.refreshConnectivity()
+            let revision = workspace.connectivityRevision
+            workspace.refreshConnectivityIfStale(maxAge: 0)
+            XCTAssertEqual(workspace.connectivityRevision, revision)
+        }
+    }
+
+    /// A mount-scoped connectivity refresh re-verifies the board on
+    /// screen and the events whose roots live on the changed volume —
+    /// not every board it happens to remember.
+    func testScopedConnectivityRefreshSkipsUntouchedEvents() async throws {
+        try await withOrganizerSandbox { _, model, workspace in
+            let alpha = try XCTUnwrap(workspace.createEvent(name: "Alpha", date: organizerDay("2026-08-26"), policy: .buffer))
+            let beta = try XCTUnwrap(workspace.createEvent(name: "Beta", date: organizerDay("2026-08-26"), policy: .buffer))
+            // Both boards known — the scoped pass only re-verifies the
+            // visible one; the other keeps its cached presence.
+            await workspace.refreshEvent(alpha)
+            await workspace.refreshEvent(beta)
+            try await waitUntil { workspace.presence[alpha] != nil && workspace.presence[beta] != nil }
+            let alphaCheckedAt = try XCTUnwrap(workspace.presence[alpha]?.checkedAt)
+            let betaCheckedAt = try XCTUnwrap(workspace.presence[beta]?.checkedAt)
+
+            workspace.selection = .event(alpha)
+            let changed: Set<URL> = [URL(fileURLWithPath: "/Volumes/External", isDirectory: true)]
+            workspace.refreshConnectivity(mountedVolumes: changed)
+            try await waitUntil {
+                (workspace.presence[alpha]?.checkedAt ?? .distantPast) > alphaCheckedAt
+            }
+            XCTAssertEqual(workspace.presence[beta]?.checkedAt, betaCheckedAt)
         }
     }
 

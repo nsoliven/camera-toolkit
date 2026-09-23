@@ -57,4 +57,46 @@ final class TileImageLoaderTests: XCTestCase {
         XCTAssertNotNil(tileImage)
         XCTAssertTrue(tileImage === heroImage)
     }
+
+    /// The decode buckets pin every size a tile or preview can land on —
+    /// the 512 rung exists so a Retina-sized request doesn't round up to
+    /// the much larger 768 bitmap.
+    func testDecodeBuckets() {
+        XCTAssertEqual(TileImageLoader.bucket(for: 200), 384)
+        XCTAssertEqual(TileImageLoader.bucket(for: 384), 384)
+        XCTAssertEqual(TileImageLoader.bucket(for: 385), 512)
+        XCTAssertEqual(TileImageLoader.bucket(for: 512), 512)
+        XCTAssertEqual(TileImageLoader.bucket(for: 513), 768)
+        XCTAssertEqual(TileImageLoader.bucket(for: 768), 768)
+        XCTAssertEqual(TileImageLoader.bucket(for: 1_000), 1_280)
+        XCTAssertEqual(TileImageLoader.bucket(for: 2_000), 2_400)
+        XCTAssertEqual(TileImageLoader.bucket(for: 9_999), 4_800)
+    }
+
+    /// The tile cache is capped well under a gigabyte of bitmaps, and the
+    /// few multi-tens-of-MB zoom previews get their own small allowance so
+    /// they cannot evict every filmstrip tile.
+    func testCacheCostLimits() {
+        let loader = TileImageLoader()
+        XCTAssertEqual(loader.tileCacheCostLimit, 320 * 1_024 * 1_024)
+        XCTAssertEqual(loader.previewCacheCostLimit, 192 * 1_024 * 1_024)
+    }
+
+    /// A finished decode is served from the cache; a memory-pressure purge
+    /// drops both the tile and the preview stores so the app sheds bitmaps
+    /// when the system asks.
+    func testPurgeForMemoryPressureClearsBothCaches() async throws {
+        let loader = TileImageLoader()
+        let file = try makeJPEG()
+        defer { try? FileManager.default.removeItem(at: file) }
+
+        _ = await loader.image(for: file, maximumPixelSize: 384)
+        _ = await loader.image(for: file, maximumPixelSize: 4_800)
+        XCTAssertNotNil(loader.cachedImage(for: file, maximumPixelSize: 384))
+        XCTAssertNotNil(loader.cachedImage(for: file, maximumPixelSize: 4_800))
+
+        loader.purgeForMemoryPressure()
+        XCTAssertNil(loader.cachedImage(for: file, maximumPixelSize: 384))
+        XCTAssertNil(loader.cachedImage(for: file, maximumPixelSize: 4_800))
+    }
 }

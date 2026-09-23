@@ -312,7 +312,7 @@ struct UnsortedBoardView: View {
                 previewStackID = stack.id
             },
             onKey: { press, orderedIDs in handleKey(press, orderedIDs: orderedIDs) },
-            menu: { stack in contextMenu(stack) }
+            menu: { stack in LazyContextMenu { contextMenu(stack) } }
         )
     }
 
