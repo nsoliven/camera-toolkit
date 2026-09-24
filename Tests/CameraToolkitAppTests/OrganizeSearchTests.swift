@@ -200,6 +200,131 @@ final class OrganizeSearchTests: XCTestCase {
         XCTAssertFalse(matches(stack, search: search, facts: facts(dad, mom)))
     }
 
+    /// "is exactly A, B" — photos of just those two together. Both must
+    /// be there and nobody else: another approved person, an unnamed
+    /// group, or any face outside the approved people disqualifies it.
+    func testPeopleRowIsExactlyKeepsOnlyThePickedPeopleAndNobodyElse() {
+        let stack = OrganizeStack(items: [item("/Card/DSC00001.ARW")])
+        let personA = UUID()
+        let personB = UUID()
+        let personC = UUID()
+        let unnamedGroup = UUID()
+        func facts(_ ids: UUID..., others: Bool = false) -> OrganizeStackFacts {
+            OrganizeStackFacts(personIDs: Set(ids), hasOtherFaces: others)
+        }
+        let search = filter([[.people([personA, personB], operator: .exactly)]])
+
+        // A and B alone together: kept.
+        XCTAssertTrue(matches(stack, search: search, facts: facts(personA, personB)))
+        // Only one of them: dropped.
+        XCTAssertFalse(matches(stack, search: search, facts: facts(personA)))
+        XCTAssertFalse(matches(stack, search: search, facts: facts(personB)))
+        // A third approved person: dropped.
+        XCTAssertFalse(matches(stack, search: search, facts: facts(personA, personB, personC)))
+        // An unnamed group listed among the subject's people: dropped.
+        XCTAssertFalse(matches(stack, search: search, facts: facts(personA, personB, unnamedGroup)))
+        // A face outside the approved people (unnamed group, suggestion,
+        // or never grouped) flagged by the board index: dropped.
+        XCTAssertFalse(matches(stack, search: search, facts: facts(personA, personB, others: true)))
+        // No faces at all: dropped.
+        XCTAssertFalse(matches(stack, search: search, facts: facts()))
+        XCTAssertFalse(matches(stack, search: search, facts: facts(others: true)))
+
+        // "is not exactly" is the negation, row for row.
+        let negated = filter([[.people([personA, personB], operator: .notExactly)]])
+        XCTAssertFalse(matches(stack, search: negated, facts: facts(personA, personB)))
+        XCTAssertTrue(matches(stack, search: negated, facts: facts(personA)))
+        XCTAssertTrue(matches(stack, search: negated, facts: facts(personA, personB, personC)))
+        XCTAssertTrue(matches(stack, search: negated, facts: facts(personA, personB, others: true)))
+        XCTAssertTrue(matches(stack, search: negated, facts: facts()))
+
+        // "is all of" still ignores the extras — only "exactly" reads them.
+        let allOf = filter([[.people([personA, personB], operator: .allOf)]])
+        XCTAssertTrue(matches(stack, search: allOf, facts: facts(personA, personB, others: true)))
+    }
+
+    /// A burst is judged on the union of its frames, like every other
+    /// operator: one frame of A alone and one of B alone make an
+    /// "exactly A, B" burst. The board index folds frames the same way,
+    /// so a stranger in any frame disqualifies the whole burst.
+    func testPeopleRowIsExactlyUsesTheUnionOfABurstsFrames() {
+        let burst = OrganizeStack(items: [
+            item("/Card/B0001_DSC00001.ARW"),
+            item("/Card/B0001_DSC00002.ARW"),
+        ])
+        XCTAssertTrue(burst.isBurst)
+        let personA = UUID()
+        let personB = UUID()
+        let search = filter([[.people([personA, personB], operator: .exactly)]])
+        // Frame 1 carries A, frame 2 carries B — the stack's facts are the
+        // union {A, B}.
+        XCTAssertTrue(matches(burst, search: search, facts: OrganizeStackFacts(personIDs: [personA, personB])))
+        XCTAssertFalse(matches(
+            burst,
+            search: search,
+            facts: OrganizeStackFacts(personIDs: [personA, personB], hasOtherFaces: true)
+        ))
+    }
+
+    /// "is exactly" composes like any row: ANDed with the group's other
+    /// rows and under the board-level chip exclusions.
+    func testPeopleRowIsExactlyCombinesWithOtherRowsAndExclusions() {
+        let parent = UUID()
+        let subevent = UUID()
+        let personA = UUID()
+        let personB = UUID()
+        let raw = OrganizeStack(items: [item("/Card/DSC00001.ARW", kind: .raw)])
+        let clip = OrganizeStack(items: [item("/Card/C0001.MP4", kind: .video)])
+        func facts(_ people: Set<UUID>, others: Bool = false, inSubevent: Bool = false) -> OrganizeStackFacts {
+            OrganizeStackFacts(
+                eventIDs: inSubevent ? [subevent, parent] : [parent],
+                personIDs: people,
+                hasOtherFaces: others
+            )
+        }
+
+        var search = OrganizeSearchFilter()
+        search.toggleEventExclusion(subevent)
+        search.addCondition(.people([personA, personB], operator: .exactly))
+        search.addCondition(.media([.raw]))
+        search.addCondition(.events([parent]))
+        XCTAssertEqual(search.groups.count, 1)
+        XCTAssertTrue(search.needsPeople)
+
+        // Just A and B, RAW, in the parent: kept.
+        XCTAssertTrue(matches(raw, search: search, facts: facts([personA, personB])))
+        // Same people but a video: the Media row drops it.
+        XCTAssertFalse(matches(clip, search: search, facts: facts([personA, personB])))
+        // Same people inside the struck subevent: the chip hides it.
+        XCTAssertFalse(matches(raw, search: search, facts: facts([personA, personB], inSubevent: true)))
+        // Someone else in the shot: dropped whatever the other rows say.
+        XCTAssertFalse(matches(raw, search: search, facts: facts([personA, personB], others: true)))
+        // Not in the parent event: the Event row drops it.
+        XCTAssertFalse(matches(raw, search: search, facts: OrganizeStackFacts(personIDs: [personA, personB])))
+    }
+
+    /// The exact pair is People-only in the picker, with wording that says
+    /// nobody else may be in the shot; chips keep the short form.
+    func testIsExactlyOperatorIsOfferedOnlyForPeople() {
+        typealias Operator = OrganizeFilterRow.Operator
+        XCTAssertEqual(Operator.options(for: .people), Operator.allCases)
+        XCTAssertTrue(Operator.options(for: .people).contains(.exactly))
+        XCTAssertTrue(Operator.options(for: .people).contains(.notExactly))
+        for property in [OrganizeFilterRow.Property.event, .media, .date] {
+            XCTAssertFalse(Operator.options(for: property).contains(.exactly), "\(property)")
+            XCTAssertFalse(Operator.options(for: property).contains(.notExactly), "\(property)")
+        }
+        XCTAssertEqual(Operator.exactly.menuTitle, "is exactly (only these people)")
+        XCTAssertEqual(Operator.exactly.title, "is exactly")
+        XCTAssertEqual(Operator.anyOf.menuTitle, Operator.anyOf.title)
+
+        // Switching an exact People row to another property starts over
+        // on "is any of", so the hidden operator never lingers.
+        var row = OrganizeFilterRow.people([UUID()], operator: .exactly)
+        row.setProperty(.media)
+        XCTAssertEqual(row.operator, .anyOf)
+    }
+
     func testMediaRowAllOfRequiresEveryPickedKind() {
         let stillOnly = OrganizeStack(items: [item("/Card/DSC00001.HEIC", kind: .photo)])
         let stillAndVideo = OrganizeStack(items: [

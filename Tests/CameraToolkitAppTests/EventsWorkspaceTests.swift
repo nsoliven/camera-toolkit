@@ -1189,6 +1189,121 @@ final class EventsWorkspaceTests: XCTestCase {
     /// The filter builder's full loop on a real scan: media, day range,
     /// event (incl. Not Sorted Yet), and face-catalog people — condition
     /// rows ANDed inside a group, groups ORed, and the text needle on top.
+    /// End to end through the face catalog: "is exactly A, B" keeps only
+    /// stacks whose confirmed approved people are A and B and whose frames
+    /// hold no other face — another approved person, an unnamed group, a
+    /// "looks like" suggestion, or a detection never grouped all count as
+    /// someone else. A burst uses the union of its frames.
+    func testPeopleIsExactlyReadsEveryFaceOnTheBoard() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let unsorted = root.appendingPathComponent("Drive/Unsorted A7V", isDirectory: true)
+            let names = [
+                "DSC00001.ARW", "DSC00002.ARW", "DSC00003.ARW", "DSC00004.ARW",
+                "DSC00005.ARW", "DSC00006.ARW", "DSC00007.ARW", "DSC00008.ARW",
+            ]
+            for (index, name) in names.enumerated() {
+                try writeOrganizerARW(
+                    unsorted.appendingPathComponent("Transfer/\(name)"),
+                    "2026:08:26 1\(index):00:00",
+                    "000"
+                )
+            }
+            try writeOrganizerARW(unsorted.appendingPathComponent("Transfer/B0001_DSC00011.ARW"), "2026:08:27 10:00:00", "100")
+            try writeOrganizerARW(unsorted.appendingPathComponent("Transfer/B0001_DSC00012.ARW"), "2026:08:27 10:00:00", "400")
+            let location = addUnsorted(unsorted, to: model)
+            workspace.scan(location)
+            try await waitUntil { workspace.sources[location.id]?.result != nil }
+            let result = try XCTUnwrap(workspace.sources[location.id]?.result)
+            func stack(_ name: String) throws -> OrganizeStack {
+                try XCTUnwrap(result.stacks.first { $0.coverItem.primary.name == name }, name)
+            }
+            let bothOnly = try stack("DSC00001.ARW")
+            let onlyA = try stack("DSC00002.ARW")
+            let onlyB = try stack("DSC00003.ARW")
+            let withC = try stack("DSC00004.ARW")
+            let withGroup = try stack("DSC00005.ARW")
+            let withUngrouped = try stack("DSC00006.ARW")
+            let withSuggestion = try stack("DSC00007.ARW")
+            let faceless = try stack("DSC00008.ARW")
+            let burst = try XCTUnwrap(result.stacks.first { $0.isBurst })
+            XCTAssertEqual(burst.items.count, 2)
+            XCTAssertEqual(result.stacks.count, 9)
+
+            _ = try CatalogStore(url: root.appendingPathComponent("catalog.sqlite")).bootstrap(
+                configuration: model.configuration,
+                createBackup: false,
+                createLibraryFolders: false
+            )
+            let store = workspace.faceStore
+            let personA = try store.createPerson(name: "Person A", isRoster: true)
+            let personB = try store.createPerson(name: "Person B", isRoster: true)
+            let personC = try store.createPerson(name: "Person C", isRoster: true)
+            let group = try store.createPerson(name: "Person 1", isRoster: false)
+            let suggestion = try store.createPerson(name: "Looks like C", isRoster: false)
+            // (person, state); nil person is a detection never grouped.
+            func seed(_ file: OrganizeFile, _ faces: [(FacePerson?, FaceState)]) throws {
+                try store.replaceFaces(
+                    photo: FacePhotoRecord(
+                        pathKey: file.pathKey,
+                        path: file.path,
+                        fileName: file.name,
+                        byteCount: file.size,
+                        modifiedAt: file.modifiedAt,
+                        scanGrade: .low
+                    ),
+                    faces: faces.enumerated().map { index, face in
+                        FaceRecord(
+                            photoID: file.pathKey,
+                            personID: face.0?.id,
+                            box: NormalizedFaceBox(x: 0.25 * Double(index), y: 0.1, width: 0.2, height: 0.2),
+                            detScore: 0.9,
+                            embedding: [0.5, 0.5],
+                            state: face.1
+                        )
+                    }
+                )
+            }
+            try seed(bothOnly.coverItem.primary, [(personA, .confirmed), (personB, .confirmed)])
+            try seed(onlyA.coverItem.primary, [(personA, .confirmed)])
+            try seed(onlyB.coverItem.primary, [(personB, .confirmed)])
+            try seed(withC.coverItem.primary, [(personA, .confirmed), (personB, .confirmed), (personC, .confirmed)])
+            try seed(withGroup.coverItem.primary, [(personA, .confirmed), (personB, .confirmed), (group, .other)])
+            try seed(withUngrouped.coverItem.primary, [(personA, .confirmed), (personB, .confirmed), (nil, .cached)])
+            try seed(withSuggestion.coverItem.primary, [(personA, .confirmed), (personB, .confirmed), (suggestion, .proposed)])
+            try seed(burst.items[0].primary, [(personA, .confirmed)])
+            try seed(burst.items[1].primary, [(personB, .confirmed)])
+
+            // The index: approved people per stack, and which stacks hold
+            // anyone else.
+            let people = workspace.boardPeople(for: result.stacks)
+            XCTAssertEqual(people.byStackID[burst.id], [personA.id, personB.id])
+            XCTAssertEqual(people.byStackID[withGroup.id], [personA.id, personB.id])
+            XCTAssertEqual(people.othersStackIDs, [withGroup.id, withUngrouped.id, withSuggestion.id])
+
+            @MainActor func board(_ rows: [OrganizeFilterRow]) -> Set<String> {
+                var search = OrganizeSearchFilter()
+                search.groups = [OrganizeFilterGroup(rows: rows)]
+                return Set(workspace.visibleStacks(result, hideSorted: false, search: search).map(\.id))
+            }
+            XCTAssertEqual(board([.people([personA.id, personB.id], operator: .exactly)]), [bothOnly.id, burst.id])
+            XCTAssertEqual(
+                board([.people([personA.id, personB.id], operator: .notExactly)]),
+                [onlyA.id, onlyB.id, withC.id, withGroup.id, withUngrouped.id, withSuggestion.id, faceless.id]
+            )
+            // "is all of" keeps its superset meaning.
+            XCTAssertEqual(
+                board([.people([personA.id, personB.id], operator: .allOf)]),
+                [bothOnly.id, withC.id, withGroup.id, withUngrouped.id, withSuggestion.id, burst.id]
+            )
+            // ANDed with a Date row: only the single on the first day.
+            let firstDay = Calendar.current.startOfDay(for: bothOnly.captureDate)
+            XCTAssertEqual(
+                board([.people([personA.id, personB.id], operator: .exactly), .days(from: firstDay, to: firstDay)]),
+                [bothOnly.id]
+            )
+        }
+    }
+
     func testStructuredBoardSearchFiltersByMediaDateEventAndPeople() async throws {
         try await withOrganizerSandbox { root, model, workspace in
             let unsorted = root.appendingPathComponent("Drive/Unsorted A7V", isDirectory: true)

@@ -1242,6 +1242,42 @@ public final class FaceIndexStore: @unchecked Sendable {
         }
     }
 
+    /// File keys (name|bytes|mtime) of every photo carrying at least one
+    /// detected face that is *not* a confirmed face on an approved person:
+    /// unnamed "Person N" groups, "looks like" suggestions, and faces the
+    /// scan kept but never grouped. The board's "is exactly" People
+    /// operator reads it as "someone else is in this shot". One row per
+    /// photo, fetched beside `rosterFaceFiles` and cached with it — it
+    /// never runs per stack.
+    public func unapprovedFaceFileKeys() throws -> Set<String> {
+        try read { database in
+            let rows = try Row.fetchAll(
+                database,
+                sql: """
+                SELECT ph.file_name, ph.byte_count, ph.modified_at
+                FROM face_photos ph
+                WHERE EXISTS (
+                    SELECT 1 FROM faces f
+                    LEFT JOIN people p ON p.id = f.person_id
+                    WHERE f.photo_id = ph.path_key
+                      AND NOT (f.state = 'confirmed' AND COALESCE(p.is_roster, 0) = 1)
+                )
+                """
+            )
+            var keys = Set<String>()
+            for row in rows {
+                autoreleasepool {
+                    let fileName: String = row["file_name"]
+                    let byteCount: Int64 = row["byte_count"]
+                    let modifiedAt: String = row["modified_at"]
+                    guard let modified = Self.formatter.date(from: modifiedAt) else { return }
+                    keys.insert(Self.fileKey(fileName: fileName, byteCount: byteCount, modifiedAt: modified))
+                }
+            }
+            return keys
+        }
+    }
+
     /// Display names of approved people keyed by the file key
     /// (name|bytes|mtime) of each photo carrying one of their confirmed
     /// faces. Search uses this to join stacks to people from catalog data

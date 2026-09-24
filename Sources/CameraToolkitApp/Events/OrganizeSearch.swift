@@ -187,8 +187,9 @@ struct OrganizeFilterRow: Equatable, Sendable, Identifiable {
     /// List-property operators — the four cells of a row's truth table
     /// over its picks. "any" keeps a subject sharing one pick, "all"
     /// keeps only a subject carrying every pick, and the "none"/"not
-    /// all" pair negates them. Date rows are always a from/to range and
-    /// ignore the operator.
+    /// all" pair negates them. People rows add "is exactly" — the subject's
+    /// people are the picks and nobody else — and its negation. Date rows
+    /// are always a from/to range and ignore the operator.
     enum Operator: String, CaseIterable, Sendable {
         /// "is any of" — the subject shares a picked value.
         case anyOf
@@ -198,24 +199,58 @@ struct OrganizeFilterRow: Equatable, Sendable, Identifiable {
         case noneOf
         /// "is not all of" — the subject is missing a picked value.
         case notAllOf
+        /// "is exactly" — the subject carries every pick and nothing else.
+        /// For People, "nothing else" also rules out unnamed groups and
+        /// faces never grouped (`OrganizeFilterSubject.hasOtherFaces`).
+        case exactly
+        /// "is not exactly" — the negation: a pick is missing or someone
+        /// else is there too.
+        case notExactly
 
+        /// The short form the board header's chips print.
         var title: String {
             switch self {
             case .anyOf: "is any of"
             case .allOf: "is all of"
             case .noneOf: "is none of"
             case .notAllOf: "is not all of"
+            case .exactly: "is exactly"
+            case .notExactly: "is not exactly"
             }
         }
 
-        /// The verdict from the subject's two set facts: whether it
-        /// carries any pick and whether it carries them all.
-        func matches(hasAny: Bool, hasAll: Bool) -> Bool {
+        /// The operator picker's wording — the exact pair spells out that
+        /// nobody else may be in the shot.
+        var menuTitle: String {
+            switch self {
+            case .exactly: "is exactly (only these people)"
+            case .notExactly: "is not exactly (not only these people)"
+            default: title
+            }
+        }
+
+        /// The operators a row's picker offers for a property. The exact
+        /// pair is People-only: it is what "photos of just these two"
+        /// needs, and Event and Media rows have no use for it yet. Date
+        /// rows draw no operator picker.
+        static func options(for property: Property) -> [Operator] {
+            switch property {
+            case .people: allCases
+            case .event, .media, .date: [.anyOf, .allOf, .noneOf, .notAllOf]
+            }
+        }
+
+        /// The verdict from the subject's set facts: whether it carries
+        /// any pick, whether it carries them all, and whether it carries
+        /// the picks and nothing else.
+        func matches(hasAny: Bool, hasAll: Bool, isExactly: Bool) -> Bool {
             switch self {
             case .anyOf: hasAny
             case .allOf: hasAll
             case .noneOf: !hasAny
             case .notAllOf: !hasAll
+            case .exactly: isExactly
+            case .notExactly: !isExactly
             }
         }
     }
@@ -321,30 +356,45 @@ struct OrganizeFilterRow: Equatable, Sendable, Identifiable {
     /// "is any of" keeps a subject sharing a pick, "is all of" keeps only
     /// a subject carrying them all, "is none of" drops it on a shared
     /// pick, and "is not all of" drops it only when it carries them all.
+    ///
+    /// "is exactly" keeps a subject whose people set equals the picks and
+    /// that holds no other face — an unnamed group, a "looks like"
+    /// suggestion, or a detection never grouped all count as someone
+    /// else. A burst is judged on the union of its frames, like every
+    /// other operator: frames of A alone and B alone make an "exactly A,
+    /// B" burst. A subject with no faces never matches it.
     func matches(subject: OrganizeFilterSubject, calendar: Calendar = .current) -> Bool {
         guard isEnabled else { return true }
         switch property {
         case .people:
             guard !peopleIDs.isEmpty else { return true }
+            let hasAll = peopleIDs.isSubset(of: subject.personIDs)
             return `operator`.matches(
                 hasAny: !subject.personIDs.isDisjoint(with: peopleIDs),
-                hasAll: peopleIDs.isSubset(of: subject.personIDs)
+                hasAll: hasAll,
+                isExactly: hasAll
+                    && subject.personIDs.isSubset(of: peopleIDs)
+                    && !subject.hasOtherFaces
             )
         case .event:
             guard !eventIDs.isEmpty || includesUnsorted else { return true }
             // "Not Sorted Yet" counts as a picked value the subject
             // carries only while it has no event at all.
+            let hasAll = eventIDs.isSubset(of: subject.eventIDs)
+                && (!includesUnsorted || subject.eventIDs.isEmpty)
             return `operator`.matches(
                 hasAny: !subject.eventIDs.isDisjoint(with: eventIDs)
                     || (includesUnsorted && subject.eventIDs.isEmpty),
-                hasAll: eventIDs.isSubset(of: subject.eventIDs)
-                    && (!includesUnsorted || subject.eventIDs.isEmpty)
+                hasAll: hasAll,
+                isExactly: hasAll && subject.eventIDs.isSubset(of: eventIDs)
             )
         case .media:
             guard !mediaKinds.isEmpty else { return true }
+            let hasAll = mediaKinds.isSubset(of: subject.mediaKinds)
             return `operator`.matches(
                 hasAny: !subject.mediaKinds.isDisjoint(with: mediaKinds),
-                hasAll: mediaKinds.isSubset(of: subject.mediaKinds)
+                hasAll: hasAll,
+                isExactly: hasAll && subject.mediaKinds.isSubset(of: mediaKinds)
             )
         case .date:
             guard dayStart != nil || dayEnd != nil, let span = subject.daySpan else { return true }
@@ -361,8 +411,14 @@ struct OrganizeFilterRow: Equatable, Sendable, Identifiable {
 /// event's resolved data. Boards build it from a stack plus its
 /// `OrganizeStackFacts`; the sidebar builds it per event.
 struct OrganizeFilterSubject: Equatable, Sendable {
-    /// Roster people and unnamed groups detected on the subject's files.
+    /// People on the subject's files — for a board stack, the approved
+    /// people with a confirmed face there.
     var personIDs: Set<UUID> = []
+    /// Some file also carries a face outside `personIDs` — an unnamed
+    /// group, a "looks like" suggestion, or a detection never grouped.
+    /// Only "is exactly" reads it. The sidebar's event subjects leave it
+    /// false, so there "is exactly" compares approved people only.
+    var hasOtherFaces = false
     /// Events the subject's files are assigned to — a partially or
     /// multiply assigned stack carries all of its events; a sidebar event
     /// carries itself. Empty means "Not Sorted Yet".
@@ -376,11 +432,13 @@ struct OrganizeFilterSubject: Equatable, Sendable {
 
     init(
         personIDs: Set<UUID> = [],
+        hasOtherFaces: Bool = false,
         eventIDs: Set<UUID> = [],
         mediaKinds: Set<OrganizeMediaKind> = [],
         daySpan: ClosedRange<Date>? = nil
     ) {
         self.personIDs = personIDs
+        self.hasOtherFaces = hasOtherFaces
         self.eventIDs = eventIDs
         self.mediaKinds = mediaKinds
         self.daySpan = daySpan
@@ -392,6 +450,7 @@ struct OrganizeFilterSubject: Equatable, Sendable {
     init(stack: OrganizeStack, facts: OrganizeStackFacts) {
         self.init(
             personIDs: facts.personIDs,
+            hasOtherFaces: facts.hasOtherFaces,
             eventIDs: facts.eventIDs,
             mediaKinds: Set(stack.items.map(\.kind)),
             daySpan: min(stack.captureDate, stack.endDate)...max(stack.captureDate, stack.endDate)
@@ -409,8 +468,13 @@ struct OrganizeStackFacts: Equatable, Sendable {
     /// Breadcrumb title when the stack lands in exactly one event — the
     /// text needle's event match, unchanged from before.
     var eventTitle: String?
-    /// Roster people and unnamed groups detected on the stack's files.
+    /// Approved people with a confirmed face on the stack's files — the
+    /// union over a burst's frames. Unnamed groups and Inbox faces are
+    /// not listed here (see `EventsWorkspace.boardPeople`).
     var personIDs: Set<UUID> = []
+    /// Some frame also carries a face that is not confirmed on an
+    /// approved person — the "someone else" fact "is exactly" reads.
+    var hasOtherFaces = false
     /// Display names of those people and groups — the text needle's person
     /// match, so typing a roster name finds the same stacks a People row
     /// would.

@@ -951,7 +951,7 @@ final class EventsWorkspace {
         search: OrganizeSearchFilter = OrganizeSearchFilter()
     ) -> [OrganizeStack] {
         guard hideSorted || !search.isEmpty else { return result.stacks }
-        let peopleByStackID = search.needsPeople ? boardPeople(for: result.stacks).byStackID : [:]
+        let people: BoardPeople = search.needsPeople ? boardPeople(for: result.stacks) : ([], [:], [])
         return result.stacks.filter { stack in
             if hideSorted, isSorted(stack) { return false }
             guard !search.isEmpty else { return true }
@@ -959,7 +959,7 @@ final class EventsWorkspace {
                 stack: stack,
                 search: search,
                 rootPath: result.rootPath,
-                facts: stackFacts(stack, peopleByStackID: peopleByStackID)
+                facts: stackFacts(stack, people: people)
             )
         }
     }
@@ -978,13 +978,13 @@ final class EventsWorkspace {
         let stacks = eventStacks[eventID] ?? []
         let scoped = search.scopingEventRows(to: scopeIDs(eventID))
         guard !scoped.isEmpty else { return stacks }
-        let peopleByStackID = scoped.needsPeople ? boardPeople(for: stacks).byStackID : [:]
+        let people: BoardPeople = scoped.needsPeople ? boardPeople(for: stacks) : ([], [:], [])
         return stacks.filter {
             OrganizeSearch.matches(
                 stack: $0,
                 search: scoped,
                 rootPath: nil,
-                facts: stackFacts($0, peopleByStackID: peopleByStackID)
+                facts: stackFacts($0, people: people)
             )
         }
     }
@@ -1041,9 +1041,10 @@ final class EventsWorkspace {
     /// are assigned to plus those events' ancestors, so an Event row for a
     /// parent keeps a stack sorted into its subevent (the reverse — a
     /// subevent row against the parent's stack — does not match) — plus
-    /// the face-catalog people on its files. `eventTitle` stays the text
-    /// needle's single-event breadcrumb match.
-    private func stackFacts(_ stack: OrganizeStack, peopleByStackID: [String: Set<UUID>]) -> OrganizeStackFacts {
+    /// the face-catalog people on its files, and whether anyone else's
+    /// face is on them too. `eventTitle` stays the text needle's
+    /// single-event breadcrumb match.
+    private func stackFacts(_ stack: OrganizeStack, people: BoardPeople) -> OrganizeStackFacts {
         var assignedIDs = Set<UUID>()
         var eventIDs = Set<UUID>()
         for item in stack.items {
@@ -1059,7 +1060,8 @@ final class EventsWorkspace {
             eventTitle: assignedIDs.count == 1
                 ? assignedIDs.first.flatMap { event($0) }.map { eventTitle($0) }
                 : nil,
-            personIDs: peopleByStackID[stack.id] ?? [],
+            personIDs: people.byStackID[stack.id] ?? [],
+            hasOtherFaces: people.othersStackIDs.contains(stack.id),
             personNames: personNames(on: stack)
         )
     }
@@ -3768,7 +3770,8 @@ final class EventsWorkspace {
         generation: Int,
         facesRevision: Int,
         rows: [(personID: UUID, name: String, fileKey: String)],
-        byFileKey: [String: [(personID: UUID, name: String)]]
+        byFileKey: [String: [(personID: UUID, name: String)]],
+        unapprovedKeys: Set<String>
     )?
     @ObservationIgnored private var rosterWarmTask: Task<Void, Never>?
     /// (mutationGeneration, facesRevision, file key → person/group names)
@@ -3794,20 +3797,28 @@ final class EventsWorkspace {
     /// synchronously when a caller cannot wait (a cold read racing the
     /// warm); `scheduleRosterWarm` keeps it off the main actor after
     /// every face change and at launch.
+    ///
+    /// `unapprovedKeys` rides the same fetch: the file keys of photos
+    /// holding any face that is not confirmed on an approved person
+    /// (unnamed groups, suggestions, never-grouped detections) — the
+    /// "someone else is here" fact behind the "is exactly" People
+    /// operator.
     private func rosterFaces() -> (
         rows: [(personID: UUID, name: String, fileKey: String)],
-        byFileKey: [String: [(personID: UUID, name: String)]]
+        byFileKey: [String: [(personID: UUID, name: String)]],
+        unapprovedKeys: Set<String>
     ) {
         let generation = faceStore.mutationGeneration
         if let cache = rosterFacesCache,
            cache.generation == generation,
            cache.facesRevision == facesRevision {
-            return (cache.rows, cache.byFileKey)
+            return (cache.rows, cache.byFileKey, cache.unapprovedKeys)
         }
         let rows = (try? faceStore.rosterFaceFiles()) ?? []
         let byFileKey = Self.groupRosterFaces(rows)
-        rosterFacesCache = (generation, facesRevision, rows, byFileKey)
-        return (rows, byFileKey)
+        let unapproved = (try? faceStore.unapprovedFaceFileKeys()) ?? []
+        rosterFacesCache = (generation, facesRevision, rows, byFileKey, unapproved)
+        return (rows, byFileKey, unapproved)
     }
 
     /// Refetch the roster pairs detached and publish them while the face
@@ -3821,11 +3832,12 @@ final class EventsWorkspace {
         let revision = facesRevision
         rosterWarmTask = Task.detached(priority: .utility) { [weak self] in
             let rows = (try? store.rosterFaceFiles()) ?? []
+            let unapproved = (try? store.unapprovedFaceFileKeys()) ?? []
             await MainActor.run {
                 guard let self,
                       self.facesRevision == revision,
                       self.faceStore.mutationGeneration == generation else { return }
-                self.rosterFacesCache = (generation, revision, rows, Self.groupRosterFaces(rows))
+                self.rosterFacesCache = (generation, revision, rows, Self.groupRosterFaces(rows), unapproved)
             }
         }
     }
@@ -4225,15 +4237,29 @@ final class EventsWorkspace {
     @ObservationIgnored private var boardPeopleCache: (
         facesRevision: Int,
         stacks: [OrganizeStack],
-        people: (options: [FacePerson], byStackID: [String: Set<UUID>])
+        people: BoardPeople
     )?
+
+    /// The board People filter's index: picker options, the approved
+    /// people on each stack, and the stacks holding anyone else.
+    typealias BoardPeople = (
+        options: [FacePerson],
+        byStackID: [String: Set<UUID>],
+        othersStackIDs: Set<String>
+    )
 
     /// Which approved people each stack's files carry (confirmed faces
     /// only), plus the filter picker's options — the approved people
     /// actually seen on these stacks. Inbox faces never satisfy a People
     /// filter; stacks without confirmed faces map to an empty set and
     /// boards never scanned for faces return no options.
-    func boardPeople(for stacks: [OrganizeStack]) -> (options: [FacePerson], byStackID: [String: Set<UUID>]) {
+    ///
+    /// `othersStackIDs` names the stacks where some frame also holds a
+    /// face that is not confirmed on an approved person — an unnamed
+    /// group, a "looks like" suggestion, or a detection never grouped.
+    /// Like `byStackID` it is the union over a burst's frames. Only
+    /// "is exactly" reads it.
+    func boardPeople(for stacks: [OrganizeStack]) -> BoardPeople {
         if let cache = boardPeopleCache,
            cache.facesRevision == facesRevision,
            cache.stacks == stacks {
@@ -4258,8 +4284,10 @@ final class EventsWorkspace {
         // queried keys, exactly as `peopleByFileKey` counted it — counted
         // once over the union, not per stack, so a file in two stacks
         // still counts once.
-        let roster = rosterFaces().byFileKey
+        let faces = rosterFaces()
+        let roster = faces.byFileKey
         var byStackID: [String: Set<UUID>] = [:]
+        var othersStackIDs = Set<String>()
         var seen: [UUID: FacePerson] = [:]
         var counts: [UUID: Int] = [:]
         for key in allKeys {
@@ -4283,6 +4311,9 @@ final class EventsWorkspace {
                 }
             }
             byStackID[stackID] = ids
+            if !faces.unapprovedKeys.isDisjoint(with: keys) {
+                othersStackIDs.insert(stackID)
+            }
         }
         let people = (
             options: seen.values.map { person in
@@ -4293,7 +4324,8 @@ final class EventsWorkspace {
                 if $0.isRoster != $1.isRoster { return $0.isRoster }
                 return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
             },
-            byStackID: byStackID
+            byStackID: byStackID,
+            othersStackIDs: othersStackIDs
         )
         boardPeopleCache = (facesRevision, stacks, people)
         return people

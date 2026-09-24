@@ -234,8 +234,8 @@ struct OrganizeFilterButton: View {
 
                 if row.wrappedValue.property != .date {
                     Picker("Operator", selection: row.operator) {
-                        ForEach(OrganizeFilterRow.Operator.allCases, id: \.self) { item in
-                            Text(item.title).tag(item)
+                        ForEach(OrganizeFilterRow.Operator.options(for: row.wrappedValue.property), id: \.self) { item in
+                            Text(item.menuTitle).tag(item)
                         }
                     }
                     .labelsHidden()
