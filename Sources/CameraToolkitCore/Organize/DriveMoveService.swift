@@ -16,6 +16,11 @@ public struct DriveMove: Codable, Hashable, Sendable {
 public struct DriveMoveIssue: Hashable, Sendable {
     public var move: DriveMove
     public var reason: String
+
+    public init(move: DriveMove, reason: String) {
+        self.move = move
+        self.reason = reason
+    }
 }
 
 /// A durable record of one Apply or reorganize action. It is written before
@@ -202,7 +207,17 @@ public struct DriveMoveService {
 
     public static func read(_ url: URL) throws -> DriveMoveJournal {
         let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
+        // Journals keep fractional seconds; older ones wrote whole seconds.
+        decoder.dateDecodingStrategy = .custom { decoder in
+            let text = try decoder.singleValueContainer().decode(String.self)
+            if let date = try? Date(text, strategy: journalDateStyle) {
+                return date
+            }
+            if let date = try? Date(text, strategy: .iso8601) {
+                return date
+            }
+            throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath, debugDescription: "Not an ISO 8601 date: \(text)"))
+        }
         return try decoder.decode(DriveMoveJournal.self, from: Data(contentsOf: url))
     }
 
@@ -315,11 +330,23 @@ public struct DriveMoveService {
     private static func write(_ journal: DriveMoveJournal, to url: URL) throws {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        encoder.dateEncodingStrategy = .iso8601
+        // Fractional seconds matter: an assignment's identity rounds its
+        // modification time, so a whole-second date read back from the
+        // journal could name a different assignment and Undo would miss it.
+        encoder.dateEncodingStrategy = .custom { date, encoder in
+            var container = encoder.singleValueContainer()
+            try container.encode(date.formatted(journalDateStyle))
+        }
         try encoder.encode(journal).write(to: url, options: .atomic)
     }
 
     private static let stampClock = StampClock()
+
+    /// `2026-08-20T06:00:04.500Z`: ISO 8601 with milliseconds.
+    private static let journalDateStyle = Date.ISO8601FormatStyle()
+        .year().month().day()
+        .time(includingFractionalSeconds: true)
+        .timeZone(separator: .omitted)
 
     private static func stamp(_ date: Date) -> String {
         stampClock.stamp(date)

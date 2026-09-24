@@ -242,15 +242,27 @@ struct ApplyPlanSheet: View {
     let plan: OrganizeApplyPlan
     let onCancel: () -> Void
     let onApply: () -> Void
+    /// Opens the organizer Trash confirmation for the identical copies.
+    var onTrashDuplicates: () -> Void = {}
+    /// Moves the name conflicts in under a free "(N)" name.
+    var onKeepBoth: () -> Void = {}
 
     /// Built once per sheet from the plan (string work only, no disk).
     private let overview: ApplyPlanOverview
     @State private var showDetails = false
 
-    init(plan: OrganizeApplyPlan, onCancel: @escaping () -> Void, onApply: @escaping () -> Void) {
+    init(
+        plan: OrganizeApplyPlan,
+        onCancel: @escaping () -> Void,
+        onApply: @escaping () -> Void,
+        onTrashDuplicates: @escaping () -> Void = {},
+        onKeepBoth: @escaping () -> Void = {}
+    ) {
         self.plan = plan
         self.onCancel = onCancel
         self.onApply = onApply
+        self.onTrashDuplicates = onTrashDuplicates
+        self.onKeepBoth = onKeepBoth
         overview = ApplyPlanOverview(plan: plan)
     }
 
@@ -258,7 +270,16 @@ struct ApplyPlanSheet: View {
         SheetScaffold(title: plan.title, subtitle: overview.sentence, width: 680, height: 600) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
-                    ApplyPlanFlowView(overview: overview)
+                    if overview.fileCount > 0 || overview.collisions.isEmpty {
+                        ApplyPlanFlowView(overview: overview)
+                    }
+                    if !overview.collisions.isEmpty {
+                        ApplyCollisionsView(
+                            collisions: overview.collisions,
+                            onTrashDuplicates: onTrashDuplicates,
+                            onKeepBoth: onKeepBoth
+                        )
+                    }
                     DisclosureGroup(isExpanded: $showDetails) {
                         VStack(alignment: .leading, spacing: 10) {
                             ApplyPlanSummaryCard(plan: plan)
@@ -283,7 +304,7 @@ struct ApplyPlanSheet: View {
             Divider()
             ApplySafetyFactsView(facts: overview.safetyFacts)
         } actions: {
-            Button("Cancel", action: onCancel)
+            Button(plan.isEmpty ? "Close" : "Cancel", action: onCancel)
                 .keyboardShortcut(.cancelAction)
             // Non-destructive (nothing is overwritten, Undo moves files
             // back), so Return confirms; the default-button fill is the
@@ -292,6 +313,81 @@ struct ApplyPlanSheet: View {
                 .keyboardShortcut(.defaultAction)
                 .disabled(plan.isEmpty)
         }
+    }
+}
+
+/// The Apply sheet's "needs a decision" box: files whose name is already
+/// taken in their event. Identical copies are already in the event and can
+/// go to the recoverable Trash; different files can move in under a free
+/// "(N)" name. Neither happens without the owner pressing the button.
+struct ApplyCollisionsView: View {
+    let collisions: [ApplyCollisionSummary]
+    let onTrashDuplicates: () -> Void
+    let onKeepBoth: () -> Void
+
+    var body: some View {
+        let duplicates = collisions.filter { $0.duplicateCount > 0 }
+        let conflicts = collisions.filter { $0.conflictCount > 0 }
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Already taken in the event")
+                .font(.headline)
+            if !duplicates.isEmpty {
+                row(
+                    symbol: "checkmark.circle.fill",
+                    tint: .green,
+                    lines: duplicates.compactMap(\.duplicateLine),
+                    names: duplicates.flatMap(\.duplicateNames),
+                    detail: "The event already has these exact bytes, so they are not pending. The copies here are spare and stay until you choose.",
+                    button: Button("Move Duplicate\(duplicates.reduce(0) { $0 + $1.duplicateCount } == 1 ? "" : "s") to Trash…", role: .destructive, action: onTrashDuplicates)
+                        .help("Opens the Trash confirmation. Files go to the drive’s _Trash folder and can be restored from the Trash window.")
+                )
+            }
+            if !conflicts.isEmpty {
+                row(
+                    symbol: "exclamationmark.triangle.fill",
+                    tint: .orange,
+                    lines: conflicts.compactMap(\.conflictLine) + conflicts.compactMap(\.heldBackLine),
+                    names: conflicts.flatMap(\.conflictNames),
+                    detail: "Two cameras or a reset counter can reuse a name. Keep Both moves this file in as \(conflicts.first?.keepBothExample ?? "“name (2)”"), next to the other one. Nothing is replaced, and Undo moves it back.",
+                    button: Button("Keep Both", action: onKeepBoth)
+                )
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.orange.quinary, in: .rect(cornerRadius: 10, style: .continuous))
+    }
+
+    private func row<B: View>(symbol: String, tint: Color, lines: [String], names: [String], detail: String, button: B) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: symbol)
+                .font(.title3)
+                .foregroundStyle(tint)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 4) {
+                ForEach(lines, id: \.self) { line in
+                    Text(line + ".")
+                        .font(.callout.weight(.semibold))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Text(Self.nameList(names))
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .textSelection(.enabled)
+                Text(detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                button
+                    .padding(.top, 2)
+            }
+        }
+    }
+
+    static func nameList(_ names: [String], limit: Int = 3) -> String {
+        let shown = names.prefix(limit).joined(separator: ", ")
+        return names.count > limit ? "\(shown) and \(names.count - limit) more" : shown
     }
 }
 
@@ -373,6 +469,13 @@ struct TrashConfirmSheet: View {
             iconTint: .orange
         ) {
             destinationCard
+
+            if let note = request.note {
+                Text(note)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
 
             if !request.sampleNames.isEmpty {
                 Text(fileList)

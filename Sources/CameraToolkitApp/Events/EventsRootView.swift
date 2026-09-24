@@ -204,7 +204,9 @@ struct EventsRootView: View {
             ApplyPlanSheet(
                 plan: plan,
                 onCancel: { workspace.pendingApplyPlan = nil },
-                onApply: { workspace.performApply(plan) }
+                onApply: { workspace.performApply(plan) },
+                onTrashDuplicates: { workspace.requestTrashApplyDuplicates(plan) },
+                onKeepBoth: { workspace.keepBoth(plan) }
             )
         }
         .sheet(item: $workspace.pendingTrash) { request in

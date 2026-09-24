@@ -228,6 +228,12 @@ struct ApplyPlanOverview: Sendable {
     /// disconnected files still get a card, but are not counted).
     var eventCount: Int
     var destinationDrives: [String]
+    /// Per event, the files whose name is already taken there — identical
+    /// copies and different files. Never counted in `moveCount`.
+    var collisions: [ApplyCollisionSummary]
+
+    var duplicateCount: Int { collisions.reduce(0) { $0 + $1.duplicateCount } }
+    var conflictCount: Int { collisions.reduce(0) { $0 + $1.conflictCount } }
 
     init(plan: OrganizeApplyPlan) {
         let routes = Self.routes(for: plan)
@@ -257,6 +263,7 @@ struct ApplyPlanOverview: Sendable {
             if !drives.contains(destination.driveName) { drives.append(destination.driveName) }
         }
         destinationDrives = drives
+        collisions = ApplyStatusWording.summaries(for: plan)
     }
 
     // MARK: - Routes (pure, unit-tested)
@@ -338,7 +345,13 @@ struct ApplyPlanOverview: Sendable {
     var fileCount: Int { moveCount + copyCount }
 
     var sentence: String {
-        Self.sentence(
+        if fileCount == 0, !collisions.isEmpty {
+            // Nothing is renamed or copied — say what is blocking instead
+            // of implying Apply will do something.
+            let lines = collisions.flatMap { [$0.duplicateLine, $0.conflictLine].compactMap { $0 } }
+            return "Nothing can move yet. " + lines.joined(separator: ". ") + "."
+        }
+        return Self.sentence(
             moveCount: moveCount,
             copyCount: copyCount,
             sourceNames: sources.map(\.name),
@@ -348,7 +361,8 @@ struct ApplyPlanOverview: Sendable {
     }
 
     var primaryActionTitle: String {
-        Self.primaryActionTitle(moveCount: moveCount, copyCount: copyCount)
+        if fileCount == 0, !collisions.isEmpty { return "Nothing to Move" }
+        return Self.primaryActionTitle(moveCount: moveCount, copyCount: copyCount)
     }
 
     var safetyFacts: [ApplySafetyFact] {

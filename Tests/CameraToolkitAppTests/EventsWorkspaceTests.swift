@@ -3361,6 +3361,152 @@ final class EventsWorkspaceTests: XCTestCase {
     }
 }
 
+// MARK: - Apply collisions (a taken destination name)
+
+extension EventsWorkspaceTests {
+    private func cardCopy(_ root: URL, event: String) -> URL {
+        root.appendingPathComponent("Drive/Camera Buffer/2026/\(event)/Sony A7V/Card Copy", isDirectory: true)
+    }
+
+    /// Regression: a sorted file whose event name was taken by a different
+    /// photo was planned as "Move 1 File", then left in place by the rename
+    /// job on every Apply. The plan now flags it, the sheet does not count
+    /// it, the status line says why, and Keep Both moves it in under a free
+    /// "(2)" name that Undo reverses.
+    func testApplyFlagsANameConflictAndKeepBothMovesItInUndoably() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let unsorted = root.appendingPathComponent("Drive/Found Folder", isDirectory: true)
+            let clash = try writeOrganizerARW(unsorted.appendingPathComponent("DSC00001.ARW"), "2026:08:26 10:00:00", "000")
+            let clashXMP = try organizerWrite(unsorted.appendingPathComponent("DSC00001.xmp"), "<new/>")
+            let clean = try writeOrganizerARW(unsorted.appendingPathComponent("DSC00003.ARW"), "2026:08:26 10:10:00", "000")
+            let location = addUnsorted(unsorted, to: model)
+            let eventID = try XCTUnwrap(workspace.createEvent(name: "Beach Day", date: organizerDay("2026-08-26"), policy: .buffer))
+            // A different photo with the same name (another camera, a counter reset).
+            let existing = try organizerWrite(cardCopy(root, event: "2026-08-26 Beach Day").appendingPathComponent("DSC00001.ARW"), "an older, different photo")
+
+            workspace.scan(location)
+            try await waitUntil { workspace.sources[location.id]?.result != nil }
+            let result = try XCTUnwrap(workspace.sources[location.id]?.result)
+            workspace.assign(stackIDs: Set(result.stacks.map(\.id)), from: location.id, to: eventID)
+            XCTAssertEqual(model.configuration.photoEventAssignments.count, 3)
+
+            let plan = EventsWorkspace.buildApplyPlan(
+                events: [try XCTUnwrap(workspace.event(eventID))],
+                configuration: model.configuration,
+                locations: workspace.locations,
+                onlyUnder: unsorted.path,
+                title: "Apply",
+                unsortedRoots: [unsorted]
+            )
+            XCTAssertEqual(plan.moveCount, 1, "only the free name moves")
+            XCTAssertEqual(plan.conflictCount, 1)
+            XCTAssertEqual(plan.duplicateCount, 0)
+            let group = try XCTUnwrap(plan.groups.first)
+            XCTAssertEqual(group.conflicts.map(\.fileName).sorted(), ["DSC00001.ARW", "DSC00001.xmp"])
+            XCTAssertEqual(group.conflicts.first { $0.fileName == "DSC00001.xmp" }?.kind, .travelsWithConflict)
+
+            let overview = ApplyPlanOverview(plan: plan)
+            XCTAssertEqual(overview.primaryActionTitle, "Move 1 File")
+            XCTAssertEqual(overview.conflictCount, 1)
+            XCTAssertEqual(overview.collisions.first?.conflictLine, "1 file can’t move: a different DSC00001.ARW is already in Beach Day")
+
+            workspace.performApply(plan)
+            try await waitUntil { !model.isBusy && workspace.latestMoveJournalTitle != nil }
+            XCTAssertTrue(FileManager.default.fileExists(atPath: cardCopy(root, event: "2026-08-26 Beach Day").appendingPathComponent("DSC00003.ARW").path))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: clean.path))
+            let status = try XCTUnwrap(model.statusMessage)
+            XCTAssertTrue(status.hasPrefix("Moved 1 file(s)"), status)
+            XCTAssertTrue(status.contains("a different DSC00001.ARW is already in Beach Day — open Apply to resolve."), status)
+            XCTAssertEqual(try String(contentsOf: existing, encoding: .utf8), "an older, different photo")
+
+            workspace.keepBoth(plan)
+            try await waitUntil { !model.isBusy && workspace.latestMoveJournalTitle == "Keep both in Beach Day" }
+            let keptRaw = cardCopy(root, event: "2026-08-26 Beach Day").appendingPathComponent("DSC00001 (2).ARW")
+            let keptXMP = cardCopy(root, event: "2026-08-26 Beach Day").appendingPathComponent("DSC00001 (2).xmp")
+            XCTAssertTrue(FileManager.default.fileExists(atPath: keptRaw.path))
+            XCTAssertTrue(FileManager.default.fileExists(atPath: keptXMP.path))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: clash.path))
+            XCTAssertEqual(try String(contentsOf: existing, encoding: .utf8), "an older, different photo")
+            XCTAssertEqual(
+                Set(model.configuration.photoEventAssignments.map(\.relativePath)),
+                ["DSC00001 (2).ARW", "DSC00001 (2).xmp", "DSC00003.ARW"]
+            )
+            await workspace.refreshEvent(eventID)
+            XCTAssertEqual(workspace.presence[eventID]?.onDrive, 3)
+
+            workspace.undoLastMove()
+            try await waitUntil { !model.isBusy && workspace.latestMoveJournalTitle == "Apply" }
+            XCTAssertTrue(FileManager.default.fileExists(atPath: clash.path))
+            XCTAssertTrue(FileManager.default.fileExists(atPath: clashXMP.path))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: keptRaw.path))
+            XCTAssertEqual(try String(contentsOf: existing, encoding: .utf8), "an older, different photo")
+            XCTAssertEqual(
+                Set(model.configuration.photoEventAssignments.map(\.relativePath)),
+                ["DSC00001.ARW", "DSC00001.xmp", "DSC00003.ARW"]
+            )
+        }
+    }
+
+    /// An identical copy already in the event is not pending, the sheet
+    /// shows it instead of "Move 1 File", and "Move Duplicate to Trash"
+    /// goes through the organizer Trash confirmation into `_Trash` —
+    /// never a delete — keeping the event's only assignment for the photo.
+    func testIdenticalCopyIsNotPendingAndGoesToTrashOnlyThroughTheConfirmation() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let unsorted = root.appendingPathComponent("Drive/Found Folder", isDirectory: true)
+            let spare = try writeOrganizerARW(unsorted.appendingPathComponent("DSC00002.ARW"), "2026:08:26 10:00:00", "000")
+            let location = addUnsorted(unsorted, to: model)
+            let eventID = try XCTUnwrap(workspace.createEvent(name: "Beach Day", date: organizerDay("2026-08-26"), policy: .buffer))
+            let inEvent = cardCopy(root, event: "2026-08-26 Beach Day").appendingPathComponent("DSC00002.ARW")
+            try FileManager.default.createDirectory(at: inEvent.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try FileManager.default.copyItem(at: spare, to: inEvent)
+
+            workspace.scan(location)
+            try await waitUntil { workspace.sources[location.id]?.result != nil }
+            let result = try XCTUnwrap(workspace.sources[location.id]?.result)
+            workspace.assign(stackIDs: Set(result.stacks.map(\.id)), from: location.id, to: eventID)
+            XCTAssertEqual(workspace.sortedFiles(in: result).files, 1)
+
+            workspace.prepareApply(sourceLocationID: location.id)
+            try await waitUntil { workspace.pendingApplyPlan != nil }
+            let plan = try XCTUnwrap(workspace.pendingApplyPlan)
+            XCTAssertTrue(plan.isEmpty)
+            XCTAssertEqual(plan.duplicateCount, 1)
+            XCTAssertEqual(plan.groups.first?.alreadyThere, 0)
+
+            // Every file is blocked: the button does not pretend to move.
+            let overview = ApplyPlanOverview(plan: plan)
+            XCTAssertEqual(overview.primaryActionTitle, "Nothing to Move")
+            XCTAssertEqual(overview.sentence, "Nothing can move yet. 1 photo is already in Beach Day (identical copy).")
+            XCTAssertEqual(model.statusMessage, "1 photo is already in Beach Day (identical copy) — open Apply to resolve.")
+
+            // Marked as already in the event: not "nothing moves until you Apply".
+            XCTAssertEqual(workspace.sortedFiles(in: result).files, 0)
+            XCTAssertEqual(workspace.applyCollisions(in: result).duplicates, 1)
+
+            // Nothing is trashed until the owner confirms.
+            workspace.requestTrashApplyDuplicates(plan)
+            XCTAssertNil(workspace.pendingApplyPlan)
+            let request = try XCTUnwrap(workspace.pendingTrash)
+            XCTAssertEqual(request.fileCount, 1)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: spare.path))
+            XCTAssertEqual(request.preservedAssignmentKeys.count, 1)
+
+            workspace.confirmTrash(request)
+            try await waitUntil { !model.isBusy && workspace.sources[location.id]?.result?.items.isEmpty == true }
+            XCTAssertFalse(FileManager.default.fileExists(atPath: spare.path))
+            XCTAssertTrue(FileManager.default.fileExists(atPath: inEvent.path))
+            let trash = root.appendingPathComponent("Drive/.Camera Toolkit/_Trash", isDirectory: true)
+            let trashed = FileManager.default.enumerator(atPath: trash.path)?.compactMap { $0 as? String } ?? []
+            XCTAssertTrue(trashed.contains { $0.hasSuffix("DSC00002.ARW") }, "\(trashed)")
+            // The event's only record of the photo stays and now finds the copy in the event.
+            XCTAssertEqual(model.configuration.photoEventAssignments.count, 1)
+            await workspace.refreshEvent(eventID)
+            XCTAssertEqual(workspace.presence[eventID]?.onDrive, 1)
+        }
+    }
+}
+
 /// Counts NotificationCenter posts — the observer block is `@Sendable`, so
 /// the tally lives behind a lock.
 private final class NotificationPostBox: @unchecked Sendable {

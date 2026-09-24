@@ -92,6 +92,11 @@ struct PendingTrashRequest: Identifiable {
     var byteCount: Int64
     var sampleNames: [String]
     var destinations: [MediaTrashDestinationPreview]
+    /// Source keys whose event assignment survives the trash — spare
+    /// identical copies whose assignment is the event's only record.
+    var preservedAssignmentKeys: Set<String> = []
+    /// An extra line for the confirmation, e.g. why these files are spare.
+    var note: String?
 }
 
 struct OrganizeApplyPlan: Identifiable, Sendable {
@@ -114,8 +119,18 @@ struct OrganizeApplyPlan: Identifiable, Sendable {
         /// chip lock in the plan sheet.
         var isPrivate: Bool
         var byteCount: Int64
+        /// Sources whose destination already holds a byte-identical file.
+        /// Not moved, not counted in `moves`; the sheet offers Trash.
+        var duplicates: [ApplyCollision] = []
+        /// Sources whose destination holds a different file with the same
+        /// name, plus the sidecars held back with them. Not moved; the
+        /// sheet offers Keep Both.
+        var conflicts: [ApplyCollision] = []
 
         var copyFileCount: Int { copies.reduce(0) { $0 + $1.files.count } }
+        /// Files that cannot move because their name is taken by another file
+        /// (sidecars held back with them are not counted).
+        var nameConflictCount: Int { conflicts.count { $0.kind == .nameConflict } }
     }
 
     let id = UUID()
@@ -129,6 +144,9 @@ struct OrganizeApplyPlan: Identifiable, Sendable {
     var fileCount: Int { moveCount + copyCount }
     var byteCount: Int64 { groups.reduce(Int64(0)) { $0 + $1.byteCount } }
     var isEmpty: Bool { moveCount == 0 && copyCount == 0 }
+    var duplicateCount: Int { groups.reduce(0) { $0 + $1.duplicates.count } }
+    var conflictCount: Int { groups.reduce(0) { $0 + $1.nameConflictCount } }
+    var hasCollisions: Bool { groups.contains { !$0.duplicates.isEmpty || !$0.conflicts.isEmpty } }
 }
 
 /// The plan behind the rename job an Apply kicked off, kept so the board can
@@ -353,6 +371,11 @@ final class EventsWorkspace {
     var renameRequest: RenameEventRequest?
     var faceScanRequest: FaceScanRequest?
     var pendingApplyPlan: OrganizeApplyPlan?
+    /// Per event: sorted files the last Apply plan found already in the
+    /// event as byte-identical copies. Not pending — the event has them.
+    var applyDuplicateSourceKeys: [UUID: Set<String>] = [:]
+    /// Per event: sorted files whose event name is taken by another file.
+    var applyConflictSourceKeys: [UUID: Set<String>] = [:]
     var pendingRemoval: RemovalRequest?
     var pendingTrash: PendingTrashRequest?
     var latestMoveJournalTitle: String?
@@ -1114,16 +1137,39 @@ final class EventsWorkspace {
         collapsedGroupIDs = collapsed ? Set(groups.map(\.id)) : []
     }
 
+    /// Sorted files still waiting for Apply. A file the last Apply plan
+    /// found already in its event as an identical copy is not waiting —
+    /// it is counted by `applyCollisions(in:)` instead.
     func sortedFiles(in result: OrganizeScanResult) -> (files: Int, bytes: Int64) {
+        let duplicates = applyDuplicateSourceKeys.values.reduce(into: Set<String>()) { $0.formUnion($1) }
         var files = 0
         var bytes: Int64 = 0
         for item in result.items {
-            for file in item.files where assignment(for: file) != nil {
+            for file in item.files where assignment(for: file) != nil && !duplicates.contains(file.pathKey) {
                 files += 1
                 bytes += file.size
             }
         }
         return (files, bytes)
+    }
+
+    /// Files in this folder the last Apply plan could not move: identical
+    /// copies already in their event, and files whose name is taken.
+    func applyCollisions(in result: OrganizeScanResult) -> (duplicates: Int, conflicts: Int) {
+        let duplicates = applyDuplicateSourceKeys.values.reduce(into: Set<String>()) { $0.formUnion($1) }
+        let conflicts = applyConflictSourceKeys.values.reduce(into: Set<String>()) { $0.formUnion($1) }
+        guard !duplicates.isEmpty || !conflicts.isEmpty else { return (0, 0) }
+        var counts = (duplicates: 0, conflicts: 0)
+        for item in result.items {
+            for file in item.files where assignment(for: file) != nil {
+                if duplicates.contains(file.pathKey) {
+                    counts.duplicates += 1
+                } else if conflicts.contains(file.pathKey) {
+                    counts.conflicts += 1
+                }
+            }
+        }
+        return counts
     }
 
     func unsortedDetail(for location: ConfiguredLocation) -> String {
@@ -2329,15 +2375,34 @@ final class EventsWorkspace {
                 )
             }.value
             guard let self else { return }
-            if plan.isEmpty {
+            noteApplyCollisions(plan, events: events.map(\.id))
+            if plan.isEmpty && !plan.hasCollisions {
                 let unavailable = plan.groups.reduce(0) { $0 + $1.unavailable }
                 model.statusMessage = unavailable > 0
                     ? "\(unavailable) file(s) are on a disconnected drive. Connect it and try again."
                     : "Nothing to move. Every sorted file is already where its event keeps it."
                 return
             }
-            model.statusMessage = "Review the plan, then press Apply."
+            model.statusMessage = plan.isEmpty
+                ? ApplyStatusWording.collisionNote(for: plan) ?? "Review the plan."
+                : "Review the plan, then press Apply."
             pendingApplyPlan = plan
+        }
+    }
+
+    /// Remembers which sorted files a plan found already in their event
+    /// (identical copies) or blocked by a same-name file, so the unsorted
+    /// board stops calling them "nothing moves until you Apply".
+    func noteApplyCollisions(_ plan: OrganizeApplyPlan, events: [UUID]) {
+        for eventID in events {
+            applyDuplicateSourceKeys[eventID] = nil
+            applyConflictSourceKeys[eventID] = nil
+        }
+        for group in plan.groups {
+            let duplicates = Set(group.duplicates.map { EventStorageLocations.pathKey($0.move.sourcePath) })
+            let conflicts = Set(group.conflicts.map { EventStorageLocations.pathKey($0.move.sourcePath) })
+            applyDuplicateSourceKeys[group.event.id] = duplicates.isEmpty ? nil : duplicates
+            applyConflictSourceKeys[group.event.id] = conflicts.isEmpty ? nil : conflicts
         }
     }
 
@@ -2360,13 +2425,21 @@ final class EventsWorkspace {
             let driveRoot = locations.driveRoot(for: policy)
             let assignments = configuration.photoEventAssignments.filter { $0.eventID == event.id }
             guard let summary = EventPresenceScanner.scan(event: event, assignments: assignments, locations: locations, mountedVolumes: mounted, pauseGate: pauseGate) else { continue }
-            var moves: [DriveMove] = []
+            var candidates: [ApplyMoveCandidate] = []
             var copies: [String: OrganizeApplyPlan.CopyBatch] = [:]
             var destinationRoots: [String: String] = [:]
             var standardizedSourceRoots: [String: String] = [:]
             var alreadyThere = 0
             var unavailable = 0
-            var bytes: Int64 = 0
+            var copyBytes: Int64 = 0
+
+            func isSameVolume(_ path: String) -> Bool {
+                let folder = (path as NSString).deletingLastPathComponent
+                if let cached = sameVolumeCache[folder] { return cached }
+                let same = VolumeInfo.isSameVolume(URL(fileURLWithPath: folder), driveRoot, mountedVolumes: mounted)
+                sameVolumeCache[folder] = same
+                return same
+            }
 
             for asset in summary.assets {
                 if let rootPrefix {
@@ -2379,7 +2452,21 @@ final class EventsWorkspace {
                 let size = asset.assignment.fileSize
                 switch asset.drive {
                 case .present:
-                    alreadyThere += 1
+                    // A same-size file is already in the event. If the
+                    // sorted file is still sitting in a folder on the same
+                    // drive, that copy is either a spare duplicate or a
+                    // different photo with the same name — the collision
+                    // check below decides. Card sources on another drive
+                    // keep their originals by design and stay "in place".
+                    if asset.source == .present, !asset.sourceIsDriveCopy,
+                       let sourcePath = asset.sourcePath, isSameVolume(sourcePath) {
+                        candidates.append(ApplyMoveCandidate(
+                            move: DriveMove(sourcePath: sourcePath, destinationPath: drivePath, byteCount: size),
+                            assignment: asset.assignment
+                        ))
+                    } else {
+                        alreadyThere += 1
+                    }
                     continue
                 case .unavailable:
                     unavailable += 1
@@ -2388,24 +2475,21 @@ final class EventsWorkspace {
                     break
                 }
                 if asset.otherDrive == .present, let other = asset.otherDrivePath {
-                    moves.append(DriveMove(sourcePath: other, destinationPath: drivePath, byteCount: size))
-                    bytes += size
+                    candidates.append(ApplyMoveCandidate(
+                        move: DriveMove(sourcePath: other, destinationPath: drivePath, byteCount: size),
+                        assignment: asset.assignment
+                    ))
                     continue
                 }
                 guard asset.source == .present, !asset.sourceIsDriveCopy, let sourcePath = asset.sourcePath else {
                     if asset.source == .unavailable { unavailable += 1 }
                     continue
                 }
-                let folder = (sourcePath as NSString).deletingLastPathComponent
-                let sameVolume: Bool
-                if let cached = sameVolumeCache[folder] {
-                    sameVolume = cached
-                } else {
-                    sameVolume = VolumeInfo.isSameVolume(URL(fileURLWithPath: folder), driveRoot, mountedVolumes: mounted)
-                    sameVolumeCache[folder] = sameVolume
-                }
-                if sameVolume {
-                    moves.append(DriveMove(sourcePath: sourcePath, destinationPath: drivePath, byteCount: size))
+                if isSameVolume(sourcePath) {
+                    candidates.append(ApplyMoveCandidate(
+                        move: DriveMove(sourcePath: sourcePath, destinationPath: drivePath, byteCount: size),
+                        assignment: asset.assignment
+                    ))
                 } else {
                     // Both roots depend only on the event/device/root
                     // string — standardizing per file paid realpath for
@@ -2432,11 +2516,19 @@ final class EventsWorkspace {
                         size: size,
                         modifiedAt: asset.assignment.modifiedAt
                     ))
+                    copyBytes += size
                 }
-                bytes += size
             }
 
-            guard !moves.isEmpty || !copies.isEmpty || unavailable > 0 else { continue }
+            // One lstat per planned rename; a streamed checksum only where a
+            // same-size file already holds the name. A taken destination
+            // never reaches the rename job, so Apply cannot silently no-op.
+            let partition = ApplyCollisionCheck.partition(candidates)
+            let moves = partition.clear.map(\.move)
+            let bytes = copyBytes + moves.reduce(Int64(0)) { $0 + $1.byteCount }
+
+            guard !moves.isEmpty || !copies.isEmpty || unavailable > 0
+                || !partition.duplicates.isEmpty || !partition.conflicts.isEmpty else { continue }
             groups.append(OrganizeApplyPlan.EventGroup(
                 event: event,
                 moves: moves,
@@ -2445,7 +2537,9 @@ final class EventsWorkspace {
                 unavailable: unavailable,
                 destinationFolder: locations.eventFolder(for: event, policy: policy).path,
                 isPrivate: policy == .archiveOnly,
-                byteCount: bytes
+                byteCount: bytes,
+                duplicates: partition.duplicates,
+                conflicts: partition.conflicts
             ))
         }
 
@@ -2484,10 +2578,12 @@ final class EventsWorkspace {
                 },
                 completion: { [weak self] report in
                     self?.didMove(report: report, events: affectedEvents)
-                    let skippedNote = report.skipped.first.map {
-                        " \(report.skipped.count) left in place: \($0.reason)"
-                    } ?? ""
-                    return "Moved \(report.moved.count) file(s) (\(report.movedBytes.formattedBytes)) into their events.\(skippedNote)"
+                    return ApplyStatusWording.afterApply(
+                        movedCount: report.moved.count,
+                        movedBytes: report.movedBytes,
+                        skipped: report.skipped,
+                        plan: plan
+                    )
                 }
             )
             if let jobID {
@@ -2506,7 +2602,125 @@ final class EventsWorkspace {
         }
         if moves.isEmpty && !copies.isEmpty {
             model.statusMessage = "Copying \(plan.copyCount) file(s) with checksum verification. Originals stay on the card."
+                + (ApplyStatusWording.collisionNote(for: plan).map { " " + $0 } ?? "")
         }
+    }
+
+    // MARK: - Apply collisions (identical copies and taken names)
+
+    /// "Move Duplicate to Trash" from the Apply sheet: the spare copies
+    /// still in an unsorted folder go through the ordinary organizer Trash
+    /// confirmation and the recoverable `_Trash` rename — never a delete.
+    /// The assignment stays when it is the event's only record of the
+    /// photo (it then describes the copy already in the event, exactly as
+    /// after an Apply); it is dropped when another assignment in the event
+    /// already points at that file.
+    func requestTrashApplyDuplicates(_ plan: OrganizeApplyPlan) {
+        pendingApplyPlan = nil
+        refreshIndexIfNeeded()
+        let duplicates = plan.groups.flatMap(\.duplicates)
+        guard !duplicates.isEmpty else { return }
+        let roots = unsortedLocations.map { location in
+            (location, EventStorageLocations.pathKey(DashboardModel.expandedPath(location.path)) + "/")
+        }
+        var byLocation: [UUID: [ApplyCollision]] = [:]
+        var order: [UUID] = []
+        for duplicate in duplicates {
+            let key = EventStorageLocations.pathKey(duplicate.move.sourcePath)
+            guard let (location, _) = roots.first(where: { key.hasPrefix($0.1) }) else { continue }
+            if byLocation[location.id] == nil { order.append(location.id) }
+            byLocation[location.id, default: []].append(duplicate)
+        }
+        guard let locationID = order.first, let location = location(locationID),
+              let chosen = byLocation[locationID] else {
+            model.statusMessage = "Those copies are not in an unsorted folder, so they were left alone. Open the folder to remove them."
+            return
+        }
+        let items = chosen.map { duplicate -> OrganizeItem in
+            let file = OrganizeFile(
+                path: duplicate.move.sourcePath,
+                size: duplicate.move.byteCount,
+                modifiedAt: duplicate.assignment?.modifiedAt ?? Date()
+            )
+            return OrganizeItem(
+                primary: file,
+                kind: OrganizeFileClassifier.kind(forExtension: file.fileExtension),
+                captureDate: file.modifiedAt,
+                hasCameraDate: false
+            )
+        }
+        presentTrash(items: items, locationID: locationID, eventID: nil, locationName: location.name)
+        pendingTrash?.preservedAssignmentKeys = Set(chosen.compactMap { duplicate -> String? in
+            guard let assignment = duplicate.assignment else { return nil }
+            return hasOtherAssignment(pointingLike: assignment) ? nil : Self.sourceKey(assignment)
+        })
+        pendingTrash?.note = order.count > 1
+            ? "Identical copies in other folders stay until you Apply those folders."
+            : "Each one is already in its event as a byte-identical file."
+    }
+
+    /// True when another assignment in the same event resolves to the same
+    /// event file (same device folder and relative path).
+    private func hasOtherAssignment(pointingLike assignment: PhotoEventAssignment) -> Bool {
+        let key = Self.sourceKey(assignment)
+        return model.configuration.photoEventAssignments.contains { other in
+            other.eventID == assignment.eventID
+                && other.deviceID == assignment.deviceID
+                && other.relativePath.lowercased() == assignment.relativePath.lowercased()
+                && Self.sourceKey(other) != key
+        }
+    }
+
+    /// "Keep Both" from the Apply sheet: each file whose name is taken in
+    /// its event moves in as `name (N).ext`, with its sidecars under the
+    /// same N. One journaled job — nothing is replaced, Undo moves the
+    /// files back under their original names. The rest of the plan is
+    /// left for the next Apply.
+    func keepBoth(_ plan: OrganizeApplyPlan) {
+        pendingApplyPlan = nil
+        let conflicts = plan.groups.flatMap(\.conflicts)
+        guard !conflicts.isEmpty else { return }
+        guard !model.isBusy, !model.isStorageBenchmarkRunning else {
+            model.statusMessage = "Another file job is already running. Wait for it to finish, then try again."
+            return
+        }
+        let journalFolder = self.journalFolder
+        let boundaries = plan.pruneBoundaries
+        let title = "Keep both in \(plan.groups.first { !$0.conflicts.isEmpty }.map { eventTitle($0.event) } ?? "the event")"
+        let affectedEvents = plan.groups.filter { !$0.conflicts.isEmpty }.map(\.event.id)
+        let remaining = plan.fileCount
+        model.runBackgroundJob(
+            action: .organize,
+            runningNote: "Moving \(conflicts.count) file(s) in under a new name",
+            logTitle: title,
+            logDetail: "Renamed files on the same drive to a free “(N)” name next to the file that already had their name. Nothing was replaced.",
+            operation: { progress in
+                try DriveMoveService().keepBoth(
+                    conflicts,
+                    title: title,
+                    journalFolder: journalFolder,
+                    pruneBoundaries: boundaries
+                ) { update in
+                    progress(DashboardModel.jobUpdate(from: update, notePrefix: "Moving", command: ""))
+                }
+            },
+            completion: { [weak self] outcome in
+                guard let self else { return "" }
+                applyAssignmentChange(
+                    AssignmentChange(title: title, removed: outcome.removedAssignments, added: outcome.addedAssignments),
+                    touching: nil
+                )
+                didMove(report: outcome.report, events: affectedEvents)
+                for eventID in affectedEvents {
+                    applyConflictSourceKeys[eventID] = nil
+                }
+                let names = outcome.report.moved.prefix(2).map { ($0.destinationPath as NSString).lastPathComponent }
+                let named = names.isEmpty ? "" : " as " + names.joined(separator: ", ") + (outcome.report.moved.count > 2 ? "…" : "")
+                let skipped = outcome.report.skipped.first.map { " \(outcome.report.skipped.count) left in place: \($0.reason)" } ?? ""
+                let rest = remaining > 0 ? " Press Apply for the other \(remaining) file(s)." : ""
+                return "Kept both: moved \(outcome.report.moved.count) file(s) in\(named). Nothing was replaced — Undo puts them back.\(skipped)\(rest)"
+            }
+        )
     }
 
     private func didMove(report: DriveMoveReport, events: [UUID]) {
@@ -3239,7 +3453,7 @@ final class EventsWorkspace {
     func confirmTrash(_ request: PendingTrashRequest) {
         pendingTrash = nil
         if let locationID = request.locationID {
-            trashItems(request.items, from: locationID)
+            trashItems(request.items, from: locationID, preservingAssignmentKeys: request.preservedAssignmentKeys)
         } else if let eventID = request.eventID {
             trashItems(request.items, fromEvent: eventID)
         }
@@ -3271,7 +3485,7 @@ final class EventsWorkspace {
     /// RAW+JPEG companions — into the drive-local `_Trash`. The burst preview
     /// calls this for single frames; a stack left with fewer items is
     /// restacked automatically when the scan result updates.
-    func trashItems(_ items: [OrganizeItem], from locationID: UUID) {
+    func trashItems(_ items: [OrganizeItem], from locationID: UUID, preservingAssignmentKeys: Set<String> = []) {
         guard let location = location(locationID) else { return }
         let files = items.flatMap(\.files)
         guard !files.isEmpty else {
@@ -3295,7 +3509,9 @@ final class EventsWorkspace {
             let key = file.pathKey
             if let assignment = assignmentsByPathKey[key] {
                 eventIDs[key] = assignment.eventID
-                removedAssignments.append(assignment)
+                if !preservingAssignmentKeys.contains(key) {
+                    removedAssignments.append(assignment)
+                }
             }
         }
         if !removedAssignments.isEmpty {

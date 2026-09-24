@@ -213,9 +213,13 @@ struct UnsortedBoardView: View {
         let sorted = workspace.sortedFiles(in: result)
         let targets = workspace.targetStackIDs()
         let orderedIDs = ordered.map(\.id)
-        let hint = sorted.files > 0
-            ? "\(sorted.files) sorted file\(sorted.files == 1 ? "" : "s") (\(sorted.bytes.formattedBytes)) still here — nothing moves until you Apply"
-            : "Select items, then press 1–3, drag onto an event, or press N for a new event"
+        let collisions = workspace.applyCollisions(in: result)
+        let hint = ApplyStatusWording.boardHint(
+            sortedFiles: sorted.files,
+            sortedBytes: sorted.bytes,
+            duplicates: collisions.duplicates,
+            conflicts: collisions.conflicts
+        ) ?? "Select items, then press 1–3, drag onto an event, or press N for a new event"
         return BoardBottomBar(model: model, workspace: workspace, hint: hint) {
             ViewThatFits(in: .horizontal) {
                 bottomBarRow(result, groups: groups, orderedIDs: orderedIDs, matched: matched, targets: targets, sorted: sorted, assignStyle: .glass, compactControls: false)
