@@ -22,40 +22,54 @@ enum OrganizeSearchScope: String, Hashable, Sendable {
 /// stays when any group does (an OR of AND-groups). Text stays free-form —
 /// file name, burst label, origin subfolder, or event title — and ANDs
 /// with the groups. An empty builder never filters.
+///
+/// On top of the groups sits one board-level exclusion list, written by
+/// the event board's subevent chips: an event struck through there hides
+/// its stacks whatever the groups say. The full match is
+/// `text ∧ ¬excluded ∧ (no active group ∨ some group matches)`.
 struct OrganizeSearchFilter: Equatable, Sendable {
     /// Raw text of the search field — normalized through `needle`.
     var text = ""
     /// The AND-groups of condition rows, ORed at match time. May be
     /// empty; groups whose rows are all empty apply no condition.
     var groups: [OrganizeFilterGroup] = []
+    /// Events whose stacks are always hidden — the header chips'
+    /// strikethrough. ANDed with the whole filter, never with one group,
+    /// so an OR-group added later cannot bring the excluded photos back.
+    /// Hand-built "Event is none of" rows stay rows and keep their
+    /// per-group meaning; only chip toggles write here.
+    var excludedEventIDs: Set<UUID> = []
 
-    /// No filtering at all — empty text and no active condition rows.
-    /// The board shows everything.
+    /// No filtering at all — empty text, no exclusions, and no active
+    /// condition rows. The board shows everything.
     var isEmpty: Bool {
         OrganizeSearch.needle(text).isEmpty && !hasActiveConditions
     }
 
-    /// Nothing to reset — no text and no rows at all, so Clear All has
-    /// nothing to clear (a group of empty rows is still a row).
+    /// Nothing to reset — no text, no exclusions, and no rows at all, so
+    /// Clear All has nothing to clear (a group of empty rows is still a
+    /// row).
     var isUntouched: Bool {
-        OrganizeSearch.needle(text).isEmpty && groups.isEmpty
+        OrganizeSearch.needle(text).isEmpty && groups.isEmpty && excludedEventIDs.isEmpty
     }
 
-    /// Any group holding at least one non-empty row — the builder is
-    /// actually narrowing the board.
+    /// Any board-level exclusion, or any group holding at least one
+    /// non-empty row — the builder is actually narrowing the board.
     var hasActiveConditions: Bool {
-        groups.contains { !$0.isEmpty }
+        !excludedEventIDs.isEmpty || groups.contains { !$0.isEmpty }
     }
 
-    /// Non-empty condition rows across every group — the funnel button's
-    /// badge count.
+    /// Non-empty condition rows across every group, plus the board-level
+    /// exclusions — the funnel button's badge count.
     var activeRowCount: Int {
-        groups.reduce(0) { $0 + $1.rows.filter { !$0.isEmpty }.count }
+        groups.reduce(excludedEventIDs.count) { $0 + $1.rows.filter { !$0.isEmpty }.count }
     }
 
     /// Every row carrying picks, in panel order — the board header's
     /// hot-link chips. Paused rows stay listed (they draw as outlines);
-    /// a row with no values never chips.
+    /// a row with no values never chips. Board-level exclusions are not
+    /// rows: the subevent chips and the panel's "Always hiding" section
+    /// show them.
     var rowsWithValues: [OrganizeFilterRow] {
         groups.flatMap(\.rows).filter(\.hasValues)
     }
@@ -72,9 +86,11 @@ struct OrganizeSearchFilter: Equatable, Sendable {
     /// and "Not Sorted Yet" cleared — a family board's stacks all belong to
     /// it, so only in-family picks can narrow it. An Event row left with no
     /// in-family pick stops filtering instead of emptying the board, which
-    /// keeps an unsorted board's carried-over picks from blanking it.
+    /// keeps an unsorted board's carried-over picks from blanking it. The
+    /// board-level exclusions narrow the same way.
     func scopingEventRows(to familyIDs: Set<UUID>) -> OrganizeSearchFilter {
         var copy = self
+        copy.excludedEventIDs.formIntersection(familyIDs)
         copy.groups = groups.map { group in
             var scoped = group
             scoped.rows = scoped.rows.map { row in
@@ -89,53 +105,41 @@ struct OrganizeSearchFilter: Equatable, Sendable {
         return copy
     }
 
-    /// Event ids an enabled "is none of" Event row excludes — a header
-    /// chip's outline state: the tag's photos are filtered out. A paused
-    /// exclusion row keeps its picks but hides nothing, so it does not
-    /// mark the chip.
-    var excludedEventIDs: Set<UUID> {
-        groups.reduce(into: Set<UUID>()) { ids, group in
-            for row in group.rows
-            where row.property == .event && row.operator == .noneOf && row.isEnabled {
-                ids.formUnion(row.eventIDs)
-            }
+    /// Toggles the board-level exclusion for one event — the header
+    /// chips' action. It never edits the condition groups, so rows the
+    /// user built by hand keep their meaning and the exclusion keeps
+    /// applying to groups added after it.
+    mutating func toggleEventExclusion(_ id: UUID) {
+        if excludedEventIDs.contains(id) {
+            excludedEventIDs.remove(id)
+        } else {
+            excludedEventIDs.insert(id)
         }
     }
 
-    /// Toggles "is none of" for an event pick — the header chips' action.
-    /// Adding joins an "is none of" Event row in every group (creating the
-    /// rows, and a group when none exist) so the tag's photos drop no
-    /// matter which OR-group a stack matches; removing takes the id out of
-    /// every such row and drops the husk it leaves behind.
-    mutating func toggleEventExclusion(_ id: UUID) {
-        if excludedEventIDs.contains(id) {
-            for groupIndex in groups.indices {
-                for rowIndex in groups[groupIndex].rows.indices
-                where groups[groupIndex].rows[rowIndex].property == .event
-                    && groups[groupIndex].rows[rowIndex].operator == .noneOf {
-                    groups[groupIndex].rows[rowIndex].eventIDs.remove(id)
-                }
-                groups[groupIndex].rows.removeAll {
-                    $0.property == .event && $0.operator == .noneOf && !$0.hasValues
-                }
-            }
-            groups.removeAll { $0.rows.isEmpty }
-        } else if groups.isEmpty {
-            groups = [OrganizeFilterGroup(rows: [.events([id], operator: .noneOf)])]
+    /// The panel's default add: the row ANDs into the last group (the only
+    /// one unless the user deliberately started an "or"), creating it on
+    /// the first add. It never opens a new OR branch — each condition
+    /// narrows the board.
+    mutating func addCondition(_ row: OrganizeFilterRow) {
+        if groups.isEmpty {
+            groups = [OrganizeFilterGroup(rows: [row])]
         } else {
-            for groupIndex in groups.indices {
-                if let rowIndex = groups[groupIndex].rows.firstIndex(where: {
-                    $0.property == .event && $0.operator == .noneOf
-                }) {
-                    groups[groupIndex].rows[rowIndex].eventIDs.insert(id)
-                    // A paused exclusion row resumes — the chip tap must
-                    // hide the tag's photos, not edit a suspended row.
-                    groups[groupIndex].rows[rowIndex].isEnabled = true
-                } else {
-                    groups[groupIndex].rows.append(.events([id], operator: .noneOf))
-                }
-            }
+            groups[groups.count - 1].rows.append(row)
         }
+    }
+
+    /// The panel's explicit "or" action — a new group whose match widens
+    /// the board rather than narrowing it.
+    mutating func addOrGroup(_ row: OrganizeFilterRow) {
+        groups.append(OrganizeFilterGroup(rows: [row]))
+    }
+
+    /// Drops every condition — the groups and the board-level exclusions —
+    /// while keeping the search text. The sidebar's "Filtered — Clear".
+    mutating func clearConditions() {
+        groups = []
+        excludedEventIDs = []
     }
 
     /// Flips one row's `isEnabled` — the header hot links' tap: pause the
@@ -453,7 +457,8 @@ enum OrganizeSearch {
         return personNames.contains { matches($0, needle: needle) }
     }
 
-    /// The builder's structured match: an OR of AND-groups. Groups whose
+    /// The builder's structured match: the board-level exclusions ANDed
+    /// with an OR of AND-groups. Groups whose
     /// rows are all empty are skipped — a row with no values does not
     /// filter, so an unfinished group must not widen the match either. No
     /// active group passes everything.
@@ -462,6 +467,9 @@ enum OrganizeSearch {
         search: OrganizeSearchFilter,
         calendar: Calendar = .current
     ) -> Bool {
+        // Board-level exclusions AND with everything: a subject carrying
+        // an excluded event drops no matter which group it would match.
+        guard subject.eventIDs.isDisjoint(with: search.excludedEventIDs) else { return false }
         let activeGroups = search.groups.filter { !$0.isEmpty }
         guard !activeGroups.isEmpty else { return true }
         return activeGroups.contains { group in
