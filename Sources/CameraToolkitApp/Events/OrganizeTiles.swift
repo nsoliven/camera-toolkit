@@ -860,10 +860,10 @@ struct OrganizeGrid<MenuContent: View>: View {
     /// Which list row shows its `···` menu; only the menu slots observe it.
     @State private var hover = BoardHoverState()
 
-    /// Accent selection while the board has focus in the active window,
-    /// grey selection otherwise — the Finder and Photos rule.
+    /// Accent selection while the window is active, grey only in the
+    /// background — independent of which control has keyboard focus.
     private var isEmphasized: Bool {
-        BoardSelectionStyle.isEmphasized(windowIsActive: appearsActive, boardHasFocus: isFocused)
+        BoardSelectionStyle.isEmphasized(windowIsActive: appearsActive)
     }
 
     /// One section per group — collapsing hides a group's rows, never the

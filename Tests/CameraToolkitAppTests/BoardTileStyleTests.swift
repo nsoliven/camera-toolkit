@@ -3,11 +3,11 @@ import AppKit
 import XCTest
 
 final class BoardTileStyleTests: XCTestCase {
-    func testSelectionIsEmphasizedOnlyWhenTheBoardHasFocusInTheActiveWindow() {
-        XCTAssertTrue(BoardSelectionStyle.isEmphasized(windowIsActive: true, boardHasFocus: true))
-        XCTAssertFalse(BoardSelectionStyle.isEmphasized(windowIsActive: true, boardHasFocus: false))
-        XCTAssertFalse(BoardSelectionStyle.isEmphasized(windowIsActive: false, boardHasFocus: true))
-        XCTAssertFalse(BoardSelectionStyle.isEmphasized(windowIsActive: false, boardHasFocus: false))
+    /// Clicking the toolbar, bottom bar, sidebar or search moves keyboard
+    /// focus off the grid; the selection must stay accent-coloured anyway.
+    func testSelectionIsEmphasizedWheneverTheWindowIsActive() {
+        XCTAssertTrue(BoardSelectionStyle.isEmphasized(windowIsActive: true))
+        XCTAssertFalse(BoardSelectionStyle.isEmphasized(windowIsActive: false))
     }
 
     func testSelectionColourFollowsTheSystemEmphasizedAndUnemphasizedColours() {

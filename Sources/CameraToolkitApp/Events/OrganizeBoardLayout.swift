@@ -22,12 +22,14 @@ enum BoardMetrics {
     static let badgeMinHitSize: CGFloat = 22
 }
 
-/// Finder/Photos selection colour: the accent-coloured highlight only while
-/// the board has keyboard focus in the active window, the grey
-/// "unemphasized" highlight otherwise.
+/// Photos selection colour: the accent-coloured highlight whenever the
+/// window is active, the grey "unemphasized" highlight only when the window
+/// is in the background. Keyboard focus deliberately plays no part: it
+/// leaves the grid on every toolbar, bottom-bar, sidebar or search click,
+/// which made the same selection flip between accent and grey.
 enum BoardSelectionStyle {
-    static func isEmphasized(windowIsActive: Bool, boardHasFocus: Bool) -> Bool {
-        windowIsActive && boardHasFocus
+    static func isEmphasized(windowIsActive: Bool) -> Bool {
+        windowIsActive
     }
 
     static func selectionNSColor(isEmphasized: Bool) -> NSColor {
