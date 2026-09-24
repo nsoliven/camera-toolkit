@@ -861,6 +861,156 @@ final class EventsWorkspaceTests: XCTestCase {
         }
     }
 
+    /// The shipping layout: a Buffer parent with a private (NAS-only)
+    /// subevent, burst-prefixed frames, and boards that draw files from
+    /// whichever place holds them — the import source, the private or
+    /// Buffer `Card Copy`, the NAS archive, or a differently cased
+    /// spelling of any of those. Every Event operator must resolve the
+    /// subevent the same way at each of those paths, and a burst's
+    /// membership is the union of its frames: "is none of" a tag drops a
+    /// stack when any frame carries the tag, "is any of" keeps it.
+    func testSubeventOperatorsResolveBurstsAtEveryStoragePath() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let unsorted = root.appendingPathComponent("Drive/Unsorted A7V", isDirectory: true)
+            let roll = unsorted.appendingPathComponent("Transfer 1", isDirectory: true)
+            // Two prefix-trusted bursts seconds apart in one folder, plus a
+            // single — the tag's burst sits right next to the parent's.
+            for (index, name) in ["B0001_DSC00001", "B0001_DSC00002", "B0001_DSC00003"].enumerated() {
+                try writeOrganizerARW(roll.appendingPathComponent("\(name).ARW"), "2026:08:24 03:04:25", "\(index)00")
+            }
+            for (index, name) in ["B0002_DSC00004", "B0002_DSC00005"].enumerated() {
+                try writeOrganizerARW(roll.appendingPathComponent("\(name).ARW"), "2026:08:24 03:04:32", "\(index)00")
+            }
+            try writeOrganizerARW(roll.appendingPathComponent("DSC00006.ARW"), "2026:08:24 03:05:00", "000")
+            let location = addUnsorted(unsorted, to: model)
+            workspace.scan(location)
+            try await waitUntil { workspace.sources[location.id]?.result != nil }
+            let result = try XCTUnwrap(workspace.sources[location.id]?.result)
+            let tagBurst = try XCTUnwrap(result.stacks.first { $0.burstLabel == "B0001" })
+            let parentBurst = try XCTUnwrap(result.stacks.first { $0.burstLabel == "B0002" })
+            let single = try XCTUnwrap(result.stacks.first { $0.coverItem.primary.name == "DSC00006.ARW" })
+            XCTAssertEqual(tagBurst.items.count, 3)
+            XCTAssertEqual(parentBurst.items.count, 2)
+
+            let parent = try XCTUnwrap(workspace.createEvent(name: "Trip", date: organizerDay("2026-08-23"), policy: .buffer))
+            let tag = try XCTUnwrap(workspace.createEvent(name: "Tag A", date: organizerDay("2026-08-24"), policy: .archiveOnly, parentEventID: parent))
+            workspace.assign(stackIDs: [tagBurst.id], from: location.id, to: tag)
+            workspace.assign(stackIDs: [parentBurst.id, single.id], from: location.id, to: parent)
+
+            let tagEvent = try XCTUnwrap(workspace.event(tag))
+            let locations = workspace.locations
+            XCTAssertEqual(locations.resolvedPolicy(for: tagEvent), .archiveOnly)
+
+            /// Every spelling a board may draw one assigned file at.
+            @MainActor func variants(of file: OrganizeFile) throws -> [String: OrganizeFile] {
+                let assignment = try XCTUnwrap(model.configuration.photoEventAssignments.first {
+                    EventsWorkspace.sourceKey($0) == file.pathKey
+                })
+                let owner = try XCTUnwrap(workspace.event(assignment.eventID))
+                let policy = locations.resolvedPolicy(for: owner)
+                let other: EventStoragePolicy = policy == .buffer ? .archiveOnly : .buffer
+                func literal(_ path: String?) throws -> OrganizeFile {
+                    OrganizeFile(literalPath: try XCTUnwrap(path), size: assignment.fileSize, modifiedAt: assignment.modifiedAt)
+                }
+                func standardized(_ url: URL?) throws -> OrganizeFile {
+                    OrganizeFile(path: try XCTUnwrap(url).path, size: assignment.fileSize, modifiedAt: assignment.modifiedAt)
+                }
+                let cardCopy = try literal(locations.impliedDrivePath(for: assignment, event: owner, policy: policy))
+                return [
+                    "source": file,
+                    "card copy": cardCopy,
+                    "other drive": try standardized(locations.driveURL(for: assignment, event: owner, policy: other)),
+                    "nas": try standardized(locations.archiveURL(for: assignment, event: owner)),
+                    "card copy, upper case": try literal(cardCopy.path.uppercased()),
+                ]
+            }
+
+            /// The three stacks as a board would draw them at one place.
+            @MainActor func stacks(at place: String) throws -> [OrganizeStack] {
+                try [tagBurst, parentBurst, single].map { stack in
+                    var moved = stack
+                    for index in moved.items.indices {
+                        moved.items[index].primary = try XCTUnwrap(variants(of: stack.items[index].primary)[place])
+                    }
+                    return moved
+                }
+            }
+
+            @MainActor func board(_ stacks: [OrganizeStack], _ row: OrganizeFilterRow) -> Set<String> {
+                workspace.eventStacks[parent] = stacks
+                var search = OrganizeSearchFilter()
+                search.groups = [OrganizeFilterGroup(rows: [row])]
+                return Set(workspace.visibleEventStacks(parent, search: search).map(\.id))
+            }
+
+            let all: Set<String> = [tagBurst.id, parentBurst.id, single.id]
+            for place in ["source", "card copy", "other drive", "nas", "card copy, upper case"] {
+                let drawn = try stacks(at: place)
+                // Every frame resolves to its own event — the lookup, the
+                // tile's tag dot, and the filter all agree.
+                for frame in drawn[0].items {
+                    XCTAssertEqual(workspace.assignment(for: frame.primary)?.eventID, tag, "\(place): \(frame.primary.name)")
+                }
+                for frame in drawn[1].items + drawn[2].items {
+                    XCTAssertEqual(workspace.assignment(for: frame.primary)?.eventID, parent, "\(place): \(frame.primary.name)")
+                }
+                XCTAssertEqual(workspace.subeventTag(for: drawn[0], in: parent)?.id, tag, place)
+                XCTAssertNil(workspace.subeventTag(for: drawn[1], in: parent), place)
+
+                XCTAssertEqual(board(drawn, .events([tag], operator: .noneOf)), [parentBurst.id, single.id], place)
+                XCTAssertEqual(board(drawn, .events([tag], operator: .anyOf)), [tagBurst.id], place)
+                XCTAssertEqual(board(drawn, .events([tag], operator: .allOf)), [tagBurst.id], place)
+                XCTAssertEqual(board(drawn, .events([tag], operator: .notAllOf)), [parentBurst.id, single.id], place)
+                // The parent pick covers its subevent's stacks too.
+                XCTAssertEqual(board(drawn, .events([parent], operator: .anyOf)), all, place)
+                XCTAssertTrue(board(drawn, .events([parent], operator: .noneOf)).isEmpty, place)
+                // The header chip writes the same exclusion.
+                var chip = OrganizeSearchFilter()
+                chip.toggleEventExclusion(tag)
+                workspace.eventStacks[parent] = drawn
+                XCTAssertEqual(Set(workspace.visibleEventStacks(parent, search: chip).map(\.id)), [parentBurst.id, single.id], place)
+            }
+
+            // A burst with mixed membership is one subject: whether its
+            // cover frame or another frame carries the tag, "is none of"
+            // drops the whole stack and "is any of" keeps it. The preview
+            // badge reads such a stack as mixed, not as the parent's.
+            let cardCopy = try stacks(at: "card copy")
+            for coverTagged in [true, false] {
+                var mixed = cardCopy[1]
+                let tagFrame = cardCopy[0].items[0]
+                if coverTagged {
+                    mixed.items.insert(tagFrame, at: mixed.items.count / 2)
+                    XCTAssertEqual(workspace.assignment(for: mixed.coverItem.primary)?.eventID, tag)
+                } else {
+                    mixed.items.append(tagFrame)
+                    XCTAssertEqual(workspace.assignment(for: mixed.coverItem.primary)?.eventID, parent)
+                }
+                XCTAssertTrue(workspace.assignedEvent(for: mixed).mixed)
+                XCTAssertNil(workspace.assignedEvent(for: mixed).event)
+                let drawn = [mixed, cardCopy[2]]
+                XCTAssertEqual(board(drawn, .events([tag], operator: .noneOf)), [single.id], "cover tagged: \(coverTagged)")
+                XCTAssertEqual(board(drawn, .events([tag], operator: .anyOf)), [parentBurst.id], "cover tagged: \(coverTagged)")
+                XCTAssertEqual(board(drawn, .events([tag], operator: .allOf)), [parentBurst.id], "cover tagged: \(coverTagged)")
+                XCTAssertEqual(board(drawn, .events([tag], operator: .notAllOf)), [single.id], "cover tagged: \(coverTagged)")
+            }
+
+            // Unsorted board: a burst with one frame in the tag and the rest
+            // still unsorted is not "Not Sorted Yet", and "is none of" the
+            // tag drops it there as well.
+            workspace.unassign(stackIDs: [parentBurst.id], from: location.id)
+            var search = OrganizeSearchFilter()
+            var partial = result
+            var mixedSource = parentBurst
+            mixedSource.items.append(tagBurst.items[0])
+            partial.stacks = [mixedSource, single]
+            search.groups = [OrganizeFilterGroup(rows: [.events([tag], operator: .noneOf)])]
+            XCTAssertEqual(workspace.visibleStacks(partial, hideSorted: false, search: search).map(\.id), [single.id])
+            search.groups = [OrganizeFilterGroup(rows: [.events([], unsorted: true)])]
+            XCTAssertTrue(workspace.visibleStacks(partial, hideSorted: false, search: search).isEmpty)
+        }
+    }
+
     func testApplySortsSubeventFilesIntoTheNestedFolder() async throws {
         try await withOrganizerSandbox { root, model, workspace in
             let unsorted = root.appendingPathComponent("Drive/Unsorted A7V", isDirectory: true)
