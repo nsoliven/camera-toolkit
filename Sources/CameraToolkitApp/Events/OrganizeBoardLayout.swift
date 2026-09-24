@@ -72,6 +72,9 @@ enum OrganizeBoardGrouping: String, CaseIterable, Identifiable, Sendable {
     case folder
     case kind
     case event
+    /// One section holding the whole board — for a sort such as "Largest
+    /// Bursts" meant to run across every day at once.
+    case ungrouped
 
     var id: String { rawValue }
 
@@ -81,6 +84,7 @@ enum OrganizeBoardGrouping: String, CaseIterable, Identifiable, Sendable {
         case .folder: "Folder"
         case .kind: "Kind"
         case .event: "Event"
+        case .ungrouped: "None"
         }
     }
 
@@ -90,22 +94,24 @@ enum OrganizeBoardGrouping: String, CaseIterable, Identifiable, Sendable {
         case .folder: "folder"
         case .kind: "square.stack.3d.up"
         case .event: "rectangle.stack"
+        case .ungrouped: "rectangle.grid.1x2"
         }
     }
 }
 
-/// Stack order inside a group (and, for day/folder groups, the group order).
-enum OrganizeBoardOrder: String, CaseIterable, Identifiable, Sendable {
-    case oldestFirst
-    case newestFirst
+/// Where a board's sort choice lives in `UserDefaults`, one pair of keys
+/// per board type — the same `CameraToolkit.<board>.*` family as grouping.
+enum OrganizeBoardSortDefaults {
+    static let unsortedKey = "CameraToolkit.organize.sortKey"
+    static let unsortedAscending = "CameraToolkit.organize.sortAscending"
+    static let eventKey = "CameraToolkit.eventboard.sortKey"
+    static let eventAscending = "CameraToolkit.eventboard.sortAscending"
+    /// The old shared Oldest/Newest First picker, read once so a board
+    /// the owner had set to Newest First opens that way after the upgrade.
+    static let legacyOrderKey = "CameraToolkit.organize.order"
 
-    var id: String { rawValue }
-
-    var title: String {
-        switch self {
-        case .oldestFirst: "Oldest First"
-        case .newestFirst: "Newest First"
-        }
+    static func legacyAscending(_ defaults: UserDefaults = .standard) -> Bool {
+        defaults.string(forKey: legacyOrderKey) != "newestFirst"
     }
 }
 
@@ -150,22 +156,23 @@ struct OrganizeBoardSection: Identifiable, Sendable {
 enum OrganizeBoardPlan {
     /// Builds the board's collapsible groups. `eventBucket` is only consulted
     /// for `.event` grouping; nil buckets collect under "Not Sorted Yet".
+    ///
+    /// `sort` orders the stacks inside every group. The groups themselves
+    /// follow the sort's direction only when it sorts by capture time
+    /// (Newest First lists the latest day first, as before); any other key
+    /// keeps days, folders and events in their natural oldest-first / A–Z
+    /// order and sorts within each — "Largest Bursts" by day shows each
+    /// day's biggest bursts first. `.ungrouped` puts the whole board in
+    /// one section for a sort across everything.
     static func groups(
         for stacks: [OrganizeStack],
         grouping: OrganizeBoardGrouping,
-        order: OrganizeBoardOrder,
+        sort: OrganizeStackSort = .oldestFirst,
         rootPath: String? = nil,
         eventBucket: (OrganizeStack) -> OrganizeEventBucket? = { _ in nil }
     ) -> [OrganizeBoardGroup] {
-        let ascending = order == .oldestFirst
-        let sortStacks: ([OrganizeStack]) -> [OrganizeStack] = { stacks in
-            stacks.sorted { lhs, rhs in
-                if lhs.captureDate != rhs.captureDate {
-                    return ascending ? lhs.captureDate < rhs.captureDate : lhs.captureDate > rhs.captureDate
-                }
-                return lhs.id < rhs.id
-            }
-        }
+        let ascending = sort.key == .captureTime ? sort.ascending : true
+        let sortStacks: ([OrganizeStack]) -> [OrganizeStack] = { sort.sorted($0) }
 
         let groups: [OrganizeBoardGroup]
         switch grouping {
@@ -177,9 +184,17 @@ enum OrganizeBoardPlan {
                     id: "day|\(day.id)",
                     title: day.date.formatted(.dateTime.weekday(.wide).month(.wide).day().year()),
                     symbol: "calendar",
-                    stacks: ascending ? day.stacks : day.stacks.reversed()
+                    stacks: sortStacks(day.stacks)
                 )
             }
+
+        case .ungrouped:
+            groups = [OrganizeBoardGroup(
+                id: "all",
+                title: "All Items",
+                symbol: "rectangle.grid.1x2",
+                stacks: sortStacks(stacks)
+            )]
 
         case .folder:
             var byFolder: [String: [OrganizeStack]] = [:]

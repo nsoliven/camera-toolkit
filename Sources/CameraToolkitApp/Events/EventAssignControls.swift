@@ -1,3 +1,4 @@
+import AppKit
 import CameraToolkitCore
 import SwiftUI
 
@@ -188,11 +189,10 @@ struct QuickAssignLabel: View {
                     .font(.caption.weight(.bold))
                     .foregroundStyle(color)
             } else {
-                // A symbol with an explicit style, like the bar's old
-                // numbered dot, so the glass button keeps the event colour.
-                Image(systemName: "circle.fill")
-                    .font(.system(size: 8))
-                    .foregroundStyle(color)
+                // A non-template bitmap: glass buttons can draw their label
+                // monochrome, which would bleach a plain shape's fill.
+                Image(nsImage: Self.dot(color))
+                    .accessibilityHidden(true)
             }
             if showsName {
                 if isPrivate {
@@ -204,6 +204,21 @@ struct QuickAssignLabel: View {
                     .lineLimit(1)
             }
         }
+    }
+}
+
+extension QuickAssignLabel {
+    /// An 8 pt circle in `color`, marked non-template so button styles
+    /// keep its colour.
+    static func dot(_ color: Color) -> NSImage {
+        let fill = NSColor(color)
+        let image = NSImage(size: NSSize(width: 8, height: 8), flipped: false) { rect in
+            fill.setFill()
+            NSBezierPath(ovalIn: rect).fill()
+            return true
+        }
+        image.isTemplate = false
+        return image
     }
 }
 

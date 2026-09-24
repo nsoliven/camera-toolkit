@@ -1013,9 +1013,9 @@ final class EventsWorkspace {
         _ eventID: UUID,
         stacks: [OrganizeStack],
         grouping: OrganizeBoardGrouping,
-        order: OrganizeBoardOrder
+        sort: OrganizeStackSort
     ) -> [OrganizeBoardGroup] {
-        OrganizeBoardPlan.groups(for: stacks, grouping: grouping, order: order)
+        OrganizeBoardPlan.groups(for: stacks, grouping: grouping, sort: sort)
     }
 
     /// The stacks an event board shows after its search field filters —

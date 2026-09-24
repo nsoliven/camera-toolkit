@@ -45,9 +45,12 @@ struct BoardToolbarTitle: View {
     }
 }
 
-/// Filter · tiles/list · sort and group · tile size · hide sorted — the
-/// board's view controls as one floating glass capsule. Compact drops the
-/// slider for Larger/Smaller items in the sort menu.
+/// Filter · tiles/list · Sort · Group · tile size · hide sorted — the
+/// board's view controls as one floating glass capsule. Sort and Group are
+/// separate, labelled menus ("Sort: Largest Bursts", "Group: Day"); compact
+/// bars shorten them to "Sort" and "Group", the narrowest to icons (the
+/// current choice stays in the help and VoiceOver label), and move the slider into the Group menu as
+/// Larger/Smaller items.
 struct BoardViewControls: View {
     @Bindable var workspace: EventsWorkspace
     /// The unfiltered board's stacks, for the filter panel's pickers.
@@ -61,11 +64,14 @@ struct BoardViewControls: View {
     @Binding var mode: OrganizeBoardMode
     @Binding var grouping: OrganizeBoardGrouping
     let groupings: [OrganizeBoardGrouping]
-    @Binding var order: OrganizeBoardOrder
+    @Binding var sort: OrganizeStackSort
     @Binding var tileWidth: Double
     /// Unsorted boards only.
     var hideSorted: Binding<Bool>? = nil
     var compact = false
+    /// The narrowest bars: Sort and Group as bare icons (their current
+    /// choice stays in the help and VoiceOver label).
+    var iconOnlyMenus = false
 
     static let tileWidthRange = 88.0...460.0
 
@@ -88,20 +94,31 @@ struct BoardViewControls: View {
             .fixedSize()
             .help("Show the board as tiles or as a list")
             Menu {
-                BoardSortMenuContent(
+                BoardSortMenuContent(sort: $sort, grouping: grouping)
+            } label: {
+                Label(compact ? "Sort" : "Sort: \(sort.summary)", systemImage: "arrow.up.arrow.down")
+                    .labelStyle(iconOnlyMenus ? AnyBoardLabelStyle(.iconOnly) : AnyBoardLabelStyle(.titleAndIcon))
+            }
+            .menuIndicator(compact ? .hidden : .visible)
+            .fixedSize()
+            .help("Sort: \(sort.key.title), \(sort.key.directionTitle(ascending: sort.ascending))")
+            .accessibilityLabel("Sort, \(sort.summary)")
+            Menu {
+                BoardGroupMenuContent(
                     workspace: workspace,
                     groups: groups,
                     grouping: $grouping,
                     groupings: groupings,
-                    order: $order,
                     tileWidth: compact && mode == .tiles ? $tileWidth : nil
                 )
             } label: {
-                Label("Sort & Group", systemImage: "arrow.up.arrow.down")
+                Label(compact ? "Group" : "Group: \(grouping.title)", systemImage: "rectangle.3.group")
+                    .labelStyle(iconOnlyMenus ? AnyBoardLabelStyle(.iconOnly) : AnyBoardLabelStyle(.titleAndIcon))
             }
-            .menuIndicator(.hidden)
+            .menuIndicator(compact ? .hidden : .visible)
             .fixedSize()
-            .help("Group, sort, and collapse the board")
+            .help("Group the board by \(grouping.title.lowercased()), or collapse its groups")
+            .accessibilityLabel("Group, \(grouping.title)")
             if mode == .tiles && !compact {
                 Slider(value: $tileWidth, in: Self.tileWidthRange) {
                     Text("Tile Size")
@@ -133,27 +150,51 @@ struct BoardViewControls: View {
     }
 }
 
-/// The Sort & Group menu's items, in their own view so they are built
-/// with the menu rather than on every board render.
+/// The Sort menu's items, in their own view so they are built with the
+/// menu rather than on every board render: the key, then its direction
+/// worded for that key ("Largest First"). Picking a new key starts it in
+/// its natural direction — biggest bursts and files first, oldest time
+/// and A–Z names first.
 private struct BoardSortMenuContent: View {
+    @Binding var sort: OrganizeStackSort
+    let grouping: OrganizeBoardGrouping
+
+    var body: some View {
+        Picker("Sort By", selection: Binding(
+            get: { sort.key },
+            set: { sort = OrganizeStackSort(key: $0) }
+        )) {
+            ForEach(OrganizeSortKey.allCases) { key in
+                Label(key.title, systemImage: key.symbol).tag(key)
+            }
+        }
+        .pickerStyle(.inline)
+        Picker("Order", selection: $sort.ascending) {
+            Label(sort.key.directionTitle(ascending: true), systemImage: "arrow.up").tag(true)
+            Label(sort.key.directionTitle(ascending: false), systemImage: "arrow.down").tag(false)
+        }
+        .pickerStyle(.inline)
+        if grouping != .ungrouped && sort.key != .captureTime {
+            Divider()
+            Text("Sorted within each \(grouping.title.lowercased()) group. Group by None to sort the whole board.")
+        }
+    }
+}
+
+/// The Group menu's items: the grouping, Expand/Collapse All, and — in a
+/// compact bar — Larger/Smaller Tiles in place of the slider.
+private struct BoardGroupMenuContent: View {
     let workspace: EventsWorkspace
     let groups: [OrganizeBoardGroup]
     @Binding var grouping: OrganizeBoardGrouping
     let groupings: [OrganizeBoardGrouping]
-    @Binding var order: OrganizeBoardOrder
     /// Set in compact bars, where the slider is not shown.
     var tileWidth: Binding<Double>?
 
     var body: some View {
         Picker("Group By", selection: $grouping) {
             ForEach(groupings) { option in
-                Text(option.title).tag(option)
-            }
-        }
-        .pickerStyle(.inline)
-        Picker("Order", selection: $order) {
-            ForEach(OrganizeBoardOrder.allCases) { option in
-                Text(option.title).tag(option)
+                Label(option.title, systemImage: option.symbol).tag(option)
             }
         }
         .pickerStyle(.inline)
@@ -171,6 +212,19 @@ private struct BoardSortMenuContent: View {
                 tileWidth.wrappedValue = max(tileWidth.wrappedValue / 1.25, BoardViewControls.tileWidthRange.lowerBound)
             }
         }
+    }
+}
+
+/// Picks between two label styles at runtime.
+private struct AnyBoardLabelStyle: LabelStyle {
+    private let make: (Configuration) -> AnyView
+
+    init(_ style: some LabelStyle) {
+        make = { AnyView(style.makeBody(configuration: $0)) }
+    }
+
+    func makeBody(configuration: Configuration) -> some View {
+        make(configuration)
     }
 }
 

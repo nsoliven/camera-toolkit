@@ -31,12 +31,12 @@ final class OrganizeBoardLayoutTests: XCTestCase {
             OrganizeStack(items: [item("/Card/DCIM/DSC00001.ARW", at: date(2026, 8, 26))]),
         ]
 
-        let ascending = OrganizeBoardPlan.groups(for: stacks, grouping: .day, order: .oldestFirst)
+        let ascending = OrganizeBoardPlan.groups(for: stacks, grouping: .day, sort: .oldestFirst)
         XCTAssertEqual(ascending.map(\.id), ["day|2026-08-26", "day|2026-08-27"])
         XCTAssertFalse(ascending[0].title.isEmpty)
         XCTAssertEqual(ascending[0].symbol, "calendar")
 
-        let descending = OrganizeBoardPlan.groups(for: stacks, grouping: .day, order: .newestFirst)
+        let descending = OrganizeBoardPlan.groups(for: stacks, grouping: .day, sort: .newestFirst)
         XCTAssertEqual(descending.map(\.id), ["day|2026-08-27", "day|2026-08-26"])
         XCTAssertEqual(descending[0].stacks.map(\.id), [stacks[0].id])
     }
@@ -48,7 +48,7 @@ final class OrganizeBoardLayoutTests: XCTestCase {
             OrganizeStack(items: [item("/Card/C0001.ARW", at: date(2026, 8, 26, hour: 14))]),
         ]
 
-        let groups = OrganizeBoardPlan.groups(for: stacks, grouping: .folder, order: .oldestFirst, rootPath: "/Card")
+        let groups = OrganizeBoardPlan.groups(for: stacks, grouping: .folder, sort: .oldestFirst, rootPath: "/Card")
         XCTAssertEqual(groups.map(\.title), ["Card", "Card/DCIM/Transfer 1", "Card/DCIM/Transfer 2"])
         XCTAssertEqual(groups.map(\.id), ["folder|Card", "folder|Card/DCIM/Transfer 1", "folder|Card/DCIM/Transfer 2"])
     }
@@ -61,7 +61,7 @@ final class OrganizeBoardLayoutTests: XCTestCase {
         let video = OrganizeStack(items: [item("/Card/C0001.MP4", kind: .video, at: date(2026, 8, 26))])
         let photo = OrganizeStack(items: [item("/Card/DSC00001.ARW", at: date(2026, 8, 26))])
 
-        let groups = OrganizeBoardPlan.groups(for: [photo, video, burst], grouping: .kind, order: .oldestFirst)
+        let groups = OrganizeBoardPlan.groups(for: [photo, video, burst], grouping: .kind, sort: .oldestFirst)
         XCTAssertEqual(groups.map(\.id), ["kind|burst", "kind|video", "kind|photo"])
         XCTAssertEqual(groups.map(\.title), ["Bursts", "Videos", "Photos"])
         XCTAssertEqual(groups[0].stacks.first?.items.count, 2)
@@ -69,7 +69,7 @@ final class OrganizeBoardLayoutTests: XCTestCase {
 
     func testKindGroupingSkipsEmptyBuckets() {
         let photo = OrganizeStack(items: [item("/Card/DSC00001.ARW", at: date(2026, 8, 26))])
-        let groups = OrganizeBoardPlan.groups(for: [photo], grouping: .kind, order: .oldestFirst)
+        let groups = OrganizeBoardPlan.groups(for: [photo], grouping: .kind, sort: .oldestFirst)
         XCTAssertEqual(groups.map(\.id), ["kind|photo"])
     }
 
@@ -89,7 +89,7 @@ final class OrganizeBoardLayoutTests: XCTestCase {
         let groups = OrganizeBoardPlan.groups(
             for: [beachStack, hikeStack, mixed, unsorted],
             grouping: .event,
-            order: .oldestFirst
+            sort: .oldestFirst
         ) { buckets[$0.id] ?? nil }
 
         XCTAssertEqual(groups.map(\.id), ["event|unsorted", "event|mixed", "event|hike", "event|beach"])
@@ -102,10 +102,53 @@ final class OrganizeBoardLayoutTests: XCTestCase {
             OrganizeStack(items: [item("/Card/DSC00002.ARW", at: date(2026, 8, 26, hour: 15))]),
             OrganizeStack(items: [item("/Card/DSC00001.ARW", at: date(2026, 8, 26, hour: 9))]),
         ]
-        let ascending = OrganizeBoardPlan.groups(for: stacks, grouping: .kind, order: .oldestFirst)
+        let ascending = OrganizeBoardPlan.groups(for: stacks, grouping: .kind, sort: .oldestFirst)
         XCTAssertEqual(ascending.first?.stacks.map(\.id), [stacks[1].id, stacks[0].id])
-        let descending = OrganizeBoardPlan.groups(for: stacks, grouping: .kind, order: .newestFirst)
+        let descending = OrganizeBoardPlan.groups(for: stacks, grouping: .kind, sort: .newestFirst)
         XCTAssertEqual(descending.first?.stacks.map(\.id), [stacks[0].id, stacks[1].id])
+    }
+
+    /// A non-time sort keeps days oldest-first and sorts inside each day;
+    /// the direction only flips the day order for capture time.
+    func testNonTimeSortSortsWithinDaysAndKeepsDaysChronological() {
+        let small = OrganizeStack(items: [item("/Card/DSC00001.ARW", at: date(2026, 8, 26, hour: 9))])
+        let big = OrganizeStack(items: [
+            item("/Card/B0001_DSC00002.ARW", at: date(2026, 8, 26, hour: 10)),
+            item("/Card/B0001_DSC00003.ARW", at: date(2026, 8, 26, hour: 10, minute: 1)),
+            item("/Card/B0001_DSC00004.ARW", at: date(2026, 8, 26, hour: 10, minute: 2)),
+        ])
+        let nextDay = OrganizeStack(items: [item("/Card/DSC00005.ARW", at: date(2026, 8, 27))])
+        let stacks = [small, big, nextDay]
+
+        let bursts = OrganizeBoardPlan.groups(for: stacks, grouping: .day, sort: OrganizeStackSort(key: .burstSize))
+        XCTAssertEqual(bursts.map(\.id), ["day|2026-08-26", "day|2026-08-27"])
+        XCTAssertEqual(bursts[0].stacks.map(\.id), [big.id, small.id])
+
+        let newest = OrganizeBoardPlan.groups(for: stacks, grouping: .day, sort: .newestFirst)
+        XCTAssertEqual(newest.map(\.id), ["day|2026-08-27", "day|2026-08-26"])
+        XCTAssertEqual(newest[1].stacks.map(\.id), [big.id, small.id])
+    }
+
+    /// Group: None is one section, sorted across the whole board — the
+    /// displayed (and keyboard) order is exactly the sort's order.
+    func testUngroupedIsOneSectionInSortOrder() {
+        let small = OrganizeStack(items: [item("/Card/DSC00001.ARW", at: date(2026, 8, 26))])
+        let big = OrganizeStack(items: [
+            item("/Card/B0001_DSC00002.ARW", at: date(2026, 8, 28)),
+            item("/Card/B0001_DSC00003.ARW", at: date(2026, 8, 28, minute: 1)),
+        ])
+        let groups = OrganizeBoardPlan.groups(for: [small, big], grouping: .ungrouped, sort: OrganizeStackSort(key: .burstSize))
+        XCTAssertEqual(groups.map(\.id), ["all"])
+        XCTAssertEqual(groups.flatMap(\.stacks).map(\.id), [big.id, small.id])
+    }
+
+    func testLegacyOrderSeedsTheSortDirection() throws {
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "OrganizeBoardLayoutTests-\(UUID().uuidString)"))
+        XCTAssertTrue(OrganizeBoardSortDefaults.legacyAscending(defaults))
+        defaults.set("newestFirst", forKey: OrganizeBoardSortDefaults.legacyOrderKey)
+        XCTAssertFalse(OrganizeBoardSortDefaults.legacyAscending(defaults))
+        defaults.set("oldestFirst", forKey: OrganizeBoardSortDefaults.legacyOrderKey)
+        XCTAssertTrue(OrganizeBoardSortDefaults.legacyAscending(defaults))
     }
 
     func testGroupSubtitleCountsStacksFramesAndBytes() {
@@ -134,7 +177,7 @@ final class OrganizeBoardLayoutTests: XCTestCase {
             ]),
             OrganizeStack(items: [item("/Card/DSC00003.ARW", at: date(2026, 8, 26, hour: 12))]),
         ]
-        let groups = OrganizeBoardPlan.groups(for: stacks, grouping: .day, order: .oldestFirst)
+        let groups = OrganizeBoardPlan.groups(for: stacks, grouping: .day, sort: .oldestFirst)
         let sections = OrganizeBoardPlan.sections(for: groups, collapsedIDs: [groups[0].id])
 
         let collapsed = sections[0]
@@ -155,7 +198,7 @@ final class OrganizeBoardLayoutTests: XCTestCase {
             OrganizeStack(items: [item("/Card/DSC00001.ARW", at: date(2026, 8, 26))]),
             OrganizeStack(items: [item("/Card/DSC00002.ARW", at: date(2026, 8, 27))]),
         ]
-        let groups = OrganizeBoardPlan.groups(for: stacks, grouping: .day, order: .oldestFirst)
+        let groups = OrganizeBoardPlan.groups(for: stacks, grouping: .day, sort: .oldestFirst)
         let sections = OrganizeBoardPlan.sections(for: groups, collapsedIDs: [groups[0].id])
 
         XCTAssertEqual(sections.map(\.id), groups.map(\.id))
@@ -182,7 +225,7 @@ final class OrganizeBoardLayoutTests: XCTestCase {
             let groups = OrganizeBoardPlan.groups(
                 for: stacks,
                 grouping: grouping,
-                order: .oldestFirst,
+                sort: .oldestFirst,
                 rootPath: "/Card"
             )
             XCTAssertFalse(groups.isEmpty, "\(grouping) dropped every group")
@@ -191,7 +234,7 @@ final class OrganizeBoardLayoutTests: XCTestCase {
                 XCTAssertFalse(group.subtitle.hasPrefix("0 items"), "\(group.id) formats as 0 items")
             }
         }
-        XCTAssertTrue(OrganizeBoardPlan.groups(for: [], grouping: .day, order: .oldestFirst).isEmpty)
+        XCTAssertTrue(OrganizeBoardPlan.groups(for: [], grouping: .day, sort: .oldestFirst).isEmpty)
     }
 
     func testRouteLabelBreadcrumbDropsVolumesPrefix() {

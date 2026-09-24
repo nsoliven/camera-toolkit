@@ -12,7 +12,8 @@ struct EventBoardView: View {
     @AppStorage("CameraToolkit.organize.tileWidth") private var tileWidth: Double = 220
     @AppStorage("CameraToolkit.organize.mode") private var boardMode: OrganizeBoardMode = .tiles
     @AppStorage("CameraToolkit.eventboard.grouping") private var grouping: OrganizeBoardGrouping = .day
-    @AppStorage("CameraToolkit.organize.order") private var sortOrder: OrganizeBoardOrder = .oldestFirst
+    @AppStorage(OrganizeBoardSortDefaults.eventKey) private var sortKey: OrganizeSortKey = .captureTime
+    @AppStorage(OrganizeBoardSortDefaults.eventAscending) private var sortAscending = OrganizeBoardSortDefaults.legacyAscending()
     @State private var previewStackID: String?
     @State private var previewFrameIndex = 0
     @State private var showAllPeople = false
@@ -26,7 +27,7 @@ struct EventBoardView: View {
 
     /// Grouping that makes sense inside one event — every stack belongs to
     /// it, so "by event" would be a single useless section.
-    private static let groupings: [OrganizeBoardGrouping] = [.day, .kind]
+    private static let groupings: [OrganizeBoardGrouping] = [.day, .kind, .ungrouped]
 
     private var effectiveGrouping: OrganizeBoardGrouping {
         Self.groupings.contains(grouping) ? grouping : .day
@@ -37,8 +38,12 @@ struct EventBoardView: View {
             eventID,
             stacks: workspace.visibleEventStacks(eventID, search: workspace.search),
             grouping: effectiveGrouping,
-            order: sortOrder
+            sort: sort
         )
+    }
+
+    private var sort: OrganizeStackSort {
+        OrganizeStackSort(key: sortKey, ascending: sortAscending)
     }
 
     var body: some View {
@@ -79,6 +84,7 @@ struct EventBoardView: View {
                     ViewThatFits(in: .horizontal) {
                         viewControls(stacks: stacks ?? [], groups: groups, matched: matched, compact: false)
                         viewControls(stacks: stacks ?? [], groups: groups, matched: matched, compact: true)
+                        viewControls(stacks: stacks ?? [], groups: groups, matched: matched, compact: true, iconOnlyMenus: true)
                     }
                 }
             }
@@ -175,7 +181,7 @@ struct EventBoardView: View {
         return nil
     }
 
-    private func viewControls(stacks: [OrganizeStack], groups: [OrganizeBoardGroup], matched: Int, compact: Bool) -> some View {
+    private func viewControls(stacks: [OrganizeStack], groups: [OrganizeBoardGroup], matched: Int, compact: Bool, iconOnlyMenus: Bool = false) -> some View {
         BoardViewControls(
             workspace: workspace,
             stacks: stacks,
@@ -185,9 +191,10 @@ struct EventBoardView: View {
             mode: $boardMode,
             grouping: Binding(get: { effectiveGrouping }, set: { grouping = $0 }),
             groupings: Self.groupings,
-            order: $sortOrder,
+            sort: Binding(get: { sort }, set: { sortKey = $0.key; sortAscending = $0.ascending }),
             tileWidth: $tileWidth,
-            compact: compact
+            compact: compact,
+            iconOnlyMenus: iconOnlyMenus
         )
     }
 

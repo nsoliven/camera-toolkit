@@ -12,7 +12,8 @@ struct UnsortedBoardView: View {
     @AppStorage("CameraToolkit.organize.hideSorted") private var hideSorted = false
     @AppStorage("CameraToolkit.organize.mode") private var boardMode: OrganizeBoardMode = .tiles
     @AppStorage("CameraToolkit.organize.grouping") private var grouping: OrganizeBoardGrouping = .day
-    @AppStorage("CameraToolkit.organize.order") private var sortOrder: OrganizeBoardOrder = .oldestFirst
+    @AppStorage(OrganizeBoardSortDefaults.unsortedKey) private var sortKey: OrganizeSortKey = .captureTime
+    @AppStorage(OrganizeBoardSortDefaults.unsortedAscending) private var sortAscending = OrganizeBoardSortDefaults.legacyAscending()
     @State private var previewStackID: String?
     @State private var previewFrameIndex = 0
 
@@ -25,10 +26,14 @@ struct UnsortedBoardView: View {
         return OrganizeBoardPlan.groups(
             for: workspace.visibleStacks(result, hideSorted: hideSorted, search: workspace.search),
             grouping: grouping,
-            order: sortOrder,
+            sort: sort,
             rootPath: result.rootPath,
             eventBucket: { workspace.eventBucket(for: $0) }
         )
+    }
+
+    private var sort: OrganizeStackSort {
+        OrganizeStackSort(key: sortKey, ascending: sortAscending)
     }
 
     /// Stacks in display order — collapsed groups contribute nothing, so
@@ -195,7 +200,9 @@ struct UnsortedBoardView: View {
 
     /// One bottom bar for the sorting workflow: sort-into on the leading
     /// side, view controls in the middle, Undo and Apply trailing. Narrow
-    /// windows fall back to numbered chips, then to a Sort Into menu.
+    /// windows first drop the tile slider and shorten Sort/Group to their
+    /// names, then show them as icons, then shrink the targets to numbered
+    /// keycaps, then fall back to a Sort Into menu.
     private func bottomBar(_ result: OrganizeScanResult, groups: [OrganizeBoardGroup], ordered: [OrganizeStack], matched: Int) -> some View {
         let sorted = workspace.sortedFiles(in: result)
         let targets = workspace.targetStackIDs()
@@ -207,8 +214,10 @@ struct UnsortedBoardView: View {
             ViewThatFits(in: .horizontal) {
                 bottomBarRow(result, groups: groups, orderedIDs: orderedIDs, matched: matched, targets: targets, sorted: sorted, assignStyle: .glass, compactControls: false)
                 bottomBarRow(result, groups: groups, orderedIDs: orderedIDs, matched: matched, targets: targets, sorted: sorted, assignStyle: .glass, compactControls: true)
+                bottomBarRow(result, groups: groups, orderedIDs: orderedIDs, matched: matched, targets: targets, sorted: sorted, assignStyle: .glass, compactControls: true, iconOnlyMenus: true)
                 bottomBarRow(result, groups: groups, orderedIDs: orderedIDs, matched: matched, targets: targets, sorted: sorted, assignStyle: .glassNumbers, compactControls: true)
-                bottomBarRow(result, groups: groups, orderedIDs: orderedIDs, matched: matched, targets: targets, sorted: sorted, assignStyle: .menu, compactControls: true)
+                bottomBarRow(result, groups: groups, orderedIDs: orderedIDs, matched: matched, targets: targets, sorted: sorted, assignStyle: .glassNumbers, compactControls: true, iconOnlyMenus: true)
+                bottomBarRow(result, groups: groups, orderedIDs: orderedIDs, matched: matched, targets: targets, sorted: sorted, assignStyle: .menu, compactControls: true, iconOnlyMenus: true)
             }
         }
     }
@@ -221,7 +230,8 @@ struct UnsortedBoardView: View {
         targets: Set<String>,
         sorted: (files: Int, bytes: Int64),
         assignStyle: EventAssignControls.Style,
-        compactControls: Bool
+        compactControls: Bool,
+        iconOnlyMenus: Bool = false
     ) -> some View {
         HStack(spacing: 10) {
             // Leading: put the selection into an event.
@@ -262,10 +272,11 @@ struct UnsortedBoardView: View {
                 mode: $boardMode,
                 grouping: $grouping,
                 groupings: OrganizeBoardGrouping.allCases,
-                order: $sortOrder,
+                sort: Binding(get: { sort }, set: { sortKey = $0.key; sortAscending = $0.ascending }),
                 tileWidth: $tileWidth,
                 hideSorted: $hideSorted,
-                compact: compactControls
+                compact: compactControls,
+                iconOnlyMenus: iconOnlyMenus
             )
             .fixedSize()
             Spacer(minLength: 0)
