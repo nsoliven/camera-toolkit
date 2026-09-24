@@ -51,13 +51,15 @@ struct BoardToolbarTitle: View {
 /// bars shorten them to "Sort" and "Group", the narrowest to icons (the
 /// current choice stays in the help and VoiceOver label), and move the slider into the Group menu as
 /// Larger/Smaller items.
+///
+/// The filter button only toggles `filterPresented`: boards lay this out
+/// inside a `ViewThatFits`, so the filter popover is attached outside it
+/// with `boardFilterPopover` (see there).
 struct BoardViewControls: View {
     @Bindable var workspace: EventsWorkspace
-    /// The unfiltered board's stacks, for the filter panel's pickers.
-    let stacks: [OrganizeStack]
-    var eventScope: Set<UUID>? = nil
-    /// Stacks the current search keeps, for the filter panel's readout.
-    let matchedCount: Int
+    /// Whether the board's filter popover is open — owned by the board,
+    /// outside the `ViewThatFits` candidates.
+    @Binding var filterPresented: Bool
     /// The board's groups as computed once for this render — Expand or
     /// Collapse All reads them instead of re-planning the board.
     let groups: [OrganizeBoardGroup]
@@ -77,13 +79,7 @@ struct BoardViewControls: View {
 
     var body: some View {
         HStack(spacing: 6) {
-            OrganizeFilterButton(
-                workspace: workspace,
-                stacks: stacks,
-                eventScope: eventScope,
-                search: $workspace.search,
-                matchedCount: matchedCount
-            )
+            OrganizeFilterButton(isPresented: $filterPresented, search: workspace.search)
             Picker("View", selection: $mode) {
                 ForEach(OrganizeBoardMode.allCases) { mode in
                     Label(mode.title, systemImage: mode.symbol).tag(mode)

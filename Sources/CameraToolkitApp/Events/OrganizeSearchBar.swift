@@ -1,7 +1,89 @@
 import CameraToolkitCore
 import SwiftUI
 
-/// The board's filter button and its filter-builder popover. The search
+/// The board's filter button. It only toggles `isPresented` and reports
+/// its bounds; the popover itself is attached once, outside the bottom
+/// bar's `ViewThatFits`, by `boardFilterPopover` — see there for why.
+struct OrganizeFilterButton: View {
+    @Binding var isPresented: Bool
+    let search: OrganizeSearchFilter
+
+    var body: some View {
+        let active = search.activeRowCount
+        Button {
+            isPresented.toggle()
+        } label: {
+            Label(active > 0 ? "Filters On" : "Filter", systemImage: "line.3.horizontal.decrease")
+                .symbolVariant(active > 0 ? .circle.fill : .none)
+                .foregroundStyle(active > 0 ? AnyShapeStyle(.tint) : AnyShapeStyle(.primary))
+        }
+        .help(active > 0
+            ? "\(active) filter\(active == 1 ? "" : "s") on — people, date, event, or media kind"
+            : "Filter by people, date, event, or media kind")
+        .anchorPreference(key: BoardFilterAnchorKey.self, value: .bounds) { $0 }
+    }
+}
+
+/// Where the visible filter button sits, for the one popover presenter.
+/// `ViewThatFits` forwards preferences only from the candidate it picked,
+/// so this is always the button the owner can see.
+struct BoardFilterAnchorKey: PreferenceKey {
+    static let defaultValue: Anchor<CGRect>? = nil
+    static func reduce(value: inout Anchor<CGRect>?, nextValue: () -> Anchor<CGRect>?) {
+        value = value ?? nextValue()
+    }
+}
+
+extension View {
+    /// Presents the filter panel from the filter button inside this view.
+    ///
+    /// Apply it OUTSIDE the bottom bar's `ViewThatFits`, never inside a
+    /// candidate. A popover is a preference, and `ViewThatFits` picks its
+    /// candidate — and so whose preferences it forwards — during layout.
+    /// With the popover inside each candidate (each with its own
+    /// presentation state), a filter edit that nudged the bar across a fit
+    /// threshold swapped candidates mid-layout: the open popover's
+    /// presentation vanished and came back, and every swap made SwiftUI's
+    /// popover bridge re-update the popover and invalidate constraints
+    /// inside the window's layout pass until AppKit threw "more Update
+    /// Constraints in Window passes than there are views" (the 2026-09-24
+    /// crash). Here one stable view owns the presentation; a candidate swap
+    /// only moves the arrow.
+    func boardFilterPopover(
+        isPresented: Binding<Bool>,
+        workspace: EventsWorkspace,
+        stacks: [OrganizeStack],
+        eventScope: Set<UUID>? = nil,
+        search: Binding<OrganizeSearchFilter>,
+        matchedCount: Int? = nil
+    ) -> some View {
+        overlayPreferenceValue(BoardFilterAnchorKey.self) { anchor in
+            GeometryReader { proxy in
+                // Before the first layout reports the button, point at the
+                // bar's top edge rather than not presenting at all.
+                let rect = anchor.map { proxy[$0] }
+                    ?? CGRect(x: proxy.size.width / 2, y: 0, width: 1, height: 1)
+                Color.clear
+                    .allowsHitTesting(false)
+                    .popover(
+                        isPresented: isPresented,
+                        attachmentAnchor: .rect(.rect(rect)),
+                        arrowEdge: .top
+                    ) {
+                        OrganizeFilterPanel(
+                            workspace: workspace,
+                            stacks: stacks,
+                            eventScope: eventScope,
+                            search: search,
+                            matchedCount: matchedCount
+                        )
+                    }
+            }
+        }
+    }
+}
+
+/// The filter-builder panel the filter button opens. The search
 /// text lives in the window's toolbar field; this panel holds condition
 /// rows — People, Date, Event, Media. Every condition added ANDs into the
 /// one group by default; an "or" group is a separate, labelled action.
@@ -13,7 +95,10 @@ import SwiftUI
 /// pickers default to the board's own day range, and on an event board the
 /// Event picker narrows to the board's family — the event plus its
 /// subevents — since picks outside it cannot match there.
-struct OrganizeFilterButton: View {
+///
+/// The panel has a fixed width and scrolls past a fixed maximum height, so
+/// adding rows never makes its ideal size depend on the board's layout.
+struct OrganizeFilterPanel: View {
     let workspace: EventsWorkspace
     /// The unfiltered board's stacks — the People picker's options and the
     /// date picker's fallback bounds come from these.
@@ -25,8 +110,6 @@ struct OrganizeFilterButton: View {
     @Binding var search: OrganizeSearchFilter
     /// Stacks the current search keeps — the footer's "N of M" readout.
     var matchedCount: Int? = nil
-
-    @State private var showFilters = false
 
     /// The properties a new or edited row can point at, in menu order.
     private var properties: [OrganizeFilterRow.Property] {
@@ -47,20 +130,7 @@ struct OrganizeFilterButton: View {
     }
 
     var body: some View {
-        let active = search.activeRowCount
-        Button {
-            showFilters.toggle()
-        } label: {
-            Label(active > 0 ? "Filters On" : "Filter", systemImage: "line.3.horizontal.decrease")
-                .symbolVariant(active > 0 ? .circle.fill : .none)
-                .foregroundStyle(active > 0 ? AnyShapeStyle(.tint) : AnyShapeStyle(.primary))
-        }
-        .help(active > 0
-            ? "\(active) filter\(active == 1 ? "" : "s") on — people, date, event, or media kind"
-            : "Filter by people, date, event, or media kind")
-        .popover(isPresented: $showFilters, arrowEdge: .top) {
-            filterPanel
-        }
+        filterPanel
     }
 
     // MARK: - Filter panel
@@ -610,7 +680,7 @@ struct OrganizeFilterHotLinks: View {
     /// The Media row's picks as "Stills, RAW" — the picker's titles, with
     /// "Other" for a kind the picker does not offer.
     private func mediaLabel(for row: OrganizeFilterRow) -> String {
-        var titles = OrganizeFilterButton.mediaOptions
+        var titles = OrganizeFilterPanel.mediaOptions
             .filter { row.mediaKinds.contains($0.kind) }
             .map(\.title)
         if row.mediaKinds.contains(.other) { titles.append("Other") }

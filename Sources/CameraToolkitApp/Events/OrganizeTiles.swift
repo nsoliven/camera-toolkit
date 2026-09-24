@@ -1386,6 +1386,8 @@ struct StackPreviewOverlay: View {
     /// canvas — face boxes align to it.
     @State private var canvasImageFrame: CGRect = .zero
     @State private var tagRequest: FaceTagRequest?
+    /// The header's Event… picker, owned outside its `ViewThatFits`.
+    @State private var showEventPicker = false
     @FocusState private var isFocused: Bool
 
     private var stackIndex: Int? { stacks.firstIndex { $0.id == stackID } }
@@ -1529,6 +1531,16 @@ struct StackPreviewOverlay: View {
                 }
             }
         }
+        // Outside the `ViewThatFits`: a sheet inside a candidate only
+        // exists while layout keeps picking that candidate.
+        .eventPickerSheet(
+            isPresented: $showEventPicker,
+            workspace: workspace,
+            verb: assignVerb,
+            excludedEventID: excludedEventID,
+            onPick: { assign(stack, to: $0) },
+            onNewEvent: { onNewEvent(stack) }
+        )
     }
 
     private func headerTitle(stack: OrganizeStack, item: OrganizeItem) -> some View {
@@ -1572,6 +1584,7 @@ struct StackPreviewOverlay: View {
                 verb: assignVerb,
                 excludedEventID: excludedEventID,
                 currentEventID: currentEventID(for: stack),
+                pickerPresented: $showEventPicker,
                 onAssign: { assign(stack, to: $0) },
                 onNewEvent: { onNewEvent(stack) }
             )

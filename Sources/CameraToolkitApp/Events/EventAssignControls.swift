@@ -40,10 +40,21 @@ struct EventAssignControls: View {
     /// event rows deactivate, while "New Event…" stays reachable.
     var canAssign = true
     var style: Style = .chips
+    /// The picker sheet's presentation, owned by the caller. Pass it when
+    /// this control sits inside a `ViewThatFits` candidate and attach
+    /// `eventPickerSheet` outside the `ViewThatFits`: a presentation inside
+    /// a candidate only exists while layout keeps picking that candidate,
+    /// so a width change mid-flow would drop or re-present the sheet (the
+    /// filter popover crashed this way). Nil keeps the sheet on the control.
+    var pickerPresented: Binding<Bool>? = nil
     let onAssign: (SavedCameraEvent) -> Void
     let onNewEvent: () -> Void
 
-    @State private var isPickerPresented = false
+    @State private var ownPickerPresented = false
+
+    private var isPickerPresented: Binding<Bool> {
+        pickerPresented ?? $ownPickerPresented
+    }
 
     var body: some View {
         let recents = Array(workspace.assignableRecents(excluding: excludedEventID).enumerated())
@@ -62,7 +73,7 @@ struct EventAssignControls: View {
                         quickAssignButton(event, index: index, showsName: true)
                     }
                     Button {
-                        isPickerPresented = true
+                        isPickerPresented.wrappedValue = true
                     } label: {
                         Label("Event…", systemImage: "calendar")
                     }
@@ -80,7 +91,7 @@ struct EventAssignControls: View {
                         quickAssignButton(event, index: index, showsName: style == .glass)
                     }
                     Button {
-                        isPickerPresented = true
+                        isPickerPresented.wrappedValue = true
                     } label: {
                         Label("Event…", systemImage: "calendar")
                     }
@@ -108,7 +119,7 @@ struct EventAssignControls: View {
                     if !recents.isEmpty {
                         Divider()
                     }
-                    Button("Choose Event…") { isPickerPresented = true }
+                    Button("Choose Event…") { isPickerPresented.wrappedValue = true }
                     Button("New Event…") { onNewEvent() }
                 } label: {
                     Label(verb.capitalizedFirstWord, systemImage: "tray.and.arrow.down")
@@ -119,16 +130,16 @@ struct EventAssignControls: View {
                 .help("\(verb) a recent event (1–3), or pick any event")
             }
         }
-        .sheet(isPresented: $isPickerPresented) {
-            EventPickerSheet(
-                workspace: workspace,
-                verb: verb,
-                excludedEventID: excludedEventID,
-                canAssign: canAssign,
-                onPick: onAssign,
-                onNewEvent: onNewEvent
-            )
-        }
+        .modifier(OwnPickerSheet(
+            isEnabled: pickerPresented == nil,
+            isPresented: $ownPickerPresented,
+            workspace: workspace,
+            verb: verb,
+            excludedEventID: excludedEventID,
+            canAssign: canAssign,
+            onPick: onAssign,
+            onNewEvent: onNewEvent
+        ))
     }
 
     /// One recent target as a button: keycap, colour dot (a checkmark when
@@ -439,5 +450,59 @@ private struct EventPickerRow: View {
         .disabled(!isEnabled)
         .opacity(isEnabled ? 1 : 0.45)
         .onHover { isHovered = $0 }
+    }
+}
+
+/// The control's own picker sheet, attached only when the caller did not
+/// take the presentation over with `pickerPresented`.
+private struct OwnPickerSheet: ViewModifier {
+    let isEnabled: Bool
+    @Binding var isPresented: Bool
+    let workspace: EventsWorkspace
+    let verb: String
+    let excludedEventID: UUID?
+    let canAssign: Bool
+    let onPick: (SavedCameraEvent) -> Void
+    let onNewEvent: () -> Void
+
+    func body(content: Content) -> some View {
+        if isEnabled {
+            content.eventPickerSheet(
+                isPresented: $isPresented,
+                workspace: workspace,
+                verb: verb,
+                excludedEventID: excludedEventID,
+                canAssign: canAssign,
+                onPick: onPick,
+                onNewEvent: onNewEvent
+            )
+        } else {
+            content
+        }
+    }
+}
+
+extension View {
+    /// `EventAssignControls`' event picker, for a caller that owns the
+    /// presentation (see `EventAssignControls.pickerPresented`).
+    func eventPickerSheet(
+        isPresented: Binding<Bool>,
+        workspace: EventsWorkspace,
+        verb: String,
+        excludedEventID: UUID? = nil,
+        canAssign: Bool = true,
+        onPick: @escaping (SavedCameraEvent) -> Void,
+        onNewEvent: @escaping () -> Void
+    ) -> some View {
+        sheet(isPresented: isPresented) {
+            EventPickerSheet(
+                workspace: workspace,
+                verb: verb,
+                excludedEventID: excludedEventID,
+                canAssign: canAssign,
+                onPick: onPick,
+                onNewEvent: onNewEvent
+            )
+        }
     }
 }

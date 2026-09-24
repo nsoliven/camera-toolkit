@@ -17,6 +17,9 @@ struct EventBoardView: View {
     @State private var previewStackID: String?
     @State private var previewFrameIndex = 0
     @State private var showAllPeople = false
+    /// The filter popover — owned here, outside the bottom bar's
+    /// `ViewThatFits`, so a candidate swap cannot re-present it mid-layout.
+    @State private var showFilters = false
     /// Shared with the View menu's Show Inspector item (⌥⌘I); the
     /// inspector itself hangs off the split view in EventsRootView.
     @AppStorage(EventInfoInspector.visibilityDefaultsKey) private var showInspector = false
@@ -82,10 +85,18 @@ struct EventBoardView: View {
             .safeAreaBar(edge: .bottom) {
                 BoardBottomBar(model: model, workspace: workspace, loadingNote: loadingNote) {
                     ViewThatFits(in: .horizontal) {
-                        viewControls(stacks: stacks ?? [], groups: groups, matched: matched, compact: false)
-                        viewControls(stacks: stacks ?? [], groups: groups, matched: matched, compact: true)
-                        viewControls(stacks: stacks ?? [], groups: groups, matched: matched, compact: true, iconOnlyMenus: true)
+                        viewControls(groups: groups, compact: false)
+                        viewControls(groups: groups, compact: true)
+                        viewControls(groups: groups, compact: true, iconOnlyMenus: true)
                     }
+                    .boardFilterPopover(
+                        isPresented: $showFilters,
+                        workspace: workspace,
+                        stacks: stacks ?? [],
+                        eventScope: workspace.scopeIDs(eventID),
+                        search: $workspace.search,
+                        matchedCount: matched
+                    )
                 }
             }
             .overlay {
@@ -181,12 +192,10 @@ struct EventBoardView: View {
         return nil
     }
 
-    private func viewControls(stacks: [OrganizeStack], groups: [OrganizeBoardGroup], matched: Int, compact: Bool, iconOnlyMenus: Bool = false) -> some View {
+    private func viewControls(groups: [OrganizeBoardGroup], compact: Bool, iconOnlyMenus: Bool = false) -> some View {
         BoardViewControls(
             workspace: workspace,
-            stacks: stacks,
-            eventScope: workspace.scopeIDs(eventID),
-            matchedCount: matched,
+            filterPresented: $showFilters,
             groups: groups,
             mode: $boardMode,
             grouping: Binding(get: { effectiveGrouping }, set: { grouping = $0 }),

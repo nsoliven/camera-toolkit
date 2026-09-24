@@ -16,6 +16,12 @@ struct UnsortedBoardView: View {
     @AppStorage(OrganizeBoardSortDefaults.unsortedAscending) private var sortAscending = OrganizeBoardSortDefaults.legacyAscending()
     @State private var previewStackID: String?
     @State private var previewFrameIndex = 0
+    /// The filter popover — owned here, outside the bottom bar's
+    /// `ViewThatFits`, so a candidate swap cannot re-present it mid-layout.
+    @State private var showFilters = false
+    /// The Event… picker sheet — outside the `ViewThatFits` for the same
+    /// reason as `showFilters`.
+    @State private var showEventPicker = false
 
     private var state: UnsortedSourceState {
         workspace.sources[location.id] ?? UnsortedSourceState()
@@ -219,6 +225,21 @@ struct UnsortedBoardView: View {
                 bottomBarRow(result, groups: groups, orderedIDs: orderedIDs, matched: matched, targets: targets, sorted: sorted, assignStyle: .glassNumbers, compactControls: true, iconOnlyMenus: true)
                 bottomBarRow(result, groups: groups, orderedIDs: orderedIDs, matched: matched, targets: targets, sorted: sorted, assignStyle: .menu, compactControls: true, iconOnlyMenus: true)
             }
+            .boardFilterPopover(
+                isPresented: $showFilters,
+                workspace: workspace,
+                stacks: result.stacks,
+                search: $workspace.search,
+                matchedCount: matched
+            )
+            .eventPickerSheet(
+                isPresented: $showEventPicker,
+                workspace: workspace,
+                verb: "Sort into",
+                canAssign: !targets.isEmpty,
+                onPick: { workspace.assign(stackIDs: targets, from: location.id, to: $0.id, orderedIDs: orderedIDs) },
+                onNewEvent: { workspace.requestNewEvent(from: location.id) }
+            )
         }
     }
 
@@ -248,6 +269,7 @@ struct UnsortedBoardView: View {
                     verb: "Sort into",
                     canAssign: !targets.isEmpty,
                     style: assignStyle,
+                    pickerPresented: $showEventPicker,
                     onAssign: { workspace.assign(stackIDs: targets, from: location.id, to: $0.id, orderedIDs: orderedIDs) },
                     onNewEvent: { workspace.requestNewEvent(from: location.id) }
                 )
@@ -266,8 +288,7 @@ struct UnsortedBoardView: View {
             Spacer(minLength: 0)
             BoardViewControls(
                 workspace: workspace,
-                stacks: result.stacks,
-                matchedCount: matched,
+                filterPresented: $showFilters,
                 groups: groups,
                 mode: $boardMode,
                 grouping: $grouping,
