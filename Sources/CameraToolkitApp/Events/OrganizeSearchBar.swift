@@ -77,6 +77,9 @@ struct OrganizeFilterButton: View {
                             orSeparator
                         }
                         ForEach($group.rows) { $row in
+                            if row.id != group.rows.first?.id {
+                                andConnector
+                            }
                             conditionRow(row: $row) {
                                 group.rows.removeAll { $0.id == row.id }
                                 // An "or" group exists to OR against —
@@ -89,9 +92,13 @@ struct OrganizeFilterButton: View {
                         // Once there is an "or", each group adds to itself;
                         // with one group the footer button below does.
                         if search.groups.count > 1 {
-                            addConditionButton("Add a condition to this group — every condition in it must match") {
+                            Button {
                                 group.rows.append(OrganizeFilterRow(property: .people))
+                            } label: {
+                                Label("And…", systemImage: "plus")
                             }
+                            .controlSize(.small)
+                            .help("Add a condition to this group — every condition in it must match")
                         }
                     }
                     HStack(spacing: 8) {
@@ -173,15 +180,27 @@ struct OrganizeFilterButton: View {
         .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 
-    /// The "or" line between groups — rows above and below it OR.
+    /// The word between two rows of one group — both must match.
+    private var andConnector: some View {
+        Text("and")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .padding(.leading, 8)
+    }
+
+    /// The labelled break between groups — photos matching the group
+    /// above or the one below stay, so it reads as a deliberate choice
+    /// rather than a thin divider.
     private var orSeparator: some View {
         HStack(spacing: 8) {
-            Rectangle().fill(Color.secondary.opacity(0.25)).frame(height: 1)
-            Text("or")
-                .font(.caption.weight(.semibold))
+            Rectangle().fill(Color.secondary.opacity(0.35)).frame(height: 1).frame(maxWidth: 16)
+            Text("\(Text("OR").fontWeight(.bold)) — or match this group instead")
+                .font(.caption)
                 .foregroundStyle(.secondary)
-            Rectangle().fill(Color.secondary.opacity(0.25)).frame(height: 1)
+                .fixedSize()
+            Rectangle().fill(Color.secondary.opacity(0.35)).frame(height: 1)
         }
+        .padding(.vertical, 4)
     }
 
     private func addConditionButton(_ help: String, action: @escaping () -> Void) -> some View {
