@@ -233,54 +233,65 @@ private struct EventNameField: NSViewRepresentable {
     }
 }
 
+/// The Apply confirmation as a before → after picture: a plain-language
+/// sentence, then From (source folders) → labelled arrows → To (event
+/// folders), a few safety lines, and the full table and per-folder file
+/// lists under a collapsed Details disclosure. Purely presentational —
+/// Apply runs exactly the plan it was handed.
 struct ApplyPlanSheet: View {
     let plan: OrganizeApplyPlan
     let onCancel: () -> Void
     let onApply: () -> Void
 
+    /// Built once per sheet from the plan (string work only, no disk).
+    private let overview: ApplyPlanOverview
+    @State private var showDetails = false
+
+    init(plan: OrganizeApplyPlan, onCancel: @escaping () -> Void, onApply: @escaping () -> Void) {
+        self.plan = plan
+        self.onCancel = onCancel
+        self.onApply = onApply
+        overview = ApplyPlanOverview(plan: plan)
+    }
+
     var body: some View {
-        SheetScaffold(title: plan.title, subtitle: summary, width: 680, height: 580) {
-            ApplyPlanSummaryCard(plan: plan)
-            Text("Where each folder lands")
-                .font(.headline)
+        SheetScaffold(title: plan.title, subtitle: overview.sentence, width: 680, height: 600) {
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 10) {
-                    ForEach(plan.groups) { group in
-                        ApplyEventGroupCard(group: group)
+                VStack(alignment: .leading, spacing: 16) {
+                    ApplyPlanFlowView(overview: overview)
+                    DisclosureGroup(isExpanded: $showDetails) {
+                        VStack(alignment: .leading, spacing: 10) {
+                            ApplyPlanSummaryCard(plan: plan)
+                            Text("Where each folder lands")
+                                .font(.headline)
+                                .padding(.top, 4)
+                            ForEach(plan.groups) { group in
+                                ApplyEventGroupCard(group: group)
+                            }
+                        }
+                        .padding(.top, 8)
+                    } label: {
+                        Text("Details")
+                            .font(.headline)
                     }
                 }
+                .padding(.trailing, 8)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .scrollIndicators(.visible)
-            .frame(minHeight: 120)
-            Label(
-                "Moves on the same drive are instant renames. Copies from another drive are checksum-verified and leave the originals in place. Nothing is overwritten, and Undo can move files back.",
-                systemImage: "checkmark.shield"
-            )
-            .font(.callout)
-            .foregroundStyle(.secondary)
-            .fixedSize(horizontal: false, vertical: true)
+            .scrollIndicators(.automatic)
+            .frame(maxHeight: .infinity)
+            Divider()
+            ApplySafetyFactsView(facts: overview.safetyFacts)
         } actions: {
             Button("Cancel", action: onCancel)
                 .keyboardShortcut(.cancelAction)
             // Non-destructive (nothing is overwritten, Undo moves files
             // back), so Return confirms; the default-button fill is the
             // system's, not an explicit prominent style.
-            Button("Apply", action: onApply)
+            Button(overview.primaryActionTitle, action: onApply)
                 .keyboardShortcut(.defaultAction)
                 .disabled(plan.isEmpty)
         }
-    }
-
-    private var summary: String {
-        var parts: [String] = []
-        if plan.moveCount > 0 {
-            parts.append("\(plan.moveCount) instant move\(plan.moveCount == 1 ? "" : "s")")
-        }
-        if plan.copyCount > 0 {
-            parts.append("\(plan.copyCount) verified cop\(plan.copyCount == 1 ? "y" : "ies")")
-        }
-        let events = plan.groups.count { !$0.moves.isEmpty || !$0.copies.isEmpty }
-        return parts.joined(separator: " and ") + " · \(plan.byteCount.formattedBytes) into \(events) event\(events == 1 ? "" : "s")"
     }
 }
 
