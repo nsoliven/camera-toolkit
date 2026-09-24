@@ -53,7 +53,9 @@ struct LazyContextMenu<Content: View>: View {
     var body: some View { content() }
 }
 
-/// An event's name capsule. `.filled` is the event's own color with text
+/// An event's name capsule — the mark for "this item is in this event",
+/// never an action (quick-assign targets are `QuickAssignLabel` buttons).
+/// `.filled` is the event's own color with text
 /// picked for contrast; `.onPhoto` is a flat dark scrim with a color dot,
 /// legible over any photo and quiet across hundreds of tiles.
 struct EventChip: View {
@@ -63,7 +65,6 @@ struct EventChip: View {
     }
 
     let event: SavedCameraEvent
-    var number: Int?
     /// Resolved private flag. Pass it when the event's own `storagePolicy`
     /// can be nil — a subevent inherits the lock from a private parent.
     var isPrivate: Bool?
@@ -77,12 +78,6 @@ struct EventChip: View {
                 Circle()
                     .fill(color)
                     .frame(width: 7, height: 7)
-            }
-            if let number {
-                Text("\(number)")
-                    .font(.caption2.weight(.bold).monospacedDigit())
-                    .padding(.horizontal, 4)
-                    .background(text.opacity(0.22), in: RoundedRectangle(cornerRadius: 3))
             }
             if isPrivate ?? (event.resolvedStoragePolicy == .archiveOnly) {
                 Image(systemName: "lock.fill")
@@ -1560,8 +1555,12 @@ struct StackPreviewOverlay: View {
                     .lineLimit(2)
             }
             .layoutPriority(1)
+            // The filled capsule is the one "this item is in" mark; the
+            // quick-assign buttons beside it are glass buttons, never chips.
             if let event = eventForStack(stack) {
                 EventChip(event: event, isPrivate: workspace.resolvedPolicy(for: event) == .archiveOnly)
+                    .help("In \(workspace.eventTitle(event))")
+                    .accessibilityLabel("In \(workspace.eventTitle(event))")
             }
         }
     }
@@ -1572,6 +1571,7 @@ struct StackPreviewOverlay: View {
                 workspace: workspace,
                 verb: assignVerb,
                 excludedEventID: excludedEventID,
+                currentEventID: currentEventID(for: stack),
                 onAssign: { assign(stack, to: $0) },
                 onNewEvent: { onNewEvent(stack) }
             )
@@ -1631,6 +1631,14 @@ struct StackPreviewOverlay: View {
             .controlSize(.large)
             .environment(\.colorScheme, .dark)
         }
+    }
+
+    /// The event every frame of the stack is already in, if there is one —
+    /// its quick-assign button shows as current. A partly sorted stack has
+    /// none, so its buttons can still finish the job.
+    private func currentEventID(for stack: OrganizeStack) -> UUID? {
+        let assigned = workspace.assignedEvent(for: stack)
+        return assigned.mixed ? nil : assigned.event?.id
     }
 
     private func headerCaption(stack: OrganizeStack, item: OrganizeItem) -> String {

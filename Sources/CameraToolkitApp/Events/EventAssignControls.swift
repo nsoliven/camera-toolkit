@@ -9,10 +9,14 @@ import SwiftUI
 /// strip and flat "All Events" menu, which did not scale past a handful
 /// of events.
 struct EventAssignControls: View {
-    /// How the targets draw. `.chips` is the palette capsules the preview
-    /// overlay uses; the glass styles are for the board's bottom bar —
-    /// `.glass` with names, `.glassNumbers` as numbered dots for narrow
-    /// windows, `.menu` as one "Sort Into" menu for the narrowest.
+    /// How the targets draw. `.chips` is the preview overlay's row of
+    /// glass buttons behind a "Move to:" caption; the glass styles are for
+    /// the board's bottom bar — `.glass` with names, `.glassNumbers` as
+    /// numbered keycaps for narrow windows, `.menu` as one "Sort Into"
+    /// menu for the narrowest. Every style is drawn as a button (glass,
+    /// a keycap for the shortcut, a small colour dot for the event) and
+    /// never as the filled event-colour capsule — that capsule is
+    /// `EventChip`, which only ever means "this photo is in this event".
     enum Style {
         case chips
         case glass
@@ -27,6 +31,10 @@ struct EventAssignControls: View {
     /// A target that can't be picked — the board's own event when moving
     /// stacks between events. Dropped from the chips and the picker alike.
     var excludedEventID: UUID? = nil
+    /// The event the previewed stack is already wholly in. Its recent
+    /// button reads as current — a checkmark, disabled — instead of as one
+    /// more place to move it.
+    var currentEventID: UUID? = nil
     /// False when there is nothing to assign: chips dim and the picker's
     /// event rows deactivate, while "New Event…" stays reachable.
     var canAssign = true
@@ -42,49 +50,33 @@ struct EventAssignControls: View {
             switch style {
             case .chips:
                 HStack(spacing: 8) {
+                    if !recents.isEmpty {
+                        Text("\(verb.capitalizedFirstLetter):")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .fixedSize()
+                            .accessibilityHidden(true)
+                    }
                     ForEach(recents, id: \.element.id) { index, event in
-                        Button {
-                            onAssign(event)
-                        } label: {
-                            EventChip(
-                                event: event,
-                                number: index + 1,
-                                isPrivate: workspace.resolvedPolicy(for: event) == .archiveOnly
-                            )
-                        }
-                        .buttonStyle(.plain)
-                        .disabled(!canAssign)
-                        .opacity(canAssign ? 1 : 0.5)
-                        .help(help(for: event, index: index))
+                        quickAssignButton(event, index: index, showsName: true)
                     }
                     Button {
                         isPickerPresented = true
                     } label: {
                         Label("Event…", systemImage: "calendar")
                     }
-                    // Glass reads on the preview's black backdrop in both
-                    // appearances; a bordered button vanished in light mode.
-                    .buttonStyle(.glass)
                     .help("Search every event by name, or create a new one")
+                    .accessibilityLabel("\(verb.capitalizedFirstLetter) another event…")
                 }
+                // Glass reads on the preview's black backdrop in both
+                // appearances; a bordered button vanished in light mode.
+                // The overlay is always dark, so its buttons are too.
+                .buttonStyle(.glass)
+                .environment(\.colorScheme, .dark)
             case .glass, .glassNumbers:
                 HStack(spacing: 6) {
                     ForEach(recents, id: \.element.id) { index, event in
-                        Button {
-                            onAssign(event)
-                        } label: {
-                            Label {
-                                Text(event.name)
-                                    .lineLimit(1)
-                            } icon: {
-                                Image(systemName: "\(index + 1).circle.fill")
-                                    .foregroundStyle(EventPalette.color(for: event.id))
-                            }
-                        }
-                        .labelStyle(style == .glassNumbers ? AnyLabelStyle(.iconOnly) : AnyLabelStyle(.titleAndIcon))
-                        .buttonStyle(.glass)
-                        .disabled(!canAssign)
-                        .help(help(for: event, index: index))
+                        quickAssignButton(event, index: index, showsName: style == .glass)
                     }
                     Button {
                         isPickerPresented = true
@@ -92,14 +84,25 @@ struct EventAssignControls: View {
                         Label("Event…", systemImage: "calendar")
                     }
                     .labelStyle(style == .glassNumbers ? AnyLabelStyle(.iconOnly) : AnyLabelStyle(.titleAndIcon))
-                    .buttonStyle(.glass)
                     .help("Search every event by name, or create a new one")
+                    .accessibilityLabel("\(verb.capitalizedFirstLetter) another event…")
                 }
+                .buttonStyle(.glass)
             case .menu:
                 Menu {
                     ForEach(recents, id: \.element.id) { index, event in
-                        Button("\(index + 1)  \(workspace.eventTitle(event))") { onAssign(event) }
-                            .disabled(!canAssign)
+                        let isCurrent = event.id == currentEventID
+                        Button {
+                            onAssign(event)
+                        } label: {
+                            if isCurrent {
+                                Label("\(index + 1)  \(workspace.eventTitle(event))", systemImage: "checkmark")
+                            } else {
+                                Text("\(index + 1)  \(workspace.eventTitle(event))")
+                            }
+                        }
+                        .disabled(!canAssign || isCurrent)
+                        .accessibilityLabel(accessibilityLabel(for: event, isCurrent: isCurrent))
                     }
                     if !recents.isEmpty {
                         Divider()
@@ -127,8 +130,99 @@ struct EventAssignControls: View {
         }
     }
 
-    private func help(for event: SavedCameraEvent, index: Int) -> String {
-        "\(verb) \(workspace.eventTitle(event)) (press \(index + 1))"
+    /// One recent target as a button: keycap, colour dot (a checkmark when
+    /// the photo is already there), lock for private, then the name.
+    private func quickAssignButton(_ event: SavedCameraEvent, index: Int, showsName: Bool) -> some View {
+        let isCurrent = event.id == currentEventID
+        return Button {
+            onAssign(event)
+        } label: {
+            QuickAssignLabel(
+                number: index + 1,
+                name: event.name,
+                color: EventPalette.color(for: event.id),
+                isPrivate: workspace.resolvedPolicy(for: event) == .archiveOnly,
+                isCurrent: isCurrent,
+                showsName: showsName
+            )
+        }
+        .disabled(!canAssign || isCurrent)
+        .help(help(for: event, index: index, isCurrent: isCurrent))
+        .accessibilityLabel(accessibilityLabel(for: event, isCurrent: isCurrent))
+        .accessibilityHint(isCurrent ? "" : "Shortcut: \(index + 1)")
+    }
+
+    private func help(for event: SavedCameraEvent, index: Int, isCurrent: Bool) -> String {
+        let title = workspace.eventTitle(event)
+        if isCurrent {
+            return "Already in \(title)"
+        }
+        return "\(verb.capitalizedFirstLetter) \(title) (\(index + 1))"
+    }
+
+    private func accessibilityLabel(for event: SavedCameraEvent, isCurrent: Bool) -> String {
+        let title = workspace.eventTitle(event)
+        let privacy = workspace.resolvedPolicy(for: event) == .archiveOnly ? ", private" : ""
+        return isCurrent ? "Already in \(title)\(privacy)" : "\(verb.capitalizedFirstLetter) \(title)\(privacy)"
+    }
+}
+
+/// A quick-assign button's content: the digit as a keycap-style shortcut
+/// hint, the event's colour as a small dot (a checkmark when the photo is
+/// already there), a lock for private events, and the name. Text stays in
+/// the button's own foreground colour — the event colour is only the dot —
+/// so it never reads as the filled assignment badge.
+struct QuickAssignLabel: View {
+    let number: Int
+    let name: String
+    let color: Color
+    var isPrivate = false
+    var isCurrent = false
+    var showsName = true
+
+    var body: some View {
+        HStack(spacing: 6) {
+            ShortcutKeycap(text: "\(number)")
+            if isCurrent {
+                Image(systemName: "checkmark")
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(color)
+            } else {
+                // A symbol with an explicit style, like the bar's old
+                // numbered dot, so the glass button keeps the event colour.
+                Image(systemName: "circle.fill")
+                    .font(.system(size: 8))
+                    .foregroundStyle(color)
+            }
+            if showsName {
+                if isPrivate {
+                    Image(systemName: "lock.fill")
+                        .imageScale(.small)
+                        .foregroundStyle(.secondary)
+                }
+                Text(name)
+                    .lineLimit(1)
+            }
+        }
+    }
+}
+
+/// A key drawn as a small outlined keycap — the shortcut hint on a button.
+struct ShortcutKeycap: View {
+    let text: String
+
+    var body: some View {
+        Text(text)
+            .font(.caption.weight(.semibold).monospacedDigit())
+            .foregroundStyle(.secondary)
+            .frame(minWidth: 11)
+            .padding(.horizontal, 4)
+            .padding(.vertical, 1)
+            .overlay {
+                RoundedRectangle(cornerRadius: 4, style: .continuous)
+                    .strokeBorder(.secondary.opacity(0.7), lineWidth: 1)
+            }
+            .accessibilityHidden(true)
     }
 }
 
@@ -149,6 +243,11 @@ private extension String {
     /// "sort into" → "Sort Into"-style title case for a menu label.
     var capitalizedFirstWord: String {
         split(separator: " ").map { $0.prefix(1).uppercased() + $0.dropFirst() }.joined(separator: " ")
+    }
+
+    /// "sort into" → "Sort into", for sentence-style help and VoiceOver.
+    var capitalizedFirstLetter: String {
+        prefix(1).uppercased() + dropFirst()
     }
 }
 
