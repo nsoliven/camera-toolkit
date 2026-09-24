@@ -10,6 +10,7 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate, NSMenuIte
     private let model = CameraToolkitRuntime.model
 
     static func main() {
+        CrashReporting.start()
         UserDefaults.standard.set(false, forKey: "NSQuitAlwaysKeepsWindows")
         let application = NSApplication.shared
         let delegate = CameraToolkitApplication()
@@ -31,6 +32,7 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate, NSMenuIte
         if model.transferQueue != nil || !model.pendingTransferBatches.isEmpty {
             TransferQueueWindowController.shared.show(model: model)
         }
+        CrashReporting.checkPreviousRunSoon()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -39,6 +41,7 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate, NSMenuIte
         // Fold the catalog's WAL back into the main file so the database
         // on disk is complete on its own after quit.
         CatalogDatabase.checkpointAndCloseAll()
+        CrashReporting.markCleanExit()
     }
 
     /// A file job keeps its progress in memory — quitting mid-copy or
