@@ -9,17 +9,27 @@ enum ApplyRouteMethod: Equatable, Sendable {
     /// Cross drive: a checksum-verified copy that leaves the original.
     case verifiedCopy
 
+    /// "Move", not "Rename": the owner read "Rename" as a button that
+    /// renames the folder. On disk it is still an exclusive rename.
     var label: String {
         switch self {
-        case .rename: "Rename"
-        case .verifiedCopy: "Verified copy"
+        case .rename: "Move"
+        case .verifiedCopy: "Copy + verify"
+        }
+    }
+
+    /// The short "why" under the flow arrow.
+    var shortDetail: String {
+        switch self {
+        case .rename: "instant · same drive"
+        case .verifiedCopy: "other drive · originals kept"
         }
     }
 
     var detail: String {
         switch self {
-        case .rename: "same drive — instant, nothing is overwritten"
-        case .verifiedCopy: "checksum-verified — the originals stay put"
+        case .rename: "Same drive: the files are renamed into the event folder. Instant, no bytes are copied, and nothing is overwritten."
+        case .verifiedCopy: "Another drive: the files are copied, checksum-verified, and the originals stay where they are."
         }
     }
 
@@ -221,7 +231,7 @@ enum ApplyRouteDiagram {
     }
 }
 
-/// A method pill: "Rename" or "Verified copy", with the safety story on
+/// A method pill: "Move" or "Copy + verify", with the safety story on
 /// hover and underneath.
 private struct ApplyMethodBadge: View {
     let method: ApplyRouteMethod
