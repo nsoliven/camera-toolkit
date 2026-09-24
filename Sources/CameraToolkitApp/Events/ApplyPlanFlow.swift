@@ -1,50 +1,87 @@
 import CameraToolkitCore
 import SwiftUI
 
-/// The apply sheet's before → after picture: the source folders on the
-/// left, one labelled arrow per destination (Move or Copy + verify), and
-/// one card per event folder on the right. Everything comes from
-/// `ApplyPlanOverview`, so nothing here touches the filesystem.
+/// The apply sheet's before → after picture, drawn as the plan's real
+/// routes: one lane per event, with every source folder that feeds it on
+/// the left (each with its share of files and its own Move or Copy +
+/// verify arrow) and the event card on the right. A folder split across
+/// events appears in each lane with its partial count and a "→ 2 events"
+/// hint, so rows never read as one folder → one event. Everything comes
+/// from `ApplyPlanOverview`, so nothing here touches the filesystem.
 struct ApplyPlanFlowView: View {
     let overview: ApplyPlanOverview
 
-    /// Sources past this collapse into a "+N more" line; the full list
-    /// stays in Details.
-    private static let visibleSources = 4
-    private static let sourceWidth: CGFloat = 176
-    private static let arrowWidth: CGFloat = 100
+    /// Routes past this per lane collapse into one summed row; the full
+    /// list stays in Details.
+    private static let visibleRoutesPerEvent = 5
+    private static let sourceWidth: CGFloat = 196
+    private static let arrowWidth: CGFloat = 92
 
     var body: some View {
-        HStack(alignment: .top, spacing: 10) {
-            VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
                 columnHeader("From")
-                ForEach(overview.sources.prefix(Self.visibleSources)) { source in
-                    ApplySourceCard(source: source)
-                }
-                if overview.sources.count > Self.visibleSources {
-                    let more = overview.sources.count - Self.visibleSources
-                    Text("+ \(more) more folder\(more == 1 ? "" : "s") · see Details")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
+                    .frame(width: Self.sourceWidth, alignment: .leading)
+                Color.clear.frame(width: Self.arrowWidth, height: 1)
+                columnHeader("To")
             }
-            .frame(width: Self.sourceWidth, alignment: .leading)
+            .padding(.horizontal, 8)
+            ForEach(overview.destinations) { destination in
+                lane(for: destination)
+            }
+        }
+    }
 
-            VStack(alignment: .leading, spacing: 8) {
-                HStack(spacing: 8) {
-                    Color.clear.frame(width: Self.arrowWidth, height: 1)
-                    columnHeader("To")
-                }
-                ForEach(overview.destinations) { destination in
-                    HStack(alignment: .center, spacing: 8) {
-                        ApplyOperationArrow(methods: destination.methods)
+    private func lane(for destination: ApplyPlanOverview.Destination) -> some View {
+        let display = destination.routeDisplay(limit: Self.visibleRoutesPerEvent)
+        return HStack(alignment: .center, spacing: 8) {
+            VStack(alignment: .leading, spacing: 6) {
+                if display.visible.isEmpty, display.overflow == nil {
+                    HStack(spacing: 8) {
+                        Text("No files to move")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .frame(width: Self.sourceWidth, alignment: .leading)
+                        ApplyOperationArrow(methods: [])
                             .frame(width: Self.arrowWidth)
-                        ApplyDestinationCard(destination: destination)
+                    }
+                }
+                ForEach(display.visible) { route in
+                    HStack(alignment: .center, spacing: 8) {
+                        ApplyRouteSourceCard(route: route)
+                            .frame(width: Self.sourceWidth)
+                        ApplyOperationArrow(methods: route.methods)
+                            .frame(width: Self.arrowWidth)
+                    }
+                }
+                if let overflow = display.overflow {
+                    HStack(alignment: .center, spacing: 8) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(overflow.line)
+                                .font(.caption.monospacedDigit())
+                            Text("Listed in Details")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                        .applyFlowCard()
+                        .frame(width: Self.sourceWidth)
+                        ApplyOperationArrow(methods: overflow.methods)
+                            .frame(width: Self.arrowWidth)
                     }
                 }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .fixedSize(horizontal: true, vertical: false)
+            ApplyDestinationCard(destination: destination)
         }
+        // Equal-height columns: the destination card grows to the height of
+        // its routes instead of floating in the middle of them.
+        .fixedSize(horizontal: false, vertical: true)
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(.separator.opacity(0.8), lineWidth: 0.5)
+        )
     }
 
     private func columnHeader(_ title: String) -> some View {
@@ -58,10 +95,12 @@ struct ApplyPlanFlowView: View {
 /// The shared card look: a quiet rounded fill that reads in light and dark
 /// without custom chrome.
 private struct ApplyFlowCard: ViewModifier {
+    var fillHeight = false
+
     func body(content: Content) -> some View {
         content
             .padding(10)
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(maxWidth: .infinity, maxHeight: fillHeight ? .infinity : nil, alignment: .leading)
             .background(.quinary, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
             .overlay(
                 RoundedRectangle(cornerRadius: 10, style: .continuous)
@@ -71,51 +110,85 @@ private struct ApplyFlowCard: ViewModifier {
 }
 
 private extension View {
-    func applyFlowCard() -> some View { modifier(ApplyFlowCard()) }
+    func applyFlowCard(fillHeight: Bool = false) -> some View { modifier(ApplyFlowCard(fillHeight: fillHeight)) }
 }
 
-/// One source folder: which drive, how many files, and whether they leave
-/// this folder (moves) or stay put (copies).
-struct ApplySourceCard: View {
-    let source: ApplyPlanOverview.Source
+/// One route's source: the folder, its drive, and the share of its files
+/// that go to this lane's event. A folder split across events says so.
+struct ApplyRouteSourceCard: View {
+    let route: ApplyPlanOverview.Route
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: 3) {
             Label {
-                Text(source.driveName)
+                Text(route.sourceDriveName)
                     .lineLimit(1)
                     .truncationMode(.middle)
             } icon: {
-                Image(systemName: source.driveName == "this Mac" ? "internaldrive.fill" : "externaldrive.fill")
+                Image(systemName: route.sourceDriveName == "this Mac" ? "internaldrive.fill" : "externaldrive.fill")
             }
             .font(.caption)
             .foregroundStyle(.secondary)
 
             Label {
-                Text(source.name)
+                Text(route.sourceName)
                     .font(.callout.weight(.semibold))
-                    .lineLimit(2)
-                    .truncationMode(.middle)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
             } icon: {
                 Image(systemName: "folder.fill")
                     .foregroundStyle(.tint)
             }
 
-            Text("\(ApplyPlanOverview.plural(source.fileCount, "file")) · \(source.byteCount.formattedBytes)")
+            Text(route.countsLine)
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.secondary)
-            Text(source.fateLine)
-                .font(.caption2)
-                .foregroundStyle(.secondary)
+            if let splitHint = route.splitHint {
+                Label(splitHint, systemImage: "arrow.triangle.branch")
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(.orange)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help("This folder's files are split across \(route.sourceEventCount) events. Each event shows its share.")
+            }
         }
         .applyFlowCard()
-        .help(source.path)
+        .help(route.sourcePath)
         .accessibilityElement(children: .combine)
     }
 }
 
-/// The labelled arrow between a source and a destination. A destination
-/// reached both ways shows both labels, moves first.
+/// A short path that gives the final folder the room: the lead shortens
+/// first (full lead, then drive ▸ …, then …), and only then does the final
+/// folder truncate, at its tail. The full path belongs in `.help`.
+struct ApplyShortPathText: View {
+    let parts: ApplyPathLabel.ShortPath
+
+    var body: some View {
+        let leads = parts.fallbackLeads
+        ViewThatFits(in: .horizontal) {
+            ForEach(Array(leads.enumerated()), id: \.offset) { _, lead in
+                Text(lead + parts.leaf)
+                    .lineLimit(1)
+                    .fixedSize()
+            }
+            // Nothing fits whole: keep the shortest lead and cut the final
+            // folder at its end.
+            HStack(spacing: 0) {
+                Text(leads.last ?? "")
+                    .fixedSize()
+                Text(parts.leaf)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(parts.text)
+    }
+}
+
+/// The labelled arrow on one route. A route that both moves and copies
+/// (rare) shows both labels, moves first.
 struct ApplyOperationArrow: View {
     let methods: [ApplyRouteMethod]
 
@@ -172,9 +245,7 @@ struct ApplyDestinationCard: View {
             }
 
             Label {
-                Text(destination.shortPath)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+                ApplyShortPathText(parts: destination.shortPathParts)
             } icon: {
                 Image(systemName: summary.isPrivate ? "lock.fill" : "folder.fill")
             }
@@ -196,7 +267,8 @@ struct ApplyDestinationCard: View {
                     .foregroundStyle(.secondary)
             }
         }
-        .applyFlowCard()
+        // Spans the lane, so every route's arrow lands on the card.
+        .applyFlowCard(fillHeight: true)
         .accessibilityElement(children: .combine)
     }
 }

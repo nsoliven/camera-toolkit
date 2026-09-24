@@ -14,32 +14,54 @@ enum ApplyPathLabel {
         return "this Mac"
     }
 
+    /// A breadcrumb split into a lead ("Crucial ▸ … ▸ ") and the final
+    /// folder ("2026-08-23 Beach Day"), so a view can squeeze the lead and
+    /// keep the final folder readable — truncating it only at its tail.
+    struct ShortPath: Equatable, Sendable {
+        /// Drive and elided middle, ending in " ▸ ". Empty for a one-part path.
+        var lead: String
+        /// The final folder name.
+        var leaf: String
+
+        var text: String { lead + leaf }
+
+        /// Leads to try, longest first, when the full text does not fit:
+        /// this lead, then drive + "…", then just "…". The final folder is
+        /// never what shrinks first.
+        var fallbackLeads: [String] {
+            guard !lead.isEmpty else { return [""] }
+            let separator = " ▸ "
+            var leads = [lead]
+            let parts = lead.components(separatedBy: separator).filter { !$0.isEmpty }
+            if parts.count > 2 || (parts.count == 2 && parts[1] != "…") {
+                leads.append(parts[0] + separator + "…" + separator)
+            }
+            let minimal = "…" + separator
+            if leads.last != minimal { leads.append(minimal) }
+            return leads
+        }
+    }
+
     /// A readable breadcrumb that keeps the drive and the final folder:
     /// "Crucial ▸ … ▸ 2026-08-23 Beach Day". Paths short enough to read
     /// whole are left whole.
     static func short(_ path: String, maxComponents: Int = 3) -> String {
-        let breadcrumb = OrganizeRouteLabel.breadcrumb(for: path)
-        let parts = breadcrumb.components(separatedBy: " ▸ ")
-        guard parts.count > max(maxComponents, 2) else { return breadcrumb }
-        return [parts[0], "…", parts[parts.count - 1]].joined(separator: " ▸ ")
+        shortParts(path, maxComponents: maxComponents).text
     }
 
-    /// The display name of the deepest folder shared by every path: its
-    /// last component (the drive name when the paths share only a volume
-    /// root). Nil when they share nothing more specific than `/` or
-    /// `/Volumes`.
-    static func commonFolderName(of paths: [String]) -> String? {
-        let split = paths.map(standardizedComponents)
-        guard var common = split.first else { return nil }
-        for components in split.dropFirst() {
-            var shared = 0
-            while shared < common.count, shared < components.count, common[shared] == components[shared] {
-                shared += 1
-            }
-            common = Array(common.prefix(shared))
+    /// `short(_:)` as lead + final folder. The middle of the path is what
+    /// gets elided, never the final folder.
+    static func shortParts(_ path: String, maxComponents: Int = 3) -> ShortPath {
+        let breadcrumb = OrganizeRouteLabel.breadcrumb(for: path)
+        let separator = " ▸ "
+        var parts = breadcrumb.components(separatedBy: separator)
+        guard let leaf = parts.popLast(), !parts.isEmpty else {
+            return ShortPath(lead: "", leaf: breadcrumb)
         }
-        if common.isEmpty || common == ["Volumes"] { return nil }
-        return common.last
+        if parts.count + 1 > max(maxComponents, 2) {
+            parts = [parts[0], "…"]
+        }
+        return ShortPath(lead: parts.joined(separator: separator) + separator, leaf: leaf)
     }
 
     private static func standardizedComponents(_ path: String) -> [String] {
@@ -68,8 +90,16 @@ struct ApplyPlanOverview: Sendable {
         var moveCount: Int
         var copyCount: Int
         var byteCount: Int64
+        /// How many event folders this folder's files are split across.
+        var eventCount: Int
 
         var fileCount: Int { moveCount + copyCount }
+
+        /// "“Transfer 1” → 2 events" when the folder feeds more than one
+        /// event, so the picture never reads as one folder → one event.
+        var splitHint: String? {
+            eventCount > 1 ? "“\(name)” → \(eventCount) events" : nil
+        }
 
         /// What happens to the files in this folder.
         var fateLine: String {
@@ -86,10 +116,29 @@ struct ApplyPlanOverview: Sendable {
         var id: UUID { summary.id }
         var summary: ApplyEventSummary
         var folderPath: String
-        var shortPath: String
+        /// "Crucial ▸ … ▸ " + "2026-08-23 Beach Day".
+        var shortPathParts: ApplyPathLabel.ShortPath
         var driveName: String
         var moveCount: Int
         var copyCount: Int
+        /// Every source folder that feeds this event, with its share.
+        var routes: [Route]
+
+        var shortPath: String { shortPathParts.text }
+
+        /// The routes shown as rows, plus one summed row for the rest, so
+        /// a long list stays short and the rows still add up to this card.
+        func routeDisplay(limit: Int) -> (visible: [Route], overflow: RouteOverflow?) {
+            guard routes.count > limit, limit > 0 else { return (routes, nil) }
+            let visible = Array(routes.prefix(limit - 1))
+            let rest = routes.dropFirst(limit - 1)
+            return (visible, RouteOverflow(
+                folderCount: rest.count,
+                moveCount: rest.reduce(0) { $0 + $1.moveCount },
+                copyCount: rest.reduce(0) { $0 + $1.copyCount },
+                byteCount: rest.reduce(Int64(0)) { $0 + $1.byteCount }
+            ))
+        }
 
         /// The operations that reach this folder, moves first.
         var methods: [ApplyRouteMethod] {
@@ -107,50 +156,95 @@ struct ApplyPlanOverview: Sendable {
         }
     }
 
+    /// One real route: the files one source folder sends to one event.
+    /// A folder that feeds two events has two routes; an event fed by two
+    /// folders has two routes. Summing routes by source gives the source
+    /// totals, and summing them by event gives the event totals, exactly.
+    struct Route: Identifiable, Equatable, Sendable {
+        var id: String { "\(destinationIndex)|\(sourcePath)" }
+        /// Index of the event group in the plan (and in `destinations`).
+        var destinationIndex: Int
+        var sourcePath: String
+        var sourceName: String
+        var sourceDriveName: String
+        var moveCount: Int
+        var copyCount: Int
+        var photoCount: Int
+        var videoCount: Int
+        var otherCount: Int
+        var byteCount: Int64
+        /// The whole source folder's totals across every event.
+        var sourceFileCount: Int
+        var sourceEventCount: Int
+
+        var fileCount: Int { moveCount + copyCount }
+
+        var methods: [ApplyRouteMethod] {
+            (moveCount > 0 ? [.rename] : []) + (copyCount > 0 ? [.verifiedCopy] : [])
+        }
+
+        /// "1 file · 2.08 GB", or "1 of 5 files · 2.08 GB" when the folder is
+        /// split across events, so the share is never mistaken for the whole.
+        var countsLine: String {
+            let files = sourceEventCount > 1 && sourceFileCount != fileCount
+                ? "\(fileCount.formatted()) of \(ApplyPlanOverview.plural(sourceFileCount, "file"))"
+                : ApplyPlanOverview.plural(fileCount, "file")
+            return "\(files) · \(byteCount.formattedBytes)"
+        }
+
+        /// "“A” → 2 events" when this route's folder is split.
+        var splitHint: String? {
+            sourceEventCount > 1 ? "“\(sourceName)” → \(sourceEventCount) events" : nil
+        }
+    }
+
+    /// The folders past a section's row limit, summed into one row.
+    struct RouteOverflow: Equatable, Sendable {
+        var folderCount: Int
+        var moveCount: Int
+        var copyCount: Int
+        var byteCount: Int64
+
+        var fileCount: Int { moveCount + copyCount }
+
+        var methods: [ApplyRouteMethod] {
+            (moveCount > 0 ? [.rename] : []) + (copyCount > 0 ? [.verifiedCopy] : [])
+        }
+
+        /// "+ 3 more folders · 12 files · 1.2 GB"
+        var line: String {
+            "+ \(ApplyPlanOverview.plural(folderCount, "more folder")) · \(ApplyPlanOverview.plural(fileCount, "file")) · \(byteCount.formattedBytes)"
+        }
+    }
+
     var sources: [Source]
     var destinations: [Destination]
+    /// Every route, grouped by event in plan order, sources sorted by path.
+    var routes: [Route]
     var moveCount: Int
     var copyCount: Int
     var byteCount: Int64
     /// Events that receive at least one file (groups holding only
     /// disconnected files still get a card, but are not counted).
     var eventCount: Int
-    var sourceName: String?
     var destinationDrives: [String]
 
     init(plan: OrganizeApplyPlan) {
-        var sourcesByPath: [String: Source] = [:]
-        for group in plan.groups {
-            for route in ApplyRouteDiagram.routes(for: group) {
-                var source = sourcesByPath[route.sourcePath] ?? Source(
-                    path: route.sourcePath,
-                    name: (route.sourcePath as NSString).lastPathComponent,
-                    driveName: ApplyPathLabel.driveName(for: route.sourcePath),
-                    moveCount: 0,
-                    copyCount: 0,
-                    byteCount: 0
-                )
-                switch route.method {
-                case .rename: source.moveCount += route.fileCount
-                case .verifiedCopy: source.copyCount += route.fileCount
-                }
-                source.byteCount += route.byteCount
-                sourcesByPath[route.sourcePath] = source
-            }
-        }
-        sources = sourcesByPath.values.sorted {
-            $0.path.localizedStandardCompare($1.path) == .orderedAscending
-        }
+        let routes = Self.routes(for: plan)
+        self.routes = routes
+        sources = Self.sources(from: routes)
 
         let summaries = ApplyRouteDiagram.eventSummaries(for: plan)
-        destinations = zip(plan.groups, summaries).map { group, summary in
-            Destination(
+        destinations = zip(plan.groups, summaries).enumerated().map { index, pair in
+            let (group, summary) = pair
+            return Destination(
                 summary: summary,
                 folderPath: group.destinationFolder,
-                shortPath: ApplyPathLabel.short(group.destinationFolder),
+                shortPathParts: ApplyPathLabel.shortParts(group.destinationFolder),
                 driveName: ApplyPathLabel.driveName(for: group.destinationFolder),
                 moveCount: group.moves.count,
-                copyCount: group.copyFileCount
+                copyCount: group.copyFileCount,
+                routes: routes.filter { $0.destinationIndex == index }
             )
         }
 
@@ -158,12 +252,87 @@ struct ApplyPlanOverview: Sendable {
         copyCount = plan.copyCount
         byteCount = plan.byteCount
         eventCount = plan.groups.count { !$0.moves.isEmpty || !$0.copies.isEmpty }
-        sourceName = ApplyPathLabel.commonFolderName(of: sources.map(\.path))
         var drives: [String] = []
         for destination in destinations where destination.moveCount + destination.copyCount > 0 {
             if !drives.contains(destination.driveName) { drives.append(destination.driveName) }
         }
         destinationDrives = drives
+    }
+
+    // MARK: - Routes (pure, unit-tested)
+
+    /// The many-to-many source folder → event mapping, built from the same
+    /// per-folder rows as the Details cards ("Where each folder lands"),
+    /// merged per (event, source folder). String work only — no disk.
+    static func routes(for plan: OrganizeApplyPlan) -> [Route] {
+        var routes: [Route] = []
+        for (index, group) in plan.groups.enumerated() {
+            var bySource: [String: Route] = [:]
+            for row in ApplyRouteDiagram.routes(for: group) {
+                var route = bySource[row.sourcePath] ?? Route(
+                    destinationIndex: index,
+                    sourcePath: row.sourcePath,
+                    sourceName: (row.sourcePath as NSString).lastPathComponent,
+                    sourceDriveName: ApplyPathLabel.driveName(for: row.sourcePath),
+                    moveCount: 0,
+                    copyCount: 0,
+                    photoCount: 0,
+                    videoCount: 0,
+                    otherCount: 0,
+                    byteCount: 0,
+                    sourceFileCount: 0,
+                    sourceEventCount: 0
+                )
+                switch row.method {
+                case .rename: route.moveCount += row.fileCount
+                case .verifiedCopy: route.copyCount += row.fileCount
+                }
+                route.photoCount += row.photoCount
+                route.videoCount += row.videoCount
+                route.otherCount += row.otherCount
+                route.byteCount += row.byteCount
+                bySource[row.sourcePath] = route
+            }
+            routes += bySource.values.sorted {
+                $0.sourcePath.localizedStandardCompare($1.sourcePath) == .orderedAscending
+            }
+        }
+
+        var totals: [String: (files: Int, events: Int)] = [:]
+        for route in routes where route.fileCount > 0 {
+            let total = totals[route.sourcePath] ?? (0, 0)
+            totals[route.sourcePath] = (total.files + route.fileCount, total.events + 1)
+        }
+        for index in routes.indices {
+            let total = totals[routes[index].sourcePath] ?? (0, 0)
+            routes[index].sourceFileCount = total.files
+            routes[index].sourceEventCount = total.events
+        }
+        return routes
+    }
+
+    /// Source folder totals: the sum of each folder's routes.
+    static func sources(from routes: [Route]) -> [Source] {
+        var byPath: [String: Source] = [:]
+        for route in routes {
+            var source = byPath[route.sourcePath] ?? Source(
+                path: route.sourcePath,
+                name: route.sourceName,
+                driveName: route.sourceDriveName,
+                moveCount: 0,
+                copyCount: 0,
+                byteCount: 0,
+                eventCount: 0
+            )
+            source.moveCount += route.moveCount
+            source.copyCount += route.copyCount
+            source.byteCount += route.byteCount
+            if route.fileCount > 0 { source.eventCount += 1 }
+            byPath[route.sourcePath] = source
+        }
+        return byPath.values.sorted {
+            $0.path.localizedStandardCompare($1.path) == .orderedAscending
+        }
     }
 
     var fileCount: Int { moveCount + copyCount }
@@ -172,8 +341,7 @@ struct ApplyPlanOverview: Sendable {
         Self.sentence(
             moveCount: moveCount,
             copyCount: copyCount,
-            sourceName: sourceName,
-            sourceFolderCount: sources.count,
+            sourceNames: sources.map(\.name),
             eventCount: eventCount,
             destinationDrives: destinationDrives
         )
@@ -196,22 +364,14 @@ struct ApplyPlanOverview: Sendable {
     static func sentence(
         moveCount: Int,
         copyCount: Int,
-        sourceName: String?,
-        sourceFolderCount: Int,
+        sourceNames: [String],
         eventCount: Int,
         destinationDrives: [String]
     ) -> String {
         guard moveCount + copyCount > 0 else {
             return "Nothing needs to move. Every file is already in place or on a disconnected drive."
         }
-        let from: String
-        if let sourceName {
-            from = " from “\(sourceName)”"
-        } else if sourceFolderCount > 1 {
-            from = " from \(sourceFolderCount) folders"
-        } else {
-            from = ""
-        }
+        let from = fromPhrase(sourceNames: sourceNames)
         let into = " into \(plural(eventCount, "event"))"
         let on: String = switch destinationDrives.count {
         case 0: ""
@@ -230,6 +390,23 @@ struct ApplyPlanOverview: Sendable {
             return "\(plural(moveCount, "file")) \(moveCount == 1 ? "moves" : "move") and \(copyCount.formatted()) \(copyCount == 1 ? "is" : "are") copied\(from)\(into)\(on). "
                 + "Moves are instant renames on the same drive. Copies come from another drive, are checksum-verified, and leave the originals in place."
         }
+    }
+
+    /// Where the files come from: every folder by name when there are few
+    /// ("from “A” and “B”"), otherwise a count ("from 5 folders"). Folders
+    /// that share a name are counted rather than listed, which would read
+    /// as the same folder twice.
+    static func fromPhrase(sourceNames: [String], maxNamed: Int = 3) -> String {
+        guard !sourceNames.isEmpty else { return "" }
+        let unique = Set(sourceNames).count == sourceNames.count
+        guard unique, sourceNames.count <= maxNamed else {
+            return " from \(sourceNames.count.formatted()) folders"
+        }
+        let quoted = sourceNames.map { "“\($0)”" }
+        let list = quoted.count == 1
+            ? quoted[0]
+            : quoted.dropLast().joined(separator: ", ") + " and " + quoted[quoted.count - 1]
+        return " from \(list)"
     }
 
     /// The confirm button names the action: "Move 40 Files",

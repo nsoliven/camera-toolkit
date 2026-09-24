@@ -354,10 +354,10 @@ struct ApplyEventGroupCard: View {
                 }
 
                 Label {
-                    Text(OrganizeRouteLabel.breadcrumb(for: group.destinationFolder))
+                    // The whole breadcrumb, but the final folder keeps its
+                    // room: the lead squeezes first.
+                    ApplyShortPathText(parts: ApplyPathLabel.shortParts(group.destinationFolder, maxComponents: .max))
                         .font(.caption.monospaced())
-                        .lineLimit(1)
-                        .truncationMode(.middle)
                 } icon: {
                     Image(systemName: group.isPrivate ? "lock.fill" : "folder.fill")
                 }

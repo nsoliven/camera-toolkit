@@ -48,22 +48,37 @@ final class ApplyPlanOverviewTests: XCTestCase {
         XCTAssertEqual(ApplyPathLabel.driveName(for: "/Drive/Camera Buffer"), "this Mac")
     }
 
-    func testCommonFolderName() {
-        XCTAssertEqual(ApplyPathLabel.commonFolderName(of: [
-            "/Volumes/C/Unsorted A7V/Transfer 1",
-            "/Volumes/C/Unsorted A7V/Transfer 2",
-        ]), "Unsorted A7V")
-        XCTAssertEqual(ApplyPathLabel.commonFolderName(of: ["/Volumes/C/Unsorted A7V/Transfer 1"]), "Transfer 1")
-        XCTAssertEqual(ApplyPathLabel.commonFolderName(of: ["/Volumes/C/A", "/Volumes/C/B"]), "C")
-        XCTAssertNil(ApplyPathLabel.commonFolderName(of: ["/Volumes/C/A", "/Volumes/D/B"]))
-        XCTAssertNil(ApplyPathLabel.commonFolderName(of: []))
+    func testShortPathPartsElideTheMiddleNotTheFinalFolder() {
+        let parts = ApplyPathLabel.shortParts("/Volumes/Crucial/Camera Buffer/2026/2026-08-23 Long Final Folder Name")
+        XCTAssertEqual(parts.lead, "Crucial ▸ … ▸ ")
+        XCTAssertEqual(parts.leaf, "2026-08-23 Long Final Folder Name")
+        XCTAssertEqual(parts.text, ApplyPathLabel.short("/Volumes/Crucial/Camera Buffer/2026/2026-08-23 Long Final Folder Name"))
+
+        let whole = ApplyPathLabel.shortParts("/Volumes/Crucial/Buffer/Beach")
+        XCTAssertEqual(whole, ApplyPathLabel.ShortPath(lead: "Crucial ▸ Buffer ▸ ", leaf: "Beach"))
+
+        let full = ApplyPathLabel.shortParts("/Volumes/Crucial/Camera Buffer/2026/Beach", maxComponents: .max)
+        XCTAssertEqual(full.lead, "Crucial ▸ Camera Buffer ▸ 2026 ▸ ")
+        XCTAssertEqual(full.leaf, "Beach")
+
+        XCTAssertEqual(parts.fallbackLeads, ["Crucial ▸ … ▸ ", "… ▸ "])
+        XCTAssertEqual(full.fallbackLeads, ["Crucial ▸ Camera Buffer ▸ 2026 ▸ ", "Crucial ▸ … ▸ ", "… ▸ "])
+        XCTAssertEqual(whole.fallbackLeads, ["Crucial ▸ Buffer ▸ ", "Crucial ▸ … ▸ ", "… ▸ "])
+        XCTAssertEqual(
+            ApplyPathLabel.shortParts("/Volumes/Crucial/Beach").fallbackLeads,
+            ["Crucial ▸ ", "… ▸ "]
+        )
+
+        let drive = ApplyPathLabel.shortParts("/Volumes/Crucial")
+        XCTAssertEqual(drive, ApplyPathLabel.ShortPath(lead: "", leaf: "Crucial"))
+        XCTAssertEqual(drive.fallbackLeads, [""])
     }
 
     // MARK: - Sentence
 
     func testMoveOnlySentenceSaysNothingIsCopied() {
         let sentence = ApplyPlanOverview.sentence(
-            moveCount: 40, copyCount: 0, sourceName: "Unsorted A7V", sourceFolderCount: 1,
+            moveCount: 40, copyCount: 0, sourceNames: ["Unsorted A7V"],
             eventCount: 2, destinationDrives: ["Buffer"]
         )
         XCTAssertEqual(
@@ -74,7 +89,7 @@ final class ApplyPlanOverviewTests: XCTestCase {
 
     func testSingularMoveSentence() {
         let sentence = ApplyPlanOverview.sentence(
-            moveCount: 1, copyCount: 0, sourceName: "Card", sourceFolderCount: 1,
+            moveCount: 1, copyCount: 0, sourceNames: ["Card"],
             eventCount: 1, destinationDrives: ["C"]
         )
         XCTAssertTrue(sentence.hasPrefix("1 file moves from “Card” into 1 event on C. It is renamed"))
@@ -82,7 +97,7 @@ final class ApplyPlanOverviewTests: XCTestCase {
 
     func testCopyOnlySentenceKeepsOriginals() {
         let sentence = ApplyPlanOverview.sentence(
-            moveCount: 0, copyCount: 12, sourceName: "LEXAR", sourceFolderCount: 1,
+            moveCount: 0, copyCount: 12, sourceNames: ["LEXAR"],
             eventCount: 1, destinationDrives: ["Crucial"]
         )
         XCTAssertEqual(
@@ -94,17 +109,31 @@ final class ApplyPlanOverviewTests: XCTestCase {
 
     func testMixedSentenceNamesBothOperations() {
         let sentence = ApplyPlanOverview.sentence(
-            moveCount: 28, copyCount: 3, sourceName: nil, sourceFolderCount: 2,
+            moveCount: 28, copyCount: 3, sourceNames: ["A", "B", "C", "D"],
             eventCount: 3, destinationDrives: ["A", "B"]
         )
-        XCTAssertTrue(sentence.hasPrefix("28 files move and 3 are copied from 2 folders into 3 events on 2 drives."))
+        XCTAssertTrue(sentence.hasPrefix("28 files move and 3 are copied from 4 folders into 3 events on 2 drives."))
         XCTAssertTrue(sentence.contains("checksum-verified"))
         XCTAssertTrue(sentence.contains("originals in place"))
     }
 
+    func testSentenceNamesEveryFolderWhenThereAreFew() {
+        let two = ApplyPlanOverview.sentence(
+            moveCount: 40, copyCount: 0, sourceNames: ["Folder A", "Folder B"],
+            eventCount: 2, destinationDrives: ["Drive"]
+        )
+        XCTAssertTrue(two.hasPrefix("40 files move from “Folder A” and “Folder B” into 2 events on Drive."), two)
+
+        XCTAssertEqual(ApplyPlanOverview.fromPhrase(sourceNames: ["A", "B", "C"]), " from “A”, “B” and “C”")
+        XCTAssertEqual(ApplyPlanOverview.fromPhrase(sourceNames: ["A", "B", "C", "D"]), " from 4 folders")
+        XCTAssertEqual(ApplyPlanOverview.fromPhrase(sourceNames: ["Transfer 1", "Transfer 1"]), " from 2 folders")
+        XCTAssertEqual(ApplyPlanOverview.fromPhrase(sourceNames: ["A"]), " from “A”")
+        XCTAssertEqual(ApplyPlanOverview.fromPhrase(sourceNames: []), "")
+    }
+
     func testEmptySentence() {
         let sentence = ApplyPlanOverview.sentence(
-            moveCount: 0, copyCount: 0, sourceName: nil, sourceFolderCount: 0,
+            moveCount: 0, copyCount: 0, sourceNames: [],
             eventCount: 0, destinationDrives: []
         )
         XCTAssertTrue(sentence.hasPrefix("Nothing needs to move"))
@@ -177,8 +206,198 @@ final class ApplyPlanOverviewTests: XCTestCase {
         XCTAssertEqual(overview.sources.map(\.driveName), ["Crucial", "LEXAR"])
         XCTAssertEqual(overview.sources[0].fateLine, "Files move out of this folder")
         XCTAssertEqual(overview.sources[1].fateLine, "Originals stay here")
-        XCTAssertNil(overview.sourceName)
         XCTAssertEqual(overview.primaryActionTitle, "Move & Copy 3 Files")
-        XCTAssertTrue(overview.sentence.hasPrefix("2 files move and 1 is copied from 2 folders into 2 events on Crucial."))
+        XCTAssertTrue(
+            overview.sentence.hasPrefix("2 files move and 1 is copied from “Transfer 1” and “DCIM” into 2 events on Crucial."),
+            overview.sentence
+        )
+        XCTAssertEqual(overview.destinations.map { $0.routes.count }, [1, 1, 0])
+        assertRoutesAddUp(overview)
+    }
+
+    // MARK: - Routes (many-to-many)
+
+    private let unsorted = "/Volumes/Drive/Unsorted"
+    private let eventX = "/Volumes/Drive/Buffer/2026/2026-01-02 Event X"
+    private let eventY = "/Volumes/Drive/.private/2026-01-02 Subevent Y"
+
+    private func moves(_ count: Int, from folder: String, into destination: String, prefix: String, ext: String = "ARW", bytes: Int64 = 10) -> [DriveMove] {
+        (1...count).map { index in
+            move("\(folder)/\(prefix)\(index).\(ext)", "\(destination)/Cam/\(prefix)\(index).\(ext)", bytes: bytes)
+        }
+    }
+
+    /// Folder A (5 files) splits: 1 video to X, 4 files to Y. Folder B
+    /// (35 files) all go to Y. A card on another drive copies into both.
+    private func manyToManyPlan() -> OrganizeApplyPlan {
+        let folderA = unsorted + "/Folder A"
+        let folderB = unsorted + "/Folder B"
+        let card = OrganizeApplyPlan.CopyBatch(
+            sourceRoot: "/Volumes/Card/DCIM",
+            destinationRoot: eventX + "/Cam",
+            deviceID: "cam",
+            files: [
+                FileRecord(path: "DCIM/100/C1.JPG", size: 7, modifiedAt: Date()),
+                FileRecord(path: "DCIM/100/C2.JPG", size: 7, modifiedAt: Date()),
+            ]
+        )
+        let cardToY = OrganizeApplyPlan.CopyBatch(
+            sourceRoot: "/Volumes/Card/DCIM",
+            destinationRoot: eventY + "/Cam",
+            deviceID: "cam",
+            files: [FileRecord(path: "DCIM/100/C3.JPG", size: 7, modifiedAt: Date())]
+        )
+        let x = group(
+            name: "Event X",
+            moves: moves(1, from: folderA, into: eventX, prefix: "AV", ext: "MP4", bytes: 2_000),
+            copies: [card],
+            destination: eventX
+        )
+        let y = group(
+            name: "Subevent Y",
+            moves: moves(3, from: folderA, into: eventY, prefix: "A", bytes: 50)
+                + [move(folderA + "/A4.XMP", eventY + "/Sidecars/A4.XMP", bytes: 1)]
+                + moves(32, from: folderB, into: eventY, prefix: "B", bytes: 40)
+                + moves(3, from: folderB, into: eventY, prefix: "BV", ext: "MP4", bytes: 100),
+            copies: [cardToY],
+            destination: eventY,
+            isPrivate: true
+        )
+        return OrganizeApplyPlan(title: "Apply", groups: [x, y], pruneBoundaries: [])
+    }
+
+    /// Every route adds up to its source's total and to its event's total,
+    /// and the whole set adds up to the plan.
+    private func assertRoutesAddUp(_ overview: ApplyPlanOverview, file: StaticString = #filePath, line: UInt = #line) {
+        for source in overview.sources {
+            let routes = overview.routes.filter { $0.sourcePath == source.path }
+            XCTAssertEqual(routes.reduce(0) { $0 + $1.moveCount }, source.moveCount, "moves from \(source.name)", file: file, line: line)
+            XCTAssertEqual(routes.reduce(0) { $0 + $1.copyCount }, source.copyCount, "copies from \(source.name)", file: file, line: line)
+            XCTAssertEqual(routes.reduce(Int64(0)) { $0 + $1.byteCount }, source.byteCount, "bytes from \(source.name)", file: file, line: line)
+            XCTAssertEqual(routes.count { $0.fileCount > 0 }, source.eventCount, file: file, line: line)
+            for route in routes {
+                XCTAssertEqual(route.sourceFileCount, source.fileCount, file: file, line: line)
+                XCTAssertEqual(route.sourceEventCount, source.eventCount, file: file, line: line)
+            }
+        }
+        for (index, destination) in overview.destinations.enumerated() {
+            let routes = destination.routes
+            XCTAssertEqual(routes, overview.routes.filter { $0.destinationIndex == index }, file: file, line: line)
+            let summary = destination.summary
+            XCTAssertEqual(routes.reduce(0) { $0 + $1.fileCount }, summary.fileCount, "files into \(summary.event.name)", file: file, line: line)
+            XCTAssertEqual(routes.reduce(0) { $0 + $1.moveCount }, destination.moveCount, file: file, line: line)
+            XCTAssertEqual(routes.reduce(0) { $0 + $1.copyCount }, destination.copyCount, file: file, line: line)
+            XCTAssertEqual(routes.reduce(0) { $0 + $1.photoCount }, summary.imageCount, file: file, line: line)
+            XCTAssertEqual(routes.reduce(0) { $0 + $1.videoCount }, summary.videoCount, file: file, line: line)
+            XCTAssertEqual(routes.reduce(0) { $0 + $1.otherCount }, summary.otherCount, file: file, line: line)
+            XCTAssertEqual(routes.reduce(Int64(0)) { $0 + $1.byteCount }, summary.byteCount, "bytes into \(summary.event.name)", file: file, line: line)
+        }
+        XCTAssertEqual(overview.routes.reduce(0) { $0 + $1.fileCount }, overview.fileCount, file: file, line: line)
+        XCTAssertEqual(overview.routes.reduce(Int64(0)) { $0 + $1.byteCount }, overview.byteCount, file: file, line: line)
+    }
+
+    func testManyToManyRoutesMatchTheRealSplit() throws {
+        let overview = ApplyPlanOverview(plan: manyToManyPlan())
+        assertRoutesAddUp(overview)
+
+        let a = try XCTUnwrap(overview.sources.first { $0.name == "Folder A" })
+        XCTAssertEqual(a.fileCount, 5)
+        XCTAssertEqual(a.byteCount, 2_000 + 3 * 50 + 1)
+        XCTAssertEqual(a.eventCount, 2)
+        XCTAssertEqual(a.splitHint, "“Folder A” → 2 events")
+        let b = try XCTUnwrap(overview.sources.first { $0.name == "Folder B" })
+        XCTAssertEqual(b.fileCount, 35)
+        XCTAssertEqual(b.eventCount, 1)
+        XCTAssertNil(b.splitHint)
+        let card = try XCTUnwrap(overview.sources.first { $0.name == "DCIM" })
+        XCTAssertEqual(card.copyCount, 3)
+        XCTAssertEqual(card.eventCount, 2)
+
+        let x = overview.destinations[0]
+        XCTAssertEqual(x.routes.map(\.sourceName), ["DCIM", "Folder A"])
+        let aToX = try XCTUnwrap(x.routes.first { $0.sourceName == "Folder A" })
+        XCTAssertEqual(aToX.fileCount, 1)
+        XCTAssertEqual(aToX.videoCount, 1)
+        XCTAssertEqual(aToX.methods, [.rename])
+        XCTAssertEqual(aToX.countsLine, "1 of 5 files · \(Int64(2_000).formattedBytes)")
+        XCTAssertEqual(aToX.splitHint, "“Folder A” → 2 events")
+        XCTAssertEqual(x.routes.first { $0.sourceName == "DCIM" }?.methods, [.verifiedCopy])
+
+        let y = overview.destinations[1]
+        XCTAssertTrue(y.summary.isPrivate)
+        XCTAssertEqual(y.routes.map(\.sourceName), ["DCIM", "Folder A", "Folder B"])
+        // A's photos and its sidecar land in two subfolders but one route.
+        let aToY = try XCTUnwrap(y.routes.first { $0.sourceName == "Folder A" })
+        XCTAssertEqual(aToY.fileCount, 4)
+        XCTAssertEqual(aToY.photoCount, 3)
+        XCTAssertEqual(aToY.otherCount, 1)
+        XCTAssertEqual(aToY.countsLine, "4 of 5 files · \(Int64(151).formattedBytes)")
+        let bToY = try XCTUnwrap(y.routes.first { $0.sourceName == "Folder B" })
+        XCTAssertEqual(bToY.countsLine, "35 files · \(Int64(32 * 40 + 300).formattedBytes)")
+        XCTAssertNil(bToY.splitHint)
+
+        XCTAssertTrue(overview.sentence.hasPrefix("40 files move and 3 are copied from “DCIM”, “Folder A” and “Folder B” into 2 events on Drive."), overview.sentence)
+    }
+
+    func testOneToOneRoute() {
+        let plan = OrganizeApplyPlan(title: "Apply", groups: [
+            group(name: "X", moves: moves(3, from: unsorted + "/A", into: eventX, prefix: "A"), destination: eventX),
+        ], pruneBoundaries: [])
+        let overview = ApplyPlanOverview(plan: plan)
+        XCTAssertEqual(overview.routes.count, 1)
+        XCTAssertEqual(overview.routes[0].countsLine, "3 files · \(Int64(30).formattedBytes)")
+        XCTAssertNil(overview.routes[0].splitHint)
+        assertRoutesAddUp(overview)
+    }
+
+    func testOneFolderToManyEvents() {
+        let plan = OrganizeApplyPlan(title: "Apply", groups: [
+            group(name: "X", moves: moves(2, from: unsorted + "/A", into: eventX, prefix: "A"), destination: eventX),
+            group(name: "Y", moves: moves(3, from: unsorted + "/A", into: eventY, prefix: "B"), destination: eventY),
+        ], pruneBoundaries: [])
+        let overview = ApplyPlanOverview(plan: plan)
+        XCTAssertEqual(overview.sources.count, 1)
+        XCTAssertEqual(overview.routes.map(\.fileCount), [2, 3])
+        XCTAssertEqual(overview.routes.map(\.destinationIndex), [0, 1])
+        XCTAssertEqual(overview.routes.map(\.splitHint), ["“A” → 2 events", "“A” → 2 events"])
+        XCTAssertTrue(overview.sentence.hasPrefix("5 files move from “A” into 2 events"), overview.sentence)
+        assertRoutesAddUp(overview)
+    }
+
+    func testManyFoldersToOneEvent() {
+        let plan = OrganizeApplyPlan(title: "Apply", groups: [
+            group(
+                name: "X",
+                moves: moves(2, from: unsorted + "/B", into: eventX, prefix: "B")
+                    + moves(1, from: unsorted + "/A", into: eventX, prefix: "A"),
+                destination: eventX
+            ),
+        ], pruneBoundaries: [])
+        let overview = ApplyPlanOverview(plan: plan)
+        XCTAssertEqual(overview.destinations[0].routes.map(\.sourceName), ["A", "B"])
+        XCTAssertEqual(overview.destinations[0].routes.map(\.fileCount), [1, 2])
+        XCTAssertTrue(overview.routes.allSatisfy { $0.splitHint == nil })
+        assertRoutesAddUp(overview)
+    }
+
+    func testRouteOverflowSumsTheHiddenRows() throws {
+        let groupMoves = (1...7).flatMap { index in
+            moves(index, from: "\(unsorted)/F\(index)", into: eventX, prefix: "F\(index)-")
+        }
+        let overview = ApplyPlanOverview(plan: OrganizeApplyPlan(
+            title: "Apply", groups: [group(name: "X", moves: groupMoves, destination: eventX)], pruneBoundaries: []
+        ))
+        let destination = overview.destinations[0]
+        let display = destination.routeDisplay(limit: 5)
+        XCTAssertEqual(display.visible.count, 4)
+        let overflow = try XCTUnwrap(display.overflow)
+        XCTAssertEqual(overflow.folderCount, 3)
+        XCTAssertEqual(display.visible.reduce(0) { $0 + $1.fileCount } + overflow.fileCount, destination.summary.fileCount)
+        XCTAssertEqual(display.visible.reduce(Int64(0)) { $0 + $1.byteCount } + overflow.byteCount, destination.summary.byteCount)
+        XCTAssertEqual(overflow.line, "+ 3 more folders · 18 files · \(Int64(180).formattedBytes)")
+
+        let fits = destination.routeDisplay(limit: 7)
+        XCTAssertEqual(fits.visible.count, 7)
+        XCTAssertNil(fits.overflow)
     }
 }
