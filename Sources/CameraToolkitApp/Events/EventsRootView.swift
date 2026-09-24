@@ -360,7 +360,7 @@ struct EventsSidebar: View {
                 // events are tested against the same OR-of-AND groups.
                 if workspace.search.hasActiveConditions {
                     Button {
-                        workspace.search.groups = []
+                        workspace.search.clearConditions()
                     } label: {
                         Label("Filtered — Clear", systemImage: "line.3.horizontal.decrease.circle.fill")
                     }

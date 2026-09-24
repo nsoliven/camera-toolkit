@@ -429,27 +429,6 @@ final class OrganizeSearchTests: XCTestCase {
         XCTAssertFalse(matches(raw, search: search, facts: OrganizeStackFacts(personIDs: [sam])))
     }
 
-    func testPausedExclusionRowUnmarksTheSubeventChip() {
-        let child = UUID()
-        var search = OrganizeSearchFilter()
-        search.toggleEventExclusion(child)
-        XCTAssertEqual(search.excludedEventIDs, [child])
-
-        // Pausing the "is none of" row lifts the exclusion — the chip
-        // drops its outline — while the row and its pick survive.
-        search.toggleRow(search.groups[0].rows[0].id)
-        XCTAssertTrue(search.excludedEventIDs.isEmpty)
-        XCTAssertEqual(search.groups[0].rows[0].eventIDs, [child])
-        XCTAssertEqual(search.rowsWithValues.count, 1)
-
-        // Tapping the subevent chip again resumes the paused row rather
-        // than stacking a second one.
-        search.toggleEventExclusion(child)
-        XCTAssertEqual(search.excludedEventIDs, [child])
-        XCTAssertEqual(search.groups.flatMap(\.rows).count, 1)
-        XCTAssertTrue(search.groups[0].rows[0].isEnabled)
-    }
-
     // MARK: - Family scoping
 
     func testScopingEventRowsToAFamilyDropsOutsidePicks() {
@@ -488,56 +467,195 @@ final class OrganizeSearchTests: XCTestCase {
         XCTAssertFalse(matches(stack, search: scoped, facts: OrganizeStackFacts()))
     }
 
-    func testToggleEventExclusionWritesNoneOfRows() {
+    // MARK: - Board-level exclusions
+
+    func testToggleEventExclusionWritesTheBoardLevelSetNotRows() {
         let child = UUID()
         let sibling = UUID()
 
-        // From an empty filter: one group holding an "is none of" row.
+        // From an empty filter: the chip lands in the exclusion set and
+        // creates no condition rows.
         var search = OrganizeSearchFilter()
         search.toggleEventExclusion(child)
         XCTAssertEqual(search.excludedEventIDs, [child])
-        XCTAssertEqual(search.groups.count, 1)
-        XCTAssertEqual(search.groups[0].rows.count, 1)
-        XCTAssertEqual(search.groups[0].rows[0].property, .event)
-        XCTAssertEqual(search.groups[0].rows[0].operator, .noneOf)
-        XCTAssertEqual(search.groups[0].rows[0].eventIDs, [child])
+        XCTAssertTrue(search.groups.isEmpty)
+        XCTAssertTrue(search.rowsWithValues.isEmpty)
+        XCTAssertTrue(search.hasActiveConditions)
+        XCTAssertFalse(search.isEmpty)
+        XCTAssertFalse(search.isUntouched)
+        XCTAssertEqual(search.activeRowCount, 1)
 
-        // A second exclusion joins the same row; removing one keeps the
-        // other, and removing the last cleans the husk away entirely.
+        // A second exclusion joins; removing one keeps the other, and
+        // removing the last leaves nothing behind.
         search.toggleEventExclusion(sibling)
         XCTAssertEqual(search.excludedEventIDs, [child, sibling])
+        XCTAssertEqual(search.activeRowCount, 2)
         search.toggleEventExclusion(child)
         XCTAssertEqual(search.excludedEventIDs, [sibling])
         search.toggleEventExclusion(sibling)
-        XCTAssertTrue(search.groups.isEmpty)
         XCTAssertTrue(search.isUntouched)
+        XCTAssertTrue(search.isEmpty)
     }
 
-    func testToggleEventExclusionAppliesAcrossEveryGroup() {
+    func testChipStateRoundTripsAndLeavesHandBuiltRowsAlone() {
         let child = UUID()
         let person = UUID()
 
-        // Groups OR together, so the exclusion lands in each — a stack
-        // matching any group still drops the excluded event.
-        var search = OrganizeSearchFilter()
-        search.groups = [
-            OrganizeFilterGroup(rows: [.people([person])]),
-            OrganizeFilterGroup(rows: [.media([.video])]),
-        ]
+        // A hand-built "Event is none of" row is the user's own condition:
+        // it does not strike the chip, and toggling the chip never edits
+        // or removes it.
+        var search = filter([[.events([child], operator: .noneOf), .people([person])]])
+        let before = search.groups
+        XCTAssertTrue(search.excludedEventIDs.isEmpty)
         search.toggleEventExclusion(child)
-        for group in search.groups {
-            XCTAssertTrue(group.rows.contains {
-                $0.property == .event && $0.operator == .noneOf && $0.eventIDs.contains(child)
-            })
+        XCTAssertEqual(search.excludedEventIDs, [child])
+        XCTAssertEqual(search.groups, before)
+        search.toggleEventExclusion(child)
+        XCTAssertTrue(search.excludedEventIDs.isEmpty)
+        XCTAssertEqual(search.groups, before)
+
+        // Clearing conditions drops rows and exclusions, keeps the text.
+        search.text = "dsc"
+        search.toggleEventExclusion(child)
+        search.clearConditions()
+        XCTAssertTrue(search.groups.isEmpty)
+        XCTAssertTrue(search.excludedEventIDs.isEmpty)
+        XCTAssertEqual(search.text, "dsc")
+    }
+
+    /// The reported case: a subevent chip struck through, then a People
+    /// group built afterwards ("any of A, B" and "none of C, D"). The
+    /// exclusion must still hide the subevent's photos, and C's photos
+    /// must drop — everything the user added narrows.
+    func testChipExclusionThenPeopleConditionsAllNarrow() {
+        let parent = UUID()
+        let subevent = UUID()
+        let personA = UUID()
+        let personB = UUID()
+        let personC = UUID()
+        let personD = UUID()
+        let stack = OrganizeStack(items: [item("/Card/DSC00001.ARW")])
+        func facts(_ people: Set<UUID>, inSubevent: Bool) -> OrganizeStackFacts {
+            OrganizeStackFacts(eventIDs: inSubevent ? [subevent, parent] : [parent], personIDs: people)
         }
 
-        // Toggling back off removes just that row; the groups' own rows
-        // survive untouched.
-        search.toggleEventExclusion(child)
+        var search = OrganizeSearchFilter()
+        search.toggleEventExclusion(subevent)
+        // The panel's default "Add Condition" path, twice.
+        search.addCondition(.people([personA, personB], operator: .anyOf))
+        search.addCondition(.people([personC, personD], operator: .noneOf))
+        XCTAssertEqual(search.groups.count, 1, "the default add path must never open an OR group")
+        XCTAssertEqual(search.groups[0].rows.count, 2)
+
+        // A alone, outside the subevent: kept.
+        XCTAssertTrue(matches(stack, search: search, facts: facts([personA], inSubevent: false)))
+        // A with C: C is excluded.
+        XCTAssertFalse(matches(stack, search: search, facts: facts([personA, personC], inSubevent: false)))
+        // C alone: neither A nor B, and C is excluded.
+        XCTAssertFalse(matches(stack, search: search, facts: facts([personC], inSubevent: false)))
+        // Nobody: fails "any of A, B".
+        XCTAssertFalse(matches(stack, search: search, facts: facts([], inSubevent: false)))
+        // A inside the struck subevent: hidden by the chip.
+        XCTAssertFalse(matches(stack, search: search, facts: facts([personA], inSubevent: true)))
+
+        // Even a deliberate "or" group cannot bring the subevent back.
+        search.addOrGroup(.media([.raw]))
         XCTAssertEqual(search.groups.count, 2)
-        for group in search.groups {
-            XCTAssertEqual(group.rows.count, 1)
-            XCTAssertFalse(group.rows.contains { $0.property == .event })
+        XCTAssertFalse(matches(stack, search: search, facts: facts([personA], inSubevent: true)))
+        XCTAssertFalse(matches(stack, search: search, facts: facts([], inSubevent: true)))
+        // Outside the subevent, the "or" group widens as asked.
+        XCTAssertTrue(matches(stack, search: search, facts: facts([personC], inSubevent: false)))
+    }
+
+    /// The old chip behaviour stuffed "none of" rows into each group; a
+    /// filter still holding such rows (the reported shape: the chip's row
+    /// alone in group 1, People rows in group 2) keeps its literal OR
+    /// meaning. Nothing rewrites hand-visible rows behind the user's back.
+    func testLegacyChipRowInItsOwnGroupKeepsItsOrMeaning() {
+        let subevent = UUID()
+        let personA = UUID()
+        let personC = UUID()
+        let stack = OrganizeStack(items: [item("/Card/DSC00001.ARW")])
+        let search = filter([
+            [.events([subevent], operator: .noneOf)],
+            [.people([personA]), .people([personC], operator: .noneOf)],
+        ])
+        XCTAssertTrue(search.excludedEventIDs.isEmpty)
+        // C's photo outside the subevent passes group 1 — the OR the
+        // panel draws between the groups.
+        XCTAssertTrue(matches(stack, search: search, facts: OrganizeStackFacts(personIDs: [personC])))
+    }
+
+    func testExclusionAndOrGroupsTruthTable() {
+        let excluded = UUID()
+        let other = UUID()
+        let personA = UUID()
+        let stack = OrganizeStack(items: [item("/Card/DSC00001.ARW")])
+        let groupA = [OrganizeFilterRow.people([personA])]
+        let groupVideo = [OrganizeFilterRow.media([.video])]
+
+        // (excluded?, groups, subject in excluded?, has A?) → kept?
+        let cases: [(Bool, [[OrganizeFilterRow]], Bool, Bool, Bool)] = [
+            // No exclusion, no groups: everything.
+            (false, [], false, false, true),
+            (false, [], true, true, true),
+            // Exclusion only: drops exactly the excluded event's stacks.
+            (true, [], false, false, true),
+            (true, [], true, false, false),
+            // One group: exclusion ∧ group.
+            (true, [groupA], false, true, true),
+            (true, [groupA], false, false, false),
+            (true, [groupA], true, true, false),
+            // Two OR-groups: exclusion ∧ (A ∨ video) — RAW here, so A decides.
+            (true, [groupA, groupVideo], false, true, true),
+            (true, [groupA, groupVideo], false, false, false),
+            (true, [groupA, groupVideo], true, true, false),
+            (false, [groupA, groupVideo], true, true, true),
+            // An empty group applies nothing; the exclusion still does.
+            (true, [[OrganizeFilterRow(property: .people)]], true, true, false),
+            (true, [[OrganizeFilterRow(property: .people)]], false, false, true),
+        ]
+        for (index, (hasExclusion, groups, inExcluded, hasA, expected)) in cases.enumerated() {
+            var search = filter(groups)
+            if hasExclusion { search.toggleEventExclusion(excluded) }
+            let facts = OrganizeStackFacts(
+                eventIDs: inExcluded ? [excluded] : [other],
+                personIDs: hasA ? [personA] : []
+            )
+            XCTAssertEqual(matches(stack, search: search, facts: facts), expected, "case \(index)")
         }
+    }
+
+    func testExclusionHidesDescendantsAndScopesToTheFamily() {
+        let parent = UUID()
+        let child = UUID()
+        let outside = UUID()
+        let stack = OrganizeStack(items: [item("/Card/DSC00001.ARW")])
+        var search = OrganizeSearchFilter()
+        search.toggleEventExclusion(child)
+        search.toggleEventExclusion(outside)
+
+        // A grandchild's stack carries its ancestors, so it drops too.
+        XCTAssertFalse(matches(stack, search: search, facts: OrganizeStackFacts(eventIDs: [UUID(), child, parent])))
+        XCTAssertTrue(matches(stack, search: search, facts: OrganizeStackFacts(eventIDs: [parent])))
+
+        // A family board keeps only in-family exclusions.
+        let scoped = search.scopingEventRows(to: [parent, child])
+        XCTAssertEqual(scoped.excludedEventIDs, [child])
+        XCTAssertFalse(search.scopingEventRows(to: [parent]).hasActiveConditions)
+    }
+
+    func testDefaultAddNarrowsAndOrIsExplicit() {
+        var search = OrganizeSearchFilter()
+        search.addCondition(.media([.raw]))
+        search.addCondition(.media([.video]))
+        search.addCondition(.people([UUID()]))
+        XCTAssertEqual(search.groups.count, 1)
+        XCTAssertEqual(search.groups[0].rows.count, 3)
+
+        // After a deliberate "or", the default add goes to that last group.
+        search.addOrGroup(.media([.photo]))
+        search.addCondition(.people([UUID()]))
+        XCTAssertEqual(search.groups.map(\.rows.count), [3, 2])
     }
 }

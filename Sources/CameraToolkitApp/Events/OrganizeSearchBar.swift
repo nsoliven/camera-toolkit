@@ -3,8 +3,10 @@ import SwiftUI
 
 /// The board's filter button and its filter-builder popover. The search
 /// text lives in the window's toolbar field; this panel holds condition
-/// rows — People, Date, Event, Media — ANDed inside a group, with groups
-/// ORed. Both AND with the text. Clear All resets it all.
+/// rows — People, Date, Event, Media. Every condition added ANDs into the
+/// one group by default; an "or" group is a separate, labelled action.
+/// Above them sit the subevent chips' "Always hiding" exclusions, which
+/// AND with everything. All of it ANDs with the text; Clear All resets it.
 ///
 /// Rows only offer values the board actually has: People lists the roster
 /// members and unnamed groups the face index saw on these stacks, the date
@@ -67,6 +69,9 @@ struct OrganizeFilterButton: View {
         VStack(alignment: .leading, spacing: 0) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 8) {
+                    if !search.excludedEventIDs.isEmpty {
+                        alwaysHidingSection
+                    }
                     ForEach($search.groups) { $group in
                         if group.id != search.groups.first?.id {
                             orSeparator
@@ -74,29 +79,39 @@ struct OrganizeFilterButton: View {
                         ForEach($group.rows) { $row in
                             conditionRow(row: $row) {
                                 group.rows.removeAll { $0.id == row.id }
-                                // A second group exists to OR against —
+                                // An "or" group exists to OR against —
                                 // removing its last row removes the group.
                                 if group.rows.isEmpty, search.groups.count > 1 {
                                     search.groups.removeAll { $0.id == group.id }
                                 }
                             }
                         }
-                        addFilterButton("Add a row to this group — every row in a group must match") {
-                            group.rows.append(OrganizeFilterRow(property: .people))
+                        // Once there is an "or", each group adds to itself;
+                        // with one group the footer button below does.
+                        if search.groups.count > 1 {
+                            addConditionButton("Add a condition to this group — every condition in it must match") {
+                                group.rows.append(OrganizeFilterRow(property: .people))
+                            }
                         }
                     }
-                    if !search.groups.isEmpty {
-                        orSeparator
-                    }
-                    addFilterButton(search.groups.isEmpty
-                        ? "Add a condition row"
-                        : "Start another group — a stack stays when any group matches") {
-                        search.groups.append(OrganizeFilterGroup(
-                            rows: [OrganizeFilterRow(property: .people)]
-                        ))
+                    HStack(spacing: 8) {
+                        if search.groups.count <= 1 {
+                            addConditionButton(search.groups.isEmpty
+                                ? "Add a condition"
+                                : "Add another condition — photos must match every condition") {
+                                search.addCondition(OrganizeFilterRow(property: .people))
+                            }
+                        }
+                        if !search.groups.isEmpty {
+                            Button("Add “Or” Group…") {
+                                search.addOrGroup(OrganizeFilterRow(property: .people))
+                            }
+                            .controlSize(.small)
+                            .help("Start a separate set of conditions — photos matching either set stay")
+                        }
                     }
                     if search.groups.isEmpty {
-                        Text("Rows in a group all have to match; groups joined by “or” match either way.")
+                        Text("Each condition you add narrows the board — photos must match all of them.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
@@ -124,6 +139,40 @@ struct OrganizeFilterButton: View {
         .frame(width: 400)
     }
 
+    /// The board-level exclusions the subevent chips write — hidden
+    /// whatever the conditions below say, so they sit above them.
+    private var alwaysHidingSection: some View {
+        let events = workspace.sidebarEvents.map(\.event)
+        let picked = events.filter { search.excludedEventIDs.contains($0.id) }
+        let stale = search.excludedEventIDs
+            .subtracting(events.map(\.id))
+            .sorted { $0.uuidString < $1.uuidString }
+        return VStack(alignment: .leading, spacing: 6) {
+            Text("Always hiding")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+            FlowLayout(horizontalSpacing: 5, verticalSpacing: 5) {
+                ForEach(picked) { event in
+                    valueChip(
+                        workspace.eventTitle(event),
+                        color: EventPalette.color(for: event.id),
+                        help: "Photos in this event stay hidden, whatever the conditions below say"
+                    ) {
+                        search.excludedEventIDs.remove(event.id)
+                    }
+                }
+                ForEach(stale, id: \.self) { id in
+                    valueChip("Deleted event", symbol: "questionmark.folder") {
+                        search.excludedEventIDs.remove(id)
+                    }
+                }
+            }
+        }
+        .padding(7)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
     /// The "or" line between groups — rows above and below it OR.
     private var orSeparator: some View {
         HStack(spacing: 8) {
@@ -135,9 +184,9 @@ struct OrganizeFilterButton: View {
         }
     }
 
-    private func addFilterButton(_ help: String, action: @escaping () -> Void) -> some View {
+    private func addConditionButton(_ help: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            Label("Filter", systemImage: "plus")
+            Label("Add Condition", systemImage: "plus")
         }
         .controlSize(.small)
         .help(help)
