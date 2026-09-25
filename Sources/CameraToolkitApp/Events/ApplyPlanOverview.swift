@@ -231,6 +231,8 @@ struct ApplyPlanOverview: Sendable {
     /// Per event, the files whose name is already taken there — identical
     /// copies and different files. Never counted in `moveCount`.
     var collisions: [ApplyCollisionSummary]
+    /// The same collisions as rows the owner decides on, one per taken name.
+    var collisionItems: [ApplyCollisionItem]
 
     var duplicateCount: Int { collisions.reduce(0) { $0 + $1.duplicateCount } }
     var conflictCount: Int { collisions.reduce(0) { $0 + $1.conflictCount } }
@@ -264,6 +266,7 @@ struct ApplyPlanOverview: Sendable {
         }
         destinationDrives = drives
         collisions = ApplyStatusWording.summaries(for: plan)
+        collisionItems = ApplyCollisionResolution.items(for: plan)
     }
 
     // MARK: - Routes (pure, unit-tested)
@@ -345,11 +348,10 @@ struct ApplyPlanOverview: Sendable {
     var fileCount: Int { moveCount + copyCount }
 
     var sentence: String {
-        if fileCount == 0, !collisions.isEmpty {
-            // Nothing is renamed or copied — say what is blocking instead
-            // of implying Apply will do something.
-            let lines = collisions.flatMap { [$0.duplicateLine, $0.conflictLine].compactMap { $0 } }
-            return "Nothing can move yet. " + lines.joined(separator: ". ") + "."
+        if fileCount == 0, !collisionItems.isEmpty {
+            // Only taken names are left: say what needs deciding instead
+            // of implying Apply will do something on its own.
+            return ApplyCollisionResolution.decisionSentence(for: collisionItems)
         }
         return Self.sentence(
             moveCount: moveCount,
@@ -360,9 +362,36 @@ struct ApplyPlanOverview: Sendable {
         )
     }
 
+    /// The confirm button with every taken name left where it is.
     var primaryActionTitle: String {
-        if fileCount == 0, !collisions.isEmpty { return "Nothing to Move" }
-        return Self.primaryActionTitle(moveCount: moveCount, copyCount: copyCount)
+        primaryActionTitle(with: ApplyCollisionDecisions())
+    }
+
+    /// The confirm button for the owner's current choices.
+    func primaryActionTitle(with decisions: ApplyCollisionDecisions) -> String {
+        Self.primaryActionTitle(
+            moveCount: moveCount,
+            copyCount: copyCount,
+            keepBothFiles: decisions.keepBoth.count,
+            keepBothConflicts: decisions.keepBothConflictCount,
+            trashCount: decisions.trash.count
+        )
+    }
+
+    func isPrimaryEnabled(with decisions: ApplyCollisionDecisions) -> Bool {
+        fileCount + decisions.keepBoth.count + decisions.trash.count > 0
+    }
+
+    /// "Skip These, Move 40 Files": apply the rest and leave every taken
+    /// name where it is. Nil when there is nothing else to apply, or when
+    /// the choices already leave them all.
+    func skipActionTitle(with decisions: ApplyCollisionDecisions) -> String? {
+        Self.skipActionTitle(moveCount: moveCount, copyCount: copyCount, hasPendingDecisions: !decisions.isEmpty)
+    }
+
+    /// "Leave Here" when only taken names remain — closing leaves them.
+    var cancelTitle: String {
+        Self.cancelTitle(fileCount: fileCount, hasCollisions: !collisionItems.isEmpty)
     }
 
     var safetyFacts: [ApplySafetyFact] {
@@ -436,10 +465,49 @@ struct ApplyPlanOverview: Sendable {
         }
     }
 
+    /// The confirm button once taken names have choices. Keep Both files
+    /// (with their sidecars) count as moves; identical copies bound for
+    /// Trash are named last, with an ellipsis because Trash asks first.
+    ///
+    ///     Keep Both & Move 1 File
+    ///     Move 41 Files (Keep Both for 1)
+    ///     Move Duplicate to Trash…
+    static func primaryActionTitle(
+        moveCount: Int,
+        copyCount: Int,
+        keepBothFiles: Int,
+        keepBothConflicts: Int,
+        trashCount: Int
+    ) -> String {
+        let base = moveCount + copyCount
+        let trashTail = trashCount > 0 ? ", Then Trash \(plural(trashCount, "Duplicate"))…" : ""
+        if base == 0, keepBothFiles == 0 {
+            return trashCount > 0 ? "Move Duplicate\(trashCount == 1 ? "" : "s") to Trash…" : "Nothing to Move"
+        }
+        if base == 0 {
+            return "Keep Both & Move \(keepBothFiles.formatted()) \(keepBothFiles == 1 ? "File" : "Files")" + trashTail
+        }
+        let keep = keepBothConflicts > 0 ? " (Keep Both for \(keepBothConflicts.formatted()))" : ""
+        return primaryActionTitle(moveCount: moveCount + keepBothFiles, copyCount: copyCount) + keep + trashTail
+    }
+
+    static func skipActionTitle(moveCount: Int, copyCount: Int, hasPendingDecisions: Bool) -> String? {
+        guard moveCount + copyCount > 0, hasPendingDecisions else { return nil }
+        return "Skip These, " + primaryActionTitle(moveCount: moveCount, copyCount: copyCount)
+    }
+
+    static func cancelTitle(fileCount: Int, hasCollisions: Bool) -> String {
+        switch (fileCount > 0, hasCollisions) {
+        case (false, true): "Leave Here"
+        case (false, false): "Close"
+        default: "Cancel"
+        }
+    }
+
     /// Two or three short safety lines. Undo applies only to moves (the
     /// journal records renames); the checksum line appears only when the
     /// plan copies something.
-    static func safetyFacts(moveCount: Int, copyCount: Int) -> [ApplySafetyFact] {
+    static func safetyFacts(moveCount: Int, copyCount: Int, trashCount: Int = 0) -> [ApplySafetyFact] {
         var facts = [ApplySafetyFact(
             symbol: "checkmark.circle",
             text: "Nothing is overwritten. A file already at the destination is left alone."
@@ -454,6 +522,12 @@ struct ApplyPlanOverview: Sendable {
             facts.append(ApplySafetyFact(
                 symbol: "checkmark.shield",
                 text: "Copies are checksum-verified, and the originals stay on their drive."
+            ))
+        }
+        if trashCount > 0 {
+            facts.append(ApplySafetyFact(
+                symbol: "trash",
+                text: "Trash asks first. Duplicates go to the drive’s _Trash and can be restored."
             ))
         }
         return facts

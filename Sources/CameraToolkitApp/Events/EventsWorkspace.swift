@@ -2551,6 +2551,12 @@ final class EventsWorkspace {
     }
 
     func performApply(_ plan: OrganizeApplyPlan) {
+        performApply(plan, thenTrash: [])
+    }
+
+    /// `thenTrash`: identical copies whose Trash confirmation opens once the
+    /// moves have landed (the job would refuse a Trash while it runs).
+    private func performApply(_ plan: OrganizeApplyPlan, thenTrash trash: [ApplyCollision]) {
         pendingApplyPlan = nil
         runningApply = nil
         let moves = plan.groups.flatMap(\.moves)
@@ -2578,6 +2584,7 @@ final class EventsWorkspace {
                 },
                 completion: { [weak self] report in
                     self?.didMove(report: report, events: affectedEvents)
+                    if !trash.isEmpty { self?.requestTrashApplyDuplicates(trash) }
                     return ApplyStatusWording.afterApply(
                         movedCount: report.moved.count,
                         movedBytes: report.movedBytes,
@@ -2616,9 +2623,15 @@ final class EventsWorkspace {
     /// after an Apply); it is dropped when another assignment in the event
     /// already points at that file.
     func requestTrashApplyDuplicates(_ plan: OrganizeApplyPlan) {
+        requestTrashApplyDuplicates(plan.groups.flatMap(\.duplicates))
+    }
+
+    /// The chosen identical copies only (the sheet's per-row "Trash
+    /// Duplicate"), through the same confirmation.
+    func requestTrashApplyDuplicates(_ duplicates: [ApplyCollision]) {
         pendingApplyPlan = nil
         refreshIndexIfNeeded()
-        let duplicates = plan.groups.flatMap(\.duplicates)
+        let duplicates = duplicates.filter { $0.kind == .identicalCopy }
         guard !duplicates.isEmpty else { return }
         let roots = unsortedLocations.map { location in
             (location, EventStorageLocations.pathKey(DashboardModel.expandedPath(location.path)) + "/")
@@ -2668,6 +2681,100 @@ final class EventsWorkspace {
                 && other.deviceID == assignment.deviceID
                 && other.relativePath.lowercased() == assignment.relativePath.lowercased()
                 && Self.sourceKey(other) != key
+        }
+    }
+
+    /// The Apply sheet's primary button with the owner's choices for taken
+    /// names. Plain moves and Keep Both renames run as one journaled job, so
+    /// one Undo reverses both; copies are queued as usual. Identical copies
+    /// chosen for Trash open the organizer Trash confirmation — right away
+    /// when nothing moves, otherwise once the move job has finished — and
+    /// nothing is trashed until the owner confirms there.
+    func performApply(_ plan: OrganizeApplyPlan, resolving decisions: ApplyCollisionDecisions) {
+        let keep = decisions.keepBoth
+        let trash = decisions.trash
+        guard !keep.isEmpty else {
+            if plan.moveCount == 0 {
+                if plan.copyCount > 0 { performApply(plan) }
+                if !trash.isEmpty { requestTrashApplyDuplicates(trash) }
+                pendingApplyPlan = nil
+                return
+            }
+            performApply(plan, thenTrash: trash)
+            return
+        }
+        pendingApplyPlan = nil
+        guard !model.isBusy, !model.isStorageBenchmarkRunning else {
+            model.statusMessage = "Another file job is already running. Wait for it to finish, then try again."
+            return
+        }
+        runningApply = nil
+        let moves = plan.groups.flatMap(\.moves)
+        let journalFolder = self.journalFolder
+        let boundaries = plan.pruneBoundaries
+        let title = plan.title
+        let keptSources = Set(keep.map(\.move.sourcePath))
+        let keptEvents = plan.groups.filter { group in group.conflicts.contains { keptSources.contains($0.move.sourcePath) } }.map(\.event.id)
+        let affectedEvents = plan.groups.map(\.event.id)
+        let conflictCount = decisions.keepBothConflictCount
+        let jobID = model.runBackgroundJob(
+            action: .organize,
+            runningNote: "Moving \(moves.count + keep.count) file(s) into their events",
+            logTitle: title,
+            logDetail: "Renamed files on the same drive. Files whose name was taken moved in under a free “(N)” name. Nothing was replaced.",
+            operation: { progress in
+                try DriveMoveService().keepBoth(
+                    keep,
+                    plainMoves: moves,
+                    title: title,
+                    journalFolder: journalFolder,
+                    pruneBoundaries: boundaries
+                ) { update in
+                    progress(DashboardModel.jobUpdate(from: update, notePrefix: "Organizing", command: ""))
+                }
+            },
+            completion: { [weak self] outcome in
+                guard let self else { return "" }
+                applyAssignmentChange(
+                    AssignmentChange(title: title, removed: outcome.removedAssignments, added: outcome.addedAssignments),
+                    touching: nil
+                )
+                didMove(report: outcome.report, events: affectedEvents)
+                // Only the files that really moved stop counting as blocked;
+                // a row left here still is.
+                let movedKeys = Set(outcome.report.moved.map { EventStorageLocations.pathKey($0.sourcePath) })
+                for eventID in keptEvents {
+                    let rest = (applyConflictSourceKeys[eventID] ?? []).subtracting(movedKeys)
+                    applyConflictSourceKeys[eventID] = rest.isEmpty ? nil : rest
+                }
+                if !trash.isEmpty { requestTrashApplyDuplicates(trash) }
+                let movedKept = outcome.report.moved.count { keptSources.contains($0.sourcePath) }
+                let skipped = outcome.report.skipped.first.map { " \(outcome.report.skipped.count) left in place: \($0.reason)" } ?? ""
+                return "Moved \(outcome.report.moved.count) file(s) (\(outcome.report.movedBytes.formattedBytes)) into their events"
+                    + (movedKept > 0 ? ", kept both for \(conflictCount) taken name\(conflictCount == 1 ? "" : "s")" : "")
+                    + ". Nothing was replaced — Undo puts them back.\(skipped)"
+            }
+        )
+        if let jobID, !moves.isEmpty {
+            runningApply = RunningApplyPlan(jobID: jobID, title: plan.title, groups: plan.groups)
+        }
+        if jobID != nil {
+            enqueueCopies(plan)
+        }
+    }
+
+    private func enqueueCopies(_ plan: OrganizeApplyPlan) {
+        for group in plan.groups {
+            for batch in group.copies {
+                model.enqueueTransfer(
+                    files: batch.files,
+                    sourcePath: batch.sourceRoot,
+                    destinationPath: batch.destinationRoot,
+                    eventID: group.event.id,
+                    eventName: locations.displayName(for: group.event),
+                    deviceID: batch.deviceID
+                )
+            }
         }
     }
 

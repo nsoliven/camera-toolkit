@@ -141,7 +141,7 @@ public enum ApplyCollisionCheck {
 
     /// Source folder + base name up to the first dot, lowercased:
     /// `DSC0001.ARW`, `DSC0001.XMP` and `DSC0001.ARW.xmp` share one key.
-    static func groupKey(_ path: String) -> String {
+    public static func groupKey(_ path: String) -> String {
         let folder = (path as NSString).deletingLastPathComponent.lowercased()
         return folder + "\u{0}" + KeepBothNaming.split((path as NSString).lastPathComponent).base.lowercased()
     }
@@ -166,13 +166,16 @@ public enum KeepBothNaming {
     /// the file and its `._` AppleDouble — and not already claimed by this
     /// batch. Returns the renamed moves in input order. The free check is
     /// advisory: the rename itself is exclusive and re-checks.
+    /// `reserved` holds destination paths other moves in the same batch
+    /// will take (the plain Apply moves), so a "(N)" name never races one.
     public static func renamedMoves(
         for moves: [DriveMove],
+        reserved: [DriveMove] = [],
         maxAttempts: Int = 999,
         exists: ((String) -> Bool)? = nil
     ) -> [DriveMove]? {
         let exists = exists ?? { DriveMoveService.exists($0) }
-        var claimed: Set<String> = []
+        var claimed = Set(reserved.map { $0.destinationPath.lowercased() })
         var renamed: [String: DriveMove] = [:]
         var order: [String] = []
         var groups: [String: [DriveMove]] = [:]
@@ -228,15 +231,19 @@ extension DriveMoveService {
     /// an ordinary journaled `apply` — exclusive renames, nothing replaced,
     /// Undo moves the files back to their original names — and each
     /// assignment's relative path follows its file's new name.
+    ///
+    /// `plainMoves` are ordinary Apply renames that go in the same journal,
+    /// so "Move 40 Files (Keep Both for 1)" is one job and one Undo.
     public func keepBoth(
         _ conflicts: [ApplyCollision],
+        plainMoves: [DriveMove] = [],
         title: String,
         journalFolder: URL?,
         pruneBoundaries: [URL] = [],
         progress: FileOperationProgressHandler? = nil
     ) throws -> KeepBothOutcome {
         let moves = conflicts.map(\.move)
-        guard let renamed = KeepBothNaming.renamedMoves(for: moves) else {
+        guard let renamed = KeepBothNaming.renamedMoves(for: moves, reserved: plainMoves) else {
             throw ToolkitError.commandFailed("No free “(N)” name was found next to those files. Nothing was moved.")
         }
         var removed: [PhotoEventAssignment] = []
@@ -253,7 +260,7 @@ extension DriveMoveService {
             assignmentBySource[URL(fileURLWithPath: move.sourcePath).standardizedFileURL.path] = (old, new)
         }
         let report = try apply(
-            renamed,
+            plainMoves + renamed,
             title: title,
             journalFolder: journalFolder,
             removedAssignments: removed,
@@ -267,5 +274,49 @@ extension DriveMoveService {
             removedAssignments: moved.map(\.old),
             addedAssignments: moved.map(\.new)
         )
+    }
+}
+
+/// What the Apply sheet shows about each side of a taken name: size and
+/// capture time. Read off the main actor; nothing here writes.
+public struct ApplyCollisionFileFacts: Equatable, Sendable {
+    public var byteCount: Int64?
+    /// EXIF capture time when the file carries one.
+    public var captureDate: Date?
+    public var modifiedAt: Date?
+
+    public init(byteCount: Int64?, captureDate: Date?, modifiedAt: Date?) {
+        self.byteCount = byteCount
+        self.captureDate = captureDate
+        self.modifiedAt = modifiedAt
+    }
+
+    /// Capture time, else the file date.
+    public var bestDate: Date? { captureDate ?? modifiedAt }
+}
+
+extension ApplyCollisionCheck {
+    /// One `lstat` and a small header read. Missing files give empty facts.
+    public static func facts(atPath path: String) -> ApplyCollisionFileFacts {
+        var info = stat()
+        guard lstat(path, &info) == 0 else {
+            return ApplyCollisionFileFacts(byteCount: nil, captureDate: nil, modifiedAt: nil)
+        }
+        let modified = Date(timeIntervalSince1970: TimeInterval(info.st_mtimespec.tv_sec) + TimeInterval(info.st_mtimespec.tv_nsec) / 1e9)
+        let isRegular = (info.st_mode & S_IFMT) == S_IFREG
+        return ApplyCollisionFileFacts(
+            byteCount: Int64(info.st_size),
+            captureDate: isRegular ? CaptureDateReader.captureDate(of: URL(fileURLWithPath: path)) : nil,
+            modifiedAt: modified
+        )
+    }
+
+    /// The name Keep Both would pick right now for a conflict and the
+    /// sidecars held with it ("DSC0001 (2).ARW"), or nil when no free
+    /// number is found. Advisory, like `renamedMoves`: the rename re-checks.
+    public static func keepBothName(for conflict: ApplyCollision, companions: [ApplyCollision] = []) -> String? {
+        guard let renamed = KeepBothNaming.renamedMoves(for: [conflict.move] + companions.map(\.move)),
+              let first = renamed.first else { return nil }
+        return (first.destinationPath as NSString).lastPathComponent
     }
 }

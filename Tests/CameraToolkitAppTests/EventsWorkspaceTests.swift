@@ -3447,6 +3447,63 @@ extension EventsWorkspaceTests {
         }
     }
 
+    /// The sheet's primary button with its default choices: the free name
+    /// moves and the taken one keeps both, in one job — one Undo reverses
+    /// both, and the file that already had the name is never touched.
+    func testApplyWithDefaultChoicesMovesAndKeepsBothInOneUndoableJob() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let unsorted = root.appendingPathComponent("Drive/Found Folder", isDirectory: true)
+            let clash = try writeOrganizerARW(unsorted.appendingPathComponent("DSC00001.ARW"), "2026:08:19 10:00:00", "000")
+            let clean = try writeOrganizerARW(unsorted.appendingPathComponent("DSC00003.ARW"), "2026:08:19 10:10:00", "000")
+            let location = addUnsorted(unsorted, to: model)
+            let eventID = try XCTUnwrap(workspace.createEvent(name: "Beach Day", date: organizerDay("2026-08-19"), policy: .buffer))
+            let folder = cardCopy(root, event: "2026-08-19 Beach Day")
+            let existing = try organizerWrite(folder.appendingPathComponent("DSC00001.ARW"), "a different photo")
+
+            workspace.scan(location)
+            try await waitUntil { workspace.sources[location.id]?.result != nil }
+            let result = try XCTUnwrap(workspace.sources[location.id]?.result)
+            workspace.assign(stackIDs: Set(result.stacks.map(\.id)), from: location.id, to: eventID)
+            let plan = EventsWorkspace.buildApplyPlan(
+                events: [try XCTUnwrap(workspace.event(eventID))],
+                configuration: model.configuration,
+                locations: workspace.locations,
+                onlyUnder: unsorted.path,
+                title: "Apply",
+                unsortedRoots: [unsorted]
+            )
+            let overview = ApplyPlanOverview(plan: plan)
+            let decisions = ApplyCollisionResolution.decisions(
+                for: overview.collisionItems,
+                choices: ApplyCollisionResolution.defaultChoices(for: overview.collisionItems)
+            )
+            XCTAssertEqual(overview.primaryActionTitle(with: decisions), "Move 2 Files (Keep Both for 1)")
+
+            workspace.performApply(plan, resolving: decisions)
+            try await waitUntil { !model.isBusy && workspace.latestMoveJournalTitle == "Apply" }
+            XCTAssertTrue(FileManager.default.fileExists(atPath: folder.appendingPathComponent("DSC00003.ARW").path))
+            XCTAssertTrue(FileManager.default.fileExists(atPath: folder.appendingPathComponent("DSC00001 (2).ARW").path))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: clash.path))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: clean.path))
+            XCTAssertEqual(try String(contentsOf: existing, encoding: .utf8), "a different photo")
+            XCTAssertEqual(
+                Set(model.configuration.photoEventAssignments.map(\.relativePath)),
+                ["DSC00001 (2).ARW", "DSC00003.ARW"]
+            )
+            XCTAssertNil(workspace.pendingTrash)
+
+            workspace.undoLastMove()
+            try await waitUntil { !model.isBusy && FileManager.default.fileExists(atPath: clash.path) }
+            XCTAssertTrue(FileManager.default.fileExists(atPath: clean.path))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: folder.appendingPathComponent("DSC00001 (2).ARW").path))
+            XCTAssertEqual(try String(contentsOf: existing, encoding: .utf8), "a different photo")
+            XCTAssertEqual(
+                Set(model.configuration.photoEventAssignments.map(\.relativePath)),
+                ["DSC00001.ARW", "DSC00003.ARW"]
+            )
+        }
+    }
+
     /// An identical copy already in the event is not pending, the sheet
     /// shows it instead of "Move 1 File", and "Move Duplicate to Trash"
     /// goes through the organizer Trash confirmation into `_Trash` —
@@ -3477,7 +3534,7 @@ extension EventsWorkspaceTests {
             // Every file is blocked: the button does not pretend to move.
             let overview = ApplyPlanOverview(plan: plan)
             XCTAssertEqual(overview.primaryActionTitle, "Nothing to Move")
-            XCTAssertEqual(overview.sentence, "Nothing can move yet. 1 photo is already in Beach Day (identical copy).")
+            XCTAssertEqual(overview.sentence, "DSC00002.ARW is already in Beach Day as an identical copy.")
             XCTAssertEqual(model.statusMessage, "1 photo is already in Beach Day (identical copy) — open Apply to resolve.")
 
             // Marked as already in the event: not "nothing moves until you Apply".

@@ -182,6 +182,68 @@ final class ApplyCollisionCheckTests: XCTestCase {
         }
     }
 
+    func testRenamedMovesSkipNamesReservedByPlainMovesInTheSameBatch() {
+        let conflict = DriveMove(sourcePath: "/tmp/A/DSC00001.ARW", destinationPath: "/Event/DSC00001.ARW", byteCount: 1)
+        // A plain move in the same Apply already lands on "(2)".
+        let plain = DriveMove(sourcePath: "/tmp/B/DSC00001 (2).ARW", destinationPath: "/Event/DSC00001 (2).ARW", byteCount: 1)
+        let renamed = KeepBothNaming.renamedMoves(for: [conflict], reserved: [plain]) { _ in false }
+        XCTAssertEqual(renamed?.map(\.destinationPath), ["/Event/DSC00001 (3).ARW"])
+    }
+
+    /// "Move 2 Files (Keep Both for 1)": the plain move and the Keep Both
+    /// rename share one journal, so one Undo reverses both.
+    func testKeepBothWithPlainMovesIsOneJournalAndOneUndo() throws {
+        try withTemporaryDirectory { root in
+            let unsorted = root.appendingPathComponent("Unsorted", isDirectory: true)
+            let event = root.appendingPathComponent("Event", isDirectory: true)
+            let journals = root.appendingPathComponent("Journals", isDirectory: true)
+            let raw = try writeFile(unsorted.appendingPathComponent("DSC00001.ARW"), "new photo")
+            let clean = try writeFile(unsorted.appendingPathComponent("DSC00002.ARW"), "free name")
+            let existing = try writeFile(event.appendingPathComponent("DSC00001.ARW"), "older photo")
+            let conflicts = ApplyCollisionCheck.partition([ApplyMoveCandidate(
+                move: DriveMove(sourcePath: raw.path, destinationPath: event.appendingPathComponent("DSC00001.ARW").path, byteCount: 1),
+                assignment: assignment(unsorted, "DSC00001.ARW", size: 1)
+            )]).conflicts
+            let plain = DriveMove(sourcePath: clean.path, destinationPath: event.appendingPathComponent("DSC00002.ARW").path, byteCount: 1)
+
+            let outcome = try DriveMoveService().keepBoth(conflicts, plainMoves: [plain], title: "Apply", journalFolder: journals)
+            XCTAssertEqual(outcome.report.moved.count, 2)
+            XCTAssertEqual(try text(event.appendingPathComponent("DSC00001 (2).ARW")), "new photo")
+            XCTAssertEqual(try text(event.appendingPathComponent("DSC00002.ARW")), "free name")
+            XCTAssertEqual(try text(existing), "older photo")
+            XCTAssertEqual(outcome.addedAssignments.map(\.relativePath), ["DSC00001 (2).ARW"])
+            let journalFiles = try FileManager.default.contentsOfDirectory(atPath: journals.path).filter { $0.hasSuffix(".json") }
+            XCTAssertEqual(journalFiles.count, 1)
+
+            let latest = try XCTUnwrap(DriveMoveService.latestUndoableJournal(in: journals))
+            _ = try DriveMoveService().undo(journalURL: latest.url)
+            XCTAssertEqual(try text(raw), "new photo")
+            XCTAssertEqual(try text(clean), "free name")
+            XCTAssertEqual(try text(existing), "older photo")
+        }
+    }
+
+    func testFactsReadSizeAndDatesWithoutWritingAndKeepBothNamePreview() throws {
+        try withTemporaryDirectory { root in
+            let source = try writeFile(root.appendingPathComponent("Unsorted/DSC00001.ARW"), "12345")
+            try writeFile(root.appendingPathComponent("Event/DSC00001.ARW"), "older")
+            try writeFile(root.appendingPathComponent("Event/DSC00001 (2).ARW"), "taken")
+            let facts = ApplyCollisionCheck.facts(atPath: source.path)
+            XCTAssertEqual(facts.byteCount, 5)
+            XCTAssertNil(facts.captureDate, "no EXIF in a synthetic file")
+            XCTAssertNotNil(facts.modifiedAt)
+            XCTAssertEqual(ApplyCollisionCheck.facts(atPath: root.appendingPathComponent("missing").path).byteCount, nil)
+
+            let conflict = ApplyCollision(
+                kind: .nameConflict,
+                move: DriveMove(sourcePath: source.path, destinationPath: root.appendingPathComponent("Event/DSC00001.ARW").path, byteCount: 5),
+                assignment: nil,
+                existingByteCount: 5
+            )
+            XCTAssertEqual(ApplyCollisionCheck.keepBothName(for: conflict), "DSC00001 (3).ARW")
+        }
+    }
+
     /// Regression: journals wrote whole-second dates while an assignment's
     /// identity rounds its modification time, so a file modified at .5 s or
     /// later came back from the journal as a different assignment and Undo
