@@ -365,6 +365,12 @@ final class EventsWorkspace {
     /// file is on it — and a status line says dates are still being read
     /// until the dated build lands.
     var eventDateReadRemainders: [UUID: Int] = [:]
+    /// Per event, set only when some of its storage places are offline
+    /// (not mounted, or mounted but not answering). When nothing the board
+    /// could read is reachable (`isOffline`), the board shows a terminal
+    /// "plug in the drive" state instead of a spinner; otherwise it loads
+    /// what is reachable and names the rest.
+    var eventReachability: [UUID: EventReachabilityReport] = [:]
     var eventImmichStatuses: [UUID: [String: ImmichCatalogStatus]] = [:]
     var discoveredDriveEvents: [DiscoveredDriveEvent] = []
     var newEventRequest: NewEventRequest?
@@ -432,6 +438,18 @@ final class EventsWorkspace {
     /// first read to prove the provisional grid already published every
     /// implied file.
     @ObservationIgnored var captureDateReadProbe: (@Sendable (URL) -> CaptureTimestamp?)?
+    /// Test seam: the mount table `refreshEvent` classifies places
+    /// against — nil in production, where `VolumeInfo.mountedVolumePaths`
+    /// reads the real one. Lets a test "mount" a `/Volumes/<name>` that
+    /// does not exist without touching a real volume.
+    @ObservationIgnored var mountedVolumesProvider: (@Sendable () -> Set<String>)?
+    /// Test seam: the bounded existence stat of each place root — nil in
+    /// production (`FileManager.fileExists`). A test parks it to stand in
+    /// for a hung SMB share.
+    @ObservationIgnored var placeResponseProbe: EventReachability.ResponseProbe?
+    /// How long one place root may take to answer before the refresh
+    /// treats its volume as not responding.
+    @ObservationIgnored var placeResponseTimeout: TimeInterval = EventReachability.defaultTimeout
     @ObservationIgnored private var loadedCaptureDateCache: CaptureDateCache?
     @ObservationIgnored private var lastConnectivityRefresh = Date.distantPast
     @ObservationIgnored private var connectivityRefreshTask: Task<Void, Never>?
@@ -1459,7 +1477,7 @@ final class EventsWorkspace {
             if case .event(let id) = selection { return id }
             return nil
         }()
-        for eventID in Set(presence.keys).union(eventStacks.keys) {
+        for eventID in Set(presence.keys).union(eventStacks.keys).union(eventReachability.keys) {
             if scopeToChanged,
                eventID != visibleEventID,
                !eventRootsChanged(eventID, changedRoots: changedRoots) {
@@ -1491,7 +1509,15 @@ final class EventsWorkspace {
     /// True when the event's storage roots live on a volume whose mount
     /// state just changed — the scoped-refresh test.
     private func eventRootsChanged(_ eventID: UUID, changedRoots: Set<String>) -> Bool {
-        guard let event = event(eventID) else { return false }
+        guard event(eventID) != nil else { return false }
+        // An event waiting on an offline card (or any other offline place)
+        // reloads when that place's volume comes back.
+        if let report = eventReachability[eventID],
+           report.states.contains(where: { place, state in
+               state.isOffline && place.volumeRoot.map { changedRoots.contains($0.standardizedFileURL.path) } == true
+           }) {
+            return true
+        }
         let locations = self.locations
         return [
             locations.driveRoot(for: .buffer),
@@ -2057,7 +2083,9 @@ final class EventsWorkspace {
         // pipeline's results instead of being overwritten by them.
         let revisionAtStart = model.catalogStateRevision
         let existingFiles = eventStacks[eventID]?.flatMap(\.files)
-        let gridIsCurrent = existingFiles != nil
+        // An empty grid is an answer ("nothing reachable"), never a board
+        // worth keeping: once a drive comes back it must rebuild.
+        let gridIsCurrent = existingFiles?.isEmpty == false
             && eventGridRevisions[eventID] == revisionAtStart
             && eventBuildRemainders[eventID] == nil
             && eventDateReadRemainders[eventID] == nil
@@ -2075,8 +2103,37 @@ final class EventsWorkspace {
         let memberByID = Dictionary(uniqueKeysWithValues: members.map { ($0.id, $0) })
         let openedAssignments = assignmentsByEvent[eventID] ?? []
         let familyAssignments = members.flatMap { assignmentsByEvent[$0.id] ?? [] }
+
+        // Reachability first, before any per-file work: the mount table
+        // answers unplugged drives without touching a path, and every
+        // other place root gets one existence stat off this actor, bounded
+        // by a timeout so a hung share can never hold the board. A volume
+        // that does not answer is treated as unmounted for the rest of
+        // this refresh — nothing below stats a file on it.
+        let mountedAll = mountedVolumesProvider?() ?? VolumeInfo.mountedVolumePaths()
+        let places = EventReachability.places(members: members, assignments: familyAssignments, locations: locations)
+        let report = await EventReachability.check(
+            places: places,
+            mountedVolumes: mountedAll,
+            timeout: placeResponseTimeout,
+            probe: placeResponseProbe
+        )
+        guard refreshGenerations[eventID] == generation else { return }
+        eventReachability[eventID] = report.offlinePlaces.isEmpty ? nil : report
+        let mounted = mountedAll.subtracting(report.unresponsiveVolumes)
+        if report.isOffline {
+            // Terminal right away: nothing the board could read is
+            // reachable, so a grid left from before the drive went away
+            // only points at dead paths. The sweep below still runs — it
+            // is string work plus mount-table answers here, never a stat —
+            // to keep the storage strip truthful.
+            eventStacks[eventID] = []
+            eventBuildRemainders[eventID] = nil
+            eventDateReadRemainders[eventID] = nil
+        }
+
         let driveAvailableByMember = Dictionary(uniqueKeysWithValues: members.map { member in
-            (member.id, VolumeInfo.isAvailable(locations.driveRoot(for: locations.resolvedPolicy(for: member))))
+            (member.id, VolumeInfo.isAvailable(locations.driveRoot(for: locations.resolvedPolicy(for: member)), mountedVolumes: mounted))
         })
         let resolve: @Sendable (PhotoEventAssignment) -> String?
         if let eventPathResolver {
@@ -2104,7 +2161,7 @@ final class EventsWorkspace {
         // an empty grid. An event that already has a board keeps every
         // tile it has while the pipeline re-verifies; it never shrinks
         // back to the first screen.
-        if driveAvailable && eventStacks[eventID] == nil {
+        if driveAvailable && eventStacks[eventID]?.isEmpty != false {
             firstPaint = await Task.detached(priority: .userInitiated) { () -> EventImpliedGrid in
                 let earliest = openedAssignments
                     .sorted { ($0.modifiedAt, $0.relativePath) < ($1.modifiedAt, $1.relativePath) }
@@ -2190,6 +2247,7 @@ final class EventsWorkspace {
                     event: member,
                     assignments: assignmentsByEvent[member.id] ?? [],
                     locations: locations,
+                    mountedVolumes: mounted,
                     probe: probe,
                     pauseGate: gate
                 ) else { cancelled = true; break }
@@ -2284,6 +2342,18 @@ final class EventsWorkspace {
         output: EventRefreshOutput?
     ) async {
         defer { resumePresenceWaiters(for: eventID, appliedGeneration: generation) }
+        // Runs before the waiters resume. The current generation always
+        // leaves the board a grid: when nothing is on disk and nothing was
+        // drawn (every place offline or empty), pass one and the build both
+        // skipped and an empty sweep equals an empty build, so no path
+        // below assigns one — and the board sat on "Loading…" forever. An
+        // empty grid is the terminal answer; the board turns it into "not
+        // connected" or "not reachable".
+        defer {
+            if refreshGenerations[eventID] == generation, eventStacks[eventID] == nil {
+                eventStacks[eventID] = []
+            }
+        }
         guard refreshGenerations[eventID] == generation else { return }
         presenceTasks[eventID] = nil
         // This generation's pipeline is done — build landed or was

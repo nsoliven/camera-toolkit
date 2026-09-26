@@ -60,8 +60,14 @@ struct EventBoardView: View {
                 .flatMap(\.stacks)
             let matched = groups.reduce(0) { $0 + $1.stacks.count }
             let title = workspace.eventTitle(event)
+            let reachability = workspace.eventReachability[eventID]
             VStack(spacing: 0) {
-                if stacks != nil {
+                if let reachability, reachability.isOffline || stacks?.isEmpty == true {
+                    // Terminal, not a spinner: nothing reachable holds the
+                    // event's files, and the report says which drives to
+                    // plug in.
+                    offlineState(event, reachability)
+                } else if stacks != nil {
                     if groups.isEmpty {
                         if workspace.search.isEmpty {
                             emptyState(event)
@@ -74,6 +80,7 @@ struct EventBoardView: View {
                 } else {
                     ProgressView("Loading \(event.name)…")
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .accessibilityIdentifier("eventBoardLoading")
                 }
             }
             .safeAreaBar(edge: .top) {
@@ -183,6 +190,12 @@ struct EventBoardView: View {
     /// Loading progress for the status caption — the board fills in first
     /// and keeps loading files and capture dates behind it.
     private var loadingNote: String? {
+        if let reachability = workspace.eventReachability[eventID], !reachability.isOffline {
+            // Partly mounted: the board loads what is reachable and says
+            // what is not, instead of waiting on it.
+            let places = reachability.offlinePlaces
+            return "\(reachability.offlineList) \(places.count == 1 ? "isn't" : "aren't") connected — showing what's reachable."
+        }
         if let remaining = workspace.eventBuildRemainders[eventID], remaining > 0 {
             return "First photos are up — the remaining \(remaining.formatted()) files are still loading."
         }
@@ -253,6 +266,26 @@ struct EventBoardView: View {
         .padding(.vertical, 8)
         .frame(maxWidth: .infinity, alignment: .leading)
         .onChange(of: eventID) { _, _ in showAllPeople = false }
+    }
+
+    /// The board's answer when the event's drives are unplugged (or a share
+    /// is not answering): which places are missing, what to plug in, and
+    /// a Retry. A mount notification re-checks on its own.
+    private func offlineState(_ event: SavedCameraEvent, _ reachability: EventReachabilityReport) -> some View {
+        let count = workspace.assignmentCount(for: eventID)
+        return ContentUnavailableView {
+            Label("Drives Not Connected", systemImage: "externaldrive.badge.xmark")
+        } description: {
+            Text("\(event.name) is on drives that aren't connected: \(reachability.offlineList). \(reachability.remedySentence)"
+                + (count > 0 ? " \(count.formatted()) file\(count == 1 ? "" : "s") are waiting in the catalog." : ""))
+        } actions: {
+            Button("Retry") {
+                Task { await workspace.refreshEvent(eventID) }
+            }
+            .help("Check again whether this event's drives and the NAS are connected")
+        }
+        .frame(maxHeight: .infinity)
+        .accessibilityIdentifier("eventBoardOffline")
     }
 
     private func emptyState(_ event: SavedCameraEvent) -> some View {
