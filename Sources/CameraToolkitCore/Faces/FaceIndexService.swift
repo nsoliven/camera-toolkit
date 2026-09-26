@@ -332,7 +332,7 @@ public struct FaceIndexService: Sendable {
             "group det ≥ \(options.groupingMinDetScore) · ≥ \(Int(options.groupingMinFacePixels)) px · ≥ \(options.minimumGroupFaces) faces",
         ]
         if let stride = options.videoFrameStride, options.scansVideo {
-            facts.append("video every \(Int(stride)) s")
+            facts.append("video every \(stride.formatted(.number.precision(.fractionLength(0...1)))) s")
         }
         return facts
     }
