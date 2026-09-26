@@ -232,19 +232,27 @@ public struct OrganizeItem: Identifiable, Hashable, Sendable {
     public var hasCameraDate: Bool
     public var burstPrefix: String?
     public var frameNumber: Int?
+    /// The camera the file's own tags name (`CameraCatalog`), mapped off
+    /// the main actor by the scan's metadata pass. Nil until that pass
+    /// has read the file, or when it carries no camera tags. Boards layer
+    /// the catalog device and the configured source over it through
+    /// `OrganizeCameraResolver`.
+    public var metadataCamera: OrganizeCamera?
 
     public init(
         primary: OrganizeFile,
         companions: [OrganizeFile] = [],
         kind: OrganizeMediaKind,
         captureDate: Date,
-        hasCameraDate: Bool
+        hasCameraDate: Bool,
+        metadataCamera: OrganizeCamera? = nil
     ) {
         self.primary = primary
         self.companions = companions
         self.kind = kind
         self.captureDate = captureDate
         self.hasCameraDate = hasCameraDate
+        self.metadataCamera = metadataCamera
         self.burstPrefix = OrganizeFileClassifier.burstPrefix(in: primary.name)
         self.frameNumber = OrganizeFileClassifier.frameNumber(in: primary.name)
     }

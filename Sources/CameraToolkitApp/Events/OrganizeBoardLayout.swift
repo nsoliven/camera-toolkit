@@ -163,16 +163,18 @@ enum OrganizeBoardPlan {
     /// keeps days, folders and events in their natural oldest-first / A–Z
     /// order and sorts within each — "Largest Bursts" by day shows each
     /// day's biggest bursts first. `.ungrouped` puts the whole board in
-    /// one section for a sort across everything.
+    /// one section for a sort across everything. `cameraName` is the
+    /// board's resolved camera per stack, read only by the Camera sort.
     static func groups(
         for stacks: [OrganizeStack],
         grouping: OrganizeBoardGrouping,
         sort: OrganizeStackSort = .oldestFirst,
         rootPath: String? = nil,
-        eventBucket: (OrganizeStack) -> OrganizeEventBucket? = { _ in nil }
+        eventBucket: (OrganizeStack) -> OrganizeEventBucket? = { _ in nil },
+        cameraName: (OrganizeStack) -> String? = { $0.items.first?.metadataCamera?.name }
     ) -> [OrganizeBoardGroup] {
         let ascending = sort.key == .captureTime ? sort.ascending : true
-        let sortStacks: ([OrganizeStack]) -> [OrganizeStack] = { sort.sorted($0) }
+        func sortStacks(_ stacks: [OrganizeStack]) -> [OrganizeStack] { sort.sorted(stacks, cameraName: cameraName) }
 
         let groups: [OrganizeBoardGroup]
         switch grouping {

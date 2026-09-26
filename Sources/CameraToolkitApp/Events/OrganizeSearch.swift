@@ -82,6 +82,59 @@ struct OrganizeSearchFilter: Equatable, Sendable {
         }
     }
 
+    /// Whether any row tests cameras — boards resolve each frame's camera
+    /// only while a Camera row is filtering.
+    var needsCameras: Bool {
+        groups.contains { group in
+            group.rows.contains { $0.property == .camera && !$0.isEmpty }
+        }
+    }
+
+    /// The Camera row a header chip edits: the first switched-on
+    /// "is any of" Camera row, if any.
+    private var chipCameraRowPath: (group: Int, row: Int)? {
+        for groupIndex in groups.indices {
+            if let rowIndex = groups[groupIndex].rows.firstIndex(where: {
+                $0.property == .camera && $0.operator == .anyOf && $0.isEnabled
+            }) {
+                return (groupIndex, rowIndex)
+            }
+        }
+        return nil
+    }
+
+    /// Whether a header chip for `cameraID` reads as on — its camera is
+    /// picked in the Camera row the chips edit.
+    func isCameraChipOn(_ cameraID: String) -> Bool {
+        guard let path = chipCameraRowPath else { return false }
+        return groups[path.group].rows[path.row].cameraIDs.contains(cameraID)
+    }
+
+    /// A camera chip's click: adds the camera to the board's "Camera is
+    /// any of" row (creating it, ANDed like any other condition), or takes
+    /// it back out — dropping the row once it holds no camera. Other
+    /// Camera rows the user built keep their meaning.
+    mutating func toggleCameraChip(_ cameraID: String) {
+        guard let path = chipCameraRowPath else {
+            addCondition(.cameras([cameraID]))
+            return
+        }
+        var row = groups[path.group].rows[path.row]
+        if row.cameraIDs.contains(cameraID) {
+            row.cameraIDs.remove(cameraID)
+        } else {
+            row.cameraIDs.insert(cameraID)
+        }
+        if row.cameraIDs.isEmpty {
+            groups[path.group].rows.remove(at: path.row)
+            if groups[path.group].rows.isEmpty {
+                groups.remove(at: path.group)
+            }
+        } else {
+            groups[path.group].rows[path.row] = row
+        }
+    }
+
     /// The same filter with every Event pick outside `familyIDs` removed,
     /// and "Not Sorted Yet" cleared — a family board's stacks all belong to
     /// it, so only in-family picks can narrow it. An Event row left with no
@@ -172,7 +225,7 @@ struct OrganizeFilterGroup: Equatable, Sendable, Identifiable {
 struct OrganizeFilterRow: Equatable, Sendable, Identifiable {
     /// The stack fact the row tests.
     enum Property: String, CaseIterable, Sendable {
-        case people, event, media, date
+        case people, event, media, date, camera
 
         var title: String {
             switch self {
@@ -180,6 +233,7 @@ struct OrganizeFilterRow: Equatable, Sendable, Identifiable {
             case .event: "Event"
             case .media: "Media"
             case .date: "Date"
+            case .camera: "Camera"
             }
         }
     }
@@ -237,6 +291,9 @@ struct OrganizeFilterRow: Equatable, Sendable, Identifiable {
             switch property {
             case .people: allCases
             case .event, .media, .date: [.anyOf, .allOf, .noneOf, .notAllOf]
+            // A frame has one camera, so "all of" only means something
+            // for a mixed burst — the row keeps to any/none.
+            case .camera: [.anyOf, .noneOf]
             }
         }
 
@@ -270,6 +327,9 @@ struct OrganizeFilterRow: Equatable, Sendable, Identifiable {
     var includesUnsorted = false
     /// Values for a Media row — stills, RAW, video.
     var mediaKinds: Set<OrganizeMediaKind> = []
+    /// Values for a Camera row — `OrganizeCamera.id`s, including
+    /// `OrganizeCamera.unknownID` for "Unknown camera".
+    var cameraIDs: Set<String> = []
     /// Inclusive day bounds for a Date row, matched at the camera wall
     /// clock's day granularity — the same day bucketing
     /// `OrganizeStacker.days` uses.
@@ -319,6 +379,13 @@ struct OrganizeFilterRow: Equatable, Sendable, Identifiable {
         return row
     }
 
+    /// A Camera row; `exclude: true` makes it "is none of".
+    static func cameras(_ ids: Set<String>, exclude: Bool = false) -> Self {
+        var row = Self(property: .camera, operator: exclude ? .noneOf : .anyOf)
+        row.cameraIDs = ids
+        return row
+    }
+
     /// A Date row — either bound may stay open.
     static func days(from start: Date?, to end: Date?) -> Self {
         var row = Self(property: .date)
@@ -335,6 +402,7 @@ struct OrganizeFilterRow: Equatable, Sendable, Identifiable {
         case .event: !eventIDs.isEmpty || includesUnsorted
         case .media: !mediaKinds.isEmpty
         case .date: dayStart != nil || dayEnd != nil
+        case .camera: !cameraIDs.isEmpty
         }
     }
 
@@ -396,6 +464,14 @@ struct OrganizeFilterRow: Equatable, Sendable, Identifiable {
                 hasAll: hasAll,
                 isExactly: hasAll && subject.mediaKinds.isSubset(of: mediaKinds)
             )
+        case .camera:
+            guard !cameraIDs.isEmpty else { return true }
+            let hasAll = cameraIDs.isSubset(of: subject.cameraIDs)
+            return `operator`.matches(
+                hasAny: !subject.cameraIDs.isDisjoint(with: cameraIDs),
+                hasAll: hasAll,
+                isExactly: hasAll && subject.cameraIDs.isSubset(of: cameraIDs)
+            )
         case .date:
             guard dayStart != nil || dayEnd != nil, let span = subject.daySpan else { return true }
             let lower = dayStart.map { calendar.startOfDay(for: $0) } ?? .distantPast
@@ -425,6 +501,9 @@ struct OrganizeFilterSubject: Equatable, Sendable {
     var eventIDs: Set<UUID> = []
     /// Media kinds present on the subject's files — stills, RAW, video.
     var mediaKinds: Set<OrganizeMediaKind> = []
+    /// Cameras that shot the subject's files — the union over a burst's
+    /// frames; a frame with no known camera adds `OrganizeCamera.unknownID`.
+    var cameraIDs: Set<String> = []
     /// The subject's capture interval, matched against a Date row's day
     /// bounds. Nil means the subject has no dates and never filters on
     /// one.
@@ -435,12 +514,14 @@ struct OrganizeFilterSubject: Equatable, Sendable {
         hasOtherFaces: Bool = false,
         eventIDs: Set<UUID> = [],
         mediaKinds: Set<OrganizeMediaKind> = [],
+        cameraIDs: Set<String> = [],
         daySpan: ClosedRange<Date>? = nil
     ) {
         self.personIDs = personIDs
         self.hasOtherFaces = hasOtherFaces
         self.eventIDs = eventIDs
         self.mediaKinds = mediaKinds
+        self.cameraIDs = cameraIDs
         self.daySpan = daySpan
     }
 
@@ -453,6 +534,7 @@ struct OrganizeFilterSubject: Equatable, Sendable {
             hasOtherFaces: facts.hasOtherFaces,
             eventIDs: facts.eventIDs,
             mediaKinds: Set(stack.items.map(\.kind)),
+            cameraIDs: facts.cameraIDs,
             daySpan: min(stack.captureDate, stack.endDate)...max(stack.captureDate, stack.endDate)
         )
     }
@@ -479,6 +561,9 @@ struct OrganizeStackFacts: Equatable, Sendable {
     /// match, so typing a roster name finds the same stacks a People row
     /// would.
     var personNames: Set<String> = []
+    /// Cameras across the stack's frames (`EventsWorkspace.cameraIDs(for:)`)
+    /// — resolved only while a Camera row filters, empty otherwise.
+    var cameraIDs: Set<String> = []
 }
 
 /// Lowercase-contains text matching for the Events sidebar and the organize

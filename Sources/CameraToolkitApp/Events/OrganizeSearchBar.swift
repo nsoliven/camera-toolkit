@@ -18,8 +18,8 @@ struct OrganizeFilterButton: View {
                 .foregroundStyle(active > 0 ? AnyShapeStyle(.tint) : AnyShapeStyle(.primary))
         }
         .help(active > 0
-            ? "\(active) filter\(active == 1 ? "" : "s") on — people, date, event, or media kind"
-            : "Filter by people, date, event, or media kind")
+            ? "\(active) filter\(active == 1 ? "" : "s") on — people, date, event, media kind, or camera"
+            : "Filter by people, date, event, media kind, or camera")
         .anchorPreference(key: BoardFilterAnchorKey.self, value: .bounds) { $0 }
     }
 }
@@ -85,7 +85,7 @@ extension View {
 
 /// The filter-builder panel the filter button opens. The search
 /// text lives in the window's toolbar field; this panel holds condition
-/// rows — People, Date, Event, Media. Every condition added ANDs into the
+/// rows — People, Date, Event, Media, Camera. Every condition added ANDs into the
 /// one group by default; an "or" group is a separate, labelled action.
 /// Above them sit the subevent chips' "Always hiding" exclusions, which
 /// AND with everything. All of it ANDs with the text; Clear All resets it.
@@ -94,7 +94,8 @@ extension View {
 /// members and unnamed groups the face index saw on these stacks, the date
 /// pickers default to the board's own day range, and on an event board the
 /// Event picker narrows to the board's family — the event plus its
-/// subevents — since picks outside it cannot match there.
+/// subevents — since picks outside it cannot match there. Camera lists
+/// each camera found on the board with its stack count.
 ///
 /// The panel has a fixed width and scrolls past a fixed maximum height, so
 /// adding rows never makes its ideal size depend on the board's layout.
@@ -113,7 +114,7 @@ struct OrganizeFilterPanel: View {
 
     /// The properties a new or edited row can point at, in menu order.
     private var properties: [OrganizeFilterRow.Property] {
-        [.people, .date, .event, .media]
+        [.people, .date, .event, .media, .camera]
     }
 
     /// The people this board can offer a People row — roster members and
@@ -331,6 +332,8 @@ struct OrganizeFilterPanel: View {
                 eventValues(row)
             case .media:
                 mediaValues(row)
+            case .camera:
+                cameraValues(row)
             }
         }
         .padding(7)
@@ -548,6 +551,56 @@ struct OrganizeFilterPanel: View {
         }
     }
 
+    // MARK: - Camera values
+
+    /// The cameras on this board with their stack counts. Files whose
+    /// camera the background pass has not read yet sit under "Unknown
+    /// camera" until it does.
+    private func cameraValues(_ row: Binding<OrganizeFilterRow>) -> some View {
+        let options = workspace.boardCameras(for: stacks)
+        let picked = row.wrappedValue.cameraIDs
+            .map { id in options.first { $0.id == id }?.camera ?? CameraCatalog.camera(id: id) }
+            .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        return FlowLayout(horizontalSpacing: 5, verticalSpacing: 5) {
+            ForEach(picked) { camera in
+                let count = options.first { $0.id == camera.id }?.stackCount ?? 0
+                valueChip(
+                    camera.name,
+                    symbol: camera.id == OrganizeCamera.unknownID ? "questionmark.circle" : "camera",
+                    help: "\(count) item\(count == 1 ? "" : "s") on this board"
+                ) {
+                    row.wrappedValue.cameraIDs.remove(camera.id)
+                }
+            }
+            if options.isEmpty {
+                Text("No items on this board yet.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                let unpicked = options.filter { !row.wrappedValue.cameraIDs.contains($0.id) }
+                Menu {
+                    ForEach(unpicked) { option in
+                        Button {
+                            row.wrappedValue.cameraIDs.insert(option.id)
+                        } label: {
+                            Label(
+                                "\(option.camera.name) (\(option.stackCount.formatted()))",
+                                systemImage: option.id == OrganizeCamera.unknownID ? "questionmark.circle" : "camera"
+                            )
+                        }
+                    }
+                } label: {
+                    addValueLabel
+                }
+                .menuIndicator(.hidden)
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .disabled(unpicked.isEmpty)
+                .help("Add a camera to this row")
+            }
+        }
+    }
+
     // MARK: - Date values
 
     private func dateValues(_ row: Binding<OrganizeFilterRow>) -> some View {
@@ -659,6 +712,8 @@ struct OrganizeFilterHotLinks: View {
             Text(peopleLabel(for: row))
         case .media:
             Text(mediaLabel(for: row))
+        case .camera:
+            Text(cameraLabel(for: row))
         case .date:
             Text(dateLabel(for: row))
         case .event:
@@ -685,6 +740,14 @@ struct OrganizeFilterHotLinks: View {
             .map(\.title)
         if row.mediaKinds.contains(.other) { titles.append("Other") }
         return titles.joined(separator: ", ")
+    }
+
+    /// The Camera row's picks as "Osmo 360, Sony A7V".
+    private func cameraLabel(for row: OrganizeFilterRow) -> String {
+        row.cameraIDs
+            .map { CameraCatalog.camera(id: $0).name }
+            .sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+            .joined(separator: ", ")
     }
 
     /// The Date row's range as "Aug 26 – Aug 27", "from Aug 26", or

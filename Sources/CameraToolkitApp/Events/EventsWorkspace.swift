@@ -598,7 +598,7 @@ final class EventsWorkspace {
                 || eventPeople(row.event.id).contains { OrganizeSearch.matches($0.name, needle: needle) }
             guard textHit else { return false }
             return OrganizeSearch.matches(
-                subject: sidebarSubject(for: row.event),
+                subject: sidebarSubject(for: row.event, cameras: filter.needsCameras),
                 search: filter
             )
         }
@@ -608,12 +608,14 @@ final class EventsWorkspace {
     /// per stack: its roster people (`event.people`, unnamed groups never
     /// count here), itself plus its ancestors so an Event row for a parent
     /// keeps the subevent's row too, the media kinds its assigned files
-    /// carry, and its date as the capture span.
-    private func sidebarSubject(for event: SavedCameraEvent) -> OrganizeFilterSubject {
+    /// carry, the cameras its assignments came from (when a Camera row
+    /// asks), and its date as the capture span.
+    private func sidebarSubject(for event: SavedCameraEvent, cameras: Bool = false) -> OrganizeFilterSubject {
         OrganizeFilterSubject(
             personIDs: Set(eventPeople(event.id).map(\.id)),
             eventIDs: ancestorScope(of: event),
             mediaKinds: eventMediaKinds(for: event.id),
+            cameraIDs: cameras ? eventCameraIDs(for: event.id) : [],
             daySpan: event.eventDate...event.eventDate
         )
     }
@@ -993,6 +995,7 @@ final class EventsWorkspace {
     ) -> [OrganizeStack] {
         guard hideSorted || !search.isEmpty else { return result.stacks }
         let people: BoardPeople = search.needsPeople ? boardPeople(for: result.stacks) : ([], [:], [])
+        let cameras = search.needsCameras
         return result.stacks.filter { stack in
             if hideSorted, isSorted(stack) { return false }
             guard !search.isEmpty else { return true }
@@ -1000,7 +1003,7 @@ final class EventsWorkspace {
                 stack: stack,
                 search: search,
                 rootPath: result.rootPath,
-                facts: stackFacts(stack, people: people)
+                facts: stackFacts(stack, people: people, cameras: cameras)
             )
         }
     }
@@ -1020,12 +1023,13 @@ final class EventsWorkspace {
         let scoped = search.scopingEventRows(to: scopeIDs(eventID))
         guard !scoped.isEmpty else { return stacks }
         let people: BoardPeople = scoped.needsPeople ? boardPeople(for: stacks) : ([], [:], [])
+        let cameras = scoped.needsCameras
         return stacks.filter {
             OrganizeSearch.matches(
                 stack: $0,
                 search: scoped,
                 rootPath: nil,
-                facts: stackFacts($0, people: people)
+                facts: stackFacts($0, people: people, cameras: cameras)
             )
         }
     }
@@ -1056,7 +1060,12 @@ final class EventsWorkspace {
         grouping: OrganizeBoardGrouping,
         sort: OrganizeStackSort
     ) -> [OrganizeBoardGroup] {
-        OrganizeBoardPlan.groups(for: stacks, grouping: grouping, sort: sort)
+        OrganizeBoardPlan.groups(
+            for: stacks,
+            grouping: grouping,
+            sort: sort,
+            cameraName: { self.primaryCamera(for: $0)?.name }
+        )
     }
 
     /// The stacks an event board shows after its search field filters —
@@ -1084,8 +1093,9 @@ final class EventsWorkspace {
     /// subevent row against the parent's stack — does not match) — plus
     /// the face-catalog people on its files, and whether anyone else's
     /// face is on them too. `eventTitle` stays the text needle's
-    /// single-event breadcrumb match.
-    private func stackFacts(_ stack: OrganizeStack, people: BoardPeople) -> OrganizeStackFacts {
+    /// single-event breadcrumb match. `cameras` resolves the frames'
+    /// cameras too — only when a Camera row is filtering.
+    private func stackFacts(_ stack: OrganizeStack, people: BoardPeople, cameras: Bool = false) -> OrganizeStackFacts {
         var assignedIDs = Set<UUID>()
         var eventIDs = Set<UUID>()
         for item in stack.items {
@@ -1103,8 +1113,134 @@ final class EventsWorkspace {
                 : nil,
             personIDs: people.byStackID[stack.id] ?? [],
             hasOtherFaces: people.othersStackIDs.contains(stack.id),
-            personNames: personNames(on: stack)
+            personNames: personNames(on: stack),
+            cameraIDs: cameras ? cameraIDs(for: stack) : []
         )
+    }
+
+    // MARK: - Cameras
+
+    /// One camera on a board and how many of its stacks carry it — the
+    /// Camera row's options and the event header's chips.
+    struct BoardCamera: Identifiable, Equatable {
+        var camera: OrganizeCamera
+        var stackCount: Int
+        var id: String { camera.id }
+    }
+
+    /// The resolver for the current configuration's sources — rebuilt only
+    /// when the configuration changes. Building it is string work.
+    var cameraResolver: OrganizeCameraResolver {
+        if let cached = cameraResolverCache, cached.revision == model.configurationRevision {
+            return cached.resolver
+        }
+        let resolver = OrganizeCameraResolver(locations: model.configuration.configuredLocations)
+        cameraResolverCache = (model.configurationRevision, resolver)
+        return resolver
+    }
+
+    /// Which camera shot one item: its assignment's device, else the
+    /// configured source holding it, else its own camera tags (nil until
+    /// the metadata pass has read them). Index lookups only.
+    func camera(for item: OrganizeItem) -> OrganizeCamera? {
+        cameraResolver.camera(
+            assignmentDeviceID: assignment(for: item.primary)?.deviceID,
+            file: item.primary,
+            metadataCamera: item.metadataCamera
+        )
+    }
+
+    /// Every camera across a stack's frames — the union a burst is judged
+    /// on, like the other filter facts. A frame with no known camera
+    /// contributes `OrganizeCamera.unknownID`.
+    func cameraIDs(for stack: OrganizeStack) -> Set<String> {
+        let resolver = cameraResolver
+        var ids = Set<String>()
+        for item in stack.items {
+            let camera = resolver.camera(
+                assignmentDeviceID: assignment(for: item.primary)?.deviceID,
+                file: item.primary,
+                metadataCamera: item.metadataCamera
+            )
+            ids.insert(camera?.id ?? OrganizeCamera.unknownID)
+        }
+        return ids
+    }
+
+    /// The first frame's camera — what the Camera sort orders by.
+    func primaryCamera(for stack: OrganizeStack) -> OrganizeCamera? {
+        stack.items.first.flatMap { camera(for: $0) }
+    }
+
+    /// (configurationRevision, resolver) behind `cameraResolver`.
+    @ObservationIgnored private var cameraResolverCache: (revision: Int, resolver: OrganizeCameraResolver)?
+    /// The last `boardCameras` answer, reused while the stacks, the
+    /// assignments, and the sources are unchanged.
+    @ObservationIgnored private var boardCamerasCache: (catalog: Int, configuration: Int, stacks: [OrganizeStack], cameras: [BoardCamera])?
+
+    /// The cameras on a board's stacks with how many stacks carry each —
+    /// most stacks first, "Unknown camera" last. A mixed burst counts
+    /// toward every camera in it.
+    func boardCameras(for stacks: [OrganizeStack]) -> [BoardCamera] {
+        if let cache = boardCamerasCache,
+           cache.catalog == model.catalogStateRevision,
+           cache.configuration == model.configurationRevision,
+           cache.stacks == stacks {
+            return cache.cameras
+        }
+        let cameras = Self.boardCameras(stacks) { self.cameraIDs(for: $0) } name: { id in
+            CameraCatalog.camera(id: id)
+        }
+        boardCamerasCache = (model.catalogStateRevision, model.configurationRevision, stacks, cameras)
+        return cameras
+    }
+
+    /// The counting behind `boardCameras(for:)`, pure so it can be tested
+    /// without a workspace.
+    static func boardCameras(
+        _ stacks: [OrganizeStack],
+        ids: (OrganizeStack) -> Set<String>,
+        name: (String) -> OrganizeCamera
+    ) -> [BoardCamera] {
+        var counts: [String: Int] = [:]
+        for stack in stacks {
+            for id in ids(stack) {
+                counts[id, default: 0] += 1
+            }
+        }
+        return counts.map { BoardCamera(camera: name($0.key), stackCount: $0.value) }
+            .sorted { lhs, rhs in
+                let lhsUnknown = lhs.id == OrganizeCamera.unknownID
+                let rhsUnknown = rhs.id == OrganizeCamera.unknownID
+                if lhsUnknown != rhsUnknown { return rhsUnknown }
+                if lhs.stackCount != rhs.stackCount { return lhs.stackCount > rhs.stackCount }
+                return lhs.camera.name.localizedStandardCompare(rhs.camera.name) == .orderedAscending
+            }
+    }
+
+    /// (catalogStateRevision, configurationRevision, camera ids by event)
+    /// — the sidebar's Camera-row facts.
+    @ObservationIgnored private var eventCameraIDsCache: (Int, Int, [UUID: Set<String>])?
+
+    /// The cameras an event's assigned files came from, read off the
+    /// assignments alone (the sidebar never reads file tags): the
+    /// assignment's device, else the configured source it was imported
+    /// from, else unknown.
+    private func eventCameraIDs(for eventID: UUID) -> Set<String> {
+        if let cache = eventCameraIDsCache,
+           cache.0 == model.catalogStateRevision,
+           cache.1 == model.configurationRevision {
+            return cache.2[eventID] ?? []
+        }
+        let resolver = cameraResolver
+        var ids: [UUID: Set<String>] = [:]
+        for assignment in model.configuration.photoEventAssignments {
+            let camera = CameraCatalog.camera(deviceID: assignment.deviceID)
+                ?? resolver.locationCamera(forPathKey: (assignment.sourceRootPath + "/" + assignment.relativePath).lowercased())
+            ids[assignment.eventID, default: []].insert(camera?.id ?? OrganizeCamera.unknownID)
+        }
+        eventCameraIDsCache = (model.catalogStateRevision, model.configurationRevision, ids)
+        return ids[eventID] ?? []
     }
 
     /// The days a board should show — `visibleStacks` re-grouped into days.

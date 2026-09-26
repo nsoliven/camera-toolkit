@@ -147,6 +147,40 @@ struct SubeventChip: View {
     }
 }
 
+/// One camera on the board with its stack count — shown in the event
+/// header when the board mixes cameras. A click adds the camera to the
+/// board's "Camera is any of" filter row (or takes it back out), so one
+/// click narrows the board to that camera.
+struct CameraChip: View {
+    let camera: OrganizeCamera
+    let count: Int
+    let isOn: Bool
+    let onToggle: () -> Void
+
+    var body: some View {
+        Toggle(isOn: Binding(get: { isOn }, set: { _ in onToggle() })) {
+            HStack(spacing: 4) {
+                Image(systemName: camera.id == OrganizeCamera.unknownID ? "questionmark.circle" : "camera")
+                    .imageScale(.small)
+                Text(camera.name)
+                    .lineLimit(1)
+                Text(count.formatted())
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+            }
+        }
+        .toggleStyle(.button)
+        .buttonBorderShape(.capsule)
+        .controlSize(.small)
+        .fixedSize()
+        .help(isOn
+            ? "Showing \(camera.name) — click to stop filtering by it"
+            : "Show only items shot on \(camera.name) (\(count) on this board)")
+        .accessibilityLabel("\(camera.name), \(count)")
+        .accessibilityValue(isOn ? "Filtering" : "Not filtering")
+    }
+}
+
 /// A named person detected on an event's photos: a neutral capsule with
 /// the person's stable color on the symbol, so the name reads in both
 /// appearances whatever the color.

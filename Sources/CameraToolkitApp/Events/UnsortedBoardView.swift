@@ -34,7 +34,8 @@ struct UnsortedBoardView: View {
             grouping: grouping,
             sort: sort,
             rootPath: result.rootPath,
-            eventBucket: { workspace.eventBucket(for: $0) }
+            eventBucket: { workspace.eventBucket(for: $0) },
+            cameraName: { workspace.primaryCamera(for: $0)?.name }
         )
     }
 

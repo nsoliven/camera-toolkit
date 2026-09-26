@@ -535,21 +535,7 @@ extension DashboardModel {
     }
 
     static func inferredDeviceID(for location: ConfiguredLocation) -> String? {
-        let fingerprint = "\(location.name) \(location.path)"
-            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
-            .lowercased()
-
-        if fingerprint.contains("nano") { return "dji-nano" }
-        if fingerprint.contains("osmo") { return "osmo-360" }
-        if fingerprint.contains("sony") || fingerprint.contains("a7v") { return "sony-a7v" }
-        if fingerprint.contains("mini 2") || fingerprint.contains("mini-2") || fingerprint.contains("mini_2") {
-            return "dji-mini-2"
-        }
-        if fingerprint.contains("action 6") || fingerprint.contains("action-6") || fingerprint.contains("action_6") {
-            return "action-6"
-        }
-        if fingerprint.contains("iphone") { return "iphone" }
-        return nil
+        location.inferredDeviceID
     }
 
     func setConfiguredLocationName(_ location: ConfiguredLocation, to value: String) {

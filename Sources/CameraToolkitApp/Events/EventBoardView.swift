@@ -221,11 +221,15 @@ struct EventBoardView: View {
     }
 
     /// Pinned under the toolbar: where the originals are (one menu per
-    /// place), subevent and people chips, and the active filters.
+    /// place), subevent, people and — on a mixed board — camera chips,
+    /// and the active filters.
     private func titleAccessory(_ event: SavedCameraEvent) -> some View {
         let people = workspace.eventPeople(eventID)
         let subevents = workspace.subevents(of: eventID)
         let shown = showAllPeople ? people : Array(people.prefix(Self.collapsedPeopleCount))
+        // Camera chips only when the board mixes cameras — one camera
+        // needs no filter.
+        let cameras = workspace.boardCameras(for: workspace.eventStacks[eventID] ?? [])
         return VStack(alignment: .leading, spacing: 8) {
             EventStorageSummary(slots: EventStorageSlots(
                 model: model,
@@ -251,6 +255,16 @@ struct EventBoardView: View {
                     }
                     .buttonStyle(.borderless)
                     .controlSize(.small)
+                }
+                if cameras.count > 1 {
+                    ForEach(cameras) { entry in
+                        CameraChip(
+                            camera: entry.camera,
+                            count: entry.stackCount,
+                            isOn: workspace.search.isCameraChipOn(entry.id),
+                            onToggle: { workspace.search.toggleCameraChip(entry.id) }
+                        )
+                    }
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)

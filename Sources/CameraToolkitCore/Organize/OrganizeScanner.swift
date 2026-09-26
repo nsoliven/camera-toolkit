@@ -131,7 +131,9 @@ public struct OrganizeScanner: Sendable {
 
     /// Pairs sidecars, reads camera capture times in parallel, and shifts
     /// files without a camera timestamp (such as video) by the folder's
-    /// camera-clock offset so they land on the same day as the photos.
+    /// camera-clock offset so they land on the same day as the photos. The
+    /// same pass reads each file's camera tags (clips too) into
+    /// `OrganizeItem.metadataCamera`.
     ///
     /// `readMissingCaptureDates: false` turns a cache miss into "no camera
     /// date" — no header read, and the miss is not stored — so a caller can
@@ -147,15 +149,21 @@ public struct OrganizeScanner: Sendable {
         progress: (@Sendable (OrganizeScanProgress) -> Void)? = nil
     ) -> (items: [OrganizeItem], clockOffset: TimeInterval, missingCaptureDates: Int) {
         let pairings = OrganizeFileClassifier.pair(files)
+        // Stills carry a capture time and camera tags; clips carry camera
+        // tags only. Both are read by the same one-pass metadata reader.
         let readable = pairings.indices.filter {
-            let kind = pairings[$0].kind
-            return (kind == .raw || kind == .photo) && CaptureDateReader.canRead(pairings[$0].primary.url)
+            let pairing = pairings[$0]
+            switch pairing.kind {
+            case .raw, .photo: return CaptureDateReader.canRead(pairing.primary.url)
+            case .video: return QuickTimeCameraReader.canRead(pairing.primary.url)
+            case .other: return false
+            }
         }
         let total = readable.count
         progress?(OrganizeScanProgress(phase: "Reading capture times", processed: 0, total: total))
 
         let timestampProbe = cache?.timestampProbe
-        let results: [(timestamp: CaptureTimestamp?, missed: Bool)] = parallelMap(
+        let results: [(metadata: CaptureMetadata, missedDate: Bool)] = parallelMap(
             count: total,
             width: concurrency,
             onCompleted: { completed in
@@ -165,26 +173,50 @@ public struct OrganizeScanner: Sendable {
             },
             transform: { index in
                 autoreleasepool {
-                    let file = pairings[readable[index]].primary
-                    if let cached = cache?.lookup(path: file.path, size: file.size, modifiedAt: file.modifiedAt) {
-                        return (cached, false)
+                    let pairing = pairings[readable[index]]
+                    let file = pairing.primary
+                    let isStill = pairing.kind != .video
+                    let cached = cache?.lookupMetadata(path: file.path, size: file.size, modifiedAt: file.modifiedAt)
+                    // A hit whose camera is still unread (a version-1
+                    // entry) is read again on a pass allowed to read — the
+                    // test probe never stands in for that refill.
+                    if let cached, cached.cameraRead || !readMissingCaptureDates || (isStill && timestampProbe != nil) {
+                        return (CaptureMetadata(timestamp: cached.timestamp, camera: cached.camera), false)
                     }
-                    guard readMissingCaptureDates else { return (nil, true) }
+                    // A clip's miss is a camera read only; it never holds
+                    // up "capture dates still coming".
+                    let missedDate = cached == nil && isStill
+                    guard readMissingCaptureDates else { return (CaptureMetadata(), missedDate) }
                     pauseGate?.waitIfPaused(for: file.url)
-                    let timestamp = timestampProbe?(file.url) ?? CaptureDateReader.timestamp(of: file.url)
-                    cache?.store(path: file.path, size: file.size, modifiedAt: file.modifiedAt, timestamp: timestamp)
-                    return (timestamp, true)
+                    var metadata: CaptureMetadata
+                    if isStill, let timestampProbe {
+                        metadata = CaptureMetadata(timestamp: timestampProbe(file.url))
+                    } else {
+                        metadata = CaptureDateReader.metadata(of: file.url)
+                    }
+                    // A version-1 entry refilling its camera keeps the
+                    // timestamp it already proved.
+                    if let cached, metadata.timestamp == nil {
+                        metadata.timestamp = cached.timestamp
+                    }
+                    cache?.store(path: file.path, size: file.size, modifiedAt: file.modifiedAt, metadata: metadata)
+                    return (metadata, missedDate)
                 }
             }
         )
         try? cache?.save()
 
         var cameraDates: [Int: Date] = [:]
+        var cameras: [Int: OrganizeCamera] = [:]
         var missingCaptureDates = 0
         for (position, pairingIndex) in readable.enumerated() {
-            if results[position].missed { missingCaptureDates += 1 }
-            if let date = results[position].timestamp?.date {
+            if results[position].missedDate { missingCaptureDates += 1 }
+            let metadata = results[position].metadata
+            if pairings[pairingIndex].kind != .video, let date = metadata.timestamp?.date {
                 cameraDates[pairingIndex] = date
+            }
+            if let camera = CameraCatalog.camera(metadata: metadata.camera) {
+                cameras[pairingIndex] = camera
             }
         }
 
@@ -209,7 +241,8 @@ public struct OrganizeScanner: Sendable {
                     companions: pairing.companions,
                     kind: pairing.kind,
                     captureDate: date,
-                    hasCameraDate: true
+                    hasCameraDate: true,
+                    metadataCamera: cameras[index]
                 )
             }
             let offset = folderOffsets[pairing.primary.folderPath] ?? rootOffset
@@ -218,7 +251,8 @@ public struct OrganizeScanner: Sendable {
                 companions: pairing.companions,
                 kind: pairing.kind,
                 captureDate: pairing.primary.modifiedAt.addingTimeInterval(offset),
-                hasCameraDate: false
+                hasCameraDate: false,
+                metadataCamera: cameras[index]
             )
         }
         return (items, rootOffset, missingCaptureDates)

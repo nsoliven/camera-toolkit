@@ -3,7 +3,8 @@ import Foundation
 /// What a board orders its stacks by. Every key reads only what an
 /// `OrganizeStack` already carries in memory — no disk, catalog, or
 /// network reads — so sorting an 11k-item board is one pass to build the
-/// keys plus one sort.
+/// keys plus one sort. (Camera reads the board's resolved camera through
+/// a lookup the caller passes — itself in-memory index work.)
 public enum OrganizeSortKey: String, CaseIterable, Identifiable, Sendable {
     /// First frame's capture time — the boards' long-standing order.
     case captureTime
@@ -17,6 +18,9 @@ public enum OrganizeSortKey: String, CaseIterable, Identifiable, Sendable {
     case fileKind
     /// Seconds from the first frame to the last.
     case burstDuration
+    /// The camera that shot the first frame, by name; unknown cameras
+    /// sort after every named one.
+    case camera
 
     public var id: String { rawValue }
 
@@ -28,6 +32,7 @@ public enum OrganizeSortKey: String, CaseIterable, Identifiable, Sendable {
         case .fileName: "File Name"
         case .fileKind: "File Kind"
         case .burstDuration: "Burst Duration"
+        case .camera: "Camera"
         }
     }
 
@@ -39,6 +44,7 @@ public enum OrganizeSortKey: String, CaseIterable, Identifiable, Sendable {
         case .fileName: "textformat"
         case .fileKind: "photo.on.rectangle"
         case .burstDuration: "timer"
+        case .camera: "camera"
         }
     }
 
@@ -46,7 +52,7 @@ public enum OrganizeSortKey: String, CaseIterable, Identifiable, Sendable {
     /// durations lead with the largest, times and names with the first.
     public var defaultAscending: Bool {
         switch self {
-        case .captureTime, .fileName, .fileKind: true
+        case .captureTime, .fileName, .fileKind, .camera: true
         case .burstSize, .fileSize, .burstDuration: false
         }
     }
@@ -60,6 +66,7 @@ public enum OrganizeSortKey: String, CaseIterable, Identifiable, Sendable {
         case .fileName: ascending ? "A to Z" : "Z to A"
         case .fileKind: ascending ? "RAW, Photo, Video" : "Video, Photo, RAW"
         case .burstDuration: ascending ? "Shortest First" : "Longest First"
+        case .camera: ascending ? "A to Z" : "Z to A"
         }
     }
 }
@@ -88,6 +95,7 @@ public struct OrganizeStackSort: Equatable, Hashable, Sendable {
         case .fileName: ascending ? "Name A–Z" : "Name Z–A"
         case .fileKind: ascending ? "Kind" : "Kind, Reversed"
         case .burstDuration: ascending ? "Shortest Bursts" : "Longest Bursts"
+        case .camera: ascending ? "Camera A–Z" : "Camera Z–A"
         }
     }
 
@@ -98,9 +106,16 @@ public struct OrganizeStackSort: Equatable, Hashable, Sendable {
 
     /// `stacks` in this order. Keys are read once per stack up front, so
     /// the comparisons themselves never re-walk a burst's frames.
-    public func sorted(_ stacks: [OrganizeStack]) -> [OrganizeStack] {
+    ///
+    /// `cameraName` is the board's resolved camera for a stack (nil when
+    /// unknown), asked only by the Camera key; the default reads the
+    /// first frame's own camera tags.
+    public func sorted(
+        _ stacks: [OrganizeStack],
+        cameraName: (OrganizeStack) -> String? = { $0.items.first?.metadataCamera?.name }
+    ) -> [OrganizeStack] {
         guard stacks.count > 1 else { return stacks }
-        let rows = stacks.map { Row(stack: $0, key: key) }
+        let rows = stacks.map { Row(stack: $0, key: key, cameraName: cameraName) }
         let ascending = ascending
         return rows.sorted { lhs, rhs in
             switch lhs.primary.compare(rhs.primary) {
@@ -117,7 +132,7 @@ public struct OrganizeStackSort: Equatable, Hashable, Sendable {
         let captureDate: Date
         let name: String
 
-        init(stack: OrganizeStack, key: OrganizeSortKey) {
+        init(stack: OrganizeStack, key: OrganizeSortKey, cameraName: (OrganizeStack) -> String?) {
             self.stack = stack
             captureDate = stack.captureDate
             name = stack.items.first?.primary.name ?? ""
@@ -128,6 +143,7 @@ public struct OrganizeStackSort: Equatable, Hashable, Sendable {
             case .fileName: primary = .text(name)
             case .fileKind: primary = .integer(Int64(Self.rank(stack.kind)))
             case .burstDuration: primary = .double(stack.endDate.timeIntervalSince(stack.captureDate))
+            case .camera: primary = .camera(cameraName(stack))
             }
         }
 
@@ -157,6 +173,8 @@ public struct OrganizeStackSort: Equatable, Hashable, Sendable {
         case integer(Int64)
         case double(Double)
         case text(String)
+        /// A camera name; nil (unknown) is greater than every name.
+        case camera(String?)
 
         func compare(_ other: Value) -> ComparisonResult {
             switch (self, other) {
@@ -164,6 +182,9 @@ public struct OrganizeStackSort: Equatable, Hashable, Sendable {
             case let (.integer(lhs), .integer(rhs)): Self.order(lhs, rhs)
             case let (.double(lhs), .double(rhs)): Self.order(lhs, rhs)
             case let (.text(lhs), .text(rhs)): lhs.localizedStandardCompare(rhs)
+            case let (.camera(lhs?), .camera(rhs?)): lhs.localizedStandardCompare(rhs)
+            case (.camera(.some), .camera(.none)): .orderedAscending
+            case (.camera(.none), .camera(.some)): .orderedDescending
             default: .orderedSame
             }
         }
