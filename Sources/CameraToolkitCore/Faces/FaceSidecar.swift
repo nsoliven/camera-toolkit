@@ -76,14 +76,22 @@ public struct FaceSidecarInstallation: Equatable, Sendable {
     public var packURL: URL { root.appendingPathComponent("models/buffalo_l", isDirectory: true) }
 
     public var isInstalled: Bool {
-        FileManager.default.isExecutableFile(atPath: pythonURL.path)
-            && FileManager.default.fileExists(atPath: packURL.appendingPathComponent("w600k_r50.onnx").path)
-            && Self.scriptURL != nil
+        isInstalled(scriptURL: Self.scriptURL)
     }
 
-    /// The bundled sidecar script.
+    /// `isInstalled` against a given script location, so a missing script
+    /// can be tested without a broken app bundle.
+    public func isInstalled(scriptURL: URL?) -> Bool {
+        FileManager.default.isExecutableFile(atPath: pythonURL.path)
+            && FileManager.default.fileExists(atPath: packURL.appendingPathComponent("w600k_r50.onnx").path)
+            && scriptURL != nil
+    }
+
+    /// The bundled sidecar script: `Contents/Resources` of the packaged app
+    /// first, never the developer's build folder from inside an app (see
+    /// `ResourceBundleLocator`). Nil when the app ships without it.
     public static var scriptURL: URL? {
-        Bundle.module.url(forResource: "face_sidecar", withExtension: "py")
+        CoreResources.faceSidecarScript.url
     }
 
     /// The message the UI shows when a scan cannot start.

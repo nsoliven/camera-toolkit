@@ -23,11 +23,17 @@ rm -rf "$app"
 mkdir -p "$macos" "$resources"
 cp ".build/release/CameraToolkit" "$macos/CameraToolkit"
 # SwiftPM resource bundles (the face sidecar script lives in the Core one)
-# sit next to the executable in .build; Bundle.module finds them again in
-# Contents/Resources.
+# sit next to the executable in .build. The app finds them in
+# Contents/Resources through ResourceBundleLocator; it must never fall back
+# to the build folder it was compiled in.
 for bundle in .build/release/CameraToolkit_*.bundle; do
   [[ -d "$bundle" ]] && ditto "$bundle" "$resources/$(basename "$bundle")"
 done
+core_script="$resources/CameraToolkit_CameraToolkitCore.bundle/face_sidecar.py"
+if [[ ! -f "$core_script" ]]; then
+  echo "error: $core_script is missing; the face engine would not work" >&2
+  exit 1
+fi
 "$repo_root/scripts/make-app-icon.swift" "$repo_root/Assets/AppIcon.png" "$resources/AppIcon.icns"
 
 cat > "$contents/Info.plist" <<'PLIST'
@@ -70,6 +76,18 @@ PLIST
 
 printf 'APPL????' > "$contents/PkgInfo"
 codesign --force --deep --sign - "$app"
+
+# The packaged binary must resolve its resources from inside the bundle.
+if ! resource_paths="$("$macos/CameraToolkit" --print-resource-paths)"; then
+  echo "error: packaged app is missing resources:" >&2
+  echo "$resource_paths" >&2
+  exit 1
+fi
+if ! grep -q '^face_sidecar.py packaged ' <<< "$resource_paths"; then
+  echo "error: face_sidecar.py does not resolve from Contents/Resources:" >&2
+  echo "$resource_paths" >&2
+  exit 1
+fi
 echo "Built $app"
 
 if $install; then

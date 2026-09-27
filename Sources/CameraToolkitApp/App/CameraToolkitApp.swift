@@ -10,6 +10,11 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate, NSMenuIte
     private let model = CameraToolkitRuntime.model
 
     static func main() {
+        // Packaging check: report where each bundled resource resolves and
+        // exit before any app state, crash reporting, or window is touched.
+        if CommandLine.arguments.contains("--print-resource-paths") {
+            exit(printResourcePaths())
+        }
         CrashReporting.start()
         UserDefaults.standard.set(false, forKey: "NSQuitAlwaysKeepsWindows")
         let application = NSApplication.shared
@@ -19,6 +24,17 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate, NSMenuIte
         application.setActivationPolicy(.regular)
         MainMenu.install(target: delegate)
         application.run()
+    }
+
+    /// One `<name> <location> <path>` line per resource; 1 if any is missing.
+    private static func printResourcePaths() -> Int32 {
+        var status: Int32 = 0
+        for (name, resolution) in CoreResources.all {
+            print("\(name) \(resolution.location.rawValue) \(resolution.url?.path ?? "-")")
+            if resolution.url == nil { status = 1 }
+        }
+        DebugLog.shared.flush()
+        return status
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
