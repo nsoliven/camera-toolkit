@@ -74,6 +74,24 @@ Immich
 
 `EventsWorkspace` in the app target orchestrates these services and reuses `DashboardModel`'s single-job gate, transfer queue, and activity log.
 
+## Layout migration
+
+`Core/Organize/LayoutMigration/` moves a drive from the legacy `<event>/<device>/Card Copy/…` layout to `<event>/Originals/<Camera>/…` with same-volume renames only. It runs from the app binary's hidden command line, with the app quit:
+
+```text
+CameraToolkit --migrate-layout --dry-run [--json <plan.json>]      # read-only
+CameraToolkit --migrate-layout --execute --plan <plan.json>        # exactly that reviewed plan
+CameraToolkit --migrate-layout --resume <journal.json>             # after an interruption
+CameraToolkit --migrate-layout --undo <journal.json>               # full undo
+    [--support-dir <folder>]   # or CAMERA_TOOLKIT_SUPPORT_DIR; reads <folder>/config.json and <folder>/catalog.sqlite only
+```
+
+- `LayoutMigrationPlanner` (read-only) walks the Buffer and private staging with `readdir` — `FileManager` hides `._` AppleDouble files — and plans every file under each legacy `Card Copy`: sidecars, `.photo-edit`, `._` twins (a file's twin follows its file, a folder's twin moves to the folder's new twin, a twin of a twin chains), unknown files, `.DS_Store`. A taken destination, on disk or claimed by another legacy folder that maps to the same camera, renames the whole base-name group to `NAME (N).EXT` through `KeepBothNaming`. Anything outside `Card Copy` is left in place and listed; symlinks and other-volume files are refused; skeleton event folders with no media are reported as odd and not touched. It derives every catalog rewrite from the moves and fingerprints the source files (size, inode, mtime), each legacy folder's listing, and a digest of the catalog rows it reads.
+- Path-keyed stores and how each is handled: `event_assets` rows adopted from a `Card Copy` get the new root (their id — `CatalogStore.eventAssetID` — changes, and `event_asset_locations` / `immich_assets` follow); rows with an implied drive copy change only when the file is renamed `(N)`; `face_photos.path_key/path/file_name` and `faces.photo_id` are re-keyed for photos at moved paths, and rows at stale paths follow a renamed file's identity; `display_orientations` (name + size + mtime) gets a copy for renamed files; `burst_splits.member_path_keys` are rewritten; `capture-dates.json` keys move with their file; trash `manifest.json` entries that name a legacy `Card Copy` are rewritten so a restore lands in `Originals`; Apply journals recorded before the migration become non-undoable through a `layout-migration.barrier` file in `Move Journals` (`DriveMoveService` refuses them — undoing one would swap assignments back while the files stay put). A queued transfer blocks the plan.
+- `LayoutMigrationExecutor` refuses while Camera Toolkit runs (`NSRunningApplication` plus a process-table scan) or while another migration holds the lock, and when anything fingerprinted changed. It then takes a verified, pinned `CatalogBackupService` backup, writes the journal (`Application Support/CameraToolkit/Layout Migrations/<stamp>-<plan>/` with the plan copy, `journal.json`, and an append-only `moves.log`), renames with `renameExclusive` (never over a file), and proves each folder — every file at its destination with its size and inode, gone from its source — before the next. One catalog transaction with deferred foreign keys applies every rewrite and must pass `integrity_check`, no new foreign-key violations, exact row counts, and every confirmed face on a moved photo still attached to an existing file, or it rolls back. Emptied legacy folders are removed with `rmdir` only.
+- Resume trusts the filesystem: each planned file is at its source or its destination, by inode; the catalog's `app_state.layoutMigration` marker shows whether the commit landed. Undo refuses when the catalog changed after the migration, takes a safety backup, restores the pre-migration backup through the SQLite backup API, restores the cache and manifests, removes the barrier, recreates the removed folders, and renames every file back.
+
+
 ## Face index
 
 Faces exist to tag events: `event.people` is the unique set of named (roster) people detected on an event's photos, surfaced as chips on event headers and names in the sidebar. The pipeline is fully on-device and lives in `CameraToolkitCore/Faces/`; the ML itself is the reference `insightface` package in a Python sidecar, never re-implemented in Swift (`docs/FACE-PIPELINE.md` is the contract):

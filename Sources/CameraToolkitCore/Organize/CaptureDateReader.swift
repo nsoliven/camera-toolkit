@@ -344,6 +344,32 @@ public final class CaptureDateCache: @unchecked Sendable {
         ))
     }
 
+    /// Moves cached entries to new paths (`old path → new path`) without
+    /// re-reading the files: the layout migration renames files, which
+    /// keeps their size and modification time. An existing entry at a new
+    /// path is left alone. Returns how many entries moved.
+    @discardableResult
+    public func rekey(_ mapping: [String: String]) -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        var moved = 0
+        for (old, new) in mapping where old != new {
+            guard let entry = entries[old], entries[new] == nil else { continue }
+            entries[new] = entry
+            entries[old] = nil
+            moved += 1
+        }
+        if moved > 0 { isDirty = true }
+        return moved
+    }
+
+    /// Paths with a cached entry.
+    public var cachedPaths: Set<String> {
+        lock.lock()
+        defer { lock.unlock() }
+        return Set(entries.keys)
+    }
+
     private func put(_ path: String, _ entry: Entry) {
         lock.lock()
         entries[path] = entry

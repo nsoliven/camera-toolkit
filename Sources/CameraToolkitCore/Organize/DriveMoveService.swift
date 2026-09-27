@@ -140,6 +140,12 @@ public struct DriveMoveService {
         guard journal.undoneAt == nil else {
             throw ToolkitError.commandFailed("That change was already undone.")
         }
+        if let barrier = Self.layoutMigrationBarrier(in: journalURL.deletingLastPathComponent()),
+           journal.createdAt < barrier.completedAt {
+            throw ToolkitError.commandFailed(
+                "“\(journal.title)” was recorded before the drive moved to the Originals layout; its paths no longer exist, so it can't be undone. Nothing was changed."
+            )
+        }
         var report = DriveMoveReport(journalPath: journalURL.path)
         let reversed = journal.completedMoves.reversed().map {
             DriveMove(sourcePath: $0.destinationPath, destinationPath: $0.sourcePath, byteCount: $0.byteCount)
@@ -197,12 +203,40 @@ public struct DriveMoveService {
     }
 
     public static func latestUndoableJournal(in folder: URL) -> (url: URL, journal: DriveMoveJournal)? {
+        let barrier = layoutMigrationBarrier(in: folder)
         for url in journals(in: folder) {
             if let journal = try? read(url), journal.undoneAt == nil, !journal.completedIndices.isEmpty {
+                // Journals older than the layout migration name Card Copy
+                // paths; undoing one would swap assignments back while the
+                // files stay in Originals.
+                if let barrier, journal.createdAt < barrier.completedAt { return nil }
                 return (url, journal)
             }
         }
         return nil
+    }
+
+    /// Written into the journal folder by the layout migration: Apply
+    /// journals recorded before `completedAt` are no longer undoable.
+    public struct LayoutMigrationBarrier: Codable, Equatable, Sendable {
+        public var migrationID: UUID
+        public var completedAt: Date
+
+        public init(migrationID: UUID, completedAt: Date) {
+            self.migrationID = migrationID
+            self.completedAt = completedAt
+        }
+    }
+
+    /// Not a `.json` file, so `journals(in:)` never lists it.
+    public static let layoutMigrationBarrierFileName = "layout-migration.barrier"
+
+    public static func layoutMigrationBarrier(in folder: URL) -> LayoutMigrationBarrier? {
+        let url = folder.appendingPathComponent(layoutMigrationBarrierFileName)
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return try? decoder.decode(LayoutMigrationBarrier.self, from: data)
     }
 
     public static func read(_ url: URL) throws -> DriveMoveJournal {

@@ -15,6 +15,18 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate, NSMenuIte
         if CommandLine.arguments.contains("--print-resource-paths") {
             exit(printResourcePaths())
         }
+        // Drive layout migration (Card Copy → Originals/<Camera>): runs and
+        // exits before any app state, catalog connection, or window exists.
+        if CommandLine.arguments.contains(LayoutMigrationCommand.flag) {
+            let status = LayoutMigrationCommand.run(
+                arguments: CommandLine.arguments,
+                defaultSupportFolder: DashboardModel.defaultApplicationSupportURL
+                    .appendingPathComponent("CameraToolkit", isDirectory: true),
+                isAppRunning: { anotherAppInstanceIsRunning() }
+            )
+            DebugLog.shared.flush()
+            exit(status)
+        }
         CrashReporting.start()
         UserDefaults.standard.set(false, forKey: "NSQuitAlwaysKeepsWindows")
         let application = NSApplication.shared
@@ -24,6 +36,16 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate, NSMenuIte
         application.setActivationPolicy(.regular)
         MainMenu.install(target: delegate)
         application.run()
+    }
+
+    /// Another Camera Toolkit app (any bundle with this bundle identifier)
+    /// is running — the layout migration refuses to touch files or the
+    /// catalog under it.
+    private static func anotherAppInstanceIsRunning() -> Bool {
+        let identifier = Bundle.main.bundleIdentifier ?? "org.cameratoolkit.CameraToolkit"
+        let own = ProcessInfo.processInfo.processIdentifier
+        return NSRunningApplication.runningApplications(withBundleIdentifier: identifier)
+            .contains { $0.processIdentifier != own && !$0.isTerminated }
     }
 
     /// One `<name> <location> <path>` line per resource; 1 if any is missing.
