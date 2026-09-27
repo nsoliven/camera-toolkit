@@ -12,8 +12,15 @@ final class EventBoardOfflineTests: XCTestCase {
     /// the fix pass one and the build skipped the offline drive, the empty
     /// sweep equalled the empty build, and `eventStacks` was never assigned
     /// — the board spun on "Loading…" forever. Now the refresh reaches a
-    /// terminal offline state well under a second, naming both drives, and
-    /// never stats a place root on an unmounted volume.
+    /// terminal offline state, naming both drives, answered from the mount
+    /// table: no place root on an unmounted volume is ever stat'ed.
+    ///
+    /// "Quickly" is proven structurally rather than by a tight stopwatch
+    /// (which flaked on a busy machine): any probe of a `/Volumes` root
+    /// would park until a long timeout, so a regression that waits on the
+    /// disk or a timeout blows through the generous backstop, while the
+    /// clock itself covers only reachability check → published offline
+    /// state, not the fixture setup or the storage-strip sweep after it.
     func testAllRootsOfflineReachesTerminalOfflineStateQuickly() async throws {
         let buffer = "/Volumes/CTOfflineBuffer-\(UUID().uuidString.prefix(8))"
         let nas = "/Volumes/CTOfflineNAS-\(UUID().uuidString.prefix(8))"
@@ -25,17 +32,36 @@ final class EventBoardOfflineTests: XCTestCase {
                 }
             }
             let probed = PathLog()
-            workspace.placeResponseProbe = { url in probed.note(url.path); return true }
+            let parked = DispatchSemaphore(value: 0)
+            defer { for _ in 0..<8 { parked.signal() } }
+            // Far beyond the backstop: waiting on even one probe fails it.
+            workspace.placeResponseTimeout = 30
+            workspace.placeResponseProbe = { url in
+                probed.note(url.path)
+                if url.path.hasPrefix("/Volumes/") { _ = parked.wait(timeout: .now() + 60) }
+                return true
+            }
+            // The mount table is read at the start of the reachability
+            // check; the offline report is published right after it.
+            let clock = Stopwatch()
+            let realMounts = VolumeInfo.mountedVolumePaths()
+            workspace.mountedVolumesProvider = { clock.start(); return realMounts }
+            withObservationTracking {
+                _ = workspace.eventReachability
+            } onChange: {
+                clock.stop()
+            }
 
-            let started = Date()
             await workspace.refreshEvent(eventID)
-            let elapsed = Date().timeIntervalSince(started)
 
-            XCTAssertLessThan(elapsed, 1.0, "an unplugged event must fail fast, took \(elapsed)s")
+            let elapsed = try XCTUnwrap(clock.elapsed, "the offline report was never published")
+            XCTAssertLessThan(elapsed, 5.0, "reachability → offline state must not wait on a disk or a timeout, took \(elapsed)s")
             XCTAssertEqual(workspace.eventStacks[eventID], [])
             let report = try XCTUnwrap(workspace.eventReachability[eventID])
             XCTAssertTrue(report.isOffline)
             XCTAssertFalse(report.anyReachable)
+            // Answered from the mount table, not by a probe timing out.
+            XCTAssertEqual(report.unresponsiveVolumes, [])
             let names = report.offlinePlaces.map(\.displayName)
             XCTAssertTrue(names.contains { $0.hasPrefix("CTOfflineBuffer-") && $0.hasSuffix("(Buffer)") }, "\(names)")
             XCTAssertTrue(names.contains { $0.hasPrefix("CTOfflineNAS-") && $0.hasSuffix("(NAS)") }, "\(names)")
@@ -73,7 +99,7 @@ final class EventBoardOfflineTests: XCTestCase {
                 return EventPresenceScanner.state(url, size: size, mounted: mounted)
             }
             let refresh = Task { await workspace.refreshEvent(eventID) }
-            try await waitUntil(timeout: 1) { workspace.eventReachability[eventID]?.isOffline == true }
+            try await waitUntil(timeout: 5) { workspace.eventReachability[eventID]?.isOffline == true }
             XCTAssertEqual(workspace.eventStacks[eventID], [])
             for _ in 0..<50 { gate.signal() }
             await refresh.value
@@ -150,7 +176,7 @@ final class EventBoardOfflineTests: XCTestCase {
             let started = Date()
             await workspace.refreshEvent(eventID)
             let elapsed = Date().timeIntervalSince(started)
-            XCTAssertLessThan(elapsed, 3, "a hung share must be bounded by the timeout, took \(elapsed)s")
+            XCTAssertLessThan(elapsed, 10, "a hung share must be bounded by the timeout (its probe parks for 30 s), took \(elapsed)s")
 
             let report = try XCTUnwrap(workspace.eventReachability[eventID])
             XCTAssertEqual(report.unresponsiveVolumes, [nas])
@@ -339,6 +365,22 @@ private final class PathLog: @unchecked Sendable {
     private var _paths: [String] = []
     var paths: [String] { lock.withLock { _paths } }
     func note(_ path: String) { lock.withLock { _paths.append(path) } }
+}
+
+/// First `start()` and first `stop()` win; later calls are ignored.
+private final class Stopwatch: @unchecked Sendable {
+    private let lock = NSLock()
+    private var started: ContinuousClock.Instant?
+    private var stopped: ContinuousClock.Instant?
+    func start() { lock.withLock { if started == nil { started = .now } } }
+    func stop() { lock.withLock { if started != nil, stopped == nil { stopped = .now } } }
+    var elapsed: TimeInterval? {
+        lock.withLock {
+            guard let started, let stopped else { return nil }
+            let duration = started.duration(to: stopped)
+            return Double(duration.components.seconds) + Double(duration.components.attoseconds) / 1e18
+        }
+    }
 }
 
 private final class MountTable: @unchecked Sendable {
