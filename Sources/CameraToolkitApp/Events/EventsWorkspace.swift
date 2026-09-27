@@ -373,6 +373,10 @@ final class EventsWorkspace {
     var eventReachability: [UUID: EventReachabilityReport] = [:]
     var eventImmichStatuses: [UUID: [String: ImmichCatalogStatus]] = [:]
     var discoveredDriveEvents: [DiscoveredDriveEvent] = []
+    /// Per event board: which of its originals have edits under the
+    /// family's `Edited/<Tag>` folders (`EditTagLinker`). Loaded off the
+    /// main actor after the board's stacks land.
+    var eventEditTags: [UUID: EditTagIndex] = [:]
     /// Camera folders on the Buffer and private staging still in the legacy
     /// `<device>/Card Copy` layout — offered for the layout migration.
     var legacyLayoutFolders: [DriveCameraFolder] = []
@@ -594,6 +598,7 @@ final class EventsWorkspace {
         applying filter: OrganizeSearchFilter = OrganizeSearchFilter()
     ) -> [(event: SavedCameraEvent, depth: Int)] {
         let needle = OrganizeSearch.needle(query)
+        let filter = filter.droppingEditTagRows()
         guard !needle.isEmpty || filter.hasActiveConditions else { return sidebarEvents }
         return sidebarEvents.filter { row in
             let textHit = needle.isEmpty
@@ -1032,12 +1037,15 @@ final class EventsWorkspace {
         guard !scoped.isEmpty else { return stacks }
         let people: BoardPeople = scoped.needsPeople ? boardPeople(for: stacks) : ([], [:], [])
         let cameras = scoped.needsCameras
+        let edits = scoped.needsEditTags
         return stacks.filter {
-            OrganizeSearch.matches(
+            var facts = stackFacts($0, people: people, cameras: cameras)
+            if edits { facts.editTags = editTags(for: $0, in: eventID) }
+            return OrganizeSearch.matches(
                 stack: $0,
                 search: scoped,
                 rootPath: nil,
-                facts: stackFacts($0, people: people, cameras: cameras)
+                facts: facts
             )
         }
     }
@@ -1124,6 +1132,83 @@ final class EventsWorkspace {
             personNames: personNames(on: stack),
             cameraIDs: cameras ? cameraIDs(for: stack) : []
         )
+    }
+
+    // MARK: - Edit tags
+
+    /// Edit tags on a stack's frames on `eventID`'s board — the union a
+    /// burst is judged on, like the other filter facts.
+    func editTags(for stack: OrganizeStack, in eventID: UUID) -> Set<String> {
+        guard let index = eventEditTags[eventID], !index.tagsByItemID.isEmpty else { return [] }
+        var tags = Set<String>()
+        for item in stack.items { tags.formUnion(index.tags(forItemID: item.id)) }
+        return tags
+    }
+
+    /// The tile badge's tags, sorted.
+    func editTagList(for stack: OrganizeStack, in eventID: UUID) -> [String] {
+        editTags(for: stack, in: eventID).sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+    }
+
+    /// Tags on a board's stacks with how many stacks carry each — the
+    /// Edit tag row's options. `scope` is the board's event family; an
+    /// unsorted board (nil) has no edits to offer.
+    func boardEditTags(for stacks: [OrganizeStack], scope: Set<UUID>?) -> [(tag: String, stackCount: Int)] {
+        guard let scope else { return [] }
+        let indexes = scope.compactMap { eventEditTags[$0] }
+        guard !indexes.isEmpty else { return [] }
+        var counts: [String: Int] = [:]
+        for stack in stacks {
+            var tags = Set<String>()
+            for index in indexes {
+                for item in stack.items { tags.formUnion(index.tags(forItemID: item.id)) }
+            }
+            for tag in tags { counts[tag, default: 0] += 1 }
+        }
+        return counts.map { ($0.key, $0.value) }.sorted {
+            $0.stackCount != $1.stackCount ? $0.stackCount > $1.stackCount : $0.tag.localizedStandardCompare($1.tag) == .orderedAscending
+        }
+    }
+
+    /// Reads the family's `Edited/` folders (both drives) and links each
+    /// edit to the board's originals — by file-name stem, else by capture
+    /// time and camera. Off the main actor; publishes only while the
+    /// board still shows the same stacks.
+    func refreshEditTags(for eventID: UUID) {
+        guard let event = event(eventID), let stacks = eventStacks[eventID] else { return }
+        let locations = self.locations
+        let members = scopeIDs(eventID).compactMap { self.event($0) } + [event]
+        var folders: [URL] = []
+        for member in members {
+            for policy in EventStoragePolicy.allCases {
+                let folder = locations.eventFolder(for: member, policy: policy)
+                if VolumeInfo.isAvailable(folder) { folders.append(folder) }
+            }
+        }
+        let candidates = stacks.flatMap(\.items).map { item in
+            EditTagCandidate(
+                itemID: item.id,
+                fileNames: [item.primary.name] + item.companions.map(\.name),
+                captureDate: item.hasCameraDate ? item.captureDate : nil,
+                cameraID: camera(for: item)?.id
+            )
+        }
+        let gate = driveActivityGate
+        let roots = folders
+        Task { @MainActor [weak self] in
+            let index = await Task.detached(priority: .utility) { () -> EditTagIndex? in
+                let folders = roots
+                guard folders.allSatisfy({ gate.waitIfPaused(for: $0, shouldStop: { Task.isCancelled }) }) else { return nil }
+                let edits = EditTagLinker.editedFiles(eventFolders: folders)
+                guard !edits.isEmpty else { return EditTagIndex() }
+                return EditTagLinker.link(edits: edits, candidates: candidates) { edit in
+                    let metadata = CaptureDateReader.metadata(of: URL(fileURLWithPath: edit.path))
+                    return (metadata.timestamp?.date, CameraCatalog.camera(metadata: metadata.camera)?.id)
+                }
+            }.value
+            guard let self, let index, self.eventStacks[eventID] == stacks else { return }
+            if self.eventEditTags[eventID] != index { self.eventEditTags[eventID] = index }
+        }
     }
 
     // MARK: - Cameras
@@ -2471,6 +2556,7 @@ final class EventsWorkspace {
         eventGridRevisions[eventID] = revision
         eventBuildRemainders[eventID] = nil
         eventDateReadRemainders[eventID] = pendingDateReads > 0 ? pendingDateReads : nil
+        if pendingDateReads == 0 { refreshEditTags(for: eventID) }
     }
 
     /// Main-actor landing point for the utility-priority sweep. Publishes
@@ -2539,6 +2625,7 @@ final class EventsWorkspace {
         guard refreshGenerations[eventID] == generation else { return }
         eventStacks[eventID] = rebuilt.carryingIDs(from: eventStacks[eventID] ?? [])
         eventGridRevisions[eventID] = revision
+        refreshEditTags(for: eventID)
     }
 
     /// Wakes refresh waiters whose sweep just landed, plus every waiter

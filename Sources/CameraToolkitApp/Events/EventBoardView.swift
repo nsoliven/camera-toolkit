@@ -332,6 +332,7 @@ struct EventBoardView: View {
             containerID: eventID,
             eventForStack: { _ in (nil, false) },
             tagForStack: { workspace.subeventTag(for: $0, in: eventID) },
+            editTagsForStack: { workspace.editTagList(for: $0, in: eventID) },
             isDimmed: { _ in false },
             badge: { workspace.badge(for: $0, in: eventID) },
             orientationForFile: { workspace.displayTurns(for: $0) },

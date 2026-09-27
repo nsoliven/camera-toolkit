@@ -341,18 +341,27 @@ private func stackTitle(_ stack: OrganizeStack) -> String {
     return stack.coverItem.primary.name
 }
 
+/// "Edited · Photomator", or "Edited · Masters +1" for several tags —
+/// the badge an original wears when `Edited/<Tag>` holds an edit of it.
+func editTagBadgeTitle(_ tags: [String]) -> String? {
+    guard let first = tags.first else { return nil }
+    return tags.count == 1 ? "Edited · \(first)" : "Edited · \(first) +\(tags.count - 1)"
+}
+
 /// VoiceOver name for a tile or row: what it is, when, and where it went.
 private func stackAccessibilityLabel(
     _ stack: OrganizeStack,
     event: SavedCameraEvent?,
     isMixed: Bool,
-    badge: TileLocationBadge?
+    badge: TileLocationBadge?,
+    editTags: [String] = []
 ) -> String {
     var parts = [stackTitle(stack), stack.captureDate.formatted(date: .abbreviated, time: .shortened)]
     if stack.kind == .video, !stack.isBurst { parts.append("Video") }
     if let event { parts.append(event.name) }
     if isMixed { parts.append("Mixed events") }
     if let badge { parts.append(badge.label) }
+    if !editTags.isEmpty { parts.append("Edited: " + editTags.joined(separator: ", ")) }
     return parts.joined(separator: ", ")
 }
 
@@ -374,6 +383,9 @@ struct StackTileView: View {
     let isMixed: Bool
     let isDimmed: Bool
     let badge: TileLocationBadge?
+    /// Edit tags linked to the stack's originals (`Edited/<Tag>`), sorted;
+    /// empty hides the "Edited · <Tag>" badge.
+    var editTags: [String] = []
     /// Subfolder the stack lives in, relative to the scan root — shown as a
     /// tooltip. Nil when the stack sits directly in the scanned folder.
     var originFolder: String? = nil
@@ -440,6 +452,12 @@ struct StackTileView: View {
                             }
                             .photoBadgeScrim()
                         }
+                        if let title = editTagBadgeTitle(editTags) {
+                            Label(title, systemImage: "slider.horizontal.3")
+                                .lineLimit(1)
+                                .photoBadgeScrim()
+                                .help("Edits in Edited/: " + editTags.joined(separator: ", "))
+                        }
                         Spacer(minLength: 0)
                     }
                 }
@@ -472,7 +490,7 @@ struct StackTileView: View {
         .contentShape(Rectangle())
         .help(originFolder.map { "In \($0)" } ?? stack.coverItem.primary.name)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel(stackAccessibilityLabel(stack, event: event, isMixed: isMixed, badge: badge))
+        .accessibilityLabel(stackAccessibilityLabel(stack, event: event, isMixed: isMixed, badge: badge, editTags: editTags))
         .accessibilityValue(isDimmed ? "Sorted" : "")
         .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)
         .accessibilityActions {
@@ -623,6 +641,7 @@ struct StackRowView<MoreMenu: View>: View {
     let isMixed: Bool
     let isDimmed: Bool
     let badge: TileLocationBadge?
+    var editTags: [String] = []
     var originFolder: String? = nil
     var onExpand: (() -> Void)? = nil
     var onPlay: (() -> Void)? = nil
@@ -668,6 +687,10 @@ struct StackRowView<MoreMenu: View>: View {
                     }
                     if let badge {
                         Label(badge.label, systemImage: badge.symbol)
+                    }
+                    if let title = editTagBadgeTitle(editTags) {
+                        Label(title, systemImage: "slider.horizontal.3")
+                            .lineLimit(1)
                     }
                 }
                 .font(.caption)
@@ -740,7 +763,7 @@ struct StackRowView<MoreMenu: View>: View {
         .padding(.horizontal, 8)
         .help(originFolder.map { "In \($0)" } ?? stack.coverItem.primary.name)
         .accessibilityElement(children: .contain)
-        .accessibilityLabel(stackAccessibilityLabel(stack, event: event, isMixed: isMixed, badge: badge))
+        .accessibilityLabel(stackAccessibilityLabel(stack, event: event, isMixed: isMixed, badge: badge, editTags: editTags))
         .accessibilityValue(isDimmed ? "Sorted" : "")
         .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)
     }
@@ -870,6 +893,8 @@ struct OrganizeGrid<MenuContent: View>: View {
     /// The subevent tag a tile or row wears — event boards resolve the
     /// owning subevent here; nil keeps the tag off (unsorted boards).
     var tagForStack: (OrganizeStack) -> SavedCameraEvent? = { _ in nil }
+    /// Edit tags for a tile's "Edited · <Tag>" badge — event boards only.
+    var editTagsForStack: (OrganizeStack) -> [String] = { _ in [] }
     let isDimmed: (OrganizeStack) -> Bool
     let badge: (OrganizeStack) -> TileLocationBadge?
     /// Display rotation recorded for a file, in quarter-turns clockwise —
@@ -1028,6 +1053,7 @@ struct OrganizeGrid<MenuContent: View>: View {
             isMixed: assigned.mixed,
             isDimmed: isDimmed(stack),
             badge: badge(stack),
+            editTags: editTagsForStack(stack),
             originFolder: OrganizeFolderLabel.subfolder(
                 forFolderPath: stack.coverItem.primary.folderPath,
                 rootPath: rootPath
@@ -1065,6 +1091,7 @@ struct OrganizeGrid<MenuContent: View>: View {
             isMixed: assigned.mixed,
             isDimmed: isDimmed(stack),
             badge: badge(stack),
+            editTags: editTagsForStack(stack),
             originFolder: OrganizeFolderLabel.title(
                 forFolderPath: stack.coverItem.primary.folderPath,
                 rootPath: rootPath

@@ -25,6 +25,32 @@ final class OrganizeSearchTests: XCTestCase {
         OrganizeSearch.matches(stack: stack, search: search, rootPath: "/Card", facts: facts)
     }
 
+    /// "Edit tag is any of / none of" — a stack keeps or drops on the
+    /// tags linked to its originals; the sidebar ignores these rows.
+    func testEditTagRowsMatchAnyOrNoneOfTheLinkedTags() {
+        let stack = OrganizeStack(items: [item("/Card/DSC1.ARW")])
+        var photomator = OrganizeStackFacts()
+        photomator.editTags = ["Photomator"]
+        let plain = OrganizeStackFacts()
+
+        var anyOf = OrganizeSearchFilter()
+        anyOf.addCondition(.editTags(["Photomator", "Masters"]))
+        XCTAssertTrue(anyOf.needsEditTags)
+        XCTAssertTrue(matches(stack, search: anyOf, facts: photomator))
+        XCTAssertFalse(matches(stack, search: anyOf, facts: plain))
+
+        var noneOf = OrganizeSearchFilter()
+        noneOf.addCondition(.editTags(["Photomator"], exclude: true))
+        XCTAssertFalse(matches(stack, search: noneOf, facts: photomator))
+        XCTAssertTrue(matches(stack, search: noneOf, facts: plain))
+
+        XCTAssertEqual(OrganizeFilterRow.Operator.options(for: .editTag), [.anyOf, .noneOf])
+        XCTAssertFalse(anyOf.droppingEditTagRows().hasActiveConditions)
+        XCTAssertEqual(editTagBadgeTitle(["Photomator"]), "Edited · Photomator")
+        XCTAssertEqual(editTagBadgeTitle(["Masters", "Photomator"]), "Edited · Masters +1")
+        XCTAssertNil(editTagBadgeTitle([]))
+    }
+
     func testNeedleTrimsAndLowercases() {
         XCTAssertEqual(OrganizeSearch.needle("  TRIP \n"), "trip")
         XCTAssertEqual(OrganizeSearch.needle("   "), "")

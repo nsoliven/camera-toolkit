@@ -1101,6 +1101,41 @@ final class EventsWorkspaceTests: XCTestCase {
         }
     }
 
+    /// An edit in the event's `Edited/<Tag>/` links to its original by
+    /// file-name stem: the original's tile gets the tag, and the board's
+    /// Edit tag row keeps (any of) or drops (none of) it.
+    func testEditedFolderTagsItsOriginalAndTheBoardFiltersOnIt() async throws {
+        try await withOrganizerSandbox { root, _, workspace in
+            let event = try XCTUnwrap(workspace.createEvent(name: "Beach Day", date: organizerDay("2026-08-26"), policy: .buffer))
+            let folder = root.appendingPathComponent("Drive/Camera Buffer/2026/2026-08-26 Beach Day", isDirectory: true)
+            try writeOrganizerARW(folder.appendingPathComponent("Originals/Sony A7V/DSC00001.ARW"), "2026:08:26 12:00:00", "000")
+            try writeOrganizerARW(folder.appendingPathComponent("Originals/Sony A7V/DSC00002.ARW"), "2026:08:26 12:05:00", "000")
+            let edit = folder.appendingPathComponent("Edited/Photomator/DSC00001-edit.jpg")
+            try FileManager.default.createDirectory(at: edit.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data("jpeg".utf8).write(to: edit)
+
+            workspace.discoverDriveEvents()
+            try await waitUntil { !workspace.discoveredDriveEvents.isEmpty }
+            XCTAssertFalse(workspace.discoveredDriveEvents.contains { $0.filesRootPath.contains("/Edited") })
+            workspace.adoptDiscoveredDriveEvents()
+            await workspace.refreshEvent(event)
+            try await waitUntil { workspace.eventEditTags[event]?.tagsByItemID.isEmpty == false }
+
+            let stacks = workspace.eventStacks[event] ?? []
+            XCTAssertEqual(stacks.count, 2)
+            let tagged = stacks.filter { !workspace.editTagList(for: $0, in: event).isEmpty }
+            XCTAssertEqual(tagged.map(\.coverItem.primary.name), ["DSC00001.ARW"])
+            XCTAssertEqual(workspace.boardEditTags(for: stacks, scope: workspace.scopeIDs(event)).map(\.tag), ["Photomator"])
+
+            var search = OrganizeSearchFilter()
+            search.addCondition(.editTags(["Photomator"]))
+            XCTAssertEqual(workspace.visibleEventStacks(event, search: search).map(\.coverItem.primary.name), ["DSC00001.ARW"])
+            search = OrganizeSearchFilter()
+            search.addCondition(.editTags(["Photomator"], exclude: true))
+            XCTAssertEqual(workspace.visibleEventStacks(event, search: search).map(\.coverItem.primary.name), ["DSC00002.ARW"])
+        }
+    }
+
     func testEventPeopleDriveChipsAndSidebarPersonFilter() async throws {
         try await withOrganizerSandbox { root, model, workspace in
             let beach = try XCTUnwrap(workspace.createEvent(name: "Beach Day", date: organizerDay("2026-08-26"), policy: .buffer))

@@ -90,6 +90,26 @@ struct OrganizeSearchFilter: Equatable, Sendable {
         }
     }
 
+    /// Whether any row tests edit tags — event boards look up each
+    /// stack's `Edited/<Tag>` links only while an Edit tag row filters.
+    var needsEditTags: Bool {
+        groups.contains { group in
+            group.rows.contains { $0.property == .editTag && !$0.isEmpty }
+        }
+    }
+
+    /// The same filter without Edit tag rows — the sidebar's event list
+    /// has no per-event edit index, so those rows narrow boards only.
+    func droppingEditTagRows() -> OrganizeSearchFilter {
+        var copy = self
+        copy.groups = groups.map { group in
+            var trimmed = group
+            trimmed.rows.removeAll { $0.property == .editTag }
+            return trimmed
+        }
+        return copy
+    }
+
     /// The Camera row a header chip edits: the first switched-on
     /// "is any of" Camera row, if any.
     private var chipCameraRowPath: (group: Int, row: Int)? {
@@ -225,7 +245,7 @@ struct OrganizeFilterGroup: Equatable, Sendable, Identifiable {
 struct OrganizeFilterRow: Equatable, Sendable, Identifiable {
     /// The stack fact the row tests.
     enum Property: String, CaseIterable, Sendable {
-        case people, event, media, date, camera
+        case people, event, media, date, camera, editTag
 
         var title: String {
             switch self {
@@ -234,6 +254,7 @@ struct OrganizeFilterRow: Equatable, Sendable, Identifiable {
             case .media: "Media"
             case .date: "Date"
             case .camera: "Camera"
+            case .editTag: "Edit tag"
             }
         }
     }
@@ -292,8 +313,9 @@ struct OrganizeFilterRow: Equatable, Sendable, Identifiable {
             case .people: allCases
             case .event, .media, .date: [.anyOf, .allOf, .noneOf, .notAllOf]
             // A frame has one camera, so "all of" only means something
-            // for a mixed burst — the row keeps to any/none.
-            case .camera: [.anyOf, .noneOf]
+            // for a mixed burst — the row keeps to any/none. Edit tags the
+            // same: "has a Photomator edit" / "has none".
+            case .camera, .editTag: [.anyOf, .noneOf]
             }
         }
 
@@ -330,6 +352,9 @@ struct OrganizeFilterRow: Equatable, Sendable, Identifiable {
     /// Values for a Camera row — `OrganizeCamera.id`s, including
     /// `OrganizeCamera.unknownID` for "Unknown camera".
     var cameraIDs: Set<String> = []
+    /// Values for an Edit tag row — first-level folder names under the
+    /// event's `Edited/`.
+    var editTags: Set<String> = []
     /// Inclusive day bounds for a Date row, matched at the camera wall
     /// clock's day granularity — the same day bucketing
     /// `OrganizeStacker.days` uses.
@@ -386,6 +411,13 @@ struct OrganizeFilterRow: Equatable, Sendable, Identifiable {
         return row
     }
 
+    /// An Edit tag row; `exclude: true` makes it "is none of".
+    static func editTags(_ tags: Set<String>, exclude: Bool = false) -> Self {
+        var row = Self(property: .editTag, operator: exclude ? .noneOf : .anyOf)
+        row.editTags = tags
+        return row
+    }
+
     /// A Date row — either bound may stay open.
     static func days(from start: Date?, to end: Date?) -> Self {
         var row = Self(property: .date)
@@ -403,6 +435,7 @@ struct OrganizeFilterRow: Equatable, Sendable, Identifiable {
         case .media: !mediaKinds.isEmpty
         case .date: dayStart != nil || dayEnd != nil
         case .camera: !cameraIDs.isEmpty
+        case .editTag: !editTags.isEmpty
         }
     }
 
@@ -472,6 +505,14 @@ struct OrganizeFilterRow: Equatable, Sendable, Identifiable {
                 hasAll: hasAll,
                 isExactly: hasAll && subject.cameraIDs.isSubset(of: cameraIDs)
             )
+        case .editTag:
+            guard !editTags.isEmpty else { return true }
+            let hasAll = editTags.isSubset(of: subject.editTags)
+            return `operator`.matches(
+                hasAny: !subject.editTags.isDisjoint(with: editTags),
+                hasAll: hasAll,
+                isExactly: hasAll && subject.editTags.isSubset(of: editTags)
+            )
         case .date:
             guard dayStart != nil || dayEnd != nil, let span = subject.daySpan else { return true }
             let lower = dayStart.map { calendar.startOfDay(for: $0) } ?? .distantPast
@@ -504,6 +545,8 @@ struct OrganizeFilterSubject: Equatable, Sendable {
     /// Cameras that shot the subject's files — the union over a burst's
     /// frames; a frame with no known camera adds `OrganizeCamera.unknownID`.
     var cameraIDs: Set<String> = []
+    /// Edit tags on the subject's originals (`Edited/<Tag>` links).
+    var editTags: Set<String> = []
     /// The subject's capture interval, matched against a Date row's day
     /// bounds. Nil means the subject has no dates and never filters on
     /// one.
@@ -515,6 +558,7 @@ struct OrganizeFilterSubject: Equatable, Sendable {
         eventIDs: Set<UUID> = [],
         mediaKinds: Set<OrganizeMediaKind> = [],
         cameraIDs: Set<String> = [],
+        editTags: Set<String> = [],
         daySpan: ClosedRange<Date>? = nil
     ) {
         self.personIDs = personIDs
@@ -522,6 +566,7 @@ struct OrganizeFilterSubject: Equatable, Sendable {
         self.eventIDs = eventIDs
         self.mediaKinds = mediaKinds
         self.cameraIDs = cameraIDs
+        self.editTags = editTags
         self.daySpan = daySpan
     }
 
@@ -535,6 +580,7 @@ struct OrganizeFilterSubject: Equatable, Sendable {
             eventIDs: facts.eventIDs,
             mediaKinds: Set(stack.items.map(\.kind)),
             cameraIDs: facts.cameraIDs,
+            editTags: facts.editTags,
             daySpan: min(stack.captureDate, stack.endDate)...max(stack.captureDate, stack.endDate)
         )
     }
@@ -564,6 +610,9 @@ struct OrganizeStackFacts: Equatable, Sendable {
     /// Cameras across the stack's frames (`EventsWorkspace.cameraIDs(for:)`)
     /// — resolved only while a Camera row filters, empty otherwise.
     var cameraIDs: Set<String> = []
+    /// Edit tags linked to the stack's frames — resolved only while an
+    /// Edit tag row filters an event board, empty otherwise.
+    var editTags: Set<String> = []
 }
 
 /// Lowercase-contains text matching for the Events sidebar and the organize

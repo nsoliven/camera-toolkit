@@ -18,8 +18,8 @@ struct OrganizeFilterButton: View {
                 .foregroundStyle(active > 0 ? AnyShapeStyle(.tint) : AnyShapeStyle(.primary))
         }
         .help(active > 0
-            ? "\(active) filter\(active == 1 ? "" : "s") on — people, date, event, media kind, or camera"
-            : "Filter by people, date, event, media kind, or camera")
+            ? "\(active) filter\(active == 1 ? "" : "s") on — people, date, event, media kind, camera, or edit tag"
+            : "Filter by people, date, event, media kind, camera, or edit tag")
         .anchorPreference(key: BoardFilterAnchorKey.self, value: .bounds) { $0 }
     }
 }
@@ -334,6 +334,8 @@ struct OrganizeFilterPanel: View {
                 mediaValues(row)
             case .camera:
                 cameraValues(row)
+            case .editTag:
+                editTagValues(row)
             }
         }
         .padding(7)
@@ -601,6 +603,49 @@ struct OrganizeFilterPanel: View {
         }
     }
 
+    // MARK: - Edit tag values
+
+    /// The first-level folders under the family's `Edited/` that link to
+    /// this board's originals.
+    private func editTagValues(_ row: Binding<OrganizeFilterRow>) -> some View {
+        let options = workspace.boardEditTags(for: stacks, scope: eventScope)
+        let picked = row.wrappedValue.editTags.sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+        return FlowLayout(horizontalSpacing: 5, verticalSpacing: 5) {
+            ForEach(picked, id: \.self) { tag in
+                let count = options.first { $0.tag == tag }?.stackCount ?? 0
+                valueChip(tag, symbol: "slider.horizontal.3", help: "\(count) item\(count == 1 ? "" : "s") on this board have a \(tag) edit") {
+                    row.wrappedValue.editTags.remove(tag)
+                }
+            }
+            if options.isEmpty {
+                Text(eventScope == nil
+                    ? "Edit tags come from an event's Edited folder — open an event board."
+                    : "No edits linked yet. Put edits in the event's Edited/<Tag>/ folder; each folder name is a tag.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                let unpicked = options.filter { !row.wrappedValue.editTags.contains($0.tag) }
+                Menu {
+                    ForEach(unpicked, id: \.tag) { option in
+                        Button {
+                            row.wrappedValue.editTags.insert(option.tag)
+                        } label: {
+                            Label("\(option.tag) (\(option.stackCount.formatted()))", systemImage: "slider.horizontal.3")
+                        }
+                    }
+                } label: {
+                    addValueLabel
+                }
+                .menuIndicator(.hidden)
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .disabled(unpicked.isEmpty)
+                .help("Add an edit tag to this row")
+            }
+        }
+    }
+
     // MARK: - Date values
 
     private func dateValues(_ row: Binding<OrganizeFilterRow>) -> some View {
@@ -714,6 +759,8 @@ struct OrganizeFilterHotLinks: View {
             Text(mediaLabel(for: row))
         case .camera:
             Text(cameraLabel(for: row))
+        case .editTag:
+            Text(row.editTags.sorted { $0.localizedStandardCompare($1) == .orderedAscending }.joined(separator: ", "))
         case .date:
             Text(dateLabel(for: row))
         case .event:
