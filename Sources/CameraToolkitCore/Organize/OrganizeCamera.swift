@@ -304,12 +304,12 @@ public enum QuickTimeCameraReader {
         }
     }
 
-    private struct Box {
+    struct Box {
         var type: String
         var payload: Range<Int>
     }
 
-    private static func boxes(_ bytes: [UInt8], _ range: Range<Int>) -> [Box] {
+    static func boxes(_ bytes: [UInt8], _ range: Range<Int>) -> [Box] {
         var result: [Box] = []
         var offset = range.lowerBound
         while offset + 8 <= range.upperBound, result.count < 4_096 {
@@ -398,11 +398,11 @@ public enum QuickTimeCameraReader {
             ?? String(bytes: slice.prefix { $0 != 0 }, encoding: .isoLatin1)
     }
 
-    private static func fourCC(_ bytes: [UInt8], _ offset: Int) -> String {
+    static func fourCC(_ bytes: [UInt8], _ offset: Int) -> String {
         String(bytes[offset..<(offset + 4)].map { Character(Unicode.Scalar($0)) })
     }
 
-    private static func uint32(_ bytes: [UInt8], _ offset: Int) -> UInt32 {
+    static func uint32(_ bytes: [UInt8], _ offset: Int) -> UInt32 {
         guard offset >= 0, offset + 4 <= bytes.count else { return 0 }
         return UInt32(bytes[offset]) << 24 | UInt32(bytes[offset + 1]) << 16
             | UInt32(bytes[offset + 2]) << 8 | UInt32(bytes[offset + 3])

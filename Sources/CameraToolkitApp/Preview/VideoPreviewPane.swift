@@ -25,7 +25,7 @@ enum VideoPreviewSupport {
         playableTimeout: Duration = playableTimeout,
         readinessTimeout: Duration = readinessTimeout
     ) async -> AVPlayer? {
-        let asset = AVURLAsset(url: url)
+        let asset = CameraVideoAsset.asset(for: url)
         let start = ContinuousClock.now
         guard await isPlayable(asset, timeout: playableTimeout) else {
             DebugLog.shared.log(

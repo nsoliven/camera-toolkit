@@ -561,8 +561,12 @@ public struct FaceIndexService: Sendable {
         telemetry: FaceScanTelemetry?
     ) -> PhotoOutcome {
         let file = item.primary
+        // An Osmo 360 OSV is sampled through its stitched LRF proxy: both
+        // lenses in one equirectangular frame at a fraction of the decode.
+        // Faces are still recorded against the OSV, the item the board shows.
+        let source = DJI360Media.faceScanFile(for: item)
         guard let stride = options.videoFrameStride,
-              let sampler = FaceVideoSampler(url: file.url, maximumPixelSize: options.detectPixels) else {
+              let sampler = FaceVideoSampler(url: source.url, maximumPixelSize: options.detectPixels) else {
             telemetry?.finish(token, faces: 0, videoFramesRead: 0, failed: true)
             return .failed
         }
@@ -580,7 +584,7 @@ public struct FaceIndexService: Sendable {
         // frame for the share of the clip it spans (≈ stride/duration of
         // the file) so the read-rate stays an honest estimate.
         let bytesPerFrame = Int64(
-            Double(file.size) * min(1, stride / max(sampler.duration, 0.001))
+            Double(source.size) * min(1, stride / max(sampler.duration, 0.001))
         )
         let nativeSize = sampler.pixelSize.width > 0 ? sampler.pixelSize : nil
         var faces: [FaceRecord] = []

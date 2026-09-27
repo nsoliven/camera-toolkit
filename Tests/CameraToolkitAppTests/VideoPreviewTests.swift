@@ -56,6 +56,36 @@ final class VideoPreviewTests: XCTestCase {
         XCTAssertFalse(playable)
     }
 
+    /// An Osmo 360 pair: the `.LRF` proxy is an MP4 AVFoundation refuses by
+    /// extension alone, so this proves the MIME override plays it, and that
+    /// an OSV whose own streams can't be read still gets a thumbnail and a
+    /// poster from its proxy. Both files are synthetic.
+    func testOSVThumbnailAndPlaybackComeFromItsLRFProxy() async throws {
+        let clip = try await Self.writeSyntheticClip()
+        defer { try? FileManager.default.removeItem(at: clip) }
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CameraToolkitOSV-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let proxy = folder.appendingPathComponent("CAM_0001_D.LRF")
+        try FileManager.default.copyItem(at: clip, to: proxy)
+        let osv = folder.appendingPathComponent("CAM_0001_D.OSV")
+        try Data("not a readable movie".utf8).write(to: osv)
+
+        let player = await VideoPreviewSupport.readyPlayer(for: proxy)
+        XCTAssertEqual(player?.status, .readyToPlay)
+
+        let tile = try XCTUnwrap(TileImageLoader.dji360Thumbnail(url: osv, maximumPixelSize: 384))
+        XCTAssertEqual(tile.width, 128)
+        let poster = try XCTUnwrap(TileImageLoader.decode(url: osv, maximumPixelSize: 2_400))
+        XCTAssertEqual(poster.width, 128)
+        XCTAssertEqual(poster.height, 96)
+
+        // Without a proxy and without readable streams there is nothing to show.
+        try FileManager.default.removeItem(at: proxy)
+        XCTAssertNil(TileImageLoader.dji360Thumbnail(url: osv, maximumPixelSize: 384))
+    }
+
     // MARK: - Synthetic clip
 
     /// Writes a few solid-color H.264 frames into a temp .mp4. Frames are

@@ -410,7 +410,10 @@ final class TileImageLoader: @unchecked Sendable {
             }
             return PreviewImageDecoder.cgImage(url: url, maximumPixelSize: maximumPixelSize)
         }
-        if OrganizeFileClassifier.videoExtensions.contains(ext) {
+        if DJI360Media.clipExtensions.contains(ext) {
+            return dji360Thumbnail(url: url, maximumPixelSize: maximumPixelSize)
+        }
+        if OrganizeFileClassifier.videoExtensions.contains(ext) || DJI360Media.proxyExtensions.contains(ext) {
             return videoFrame(url: url, maximumPixelSize: maximumPixelSize)
         }
         if OrganizeFileClassifier.photoExtensions.contains(ext) {
@@ -419,8 +422,27 @@ final class TileImageLoader: @unchecked Sendable {
         return nil
     }
 
+    /// An Osmo 360 OSV never decodes its 3840² fisheye streams when it can
+    /// help it: tiles read the clip's embedded 688×344 equirectangular
+    /// cover, larger posters a frame of the sibling LRF proxy, and only a
+    /// clip with neither falls back to one lens of the original
+    /// (`DJI360Media.thumbnailSourceOrder`). Results land in the ordinary
+    /// in-memory cache under the OSV's own key; nothing is written to disk.
+    static func dji360Thumbnail(url: URL, maximumPixelSize: Int) -> CGImage? {
+        DJI360Media.thumbnail(forClipAt: url, maximumPixelSize: maximumPixelSize) { source in
+            switch source {
+            case .embeddedCover(let clip):
+                return QuickTimeCoverArtReader.image(from: clip, maximumPixelSize: maximumPixelSize)
+            case .proxyFrame(let proxy):
+                return videoFrame(url: proxy, maximumPixelSize: maximumPixelSize)
+            case .lensFrame(let clip):
+                return videoFrame(url: clip, maximumPixelSize: maximumPixelSize)
+            }
+        }
+    }
+
     private static func videoFrame(url: URL, maximumPixelSize: Int) -> CGImage? {
-        let generator = AVAssetImageGenerator(asset: AVURLAsset(url: url))
+        let generator = AVAssetImageGenerator(asset: CameraVideoAsset.asset(for: url))
         generator.appliesPreferredTrackTransform = true
         generator.maximumSize = CGSize(width: maximumPixelSize, height: maximumPixelSize)
         generator.requestedTimeToleranceBefore = .positiveInfinity

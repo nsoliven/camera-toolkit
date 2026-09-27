@@ -378,6 +378,14 @@ struct EventBoardView: View {
         .optionalHelp(menu.rotateHelp)
         Divider()
         Button("Preview") { openPreview(stack.id) }
+        // A 360 clip's own editor leads when it's installed; Photomator
+        // stays for everything else.
+        if DJIStudio.isOffered(for: stack.items.map(\.primary.url), resolver: WorkspaceBundleResolver.shared) {
+            Button("Open in \(DJIStudio.name)") {
+                openInDJIStudio(targets)
+            }
+            .help(DJIStudio.help)
+        }
         Button("Open in Photomator") {
             openInPhotomator(targets)
         }
@@ -397,6 +405,17 @@ struct EventBoardView: View {
 
     private func stacks(for ids: Set<String>) -> [OrganizeStack] {
         workspace.stacks(matching: ids, inEvent: eventID)
+    }
+
+    private func openInDJIStudio(_ ids: Set<String>) {
+        let urls = urls(for: ids)
+        guard !urls.isEmpty else {
+            workspace.model.statusMessage = "Those stacks are not on the board anymore — click them again."
+            return
+        }
+        if !DJIStudio.open(urls) {
+            workspace.model.statusMessage = "DJI Studio isn't installed, or none of those items is a 360° clip."
+        }
     }
 
     private func openInPhotomator(_ ids: Set<String>) {
@@ -466,7 +485,7 @@ struct EventBoardView: View {
                 openPreview(id)
             }
         case .openSelection:
-            PhotomatorLauncher.open(urls(for: workspace.targetStackIDs()))
+            PreferredExternalOpen.open(urls(for: workspace.targetStackIDs()))
         case .revealSelection:
             NSWorkspace.shared.activateFileViewerSelecting(urls(for: workspace.targetStackIDs()))
         case .reload:

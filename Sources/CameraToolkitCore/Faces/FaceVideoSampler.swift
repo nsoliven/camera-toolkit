@@ -13,7 +13,7 @@ public final class FaceVideoSampler {
     public let duration: TimeInterval
 
     public init?(url: URL, maximumPixelSize: Int) {
-        let asset = AVURLAsset(url: url)
+        let asset = CameraVideoAsset.asset(for: url)
         let duration = asset.duration.seconds
         guard duration.isFinite, duration > 0 else { return nil }
         let generator = AVAssetImageGenerator(asset: asset)

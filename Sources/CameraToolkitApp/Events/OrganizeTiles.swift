@@ -1389,6 +1389,10 @@ struct StackPreviewOverlay: View {
     /// nil = still checking, true = an AVPlayer is running, false = the codec
     /// can't play in-app and the poster stays on screen.
     @State private var videoPlayable: Bool?
+    /// Shows a 360° clip on a look-around sphere instead of the flat
+    /// equirectangular frame. Off by default; survives stepping between
+    /// clips in one preview session.
+    @State private var sphericalView = false
     @State private var image: CGImage?
     /// The frame+rotation a high-resolution decode was requested for — set
     /// the moment zoom passes fit so a stale frame never triggers a fetch.
@@ -1672,7 +1676,7 @@ struct StackPreviewOverlay: View {
                     .buttonBorderShape(.circle)
                     .menuIndicator(.hidden)
                     .fixedSize()
-                    .help("Open \(item.primary.name) in another app (O opens it in Photomator)")
+                    .help("Open \(item.primary.name) in another app (O opens it in \(DJIStudio.isOffered(for: [item.primary.url], resolver: WorkspaceBundleResolver.shared) ? DJIStudio.name : "Photomator"))")
                 }
             }
             .controlSize(.large)
@@ -1797,7 +1801,10 @@ struct StackPreviewOverlay: View {
     /// player chrome; a clip the probe can't prove playable keeps its
     /// poster with a note.
     private func videoPane(_ item: OrganizeItem) -> some View {
-        ZStack {
+        let dji360 = DJI360PreviewKind(item: item)
+        let studioAvailable = dji360 != nil
+            && DJIStudio.isOffered(for: [item.primary.url], resolver: WorkspaceBundleResolver.shared)
+        return ZStack {
             Color.black
             if let image {
                 Image(decorative: image, scale: 1)
@@ -1806,7 +1813,11 @@ struct StackPreviewOverlay: View {
                     .opacity(videoPlayer == nil ? 1 : 0)
             }
             if let videoPlayer {
-                VideoPreviewPane(player: videoPlayer)
+                if sphericalView, dji360 == .proxy {
+                    SphericalVideoView(player: videoPlayer)
+                } else {
+                    VideoPreviewPane(player: videoPlayer)
+                }
             } else if videoPlayable == false {
                 ContentUnavailableView {
                     Label("Can’t Play In-App", systemImage: "video.slash")
@@ -1817,15 +1828,33 @@ struct StackPreviewOverlay: View {
                         NSWorkspace.shared.activateFileViewerSelecting([item.primary.url])
                         isFocused = true
                     }
-                    Button("Open in Photomator") {
-                        PhotomatorLauncher.open(item.files.map(\.url))
+                    if studioAvailable {
+                        Button("Open in \(DJIStudio.name)") {
+                            DJIStudio.open([item.primary.url])
+                        }
+                        .buttonStyle(.borderedProminent)
+                    } else {
+                        Button("Open in Photomator") {
+                            PhotomatorLauncher.open(item.files.map(\.url))
+                        }
+                        .buttonStyle(.borderedProminent)
                     }
-                    .buttonStyle(.borderedProminent)
                 }
                 .environment(\.colorScheme, .dark)
             } else {
                 ProgressView()
                     .tint(.white)
+            }
+        }
+        .overlay(alignment: .top) {
+            if let dji360, videoPlayer != nil {
+                DJI360PreviewBanner(
+                    kind: dji360,
+                    studioAvailable: studioAvailable,
+                    sphericalView: $sphericalView,
+                    onOpenInStudio: { DJIStudio.open([item.primary.url]) }
+                )
+                .padding(.top, 12)
             }
         }
         .contextMenu {
@@ -2015,7 +2044,11 @@ struct StackPreviewOverlay: View {
                 }
             }
             if press.characters.lowercased() == "o", let item {
-                PhotomatorLauncher.open(item.files.map(\.url))
+                // A 360 clip goes to DJI Studio when it's installed; every
+                // other file, as before, to Photomator.
+                if !DJIStudio.open([item.primary.url]) {
+                    PhotomatorLauncher.open(item.files.map(\.url))
+                }
                 return .handled
             }
             guard press.modifiers.isEmpty,
@@ -2088,8 +2121,9 @@ struct StackPreviewOverlay: View {
             // The poster is already up; now prove the clip can actually
             // play before handing it to AVPlayer. The probe is bounded, so
             // an unopenable codec or a stalled source ends on the
-            // can't-play affordances instead of a dead spinner.
-            let player = await VideoPreviewSupport.readyPlayer(for: url)
+            // can't-play affordances instead of a dead spinner. An Osmo 360
+            // OSV plays its stitched LRF proxy when it has one.
+            let player = await VideoPreviewSupport.readyPlayer(for: DJI360Media.playbackFile(for: item).url)
             guard !Task.isCancelled else { return }
             if let player {
                 videoPlayable = true

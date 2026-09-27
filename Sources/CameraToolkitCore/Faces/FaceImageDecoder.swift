@@ -17,7 +17,7 @@ public enum FaceImageDecoder {
     /// tolerance, track transform applied, the same poster the tile grid
     /// shows — so a video contributes faces without sweeping keyframes.
     public static func posterImage(for url: URL, maximumPixelSize: Int) -> CGImage? {
-        let generator = AVAssetImageGenerator(asset: AVURLAsset(url: url))
+        let generator = AVAssetImageGenerator(asset: CameraVideoAsset.asset(for: url))
         generator.appliesPreferredTrackTransform = true
         generator.maximumSize = CGSize(width: maximumPixelSize, height: maximumPixelSize)
         generator.requestedTimeToleranceBefore = .positiveInfinity

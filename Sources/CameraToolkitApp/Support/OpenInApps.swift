@@ -1,4 +1,5 @@
 import AppKit
+import CameraToolkitCore
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -196,9 +197,18 @@ enum OpenInAppActions {
 struct OpenInAppMenuItems: View {
     let urls: [URL]
     var lookup: any ApplicationLookup = InstalledApplicationLookup.shared
+    var bundleResolver: any BundleApplicationResolving = WorkspaceBundleResolver.shared
 
     var body: some View {
         let apps = OpenInApp.installedApps(lookup: lookup)
+        // A 360 clip's own editor leads the list when it is installed.
+        if DJIStudio.isOffered(for: urls, resolver: bundleResolver) {
+            Button(DJIStudio.name) {
+                DJIStudio.open(urls, resolver: bundleResolver)
+            }
+            .help(DJIStudio.help)
+            Divider()
+        }
         ForEach(apps) { app in
             Button(app.name) {
                 OpenInAppActions.open(urls, in: app, lookup: lookup)
@@ -213,6 +223,109 @@ struct OpenInAppMenuItems: View {
         }
         Button("Choose Application…") {
             OpenInAppActions.chooseApplication(toOpen: urls)
+        }
+    }
+}
+
+// MARK: - DJI Studio
+
+/// Resolves an installed app by bundle identifier. A protocol so tests can
+/// say "installed" or "not installed" without touching LaunchServices.
+protocol BundleApplicationResolving: Sendable {
+    func applicationURL(bundleIdentifier: String) -> URL?
+}
+
+/// The real resolver: `NSWorkspace.urlForApplication(withBundleIdentifier:)`,
+/// remembered briefly so a menu re-rendering never re-queries
+/// LaunchServices. A newly installed app appears within `ttl` seconds.
+final class WorkspaceBundleResolver: BundleApplicationResolving, @unchecked Sendable {
+    static let shared = WorkspaceBundleResolver()
+
+    let ttl: TimeInterval
+    private let lock = NSLock()
+    private var cache: [String: (resolvedAt: Date, url: URL?)] = [:]
+
+    init(ttl: TimeInterval = 30) {
+        self.ttl = ttl
+    }
+
+    func applicationURL(bundleIdentifier: String) -> URL? {
+        lock.lock()
+        defer { lock.unlock() }
+        if let hit = cache[bundleIdentifier], Date().timeIntervalSince(hit.resolvedAt) < ttl {
+            return hit.url
+        }
+        let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleIdentifier)
+        cache[bundleIdentifier] = (Date(), url)
+        return url
+    }
+}
+
+/// DJI Studio, DJI's desktop editor for Osmo 360 footage — the primary
+/// external-open target for `.OSV`/`.LRF`. Offered only when LaunchServices
+/// knows the app; resolved by bundle id, never by a hard-coded path.
+/// Photos keep going to Photomator.
+enum DJIStudio {
+    static let bundleIdentifier = "com.light.studio"
+    static let name = "DJI Studio"
+    static let help = "Open this 360° clip in DJI Studio for full-quality stitching, reframing and export."
+
+    /// The files DJI Studio should receive for `urls`: only the 360 ones.
+    static func targets(in urls: [URL]) -> [URL] {
+        urls.filter(DJI360Media.isDJI360File)
+    }
+
+    /// The primaries of `items` that are 360 clips. An OSV+LRF item hands
+    /// over just the OSV — DJI Studio finds its proxy itself.
+    static func targets(for items: [OrganizeItem]) -> [URL] {
+        targets(in: items.map(\.primary.url))
+    }
+
+    static func applicationURL(resolver: any BundleApplicationResolving) -> URL? {
+        resolver.applicationURL(bundleIdentifier: bundleIdentifier)
+    }
+
+    /// Whether an "Open in DJI Studio" action belongs next to `urls`: at
+    /// least one 360 file, and the app resolvable.
+    static func isOffered(for urls: [URL], resolver: any BundleApplicationResolving) -> Bool {
+        !targets(in: urls).isEmpty && applicationURL(resolver: resolver) != nil
+    }
+
+    /// Opens the 360 files among `urls` in DJI Studio, activated. Returns
+    /// false — doing nothing — when there are none or the app is gone.
+    @discardableResult
+    static func open(_ urls: [URL], resolver: any BundleApplicationResolving = WorkspaceBundleResolver.shared) -> Bool {
+        let files = targets(in: urls)
+        guard !files.isEmpty, let app = applicationURL(resolver: resolver) else { return false }
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = true
+        NSWorkspace.shared.open(files, withApplicationAt: app, configuration: configuration)
+        return true
+    }
+}
+
+/// The default external open (O / ⌘O): 360 clips go to DJI Studio when it
+/// is installed, everything else — and the clips when it is not — to
+/// Photomator as before.
+enum PreferredExternalOpen {
+    /// How `urls` split between the two destinations.
+    static func route(
+        _ urls: [URL],
+        resolver: any BundleApplicationResolving
+    ) -> (djiStudio: [URL], photomator: [URL]) {
+        guard DJIStudio.applicationURL(resolver: resolver) != nil else { return ([], urls) }
+        let studio = DJIStudio.targets(in: urls)
+        guard !studio.isEmpty else { return ([], urls) }
+        return (studio, urls.filter { !DJI360Media.isDJI360File($0) })
+    }
+
+    static func open(_ urls: [URL], resolver: any BundleApplicationResolving = WorkspaceBundleResolver.shared) {
+        let routed = route(urls, resolver: resolver)
+        if !routed.djiStudio.isEmpty {
+            DJIStudio.open(routed.djiStudio, resolver: resolver)
+        }
+        if !routed.photomator.isEmpty {
+            PhotomatorLauncher.open(routed.photomator)
         }
     }
 }
