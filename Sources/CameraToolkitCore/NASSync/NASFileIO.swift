@@ -109,13 +109,18 @@ public enum NASFileIO {
     /// drive copy is never removed without a verified NAS copy (Take Off
     /// Drive re-hashes the NAS copy again). The SSH verifier also asks the
     /// NAS to commit (`sync`) once per batch before it hashes.
+    ///
+    /// `willFlush` runs once every byte is written, just before the flush —
+    /// only when `options.flushEachFile` asks for one — so a caller can
+    /// time and show the flush on its own.
     public static func copyNew(
         from source: String,
         to destination: String,
         expectedByteCount: Int64,
         options: CopyOptions = .fast,
         clock: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
-        progress: (Int) -> Void = { _ in }
+        progress: (Int) -> Void = { _ in },
+        willFlush: () -> Void = {}
     ) throws -> CopyResult {
         let observer = copyCallObserver
         let started = clock()
@@ -164,6 +169,7 @@ public enum NASFileIO {
         let copied = clock()
         var flushed = copied
         if options.flushEachFile {
+            willFlush()
             // F_FULLFSYNC where the filesystem has it (SMB may not); fsync
             // always, so the share has the bytes before the rename names them.
             observer?("F_FULLFSYNC")

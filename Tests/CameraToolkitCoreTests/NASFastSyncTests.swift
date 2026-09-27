@@ -114,6 +114,106 @@ final class NASFastSyncTests: XCTestCase {
         }
     }
 
+    // MARK: Jobs window telemetry
+
+    /// Four transfers at once: busy time per phase is summed over them,
+    /// the shares add up to exactly 100 %, and the fast engine never
+    /// spends a moment flushing.
+    func testAFourWorkerFastSyncReportsPhaseSharesThatSumTo100WithNoFlush() throws {
+        try withTemporaryDirectory { root in
+            let f = try fixture(root, count: 12)
+            // Slow the SMB re-read so the four transfers overlap.
+            NASFileIO.verificationHashOverride = { _ in usleep(20_000); return nil }
+            let recorder = ProgressRecorder()
+            let report = try NASSyncService(store: nil, options: NASSyncOptions(parallelTransfers: 4)).sync(f.plan, nasRoot: f.nas, progress: recorder.handler)
+            try assertAllCopied(f, report)
+            XCTAssertEqual(report.timings.parallelTransfers, 4)
+
+            let last = try XCTUnwrap(recorder.updates.last)
+            let telemetry = try XCTUnwrap(last.telemetry)
+            let byLabel = Dictionary(uniqueKeysWithValues: telemetry.phases.map { ($0.label, $0) })
+            XCTAssertEqual(byLabel["Flush"]?.seconds ?? 0, 0, "the fast engine never flushes")
+            XCTAssertEqual(byLabel["Copy"]?.bytes, f.plan.totalBytes)
+            XCTAssertEqual(byLabel["Verify"]?.bytes, f.plan.totalBytes)
+            XCTAssertNil(byLabel[NASSyncRun.remoteVerifyPhase])
+            XCTAssertEqual(telemetry.phases.reduce(Int64(0)) { $0 + $1.bytes }, last.processedBytes)
+            XCTAssertEqual(telemetry.transferBytes, 2 * f.plan.totalBytes, "copies and SMB re-reads cross the link")
+
+            let shares = telemetry.phaseShares
+            XCTAssertEqual(shares.map(\.percent).reduce(0, +), 100)
+            XCTAssertEqual(shares.map(\.fraction).reduce(0, +), 1, accuracy: 1e-9)
+            XCTAssertEqual(shares.first { $0.label == "Flush" }?.percent ?? 0, 0)
+            // Busy time: the verify re-reads alone (12 × ≥20 ms) — which
+            // ran four at a time — exceed their wall time.
+            let verify = try XCTUnwrap(byLabel["Verify"])
+            XCTAssertGreaterThanOrEqual(verify.seconds, 0.24)
+            XCTAssertGreaterThan(verify.seconds, try XCTUnwrap(verify.activeSeconds) * 1.5)
+            XCTAssertEqual(telemetry.configuration, "4 transfers in parallel · SMB verify")
+        }
+    }
+
+    /// With SSH verification the NAS-side hashing has its own phase and
+    /// its bytes are not counted as crossing the link.
+    func testSSHVerificationIsItsOwnPhaseInTheBreakdown() throws {
+        try withTemporaryDirectory { root in
+            let f = try fixture(root, count: 5)
+            let verifier = NASRemoteVerifier(localPrefix: f.nas.path + "/", serverPrefix: f.server.path, label: "test", transport: try localTransport(root, syncLog: root.appendingPathComponent("sync.log")))
+            let recorder = ProgressRecorder()
+            let options = NASSyncOptions(parallelTransfers: 4, remoteVerifier: verifier, remoteBatchFiles: 2)
+            let report = try NASSyncService(store: nil, options: options).sync(f.plan, nasRoot: f.nas, progress: recorder.handler)
+            try assertAllCopied(f, report)
+            let telemetry = try XCTUnwrap(recorder.updates.last?.telemetry)
+            let byLabel = Dictionary(uniqueKeysWithValues: telemetry.phases.map { ($0.label, $0) })
+            XCTAssertEqual(byLabel[NASSyncRun.remoteVerifyPhase]?.bytes, f.plan.totalBytes)
+            XCTAssertGreaterThan(byLabel[NASSyncRun.remoteVerifyPhase]?.seconds ?? 0, 0)
+            XCTAssertNil(byLabel["Verify"], "nothing was re-read over SMB")
+            XCTAssertEqual(byLabel["Flush"]?.seconds ?? 0, 0)
+            XCTAssertEqual(telemetry.transferBytes, f.plan.totalBytes, "only the copies crossed the link")
+            XCTAssertEqual(telemetry.phaseShares.map(\.percent).reduce(0, +), 100)
+            XCTAssertEqual(telemetry.configuration, "4 transfers in parallel · SSH verify")
+        }
+    }
+
+    /// One row per transfer: a file takes the lowest free row, a finished
+    /// transfer's row is reused by the next file, a row never blinks out
+    /// between files, and every row carries its bytes and speed.
+    func testTransferRowsAreReusedAndNeverBlinkOutBetweenFiles() throws {
+        try withTemporaryDirectory { root in
+            let f = try fixture(root, count: 8)
+            // Long enough per file that ~4 Hz progress sees both rounds.
+            NASFileIO.verificationHashOverride = { _ in usleep(400_000); return nil }
+            let recorder = ProgressRecorder()
+            let report = try NASSyncService(store: nil, options: NASSyncOptions(parallelTransfers: 4)).sync(f.plan, nasRoot: f.nas, progress: recorder.handler)
+            try assertAllCopied(f, report)
+
+            let updates = recorder.updates
+            XCTAssertGreaterThan(updates.count, 3)
+            var namesBySlot: [Int: Set<String>] = [:]
+            var seenIn: [Int: [Int]] = [:]
+            for (position, update) in updates.enumerated() {
+                let rows = update.telemetry?.activeItems ?? []
+                let slots = rows.compactMap(\.slot)
+                XCTAssertEqual(slots.count, rows.count, "every sync row has a slot")
+                XCTAssertEqual(Set(slots).count, slots.count, "one file per row at a time")
+                for row in rows {
+                    let slot = try XCTUnwrap(row.slot)
+                    XCTAssertTrue((0..<4).contains(slot), "SMB verify uses only the four transfer rows")
+                    XCTAssertEqual(row.bytesTotal.map { $0 > 0 }, true)
+                    XCTAssertLessThanOrEqual(row.bytesDone ?? 0, row.bytesTotal ?? 0)
+                    XCTAssertNotNil(row.phase)
+                    namesBySlot[slot, default: []].insert(row.name)
+                    seenIn[slot, default: []].append(position)
+                }
+            }
+            XCTAssertTrue(namesBySlot.values.contains { $0.count >= 2 }, "a finished row is reused: \(namesBySlot)")
+            for (slot, positions) in seenIn {
+                // Contiguous: once shown, a row stays until the transfers end.
+                XCTAssertEqual(positions, Array(positions[0]...positions[positions.count - 1]), "row \(slot) blinked out")
+            }
+            XCTAssertTrue(updates.last?.telemetry?.activeItems.isEmpty == true, "rows clear when the job is done")
+        }
+    }
+
     // MARK: Concurrency bound
 
     func testTheTransferPoolNeverRunsMoreThanItsWidth() {

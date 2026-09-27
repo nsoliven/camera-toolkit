@@ -187,6 +187,7 @@ public struct NASSyncService {
         }
         let known = try store?.records(nasRoot: root) ?? [:]
         let run = NASSyncRun(root: root, plan: plan, options: options, now: now, clock: clock, progress: progress)
+        run.time("Check", lane: NASSyncRun.checkLane)
         let store = self.store
         func flushRecords(force: Bool = false) {
             let batch = run.takePendingRecords(minimum: force ? 1 : 64)
@@ -271,6 +272,7 @@ public struct NASSyncService {
             let temporary = (folder as NSString).appendingPathComponent(".\(name)\(NASSyncPlanner.temporaryMarker)\(UUID().uuidString.prefix(8))")
             jobs.append(.init(index: index, item: item, destination: destination, kind: .copy(temporary: temporary)))
         }
+        run.endTime(lane: NASSyncRun.checkLane)
         run.addTiming { $0.checkSeconds = clock() - started }
         flushRecords()
 
@@ -296,6 +298,7 @@ public struct NASSyncService {
             pool.submitAcquired { run.perform(job) }
         }
         pool.waitForAll(tick: tick)
+        run.clearTransferRows()
         // The last partial NAS-side batch.
         run.verifyRemainingBatch()
         run.waitForVerification(tick: tick)
@@ -392,13 +395,23 @@ final class NASSyncRun: @unchecked Sendable {
     private var doneWork: Int64 = 0
     private var totalWork: Int64
     private var finishedFiles = 0
-    private var active: [Int: JobActiveItem] = [:]
+    /// One row per parallel transfer (`0..<parallelTransfers`), plus the
+    /// NAS-side verification thread's row at `verifyLane`. A finished
+    /// transfer's row stays, showing how it ended, until the next file
+    /// takes it — so rows never blink out between files.
+    private var rows: [Row?]
+    /// Where the time goes, per phase, summed over the lanes (the
+    /// transfer rows, the verification thread and the check pass).
+    private var phases = JobPhaseLedger(order: NASSyncRun.phaseOrder)
+    /// Bytes moved over the link: copies and SMB re-reads.
+    private var transferBytes: Int64 = 0
+    private let startedAt: TimeInterval
     private var stopReason: String?
     private var nasGone = false
     private var batch: [Written] = []
     private var batchBytes: Int64 = 0
-    private var limiter = FileOperationProgressLimiter()
-    private var estimator = ScanRateEstimator()
+    /// About 4 progress emissions a second, whatever the chunk rate.
+    private var limiter = FileOperationProgressLimiter(minimumInterval: 0.25)
     private let verifyQueue = DispatchQueue(label: "CameraToolkit.NASSync.remoteVerify", qos: .utility)
     private let verifyGroup = DispatchGroup()
 
@@ -416,7 +429,119 @@ final class NASSyncRun: @unchecked Sendable {
         report.timings.parallelTransfers = options.parallelTransfers
         report.timings.verification = options.verificationLabel
         report.timings.flushEachFile = options.copy.flushEachFile
-        estimator.start(at: clock())
+        rows = Array(repeating: nil, count: options.parallelTransfers + 1)
+        startedAt = clock()
+    }
+
+    // MARK: Phases and rows
+
+    /// Phase labels, in display order. "Flush" is only ever timed by the
+    /// legacy engine; "Remote verify (NAS)" only with SSH verification.
+    static let phaseOrder = ["Check", "Copy", "Flush", "Verify", remoteVerifyPhase, "Hash", "Rename"]
+    static let remoteVerifyPhase = "Remote verify (NAS)"
+    /// Phases whose bytes cross the link — the combined transfer speed.
+    static let linkPhases: Set<String> = ["Copy", "Verify"]
+    /// The planning pass's lane in the phase ledger.
+    static let checkLane = -1
+    /// The NAS-side verification thread's row and lane.
+    var verifyLane: Int { options.parallelTransfers }
+
+    /// What a transfer row shows.
+    struct Row: Sendable {
+        var name: String
+        var path: String
+        var step: String
+        var phase: String
+        var bytesDone: Int64
+        var bytesTotal: Int64
+        var busy: Bool
+        /// Everything this row has moved, for its rate meter.
+        var moved: Int64 = 0
+        var meter = TransferRateMeter()
+    }
+
+    /// One-line configuration for the Jobs window.
+    var configuration: String {
+        let count = options.parallelTransfers
+        var parts = ["\(count) transfer\(count == 1 ? "" : "s") in parallel", options.remoteVerifier == nil ? "SMB verify" : "SSH verify"]
+        if options.copy.flushEachFile { parts.append("flush per file") }
+        return parts.joined(separator: " · ")
+    }
+
+    func time(_ label: String, lane: Int) {
+        let t = clock()
+        lock.withLock { phases.begin(label, lane: lane, at: t) }
+    }
+
+    func endTime(lane: Int) {
+        let t = clock()
+        lock.withLock { phases.end(lane: lane, at: t) }
+    }
+
+    /// The lowest transfer row no file is using. The pool never runs more
+    /// than `parallelTransfers` jobs, so one is always free.
+    private func takeSlot(for job: Job) -> Int {
+        lock.withLock {
+            let slot = (0..<options.parallelTransfers).first { rows[$0]?.busy != true } ?? 0
+            // Claimed in the same lock, so two transfers never share a row.
+            // The row's meter and byte history carry over to the next file.
+            var row = rows[slot] ?? Row(name: "", path: "", step: "", phase: "", bytesDone: 0, bytesTotal: 0, busy: true)
+            row.name = (job.item.relativePath as NSString).lastPathComponent
+            row.path = job.item.relativePath
+            row.step = "Starting"
+            row.phase = "Starting"
+            row.bytesDone = 0
+            row.bytesTotal = job.item.byteCount
+            row.busy = true
+            rows[slot] = row
+            return slot
+        }
+    }
+
+    /// Puts `name` on `slot`'s row in a new phase, and times that phase.
+    private func show(_ slot: Int, name: String, path: String, step: String, phase: String, total: Int64, done: Int64 = 0, timing: String?) {
+        let t = clock()
+        lock.withLock {
+            var row = rows[slot] ?? Row(name: name, path: path, step: step, phase: phase, bytesDone: 0, bytesTotal: total, busy: true)
+            row.name = name
+            row.path = path
+            row.step = step
+            row.phase = phase
+            row.bytesDone = done
+            row.bytesTotal = total
+            row.busy = true
+            rows[slot] = row
+            if let timing { phases.begin(timing, lane: slot, at: t) }
+        }
+        emit(step, path: path, force: false)
+    }
+
+    private func show(_ slot: Int, _ job: Job, step: String, phase: String, done: Int64 = 0, timing: String?) {
+        show(slot, name: (job.item.relativePath as NSString).lastPathComponent, path: job.item.relativePath, step: step, phase: phase, total: job.item.byteCount, done: done, timing: timing)
+    }
+
+    /// The row's file is done with this lane. A transfer row keeps showing
+    /// `outcome` until the next file takes it; the verification row goes.
+    private func release(_ slot: Int, outcome: String) {
+        let t = clock()
+        lock.withLock {
+            phases.end(lane: slot, at: t)
+            if slot < options.parallelTransfers {
+                rows[slot]?.busy = false
+                rows[slot]?.step = outcome
+                rows[slot]?.phase = outcome
+            } else {
+                rows[slot] = nil
+            }
+        }
+        emit("Syncing", force: false)
+    }
+
+    /// All transfers are done; only NAS-side verification may remain.
+    func clearTransferRows() {
+        lock.withLock {
+            for slot in 0..<options.parallelTransfers { rows[slot] = nil }
+        }
     }
 
     // MARK: State
@@ -461,8 +586,18 @@ final class NASSyncRun: @unchecked Sendable {
         lock.withLock { change(&report.timings) }
     }
 
-    private func addWork(_ bytes: Int) {
-        lock.withLock { doneWork += Int64(bytes) }
+    /// Credits bytes to the job, to `phase` and to `slot`'s row.
+    private func addWork(_ bytes: Int, _ phase: String, slot: Int?) {
+        let count = Int64(bytes)
+        lock.withLock {
+            doneWork += count
+            phases.addBytes(count, to: phase)
+            if Self.linkPhases.contains(phase) { transferBytes += count }
+            if let slot {
+                rows[slot]?.bytesDone += count
+                rows[slot]?.moved += count
+            }
+        }
     }
 
     private func appendRecord(_ item: NASSyncItem, _ state: NASSyncRecord.State, sha: String?, nasSHA: String?, detail: String?, verified: Bool) {
@@ -529,17 +664,6 @@ final class NASSyncRun: @unchecked Sendable {
         }
     }
 
-    private func setActive(_ job: Job, _ step: String?) {
-        lock.withLock {
-            if let step {
-                active[job.index] = JobActiveItem(name: (job.item.relativePath as NSString).lastPathComponent, path: job.item.relativePath, step: step)
-            } else {
-                active[job.index] = nil
-            }
-        }
-        emit(step ?? "Syncing", path: job.item.relativePath, force: step == nil)
-    }
-
     // MARK: Progress
 
     func emit(_ phase: String, path: String? = nil, force: Bool) {
@@ -547,9 +671,29 @@ final class NASSyncRun: @unchecked Sendable {
         let t = clock()
         let snapshot: FileOperationProgress? = lock.withLock {
             guard limiter.shouldEmit(force: force) else { return nil }
-            estimator.record(units: Double(doneWork), at: t)
-            let items = active.sorted { $0.key < $1.key }.map(\.value)
-            let shown = path ?? items.first?.path ?? ""
+            var items: [JobActiveItem] = []
+            for slot in rows.indices {
+                guard var row = rows[slot] else { continue }
+                row.meter.record(row.moved, at: t)
+                rows[slot] = row
+                items.append(JobActiveItem(
+                    name: row.name,
+                    path: row.path,
+                    step: row.step,
+                    slot: slot,
+                    phase: row.phase,
+                    bytesDone: row.bytesDone,
+                    bytesTotal: row.bytesTotal,
+                    bytesPerSecond: row.meter.bytesPerSecond
+                ))
+            }
+            let shown = path ?? items.first { rows[$0.slot ?? 0]?.busy == true }?.path ?? ""
+            // Time left at the job's average speed, once past a 15 s warm-up.
+            let elapsed = t - startedAt
+            let remaining = Double(max(totalWork - doneWork, 0))
+            let secondsRemaining: Double? = elapsed < 15 ? nil
+                : remaining == 0 ? 0
+                : doneWork > 0 ? remaining / (Double(doneWork) / elapsed) : nil
             let counters = [
                 JobCounter(label: "Copied", value: report.copied.count),
                 JobCounter(label: "Already on NAS", value: report.matchedExisting.count + report.alreadyVerified.count),
@@ -566,7 +710,7 @@ final class NASSyncRun: @unchecked Sendable {
                 totalFiles: totalFiles,
                 processedBytes: doneWork,
                 totalBytes: totalWork,
-                bytesPerSecond: 0,
+                bytesPerSecond: elapsed > 0 ? Double(transferBytes) / elapsed : 0,
                 telemetry: JobTelemetry(
                     step: phase,
                     activeItems: items,
@@ -575,8 +719,11 @@ final class NASSyncRun: @unchecked Sendable {
                     work: JobWorkEstimate(
                         unitsDone: Int(doneWork),
                         unitsTotal: Int(totalWork),
-                        secondsRemaining: estimator.secondsRemaining(Double(max(totalWork - doneWork, 0)), at: t)
-                    )
+                        secondsRemaining: secondsRemaining
+                    ),
+                    phases: phases.snapshot(at: t),
+                    configuration: configuration,
+                    transferBytes: transferBytes
                 )
             )
         }
@@ -586,9 +733,21 @@ final class NASSyncRun: @unchecked Sendable {
     // MARK: Work (pool threads)
 
     func perform(_ job: Job) {
+        let slot = takeSlot(for: job)
         switch job.kind {
-        case .compareExisting: compareExisting(job)
-        case .copy(let temporary): copy(job, temporary: temporary)
+        case .compareExisting: compareExisting(job, slot: slot)
+        case .copy(let temporary): copy(job, temporary: temporary, slot: slot)
+        }
+    }
+
+    /// How a finished file's row reads until the next file takes it.
+    private func outcome(of item: NASSyncItem) -> String {
+        lock.withLock {
+            // Only the files settled since this one can be after it.
+            let recent = options.parallelTransfers + 1
+            if report.failed.suffix(recent).contains(where: { $0.path == item.relativePath }) { return "Failed" }
+            if report.conflicts.suffix(recent).contains(where: { $0.path == item.relativePath }) { return "Conflict" }
+            return "Verified"
         }
     }
 
@@ -602,15 +761,15 @@ final class NASSyncRun: @unchecked Sendable {
         }
     }
 
-    private func compareExisting(_ job: Job) {
+    private func compareExisting(_ job: Job, slot: Int) {
         let item = job.item
         var done: Int64 = 0
         do {
-            setActive(job, "Hashing drive copy")
+            show(slot, job, step: "Hashing drive copy", phase: "Hashing", timing: "Hash")
             let start = clock()
-            let sourceHash = try NASFileIO.sha256(item.sourcePath, uncached: false, expectedByteCount: item.byteCount) { self.addWork($0); done += Int64($0); self.emit("Hashing drive copy", force: false) }
-            setActive(job, "Re-reading NAS copy")
-            let nasHash = try NASFileIO.sha256(job.destination, uncached: true, expectedByteCount: item.byteCount) { self.addWork($0); done += Int64($0); self.emit("Re-reading NAS copy", force: false) }
+            let sourceHash = try NASFileIO.sha256(item.sourcePath, uncached: false, expectedByteCount: item.byteCount) { self.addWork($0, "Hash", slot: slot); done += Int64($0); self.emit("Hashing drive copy", force: false) }
+            show(slot, job, step: "Re-reading NAS copy", phase: "Verifying", timing: "Verify")
+            let nasHash = try NASFileIO.sha256(job.destination, uncached: true, expectedByteCount: item.byteCount) { self.addWork($0, "Verify", slot: slot); done += Int64($0); self.emit("Re-reading NAS copy", force: false) }
             addTiming { $0.verifySeconds += self.clock() - start; $0.smbVerifyBytes += item.byteCount }
             if sourceHash == nasHash {
                 finishMatched(item, sha: sourceHash)
@@ -621,21 +780,32 @@ final class NASSyncRun: @unchecked Sendable {
         } catch {
             failed(job, error, work: 2 * item.byteCount - done)
         }
-        setActive(job, nil)
+        release(slot, outcome: outcome(of: item))
     }
 
-    private func copy(_ job: Job, temporary: String) {
+    private func copy(_ job: Job, temporary: String, slot: Int) {
         let item = job.item
         var done: Int64 = 0
         do {
-            setActive(job, "Copying to NAS")
+            show(slot, job, step: "Copying to NAS", phase: "Copying", timing: "Copy")
             let result: NASFileIO.CopyResult
             do {
-                result = try NASFileIO.copyNew(from: item.sourcePath, to: temporary, expectedByteCount: item.byteCount, options: options.copy, clock: clock) {
-                    self.addWork($0)
-                    done += Int64($0)
-                    self.emit("Copying to NAS", force: false)
-                }
+                result = try NASFileIO.copyNew(
+                    from: item.sourcePath,
+                    to: temporary,
+                    expectedByteCount: item.byteCount,
+                    options: options.copy,
+                    clock: clock,
+                    progress: {
+                        self.addWork($0, "Copy", slot: slot)
+                        done += Int64($0)
+                        self.emit("Copying to NAS", force: false)
+                    },
+                    // Only the legacy engine flushes; the fast one never calls this.
+                    willFlush: {
+                        self.show(slot, job, step: "Flushing to NAS", phase: "Flushing", done: item.byteCount, timing: "Flush")
+                    }
+                )
             } catch {
                 unlink(temporary)
                 throw error
@@ -654,40 +824,41 @@ final class NASSyncRun: @unchecked Sendable {
             _ = setModificationTime(temporary, item.modifiedAt)
             let written = Written(job: job, temporary: temporary, sourceHash: result.sha256)
             if options.remoteVerifier != nil {
-                setActive(job, nil)
+                release(slot, outcome: "Queued for NAS verify")
                 enqueueForRemoteVerification(written)
                 return
             }
-            verifyOverSMBAndPlace(written)
+            verifyOverSMBAndPlace(written, slot: slot)
+            release(slot, outcome: outcome(of: item))
         } catch {
             failed(job, error, work: 2 * item.byteCount - done)
-            setActive(job, nil)
+            release(slot, outcome: "Failed")
         }
     }
 
     /// Re-reads the temporary over SMB (uncached) and renames it in on a match.
-    private func verifyOverSMBAndPlace(_ written: Written) {
+    /// The caller releases `slot`.
+    private func verifyOverSMBAndPlace(_ written: Written, slot: Int) {
         let job = written.job
         let item = job.item
         var done: Int64 = 0
         do {
-            setActive(job, "Re-reading NAS copy")
+            show(slot, job, step: "Re-reading NAS copy", phase: "Verifying", timing: "Verify")
             let start = clock()
             let nasHash = try NASFileIO.sha256(written.temporary, uncached: true, expectedByteCount: item.byteCount) {
-                self.addWork($0)
+                self.addWork($0, "Verify", slot: slot)
                 done += Int64($0)
                 self.emit("Re-reading NAS copy", force: false)
             }
             addTiming { $0.verifySeconds += self.clock() - start; $0.smbVerifyBytes += item.byteCount }
             try check(written, nasHash: nasHash, how: "when re-read from the NAS")
-            try place(written)
+            try place(written, slot: slot)
         } catch let error as MismatchError {
             failed(job, error, work: item.byteCount - done, mismatch: true)
         } catch {
             unlink(written.temporary)
             failed(job, error, work: item.byteCount - done)
         }
-        setActive(job, nil)
     }
 
     private struct MismatchError: LocalizedError {
@@ -703,9 +874,10 @@ final class NASSyncRun: @unchecked Sendable {
     }
 
     /// Renames a verified temporary into place, never over a file.
-    private func place(_ written: Written) throws {
+    private func place(_ written: Written, slot: Int) throws {
         let job = written.job
         let item = job.item
+        show(slot, job, step: "Renaming into place", phase: "Renaming", done: item.byteCount, timing: "Rename")
         let start = clock()
         defer { addTiming { $0.renameSeconds += self.clock() - start } }
         do {
@@ -713,6 +885,7 @@ final class NASSyncRun: @unchecked Sendable {
         } catch {
             // Someone else put a file there meanwhile: compare, never replace.
             guard LayoutMigrationDisk.lstatEntry(job.destination) != nil else { throw error }
+            time("Verify", lane: slot)
             let other = try NASFileIO.sha256(job.destination, uncached: true)
             unlink(written.temporary)
             if other == written.sourceHash {
@@ -766,8 +939,18 @@ final class NASSyncRun: @unchecked Sendable {
     /// NAS could not answer for (SSH down, path not mapped) is re-read over
     /// SMB instead; only a hash that differs fails a file.
     private func verifyRemote(_ written: [Written]) {
-        guard let verifier = options.remoteVerifier else { return }
-        for entry in written { setActive(entry.job, "Hashing on NAS") }
+        guard let verifier = options.remoteVerifier, let first = written.first else { return }
+        let lane = verifyLane
+        let batchBytes = written.reduce(Int64(0)) { $0 + $1.job.item.byteCount }
+        show(
+            lane,
+            name: written.count == 1 ? (first.job.item.relativePath as NSString).lastPathComponent : "\(written.count) files",
+            path: first.job.item.relativePath,
+            step: "Hashing on NAS",
+            phase: "Verifying on NAS",
+            total: batchBytes,
+            timing: Self.remoteVerifyPhase
+        )
         let start = clock()
         var hashes: [String: String] = [:]
         var failure: String?
@@ -790,22 +973,22 @@ final class NASSyncRun: @unchecked Sendable {
                         $0.remoteFallbackReason = failure ?? "The NAS could not hash \((entry.temporary as NSString).lastPathComponent) at its mapped server path."
                     }
                 }
-                verifyOverSMBAndPlace(entry)
+                verifyOverSMBAndPlace(entry, slot: lane)
                 continue
             }
-            addWork(Int(item.byteCount))
+            addWork(Int(item.byteCount), Self.remoteVerifyPhase, slot: lane)
             addTiming { $0.remoteVerifyBytes += item.byteCount }
             do {
                 try check(entry, nasHash: nasHash, how: "when hashed on the NAS")
-                try place(entry)
+                try place(entry, slot: lane)
             } catch let error as MismatchError {
                 failed(entry.job, error, work: 0, mismatch: true)
             } catch {
                 unlink(entry.temporary)
                 failed(entry.job, error, work: 0)
             }
-            setActive(entry.job, nil)
         }
+        release(lane, outcome: "Verified")
     }
 }
 
