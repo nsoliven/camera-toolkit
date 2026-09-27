@@ -175,9 +175,9 @@ final class LayoutMigrationExecutorTests: XCTestCase {
             }
             // Nothing moved through any of it, and no journal was left.
             var expected = before
-            expected["Buffer/2026/2026-08-23 Trip 2026/DJI Osmo 360/Card Copy/CAM_0001.LRF"] = nil
+            expected["Buffer/2026/2026-08-23 Sample Trip 2026/DJI Osmo 360/Card Copy/CAM_0001.LRF"] = nil
             var now = try fixture.driveTree()
-            now["Buffer/2026/2026-08-23 Trip 2026/DJI Osmo 360/Card Copy/CAM_0001.LRF"] = nil
+            now["Buffer/2026/2026-08-23 Sample Trip 2026/DJI Osmo 360/Card Copy/CAM_0001.LRF"] = nil
             XCTAssertEqual(now, expected)
             XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.support.appendingPathComponent("Layout Migrations").appendingPathComponent("x").path))
         }

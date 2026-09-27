@@ -2876,7 +2876,7 @@ final class EventsWorkspaceTests: XCTestCase {
     /// the same moment — never return silently.
     func testMoveStacksWhilePresenceIndexIsEmptyRunsFromTheCatalog() async throws {
         try await withOrganizerSandbox { root, model, workspace in
-            let eventID = try XCTUnwrap(workspace.createEvent(name: "Trip 2026", date: organizerDay("2026-08-26"), policy: .buffer))
+            let eventID = try XCTUnwrap(workspace.createEvent(name: "Sample Trip 2026", date: organizerDay("2026-08-26"), policy: .buffer))
             let targetID = try XCTUnwrap(workspace.createEvent(name: "Japan 2026", date: organizerDay("2026-08-27"), policy: .buffer))
             let event = try XCTUnwrap(workspace.event(eventID))
             let locations = workspace.locations
@@ -2948,7 +2948,7 @@ final class EventsWorkspaceTests: XCTestCase {
     /// and runs as soon as the refresh publishes the grid.
     func testMoveStacksBeforeBoardPaintsQueuesThenRuns() async throws {
         try await withOrganizerSandbox { root, model, workspace in
-            let eventID = try XCTUnwrap(workspace.createEvent(name: "Trip 2026", date: organizerDay("2026-08-26"), policy: .buffer))
+            let eventID = try XCTUnwrap(workspace.createEvent(name: "Sample Trip 2026", date: organizerDay("2026-08-26"), policy: .buffer))
             let targetID = try XCTUnwrap(workspace.createEvent(name: "Japan 2026", date: organizerDay("2026-08-27"), policy: .buffer))
             let event = try XCTUnwrap(workspace.event(eventID))
             let locations = workspace.locations
@@ -2991,7 +2991,7 @@ final class EventsWorkspaceTests: XCTestCase {
     /// collision and a move onto the same event each leave a sentence.
     func testMoveStacksExplainsWhenNothingCanMove() async throws {
         try await withOrganizerSandbox { root, model, workspace in
-            let eventID = try XCTUnwrap(workspace.createEvent(name: "Trip 2026", date: organizerDay("2026-08-26"), policy: .buffer))
+            let eventID = try XCTUnwrap(workspace.createEvent(name: "Sample Trip 2026", date: organizerDay("2026-08-26"), policy: .buffer))
             let targetID = try XCTUnwrap(workspace.createEvent(name: "Japan 2026", date: organizerDay("2026-08-27"), policy: .buffer))
             let event = try XCTUnwrap(workspace.event(eventID))
             let locations = workspace.locations
@@ -3037,7 +3037,7 @@ final class EventsWorkspaceTests: XCTestCase {
     /// the file's unsorted folder, and a tracked job runs it.
     func testReturnToUnsortedWhilePresenceIndexIsEmptyRenamesBack() async throws {
         try await withOrganizerSandbox { root, model, workspace in
-            let eventID = try XCTUnwrap(workspace.createEvent(name: "Trip 2026", date: organizerDay("2026-08-26"), policy: .buffer))
+            let eventID = try XCTUnwrap(workspace.createEvent(name: "Sample Trip 2026", date: organizerDay("2026-08-26"), policy: .buffer))
             let event = try XCTUnwrap(workspace.event(eventID))
             let locations = workspace.locations
             let cardCopy = locations.originalsRoot(for: event, deviceID: "sony-a7v", policy: .buffer)
@@ -3097,7 +3097,7 @@ final class EventsWorkspaceTests: XCTestCase {
     /// path and now also for the mid-"Checking" catalog path.
     func testReturnToUnsortedAdoptedFileExplainsItselfWhileChecking() async throws {
         try await withOrganizerSandbox { root, model, workspace in
-            let eventID = try XCTUnwrap(workspace.createEvent(name: "Trip 2026", date: organizerDay("2026-08-26"), policy: .buffer))
+            let eventID = try XCTUnwrap(workspace.createEvent(name: "Sample Trip 2026", date: organizerDay("2026-08-26"), policy: .buffer))
             let event = try XCTUnwrap(workspace.event(eventID))
             let locations = workspace.locations
             let cardCopy = locations.originalsRoot(for: event, deviceID: "sony-a7v", policy: .buffer)
@@ -3201,7 +3201,7 @@ final class EventsWorkspaceTests: XCTestCase {
             let burst = try XCTUnwrap(stacks.first { $0.isBurst })
             let sidecar = try XCTUnwrap(stacks.first { !$0.isBurst })
 
-            let eventID = try XCTUnwrap(workspace.createEvent(name: "Trip 2026", date: organizerDay("2026-08-26"), policy: .buffer))
+            let eventID = try XCTUnwrap(workspace.createEvent(name: "Sample Trip 2026", date: organizerDay("2026-08-26"), policy: .buffer))
             let otherID = try XCTUnwrap(workspace.createEvent(name: "Japan 2026", date: organizerDay("2026-08-27"), policy: .buffer))
 
             // Unsorted board: every event is a Sort Into target.

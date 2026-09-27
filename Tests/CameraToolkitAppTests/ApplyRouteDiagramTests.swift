@@ -128,7 +128,7 @@ final class ApplyRouteDiagramTests: XCTestCase {
     }
 
     func testPlanSummaryListsEveryEventWithBalancedCounts() {
-        let first = eventGroup(name: "Trip 2026", moves: [
+        let first = eventGroup(name: "Sample Trip 2026", moves: [
             move("/Card/DCIM/DSC00001.ARW", "/E1/Sony A7V/Card Copy/DSC00001.ARW", bytes: 200),
             move("/Card/DCIM/DSC00002.ARW", "/E1/Sony A7V/Card Copy/DSC00002.ARW", bytes: 200),
             move("/Card/DCIM/C0001.MP4", "/E1/Sony A7V/Card Copy/C0001.MP4", bytes: 900),
@@ -147,7 +147,7 @@ final class ApplyRouteDiagramTests: XCTestCase {
         let plan = OrganizeApplyPlan(title: "Apply", groups: [first, second], pruneBoundaries: [])
 
         let summaries = ApplyRouteDiagram.eventSummaries(for: plan)
-        XCTAssertEqual(summaries.map(\.event.name), ["Trip 2026", "Second Event"])
+        XCTAssertEqual(summaries.map(\.event.name), ["Sample Trip 2026", "Second Event"])
 
         for row in summaries {
             XCTAssertEqual(row.imageCount + row.videoCount + row.otherCount, row.fileCount)

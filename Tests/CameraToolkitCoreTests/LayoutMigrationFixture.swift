@@ -6,7 +6,7 @@ import XCTest
 /// A synthetic drive and support folder shaped like the owner's:
 ///
 /// ```
-/// Buffer/2026/2026-08-23 Trip 2026/
+/// Buffer/2026/2026-08-23 Sample Trip 2026/
 ///   Sony A7V/Card Copy/            DSC00001.ARW (+ .ARW.xmp, ._ twin), DSC00002.ARW + .JPG
 ///                                  (+ ._ twin and its own ._._ twin),
 ///                                  DSC00003.ARW.photo-edit, notes.txt (unknown), .DS_Store,
@@ -17,7 +17,7 @@ import XCTest
 ///   Originals/Sony A7V/DSC00002.ARW  already there (a mixed drive) → "(2)"
 ///   Photomator/edit.jpg, Exports/Masters/   event-level folders → left in place
 /// Buffer/2026/2026-08-23 Unparsed A7V/Sony A7V/Card Copy/.DS_Store   junk folder
-/// .Camera Toolkit/Private/2026/2026-08-23 Trip 2026/2026-08-24 Hangout/
+/// .Camera Toolkit/Private/2026/2026-08-23 Sample Trip 2026/2026-08-24 Side Trip/
 ///   Sony A7V/Card Copy/DSC00100.ARW, DJI Nano/Card Copy/DJI_0001.MP4
 /// .Camera Toolkit/_Trash/2026-09-21_230244/manifest.json  (entry in a legacy Card Copy)
 /// ```
@@ -38,9 +38,9 @@ struct LayoutMigrationFixture {
     let parent: SavedCameraEvent
     let child: SavedCameraEvent
 
-    var parentFolder: URL { buffer.appendingPathComponent("2026/2026-08-23 Trip 2026", isDirectory: true) }
+    var parentFolder: URL { buffer.appendingPathComponent("2026/2026-08-23 Sample Trip 2026", isDirectory: true) }
     var childFolder: URL {
-        privateRoot.appendingPathComponent("2026/2026-08-23 Trip 2026/2026-08-24 Hangout", isDirectory: true)
+        privateRoot.appendingPathComponent("2026/2026-08-23 Sample Trip 2026/2026-08-24 Side Trip", isDirectory: true)
     }
     var sonyCardCopy: URL { parentFolder.appendingPathComponent("Sony A7V/Card Copy", isDirectory: true) }
     var osmoCardCopy: URL { parentFolder.appendingPathComponent("DJI Osmo 360/Card Copy", isDirectory: true) }
@@ -75,19 +75,19 @@ struct LayoutMigrationFixture {
         day.calendar = Calendar(identifier: .gregorian)
         day.locale = Locale(identifier: "en_US_POSIX")
         day.dateFormat = "yyyy-MM-dd"
-        let parent = SavedCameraEvent(name: "Trip 2026", eventDate: day.date(from: "2026-08-23")!, storagePolicy: .buffer)
+        let parent = SavedCameraEvent(name: "Sample Trip 2026", eventDate: day.date(from: "2026-08-23")!, storagePolicy: .buffer)
         let child = SavedCameraEvent(
-            name: "Hangout",
+            name: "Side Trip",
             eventDate: day.date(from: "2026-08-24")!,
             storagePolicy: .archiveOnly,
             parentEventID: parent.id
         )
 
-        let parentFolder = buffer.appendingPathComponent("2026/2026-08-23 Trip 2026", isDirectory: true)
+        let parentFolder = buffer.appendingPathComponent("2026/2026-08-23 Sample Trip 2026", isDirectory: true)
         let sony = parentFolder.appendingPathComponent("Sony A7V/Card Copy", isDirectory: true)
         let osmo = parentFolder.appendingPathComponent("DJI Osmo 360/Card Copy", isDirectory: true)
         let osmoAlt = parentFolder.appendingPathComponent("osmo-360/Card Copy", isDirectory: true)
-        let childFolder = privateRoot.appendingPathComponent("2026/2026-08-23 Trip 2026/2026-08-24 Hangout", isDirectory: true)
+        let childFolder = privateRoot.appendingPathComponent("2026/2026-08-23 Sample Trip 2026/2026-08-24 Side Trip", isDirectory: true)
 
         func put(_ url: URL, _ text: String) throws {
             try writeFile(url, text)
@@ -228,15 +228,15 @@ struct LayoutMigrationFixture {
 
         // A trash batch whose file came out of a legacy Card Copy.
         let batch = trashRoot.appendingPathComponent("2026-09-21_230244", isDirectory: true)
-        try writeFile(batch.appendingPathComponent("Buffer/2026/2026-08-23 Trip 2026/Sony A7V/Card Copy/DSC08937.ARW"), "trashed")
+        try writeFile(batch.appendingPathComponent("Buffer/2026/2026-08-23 Sample Trip 2026/Sony A7V/Card Copy/DSC08937.ARW"), "trashed")
         let manifest = MediaTrashManifest(
             version: 1,
             batchID: "2026-09-21_230244",
             createdAt: fixedDate,
             entries: [MediaTrashEntry(
-                trashedRelativePath: "Buffer/2026/2026-08-23 Trip 2026/Sony A7V/Card Copy/DSC08937.ARW",
+                trashedRelativePath: "Buffer/2026/2026-08-23 Sample Trip 2026/Sony A7V/Card Copy/DSC08937.ARW",
                 originalAbsolutePath: sony.appendingPathComponent("DSC08937.ARW").path,
-                originalLocationName: "Trip 2026",
+                originalLocationName: "Sample Trip 2026",
                 size: 7
             )]
         )
