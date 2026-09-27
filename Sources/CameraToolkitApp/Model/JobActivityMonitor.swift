@@ -122,7 +122,7 @@ final class JobActivityMonitor {
 
     /// One sample. Called on every TimelineView tick while the pane is on
     /// screen — everything here is a microseconds-cheap syscall.
-    func tick(job: JobSnapshot?) {
+    func tick(job: JobSnapshot?, now: TimeInterval = ProcessInfo.processInfo.systemUptime) {
         let ticks = SystemLoadProbe.cpuTicks()
         let cpu = ticks.flatMap { current -> Double? in
             previousCPUTicks.flatMap { SystemLoadProbe.cpuFraction(between: $0, and: current) }
@@ -142,7 +142,6 @@ final class JobActivityMonitor {
         if job.id != observedJobID { resetByteHistory(for: job.id) }
         guard job.state == .running || job.state == .queued else { return }
 
-        let now = ProcessInfo.processInfo.systemUptime
         let bytes = job.processedBytes
         if hasByteBaseline, now > lastByteUptime {
             let rate = Double(max(bytes - lastByteCount, 0)) / (now - lastByteUptime)
@@ -155,6 +154,26 @@ final class JobActivityMonitor {
         lastByteCount = bytes
         lastByteUptime = now
         hasByteBaseline = true
+    }
+
+    /// What the header's "left" readout says.
+    enum RemainingEstimate: Equatable {
+        /// Too early (or too little measured) to extrapolate.
+        case estimating
+        case seconds(TimeInterval)
+    }
+
+    /// Time left for a running job. A job that measures its own work (the
+    /// face scan's photos + planned video frames, at a smoothed recent
+    /// rate) is trusted over the byte counters, which only move when a
+    /// file finishes and so read as a collapsed rate mid-clip. Other jobs
+    /// fall back to the byte-rate estimate.
+    func remainingEstimate(for job: JobSnapshot) -> RemainingEstimate? {
+        guard job.state == .running else { return nil }
+        if let work = job.telemetry?.work {
+            return work.secondsRemaining.map { .seconds($0) } ?? .estimating
+        }
+        return estimatedRemaining(for: job).map { .seconds($0) }
     }
 
     /// Byte-rate ETA when the job reports byte counters; nil when there is
