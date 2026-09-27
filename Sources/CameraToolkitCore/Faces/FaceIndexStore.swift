@@ -104,6 +104,13 @@ public final class FaceIndexStore: @unchecked Sendable {
         return formatter
     }()
 
+    /// Parses a `face_photos` / `faces` timestamp the way the store reads
+    /// its own rows (fractional seconds, whole seconds as a fallback).
+    static func parseTimestamp(_ text: String) -> Date? {
+        if let date = formatter.date(from: text) { return date }
+        return try? Date(text, strategy: .iso8601)
+    }
+
     private static func timestamp(_ date: Date, _ formatter: ISO8601DateFormatter) -> String {
         formatter.string(from: date)
     }

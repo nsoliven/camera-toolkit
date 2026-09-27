@@ -283,7 +283,7 @@ public enum DriveEventDiscovery {
     /// `<year>/<parent event folder>/…/<event folder>` components of `url`
     /// relative to `root`. Independent of which drive the path sits on, so it
     /// can be compared against a saved event's expected layout.
-    static func relativeComponents(of url: URL, under root: URL) -> [String] {
+    public static func relativeComponents(of url: URL, under root: URL) -> [String] {
         let rootPath = root.standardizedFileURL.path
         let path = url.standardizedFileURL.path
         guard path.hasPrefix(rootPath + "/") else { return [] }
@@ -291,7 +291,7 @@ public enum DriveEventDiscovery {
     }
 
     /// The `<year>/<…>/<event folder>` components `event` should occupy.
-    static func folderComponents(of event: SavedCameraEvent, locations: EventStorageLocations) -> [String] {
+    public static func folderComponents(of event: SavedCameraEvent, locations: EventStorageLocations) -> [String] {
         let layout = locations.layout(for: event, deviceID: nil)
         return [layout.year] + layout.parentEventFolders + [layout.eventFolder]
     }
