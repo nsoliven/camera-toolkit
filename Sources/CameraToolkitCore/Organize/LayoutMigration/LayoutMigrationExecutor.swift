@@ -861,6 +861,11 @@ public final class LayoutMigrationExecutor {
     /// Copies the backup into the live catalog with the SQLite backup API
     /// and checks the result against the backup's recorded counts.
     private func restoreCatalog(from backup: URL, expectedCounts: [String: Int]) throws {
+        try Self.restoreCatalog(catalogURL: catalogURL, from: backup, expectedCounts: expectedCounts)
+    }
+
+    /// Shared with the NAS layout migration's undo.
+    static func restoreCatalog(catalogURL: URL, from backup: URL, expectedCounts: [String: Int]) throws {
         CatalogDatabase.checkpointAndClose(url: catalogURL)
         var source: OpaquePointer?
         guard sqlite3_open_v2(backup.path, &source, SQLITE_OPEN_READONLY, nil) == SQLITE_OK, let source else {
@@ -884,7 +889,7 @@ public final class LayoutMigrationExecutor {
             throw ToolkitError.commandFailed("The restore stopped early: \(String(cString: sqlite3_errmsg(destination)))")
         }
         CatalogDatabase.checkpointAndClose(url: catalogURL)
-        let counts = try writer().read { db -> [String: Int] in
+        let counts = try CatalogDatabase.writer(for: catalogURL).read { db -> [String: Int] in
             var counts: [String: Int] = [:]
             for table in expectedCounts.keys where try db.tableExists(table) {
                 counts[table] = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM \"\(table)\"") ?? -1

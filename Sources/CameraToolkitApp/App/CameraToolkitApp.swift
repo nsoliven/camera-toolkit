@@ -27,6 +27,18 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate, NSMenuIte
             DebugLog.shared.flush()
             exit(status)
         }
+        // NAS layout migration (legacy RAW/JPEG/Video archive → mirror
+        // layout): server-side renames from a reviewed mapping; same rules.
+        if CommandLine.arguments.contains(NASLayoutMigrationCommand.flag) {
+            let status = NASLayoutMigrationCommand.run(
+                arguments: CommandLine.arguments,
+                defaultSupportFolder: DashboardModel.defaultApplicationSupportURL
+                    .appendingPathComponent("CameraToolkit", isDirectory: true),
+                isAppRunning: { anotherAppInstanceIsRunning() }
+            )
+            DebugLog.shared.flush()
+            exit(status)
+        }
         CrashReporting.start()
         UserDefaults.standard.set(false, forKey: "NSQuitAlwaysKeepsWindows")
         let application = NSApplication.shared
