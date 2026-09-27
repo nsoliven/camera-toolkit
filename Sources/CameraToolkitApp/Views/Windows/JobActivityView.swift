@@ -1,21 +1,27 @@
 import CameraToolkitCore
+import Charts
 import SwiftUI
 
 /// The Jobs window's activity pane — the "what is it actually doing" card
 /// under an expanded job row: the files in flight and their pipeline step,
-/// live counters, a media read-rate graph, machine pressure, and the real
-/// model packages in use. Everything shown comes from the job's own
-/// progress counters or from hardware probes; a counter the system cannot
-/// report is labeled "n/a", never faked.
+/// live counters, the job's speed against its link, where the time goes,
+/// machine pressure, and the real model packages in use. Everything shown
+/// comes from the job's own progress counters or from hardware probes; a
+/// counter the system cannot report is left out, never faked.
 struct JobActivityDetail: View {
     let job: JobSnapshot
     let monitor: JobActivityMonitor
+    /// False renders the monitor's current state without sampling — the
+    /// off-screen snapshot harness feeds it synthetic samples instead.
+    var sampling = true
+    /// Uptime the snapshot harness pins "now" to.
+    var fixedUptime: TimeInterval?
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: 1)) { context in
             content(now: context.date)
                 .onChange(of: context.date, initial: true) {
-                    monitor.tick(job: job)
+                    if sampling { monitor.tick(job: job) }
                 }
         }
     }
@@ -24,7 +30,7 @@ struct JobActivityDetail: View {
         VStack(alignment: .leading, spacing: 10) {
             headline(now: now)
             progressAndCounts
-            throughputAndHardware
+            throughputCard(now: fixedUptime ?? ProcessInfo.processInfo.systemUptime)
             debugLines
         }
         .padding(.leading, 36)
@@ -75,8 +81,52 @@ struct JobActivityDetail: View {
         return step
     }
 
+    /// Rows for a job with a fixed set of parallel transfers (Sync to
+    /// NAS), in row order; empty for other jobs.
+    private var transferRows: [JobActiveItem] {
+        (job.telemetry?.activeItems ?? []).filter { $0.slot != nil }.sorted { ($0.slot ?? 0) < ($1.slot ?? 0) }
+    }
+
     @ViewBuilder
     private func headline(now: Date) -> some View {
+        if let configuration = job.telemetry?.configuration, job.action == .syncBuffer || !transferRows.isEmpty {
+            transferHeadline(configuration: configuration, now: now)
+        } else {
+            itemHeadline(now: now)
+        }
+    }
+
+    /// "4 transfers in parallel · SSH verify", the job's status on its own
+    /// line, then one steady row per transfer.
+    @ViewBuilder
+    private func transferHeadline(configuration: String, now: Date) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(configuration)
+                    .font(.callout.weight(.semibold))
+                    .lineLimit(1)
+                Spacer(minLength: 12)
+                Text(timingText(now: now))
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            Text(job.telemetry?.step ?? (job.note.isEmpty ? job.action.displayName : job.note))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+            if !transferRows.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(transferRows, id: \.slot) { item in
+                        TransferRow(item: item)
+                    }
+                }
+                .transaction { $0.animation = nil }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func itemHeadline(now: Date) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             if let first = headlineItems.first {
                 stepChip(first.step)
@@ -188,58 +238,79 @@ struct JobActivityDetail: View {
         return parts.isEmpty ? "Waiting for the job to report" : parts.joined(separator: " · ")
     }
 
-    // MARK: - Throughput and machine pressure
+    // MARK: - Throughput
 
-    private var throughputAndHardware: some View {
-        HStack(alignment: .top, spacing: 16) {
-            VStack(alignment: .leading, spacing: 4) {
-                Sparkline(samples: monitor.readRateHistory)
-                    .frame(height: 44)
-                Text(readRateCaption)
-                    .font(.caption2.monospacedDigit())
-                    .foregroundStyle(.secondary)
+    /// The speed card: big fixed-width readouts, a labelled chart against
+    /// the link's ceiling, and — for jobs that time their phases — where
+    /// the time goes.
+    private func throughputCard(now: TimeInterval) -> some View {
+        let readout = monitor.readout(for: job, now: now)
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top, spacing: 16) {
+                readouts(readout)
+                Spacer(minLength: 12)
+                hardwareStrip
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
+            ThroughputChart(readout: readout)
+                .frame(height: 132)
+            if let telemetry = job.telemetry, !telemetry.phaseShares.isEmpty {
+                PhaseBreakdown(shares: telemetry.phaseShares)
+            }
+        }
+        .padding(12)
+        .background(.background.secondary, in: RoundedRectangle(cornerRadius: 10))
+    }
 
-            HStack(spacing: 12) {
-                metricCell(
-                    "CPU",
-                    fraction: monitor.hardware.cpuFraction,
-                    history: monitor.cpuHistory,
-                    help: "System-wide CPU load across all cores"
-                )
-                metricCell(
-                    "GPU",
-                    fraction: monitor.hardware.gpuFraction,
-                    history: monitor.gpuHistory,
-                    help: monitor.hardware.gpuFraction == nil
-                        ? "This Mac's GPU driver does not report utilization — shown as n/a rather than guessed"
-                        : "GPU device utilization reported by the driver"
-                )
-                metricCell(
-                    "ANE",
-                    fraction: nil,
-                    history: [],
-                    help: "Neural Engine activity is only measurable via powermetrics, which needs sudo — not sampled"
-                )
-                thermalCell
+    private func readouts(_ readout: JobThroughputReadout) -> some View {
+        let unit = readout.unit.axisLabel
+        let bytes = readout.unit == .megabytesPerSecond
+        let current: String? = readout.current.map { bytes ? JobThroughputFormat.rate($0) : JobThroughputFormat.itemRate($0) }
+        let average: String? = readout.average.map { bytes ? JobThroughputFormat.rate($0) : JobThroughputFormat.itemRate($0) }
+        // A job with parallel transfers reports them together.
+        let combined = job.telemetry?.transferBytes != nil
+        let nowLabel = combined ? "now · combined" : "now"
+        let nowCaption: String = readout.heldFor.map { "\(nowLabel) · held \(Self.durationText($0))" } ?? nowLabel
+        let nowHelp: String = (readout.isHeld
+            ? "No progress reported for a few seconds — the last smoothed speed is held, not blanked."
+            : "Smoothed over about the last 5 seconds") + (combined ? " All parallel transfers together." : "")
+        let filesUnit = job.action == .faceScan ? "photos/s" : "files/s"
+        return HStack(alignment: .firstTextBaseline, spacing: 22) {
+            // A finished job has no current speed: its average leads.
+            if job.state == .running || job.state == .queued {
+                ThroughputValue(value: current, unit: unit, caption: nowCaption, prominent: true, faded: readout.isHeld, help: nowHelp)
+            }
+            ThroughputValue(value: average, unit: unit, caption: combined ? "average · combined" : "average", prominent: !(job.state == .running || job.state == .queued), help: "Everything this job has moved, over its elapsed time" + (combined ? ", all parallel transfers together" : ""))
+            if let files = readout.filesPerSecond {
+                ThroughputValue(value: JobThroughputFormat.itemRate(files), unit: filesUnit, caption: "files", faded: readout.isHeld, help: "Finished files per second, smoothed")
+            }
+            if let frames = readout.framesPerSecond {
+                ThroughputValue(value: JobThroughputFormat.itemRate(frames), unit: "frames/s", caption: "video", help: "Video frames decoded per second, smoothed")
             }
         }
     }
 
-    private var readRateCaption: String {
-        let current = monitor.readRateHistory.last ?? job.bytesPerSecond
-        if current > 0 {
-            var text = "Read \(Int64(current).formattedBytes)/s"
-            if monitor.peakReadRate > 0 {
-                text += " · peak \(Int64(monitor.peakReadRate).formattedBytes)/s"
+    // MARK: - Machine pressure
+
+    /// CPU, GPU and thermal in one compact strip. Counters macOS does not
+    /// expose are left out rather than shown as "n/a"; the tooltip says why.
+    private var hardwareStrip: some View {
+        HStack(spacing: 12) {
+            metricCell(
+                "CPU",
+                fraction: monitor.hardware.cpuFraction,
+                history: monitor.cpuHistory,
+                help: "System-wide CPU load across all cores. Neural Engine load is not shown: macOS only reports it through powermetrics, which needs administrator rights."
+            )
+            if monitor.hardware.gpuFraction != nil || !monitor.gpuHistory.isEmpty {
+                metricCell(
+                    "GPU",
+                    fraction: monitor.hardware.gpuFraction,
+                    history: monitor.gpuHistory,
+                    help: "GPU device utilization reported by the driver"
+                )
             }
-            return text
+            thermalCell
         }
-        if job.state == .running {
-            return job.totalBytes > 0 ? "Reading…" : "This job reports no byte counters — graph shows media bytes only"
-        }
-        return "No read rate recorded"
     }
 
     private func metricCell(
@@ -248,33 +319,31 @@ struct JobActivityDetail: View {
         history: [Double],
         help: String
     ) -> some View {
-        VStack(spacing: 3) {
-            Text(label)
-                .font(.caption2.weight(.bold))
-                .foregroundStyle(.secondary)
-            Sparkline(samples: history, tint: .secondary)
-                .frame(width: 52, height: 14)
-            Text(fraction.map { "\(Int(($0 * 100).rounded()))%" } ?? "n/a")
-                .font(.caption.monospacedDigit())
-                .foregroundStyle(fraction == nil ? .tertiary : .primary)
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(alignment: .firstTextBaseline, spacing: 4) {
+                Text(label)
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(.secondary)
+                Text(fraction.map { "\(Int(($0 * 100).rounded()))%" } ?? JobThroughputFormat.placeholder)
+                    .font(.caption.monospacedDigit())
+                    .frame(width: 32, alignment: .trailing)
+            }
+            Sparkline(samples: history, tint: .secondary, fixedPeak: 1)
+                .frame(width: 64, height: 14)
         }
-        .frame(width: 56)
         .help(help)
     }
 
     private var thermalCell: some View {
-        VStack(spacing: 3) {
+        VStack(alignment: .leading, spacing: 2) {
             Text("THERMAL")
                 .font(.caption2.weight(.bold))
                 .foregroundStyle(.secondary)
-            Sparkline(samples: [])
-                .hidden()
-                .frame(width: 52, height: 14)
             Text(thermalLabel)
-                .font(.caption.monospacedDigit())
+                .font(.caption)
                 .foregroundStyle(thermalColor)
+                .frame(height: 14)
         }
-        .frame(width: 56)
         .help("System thermal state" + (monitor.hardware.lowPowerMode ? " · Low Power Mode is on" : ""))
     }
 
@@ -353,6 +422,11 @@ struct JobActivityDetail: View {
         case "verify": .green
         case "remove": .red
         case "upload": .cyan
+        case "flush", "flushing to nas": .orange
+        case "rename": .purple
+        case "copying to nas": .blue
+        case "re-reading nas copy": .green
+        case "hashing drive copy": .teal
         default: .secondary
         }
     }
@@ -386,14 +460,16 @@ struct JobActivityDetail: View {
 }
 
 /// A small live line graph — samples oldest → newest, autoscaled to the
-/// window peak with a soft fill. Empty data draws an empty track.
+/// window peak (or to `fixedPeak`, so a 20 % load does not fill the
+/// track) with a soft fill. Empty data draws an empty track.
 struct Sparkline: View {
     var samples: [Double]
     var tint: Color = .accentColor
+    var fixedPeak: Double?
 
     var body: some View {
         Canvas { context, size in
-            guard let peak = samples.max(), peak > 0, samples.count > 1 else { return }
+            guard let peak = fixedPeak ?? samples.max(), peak > 0, samples.count > 1 else { return }
             let stepX = size.width / CGFloat(samples.count - 1)
             var line = Path()
             for (index, value) in samples.enumerated() {
@@ -420,6 +496,271 @@ struct Sparkline: View {
             RoundedRectangle(cornerRadius: 5)
                 .strokeBorder(.quaternary, lineWidth: 1)
         )
+    }
+}
+
+/// One labelled readout: a fixed-width number that never blanks between
+/// samples (a held value fades instead), its unit, and what it measures.
+struct ThroughputValue: View {
+    var value: String?
+    var unit: String
+    var caption: String
+    var prominent = false
+    var faded = false
+    var help: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(caption.uppercased())
+                .font(.caption2.weight(.bold).monospacedDigit())
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+            HStack(alignment: .firstTextBaseline, spacing: 4) {
+                Text(value ?? JobThroughputFormat.placeholder)
+                    .font(.system(size: prominent ? 28 : 18, weight: prominent ? .semibold : .medium, design: .rounded))
+                    .monospacedDigit()
+                    .contentTransition(.numericText())
+                    .foregroundStyle(value == nil ? .tertiary : .primary)
+                Text(unit)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+            }
+            .opacity(faded ? 0.45 : 1)
+            .animation(.easeInOut(duration: 0.4), value: faded)
+        }
+        // A fixed slot: the unit and the next readout stay put as digits
+        // and the "held" caption come and go.
+        .frame(minWidth: prominent ? 132 : 96, alignment: .leading)
+        .help(help)
+    }
+}
+
+/// Throughput over the last few minutes: one smoothed line per series
+/// (a Sync job's copy/write and verify/re-read rates), a labelled y-axis in
+/// MB/s on a scale that does not jump with every spike, elapsed job time
+/// along x, and the link's expected ceiling as a dashed rule.
+struct ThroughputChart: View {
+    let readout: JobThroughputReadout
+
+    static let seriesColors: [String: Color] = [
+        "Throughput": .blue,
+        "Files": .blue,
+        "Overall": .gray,
+        "Copy (write)": .blue,
+        "Verify (re-read)": .green,
+        "Verify (on NAS)": .mint,
+        "Hash (drive read)": .teal,
+    ]
+
+    private var colorDomain: [String] { readout.series }
+    private var colorRange: [Color] { readout.series.map { Self.seriesColors[$0] ?? .gray } }
+
+    var body: some View {
+        if readout.points.isEmpty {
+            RoundedRectangle(cornerRadius: 6)
+                .strokeBorder(.quaternary, lineWidth: 1)
+                .overlay {
+                    Text(readout.average == nil ? "Waiting for the job to move data…" : "No live samples — this job ran while the pane was closed")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+        } else {
+            chart
+        }
+    }
+
+    private var chart: some View {
+        Chart {
+            ForEach(readout.points) { point in
+                if readout.series.count == 1 {
+                    AreaMark(
+                        x: .value("Elapsed", point.elapsed),
+                        y: .value(readout.unit.axisLabel, point.value)
+                    )
+                    .interpolationMethod(.monotone)
+                    .foregroundStyle(
+                        .linearGradient(
+                            colors: [(Self.seriesColors[point.series] ?? .blue).opacity(0.22), .clear],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        )
+                    )
+                }
+                LineMark(
+                    x: .value("Elapsed", point.elapsed),
+                    y: .value(readout.unit.axisLabel, point.value),
+                    series: .value("Series", point.series)
+                )
+                .interpolationMethod(.monotone)
+                .lineStyle(StrokeStyle(lineWidth: 1.8, lineCap: .round, lineJoin: .round))
+                .foregroundStyle(by: .value("Series", point.series))
+            }
+            if let ceiling = readout.ceiling {
+                RuleMark(y: .value("Ceiling", ceiling.megabytesPerSecond))
+                    .lineStyle(StrokeStyle(lineWidth: 1, dash: [5, 4]))
+                    .foregroundStyle(Color.gray)
+                    .annotation(position: .top, alignment: .leading, spacing: 2) {
+                        Text("\(ceiling.caption) expected")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+            }
+        }
+        .chartForegroundStyleScale(domain: colorDomain, range: colorRange)
+        .chartLegend(readout.series.count > 1 ? .visible : .hidden)
+        .chartLegend(position: .top, alignment: .trailing, spacing: 4)
+        .chartYScale(domain: 0...max(readout.yUpper, 1))
+        .chartXScale(domain: readout.xDomain)
+        .chartYAxis {
+            AxisMarks(position: .leading, values: .automatic(desiredCount: 4)) { value in
+                AxisGridLine()
+                AxisValueLabel {
+                    if let number = value.as(Double.self) {
+                        Text(Self.axisNumber(number))
+                            .monospacedDigit()
+                    }
+                }
+            }
+        }
+        .chartYAxisLabel(readout.unit.axisLabel, position: .topLeading)
+        .chartXAxis {
+            AxisMarks(values: .stride(by: Self.xStride(readout.xDomain))) { value in
+                AxisGridLine()
+                AxisTick()
+                AxisValueLabel {
+                    if let seconds = value.as(Double.self) {
+                        Text(JobActivityDetail.durationText(seconds))
+                            .monospacedDigit()
+                    }
+                }
+            }
+        }
+        .accessibilityLabel("Throughput over the last \(Int(JobThroughputTrack.chartWindow / 60)) minutes")
+    }
+
+    static func axisNumber(_ value: Double) -> String {
+        value >= 10 || value == 0 ? Int(value.rounded()).formatted() : String(format: "%.1f", value)
+    }
+
+    /// Tick spacing for elapsed time: every 15 s for a young job, 30 s
+    /// once the window is full.
+    static func xStride(_ domain: ClosedRange<Double>) -> Double {
+        domain.upperBound - domain.lowerBound > 120 ? 30 : 15
+    }
+}
+
+/// One parallel transfer: its phase, the file, a bar of the bytes it has
+/// moved in that phase, and its own smoothed speed. Every piece has a
+/// fixed width, so a row reused by the next file does not reflow.
+struct TransferRow: View {
+    let item: JobActiveItem
+
+    static func color(_ phase: String?) -> Color {
+        switch phase {
+        case "Copying": .blue
+        case "Flushing": .orange
+        case "Verifying": .green
+        case "Verifying on NAS": .mint
+        case "Hashing": .teal
+        case "Renaming": .purple
+        case "Failed": .red
+        case "Conflict": .orange
+        default: .secondary
+        }
+    }
+
+    var body: some View {
+        let phase = item.phase ?? item.step
+        HStack(spacing: 8) {
+            Text(phase)
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(Self.color(item.phase))
+                .lineLimit(1)
+                .frame(width: 120, alignment: .leading)
+            Text(item.name)
+                .font(.caption.monospaced())
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .help(item.path)
+            ProgressView(value: item.byteFraction ?? 0)
+                .progressViewStyle(.linear)
+                .tint(Self.color(item.phase))
+                .frame(width: 120)
+            Text(JobThroughputFormat.sizeProgress(done: item.bytesDone ?? 0, total: item.bytesTotal ?? 0))
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .frame(width: 128, alignment: .trailing)
+            Text("\(JobThroughputFormat.rate(JobThroughputFormat.megabytes(item.bytesPerSecond ?? 0))) MB/s")
+                .font(.caption.monospacedDigit())
+                .frame(width: 76, alignment: .trailing)
+        }
+        .accessibilityElement(children: .combine)
+    }
+}
+
+/// Where the job's time went — a thin stacked bar plus
+/// "Copy 30% · Flush 40% · Verify 25% · Rename 5%", with the speed each
+/// data-moving phase ran at.
+struct PhaseBreakdown: View {
+    let shares: [JobPhaseShare]
+
+    static func color(_ phase: String) -> Color {
+        switch phase {
+        case "Copy": .blue
+        case "Flush": .orange
+        case "Verify": .green
+        case "Remote verify (NAS)": .mint
+        case "Hash": .teal
+        case "Rename": .purple
+        default: .gray
+        }
+    }
+
+    /// "Copy 30% · Flush 40% · Verify 25% · Rename 5%"
+    static func summary(_ shares: [JobPhaseShare]) -> String {
+        shares.map { "\($0.label) \($0.percent)%" }.joined(separator: " · ")
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 6) {
+                Text("BUSY TIME")
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(.secondary)
+                    .help("Share of the time spent in each phase, summed over the parallel transfers")
+                GeometryReader { geometry in
+                    HStack(spacing: 1) {
+                        ForEach(shares, id: \.label) { share in
+                            Rectangle()
+                                .fill(Self.color(share.label).gradient)
+                                .frame(width: max(geometry.size.width * share.fraction - 1, 1))
+                        }
+                    }
+                    .clipShape(Capsule())
+                }
+                .frame(height: 8)
+            }
+            HStack(spacing: 12) {
+                ForEach(shares, id: \.label) { share in
+                    HStack(spacing: 4) {
+                        Circle()
+                            .fill(Self.color(share.label))
+                            .frame(width: 7, height: 7)
+                        Text("\(share.label) \(share.percent)%")
+                            .font(.caption.monospacedDigit())
+                        if let rate = share.bytesPerSecond {
+                            Text("\(JobThroughputFormat.rate(JobThroughputFormat.megabytes(rate))) MB/s")
+                                .font(.caption2.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .help("\(share.label): \(JobActivityDetail.durationText(share.seconds)) so far" + (share.bytesPerSecond.map { " at \(JobThroughputFormat.rate(JobThroughputFormat.megabytes($0))) MB/s while running" } ?? ""))
+                }
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(Self.summary(shares))
+        }
     }
 }
 

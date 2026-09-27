@@ -16,8 +16,8 @@ final class ScanTestClock: @unchecked Sendable {
 
 /// The owner's XHIGH scan: 52 DJI clips, 6 h 7 min, 257.69 GB, ~12 frames/s.
 /// Byte progress only reached the Jobs window when a whole file finished,
-/// and the monitor's per-second EWMA (×0.55 per idle tick) collapsed the
-/// rate between completions — 904 h on screen for a ~1 h job.
+/// and the old monitor's per-second EWMA (×0.55 per idle tick) collapsed
+/// the rate between completions — 904 h on screen for a ~1 h job.
 @MainActor
 final class ScanETATests: XCTestCase {
     private struct Observation {
@@ -25,7 +25,7 @@ final class ScanETATests: XCTestCase {
         var filesDone: Int
         var framesDone: Int
         var totalFrames: Int
-        /// The largest pre-fix byte-rate ETA the monitor produced.
+        /// The largest byte-rate ETA the monitor produced.
         var worstByteETA: TimeInterval
     }
 
@@ -119,9 +119,12 @@ final class ScanETATests: XCTestCase {
         let observed = replay(until: 107, monitor: monitor)
         XCTAssertTrue((43_900...44_200).contains(observed.totalFrames), "\(observed.totalFrames)")
 
-        // Root cause, pinned: the byte-rate path collapses to an absurd
-        // figure while long clips are in flight.
-        XCTAssertGreaterThan(observed.worstByteETA, 99 * 3600, "the pre-fix byte ETA is what showed 904 h")
+        // The byte-rate path used to decay ×0.55 on every tick without a
+        // finished file and read 904 h here. It now measures between the
+        // counter's change points and holds the rate in between, so even
+        // this worst case stays in the right order of magnitude.
+        XCTAssertGreaterThan(observed.worstByteETA, 0)
+        XCTAssertLessThan(observed.worstByteETA, 3 * 3600, "the byte ETA no longer collapses between file completions")
 
         // The work-unit estimate: remaining frames at ~12 frames/s.
         let estimate = try XCTUnwrap(monitor.remainingEstimate(for: observed.job))
