@@ -18,7 +18,7 @@ New here? Press **Start Guided Setup** on the welcome screen, or **Guide** in th
 2. Select photos and press 1–3 for a recent event, drag them onto an event, or press N to make a new event. **Event…** searches every event by name.
 3. Mark an event **Private · NAS only** when it should never sit in the shared Buffer.
 4. Press **Apply**. Files already on the working drive move into their event folders instantly; files on a card are copied and verified.
-5. Open an event and use its storage strip: **Archive to NAS**, **Take Off Drive**, **Free Up Source**, and **Upload** to Immich.
+5. Open an event and use its storage strip: **Sync to NAS**, **Take Off Drive**, **Free Up Source**, and **Upload** to Immich.
 6. Edit the RAW files in Photomator straight from the event.
 
 ## What the app does
@@ -109,7 +109,7 @@ Then add cards and unsorted folders from the Events sidebar with **Add Folder or
 3. Press a number key for one of the nine most recent events, drag onto any event, or press N to create one.
 4. Press **Apply** and review the plan. Same-drive files move; card files copy with verification.
 5. Open the event. Choose **Shared Buffer** or **Private · NAS only**.
-6. **Archive to NAS** copies with SHA-256 verification. **Take Off Drive** then re-hashes against the NAS and moves the drive copies to the drive's hidden `_Trash`.
+6. **Sync to NAS** copies only what the NAS is missing, to the same paths as the drive, and re-reads every copy from the NAS to check its SHA-256; a different file already there is reported as a conflict, never overwritten. **Take Off Drive** only takes files whose NAS copy a sync verified, re-hashes them against the NAS and moves the drive copies to the drive's hidden `_Trash`.
 7. **Free Up Source** re-hashes card originals against their drive copies before removing them.
 8. Turn on **Send to Immich** and press **Upload** for events you want in Immich.
 
@@ -156,7 +156,8 @@ Buffer/<year>/<yyyy-MM-dd event>/
 - Sorting records assignments only. Apply shows a plan before anything moves.
 - Same-drive moves are exclusive renames that never overwrite a file, and every move is journaled for Undo.
 - Copies to another drive are checksum-verified and leave the original in place.
-- **Take Off Drive** requires a matching NAS copy, typed confirmation, and a fresh checksum pass over the whole set, and it moves files to a recoverable `_Trash` batch instead of deleting them.
+- **Sync to NAS** re-reads every copy from the NAS and never overwrites a file already there.
+- **Take Off Drive** requires a NAS copy verified by Sync to NAS, typed confirmation, and a fresh checksum pass over the whole set, and it moves files to a recoverable `_Trash` batch instead of deleting them.
 - **Free Up Camera** and **Free Up Source** are the only source-destructive actions. They require typing `REMOVE`, perform a fresh all-files checksum pass, and remove nothing when any file fails.
 - Archive success requires checksum verification and writes a manifest.
 - Private staging is hidden from Finder but is not encrypted or access-controlled.

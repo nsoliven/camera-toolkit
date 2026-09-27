@@ -375,6 +375,7 @@ public struct CatalogStore {
             updated_at TEXT NOT NULL
         );
         """, database: database)
+        try execute(NASSyncStore.schema, database: database)
     }
 
     private func ensureLibraryFolders(configuration: AppConfiguration) throws -> [URL] {

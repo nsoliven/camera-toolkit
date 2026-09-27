@@ -171,6 +171,11 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate, NSMenuIte
         CameraToolkitRuntime.workspace.addUnsortedFolder()
     }
 
+    @objc func syncAllToNAS(_ sender: Any?) {
+        CameraToolkitMainWindow.shared.show(model: model)
+        CameraToolkitRuntime.workspace.syncAllToNAS()
+    }
+
     @objc func toggleSidebar(_ sender: Any?) {
         model.toggleSidebar()
     }

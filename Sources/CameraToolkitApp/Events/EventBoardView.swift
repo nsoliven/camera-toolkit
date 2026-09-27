@@ -526,6 +526,9 @@ private struct EventBoardToolbar: ToolbarContent {
         }
         .sharedBackgroundVisibility(.hidden)
         ToolbarItem(placement: .primaryAction) {
+            NASSyncToolbarButton(model: model, workspace: workspace, event: event)
+        }
+        ToolbarItem(placement: .primaryAction) {
             Menu {
                 EventActionsMenu(model: model, workspace: workspace, event: event)
             } label: {
@@ -542,6 +545,41 @@ private struct EventBoardToolbar: ToolbarContent {
                 Label(showInspector ? "Hide Event Info" : "Show Event Info", systemImage: "sidebar.trailing")
             }
             .help(showInspector ? "Hide Event Info (⌥⌘I)" : "Show Event Info — storage, people, and the event's details (⌥⌘I)")
+        }
+    }
+}
+
+/// "Sync to NAS" in the board header — or "Connect to NAS…" while the NAS
+/// share is not mounted and an SMB address is configured.
+private struct NASSyncToolbarButton: View {
+    let model: DashboardModel
+    let workspace: EventsWorkspace
+    let event: SavedCameraEvent
+
+    var body: some View {
+        if workspace.nasIsConnected {
+            Button {
+                workspace.syncToNAS(event.id)
+            } label: {
+                Label("Sync to NAS", systemImage: "arrow.up.to.line.circle")
+            }
+            .disabled(model.isBusy)
+            .help("Sync to NAS — copy this event and its subevents to the NAS, verifying every copy by re-reading it")
+        } else if workspace.nasShareURL != nil {
+            Button {
+                workspace.connectToNAS()
+            } label: {
+                Label("Connect to NAS…", systemImage: "server.rack")
+            }
+            .help("The NAS is not connected. Open the configured share so Finder mounts it.")
+        } else {
+            Button {
+                workspace.syncToNAS(event.id)
+            } label: {
+                Label("Sync to NAS", systemImage: "arrow.up.to.line.circle")
+            }
+            .disabled(true)
+            .help("The NAS is not connected. Mount the share in Finder, or set its smb:// address in Settings → Locations.")
         }
     }
 }
@@ -687,7 +725,7 @@ struct EventStorageSlots {
         let onDrive = assets.count { $0.drive == .present }
         let onOther = assets.count { $0.otherDrive == .present }
         let needsDrive = assets.count { $0.drive != .present && ($0.otherDrive == .present || $0.isOnSeparateSource) }
-        let removable = assets.count { ($0.drive == .present || $0.otherDrive == .present) && $0.archive == .present }
+        let removable = assets.count { ($0.drive == .present || $0.otherDrive == .present) && $0.archiveIsTrusted }
         let offline = summary?.driveOffline ?? false
         let detail: String
         if summary == nil {
@@ -726,7 +764,7 @@ struct EventStorageSlots {
             if removable > 0 {
                 Button("Take Off Drive…") { workspace.requestRemoveFromDrive(event.id) }
                     .disabled(model.isBusy)
-                    .help("Only files whose NAS copy matches byte for byte leave the drive")
+                    .help("Only files whose NAS copy Sync to NAS verified leave the drive, and each is re-hashed against the NAS first")
             }
             if offline {
                 checkAgainButton
@@ -737,25 +775,40 @@ struct EventStorageSlots {
     var nas: StorageSlot<some View> {
         let total = assets.count
         let onNAS = assets.count { $0.archive == .present }
+        let verified = summary?.verifiedOnArchive ?? 0
+        let legacy = summary?.onLegacyArchiveLayout ?? 0
         let offline = summary?.archiveOffline ?? false
-        let reachable = assets.count { $0.archive != .present && ($0.drive == .present || $0.otherDrive == .present || $0.source == .present) }
+        let onDrive = assets.count { $0.drive == .present || $0.otherDrive == .present }
+        let detail: String
+        if offline {
+            detail = workspace.nasShareURL == nil ? "Connect the NAS share to sync" : "Not connected — Connect to NAS…"
+        } else if total > 0, verified == total, let date = summary?.oldestArchiveVerification {
+            detail = "On NAS ✓ verified \(date.formatted(date: .abbreviated, time: .shortened))"
+        } else if total > 0, onNAS == total {
+            detail = legacy > 0
+                ? "On NAS · \(legacy) in the old archive layout"
+                : "On NAS · \(verified) of \(total) verified — Sync to NAS checks the rest"
+        } else {
+            detail = "\(max(total - onNAS, 0)) not on the NAS yet"
+        }
         return StorageSlot(
             title: "NAS",
             symbol: "server.rack",
             tint: .green,
             value: summary == nil ? "Checking…" : (offline ? "Offline" : "\(onNAS) of \(total)"),
-            detail: offline
-                ? "Connect the NAS share to archive"
-                : (total > 0 && onNAS == total ? "Verified in Library Originals" : "\(max(total - onNAS, 0)) not archived yet"),
+            detail: detail,
             state: summary == nil ? .unknown : (offline ? .offline : (total > 0 && onNAS == total ? .complete : .partial))
         ) {
-            if !offline && reachable > 0 {
-                Button("Archive to NAS") { workspace.archiveToNAS(event.id) }
-                    .disabled(model.isBusy)
-                    .help("Copy with a SHA-256 check of every file. Existing different files are never overwritten.")
-            }
             if offline {
+                if workspace.nasShareURL != nil {
+                    Button("Connect to NAS…") { workspace.connectToNAS() }
+                        .help("Open the configured NAS share so Finder mounts it")
+                }
                 checkAgainButton
+            } else if onDrive > 0 || verified < onNAS {
+                Button("Sync to NAS") { workspace.syncToNAS(event.id) }
+                    .disabled(model.isBusy)
+                    .help("Copy only the files missing on the NAS, each to the same path it has on the drive, and re-read every copy from the NAS to check its SHA-256. Existing files are never overwritten.")
             }
         }
     }

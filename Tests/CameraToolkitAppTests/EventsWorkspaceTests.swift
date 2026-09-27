@@ -96,6 +96,57 @@ final class EventsWorkspaceTests: XCTestCase {
         }
     }
 
+    func testSyncToNASMirrorsTheEventAndOnlyVerifiedCopiesCanLeaveTheDrive() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let unsorted = root.appendingPathComponent("Drive/Unsorted A7V", isDirectory: true)
+            try writeOrganizerARW(unsorted.appendingPathComponent("Transfer 1/DSC00001.ARW"), "2026:08:26 10:00:00", "000")
+            try writeOrganizerARW(unsorted.appendingPathComponent("Transfer 1/DSC00002.ARW"), "2026:08:26 10:10:00", "000")
+            let location = addUnsorted(unsorted, to: model)
+            workspace.scan(location)
+            try await waitUntil { workspace.sources[location.id]?.result != nil }
+            let result = try XCTUnwrap(workspace.sources[location.id]?.result)
+            let beach = try XCTUnwrap(workspace.createEvent(name: "Beach Day", date: organizerDay("2026-08-26"), policy: .buffer))
+            workspace.assign(stackIDs: Set(result.stacks.map(\.id)), from: location.id, to: beach)
+            let plan = EventsWorkspace.buildApplyPlan(
+                events: [try XCTUnwrap(workspace.event(beach))],
+                configuration: model.configuration,
+                locations: workspace.locations,
+                onlyUnder: unsorted.path,
+                title: "Apply",
+                unsortedRoots: [unsorted]
+            )
+            workspace.performApply(plan)
+            try await waitUntil { !model.isBusy && workspace.latestMoveJournalTitle != nil }
+            let nas = root.appendingPathComponent("Library", isDirectory: true)
+            try FileManager.default.createDirectory(at: nas, withIntermediateDirectories: true)
+            XCTAssertEqual(workspace.locations.nasRoot.path, nas.standardizedFileURL.path)
+
+            // A same-size copy put on the NAS by hand is not enough.
+            let handCopy = nas.appendingPathComponent("2026/2026-08-26 Beach Day/Originals/Sony A7V/DSC00001.ARW")
+            try FileManager.default.createDirectory(at: handCopy.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try FileManager.default.copyItem(
+                at: root.appendingPathComponent("Drive/Camera Buffer/2026/2026-08-26 Beach Day/Originals/Sony A7V/DSC00001.ARW"),
+                to: handCopy
+            )
+            await workspace.refreshEvent(beach)
+            XCTAssertEqual(workspace.presence[beach]?.onArchive, 1)
+            XCTAssertEqual(workspace.presence[beach]?.verifiedOnArchive, 0)
+            workspace.requestRemoveFromDrive(beach)
+            XCTAssertNil(workspace.pendingRemoval)
+
+            workspace.syncToNAS(beach)
+            try await waitUntil { !model.isBusy }
+            XCTAssertEqual(model.jobs.first?.state, .done, model.jobs.first?.note ?? "")
+            XCTAssertTrue(FileManager.default.fileExists(atPath: nas.appendingPathComponent("2026/2026-08-26 Beach Day/Originals/Sony A7V/DSC00002.ARW").path))
+            await workspace.refreshEvent(beach)
+            XCTAssertEqual(workspace.presence[beach]?.verifiedOnArchive, 2)
+            XCTAssertNotNil(workspace.presence[beach]?.oldestArchiveVerification)
+            workspace.requestRemoveFromDrive(beach)
+            XCTAssertEqual(workspace.pendingRemoval?.fileCount, 2)
+            workspace.pendingRemoval = nil
+        }
+    }
+
     func testMovingAppliedBurstToPrivateEventRenamesItOutOfTheBuffer() async throws {
         try await withOrganizerSandbox { root, model, workspace in
             let unsorted = root.appendingPathComponent("Drive/Unsorted A7V", isDirectory: true)

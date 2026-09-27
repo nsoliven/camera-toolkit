@@ -256,19 +256,10 @@ private struct MoveCandidate: Sendable {
     }
 }
 
-private struct NASArchiveGroup: Sendable {
-    /// The event these files are assigned to — on a family board the
-    /// assets can belong to a subevent, whose layout nests deeper.
-    var owner: SavedCameraEvent
-    var root: URL
-    var deviceID: String?
-    var files: [FileRecord]
-}
-
-private struct NASArchiveOutcome: Sendable {
-    var copied = 0
-    var alreadySafe = 0
-    var conflicts = 0
+private struct NASSyncJobOutcome: Sendable {
+    var report: NASSyncReport
+    var plan: NASSyncPlan
+    var reportPath: String?
 }
 
 private struct ImmichCandidate: Sendable {
@@ -830,10 +821,13 @@ final class EventsWorkspace {
     }
 
     func isConnected(_ location: ConfiguredLocation) -> Bool {
+        isConnected(folder: URL(fileURLWithPath: DashboardModel.expandedPath(location.path), isDirectory: true))
+    }
+
+    func isConnected(folder url: URL) -> Bool {
         // Tracked read: views that call this re-evaluate when
         // `refreshConnectivity()` bumps `connectivityRevision`.
         _ = connectivityRevision
-        let url = URL(fileURLWithPath: DashboardModel.expandedPath(location.path), isDirectory: true)
         // One filesystem check per folder per connectivity revision — a
         // sidebar re-render between refreshes answers from the cache.
         if let cached = connectedPathsCache, cached.revision == connectivityRevision, let connected = cached.paths[url.path] {
@@ -2472,6 +2466,13 @@ final class EventsWorkspace {
 
             var memberSummaries: [UUID: EventPresenceSummary] = [:]
             var cancelled = false
+            // What Sync to NAS verified under this family's NAS folder —
+            // one catalog read, so presence can say "verified <date>".
+            let nasVerified = NASSyncStore.verifiedDates(
+                catalogURL: catalogURL,
+                nasRoot: locations.nasRoot.path,
+                prefixes: [locations.layout(for: event, deviceID: nil).mirrorEventFolderPath]
+            )
             for member in members {
                 guard !Task.isCancelled else { cancelled = true; break }
                 guard let memberSummary = EventPresenceScanner.scan(
@@ -2480,7 +2481,8 @@ final class EventsWorkspace {
                     locations: locations,
                     mountedVolumes: mounted,
                     probe: probe,
-                    pauseGate: gate
+                    pauseGate: gate,
+                    nasVerified: nasVerified
                 ) else { cancelled = true; break }
                 memberSummaries[member.id] = memberSummary
             }
@@ -3569,114 +3571,138 @@ final class EventsWorkspace {
 
     // MARK: - NAS, drive, and source
 
-    func archiveToNAS(_ eventID: UUID) {
-        guard let event = event(eventID), let summary = presence[eventID] else {
-            Task { await refreshEvent(eventID) }
+    /// True when the NAS mirror root is mounted and exists.
+    /// Cached per connectivity revision like the sidebar's checks, so a
+    /// toolbar re-render never stats a slow share.
+    var nasIsConnected: Bool {
+        isConnected(folder: locations.nasRoot)
+    }
+
+    /// The configured SMB share, when there is one to open.
+    var nasShareURL: URL? {
+        let text = model.configuration.nasSMBURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: text), url.scheme?.lowercased() == "smb", url.host != nil else { return nil }
+        return url
+    }
+
+    /// Opens the configured SMB share so Finder mounts it (it asks for
+    /// credentials itself); the volume observer refreshes once it mounts.
+    func connectToNAS() {
+        guard let url = nasShareURL else {
+            model.statusMessage = "Set the NAS share address (smb://…) in Settings → Locations, or connect the share in Finder."
             return
         }
+        if !NSWorkspace.shared.open(url) {
+            model.statusMessage = "Could not open \(url.absoluteString)."
+        }
+    }
+
+    /// One-way Buffer → NAS copy of the event and its subevents.
+    func syncToNAS(_ eventID: UUID) {
+        guard let event = event(eventID) else { return }
+        startNASSync(events: eventFamily(eventID), title: eventTitle(event), refresh: [eventID])
+    }
+
+    /// One-way Buffer → NAS copy of every event.
+    func syncAllToNAS() {
+        let events = model.configuration.savedEvents
+        guard !events.isEmpty else {
+            model.statusMessage = "There are no events to sync."
+            return
+        }
+        startNASSync(events: events, title: "all events", refresh: events.filter { $0.parentEventID == nil }.map(\.id))
+    }
+
+    private func startNASSync(events: [SavedCameraEvent], title: String, refresh: [UUID]) {
         let locations = self.locations
+        // A live check: the user just asked, so the cached answer may be old.
         guard VolumeInfo.isAvailable(locations.nasRoot), FileManager.default.fileExists(atPath: locations.nasRoot.path) else {
-            model.statusMessage = "The NAS library is not connected: \(locations.nasRoot.path)"
+            model.statusMessage = "The NAS is not connected (\(locations.nasRoot.path))."
+                + (nasShareURL == nil ? "" : " Use Connect to NAS… first.")
             return
         }
-        var groups: [String: NASArchiveGroup] = [:]
-        // The root only varies with (owner, device, policy, layout) — the
-        // presence sweep already found the copy, so its root is the found
-        // path minus the relative path (Originals/<Camera>, or a legacy
-        // Card Copy on a drive not migrated yet), and a source root
-        // standardizes once — so group keys reuse memoized paths instead
-        // of a realpath walk per asset.
-        var foundRoots: [String: URL] = [:]
-        var sourceRoots: [String: URL] = [:]
-        var standardizedKeys: [String: String] = [:]
-        func foundRoot(_ path: String) -> URL {
-            if let cached = foundRoots[path] { return cached }
-            let built = URL(fileURLWithPath: path, isDirectory: true)
-            foundRoots[path] = built
-            return built
-        }
-        func standardizedKey(for root: URL) -> String {
-            if let cached = standardizedKeys[root.path] { return cached }
-            let built = root.standardizedFileURL.path
-            standardizedKeys[root.path] = built
-            return built
-        }
-        for asset in summary.assets where asset.archive != .present {
-            // Family scope: the asset's own event resolves the folders —
-            // a subevent's copies live in its nested Originals, and its
-            // archive layout nests under the parent's folders.
-            let owner = self.event(asset.assignment.eventID) ?? event
-            let root: URL
-            if asset.drive == .present, let path = asset.driveRootPath {
-                root = foundRoot(path)
-            } else if asset.otherDrive == .present, let path = asset.otherDriveRootPath {
-                root = foundRoot(path)
-            } else if asset.source == .present {
-                root = sourceRoots[asset.assignment.sourceRootPath] ?? {
-                    let built = URL(fileURLWithPath: DashboardModel.expandedPath(asset.assignment.sourceRootPath), isDirectory: true)
-                    sourceRoots[asset.assignment.sourceRootPath] = built
-                    return built
-                }()
-            } else {
-                continue
-            }
-            let key = standardizedKey(for: root) + "\u{0}" + (asset.assignment.deviceID ?? "")
-            groups[key, default: NASArchiveGroup(owner: owner, root: root, deviceID: asset.assignment.deviceID, files: [])].files.append(
-                FileRecord(path: asset.assignment.relativePath, size: asset.assignment.fileSize, modifiedAt: asset.assignment.modifiedAt)
-            )
-        }
-        guard !groups.isEmpty else {
-            model.statusMessage = summary.onArchive == summary.total
-                ? "\(eventTitle(event)) is already on the NAS."
-                : "No reachable copy of the remaining files. Connect the drive or card that has them."
-            return
-        }
-        let archiveGroups = groups.values.sorted { $0.root.path < $1.root.path }
-        let archiveRoot = locations.nasRoot
-        let manifestFolder = URL(fileURLWithPath: DashboardModel.expandedPath(model.configuration.catalogDatabasePath))
-            .deletingLastPathComponent()
-            .appendingPathComponent("NAS Archive Manifests", isDirectory: true)
-        let fileCount = archiveGroups.reduce(0) { $0 + $1.files.count }
+        let catalogURL = URL(fileURLWithPath: DashboardModel.expandedPath(model.configuration.catalogDatabasePath))
+        let reportsFolder = catalogURL.deletingLastPathComponent().appendingPathComponent("NAS Sync", isDirectory: true)
+        let nasRoot = locations.nasRoot
         model.runBackgroundJob(
             action: .syncBuffer,
-            runningNote: "Archiving \(fileCount) file(s) from \(eventTitle(event)) to the NAS",
-            logTitle: "Archived \(eventTitle(event)) to the NAS",
-            logDetail: "Copied originals into Library Originals and checked every copy with SHA-256. Different existing files were never overwritten.",
+            runningNote: "Syncing \(title) to the NAS",
+            logTitle: "Synced \(title) to the NAS",
+            logDetail: "Copied only files missing on the NAS, each to the same path it has on the drive, and re-read every copy from the NAS to check its SHA-256. Existing files were never overwritten.",
+            destinationPath: nasRoot.path,
             operation: { progress in
-                var outcome = NASArchiveOutcome()
-                for (index, group) in archiveGroups.enumerated() {
-                    let span = 1.0 / Double(archiveGroups.count)
-                    let base = Double(index) * span
-                    let layout = locations.layout(for: group.owner, deviceID: group.deviceID)
-                    let plan = try OrganizedArchivePlanner().plan(
-                        source: group.root,
-                        sourceFiles: group.files,
-                        archiveRoot: archiveRoot,
-                        layout: layout
-                    ) { update in
-                        progress(DashboardModel.jobUpdate(from: update, lowerBound: base, upperBound: base + span * 0.3, notePrefix: "Checking NAS", command: ""))
-                    }
-                    let result = try OrganizedArchiveService().archive(source: group.root, archiveRoot: archiveRoot, plan: plan, manifestFolder: manifestFolder) { update in
-                        progress(DashboardModel.jobUpdate(from: update, lowerBound: base + span * 0.3, upperBound: base + span, notePrefix: "Archiving to NAS", command: ""))
-                    }
-                    outcome.copied += result.copied.count
-                    outcome.alreadySafe += result.skippedIdentical.count
-                    outcome.conflicts += result.conflicts.count
+                progress(BackgroundJobUpdate(progress: 0.02, note: "Sync to NAS: listing the drive folders"))
+                let plan = NASSyncPlanner.plan(events: events, locations: locations)
+                let store = try? NASSyncStore(catalogURL: catalogURL)
+                let report = try NASSyncService(store: store).sync(plan, nasRoot: nasRoot) { update in
+                    progress(DashboardModel.jobUpdate(from: update, lowerBound: 0.03, upperBound: 0.99, notePrefix: "Sync to NAS", command: ""))
                 }
-                return outcome
+                let reportPath = Self.writeNASSyncReport(report, plan: plan, title: title, to: reportsFolder)
+                return NASSyncJobOutcome(report: report, plan: plan, reportPath: reportPath)
             },
             completion: { [weak self] outcome in
-                Task { await self?.refreshEvent(eventID) }
-                return "NAS archive verified for \(self?.eventTitle(event) ?? event.name): \(outcome.copied) copied, \(outcome.alreadySafe) already safe, \(outcome.conflicts) conflict(s) left untouched."
+                for eventID in refresh {
+                    Task { await self?.refreshEvent(eventID) }
+                }
+                let report = outcome.report
+                var parts = ["\(report.copied.count) copied and verified", "\(report.matchedExisting.count + report.alreadyVerified.count) already on the NAS"]
+                if !report.conflicts.isEmpty { parts.append("\(report.conflicts.count) conflict(s) left untouched") }
+                if !report.failed.isEmpty { parts.append("\(report.failed.count) failed and skipped") }
+                if report.notAttempted > 0 { parts.append("\(report.notAttempted) not attempted") }
+                if !outcome.plan.outsideLayout.isEmpty { parts.append("\(outcome.plan.outsideLayout.count) folder(s) outside Originals/Edited not synced") }
+                if !outcome.plan.unreadable.isEmpty { parts.append("\(outcome.plan.unreadable.count) drive folder(s) unreadable") }
+                var summary = "Sync to NAS for \(title): " + parts.joined(separator: ", ") + "."
+                if let stopped = report.stoppedReason { summary += " " + stopped }
+                if let path = outcome.reportPath, !report.succeeded { summary += " Details: \(path)" }
+                guard report.succeeded, outcome.plan.unreadable.isEmpty else {
+                    throw ToolkitError.commandFailed(summary)
+                }
+                return summary
             }
         )
     }
 
+    /// Every issue of a sync, per file, as JSON beside the catalog — a job
+    /// note cannot hold 11,000 lines.
+    nonisolated private static func writeNASSyncReport(_ report: NASSyncReport, plan: NASSyncPlan, title: String, to folder: URL) -> String? {
+        struct Document: Encodable {
+            var title: String
+            var finishedAt: Date
+            var report: NASSyncReport
+            var outsideLayout: [String]
+            var refused: [NASSyncIssue]
+            var unreadable: [NASSyncIssue]
+            var skippedJunk: Int
+        }
+        do {
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.dateFormat = "yyyyMMdd-HHmmss"
+            let url = folder.appendingPathComponent("sync-\(formatter.string(from: Date()))-\(UUID().uuidString.prefix(6)).json")
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+            encoder.dateEncodingStrategy = .iso8601
+            try encoder.encode(Document(
+                title: title,
+                finishedAt: Date(),
+                report: report,
+                outsideLayout: plan.outsideLayout,
+                refused: plan.refused,
+                unreadable: plan.unreadable,
+                skippedJunk: plan.skippedJunk
+            )).write(to: url, options: .withoutOverwriting)
+            return url.path
+        } catch {
+            return nil
+        }
+    }
+
     func requestRemoveFromDrive(_ eventID: UUID) {
         guard let summary = presence[eventID] else { return }
-        let eligible = summary.assets.filter { ($0.drive == .present || $0.otherDrive == .present) && $0.archive == .present }
+        let eligible = summary.assets.filter { ($0.drive == .present || $0.otherDrive == .present) && $0.archiveIsTrusted }
         guard !eligible.isEmpty else {
-            model.statusMessage = "Archive to the NAS first. Only files with a NAS copy can leave the drive."
+            model.statusMessage = "Sync to NAS first. Only files whose NAS copy Sync to NAS verified can leave the drive."
             return
         }
         pendingRemoval = RemovalRequest(
@@ -3714,7 +3740,9 @@ final class EventsWorkspace {
         guard let event = event(eventID), let summary = presence[eventID] else { return }
         let locations = self.locations
         var pairs: [VerifiedRemovalPair] = []
-        for asset in summary.assets where asset.archive == .present {
+        // Only NAS copies Sync to NAS verified (or the legacy archive
+        // checked); VerifiedRemovalService re-hashes each pair regardless.
+        for asset in summary.assets where asset.archiveIsTrusted {
             guard let archive = asset.archivePath else { continue }
             // Family scope: each asset's folders resolve through its own
             // event — a subevent's copies sit in its nested event folder.

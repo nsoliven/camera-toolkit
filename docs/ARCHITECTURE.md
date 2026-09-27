@@ -76,6 +76,15 @@ Immich
 
 `EventsWorkspace` in the app target orchestrates these services and reuses `DashboardModel`'s single-job gate, transfer queue, and activity log.
 
+## Sync to NAS
+
+`Core/NASSync/` is the one-way Buffer → NAS copy (`EventsWorkspace.syncToNAS` for an event and its subevents, `syncAllToNAS` from File → Sync All Events to NAS), run as a Jobs entry through `runBackgroundJob`:
+
+- `NASSyncPlanner` lists each event's `Originals/` and `Edited/` on its policy drive (then the other drive, for copies left there) with `DirectoryListing` — `getattrlistbulk`, one call per batch of entries, so an SMB share answers per folder instead of per file. `._*`, `.DS_Store`, symlinks, and entries outside `Originals`/`Edited`/known subevent folders (a drive still in the `Card Copy` layout) are reported, never synced.
+- `NASSyncService` copies each file to the same relative path under `EventStorageLocations.nasRoot`: verified earlier at the same size and drive mtime → skipped; already on the NAS → both hashed, equal is verified, different is a conflict that is never overwritten; missing → streamed through one 4 MiB buffer into an exclusively created temporary, `F_FULLFSYNC`/`fsync`, re-read from the NAS with `F_NOCACHE`, and only a SHA-256 match is renamed in (`NASFileIO.renameExclusive`: `RENAME_EXCL`, or check-then-rename where SMB answers `ENOTSUP`). A failure is recorded and skipped; the job stops early only when the NAS disappears. Progress reports bytes of work (copy + verify read) with a smoothed ETA and Copied / Already on NAS / Conflicts / Failed counters; the per-file report is written to `NAS Sync/` beside the catalog.
+- `NASSyncStore` keeps per-file results in the catalog's `nas_sync_files` table (NAS root + case-folded relative path → size, drive mtime, SHA-256, state, verified date). Presence reads it (`EventAssetPresence.archiveVerifiedAt`), the NAS slot says "On NAS ✓ verified <date>", and Take Off Drive only offers files whose NAS copy is verified (`archiveIsTrusted`) — and still re-hashes each pair before moving anything.
+- When the NAS is not mounted, the board header and NAS slot offer Connect to NAS…, which opens the configured `nasSMBURL` with `NSWorkspace`.
+
 ## Layout migration
 
 `Core/Organize/LayoutMigration/` moves a drive from the legacy `<event>/<device>/Card Copy/…` layout to `<event>/Originals/<Camera>/…` with same-volume renames only. It runs from the app binary's hidden command line, with the app quit:

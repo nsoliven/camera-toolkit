@@ -205,7 +205,7 @@ struct SetupGuidePanel: View {
     private var library: some View {
         let status = guide.libraryStatus
         return VStack(alignment: .leading, spacing: 12) {
-            Text("The NAS library is the permanent home. Archive to NAS copies an event there and checks every file.")
+            Text("The NAS library is the permanent home. Sync to NAS copies an event there — the same folders as the drive — and re-reads every copy from the NAS to check it.")
             PlaceStatusCard(title: "NAS library", symbol: "server.rack", tint: .green, status: status) {
                 workspace.refreshConnectivity()
             }
@@ -400,7 +400,7 @@ struct SetupGuidePanel: View {
                 .buttonStyle(.borderedProminent)
             GuideBullet(symbol: "sdcard", text: "Card / Unsorted: photos still on the card or in the unsorted folder. Free Up Source clears them after checking the drive copies.")
             GuideBullet(symbol: "externaldrive.fill", text: "Shared Buffer or Private: the switch at the top of the event picks which. Put on Buffer or Move to Private does the move.")
-            GuideBullet(symbol: "server.rack", text: "NAS: Archive to NAS makes the permanent copy. Take Off Drive then frees the drive after checking every file.")
+            GuideBullet(symbol: "server.rack", text: "NAS: Sync to NAS makes the permanent copy and verifies it. Take Off Drive then frees the drive after re-checking every file.")
             GuideBullet(symbol: "cloud.fill", text: "Immich: turn on Send, then press Upload.")
         }
     }

@@ -24,6 +24,17 @@ public struct EventAssetPresence: Identifiable, Hashable, Sendable {
     /// (`Originals/<year>/<event>/<device>/RAW|JPEG|…`): the event was
     /// archived before the mirror layout and not migrated yet.
     public var archiveIsLegacyLayout: Bool = false
+    /// When Sync to NAS last proved the mirror copy byte-identical by
+    /// re-reading it from the NAS. Nil when no sync verified it — a legacy
+    /// copy, or a file that only happens to have the right size.
+    public var archiveVerifiedAt: Date?
+
+    /// A NAS copy Take Off Drive may rely on: verified by Sync to NAS, or
+    /// archived (and SHA-256 checked) by the legacy archive before the
+    /// mirror layout. Take Off Drive re-hashes it either way.
+    public var archiveIsTrusted: Bool {
+        archive == .present && (archiveVerifiedAt != nil || archiveIsLegacyLayout)
+    }
 
     /// The folder `drivePath` sits in minus the assignment's relative path —
     /// the root to pair with `assignment.relativePath` when the copy is
@@ -74,6 +85,11 @@ public struct EventPresenceSummary: Sendable {
     public var missingEverywhere: Int { assets.count { $0.bestLocalPath == nil } }
     /// NAS copies found only in the legacy archive layout.
     public var onLegacyArchiveLayout: Int { assets.count { $0.archive == .present && $0.archiveIsLegacyLayout } }
+    /// NAS mirror copies Sync to NAS verified by re-reading them.
+    public var verifiedOnArchive: Int { assets.count { $0.archive == .present && $0.archiveVerifiedAt != nil } }
+    /// The oldest verification among them — "verified <date>" is only as
+    /// fresh as the least recently checked file.
+    public var oldestArchiveVerification: Date? { assets.compactMap { $0.archive == .present ? $0.archiveVerifiedAt : nil }.min() }
 }
 
 public enum EventPresenceScanner {
@@ -95,7 +111,8 @@ public enum EventPresenceScanner {
         locations: EventStorageLocations,
         mountedVolumes: Set<String>? = nil,
         probe: PresenceProbe? = nil,
-        pauseGate: DriveActivityGate? = nil
+        pauseGate: DriveActivityGate? = nil,
+        nasVerified: [String: Date]? = nil
     ) -> EventPresenceSummary? {
         let mounted = mountedVolumes ?? VolumeInfo.mountedVolumePaths()
         let policy = locations.resolvedPolicy(for: event)
@@ -147,6 +164,7 @@ public enum EventPresenceScanner {
         assets.reserveCapacity(assignments.count)
         for assignment in assignments {
             if Task<Never, Never>.isCancelled { return nil }
+            var mirrorKey: String?
             let (source, drive, other, archive, legacyDrive, legacyOther, legacyArchive) = autoreleasepool {
                 () -> (URL?, URL?, URL?, URL?, URL?, URL?, URL?) in
                 let valid = isValidRelative(assignment.relativePath)
@@ -157,6 +175,7 @@ public enum EventPresenceScanner {
                 let archiveLayout = layout(assignment.deviceID)
                 let archive = try? archiveLayout.mirrorRelativePath(for: assignment.relativePath)
                 let legacyArchive = try? archiveLayout.legacyArchiveRelativePath(for: assignment.relativePath)
+                mirrorKey = archive.map(NASSyncStore.pathKey)
                 return (
                     source,
                     join(originalsRoot(policy, assignment.deviceID)),
@@ -213,7 +232,10 @@ public enum EventPresenceScanner {
                 sourceIsDriveCopy: sourceIsDrive,
                 driveIsLegacyLayout: driveResolved.2,
                 otherDriveIsLegacyLayout: otherResolved.2,
-                archiveIsLegacyLayout: archiveResolved.2
+                archiveIsLegacyLayout: archiveResolved.2,
+                archiveVerifiedAt: archiveResolved.1 == .present && !archiveResolved.2
+                    ? mirrorKey.flatMap { nasVerified?[$0] }
+                    : nil
             ))
         }
         return EventPresenceSummary(eventID: event.id, policy: policy, assets: assets, checkedAt: Date())

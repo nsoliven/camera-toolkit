@@ -203,6 +203,25 @@ struct LibrarySettingsPane: View {
                     choose: { model.chooseCameraLibraryRoot() }
                 )
                 PathSettingRow(
+                    title: "NAS mirror root",
+                    path: Binding(
+                        get: { model.configuration.archiveLayoutRootPath },
+                        set: { model.setConfigPath(\.archiveLayoutRootPath, to: $0) }
+                    ),
+                    choose: {
+                        _ = model.chooseFolder(title: "Choose the NAS Mirror Root", keyPath: \.archiveLayoutRootPath)
+                    }
+                )
+                .help("Sync to NAS puts every drive file at the same <year>/<event>/… path under this folder. Events archived before the mirror layout stay readable where they are.")
+                LabeledContent("NAS share") {
+                    TextField("smb://nas.local/share", text: Binding(
+                        get: { model.configuration.nasSMBURL },
+                        set: { value in model.updateConfiguration { $0.nasSMBURL = value.trimmingCharacters(in: .whitespacesAndNewlines) } }
+                    ))
+                    .frame(minWidth: 220)
+                    .help("Connect to NAS… opens this address so Finder mounts the share when it is not connected.")
+                }
+                PathSettingRow(
                     title: "Photo list database",
                     path: Binding(
                         get: { model.configuration.catalogDatabasePath },
