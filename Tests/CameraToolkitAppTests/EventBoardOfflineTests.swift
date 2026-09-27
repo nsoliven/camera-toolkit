@@ -115,7 +115,7 @@ final class EventBoardOfflineTests: XCTestCase {
         try await withSandbox(bufferVolume: nil, nasVolume: nas) { _, model, workspace in
             let eventID = try XCTUnwrap(workspace.createEvent(name: "Beach", date: day("2026-08-26"), policy: .buffer))
             let event = try XCTUnwrap(workspace.event(eventID))
-            let cardCopy = workspace.locations.cardCopyRoot(for: event, deviceID: "sony-a7v", policy: .buffer)
+            let cardCopy = workspace.locations.originalsRoot(for: event, deviceID: "sony-a7v", policy: .buffer)
             var assignments: [PhotoEventAssignment] = []
             for index in 0..<20 {
                 let name = String(format: "DSC%05d.ARW", index)
@@ -150,7 +150,7 @@ final class EventBoardOfflineTests: XCTestCase {
         try await withSandbox(bufferVolume: nil, nasVolume: nas) { _, model, workspace in
             let eventID = try XCTUnwrap(workspace.createEvent(name: "Beach", date: day("2026-08-26"), policy: .buffer))
             let event = try XCTUnwrap(workspace.event(eventID))
-            let cardCopy = workspace.locations.cardCopyRoot(for: event, deviceID: "sony-a7v", policy: .buffer)
+            let cardCopy = workspace.locations.originalsRoot(for: event, deviceID: "sony-a7v", policy: .buffer)
             var assignments: [PhotoEventAssignment] = []
             for index in 0..<5 {
                 try write(cardCopy.appendingPathComponent(String(format: "DSC%05d.ARW", index)), bytes: 64)

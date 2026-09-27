@@ -119,9 +119,10 @@ final class DriveActivityGateTests: XCTestCase {
             }
             let summary = try XCTUnwrap(box.value ?? nil)
             XCTAssertEqual(summary.assets.count, 1)
-            // Source, policy drive, other drive, archive — probed only
-            // after the volume resumed.
-            XCTAssertEqual(probed.values.count, 4)
+            // Source, policy drive (+ its legacy Card Copy fallback, since
+            // the probe reports the current copy missing), other drive (+
+            // fallback), archive — probed only after the volume resumed.
+            XCTAssertEqual(probed.values.count, 6)
         }
     }
 }

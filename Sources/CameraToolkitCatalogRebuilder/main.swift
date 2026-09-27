@@ -144,12 +144,14 @@ private func configuredEvent(
     }
 }
 
-private func bufferURL(
+/// Where the Buffer keeps the assignment's file: `Originals/<Camera>` first,
+/// then the legacy `<device>/Card Copy` of a drive not migrated yet.
+private func bufferURLs(
     for assignment: PhotoEventAssignment,
     event: SavedCameraEvent,
     bufferRoot: URL,
     events: [SavedCameraEvent]
-) -> URL {
+) -> [URL] {
     let ancestors = EventHierarchy.ancestors(of: event, in: events)
     var url = bufferRoot.appendingPathComponent(
         String(dayFormatter.string(from: (ancestors.first ?? event).eventDate).prefix(4)),
@@ -169,11 +171,17 @@ private func bufferURL(
         eventName: event.name,
         deviceID: assignment.deviceID ?? "generic-camera"
     )
-    return url
-        .appendingPathComponent(layout.eventFolder, isDirectory: true)
-        .appendingPathComponent(layout.deviceFolder, isDirectory: true)
-        .appendingPathComponent("Card Copy", isDirectory: true)
-        .appendingPathComponent(assignment.relativePath)
+    let eventFolder = url.appendingPathComponent(layout.eventFolder, isDirectory: true)
+    return [
+        eventFolder
+            .appendingPathComponent(EventStorageLocations.originalsFolderName, isDirectory: true)
+            .appendingPathComponent(layout.cameraFolder, isDirectory: true)
+            .appendingPathComponent(assignment.relativePath),
+        eventFolder
+            .appendingPathComponent(layout.deviceFolder, isDirectory: true)
+            .appendingPathComponent(EventStorageLocations.legacyCardCopyFolderName, isDirectory: true)
+            .appendingPathComponent(assignment.relativePath),
+    ]
 }
 
 private func run() throws {
@@ -265,9 +273,10 @@ private func run() throws {
                 CatalogPresenceObservation(eventAssetID: eventAssetID, location: .source, state: .present)
             )
 
-            let destination = bufferURL(for: assignment, event: event, bufferRoot: bufferRoot, events: configuration.savedEvents)
-            let destinationSize = try? destination.resourceValues(forKeys: [.fileSizeKey]).fileSize
-            let isPresent = destinationSize.map(Int64.init) == assignment.fileSize
+            let isPresent = bufferURLs(for: assignment, event: event, bufferRoot: bufferRoot, events: configuration.savedEvents)
+                .contains { destination in
+                    (try? destination.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init) == assignment.fileSize
+                }
             if isPresent { bufferPresentCount += 1 }
             bufferObservations.append(
                 CatalogPresenceObservation(

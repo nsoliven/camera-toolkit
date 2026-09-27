@@ -70,8 +70,8 @@ final class EventsWorkspaceTests: XCTestCase {
             workspace.performApply(plan)
             try await waitUntil { !model.isBusy && workspace.latestMoveJournalTitle != nil }
 
-            let bufferEvent = root.appendingPathComponent("Drive/Camera Buffer/2026/2026-08-26 Beach Day/Sony A7V/Card Copy", isDirectory: true)
-            let privateEvent = root.appendingPathComponent("Drive/.Camera Toolkit/Private/2026/2026-08-26 Hotel Night/Sony A7V/Card Copy", isDirectory: true)
+            let bufferEvent = root.appendingPathComponent("Drive/Camera Buffer/2026/2026-08-26 Beach Day/Originals/Sony A7V", isDirectory: true)
+            let privateEvent = root.appendingPathComponent("Drive/.Camera Toolkit/Private/2026/2026-08-26 Hotel Night/Originals/Sony A7V", isDirectory: true)
             XCTAssertTrue(FileManager.default.fileExists(atPath: bufferEvent.appendingPathComponent("DSC00001.ARW").path))
             XCTAssertTrue(FileManager.default.fileExists(atPath: bufferEvent.appendingPathComponent("DSC00001.xmp").path))
             XCTAssertTrue(FileManager.default.fileExists(atPath: privateEvent.appendingPathComponent("DSC00020.ARW").path))
@@ -125,7 +125,7 @@ final class EventsWorkspaceTests: XCTestCase {
             workspace.moveStacks([appliedStack.id], fromEvent: shared, toEvent: hidden)
             try await waitUntil { !model.isBusy && workspace.latestMoveJournalTitle == "Move to Just Us" }
 
-            let privateCopy = root.appendingPathComponent("Drive/.Camera Toolkit/Private/2026/2026-08-27 Just Us/Sony A7V/Card Copy/B0007_DSC00002.ARW")
+            let privateCopy = root.appendingPathComponent("Drive/.Camera Toolkit/Private/2026/2026-08-27 Just Us/Originals/Sony A7V/B0007_DSC00002.ARW")
             XCTAssertTrue(FileManager.default.fileExists(atPath: privateCopy.path))
             XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("Drive/Camera Buffer/2026/2026-08-27 City Walk").path))
             XCTAssertEqual(model.configuration.photoEventAssignments.filter { $0.eventID == hidden }.count, 2)
@@ -169,7 +169,7 @@ final class EventsWorkspaceTests: XCTestCase {
             try await waitUntil { !model.isBusy && workspace.latestMoveJournalTitle != nil }
 
             let destination = root.appendingPathComponent(
-                "Drive/Camera Buffer/2026/2026-08-26 Beach Day/Sony A7V/Card Copy/DSC05012.JPG"
+                "Drive/Camera Buffer/2026/2026-08-26 Beach Day/Originals/Sony A7V/DSC05012.JPG"
             )
             XCTAssertTrue(FileManager.default.fileExists(atPath: destination.path))
             XCTAssertFalse(FileManager.default.fileExists(atPath: source.path))
@@ -593,7 +593,7 @@ final class EventsWorkspaceTests: XCTestCase {
         try await withOrganizerSandbox { root, model, workspace in
             let parent = try XCTUnwrap(workspace.createEvent(name: "TRIP2026", date: organizerDay("2026-08-21"), policy: .buffer))
             let child = try XCTUnwrap(workspace.createEvent(name: "Matcha", date: organizerDay("2026-08-23"), policy: nil, parentEventID: parent))
-            let cardCopy = root.appendingPathComponent("Drive/Camera Buffer/2026/2026-08-21 TRIP2026/2026-08-23 Matcha/Sony A7V/Card Copy", isDirectory: true)
+            let cardCopy = root.appendingPathComponent("Drive/Camera Buffer/2026/2026-08-21 TRIP2026/2026-08-23 Matcha/Originals/Sony A7V", isDirectory: true)
             try writeOrganizerARW(cardCopy.appendingPathComponent("DSC00001.ARW"), "2026:08:23 10:00:00", "000")
             model.updateConfiguration { configuration in
                 configuration.photoEventAssignments.append(PhotoEventAssignment(
@@ -610,10 +610,10 @@ final class EventsWorkspaceTests: XCTestCase {
 
             let movedFolder = root.appendingPathComponent("Drive/Camera Buffer/2026/2026-08-21 TRIP2026 Renamed", isDirectory: true)
             XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("Drive/Camera Buffer/2026/2026-08-21 TRIP2026").path))
-            XCTAssertTrue(FileManager.default.fileExists(atPath: movedFolder.appendingPathComponent("2026-08-23 Matcha/Sony A7V/Card Copy/DSC00001.ARW").path))
+            XCTAssertTrue(FileManager.default.fileExists(atPath: movedFolder.appendingPathComponent("2026-08-23 Matcha/Originals/Sony A7V/DSC00001.ARW").path))
             XCTAssertEqual(
                 model.configuration.photoEventAssignments.first?.sourceRootPath,
-                movedFolder.appendingPathComponent("2026-08-23 Matcha/Sony A7V/Card Copy").path
+                movedFolder.appendingPathComponent("2026-08-23 Matcha/Originals/Sony A7V").path
             )
         }
     }
@@ -622,14 +622,14 @@ final class EventsWorkspaceTests: XCTestCase {
         try await withOrganizerSandbox { root, model, workspace in
             let parent = try XCTUnwrap(workspace.createEvent(name: "TRIP2026", date: organizerDay("2026-08-21"), policy: .buffer))
             let child = try XCTUnwrap(workspace.createEvent(name: "Matcha", date: organizerDay("2026-08-23"), policy: nil, parentEventID: parent))
-            let nestedFolder = root.appendingPathComponent("Drive/Camera Buffer/2026/2026-08-21 TRIP2026/2026-08-23 Matcha/Sony A7V/Card Copy", isDirectory: true)
+            let nestedFolder = root.appendingPathComponent("Drive/Camera Buffer/2026/2026-08-21 TRIP2026/2026-08-23 Matcha/Originals/Sony A7V", isDirectory: true)
             try writeOrganizerARW(nestedFolder.appendingPathComponent("DSC00001.ARW"), "2026:08:23 10:00:00", "000")
 
             workspace.renameEvent(child, name: "Matcha", date: organizerDay("2026-08-23"), policy: nil, parentEventID: nil)
 
             XCTAssertNil(workspace.event(child)?.parentEventID)
             XCTAssertFalse(FileManager.default.fileExists(atPath: nestedFolder.path))
-            XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("Drive/Camera Buffer/2026/2026-08-23 Matcha/Sony A7V/Card Copy/DSC00001.ARW").path))
+            XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("Drive/Camera Buffer/2026/2026-08-23 Matcha/Originals/Sony A7V/DSC00001.ARW").path))
         }
     }
 
@@ -833,7 +833,7 @@ final class EventsWorkspaceTests: XCTestCase {
             XCTAssertEqual(workspace.subeventTag(for: try XCTUnwrap(boardByName["DSC00003.ARW"]), in: grandchild)?.id, grandchild)
             XCTAssertEqual(workspace.subeventTag(for: try XCTUnwrap(boardByName["DSC00002.ARW"]), in: child)?.id, child)
 
-            // Applied photos sit in Card Copy, not the folder they were
+            // Applied photos sit in Originals, not the folder they were
             // imported from. The filter still has to see which subevent
             // owns them, or "is none of" leaves the count unchanged.
             let childEvent = try XCTUnwrap(workspace.event(child))
@@ -864,7 +864,7 @@ final class EventsWorkspaceTests: XCTestCase {
     /// The shipping layout: a Buffer parent with a private (NAS-only)
     /// subevent, burst-prefixed frames, and boards that draw files from
     /// whichever place holds them — the import source, the private or
-    /// Buffer `Card Copy`, the NAS archive, or a differently cased
+    /// Buffer `Originals/<Camera>`, the NAS archive, or a differently cased
     /// spelling of any of those. Every Event operator must resolve the
     /// subevent the same way at each of those paths, and a burst's
     /// membership is the union of its frames: "is none of" a tag drops a
@@ -1039,7 +1039,7 @@ final class EventsWorkspaceTests: XCTestCase {
             workspace.performApply(plan)
             try await waitUntil { !model.isBusy && workspace.latestMoveJournalTitle != nil }
 
-            let nested = root.appendingPathComponent("Drive/.Camera Toolkit/Private/2026/2026-08-21 TRIP2026/2026-08-23 Matcha/Sony A7V/Card Copy/DSC00001.ARW")
+            let nested = root.appendingPathComponent("Drive/.Camera Toolkit/Private/2026/2026-08-21 TRIP2026/2026-08-23 Matcha/Originals/Sony A7V/DSC00001.ARW")
             XCTAssertTrue(FileManager.default.fileExists(atPath: nested.path))
             XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("Drive/Camera Buffer/2026/2026-08-23 Matcha").path))
         }
@@ -1091,7 +1091,7 @@ final class EventsWorkspaceTests: XCTestCase {
             XCTAssertEqual(workspace.visibleDays(result, hideSorted: true, matching: "dsc00009").flatMap(\.stacks).map(\.id), [single.id])
 
             // Discovered drive events filter by name for the banner.
-            let cardCopy = root.appendingPathComponent("Drive/Camera Buffer/2026/2026-08-26 Found Day/Sony A7V/Card Copy", isDirectory: true)
+            let cardCopy = root.appendingPathComponent("Drive/Camera Buffer/2026/2026-08-26 Found Day/Originals/Sony A7V", isDirectory: true)
             try writeOrganizerARW(cardCopy.appendingPathComponent("DSC00050.ARW"), "2026:08:26 12:00:00", "000")
             workspace.discoverDriveEvents()
             try await waitUntil { !workspace.discoveredDriveEvents.isEmpty }
@@ -1620,7 +1620,7 @@ final class EventsWorkspaceTests: XCTestCase {
     }
 
     /// First paint is local: the board's stacks come from the catalog-implied
-    /// `Card Copy` path before the four-place sweep answers — even while an
+    /// `Originals/<Camera>` path before the four-place sweep answers — even while an
     /// archive stat is parked the way a NAS share stalls. 2,000 assignments
     /// stand in for the real 2,251/10,987-file events: the parked stat is
     /// what proves the ordering, the count keeps it honest. While parked,
@@ -1631,7 +1631,7 @@ final class EventsWorkspaceTests: XCTestCase {
             let eventID = try XCTUnwrap(workspace.createEvent(name: "Big Trip", date: organizerDay("2026-08-26"), policy: .buffer))
             let event = try XCTUnwrap(workspace.event(eventID))
             let locations = workspace.locations
-            let cardCopy = locations.cardCopyRoot(for: event, deviceID: "sony-a7v", policy: .buffer)
+            let cardCopy = locations.originalsRoot(for: event, deviceID: "sony-a7v", policy: .buffer)
             let fileCount = 2_000
             var assignments: [PhotoEventAssignment] = []
             for index in 0..<fileCount {
@@ -1696,7 +1696,7 @@ final class EventsWorkspaceTests: XCTestCase {
             let eventID = try XCTUnwrap(workspace.createEvent(name: "Trip", date: organizerDay("2026-08-26"), policy: .buffer))
             let event = try XCTUnwrap(workspace.event(eventID))
             let locations = workspace.locations
-            let cardCopy = locations.cardCopyRoot(for: event, deviceID: "sony-a7v", policy: .buffer)
+            let cardCopy = locations.originalsRoot(for: event, deviceID: "sony-a7v", policy: .buffer)
             var assignments: [PhotoEventAssignment] = []
             for index in 0..<3 {
                 let name = String(format: "DSC%05d.ARW", index)
@@ -1753,7 +1753,7 @@ final class EventsWorkspaceTests: XCTestCase {
             let eventID = try XCTUnwrap(workspace.createEvent(name: "Big Trip", date: organizerDay("2026-08-26"), policy: .buffer))
             let event = try XCTUnwrap(workspace.event(eventID))
             let locations = workspace.locations
-            let cardCopy = locations.cardCopyRoot(for: event, deviceID: "sony-a7v", policy: .buffer)
+            let cardCopy = locations.originalsRoot(for: event, deviceID: "sony-a7v", policy: .buffer)
             let fileCount = 2_000
             // Frame numbers step by 10 — never consecutive — and
             // modifiedAt climbs one second per file, so every file stays
@@ -1825,7 +1825,7 @@ final class EventsWorkspaceTests: XCTestCase {
             let eventID = try XCTUnwrap(workspace.createEvent(name: "Big Trip", date: organizerDay("2026-08-26"), policy: .buffer))
             let event = try XCTUnwrap(workspace.event(eventID))
             let locations = workspace.locations
-            let cardCopy = locations.cardCopyRoot(for: event, deviceID: "sony-a7v", policy: .buffer)
+            let cardCopy = locations.originalsRoot(for: event, deviceID: "sony-a7v", policy: .buffer)
             let fileCount = 2_000
             var assignments: [PhotoEventAssignment] = []
             for index in 0..<fileCount {
@@ -2408,7 +2408,7 @@ final class EventsWorkspaceTests: XCTestCase {
         try await withOrganizerSandbox { root, model, workspace in
             let eventID = try XCTUnwrap(workspace.createEvent(name: "Big Trip", date: organizerDay("2026-08-26"), policy: .buffer))
             let event = try XCTUnwrap(workspace.event(eventID))
-            let cardCopy = workspace.locations.cardCopyRoot(for: event, deviceID: "sony-a7v", policy: .buffer)
+            let cardCopy = workspace.locations.originalsRoot(for: event, deviceID: "sony-a7v", policy: .buffer)
             let fileCount = 260
             var assignments: [PhotoEventAssignment] = []
             for index in 0..<fileCount {
@@ -2836,7 +2836,7 @@ final class EventsWorkspaceTests: XCTestCase {
     /// The bug: Move to Event clicked while the storage row still says
     /// "Checking" used to vanish — `eventStacks` is painted but the presence
     /// index behind it is empty until the sweep lands. The catalog already
-    /// knows each file's event and the Card Copy path the grid implied, so
+    /// knows each file's event and the Originals path the grid implied, so
     /// the click must plan the rename from that and open a tracked job in
     /// the same moment — never return silently.
     func testMoveStacksWhilePresenceIndexIsEmptyRunsFromTheCatalog() async throws {
@@ -2845,11 +2845,11 @@ final class EventsWorkspaceTests: XCTestCase {
             let targetID = try XCTUnwrap(workspace.createEvent(name: "Japan 2026", date: organizerDay("2026-08-27"), policy: .buffer))
             let event = try XCTUnwrap(workspace.event(eventID))
             let locations = workspace.locations
-            let cardCopy = locations.cardCopyRoot(for: event, deviceID: "sony-a7v", policy: .buffer)
+            let cardCopy = locations.originalsRoot(for: event, deviceID: "sony-a7v", policy: .buffer)
             let unsorted = root.appendingPathComponent("Drive/Unsorted A7V", isDirectory: true)
 
             // Post-Apply state: the originals already sit in the event's
-            // Card Copy folder and the catalog says where they came from.
+            // Originals folder and the catalog says where they came from.
             var assignments: [PhotoEventAssignment] = []
             for (name, sub) in [("B0001_DSC00001.ARW", "100"), ("B0001_DSC00002.ARW", "400")] {
                 let url = try writeOrganizerARW(cardCopy.appendingPathComponent(name), "2026:08:26 10:00:00", sub)
@@ -2898,7 +2898,7 @@ final class EventsWorkspaceTests: XCTestCase {
             await refresh.value
 
             let target = try XCTUnwrap(workspace.event(targetID))
-            let targetCopy = locations.cardCopyRoot(for: target, deviceID: "sony-a7v", policy: .buffer)
+            let targetCopy = locations.originalsRoot(for: target, deviceID: "sony-a7v", policy: .buffer)
             for name in ["B0001_DSC00001.ARW", "B0001_DSC00002.ARW"] {
                 XCTAssertTrue(FileManager.default.fileExists(atPath: targetCopy.appendingPathComponent(name).path))
                 XCTAssertFalse(FileManager.default.fileExists(atPath: cardCopy.appendingPathComponent(name).path))
@@ -2917,7 +2917,7 @@ final class EventsWorkspaceTests: XCTestCase {
             let targetID = try XCTUnwrap(workspace.createEvent(name: "Japan 2026", date: organizerDay("2026-08-27"), policy: .buffer))
             let event = try XCTUnwrap(workspace.event(eventID))
             let locations = workspace.locations
-            let cardCopy = locations.cardCopyRoot(for: event, deviceID: "sony-a7v", policy: .buffer)
+            let cardCopy = locations.originalsRoot(for: event, deviceID: "sony-a7v", policy: .buffer)
             let unsorted = root.appendingPathComponent("Drive/Unsorted A7V", isDirectory: true)
             let url = try writeOrganizerARW(cardCopy.appendingPathComponent("DSC00001.ARW"), "2026:08:26 10:00:00", "000")
             let assignment = PhotoEventAssignment(
@@ -2932,7 +2932,7 @@ final class EventsWorkspaceTests: XCTestCase {
             XCTAssertNil(workspace.eventStacks[eventID])
 
             // The board never painted, so the stack id is the cover path the
-            // first paint will draw — the implied Card Copy path.
+            // first paint will draw — the implied Originals path.
             let stackID = try XCTUnwrap(locations.driveURL(for: assignment, event: event, policy: .buffer)).path
             workspace.moveStacks([stackID], fromEvent: eventID, toEvent: targetID)
 
@@ -2940,7 +2940,7 @@ final class EventsWorkspaceTests: XCTestCase {
             XCTAssertFalse(model.isBusy)
 
             let target = try XCTUnwrap(workspace.event(targetID))
-            let destination = locations.cardCopyRoot(for: target, deviceID: "sony-a7v", policy: .buffer)
+            let destination = locations.originalsRoot(for: target, deviceID: "sony-a7v", policy: .buffer)
                 .appendingPathComponent("DSC00001.ARW")
             try await waitUntil {
                 FileManager.default.fileExists(atPath: destination.path)
@@ -2960,7 +2960,7 @@ final class EventsWorkspaceTests: XCTestCase {
             let targetID = try XCTUnwrap(workspace.createEvent(name: "Japan 2026", date: organizerDay("2026-08-27"), policy: .buffer))
             let event = try XCTUnwrap(workspace.event(eventID))
             let locations = workspace.locations
-            let cardCopy = locations.cardCopyRoot(for: event, deviceID: "sony-a7v", policy: .buffer)
+            let cardCopy = locations.originalsRoot(for: event, deviceID: "sony-a7v", policy: .buffer)
             let url = try writeOrganizerARW(cardCopy.appendingPathComponent("DSC00001.ARW"), "2026:08:26 10:00:00", "000")
             let unsorted = root.appendingPathComponent("Drive/Unsorted A7V", isDirectory: true)
             let fileSize = Int64(try XCTUnwrap(try url.resourceValues(forKeys: [.fileSizeKey]).fileSize))
@@ -3005,7 +3005,7 @@ final class EventsWorkspaceTests: XCTestCase {
             let eventID = try XCTUnwrap(workspace.createEvent(name: "Trip 2026", date: organizerDay("2026-08-26"), policy: .buffer))
             let event = try XCTUnwrap(workspace.event(eventID))
             let locations = workspace.locations
-            let cardCopy = locations.cardCopyRoot(for: event, deviceID: "sony-a7v", policy: .buffer)
+            let cardCopy = locations.originalsRoot(for: event, deviceID: "sony-a7v", policy: .buffer)
             let unsorted = root.appendingPathComponent("Drive/Unsorted A7V", isDirectory: true)
             let url = try writeOrganizerARW(cardCopy.appendingPathComponent("DSC00001.ARW"), "2026:08:26 10:00:00", "000")
             let fileSize = Int64(try XCTUnwrap(try url.resourceValues(forKeys: [.fileSizeKey]).fileSize))
@@ -3056,8 +3056,8 @@ final class EventsWorkspaceTests: XCTestCase {
         }
     }
 
-    /// A file adopted from a Card Copy folder has no unsorted home: its
-    /// catalog source is the Card Copy path itself. Return to Unsorted must
+    /// A file adopted from an Originals folder has no unsorted home: its
+    /// catalog source is the Originals path itself. Return to Unsorted must
     /// say that instead of doing nothing — the note exists for the swept
     /// path and now also for the mid-"Checking" catalog path.
     func testReturnToUnsortedAdoptedFileExplainsItselfWhileChecking() async throws {
@@ -3065,7 +3065,7 @@ final class EventsWorkspaceTests: XCTestCase {
             let eventID = try XCTUnwrap(workspace.createEvent(name: "Trip 2026", date: organizerDay("2026-08-26"), policy: .buffer))
             let event = try XCTUnwrap(workspace.event(eventID))
             let locations = workspace.locations
-            let cardCopy = locations.cardCopyRoot(for: event, deviceID: "sony-a7v", policy: .buffer)
+            let cardCopy = locations.originalsRoot(for: event, deviceID: "sony-a7v", policy: .buffer)
             let url = try writeOrganizerARW(cardCopy.appendingPathComponent("DSC00001.ARW"), "2026:08:26 10:00:00", "000")
             let fileSize = Int64(try XCTUnwrap(try url.resourceValues(forKeys: [.fileSizeKey]).fileSize))
             model.updateConfiguration {
@@ -3212,7 +3212,7 @@ final class EventsWorkspaceTests: XCTestCase {
             // A hand-organized event folder for discovery to find, and an
             // assignable drop so the presence sweep has work too.
             try writeOrganizerARW(
-                drive.appendingPathComponent("Camera Buffer/2026/2026-08-26 Harbor/Sony A7V/Card Copy/DSC00001.ARW"),
+                drive.appendingPathComponent("Camera Buffer/2026/2026-08-26 Harbor/Originals/Sony A7V/DSC00001.ARW"),
                 "2026:08:26 10:00:00",
                 "000"
             )
@@ -3365,7 +3365,7 @@ final class EventsWorkspaceTests: XCTestCase {
 
 extension EventsWorkspaceTests {
     private func cardCopy(_ root: URL, event: String) -> URL {
-        root.appendingPathComponent("Drive/Camera Buffer/2026/\(event)/Sony A7V/Card Copy", isDirectory: true)
+        root.appendingPathComponent("Drive/Camera Buffer/2026/\(event)/Originals/Sony A7V", isDirectory: true)
     }
 
     /// Regression: a sorted file whose event name was taken by a different

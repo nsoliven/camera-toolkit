@@ -52,7 +52,7 @@ struct ApplyRouteRow: Identifiable, Equatable, Sendable {
     /// "A7V Card ▸ DCIM ▸ Transfer 1"
     var sourceLabel: String
     /// Where these files land, relative to the event folder — e.g.
-    /// "Sony A7V ▸ Card Copy". Empty means the event folder itself.
+    /// "Originals ▸ Sony A7V". Empty means the event folder itself.
     var destinationLabel: String
     var fileCount: Int
     var photoCount: Int
@@ -466,7 +466,7 @@ struct ApplyPlanSummaryCard: View {
 }
 
 /// The compact diagram boards show while an apply's rename job runs:
-/// "Transfer 1 → Beach Day ▸ Sony A7V ▸ Card Copy", one line per source
+/// "Transfer 1 → Beach Day ▸ Originals ▸ Sony A7V", one line per source
 /// folder, capped so the status strip stays thin.
 struct ApplyProgressBanner: View {
     let running: RunningApplyPlan

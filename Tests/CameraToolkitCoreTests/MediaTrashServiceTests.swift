@@ -77,6 +77,39 @@ final class MediaTrashServiceTests: XCTestCase {
         }
     }
 
+    /// Trash and Restore round-trip a file and its sidecar out of an event's
+    /// `Originals/<Camera>` folder, keeping the layout path in the batch and
+    /// in the manifest.
+    func testTrashAndRestoreRoundTripInsideTheOriginalsLayout() throws {
+        try withTemporaryDirectory { root in
+            var configuration = testConfiguration(root: root)
+            let event = SavedCameraEvent(name: "Harbor", eventDate: try XCTUnwrap(DateFormatter.yyyyMMdd.date(from: "2026-08-26")))
+            configuration.savedEvents = [event]
+            let locations = EventStorageLocations(configuration: configuration)
+            let originals = locations.originalsRoot(for: event, deviceID: "osmo-360", policy: .buffer)
+            let clip = try writeFile(originals.appendingPathComponent("CAM_0001.OSV"), "clip")
+            let proxy = try writeFile(originals.appendingPathComponent("CAM_0001.LRF"), "proxy")
+            let trash = root.appendingPathComponent("Drive/.Camera Toolkit/_Trash", isDirectory: true)
+            let trashService = service(removedFilesRoot: trash)
+
+            let batch = try trashService.trash(files: [file(clip), file(proxy)], originRoot: locations.bufferRoot)
+            XCTAssertTrue(batch.skipped.isEmpty)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: clip.path))
+            let folder = trash.appendingPathComponent(batch.name, isDirectory: true)
+            let manifest = try readManifest(folder.appendingPathComponent("manifest.json"))
+            XCTAssertEqual(Set(manifest.entries.map(\.trashedRelativePath)), [
+                "2026/2026-08-26 Harbor/Originals/Osmo 360/CAM_0001.OSV",
+                "2026/2026-08-26 Harbor/Originals/Osmo 360/CAM_0001.LRF",
+            ])
+
+            let listed = try XCTUnwrap(trashService.listBatches(under: [trash]).first)
+            let report = trashService.restore(batch: listed)
+            XCTAssertEqual(report.restored.count, 2)
+            XCTAssertEqual(try String(contentsOf: clip, encoding: .utf8), "clip")
+            XCTAssertEqual(try String(contentsOf: proxy, encoding: .utf8), "proxy")
+        }
+    }
+
     func testTrashRoutesFilesToTheirOwnVolumesTrash() throws {
         try withTemporaryDirectory { root in
             let volumeNames = ["VolA", "VolB"]

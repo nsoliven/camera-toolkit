@@ -117,9 +117,10 @@ final class ConfigurationStoreTests: XCTestCase {
 
             XCTAssertEqual(loaded.savedEvents, [event])
             XCTAssertEqual(loaded.photoEventAssignments, [assignment])
-            XCTAssertEqual(loaded.bufferEditsFolderPath(), root.appendingPathComponent("Buffer/2025/2025-07-10 Summer Portraits/Photomator").path)
-            XCTAssertEqual(loaded.bufferExportFolderPath("Web"), root.appendingPathComponent("Buffer/2025/2025-07-10 Summer Portraits/Exports/Web").path)
-            XCTAssertEqual(loaded.eventWorkspaceFolderPaths().count, 5)
+            XCTAssertEqual(loaded.bufferEditsFolderPath(), root.appendingPathComponent("Buffer/2025/2025-07-10 Summer Portraits/Edited").path)
+            XCTAssertEqual(loaded.bufferEditedFolderPath("Web"), root.appendingPathComponent("Buffer/2025/2025-07-10 Summer Portraits/Edited/Web").path)
+            XCTAssertEqual(loaded.eventWorkspaceFolderPaths().count, 2)
+            XCTAssertTrue(loaded.bufferBatchFolderPath().hasPrefix(root.appendingPathComponent("Buffer/2025/2025-07-10 Summer Portraits/Originals/").path))
         }
     }
 }

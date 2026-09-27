@@ -104,11 +104,11 @@ final class EventHierarchyTests: XCTestCase {
 
             XCTAssertEqual(
                 locations.driveURL(for: assignment, event: child, policy: .buffer)?.path,
-                root.appendingPathComponent("Buffer/2026/2026-08-21 TRIP2026/2026-08-23 Matcha/Sony A7V/Card Copy/DSC00001.ARW").standardizedFileURL.path
+                root.appendingPathComponent("Buffer/2026/2026-08-21 TRIP2026/2026-08-23 Matcha/Originals/Sony A7V/DSC00001.ARW").standardizedFileURL.path
             )
             XCTAssertEqual(
                 locations.driveURL(for: assignment, event: child, policy: .archiveOnly)?.path,
-                root.appendingPathComponent(".Camera Toolkit/Private/2026/2026-08-21 TRIP2026/2026-08-23 Matcha/Sony A7V/Card Copy/DSC00001.ARW").standardizedFileURL.path
+                root.appendingPathComponent(".Camera Toolkit/Private/2026/2026-08-21 TRIP2026/2026-08-23 Matcha/Originals/Sony A7V/DSC00001.ARW").standardizedFileURL.path
             )
             XCTAssertEqual(
                 locations.archiveURL(for: assignment, event: grandchild)?.path,

@@ -1,7 +1,17 @@
 import Foundation
 
+/// Which on-disk layout a discovered camera folder uses.
+public enum DriveFolderLayout: String, Codable, Hashable, Sendable {
+    /// `<event>/Originals/<Camera>/…`
+    case originals
+    /// `<event>/<device>/Card Copy/…` — the layout `Originals` replaced.
+    /// Still discovered so an unmigrated drive is found and offered for
+    /// the layout migration.
+    case legacyCardCopy
+}
+
 public struct DiscoveredDriveEvent: Identifiable, Hashable, Sendable {
-    public var id: String { cardCopyPath }
+    public var id: String { filesRootPath }
     public var eventFolderPath: String
     /// On-disk path of the parent event folder, when this folder nests inside
     /// another dated event folder. Adoption turns it into `parentEventID`.
@@ -9,8 +19,11 @@ public struct DiscoveredDriveEvent: Identifiable, Hashable, Sendable {
     public var name: String
     public var dateString: String
     public var deviceID: String
-    public var cardCopyPath: String
-    /// Files not yet covered by any event assignment, relative to `cardCopyPath`.
+    /// The camera's files root: `<event>/Originals/<Camera>`, or the legacy
+    /// `<event>/<device>/Card Copy`.
+    public var filesRootPath: String
+    public var layout: DriveFolderLayout
+    /// Files not yet covered by any event assignment, relative to `filesRootPath`.
     public var files: [FileRecord]
     public var policy: EventStoragePolicy
     public var matchingEventID: UUID?
@@ -18,22 +31,43 @@ public struct DiscoveredDriveEvent: Identifiable, Hashable, Sendable {
     public var byteCount: Int64 { files.reduce(Int64(0)) { $0 + $1.size } }
 }
 
-/// Finds event folders already on the working drive
-/// (`<yyyy>/<yyyy-MM-dd Name>/<Camera>/Card Copy`) that the configuration does
-/// not know about yet, so a drive organized by hand can join the catalog.
+/// One camera folder on the drive, whatever its assignments: used to tell
+/// the owner how much of a drive still sits in the legacy layout.
+public struct DriveCameraFolder: Hashable, Sendable {
+    public var eventFolderPath: String
+    /// `<event>/<device>` for the legacy layout, `<event>/Originals/<Camera>` otherwise.
+    public var cameraFolderPath: String
+    public var filesRootPath: String
+    public var layout: DriveFolderLayout
+    public var deviceID: String
+}
+
+/// Finds event folders already on the working drive that the configuration
+/// does not know about yet, so a drive organized by hand can join the
+/// catalog. Both layouts are read during the transition:
+/// `<yyyy>/<yyyy-MM-dd Name>/Originals/<Camera>/…` and the legacy
+/// `<yyyy>/<yyyy-MM-dd Name>/<Camera>/Card Copy/…`.
 /// A dated folder inside an event folder is a subevent root — it can hold
-/// device folders of its own and deeper subevents.
+/// camera folders of its own and deeper subevents. `Edited` is the owner's
+/// and is never read as a camera.
 public enum DriveEventDiscovery {
+    /// The device id a camera folder names. Accepts the current display
+    /// names ("Osmo 360", "Osmo Nano"), the legacy device folders
+    /// ("DJI Osmo 360", "DJI Nano"), and the ids themselves.
     public static func deviceID(forDeviceFolder name: String) -> String {
-        switch name.lowercased() {
-        case "sony a7v", "sony-a7v": "sony-a7v"
-        case "dji osmo 360", "osmo-360": "osmo-360"
-        case "dji mini 2", "dji-mini-2": "dji-mini-2"
-        case "dji nano", "dji-nano": "dji-nano"
-        case "dji action 6", "action-6": "action-6"
-        case "iphone": "iphone"
-        case "camera": "generic-camera"
-        default: name
+        let lowered = name.lowercased()
+        if let known = CameraCatalog.deviceNames.first(where: { $0.value.lowercased() == lowered })?.key {
+            return known
+        }
+        switch lowered {
+        case "sony a7v", "sony-a7v": return "sony-a7v"
+        case "dji osmo 360", "osmo-360": return "osmo-360"
+        case "dji mini 2", "dji-mini-2": return "dji-mini-2"
+        case "dji nano", "dji-nano": return "dji-nano"
+        case "dji action 6", "action-6": return "action-6"
+        case "iphone": return "iphone"
+        case "camera": return "generic-camera"
+        default: return name
         }
     }
 
@@ -55,15 +89,19 @@ public enum DriveEventDiscovery {
         // assignment minted date formatters by the thousand, so they are
         // memoized and each file contributes a join + standardize — the
         // same work `driveURL`/`sourceURL` do.
-        var cardRoots: [String: URL] = [:]
+        var driveRoots: [String: [URL]] = [:]
         var sourceRoots: [String: URL] = [:]
         var validRelative: [String: Bool] = [:]
-        func cardCopyRoot(_ policy: EventStoragePolicy, _ event: SavedCameraEvent, _ deviceID: String?) -> URL {
+        /// Both layouts' roots: an assignment covers its file in either.
+        func driveCandidateRoots(_ policy: EventStoragePolicy, _ event: SavedCameraEvent, _ deviceID: String?) -> [URL] {
             let key = "\(event.id)\u{0}\(policy.rawValue)\u{0}\(deviceID ?? "")"
-            if let cached = cardRoots[key] { return cached }
-            let root = locations.cardCopyRoot(for: event, deviceID: deviceID, policy: policy)
-            cardRoots[key] = root
-            return root
+            if let cached = driveRoots[key] { return cached }
+            let roots = [
+                locations.originalsRoot(for: event, deviceID: deviceID, policy: policy),
+                locations.legacyCardCopyRoot(for: event, deviceID: deviceID, policy: policy),
+            ]
+            driveRoots[key] = roots
+            return roots
         }
         func isValidRelative(_ path: String) -> Bool {
             if let cached = validRelative[path] { return cached }
@@ -78,10 +116,12 @@ public enum DriveEventDiscovery {
             autoreleasepool {
                 for candidatePolicy in EventStoragePolicy.allCases {
                     guard isValidRelative(assignment.relativePath) else { continue }
-                    let url = cardCopyRoot(candidatePolicy, event, assignment.deviceID)
-                        .appendingPathComponent(assignment.relativePath)
-                        .standardizedFileURL
-                    covered.insert(EventStorageLocations.pathKey(url.path))
+                    for root in driveCandidateRoots(candidatePolicy, event, assignment.deviceID) {
+                        let url = root
+                            .appendingPathComponent(assignment.relativePath)
+                            .standardizedFileURL
+                        covered.insert(EventStorageLocations.pathKey(url.path))
+                    }
                 }
                 if isValidRelative(assignment.relativePath) {
                     let sourceRoot: URL
@@ -123,8 +163,8 @@ public enum DriveEventDiscovery {
     }
 
     /// Scans one dated event folder: dated subdirectories are subevent roots
-    /// and recurse; anything else is treated as a camera/device folder that
-    /// may hold a `Card Copy`.
+    /// and recurse; `Originals/<Camera>` folders are the current layout;
+    /// any other folder holding a `Card Copy` is a legacy camera folder.
     private static func scanEventFolder(
         _ eventFolder: URL,
         parentEventFolderPath: String?,
@@ -138,6 +178,7 @@ public enum DriveEventDiscovery {
     ) throws {
         guard let parsed = parseEventFolder(eventFolder.lastPathComponent) else { return }
         let eventFolderPath = eventFolder.standardizedFileURL.path
+        var found: [DriveCameraFolder] = []
         for subdirectory in try directories(in: eventFolder, fileManager: fileManager) {
             if parseEventFolder(subdirectory.lastPathComponent) != nil {
                 try scanEventFolder(
@@ -153,14 +194,13 @@ public enum DriveEventDiscovery {
                 )
                 continue
             }
-            let cardCopy = subdirectory.appendingPathComponent("Card Copy", isDirectory: true)
-            var isDirectory: ObjCBool = false
-            guard fileManager.fileExists(atPath: cardCopy.path, isDirectory: &isDirectory), isDirectory.boolValue else {
-                continue
-            }
-            let files = try FileScanner(fileManager: fileManager).scan(root: cardCopy).filter { file in
+            found += try cameraFolders(in: subdirectory, eventFolderPath: eventFolderPath, fileManager: fileManager)
+        }
+        for folder in found {
+            let root = URL(fileURLWithPath: folder.filesRootPath, isDirectory: true)
+            let files = try FileScanner(fileManager: fileManager).scan(root: root).filter { file in
                 autoreleasepool {
-                    !covered.contains(EventStorageLocations.pathKey(cardCopy.appendingPathComponent(file.path).path))
+                    !covered.contains(EventStorageLocations.pathKey(root.appendingPathComponent(file.path).path))
                 }
             }
             guard !files.isEmpty else { continue }
@@ -173,13 +213,71 @@ public enum DriveEventDiscovery {
                 parentEventFolderPath: parentEventFolderPath,
                 name: parsed.name,
                 dateString: parsed.date,
-                deviceID: deviceID(forDeviceFolder: subdirectory.lastPathComponent),
-                cardCopyPath: cardCopy.standardizedFileURL.path,
+                deviceID: folder.deviceID,
+                filesRootPath: folder.filesRootPath,
+                layout: folder.layout,
                 files: files,
                 policy: policy,
                 matchingEventID: matching?.id
             ))
         }
+    }
+
+    /// The camera folders one non-dated child of an event folder holds:
+    /// every `<Camera>` inside `Originals`, or the child itself when it is a
+    /// legacy device folder with a `Card Copy`. `Edited` holds none.
+    static func cameraFolders(in subdirectory: URL, eventFolderPath: String, fileManager: FileManager) throws -> [DriveCameraFolder] {
+        let name = subdirectory.lastPathComponent
+        if name == EventStorageLocations.editedFolderName { return [] }
+        if name == EventStorageLocations.originalsFolderName {
+            return try directories(in: subdirectory, fileManager: fileManager).map { camera in
+                DriveCameraFolder(
+                    eventFolderPath: eventFolderPath,
+                    cameraFolderPath: camera.standardizedFileURL.path,
+                    filesRootPath: camera.standardizedFileURL.path,
+                    layout: .originals,
+                    deviceID: deviceID(forDeviceFolder: camera.lastPathComponent)
+                )
+            }
+        }
+        let cardCopy = subdirectory.appendingPathComponent(EventStorageLocations.legacyCardCopyFolderName, isDirectory: true)
+        var isDirectory: ObjCBool = false
+        guard fileManager.fileExists(atPath: cardCopy.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+            return []
+        }
+        return [DriveCameraFolder(
+            eventFolderPath: eventFolderPath,
+            cameraFolderPath: subdirectory.standardizedFileURL.path,
+            filesRootPath: cardCopy.standardizedFileURL.path,
+            layout: .legacyCardCopy,
+            deviceID: deviceID(forDeviceFolder: name)
+        )]
+    }
+
+    /// Every camera folder under `driveRoot`'s dated event folders (and
+    /// their subevents), in both layouts, whether or not the catalog covers
+    /// its files. Nothing is read beyond directory listings.
+    public static func cameraFolders(driveRoot: URL, fileManager: FileManager = .default) throws -> [DriveCameraFolder] {
+        guard fileManager.fileExists(atPath: driveRoot.path) else { return [] }
+        var result: [DriveCameraFolder] = []
+        func walk(_ eventFolder: URL) throws {
+            guard parseEventFolder(eventFolder.lastPathComponent) != nil else { return }
+            let eventFolderPath = eventFolder.standardizedFileURL.path
+            for subdirectory in try directories(in: eventFolder, fileManager: fileManager) {
+                if parseEventFolder(subdirectory.lastPathComponent) != nil {
+                    try walk(subdirectory)
+                } else {
+                    result += try cameraFolders(in: subdirectory, eventFolderPath: eventFolderPath, fileManager: fileManager)
+                }
+            }
+        }
+        for year in try directories(in: driveRoot, fileManager: fileManager)
+        where year.lastPathComponent.count == 4 && year.lastPathComponent.allSatisfy(\.isNumber) {
+            for eventFolder in try directories(in: year, fileManager: fileManager) {
+                try walk(eventFolder)
+            }
+        }
+        return result
     }
 
     /// `<year>/<parent event folder>/…/<event folder>` components of `url`
@@ -270,7 +368,7 @@ public enum DriveEventDiscovery {
             }
             for file in folder.files {
                 configuration.photoEventAssignments.append(PhotoEventAssignment(
-                    sourceRootPath: folder.cardCopyPath,
+                    sourceRootPath: folder.filesRootPath,
                     relativePath: file.path,
                     fileSize: file.size,
                     modifiedAt: file.modifiedAt,
@@ -283,7 +381,7 @@ public enum DriveEventDiscovery {
         return (created, added)
     }
 
-    static func parseEventFolder(_ name: String) -> (date: String, name: String)? {
+    public static func parseEventFolder(_ name: String) -> (date: String, name: String)? {
         guard name.count > 11 else { return nil }
         let date = String(name.prefix(10))
         let separator = name[name.index(name.startIndex, offsetBy: 10)]
@@ -295,7 +393,7 @@ public enum DriveEventDiscovery {
         return (date, rest)
     }
 
-    private static func directories(in url: URL, fileManager: FileManager) throws -> [URL] {
+    static func directories(in url: URL, fileManager: FileManager) throws -> [URL] {
         try fileManager.contentsOfDirectory(
             at: url,
             includingPropertiesForKeys: [.isDirectoryKey],

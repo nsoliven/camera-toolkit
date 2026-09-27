@@ -27,11 +27,11 @@ final class OrganizeStorageTests: XCTestCase {
 
             XCTAssertEqual(
                 locations.driveURL(for: assignment, event: event, policy: .buffer)?.path,
-                root.appendingPathComponent("Buffer/2026/2026-08-26 Mountain Trip/Sony A7V/Card Copy/DSC00001.ARW").standardizedFileURL.path
+                root.appendingPathComponent("Buffer/2026/2026-08-26 Mountain Trip/Originals/Sony A7V/DSC00001.ARW").standardizedFileURL.path
             )
             XCTAssertEqual(
                 locations.driveURL(for: assignment, event: event, policy: .archiveOnly)?.path,
-                root.appendingPathComponent(".Camera Toolkit/Private/2026/2026-08-26 Mountain Trip/Sony A7V/Card Copy/DSC00001.ARW").standardizedFileURL.path
+                root.appendingPathComponent(".Camera Toolkit/Private/2026/2026-08-26 Mountain Trip/Originals/Sony A7V/DSC00001.ARW").standardizedFileURL.path
             )
             XCTAssertEqual(
                 locations.archiveURL(for: assignment, event: event)?.path,
@@ -245,6 +245,98 @@ final class OrganizeStorageTests: XCTestCase {
             XCTAssertTrue(summary.assets.allSatisfy(\.sourceIsDriveCopy))
 
             XCTAssertTrue(try DriveEventDiscovery.discover(driveRoot: buffer, policy: .buffer, configuration: configuration).isEmpty)
+            // The adopted files still sit in the legacy layout: presence
+            // found them only through the transition fallback.
+            XCTAssertTrue(summary.assets.allSatisfy(\.driveIsLegacyLayout))
+            XCTAssertEqual(summary.onLegacyLayout, 2)
+        }
+    }
+
+    /// The current layout — `Originals/<Camera>`, `Edited`, nested
+    /// subevents — is discovered and adopted; `Edited` is never a camera,
+    /// and a drive holding both layouts reports each camera folder once
+    /// with the layout it uses.
+    func testDiscoversOriginalsLayoutAndLegacyFoldersSideBySide() throws {
+        try withTemporaryDirectory { root in
+            var configuration = testConfiguration(root: root)
+            let buffer = root.appendingPathComponent("Buffer", isDirectory: true)
+            let trip = buffer.appendingPathComponent("2026/2026-08-23 Trip", isDirectory: true)
+            try writeFile(trip.appendingPathComponent("Originals/Sony A7V/DSC00001.ARW"), "a")
+            try writeFile(trip.appendingPathComponent("Originals/Osmo 360/CAM_0001.OSV"), "b")
+            try writeFile(trip.appendingPathComponent("Edited/Photomator/DSC00001.jpg"), "edit")
+            try writeFile(trip.appendingPathComponent("2026-08-24 Beach/Originals/Osmo Nano/DJI_0001.MP4"), "c")
+            try writeFile(trip.appendingPathComponent("2026-08-24 Beach/Edited/Web/DJI_0001.jpg"), "edit")
+            // A camera still in the legacy layout inside the same event.
+            try writeFile(trip.appendingPathComponent("DJI Osmo 360/Card Copy/CAM_0002.OSV"), "d")
+
+            let found = try DriveEventDiscovery.discover(driveRoot: buffer, policy: .buffer, configuration: configuration)
+            let byRoot = Dictionary(uniqueKeysWithValues: found.map { (URL(fileURLWithPath: $0.filesRootPath).lastPathComponent, $0) })
+            XCTAssertEqual(Set(byRoot.keys), ["Sony A7V", "Osmo 360", "Osmo Nano", "Card Copy"])
+            XCTAssertEqual(byRoot["Sony A7V"]?.deviceID, "sony-a7v")
+            XCTAssertEqual(byRoot["Osmo 360"]?.deviceID, "osmo-360")
+            XCTAssertEqual(byRoot["Osmo 360"]?.layout, .originals)
+            XCTAssertEqual(byRoot["Osmo Nano"]?.deviceID, "dji-nano")
+            XCTAssertEqual(byRoot["Osmo Nano"]?.name, "Beach")
+            XCTAssertEqual(byRoot["Osmo Nano"]?.parentEventFolderPath, trip.standardizedFileURL.path)
+            XCTAssertEqual(byRoot["Card Copy"]?.layout, .legacyCardCopy)
+            XCTAssertEqual(byRoot["Card Copy"]?.deviceID, "osmo-360")
+            XCTAssertFalse(found.contains { $0.filesRootPath.contains("/Edited") })
+
+            let folders = try DriveEventDiscovery.cameraFolders(driveRoot: buffer)
+            XCTAssertEqual(folders.count, 4)
+            XCTAssertEqual(folders.filter { $0.layout == .legacyCardCopy }.map(\.cameraFolderPath), [
+                trip.appendingPathComponent("DJI Osmo 360").standardizedFileURL.path,
+            ])
+
+            let adopted = DriveEventDiscovery.adopt(found, into: &configuration)
+            XCTAssertEqual(adopted.createdEvents, 2)
+            XCTAssertEqual(adopted.addedAssignments, 4)
+            let beach = try XCTUnwrap(configuration.savedEvents.first { $0.name == "Beach" })
+            let tripEvent = try XCTUnwrap(configuration.savedEvents.first { $0.name == "Trip" })
+            XCTAssertEqual(beach.parentEventID, tripEvent.id)
+            let locations = EventStorageLocations(configuration: configuration)
+            let nano = try XCTUnwrap(configuration.photoEventAssignments.first { $0.eventID == beach.id })
+            // The computed layout agrees with the folder adoption read.
+            XCTAssertEqual(
+                locations.driveURL(for: nano, event: beach, policy: .buffer)?.path,
+                trip.appendingPathComponent("2026-08-24 Beach/Originals/Osmo Nano/DJI_0001.MP4").standardizedFileURL.path
+            )
+            let summary = try XCTUnwrap(EventPresenceScanner.scan(
+                event: tripEvent,
+                assignments: configuration.photoEventAssignments.filter { $0.eventID == tripEvent.id },
+                locations: locations
+            ))
+            XCTAssertEqual(summary.onDrive, 3)
+            XCTAssertEqual(summary.onLegacyLayout, 1)
+            XCTAssertTrue(summary.assets.allSatisfy(\.sourceIsDriveCopy))
+            XCTAssertTrue(try DriveEventDiscovery.discover(driveRoot: buffer, policy: .buffer, configuration: configuration).isEmpty)
+        }
+    }
+
+    /// Presence prefers the current layout; a file only in the legacy
+    /// `Card Copy` is found there and flagged, and `driveRootPath` is the
+    /// root the file was actually found under.
+    func testPresenceFallsBackToLegacyCardCopyOnlyWhenTheCurrentCopyIsMissing() throws {
+        try withTemporaryDirectory { root in
+            let configuration = testConfiguration(root: root)
+            let locations = EventStorageLocations(configuration: configuration)
+            let event = SavedCameraEvent(name: "City Walk", eventDate: try XCTUnwrap(DateFormatter.yyyyMMdd.date(from: "2026-08-29")))
+            let assignment = PhotoEventAssignment(sourceRootPath: root.appendingPathComponent("Unsorted").path, relativePath: "DSC00001.ARW", fileSize: 3, modifiedAt: Date(), eventID: event.id, deviceID: "sony-a7v")
+            let legacy = try XCTUnwrap(locations.legacyDriveURL(for: assignment, event: event, policy: .buffer))
+            try writeFile(legacy, "abc")
+
+            var asset = try XCTUnwrap(EventPresenceScanner.scan(event: event, assignments: [assignment], locations: locations)?.assets.first)
+            XCTAssertEqual(asset.drive, .present)
+            XCTAssertTrue(asset.driveIsLegacyLayout)
+            XCTAssertEqual(asset.drivePath, legacy.path)
+            XCTAssertEqual(asset.driveRootPath, legacy.deletingLastPathComponent().path)
+
+            let current = try XCTUnwrap(locations.driveURL(for: assignment, event: event, policy: .buffer))
+            try writeFile(current, "abc")
+            asset = try XCTUnwrap(EventPresenceScanner.scan(event: event, assignments: [assignment], locations: locations)?.assets.first)
+            XCTAssertEqual(asset.drivePath, current.path)
+            XCTAssertFalse(asset.driveIsLegacyLayout)
+            XCTAssertEqual(asset.driveRootPath, locations.originalsRoot(for: event, deviceID: "sony-a7v", policy: .buffer).path)
         }
     }
 
@@ -304,8 +396,9 @@ final class OrganizeStorageTests: XCTestCase {
     /// The folder names the presence sweep, card-copy roots, and archive
     /// layout emit are on-disk identity — a single changed byte would move
     /// every file. The sweep now shares formatters, so this pins every
-    /// component: the `yyyy-MM-dd` date, device folder, media folder,
-    /// subevent nesting, and `Card Copy` suffix.
+    /// component: the `yyyy-MM-dd` date, camera and device folders, media
+    /// folder, subevent nesting, and the `Originals` level (plus the
+    /// legacy `Card Copy` suffix the migration reads).
     func testEventFolderNamesStayPinned() throws {
         try withTemporaryDirectory { root in
             let configuration = testConfiguration(root: root)
@@ -335,10 +428,39 @@ final class OrganizeStorageTests: XCTestCase {
             XCTAssertEqual(deviceFolder("iphone"), "iPhone")
             XCTAssertEqual(deviceFolder(""), "Camera")
 
+            // Every drive camera folder name: the boards' display names.
+            func cameraFolder(_ id: String) -> String {
+                OrganizedArchiveLayout(eventDate: "2026-08-26", eventName: "E", deviceID: id).cameraFolder
+            }
+            XCTAssertEqual(cameraFolder("sony-a7v"), "Sony A7V")
+            XCTAssertEqual(cameraFolder("osmo-360"), "Osmo 360")
+            XCTAssertEqual(cameraFolder("dji-mini-2"), "DJI Mini 2")
+            XCTAssertEqual(cameraFolder("dji-nano"), "Osmo Nano")
+            XCTAssertEqual(cameraFolder("action-6"), "Osmo Action 6")
+            XCTAssertEqual(cameraFolder("iphone"), "iPhone")
+            XCTAssertEqual(cameraFolder("generic-camera"), "Camera")
+            XCTAssertEqual(cameraFolder(""), "Camera")
+            XCTAssertEqual(cameraFolder("Hasselblad X2D"), "Hasselblad X2D")
+
             // Full on-disk roots for both policies.
             XCTAssertEqual(
-                locations.cardCopyRoot(for: event, deviceID: "sony-a7v", policy: .buffer).path,
-                root.appendingPathComponent("Buffer/2026/2026-08-26 Mountain Trip/Sony A7V/Card Copy")
+                locations.originalsRoot(for: event, deviceID: "sony-a7v", policy: .buffer).path,
+                root.appendingPathComponent("Buffer/2026/2026-08-26 Mountain Trip/Originals/Sony A7V")
+                    .standardizedFileURL.path
+            )
+            XCTAssertEqual(
+                locations.originalsRoot(for: event, deviceID: "osmo-360", policy: .archiveOnly).path,
+                root.appendingPathComponent(".Camera Toolkit/Private/2026/2026-08-26 Mountain Trip/Originals/Osmo 360")
+                    .standardizedFileURL.path
+            )
+            XCTAssertEqual(
+                locations.editedRoot(for: event, policy: .buffer).path,
+                root.appendingPathComponent("Buffer/2026/2026-08-26 Mountain Trip/Edited").standardizedFileURL.path
+            )
+            // The legacy root the migration and the transition fallback read.
+            XCTAssertEqual(
+                locations.legacyCardCopyRoot(for: event, deviceID: "osmo-360", policy: .buffer).path,
+                root.appendingPathComponent("Buffer/2026/2026-08-26 Mountain Trip/DJI Osmo 360/Card Copy")
                     .standardizedFileURL.path
             )
             XCTAssertEqual(

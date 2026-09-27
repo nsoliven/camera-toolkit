@@ -117,10 +117,14 @@ The layout is intentionally readable:
 
 ```text
 Buffer/<year>/<yyyy-MM-dd event>/
-└── <camera>/Card Copy/
+├── Originals/<Camera>/        # everything the camera wrote, with its sidecars
+├── Edited/<folder>/…          # your edits; each first-level folder is an edit tag
+└── <yyyy-MM-dd subevent>/     # subevents nest inside their parent, same inside
+    ├── Originals/<Camera>/
+    └── Edited/…
 
 <drive>/.Camera Toolkit/
-├── Private/<year>/<yyyy-MM-dd event>/<camera>/Card Copy/
+├── Private/<year>/<yyyy-MM-dd event>/[…subevent…]/Originals/<Camera>/
 └── _Trash/<batch>/
 
 Photo Library/Originals/<year>/<yyyy-MM-dd event>/<camera>/
@@ -129,6 +133,8 @@ Photo Library/Originals/<year>/<yyyy-MM-dd event>/<camera>/
 ├── Video/
 └── Camera Support/
 ```
+
+`<Camera>` is the device's display name — `Sony A7V`, `Osmo 360`, `Osmo Nano`. When two different files from one camera share a name, the second is kept as `NAME (2).EXT` and its sidecars take the same suffix. Drives organized before `Originals` existed used `<event>/<camera>/Card Copy/`; the app still reads that layout, and the layout migration (see "Layout migration" in `docs/ARCHITECTURE.md`) moves it into `Originals` with journaled, undoable same-drive renames. The NAS library keeps its `RAW`/`JPEG`/`Video` split for now.
 
 ## Keyboard shortcuts
 

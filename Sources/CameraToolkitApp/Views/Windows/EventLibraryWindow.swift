@@ -243,8 +243,8 @@ private struct EventLibraryView: View {
                 Text("Event folders")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
-                eventFolderButton("Photomator", systemImage: "slider.horizontal.3", url: eventFolderURLs(event).photomator)
-                eventFolderButton("Exports", systemImage: "square.and.arrow.up", url: eventFolderURLs(event).exports)
+                eventFolderButton("Originals", systemImage: "camera", url: eventFolderURLs(event).originals)
+                eventFolderButton("Edited", systemImage: "slider.horizontal.3", url: eventFolderURLs(event).edited)
                 eventFolderButton("Library Edited", systemImage: "externaldrive", url: eventFolderURLs(event).libraryEdited)
                 Spacer()
             }
@@ -430,7 +430,7 @@ private struct EventLibraryView: View {
         .help(url.path)
     }
 
-    private func eventFolderURLs(_ event: SavedCameraEvent) -> (photomator: URL, exports: URL, libraryEdited: URL) {
+    private func eventFolderURLs(_ event: SavedCameraEvent) -> (originals: URL, edited: URL, libraryEdited: URL) {
         // The shared resolver keeps subevent folders nested inside their
         // parent event folder on both the Buffer and the library.
         let locations = EventStorageLocations(configuration: model.configuration)
@@ -444,8 +444,8 @@ private struct EventLibraryView: View {
         }
         editedEvent.appendPathComponent(layout.eventFolder, isDirectory: true)
         return (
-            bufferEvent.appendingPathComponent("Photomator", isDirectory: true),
-            bufferEvent.appendingPathComponent("Exports", isDirectory: true),
+            bufferEvent.appendingPathComponent(EventStorageLocations.originalsFolderName, isDirectory: true),
+            locations.editedRoot(for: event, policy: .buffer),
             editedEvent
         )
     }
@@ -633,7 +633,7 @@ private struct EventLibraryView: View {
             let sourceRoot = NSString(string: assignment.sourceRootPath).expandingTildeInPath
             let sourceURL = URL(fileURLWithPath: sourceRoot, isDirectory: true)
                 .appendingPathComponent(assignment.relativePath)
-            let bufferURL = locations.cardCopyRoot(for: event, deviceID: deviceID, policy: .buffer)
+            let bufferURL = locations.originalsRoot(for: event, deviceID: deviceID, policy: .buffer)
                 .appendingPathComponent(assignment.relativePath)
             guard let archiveRelativePath = try? layout.destinationRelativePath(for: assignment.relativePath) else { return nil }
             let archiveURL = locations.libraryRoot

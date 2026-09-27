@@ -193,11 +193,42 @@ public struct EventStorageLocations: Sendable {
         return url.appendingPathComponent(layout.eventFolder, isDirectory: true)
     }
 
-    public func cardCopyRoot(for event: SavedCameraEvent, deviceID: String?, policy: EventStoragePolicy) -> URL {
+    /// `Originals`: everything a camera wrote, one folder per camera.
+    public static let originalsFolderName = "Originals"
+    /// `Edited`: the owner's edits; each first-level folder is an edit tag.
+    public static let editedFolderName = "Edited"
+    /// The per-device folder of the legacy layout
+    /// (`<event>/<device>/Card Copy`) that `Originals/<Camera>` replaced.
+    /// Only discovery, presence fallback, and the layout migration read it.
+    public static let legacyCardCopyFolderName = "Card Copy"
+
+    /// Folder names inside an event folder that belong to the event itself,
+    /// never to a camera or a subevent.
+    public static let reservedEventFolderNames: Set<String> = [originalsFolderName, editedFolderName]
+
+    /// `<event folder>/Originals/<Camera>` — where one camera's files for
+    /// the event live on the policy's drive.
+    public func originalsRoot(for event: SavedCameraEvent, deviceID: String?, policy: EventStoragePolicy) -> URL {
+        let layout = layout(for: event, deviceID: deviceID)
+        return eventFolder(for: event, policy: policy)
+            .appendingPathComponent(Self.originalsFolderName, isDirectory: true)
+            .appendingPathComponent(layout.cameraFolder, isDirectory: true)
+    }
+
+    /// `<event folder>/Edited` on the policy's drive.
+    public func editedRoot(for event: SavedCameraEvent, policy: EventStoragePolicy) -> URL {
+        eventFolder(for: event, policy: policy)
+            .appendingPathComponent(Self.editedFolderName, isDirectory: true)
+    }
+
+    /// `<event folder>/<device folder>/Card Copy` — the legacy layout's
+    /// root for one camera. Read during the transition only: a drive that
+    /// has not been migrated yet still keeps its files there.
+    public func legacyCardCopyRoot(for event: SavedCameraEvent, deviceID: String?, policy: EventStoragePolicy) -> URL {
         let layout = layout(for: event, deviceID: deviceID)
         return eventFolder(for: event, policy: policy)
             .appendingPathComponent(layout.deviceFolder, isDirectory: true)
-            .appendingPathComponent("Card Copy", isDirectory: true)
+            .appendingPathComponent(Self.legacyCardCopyFolderName, isDirectory: true)
     }
 
     public func sourceURL(for assignment: PhotoEventAssignment) -> URL? {
@@ -209,21 +240,29 @@ public struct EventStorageLocations: Sendable {
 
     public func driveURL(for assignment: PhotoEventAssignment, event: SavedCameraEvent, policy: EventStoragePolicy) -> URL? {
         guard (try? PathSafety.validateRelativePath(assignment.relativePath)) != nil else { return nil }
-        return cardCopyRoot(for: event, deviceID: assignment.deviceID, policy: policy)
+        return originalsRoot(for: event, deviceID: assignment.deviceID, policy: policy)
+            .appendingPathComponent(assignment.relativePath)
+            .standardizedFileURL
+    }
+
+    /// Where the legacy layout kept this assignment's drive copy.
+    public func legacyDriveURL(for assignment: PhotoEventAssignment, event: SavedCameraEvent, policy: EventStoragePolicy) -> URL? {
+        guard (try? PathSafety.validateRelativePath(assignment.relativePath)) != nil else { return nil }
+        return legacyCardCopyRoot(for: event, deviceID: assignment.deviceID, policy: policy)
             .appendingPathComponent(assignment.relativePath)
             .standardizedFileURL
     }
 
     /// The path the event board trusts before any place is probed: the
-    /// policy's `Card Copy` root joined with the assignment's relative
-    /// path. Unlike `driveURL` this never calls `standardizedFileURL`,
+    /// policy's `Originals/<Camera>` root joined with the assignment's
+    /// relative path. Unlike `driveURL` this never calls `standardizedFileURL`,
     /// which resolves symlinked ancestors through the filesystem — the
     /// root was standardized once at init and `relativePath` is already
     /// validated, so the join is pure string work. A file that actually
     /// lives somewhere else is corrected by the presence sweep.
     public func impliedDrivePath(for assignment: PhotoEventAssignment, event: SavedCameraEvent, policy: EventStoragePolicy) -> String? {
         guard (try? PathSafety.validateRelativePath(assignment.relativePath)) != nil else { return nil }
-        return cardCopyRoot(for: event, deviceID: assignment.deviceID, policy: policy)
+        return originalsRoot(for: event, deviceID: assignment.deviceID, policy: policy)
             .appendingPathComponent(assignment.relativePath)
             .path
     }
@@ -280,7 +319,7 @@ public struct EventStorageLocations: Sendable {
 /// Builds event assignments for files picked in an unsorted folder.
 ///
 /// Each file is identified by its own folder plus file name, so its copy in
-/// the event's `Card Copy` folder stays flat. When a file name repeats inside
+/// the event's `Originals/<Camera>` folder stays flat. When a file name repeats inside
 /// the scanned folder or the event, the identity falls back to the path under
 /// the scanned root, which keeps both copies apart.
 public enum OrganizeAssignmentBuilder {

@@ -182,7 +182,7 @@ private struct AssignmentChange {
     var added: [PhotoEventAssignment]
 }
 
-/// A grid built from the catalog-implied `Card Copy` paths, before any
+/// A grid built from the catalog-implied `Originals/<Camera>` paths, before any
 /// place has been probed. Pass one of an event open paints the first
 /// screen of one of these; the deferred pass builds the whole event's.
 private struct EventImpliedGrid: Sendable {
@@ -306,11 +306,11 @@ private final class MountObserverBox: @unchecked Sendable {
     var observers: [NSObjectProtocol] = []
 }
 
-/// One `Card Copy` root per (member, device id) for the default implied-path
+/// One `Originals/<Camera>` root per (member, device id) for the default implied-path
 /// resolver — building the root spends a `DateFormatter` and an ancestor
 /// walk per call, so the build runs once per key and only `relativePath`
 /// joins per file.
-private final class ImpliedCardCopyRoots: @unchecked Sendable {
+private final class ImpliedOriginalsRoots: @unchecked Sendable {
     private let lock = NSLock()
     private var roots: [String: URL] = [:]
 
@@ -373,6 +373,9 @@ final class EventsWorkspace {
     var eventReachability: [UUID: EventReachabilityReport] = [:]
     var eventImmichStatuses: [UUID: [String: ImmichCatalogStatus]] = [:]
     var discoveredDriveEvents: [DiscoveredDriveEvent] = []
+    /// Camera folders on the Buffer and private staging still in the legacy
+    /// `<device>/Card Copy` layout — offered for the layout migration.
+    var legacyLayoutFolders: [DriveCameraFolder] = []
     var newEventRequest: NewEventRequest?
     var renameRequest: RenameEventRequest?
     var faceScanRequest: FaceScanRequest?
@@ -426,7 +429,7 @@ final class EventsWorkspace {
     @ObservationIgnored var presenceProbe: EventPresenceScanner.PresenceProbe?
     /// Test seam: resolves one assignment's board path inside an event
     /// refresh — the first screen and the deferred build both go through
-    /// it. Production joins the catalog-implied `Card Copy` path, pure
+    /// it. Production joins the catalog-implied `Originals/<Camera>` path, pure
     /// string work that never touches the filesystem; a test counts
     /// which assignments resolved — or parks on one — to prove the first
     /// screen published before the rest of the files were resolved at
@@ -892,11 +895,12 @@ final class EventsWorkspace {
                 bytes[assignment.eventID, default: 0] += assignment.fileSize
             }
         }
-        // The board's tiles point at Card Copy (or the other drive, or the
-        // NAS), not at the path the file was imported from. Index those
-        // too, without letting them steal a source path that already
-        // belongs to a different assignment. One root per event and camera
-        // — building it per file redoes the date formatting 13,000 times.
+        // The board's tiles point at Originals/<Camera> (or the other drive,
+        // a not-yet-migrated legacy Card Copy, or the NAS), not at the path
+        // the file was imported from. Index those too, without letting them
+        // steal a source path that already belongs to a different
+        // assignment. One root per event and camera — building it per file
+        // redoes the date formatting 13,000 times.
         let eventsByID = Dictionary(uniqueKeysWithValues: model.configuration.savedEvents.map { ($0.id, $0) })
         var cardRoots: [String: String] = [:]
         var archiveLayouts: [String: OrganizedArchiveLayout] = [:]
@@ -905,16 +909,20 @@ final class EventsWorkspace {
                 guard let owner = eventsByID[assignment.eventID],
                       (try? PathSafety.validateRelativePath(assignment.relativePath)) != nil else { return }
                 for policy in [EventStoragePolicy.buffer, .archiveOnly] {
-                    let cacheKey = "\(owner.id.uuidString)\u{0}\(assignment.deviceID ?? "")\u{0}\(policy.rawValue)"
-                    let rootPath = cardRoots[cacheKey] ?? {
-                        let built = locations.cardCopyRoot(for: owner, deviceID: assignment.deviceID, policy: policy).path
-                        cardRoots[cacheKey] = built
-                        return built
-                    }()
-                    if let key = EventStorageLocations.joinedPathKey(rootPath: rootPath, relativePath: assignment.relativePath) {
-                        insert(key, assignment)
-                    } else {
-                        insert(EventStorageLocations.pathKey(rootPath + "/" + assignment.relativePath), assignment)
+                    for legacy in [false, true] {
+                        let cacheKey = "\(owner.id.uuidString)\u{0}\(assignment.deviceID ?? "")\u{0}\(policy.rawValue)\u{0}\(legacy)"
+                        let rootPath = cardRoots[cacheKey] ?? {
+                            let built = (legacy
+                                ? locations.legacyCardCopyRoot(for: owner, deviceID: assignment.deviceID, policy: policy)
+                                : locations.originalsRoot(for: owner, deviceID: assignment.deviceID, policy: policy)).path
+                            cardRoots[cacheKey] = built
+                            return built
+                        }()
+                        if let key = EventStorageLocations.joinedPathKey(rootPath: rootPath, relativePath: assignment.relativePath) {
+                            insert(key, assignment)
+                        } else {
+                            insert(EventStorageLocations.pathKey(rootPath + "/" + assignment.relativePath), assignment)
+                        }
                     }
                 }
                 let layoutKey = "\(owner.id.uuidString)\u{0}\(assignment.deviceID ?? "")"
@@ -2131,19 +2139,19 @@ final class EventsWorkspace {
         let locations = self.locations
         let gate = driveActivityGate
         Task { @MainActor [weak self] in
-            let found = await Task.detached(priority: .utility) { () -> [DiscoveredDriveEvent] in
+            let found = await Task.detached(priority: .utility) { () -> ([DiscoveredDriveEvent], [DriveCameraFolder]) in
                 var all: [DiscoveredDriveEvent] = []
-                if VolumeInfo.isAvailable(locations.bufferRoot),
-                   gate.waitIfPaused(for: locations.bufferRoot, shouldStop: { Task.isCancelled }) {
-                    all += (try? DriveEventDiscovery.discover(driveRoot: locations.bufferRoot, policy: .buffer, configuration: configuration)) ?? []
+                var legacy: [DriveCameraFolder] = []
+                for (root, policy) in [(locations.bufferRoot, EventStoragePolicy.buffer), (locations.privateStagingRoot, .archiveOnly)] {
+                    guard VolumeInfo.isAvailable(root),
+                          gate.waitIfPaused(for: root, shouldStop: { Task.isCancelled }) else { continue }
+                    all += (try? DriveEventDiscovery.discover(driveRoot: root, policy: policy, configuration: configuration)) ?? []
+                    legacy += ((try? DriveEventDiscovery.cameraFolders(driveRoot: root)) ?? []).filter { $0.layout == .legacyCardCopy }
                 }
-                if VolumeInfo.isAvailable(locations.privateStagingRoot),
-                   gate.waitIfPaused(for: locations.privateStagingRoot, shouldStop: { Task.isCancelled }) {
-                    all += (try? DriveEventDiscovery.discover(driveRoot: locations.privateStagingRoot, policy: .archiveOnly, configuration: configuration)) ?? []
-                }
-                return all
+                return (all, legacy)
             }.value
-            self?.discoveredDriveEvents = found
+            self?.discoveredDriveEvents = found.0
+            self?.legacyLayoutFolders = found.1
         }
     }
 
@@ -2169,7 +2177,7 @@ final class EventsWorkspace {
     ///
     /// Pass one draws only the first screen of the grid — the earliest
     /// files of the event being opened — from the place the catalog
-    /// already implies: that event's `Card Copy` folder joined with each
+    /// already implies: that event's `Originals/<Camera>` folder joined with each
     /// assignment's relative path. That join is pure string work — no
     /// `standardizedFileURL`, no `resourceValues`, no per-file stat — so
     /// the first tiles never wait on the card, the other drive, or the
@@ -2275,12 +2283,12 @@ final class EventsWorkspace {
         if let eventPathResolver {
             resolve = eventPathResolver
         } else {
-            let cardCopyRoots = ImpliedCardCopyRoots()
+            let originalsRoots = ImpliedOriginalsRoots()
             resolve = { assignment in
                 guard (try? PathSafety.validateRelativePath(assignment.relativePath)) != nil else { return nil }
                 let owner = memberByID[assignment.eventID] ?? event
-                let root = cardCopyRoots.root(memberID: owner.id, deviceID: assignment.deviceID) {
-                    locations.cardCopyRoot(for: owner, deviceID: assignment.deviceID, policy: locations.resolvedPolicy(for: owner))
+                let root = originalsRoots.root(memberID: owner.id, deviceID: assignment.deviceID) {
+                    locations.originalsRoot(for: owner, deviceID: assignment.deviceID, policy: locations.resolvedPolicy(for: owner))
                 }
                 return root.appendingPathComponent(assignment.relativePath).path
             }
@@ -2514,7 +2522,7 @@ final class EventsWorkspace {
         // are on disk" decides whether a restack is owed.
         guard Set(output.files.map(\.pathKey)) != Set((builtFiles ?? []).map(\.pathKey)) else { return }
 
-        // Files resolved somewhere other than the implied Card Copy path —
+        // Files resolved somewhere other than the implied Originals path —
         // restack onto the real ones. Continuation, not `task.value`, so
         // the rebuild keeps its utility priority.
         let cache = captureDateCache
@@ -2701,7 +2709,7 @@ final class EventsWorkspace {
                     // string — standardizing per file paid realpath for
                     // every asset, so they are memoized per event.
                     let destinationRoot = destinationRoots[asset.assignment.deviceID ?? ""] ?? {
-                        let built = locations.cardCopyRoot(for: event, deviceID: asset.assignment.deviceID, policy: policy).path
+                        let built = locations.originalsRoot(for: event, deviceID: asset.assignment.deviceID, policy: policy).path
                         destinationRoots[asset.assignment.deviceID ?? ""] = built
                         return built
                     }()
@@ -3173,7 +3181,7 @@ final class EventsWorkspace {
     }
 
     /// `EventPresenceScanner`'s answer without the sweep: while an event is
-    /// still "Checking", each file's catalog assignment plus the Card Copy
+    /// still "Checking", each file's catalog assignment plus the Originals
     /// path the grid implied is enough to plan a move. A location reads
     /// `.present` only where the file's own path matches — exactly the place
     /// the file was drawn at — and `.missing` elsewhere, so a plan never
@@ -3257,7 +3265,7 @@ final class EventsWorkspace {
             if asset.sourceIsDriveCopy {
                 if let path = [asset.drive == .present ? asset.drivePath : nil, asset.otherDrive == .present ? asset.otherDrivePath : nil]
                     .compactMap({ $0 }).first {
-                    moved.sourceRootPath = locations.cardCopyRoot(for: to, deviceID: moved.deviceID, policy: targetPolicy).path
+                    moved.sourceRootPath = locations.originalsRoot(for: to, deviceID: moved.deviceID, policy: targetPolicy).path
                     moveSource = path
                 }
             } else if asset.drive == .present {
@@ -3483,18 +3491,19 @@ final class EventsWorkspace {
             return
         }
         var groups: [String: NASArchiveGroup] = [:]
-        // The root only varies with (owner, device, policy) — cardCopyRoot
-        // is already standardized and a source root standardizes once —
-        // so group keys reuse memoized paths instead of a realpath walk
-        // per asset.
-        var cardRoots: [String: URL] = [:]
+        // The root only varies with (owner, device, policy, layout) — the
+        // presence sweep already found the copy, so its root is the found
+        // path minus the relative path (Originals/<Camera>, or a legacy
+        // Card Copy on a drive not migrated yet), and a source root
+        // standardizes once — so group keys reuse memoized paths instead
+        // of a realpath walk per asset.
+        var foundRoots: [String: URL] = [:]
         var sourceRoots: [String: URL] = [:]
         var standardizedKeys: [String: String] = [:]
-        func cardCopyRoot(_ owner: SavedCameraEvent, _ deviceID: String?, _ policy: EventStoragePolicy) -> URL {
-            let cacheKey = "\(owner.id)\u{0}\(deviceID ?? "")\u{0}\(policy.rawValue)"
-            if let cached = cardRoots[cacheKey] { return cached }
-            let built = locations.cardCopyRoot(for: owner, deviceID: deviceID, policy: policy)
-            cardRoots[cacheKey] = built
+        func foundRoot(_ path: String) -> URL {
+            if let cached = foundRoots[path] { return cached }
+            let built = URL(fileURLWithPath: path, isDirectory: true)
+            foundRoots[path] = built
             return built
         }
         func standardizedKey(for root: URL) -> String {
@@ -3505,15 +3514,14 @@ final class EventsWorkspace {
         }
         for asset in summary.assets where asset.archive != .present {
             // Family scope: the asset's own event resolves the folders —
-            // a subevent's copies live in its nested Card Copy, and its
+            // a subevent's copies live in its nested Originals, and its
             // archive layout nests under the parent's folders.
             let owner = self.event(asset.assignment.eventID) ?? event
-            let ownerPolicy = locations.resolvedPolicy(for: owner)
             let root: URL
-            if asset.drive == .present {
-                root = cardCopyRoot(owner, asset.assignment.deviceID, ownerPolicy)
-            } else if asset.otherDrive == .present {
-                root = cardCopyRoot(owner, asset.assignment.deviceID, ownerPolicy == .buffer ? .archiveOnly : .buffer)
+            if asset.drive == .present, let path = asset.driveRootPath {
+                root = foundRoot(path)
+            } else if asset.otherDrive == .present, let path = asset.otherDriveRootPath {
+                root = foundRoot(path)
             } else if asset.source == .present {
                 root = sourceRoots[asset.assignment.sourceRootPath] ?? {
                     let built = URL(fileURLWithPath: DashboardModel.expandedPath(asset.assignment.sourceRootPath), isDirectory: true)
@@ -3621,7 +3629,7 @@ final class EventsWorkspace {
             let owner = self.event(asset.assignment.eventID) ?? event
             let policy = locations.resolvedPolicy(for: owner)
             let eventFolderPath = locations.layout(for: owner, deviceID: nil).eventFolderPath
-            let deviceFolder = locations.layout(for: owner, deviceID: asset.assignment.deviceID).deviceFolder
+            let cameraFolder = locations.layout(for: owner, deviceID: asset.assignment.deviceID).cameraFolder
             let copies: [(CatalogPresenceState, String?, EventStoragePolicy)] = [
                 (asset.drive, asset.drivePath, policy),
                 (asset.otherDrive, asset.otherDrivePath, policy == .buffer ? .archiveOnly : .buffer),
@@ -3631,7 +3639,7 @@ final class EventsWorkspace {
                 pairs.append(VerifiedRemovalPair(
                     driveCopyPath: path,
                     referencePath: archive,
-                    batchRelativePath: "\(copyPolicy == .buffer ? "Buffer" : "Private")/\(eventFolderPath)/\(deviceFolder)/\(asset.assignment.relativePath)",
+                    batchRelativePath: "\(copyPolicy == .buffer ? "Buffer" : "Private")/\(eventFolderPath)/\(EventStorageLocations.originalsFolderName)/\(cameraFolder)/\(asset.assignment.relativePath)",
                     byteCount: asset.assignment.fileSize
                 ))
             }
@@ -3680,9 +3688,12 @@ final class EventsWorkspace {
         for asset in summary.assets where asset.isOnSeparateSource && asset.drive == .present {
             let sourceRoot = URL(fileURLWithPath: DashboardModel.expandedPath(asset.assignment.sourceRootPath), isDirectory: true)
             // Family scope: the drive copy the source is checked against
-            // sits in the asset's own event's nested Card Copy folder.
+            // sits in the asset's own event's nested Originals folder — or,
+            // on a drive not migrated yet, its legacy Card Copy — exactly
+            // where the presence sweep found it.
             let owner = self.event(asset.assignment.eventID) ?? event
-            let driveRoot = locations.cardCopyRoot(for: owner, deviceID: asset.assignment.deviceID, policy: locations.resolvedPolicy(for: owner))
+            let driveRoot = asset.driveRootPath.map { URL(fileURLWithPath: $0, isDirectory: true) }
+                ?? locations.originalsRoot(for: owner, deviceID: asset.assignment.deviceID, policy: locations.resolvedPolicy(for: owner))
             let key = sourceRoot.path + "\u{0}" + driveRoot.path
             groups[key, default: SourceCleanupGroup(sourceRoot: sourceRoot, driveRoot: driveRoot, files: [])].files.append(
                 FileRecord(path: asset.assignment.relativePath, size: asset.assignment.fileSize, modifiedAt: asset.assignment.modifiedAt)

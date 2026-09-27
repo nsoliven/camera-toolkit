@@ -130,6 +130,19 @@ public struct OrganizedArchiveLayout: Sendable {
     /// can join a larger relative path directly.
     public var eventFolderPath: String { (parentEventFolders + [eventFolder]).joined(separator: "/") }
 
+    /// The camera folder of the drive layout,
+    /// `<event>/Originals/<cameraFolder>/`: the device's display name
+    /// ("Sony A7V", "Osmo 360", "Osmo Nano"), the same name the boards'
+    /// camera chips print. A custom device id is its own name; no device
+    /// or the generic one is "Camera".
+    public var cameraFolder: String {
+        Self.pathComponent(CameraCatalog.camera(deviceID: deviceID)?.name ?? "", fallback: "Camera")
+    }
+
+    /// The device folder of the NAS archive layout
+    /// (`Originals/<year>/<event>/<deviceFolder>/RAW`) and of the legacy
+    /// drive layout (`<event>/<deviceFolder>/Card Copy`). The drive's
+    /// current layout uses `cameraFolder`.
     public var deviceFolder: String {
         switch deviceID {
         case "sony-a7v": "Sony A7V"
@@ -198,7 +211,7 @@ public struct OrganizedArchiveLayout: Sendable {
         return dayFormatter.date(from: prefix) == nil ? dayFormatter.string(from: Date()) : prefix
     }
 
-    private static func pathComponent(_ value: String, fallback: String) -> String {
+    static func pathComponent(_ value: String, fallback: String) -> String {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         let source = trimmed.isEmpty ? fallback : trimmed
         let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: " ._-'"))

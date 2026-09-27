@@ -311,10 +311,16 @@ struct EventsSidebar: View {
         let hasLocations = !workspace.unsortedLocations.isEmpty
         List(selection: $listSelection) {
             let discovered = workspace.discoveredDriveEvents(matching: query)
-            if !discovered.isEmpty {
+            let legacyFolders = workspace.legacyLayoutFolders
+            if !discovered.isEmpty || !legacyFolders.isEmpty {
                 Section("Found on Your Drive") {
-                    discoveryBanner(discovered)
-                        .guideHighlight(.discovered, in: workspace)
+                    if !discovered.isEmpty {
+                        discoveryBanner(discovered)
+                            .guideHighlight(.discovered, in: workspace)
+                    }
+                    if !legacyFolders.isEmpty {
+                        legacyLayoutBanner(legacyFolders)
+                    }
                 }
             }
 
@@ -409,6 +415,23 @@ struct EventsSidebar: View {
         .safeAreaBar(edge: .bottom) {
             SidebarFooter(model: model, workspace: workspace)
         }
+    }
+
+    /// Camera folders still in `<device>/Card Copy`. Their files keep
+    /// working in the meantime; the layout migration moves them into
+    /// `Originals/<Camera>` with journaled, undoable renames.
+    private func legacyLayoutBanner(_ folders: [DriveCameraFolder]) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("\(folders.count) camera folder\(folders.count == 1 ? " uses" : "s use") the old Card Copy layout.")
+                .font(.callout.weight(.semibold))
+                .fixedSize(horizontal: false, vertical: true)
+            Text("Files there still show on their events. The layout migration moves them into Originals/<Camera> without copying, and can be undone.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.vertical, 4)
+        .help(folders.prefix(8).map(\.cameraFolderPath).joined(separator: "\n"))
     }
 
     private func discoveryBanner(_ found: [DiscoveredDriveEvent]) -> some View {

@@ -369,11 +369,12 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
             .appendingPathComponent(folder.rawValue, isDirectory: true)
     }
 
+    /// `<event>/Originals/<Camera>` on the Buffer for the selected event and device.
     public func bufferBatchFolderPath() -> String {
         let layout = OrganizedArchiveLayout(configuration: self)
         return URL(fileURLWithPath: bufferEventFolderPath(), isDirectory: true)
-            .appendingPathComponent(layout.deviceFolder, isDirectory: true)
-            .appendingPathComponent("Card Copy", isDirectory: true)
+            .appendingPathComponent(EventStorageLocations.originalsFolderName, isDirectory: true)
+            .appendingPathComponent(layout.cameraFolder, isDirectory: true)
             .path
     }
 
@@ -392,31 +393,27 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         bufferBatchFolderPath()
     }
 
-    public func bufferExportsFolderPath() -> String {
-        URL(fileURLWithPath: bufferEventFolderPath(), isDirectory: true)
-            .appendingPathComponent("Exports", isDirectory: true)
-            .path
-    }
-
+    /// `<event>/Edited` — the owner's edits; each first-level folder in it
+    /// is an edit tag ("Photomator", "Masters", …).
     public func bufferEditsFolderPath() -> String {
         URL(fileURLWithPath: bufferEventFolderPath(), isDirectory: true)
-            .appendingPathComponent("Photomator", isDirectory: true)
+            .appendingPathComponent(EventStorageLocations.editedFolderName, isDirectory: true)
             .path
     }
 
-    public func bufferExportFolderPath(_ folderName: String) -> String {
-        URL(fileURLWithPath: bufferExportsFolderPath(), isDirectory: true)
+    /// `<event>/Edited/<folder>` — one edit tag's folder.
+    public func bufferEditedFolderPath(_ folderName: String) -> String {
+        URL(fileURLWithPath: bufferEditsFolderPath(), isDirectory: true)
             .appendingPathComponent(Self.pathComponent(folderName, fallback: "Masters"), isDirectory: true)
             .path
     }
 
+    /// The folders a new event starts with: the camera's `Originals`
+    /// folder and `Edited`.
     public func eventWorkspaceFolderPaths() -> [String] {
         [
             bufferBatchFolderPath(),
-            bufferEditsFolderPath(),
-            bufferExportFolderPath("Masters"),
-            bufferExportFolderPath("Web"),
-            bufferExportFolderPath("Social")
+            bufferEditsFolderPath()
         ]
     }
 

@@ -15,6 +15,22 @@ public struct EventAssetPresence: Identifiable, Hashable, Sendable {
     public var archive: CatalogPresenceState
     /// True when the assignment was adopted from a folder already on the drive.
     public var sourceIsDriveCopy: Bool
+    /// True when `drivePath` / `otherDrivePath` is the legacy
+    /// `<device>/Card Copy` copy: the drive has not been migrated to
+    /// `Originals/<Camera>` yet and the file was found only there.
+    public var driveIsLegacyLayout: Bool = false
+    public var otherDriveIsLegacyLayout: Bool = false
+
+    /// The folder `drivePath` sits in minus the assignment's relative path —
+    /// the root to pair with `assignment.relativePath` when the copy is
+    /// read or moved. Nil when the path does not end in the relative path.
+    public var driveRootPath: String? { Self.root(of: drivePath, relativePath: assignment.relativePath) }
+    public var otherDriveRootPath: String? { Self.root(of: otherDrivePath, relativePath: assignment.relativePath) }
+
+    static func root(of path: String?, relativePath: String) -> String? {
+        guard let path, path.hasSuffix("/" + relativePath) else { return nil }
+        return String(path.dropLast(relativePath.count + 1))
+    }
 
     public var bestLocalPath: String? {
         if drive == .present { return drivePath }
@@ -49,6 +65,8 @@ public struct EventPresenceSummary: Sendable {
     public var onArchive: Int { assets.count { $0.archive == .present } }
     public var archiveOffline: Bool { assets.contains { $0.archive == .unavailable } }
     public var driveOffline: Bool { assets.contains { $0.drive == .unavailable } }
+    /// Files found only in the legacy `Card Copy` layout.
+    public var onLegacyLayout: Int { assets.count { ($0.drive == .present && $0.driveIsLegacyLayout) || ($0.otherDrive == .present && $0.otherDriveIsLegacyLayout) } }
     public var missingEverywhere: Int { assets.count { $0.bestLocalPath == nil } }
 }
 
@@ -84,15 +102,23 @@ public enum EventPresenceScanner {
         // and each rebuild minted several DateFormatters — so they are
         // memoized here and per-file work is a string join plus the same
         // validation and standardization the public helpers apply.
-        var cardRoots: [String: URL] = [:]
+        var driveRoots: [String: URL] = [:]
+        var legacyRoots: [String: URL] = [:]
         var layouts: [String: OrganizedArchiveLayout] = [:]
         var validRelative: [String: Bool] = [:]
 
-        func cardCopyRoot(_ policy: EventStoragePolicy, _ deviceID: String?) -> URL {
+        func originalsRoot(_ policy: EventStoragePolicy, _ deviceID: String?) -> URL {
             let key = "\(policy.rawValue)\u{0}\(deviceID ?? "")"
-            if let cached = cardRoots[key] { return cached }
-            let root = locations.cardCopyRoot(for: event, deviceID: deviceID, policy: policy)
-            cardRoots[key] = root
+            if let cached = driveRoots[key] { return cached }
+            let root = locations.originalsRoot(for: event, deviceID: deviceID, policy: policy)
+            driveRoots[key] = root
+            return root
+        }
+        func legacyRoot(_ policy: EventStoragePolicy, _ deviceID: String?) -> URL {
+            let key = "\(policy.rawValue)\u{0}\(deviceID ?? "")"
+            if let cached = legacyRoots[key] { return cached }
+            let root = locations.legacyCardCopyRoot(for: event, deviceID: deviceID, policy: policy)
+            legacyRoots[key] = root
             return root
         }
         func layout(_ deviceID: String?) -> OrganizedArchiveLayout {
@@ -115,22 +141,22 @@ public enum EventPresenceScanner {
         assets.reserveCapacity(assignments.count)
         for assignment in assignments {
             if Task<Never, Never>.isCancelled { return nil }
-            let (source, drive, other, archive) = autoreleasepool { () -> (URL?, URL?, URL?, URL?) in
+            let (source, drive, other, archive, legacyDrive, legacyOther) = autoreleasepool {
+                () -> (URL?, URL?, URL?, URL?, URL?, URL?) in
                 let valid = isValidRelative(assignment.relativePath)
                 let source = locations.sourceURL(for: assignment)
-                let drive = valid ? cardCopyRoot(policy, assignment.deviceID)
-                    .appendingPathComponent(assignment.relativePath)
-                    .standardizedFileURL : nil
-                let other = valid ? cardCopyRoot(otherPolicy, assignment.deviceID)
-                    .appendingPathComponent(assignment.relativePath)
-                    .standardizedFileURL : nil
+                func join(_ root: URL) -> URL? {
+                    valid ? root.appendingPathComponent(assignment.relativePath).standardizedFileURL : nil
+                }
                 let archive = try? layout(assignment.deviceID)
                     .destinationRelativePath(for: assignment.relativePath)
                 return (
                     source,
-                    drive,
-                    other,
-                    archive.map { locations.libraryRoot.appendingPathComponent($0).standardizedFileURL }
+                    join(originalsRoot(policy, assignment.deviceID)),
+                    join(originalsRoot(otherPolicy, assignment.deviceID)),
+                    archive.map { locations.libraryRoot.appendingPathComponent($0).standardizedFileURL },
+                    join(legacyRoot(policy, assignment.deviceID)),
+                    join(legacyRoot(otherPolicy, assignment.deviceID))
                 )
             }
             if let pauseGate {
@@ -141,25 +167,42 @@ public enum EventPresenceScanner {
                     ) else { return nil }
                 }
             }
-            // Both candidates are already `standardizedFileURL` paths, so
+            // Every candidate is already a `standardizedFileURL` path, so
             // `pathKey` on them reduces to a lowercase compare — no extra
             // standardize (or stat) per file.
             let sourceKey = source?.path.lowercased()
-            let sourceIsDrive = sourceKey != nil && [drive, other].contains {
+            let sourceIsDrive = sourceKey != nil && [drive, other, legacyDrive, legacyOther].contains {
                 $0?.path.lowercased() == sourceKey
             }
+            // The current layout first. A copy missing there is looked for
+            // in the legacy `Card Copy` folder, so a drive that has not been
+            // migrated yet still shows its files; an offline drive is not
+            // probed twice.
+            func resolve(_ current: URL?, _ legacy: URL?) -> (URL?, CatalogPresenceState, Bool) {
+                let state = probe(current, assignment.fileSize, mounted)
+                guard state == .missing, let legacy else { return (current, state, false) }
+                let legacyState = probe(legacy, assignment.fileSize, mounted)
+                return legacyState == .present ? (legacy, .present, true) : (current, state, false)
+            }
+            // Probe order stays source, drive, other drive, archive.
+            let sourceState = probe(source, assignment.fileSize, mounted)
+            let driveResolved = resolve(drive, legacyDrive)
+            let otherResolved = resolve(other, legacyOther)
+            let archiveState = probe(archive, assignment.fileSize, mounted)
             assets.append(EventAssetPresence(
                 id: CatalogStore.eventAssetID(assignment),
                 assignment: assignment,
                 sourcePath: source?.path,
-                drivePath: drive?.path,
-                otherDrivePath: other?.path,
+                drivePath: driveResolved.0?.path,
+                otherDrivePath: otherResolved.0?.path,
                 archivePath: archive?.path,
-                source: probe(source, assignment.fileSize, mounted),
-                drive: probe(drive, assignment.fileSize, mounted),
-                otherDrive: probe(other, assignment.fileSize, mounted),
-                archive: probe(archive, assignment.fileSize, mounted),
-                sourceIsDriveCopy: sourceIsDrive
+                source: sourceState,
+                drive: driveResolved.1,
+                otherDrive: otherResolved.1,
+                archive: archiveState,
+                sourceIsDriveCopy: sourceIsDrive,
+                driveIsLegacyLayout: driveResolved.2,
+                otherDriveIsLegacyLayout: otherResolved.2
             ))
         }
         return EventPresenceSummary(eventID: event.id, policy: policy, assets: assets, checkedAt: Date())
