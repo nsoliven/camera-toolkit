@@ -34,6 +34,8 @@ public struct NASLayoutMigrationReport: Sendable {
 ///    emptied — never a delete of anything with content.
 public final class NASLayoutMigrationExecutor {
     public static let markerKey = "nasLayoutMigration"
+    /// Largest file the sampled hash picks when an event has smaller ones.
+    public static let sampleByteLimit: Int64 = 1 << 30
 
     public struct Hooks {
         public var afterJournal: (() throws -> Void)?
@@ -231,7 +233,7 @@ public final class NASLayoutMigrationExecutor {
                 journal.catalogCommittedAt = now()
                 journal.phase = .catalogCommitted
                 try save(&journal, to: journalURL)
-                lines.append("Catalog: \(plan.catalog.facePhotoRewrites.count) face photo rows and \(plan.catalog.syncRecordRewrites.count) sync records rewritten and verified.")
+                lines.append("Catalog: \(plan.catalog.facePhotoRewrites.count) face photo rows, \(plan.catalog.syncRecordRewrites.count) sync records, \((plan.catalog.assignmentRewrites ?? []).count) assignments and \((plan.catalog.eventRenames ?? []).count) event renames rewritten and verified.")
                 try hooks.afterCatalogCommit?()
             }
             if journal.phase == .catalogCommitted {
@@ -357,7 +359,11 @@ public final class NASLayoutMigrationExecutor {
 
     /// Up to `verifySamples` media files per event, spread over the event.
     private func sampleIndices(_ event: NASLayoutMigrationPlan.Event) -> Set<Int> {
-        let media = event.moves.indices.filter { event.moves[$0].kind == .media && event.moves[$0].companionOf == nil }
+        let allMedia = event.moves.indices.filter { event.moves[$0].kind == .media && event.moves[$0].companionOf == nil }
+        // Up to 1 GiB each where the event has such files: a rename moves no
+        // bytes, and a sample of a 17 GB clip would cost minutes over SMB.
+        let small = allMedia.filter { event.moves[$0].byteCount <= Self.sampleByteLimit }
+        let media = small.isEmpty ? Array(allMedia.sorted { event.moves[$0].byteCount < event.moves[$1].byteCount }.prefix(1)) : small
         guard verifySamples > 0, !media.isEmpty else { return [] }
         let count = min(verifySamples, media.count)
         return Set((0..<count).map { media[($0 * media.count) / count] })
@@ -457,6 +463,46 @@ public final class NASLayoutMigrationExecutor {
             let violationsBefore = Set(try CatalogStateStore.foreignKeyViolations(db))
             let confirmedBefore = try db.tableExists("faces") ? try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM faces WHERE state = 'confirmed'") ?? 0 : 0
             let temporary = "nas-layout-migration-tmp|"
+            // Assignments whose source is a moved NAS file: two steps
+            // through a temporary id; presence and Immich rows follow.
+            let assignmentRewrites = changes.assignmentRewrites ?? []
+            for rewrite in assignmentRewrites {
+                try db.execute(
+                    sql: "UPDATE event_assets SET id = ?, source_root_path = ?, relative_path = ?, updated_at = ? WHERE id = ?",
+                    arguments: [temporary + rewrite.newID, rewrite.newSourceRootPath, rewrite.newRelativePath, nowText, rewrite.oldID]
+                )
+                guard db.changesCount == 1 else {
+                    throw ToolkitError.commandFailed("Assignment \(rewrite.oldID) was not found; nothing was written to the catalog.")
+                }
+                for table in ["event_asset_locations", "immich_assets"] where try db.tableExists(table) {
+                    try db.execute(sql: "UPDATE \(table) SET event_asset_id = ? WHERE event_asset_id = ?", arguments: [temporary + rewrite.newID, rewrite.oldID])
+                }
+            }
+            for rewrite in assignmentRewrites {
+                try db.execute(sql: "UPDATE event_assets SET id = ? WHERE id = ?", arguments: [rewrite.newID, temporary + rewrite.newID])
+                for table in ["event_asset_locations", "immich_assets"] where try db.tableExists(table) {
+                    try db.execute(sql: "UPDATE \(table) SET event_asset_id = ? WHERE event_asset_id = ?", arguments: [rewrite.newID, temporary + rewrite.newID])
+                }
+            }
+            // Catalog event renames, through the store the app writes
+            // events with: only the renamed events' rows change.
+            let renames = changes.eventRenames ?? []
+            if !renames.isEmpty {
+                let stateBefore = try CatalogStateStore.load(db)
+                var stateAfter = stateBefore
+                for rename in renames {
+                    guard let index = stateAfter.savedEvents.firstIndex(where: { $0.id == rename.eventID }),
+                          stateAfter.savedEvents[index].name == rename.oldName else {
+                        throw ToolkitError.commandFailed("The catalog event \(rename.oldName) changed; nothing was written to the catalog.")
+                    }
+                    stateAfter.savedEvents[index].name = rename.newName
+                }
+                let written = try CatalogStateStore.write(from: stateBefore, to: stateAfter, database: db)
+                guard written.eventsWritten == renames.count, written.eventsDeleted == 0, written.assignmentsWritten == 0,
+                      written.assignmentsDeleted == 0 else {
+                    throw ToolkitError.commandFailed("The event renames touched more than the renamed events; nothing was written to the catalog.")
+                }
+            }
             for rewrite in changes.facePhotoRewrites {
                 try db.execute(
                     sql: "UPDATE face_photos SET path_key = ?, path = ?, file_name = ?, updated_at = ? WHERE path_key = ?",
@@ -535,6 +581,28 @@ public final class NASLayoutMigrationExecutor {
                     failures.append("face photo \(rewrite.newPath) points at a file that is not there")
                 }
             }
+            for rewrite in assignmentRewrites {
+                if try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM event_assets WHERE id = ?", arguments: [rewrite.newID]) != 1 {
+                    failures.append("assignment \(rewrite.newID) is missing")
+                }
+            }
+            if !renames.isEmpty {
+                // The app computes each renamed event's NAS folder from the
+                // catalog as it now reads.
+                let state = try CatalogStateStore.load(db)
+                var configuration = self.configuration
+                configuration.savedEvents = state.savedEvents
+                let locations = EventStorageLocations(configuration: configuration)
+                for rename in renames {
+                    guard let event = state.savedEvents.first(where: { $0.id == rename.eventID }) else {
+                        failures.append("event \(rename.eventID) is missing")
+                        continue
+                    }
+                    if event.name != rename.newName { failures.append("event \(rename.eventID) is named \(event.name), not \(rename.newName)") }
+                    let folder = locations.layout(for: event, deviceID: nil).mirrorEventFolderPath
+                    if folder != rename.newMirrorFolder { failures.append("event \(rename.newName) resolves to \(folder), not \(rename.newMirrorFolder)") }
+                }
+            }
             guard failures.isEmpty else {
                 throw ToolkitError.commandFailed("The catalog rewrite failed its checks and was rolled back:\n- " + failures.joined(separator: "\n- "))
             }
@@ -565,8 +633,14 @@ public final class NASLayoutMigrationExecutor {
 
     private func removeEmptiedFolders(plan: NASLayoutMigrationPlan, journal: inout NASLayoutMigrationJournal) {
         var removed = Set(journal.removedDirectories)
-        for event in plan.events {
-            for path in event.sourceDirectories where !removed.contains(path) {
+        // Every event's folders together, deepest first: a parent shared by
+        // two events is tried only after both emptied their folders.
+        let all = Set(plan.events.flatMap(\.sourceDirectories) + (plan.sourceDirectories ?? [])).sorted {
+            let a = $0.split(separator: "/").count, b = $1.split(separator: "/").count
+            return a == b ? $0 > $1 : a > b
+        }
+        do {
+            for path in all where !removed.contains(path) {
                 guard LayoutMigrationDisk.lstatEntry(path)?.kind == .directory else { continue }
                 if rmdir(path) == 0 {
                     journal.removedDirectories.append(path)

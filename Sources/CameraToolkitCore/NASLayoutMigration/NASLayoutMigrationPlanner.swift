@@ -37,7 +37,7 @@ public struct NASLayoutMigrationPlanner {
         }
     }
 
-    private let now: () -> Date
+    let now: () -> Date
 
     public init(now: @escaping () -> Date = { Date() }) {
         self.now = now
@@ -88,6 +88,7 @@ public struct NASLayoutMigrationPlanner {
     }
 
     public func plan(_ inputs: Inputs) throws -> NASLayoutMigrationPlan {
+        if inputs.mapping.isFileMode { return try planFiles(inputs) }
         let mapping = inputs.mapping
         let locations = EventStorageLocations(configuration: inputs.configuration)
         let legacyRoot = URL(fileURLWithPath: NSString(string: mapping.legacyRoot
@@ -522,61 +523,9 @@ public struct NASLayoutMigrationPlanner {
         }
 
         // The catalog: rows that name a moved NAS path.
-        var catalog = NASLayoutMigrationPlan.CatalogChanges(
-            facePhotoRewrites: [], orientationCopies: [], burstSplitRewrites: [], syncRecordRewrites: [],
-            tableCounts: [:], confirmedFaces: 0, markerKey: NASLayoutMigrationExecutor.markerKey
-        )
-        var catalogDigest: String?
+        let catalog = Self.catalogChanges(snapshot: snapshot, moves: events.flatMap(\.moves), blockers: &blockers)
+        let catalogDigest = snapshot?.digest
         if let snapshot {
-            let moves = events.flatMap(\.moves)
-            var moveBySource: [String: NASLayoutMigrationPlan.Move] = [:]
-            for move in moves where move.companionOf == nil { moveBySource[move.source.lowercased()] = move }
-            catalogDigest = snapshot.digest
-            catalog.tableCounts = snapshot.base.tableCounts
-            catalog.confirmedFaces = snapshot.base.confirmedFaces
-            let existingKeys = Set(snapshot.base.facePhotos.map(\.pathKey))
-            var movingAway = Set<String>()
-            for photo in snapshot.base.facePhotos {
-                guard let move = moveBySource[photo.pathKey] else { continue }
-                let newKey = EventStorageLocations.pathKey(move.destination)
-                catalog.facePhotoRewrites.append(.init(
-                    oldPathKey: photo.pathKey,
-                    newPathKey: newKey,
-                    newPath: move.destination,
-                    newFileName: (move.destination as NSString).lastPathComponent,
-                    confirmedFaceCount: photo.confirmedFaceCount
-                ))
-                movingAway.insert(photo.pathKey)
-            }
-            for rewrite in catalog.facePhotoRewrites where existingKeys.contains(rewrite.newPathKey) && !movingAway.contains(rewrite.newPathKey) {
-                blockers.append("A face photo row already exists for \(rewrite.newPath); re-keying \(rewrite.oldPathKey) onto it would merge two photos.")
-            }
-            for move in moves where move.renamed && move.companionOf == nil {
-                let date = Date(timeIntervalSinceReferenceDate: move.modifiedAt)
-                let oldKey = FaceIndexStore.fileKey(fileName: (move.source as NSString).lastPathComponent, byteCount: move.byteCount, modifiedAt: date)
-                let newKey = FaceIndexStore.fileKey(fileName: (move.destination as NSString).lastPathComponent, byteCount: move.byteCount, modifiedAt: date)
-                if let turns = snapshot.base.state.displayOrientations[oldKey], snapshot.base.state.displayOrientations[newKey] == nil {
-                    catalog.orientationCopies.append(.init(oldKey: oldKey, newKey: newKey, quarterTurns: turns))
-                }
-            }
-            for split in snapshot.base.state.burstSplits {
-                let mapped = split.memberPathKeys.map { key in moveBySource[key].map { EventStorageLocations.pathKey($0.destination) } ?? key }
-                if mapped != split.memberPathKeys {
-                    catalog.burstSplitRewrites.append(.init(id: split.id, oldMemberPathKeys: split.memberPathKeys, newMemberPathKeys: mapped))
-                }
-            }
-            for row in snapshot.syncRecords {
-                guard let move = moveBySource[(row.nasRoot + "/" + row.relativePath).lowercased()] else { continue }
-                guard move.destination.hasPrefix(row.nasRoot + "/") else {
-                    blockers.append("A Sync to NAS record for \(row.relativePath) would move outside its NAS root \(row.nasRoot).")
-                    continue
-                }
-                catalog.syncRecordRewrites.append(.init(
-                    nasRoot: row.nasRoot,
-                    oldPathKey: row.pathKey,
-                    newRelativePath: String(move.destination.dropFirst(row.nasRoot.count + 1))
-                ))
-            }
             // Assignments adopted from a NAS folder would need their ids
             // re-derived; the app never adopts from the NAS, so refuse.
             let prefixes = events.map { $0.sourcePath.lowercased() + "/" }

@@ -40,6 +40,11 @@ public struct NASLayoutMigrationPlan: Codable, Equatable, Sendable {
     public var catalog: CatalogChanges
     public var fingerprint: Fingerprint
     public var summary: Summary
+    /// Per-file mode: every source folder the moves may empty (absolute,
+    /// deepest first), removed with `rmdir` once the catalog is committed.
+    public var sourceDirectories: [String]?
+    /// Per-file mode: what the reviewed CSV asked for.
+    public var fileMapping: FileMappingSummary?
 
     public var isExecutable: Bool { blockers.isEmpty }
     public var allMoves: [Move] { events.flatMap(\.moves) }
@@ -141,6 +146,67 @@ public struct NASLayoutMigrationPlan: Codable, Equatable, Sendable {
         public var newRelativePath: String
     }
 
+    /// A catalog event renamed in the catalog transaction.
+    public struct EventRenameChange: Codable, Equatable, Sendable {
+        public enum DriveFolderState: String, Codable, Equatable, Sendable {
+            /// No drive folder under the old name: nothing to rename there.
+            case absent
+            /// A Buffer or private-staging folder has the old name — it must
+            /// be renamed with the event (a blocker until it is).
+            case present
+            /// The drive is not mounted; it could not be checked.
+            case offline
+        }
+
+        public var eventID: UUID
+        public var oldName: String
+        public var newName: String
+        /// Mirror-root-relative `<year>/<yyyy-MM-dd> <name>`, before and after.
+        public var oldMirrorFolder: String
+        public var newMirrorFolder: String
+        /// The event's drive folder (Buffer or private staging), before and after.
+        public var oldDriveFolder: String
+        public var newDriveFolder: String
+        public var driveFolderState: DriveFolderState
+        /// Assignments whose source root lies inside the old drive folder
+        /// (adopted drive copies). Reported; their rows are not rewritten.
+        public var assignmentsUnderOldDriveFolder: Int
+    }
+
+    /// A catalog event whose NAS folder the file mapping fills: its
+    /// assignments decide the subfolder under `Originals/<Camera>/` each of
+    /// its files lands in, so presence finds them where the app looks.
+    public struct AttachedEvent: Codable, Equatable, Sendable {
+        public var eventID: UUID
+        public var name: String
+        public var mirrorFolder: String
+        public var assignments: Int
+        /// Assignments with exactly one file of that name and size in the event's folder.
+        public var matched: Int
+        /// Matched files already at the app's path.
+        public var alreadyAligned: Int
+        /// Matched files moved to the app's path instead of the CSV's.
+        public var aligned: Int
+        /// Same-name sidecars that followed an aligned file.
+        public var followers: Int
+        /// Matched files kept at the CSV's path because the app's path
+        /// holds a character SMB cannot store portably.
+        public var keptNonPortable: Int
+        public var unmatched: Int
+    }
+
+    public struct FileMappingSummary: Codable, Equatable, Sendable {
+        public var digest: String
+        public var rows: Int
+        public var moves: Int
+        /// AppleDouble twins moved that the CSV did not list.
+        public var unlistedTwins: Int
+        public var stays: Int
+        /// Files the CSV sends somewhere other than the app's path, moved to
+        /// the app's path for a catalog event (see `catalog.attachedEvents`).
+        public var alignedToCatalog: Int
+    }
+
     public struct CatalogChanges: Codable, Equatable, Sendable {
         public var facePhotoRewrites: [FacePhotoRewrite]
         public var orientationCopies: [LayoutMigrationPlan.OrientationCopy]
@@ -149,9 +215,15 @@ public struct NASLayoutMigrationPlan: Codable, Equatable, Sendable {
         public var tableCounts: [String: Int]
         public var confirmedFaces: Int
         public var markerKey: String
+        /// Assignments whose source file is a moved NAS file (their id
+        /// changes; presence and Immich rows follow).
+        public var assignmentRewrites: [LayoutMigrationPlan.AssignmentRewrite]?
+        public var eventRenames: [EventRenameChange]?
+        public var attachedEvents: [AttachedEvent]?
 
         public var isEmpty: Bool {
             facePhotoRewrites.isEmpty && orientationCopies.isEmpty && burstSplitRewrites.isEmpty && syncRecordRewrites.isEmpty
+                && (assignmentRewrites ?? []).isEmpty && (eventRenames ?? []).isEmpty
         }
     }
 
@@ -213,8 +285,22 @@ extension NASLayoutMigrationPlan {
         lines.append("Unknown camera folders (kept verbatim): \(s.unknownCameras)")
         lines.append("Kept subfolders under Originals/<Camera>: \(s.keptSubfolders); files put back in their catalog subfolder: \(s.knownSubfolderFiles)")
         lines.append("Left in place: \(s.leftInPlace); unreadable (skipped, reported): \(s.unreadable); refused: \(s.refused)")
-        lines.append("Catalog: \(s.facePhotoRewrites) face photo rows re-keyed, \(s.syncRecordRewrites) sync records, \(catalog.orientationCopies.count) rotation copies, \(catalog.burstSplitRewrites.count) burst splits")
+        lines.append("Catalog: \(s.facePhotoRewrites) face photo rows re-keyed, \(s.syncRecordRewrites) sync records, \(catalog.orientationCopies.count) rotation copies, \(catalog.burstSplitRewrites.count) burst splits, \((catalog.assignmentRewrites ?? []).count) assignments re-pointed, \(catalog.confirmedFaces) confirmed faces kept")
+        if let file = fileMapping {
+            lines.append("File mapping: sha256 \(file.digest); \(file.rows) rows, \(file.moves) to move, \(file.stays) to stay; \(file.unlistedTwins) unlisted AppleDouble twins follow their file; \(file.alignedToCatalog) moved to the catalog event's path instead of the CSV's")
+            lines.append("Emptied source folders to rmdir afterwards (only if empty): \((sourceDirectories ?? []).count) candidates")
+        }
+        for rename in catalog.eventRenames ?? [] {
+            lines.append("Catalog event rename: \"\(rename.oldName)\" → \"\(rename.newName)\" (\(rename.eventID.uuidString)); NAS folder \(rename.oldMirrorFolder) → \(rename.newMirrorFolder); drive folder \(rename.driveFolderState.rawValue): \(rename.oldDriveFolder)\(rename.assignmentsUnderOldDriveFolder > 0 ? "; \(rename.assignmentsUnderOldDriveFolder) assignment(s) name a source root inside it (left as they are)" : "")")
+        }
+        for attached in catalog.attachedEvents ?? [] {
+            lines.append("Catalog event \"\(attached.name)\" → \(attached.mirrorFolder): \(attached.assignments) assignments, \(attached.matched) matched (\(attached.alreadyAligned) already at the app's path, \(attached.aligned) moved there, \(attached.followers) sidecars followed, \(attached.keptNonPortable) kept at the CSV path: not SMB-portable), \(attached.unmatched) unmatched")
+        }
         for event in events {
+            if fileMapping != nil {
+                lines.append("  \(event.destination)  ←  \(event.source) — \(event.moves.count) files, \(bytes(event.byteCount))")
+                continue
+            }
             lines.append("  \(event.source)  →  \(event.destination)")
             for camera in event.cameras {
                 lines.append("      \(camera.sourceFolder) → Originals/\(camera.camera)\(camera.known ? "" : " (unknown name, kept)") — \(camera.files) files")

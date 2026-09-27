@@ -14,13 +14,17 @@ public struct DirectoryListingEntry: Equatable, Hashable, Sendable {
     /// The file id the filesystem reports. Not stable over SMB — never an
     /// identity on a network share, only a hint.
     public var fileID: UInt64
+    /// Whether this user may read the entry, as the listing reports it
+    /// (`ATTR_CMN_USERACCESS`). True when the filesystem does not say.
+    public var isReadable: Bool
 
-    public init(name: String, kind: Kind, size: Int64, modifiedAt: Double, fileID: UInt64) {
+    public init(name: String, kind: Kind, size: Int64, modifiedAt: Double, fileID: UInt64, isReadable: Bool = true) {
         self.name = name
         self.kind = kind
         self.size = size
         self.modifiedAt = modifiedAt
         self.fileID = fileID
+        self.isReadable = isReadable
     }
 }
 
@@ -54,7 +58,7 @@ public enum DirectoryListing {
         var request = attrlist()
         request.bitmapcount = u_short(ATTR_BIT_MAP_COUNT)
         request.commonattr = attrgroup_t(ATTR_CMN_RETURNED_ATTRS) | attrgroup_t(ATTR_CMN_NAME) | attrgroup_t(ATTR_CMN_OBJTYPE)
-            | attrgroup_t(ATTR_CMN_MODTIME) | attrgroup_t(ATTR_CMN_FILEID)
+            | attrgroup_t(ATTR_CMN_MODTIME) | attrgroup_t(ATTR_CMN_USERACCESS) | attrgroup_t(ATTR_CMN_FILEID)
         request.fileattr = attrgroup_t(ATTR_FILE_DATALENGTH)
         let bufferSize = 256 * 1024
         let buffer = UnsafeMutableRawPointer.allocate(byteCount: bufferSize, alignment: 16)
@@ -90,6 +94,10 @@ public enum DirectoryListing {
                 field = field.advanced(by: MemoryLayout<fsobj_type_t>.size)
                 let modified = field.loadUnaligned(as: timespec.self)
                 field = field.advanced(by: MemoryLayout<timespec>.size)
+                // ATTR_CMN_USERACCESS packs before ATTR_CMN_FILEID (bit order).
+                let access = field.loadUnaligned(as: UInt32.self)
+                let accessReturned = returned.commonattr & attrgroup_t(ATTR_CMN_USERACCESS) != 0
+                field = field.advanced(by: MemoryLayout<UInt32>.size)
                 let fileID = field.loadUnaligned(as: UInt64.self)
                 field = field.advanced(by: MemoryLayout<UInt64>.size)
                 var size: Int64 = 0
@@ -110,7 +118,8 @@ public enum DirectoryListing {
                         kind: kind,
                         size: kind == .file ? size : 0,
                         modifiedAt: Date(timeIntervalSince1970: seconds).timeIntervalSinceReferenceDate,
-                        fileID: fileID
+                        fileID: fileID,
+                        isReadable: !accessReturned || access & UInt32(R_OK) != 0
                     ))
                 }
                 entry = entry.advanced(by: length)
@@ -144,7 +153,8 @@ public enum DirectoryListing {
                 kind: kind,
                 size: kind == .file ? Int64(info.st_size) : 0,
                 modifiedAt: Date(timeIntervalSince1970: seconds).timeIntervalSinceReferenceDate,
-                fileID: UInt64(info.st_ino)
+                fileID: UInt64(info.st_ino),
+                isReadable: access(child, R_OK) == 0
             ))
         }
         return entries.sorted { $0.name < $1.name }
