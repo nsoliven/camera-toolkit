@@ -29,11 +29,11 @@ public struct EventAssetPresence: Identifiable, Hashable, Sendable {
     /// copy, or a file that only happens to have the right size.
     public var archiveVerifiedAt: Date?
 
-    /// A NAS copy Take Off Drive may rely on: verified by Sync to NAS, or
-    /// archived (and SHA-256 checked) by the legacy archive before the
-    /// mirror layout. Take Off Drive re-hashes it either way.
+    /// A NAS copy Take Off Drive may rely on: one Sync to NAS verified by
+    /// re-reading it. A legacy-layout copy is not — migrate the event, then
+    /// Sync to NAS verifies it in place. Take Off Drive re-hashes it anyway.
     public var archiveIsTrusted: Bool {
-        archive == .present && (archiveVerifiedAt != nil || archiveIsLegacyLayout)
+        archive == .present && archiveVerifiedAt != nil && !archiveIsLegacyLayout
     }
 
     /// The folder `drivePath` sits in minus the assignment's relative path —

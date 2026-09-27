@@ -3650,6 +3650,9 @@ final class EventsWorkspace {
                 if !report.failed.isEmpty { parts.append("\(report.failed.count) failed and skipped") }
                 if report.notAttempted > 0 { parts.append("\(report.notAttempted) not attempted") }
                 if !outcome.plan.outsideLayout.isEmpty { parts.append("\(outcome.plan.outsideLayout.count) folder(s) outside Originals/Edited not synced") }
+                if !outcome.plan.inLegacyLayout.isEmpty {
+                    parts.append("\(outcome.plan.inLegacyLayout.count) already on the NAS in the old archive layout, not copied again (run the NAS layout migration for this event, then sync)")
+                }
                 if !outcome.plan.unreadable.isEmpty { parts.append("\(outcome.plan.unreadable.count) drive folder(s) unreadable") }
                 var summary = "Sync to NAS for \(title): " + parts.joined(separator: ", ") + "."
                 if let stopped = report.stoppedReason { summary += " " + stopped }
@@ -3673,6 +3676,7 @@ final class EventsWorkspace {
             var refused: [NASSyncIssue]
             var unreadable: [NASSyncIssue]
             var skippedJunk: Int
+            var inLegacyLayout: [String]
         }
         do {
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
@@ -3690,7 +3694,8 @@ final class EventsWorkspace {
                 outsideLayout: plan.outsideLayout,
                 refused: plan.refused,
                 unreadable: plan.unreadable,
-                skippedJunk: plan.skippedJunk
+                skippedJunk: plan.skippedJunk,
+                inLegacyLayout: plan.inLegacyLayout
             )).write(to: url, options: .withoutOverwriting)
             return url.path
         } catch {
@@ -3740,8 +3745,8 @@ final class EventsWorkspace {
         guard let event = event(eventID), let summary = presence[eventID] else { return }
         let locations = self.locations
         var pairs: [VerifiedRemovalPair] = []
-        // Only NAS copies Sync to NAS verified (or the legacy archive
-        // checked); VerifiedRemovalService re-hashes each pair regardless.
+        // Only NAS copies Sync to NAS verified; VerifiedRemovalService
+        // re-hashes each pair regardless.
         for asset in summary.assets where asset.archiveIsTrusted {
             guard let archive = asset.archivePath else { continue }
             // Family scope: each asset's folders resolve through its own

@@ -301,6 +301,44 @@ final class NASSyncTests: XCTestCase {
         }
     }
 
+    func testFilesAlreadyInTheLegacyArchiveLayoutAreNotCopiedAgainOrTrusted() throws {
+        try withTemporaryDirectory { root in
+            var f = try fixture(root)
+            // The legacy archive lives under the library root, the mirror
+            // under the NAS root; put the library on the same "NAS".
+            f.configuration.cameraLibraryRootPath = f.nas.path
+            f.locations = EventStorageLocations(configuration: f.configuration)
+            let expected = try populate(f)
+            let osmo = f.locations.originalsRoot(for: f.event, deviceID: "osmo-360", policy: .buffer)
+            let assignment = PhotoEventAssignment(sourceRootPath: osmo.path, relativePath: "CAM_0001.OSV", fileSize: 5_000, modifiedAt: Date(), eventID: f.event.id, deviceID: "osmo-360")
+            // Archived the old way: same size under Video/.
+            try writeFile(try XCTUnwrap(f.locations.legacyArchiveURL(for: assignment, event: f.event)), Data(repeating: 3, count: 5_000))
+            // DSC00001.ARW and Transfer 2/DSC00001.ARW both flatten to one
+            // legacy RAW/DSC00001.ARW of the same size: ambiguous, so
+            // neither is held back.
+            let sony = PhotoEventAssignment(sourceRootPath: osmo.path, relativePath: "DSC00001.ARW", fileSize: 3_000, modifiedAt: Date(), eventID: f.event.id, deviceID: "sony-a7v")
+            try writeFile(try XCTUnwrap(f.locations.legacyArchiveURL(for: sony, event: f.event)), Data(repeating: 2, count: 3_000))
+
+            let plan = NASSyncPlanner.plan(events: [f.event, f.child], locations: f.locations)
+            let mirror = "2026/2026-08-26 Mountain Trip/Originals/Osmo 360/CAM_0001.OSV"
+            XCTAssertEqual(plan.inLegacyLayout, [mirror])
+            XCTAssertFalse(plan.items.contains { $0.relativePath == mirror })
+            XCTAssertEqual(plan.items.count, expected.count - 1)
+            let report = try NASSyncService(store: nil).sync(plan, nasRoot: f.nas)
+            XCTAssertTrue(report.succeeded)
+            XCTAssertNil(LayoutMigrationDisk.lstatEntry(f.nas.appendingPathComponent(mirror).path))
+            XCTAssertTrue(report.copied.contains("2026/2026-08-26 Mountain Trip/Originals/Sony A7V/DSC00001.ARW"))
+            XCTAssertTrue(report.copied.contains("2026/2026-08-26 Mountain Trip/Originals/Sony A7V/Transfer 2/DSC00001.ARW"))
+
+            // The legacy copy shows as on the NAS but cannot justify Take
+            // Off Drive until it is migrated and verified.
+            let summary = try XCTUnwrap(EventPresenceScanner.scan(event: f.event, assignments: [assignment], locations: f.locations))
+            XCTAssertEqual(summary.onArchive, 1)
+            XCTAssertEqual(summary.onLegacyArchiveLayout, 1)
+            XCTAssertFalse(try XCTUnwrap(summary.assets.first).archiveIsTrusted)
+        }
+    }
+
     func testPresenceSaysWhichNASCopiesSyncVerified() throws {
         try withTemporaryDirectory { root in
             let f = try fixture(root)

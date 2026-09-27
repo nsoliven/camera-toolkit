@@ -43,6 +43,11 @@ public struct NASSyncPlan: Sendable {
     public var refused: [NASSyncIssue]
     /// Folders that could not be listed.
     public var unreadable: [NASSyncIssue]
+    /// Drive files already on the NAS in the legacy archive layout
+    /// (`Originals/<year>/<event>/<device>/RAW|JPEG|…`, same size). Not
+    /// copied again — that would duplicate the event on the NAS; migrate
+    /// the event with `--migrate-nas-layout`, then sync verifies it.
+    public var inLegacyLayout: [String] = []
 
     public var totalBytes: Int64 { items.reduce(0) { $0 + $1.byteCount } }
 }
@@ -59,7 +64,9 @@ public enum NASSyncPlanner {
         name.hasPrefix("._") || name == ".DS_Store" || name.contains(temporaryMarker)
     }
 
-    public static func plan(events: [SavedCameraEvent], locations: EventStorageLocations) -> NASSyncPlan {
+    /// `checkLegacyLayout` lists the legacy archive folders of each event
+    /// (on the NAS) so a file archived the old way is not copied twice.
+    public static func plan(events: [SavedCameraEvent], locations: EventStorageLocations, checkLegacyLayout: Bool = true) -> NASSyncPlan {
         var plan = NASSyncPlan(items: [], outsideLayout: [], skippedJunk: 0, refused: [], unreadable: [])
         var seen = Set<String>()
         // Folder paths of every event in the set, so a subevent's folder
@@ -100,8 +107,58 @@ public enum NASSyncPlanner {
                 }
             }
         }
+        if checkLegacyLayout {
+            skipLegacyCopies(&plan, events: events, locations: locations)
+        }
         plan.items.sort { $0.relativePath < $1.relativePath }
         return plan
+    }
+
+    /// Drops items whose legacy archive copy (flattened name, same size)
+    /// is on the NAS. One listing per legacy media folder; an event with no
+    /// legacy folder costs one stat.
+    private static func skipLegacyCopies(_ plan: inout NASSyncPlan, events: [SavedCameraEvent], locations: EventStorageLocations) {
+        let byID = Dictionary(events.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        var legacyEventExists: [UUID: Bool] = [:]
+        var listings: [String: [String: DirectoryListingEntry]] = [:]
+        func legacyPath(_ item: NASSyncItem) -> String? {
+            guard let eventID = item.eventID, let event = byID[eventID] else { return nil }
+            let prefix = locations.layout(for: event, deviceID: nil).mirrorEventFolderPath + "/" + EventStorageLocations.originalsFolderName + "/"
+            guard item.relativePath.hasPrefix(prefix) else { return nil }
+            let rest = item.relativePath.dropFirst(prefix.count)
+            guard let slash = rest.firstIndex(of: "/") else { return nil }
+            let camera = String(rest[..<slash])
+            let subpath = String(rest[rest.index(after: slash)...])
+            if legacyEventExists[eventID] == nil {
+                legacyEventExists[eventID] = LayoutMigrationDisk.lstatEntry(locations.legacyArchiveEventFolder(for: event).path)?.kind == .directory
+            }
+            guard legacyEventExists[eventID] == true else { return nil }
+            let layout = locations.layout(for: event, deviceID: DriveEventDiscovery.deviceID(forDeviceFolder: camera))
+            guard let legacyRelative = try? layout.legacyArchiveRelativePath(for: subpath) else { return nil }
+            return locations.libraryRoot.appendingPathComponent(legacyRelative).path
+        }
+        // The legacy layout flattened names: two drive files that flatten
+        // to one legacy name cannot be told apart by name and size, so
+        // neither is held back — both are copied to their mirror paths.
+        var legacyByItem: [String: String] = [:]
+        var claims: [String: Int] = [:]
+        for item in plan.items {
+            guard let legacy = legacyPath(item) else { continue }
+            legacyByItem[item.relativePath] = legacy
+            claims[legacy.lowercased(), default: 0] += 1
+        }
+        plan.items.removeAll { item in
+            guard let legacy = legacyByItem[item.relativePath], claims[legacy.lowercased()] == 1 else { return false }
+            let folder = (legacy as NSString).deletingLastPathComponent
+            if listings[folder] == nil {
+                let entries = LayoutMigrationDisk.lstatEntry(folder)?.kind == .directory ? ((try? DirectoryListing.list(folder)) ?? []) : []
+                listings[folder] = Dictionary(entries.map { ($0.name, $0) }, uniquingKeysWith: { first, _ in first })
+            }
+            guard let entry = listings[folder]?[(legacy as NSString).lastPathComponent],
+                  entry.kind == .file, entry.size == item.byteCount else { return false }
+            plan.inLegacyLayout.append(item.relativePath)
+            return true
+        }
     }
 
     private static func walk(_ folder: String, driveRoot: String, eventID: UUID, plan: inout NASSyncPlan, seen: inout Set<String>) {
