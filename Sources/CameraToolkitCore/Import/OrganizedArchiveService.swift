@@ -168,9 +168,11 @@ public struct OrganizedArchiveLayout: Sendable {
     /// same `<year>/<event>/Originals/<Camera>/<subpath>` it has under the
     /// drive root. `sourcePath` is the path under `Originals/<Camera>` —
     /// its subfolders are kept, so two files with one name never collide.
+    /// A component SMB cannot store (`w: Sam`, a trailing dot) is
+    /// rewritten by `PortablePath`, the same rule Sync to NAS applies.
     public func mirrorRelativePath(for sourcePath: String) throws -> String {
         try PathSafety.validateRelativePath(sourcePath)
-        return mirrorOriginalsPath + "/" + sourcePath
+        return mirrorOriginalsPath + "/" + PortablePath.sanitize(relativePath: sourcePath)
     }
 
     /// The legacy NAS archive layout,
@@ -207,7 +209,7 @@ public struct OrganizedArchiveLayout: Sendable {
     public func requiredFolders(for sourcePaths: [String]) -> [String] {
         var folders: Set<String> = [mirrorOriginalsPath]
         for path in sourcePaths {
-            let parent = (path as NSString).deletingLastPathComponent
+            let parent = (PortablePath.sanitize(relativePath: path) as NSString).deletingLastPathComponent
             if !parent.isEmpty {
                 folders.insert(mirrorOriginalsPath + "/" + parent)
             }

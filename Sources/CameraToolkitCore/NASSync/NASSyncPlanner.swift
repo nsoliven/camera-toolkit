@@ -1,7 +1,8 @@
 import Foundation
 
-/// One drive file Sync to NAS copies: its absolute drive path and the path
-/// under the drive root — which is also its path under the NAS mirror root.
+/// One drive file Sync to NAS copies: its absolute drive path and its path
+/// under the NAS mirror root — the path under the drive root, with any
+/// component SMB cannot store rewritten by `PortablePath`.
 public struct NASSyncItem: Codable, Equatable, Hashable, Sendable {
     public var sourcePath: String
     public var relativePath: String
@@ -185,12 +186,15 @@ public enum NASSyncPlanner {
                     plan.refused.append(NASSyncIssue(path: path, reason: "The path cannot be mirrored safely."))
                     continue
                 }
+                // The NAS path: a component SMB cannot store is rewritten
+                // by the rule presence uses (`PortablePath`).
+                let mirrored = PortablePath.sanitize(relativePath: relative)
                 // The policy drive is walked first, so its copy wins over
                 // one left on the other drive.
-                guard seen.insert(NASSyncStore.pathKey(relative)).inserted else { continue }
+                guard seen.insert(NASSyncStore.pathKey(mirrored)).inserted else { continue }
                 plan.items.append(NASSyncItem(
                     sourcePath: path,
-                    relativePath: relative,
+                    relativePath: mirrored,
                     byteCount: entry.size,
                     modifiedAt: entry.modifiedAt,
                     eventID: eventID

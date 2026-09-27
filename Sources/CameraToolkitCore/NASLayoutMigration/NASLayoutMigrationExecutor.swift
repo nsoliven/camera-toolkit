@@ -603,6 +603,29 @@ public final class NASLayoutMigrationExecutor {
                     if folder != rename.newMirrorFolder { failures.append("event \(rename.newName) resolves to \(folder), not \(rename.newMirrorFolder)") }
                 }
             }
+            // Relative paths made portable: the app, reading the catalog as
+            // it now is, must compute each file's NAS path as the moved file.
+            let portable = assignmentRewrites.filter {
+                $0.oldSourceRootPath == $0.newSourceRootPath && $0.oldRelativePath != $0.newRelativePath
+            }
+            if !portable.isEmpty {
+                let state = try CatalogStateStore.load(db)
+                var configuration = self.configuration
+                configuration.savedEvents = state.savedEvents
+                let locations = EventStorageLocations(configuration: configuration)
+                let byID = Dictionary(state.photoEventAssignments.map { (CatalogStore.eventAssetID($0), $0) }, uniquingKeysWith: { first, _ in first })
+                for rewrite in portable {
+                    guard let assignment = byID[rewrite.newID],
+                          let event = state.savedEvents.first(where: { $0.id == assignment.eventID }),
+                          let archive = locations.archiveURL(for: assignment, event: event) else {
+                        failures.append("assignment \(rewrite.newID) does not resolve to a NAS path")
+                        continue
+                    }
+                    if archive.path != rewrite.destination {
+                        failures.append("assignment \(rewrite.newRelativePath) resolves to \(archive.path), not \(rewrite.destination)")
+                    }
+                }
+            }
             guard failures.isEmpty else {
                 throw ToolkitError.commandFailed("The catalog rewrite failed its checks and was rolled back:\n- " + failures.joined(separator: "\n- "))
             }

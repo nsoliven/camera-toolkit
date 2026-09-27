@@ -190,9 +190,13 @@ public struct NASLayoutMigrationPlan: Codable, Equatable, Sendable {
         /// Same-name sidecars that followed an aligned file.
         public var followers: Int
         /// Matched files kept at the CSV's path because the app's path
-        /// holds a character SMB cannot store portably.
+        /// held a character SMB cannot store. Always 0 since the app's path
+        /// is made portable (`sanitized`); kept for plans made before.
         public var keptNonPortable: Int
         public var unmatched: Int
+        /// Matched files whose relative path SMB cannot store: they go to
+        /// its `PortablePath` form and their assignment row is rewritten.
+        public var sanitized: Int?
     }
 
     public struct FileMappingSummary: Codable, Equatable, Sendable {
@@ -215,8 +219,9 @@ public struct NASLayoutMigrationPlan: Codable, Equatable, Sendable {
         public var tableCounts: [String: Int]
         public var confirmedFaces: Int
         public var markerKey: String
-        /// Assignments whose source file is a moved NAS file (their id
-        /// changes; presence and Immich rows follow).
+        /// Assignments whose source file is a moved NAS file, or whose
+        /// relative path is made SMB-portable (their id changes; presence
+        /// and Immich rows follow).
         public var assignmentRewrites: [LayoutMigrationPlan.AssignmentRewrite]?
         public var eventRenames: [EventRenameChange]?
         public var attachedEvents: [AttachedEvent]?
@@ -294,7 +299,7 @@ extension NASLayoutMigrationPlan {
             lines.append("Catalog event rename: \"\(rename.oldName)\" → \"\(rename.newName)\" (\(rename.eventID.uuidString)); NAS folder \(rename.oldMirrorFolder) → \(rename.newMirrorFolder); drive folder \(rename.driveFolderState.rawValue): \(rename.oldDriveFolder)\(rename.assignmentsUnderOldDriveFolder > 0 ? "; \(rename.assignmentsUnderOldDriveFolder) assignment(s) name a source root inside it (left as they are)" : "")")
         }
         for attached in catalog.attachedEvents ?? [] {
-            lines.append("Catalog event \"\(attached.name)\" → \(attached.mirrorFolder): \(attached.assignments) assignments, \(attached.matched) matched (\(attached.alreadyAligned) already at the app's path, \(attached.aligned) moved there, \(attached.followers) sidecars followed, \(attached.keptNonPortable) kept at the CSV path: not SMB-portable), \(attached.unmatched) unmatched")
+            lines.append("Catalog event \"\(attached.name)\" → \(attached.mirrorFolder): \(attached.assignments) assignments, \(attached.matched) matched (\(attached.alreadyAligned) already at the app's path, \(attached.aligned) moved there, \(attached.followers) sidecars followed, \(attached.sanitized ?? 0) with a relative path made SMB-portable, \(attached.keptNonPortable) kept at the CSV path), \(attached.unmatched) unmatched")
         }
         for event in events {
             if fileMapping != nil {

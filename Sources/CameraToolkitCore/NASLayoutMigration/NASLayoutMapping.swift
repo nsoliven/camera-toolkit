@@ -210,8 +210,11 @@ public struct NASLayoutMapping: Codable, Equatable, Sendable {
     /// Row-level problems of a per-file mapping: unclean paths, a source or
     /// a destination listed twice (compared case-insensitively, as SMB
     /// does), a destination that is some row's source or runs through one,
-    /// and a destination inside a top-level folder that holds sources (the
-    /// legacy tree) — each would make one rename depend on another.
+    /// a destination inside the legacy archive tree (`Originals/`) while it
+    /// holds sources, and a destination folder that is a source folder, lies
+    /// inside one or contains one — each would make one rename depend on
+    /// another. A rename inside the mirror layout (`2026/<old event>/…` →
+    /// `2026/<new event>/…`) keeps the two trees apart and is allowed.
     /// Messages are capped; the count is always given.
     static func fileProblems(_ files: [FileEntry]) -> [String] {
         var problems: [String] = []
@@ -237,6 +240,16 @@ public struct NASLayoutMapping: Codable, Equatable, Sendable {
             }
         }
         let areas = Set(files.compactMap { $0.source.contains("/") ? $0.source.split(separator: "/").first.map { $0.lowercased() } : nil })
+        let legacyArea = CameraLibraryFolder.originals.rawValue.lowercased()
+        // Source folders, and every folder above one.
+        let sourceFolders = Set(files.map { ($0.source.lowercased() as NSString).deletingLastPathComponent })
+        var aboveSourceFolders = Set<String>()
+        for folder in sourceFolders {
+            var current = folder
+            while !current.isEmpty, aboveSourceFolders.insert(current).inserted {
+                current = (current as NSString).deletingLastPathComponent
+            }
+        }
         for file in files {
             guard let destination = file.destination else { continue }
             let lower = destination.lowercased()
@@ -247,8 +260,19 @@ public struct NASLayoutMapping: Codable, Equatable, Sendable {
             if parts.count > 1, (1..<parts.count).contains(where: { sources.contains(parts[..<$0].joined(separator: "/")) }) {
                 add("\(file.source): the destination \(destination) runs through a source file.")
             }
-            if let first = parts.first, areas.contains(first) {
+            if let first = parts.first, first == legacyArea, areas.contains(first) {
                 add("\(file.source): the destination \(destination) lies inside the legacy tree (\(first)/ holds sources).")
+                continue
+            }
+            let folder = (lower as NSString).deletingLastPathComponent
+            var inside = (folder as NSString).deletingLastPathComponent
+            var overlaps = aboveSourceFolders.contains(folder) || (folder.isEmpty && sourceFolders.contains(""))
+            while !overlaps, !inside.isEmpty {
+                overlaps = sourceFolders.contains(inside)
+                inside = (inside as NSString).deletingLastPathComponent
+            }
+            if overlaps {
+                add("\(file.source): the destination folder of \(destination) is, contains or lies inside a folder that holds sources.")
             }
         }
         if extra > 0 { problems.append("… and \(extra) more problem(s) in the file mapping.") }

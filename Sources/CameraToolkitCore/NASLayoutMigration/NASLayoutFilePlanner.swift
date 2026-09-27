@@ -27,7 +27,12 @@ import Foundation
 /// - for every catalog event whose (renamed) NAS folder the CSV fills, its
 ///   assignments move their file to the app's path
 ///   `<event>/Originals/<Camera>/<relative path>` (same-name sidecars
-///   follow), so presence finds the files where the app looks.
+///   follow), so presence finds the files where the app looks;
+/// - an assigned file whose relative path has a component SMB cannot store
+///   (`w: Sam`) goes to the `PortablePath` form the app computes
+///   (`with Sam`), and its assignment's relative path is rewritten to
+///   that form in the catalog transaction (a new id; presence and Immich
+///   rows follow, faces are keyed by path and untouched).
 extension NASLayoutMigrationPlanner {
     /// One CSV row that is on the NAS.
     private struct FileCandidate {
@@ -245,6 +250,7 @@ extension NASLayoutMigrationPlanner {
 
         // MARK: Catalog events whose NAS folder the CSV fills
         var attached: [NASLayoutMigrationPlan.AttachedEvent] = []
+        var portableRewrites: [(assignment: PhotoEventAssignment, destination: String)] = []
         var alignedTotal = 0
         let moving = candidates.indices.filter { !candidates[$0].entry.name.hasPrefix("._") }
         for event in renamedEvents {
@@ -269,7 +275,7 @@ extension NASLayoutMigrationPlanner {
             }
             var info = NASLayoutMigrationPlan.AttachedEvent(
                 eventID: event.id, name: event.name, mirrorFolder: folder, assignments: eventAssignments.count,
-                matched: 0, alreadyAligned: 0, aligned: 0, followers: 0, keptNonPortable: 0, unmatched: 0
+                matched: 0, alreadyAligned: 0, aligned: 0, followers: 0, keptNonPortable: 0, unmatched: 0, sanitized: 0
             )
             // source folder + base name → the folder its assigned file took
             var takenFolder: [String: Set<String>] = [:]
@@ -286,11 +292,14 @@ extension NASLayoutMigrationPlanner {
                 let expected = mirrorRoot + "/" + expectedRelative
                 let base = KeepBothNaming.split(candidates[index].entry.name).base.lowercased()
                 let groupKey = candidates[index].folder.lowercased() + "\u{0}" + base
+                if !PortablePath.isPortable(relativePath: assignment.relativePath) {
+                    // `expected` already holds the portable form; the row
+                    // is rewritten to it below.
+                    portableRewrites.append((assignment, expected))
+                    info.sanitized = (info.sanitized ?? 0) + 1
+                }
                 if candidates[index].destination == expected {
                     info.alreadyAligned += 1
-                } else if !Self.isPortable(assignment.relativePath) {
-                    info.keptNonPortable += 1
-                    continue
                 } else {
                     candidates[index].destination = expected
                     info.aligned += 1
@@ -310,8 +319,8 @@ extension NASLayoutMigrationPlanner {
                 info.followers += 1
             }
             alignedTotal += info.aligned + info.followers
-            if info.keptNonPortable > 0 {
-                notes.append("\"\(event.name)\": \(info.keptNonPortable) assigned file(s) keep the CSV path because the app's path has a character SMB cannot store portably (one of \(Self.nonPortableCharacters), or a trailing space or dot); presence will not find them there.")
+            if let sanitized = info.sanitized, sanitized > 0 {
+                notes.append("\"\(event.name)\": \(sanitized) assigned file(s) have a relative path SMB cannot store (one of \(PortablePath.unsafeCharacters), or a trailing space or dot); they go to its portable form and their catalog rows are rewritten to it.")
             }
             attached.append(info)
         }
@@ -564,6 +573,28 @@ extension NASLayoutMigrationPlanner {
                     destination: move.destination
                 ))
             }
+            // Relative paths SMB cannot store: the row takes the portable
+            // form its file now has on the NAS (the source root stays).
+            if !portableRewrites.isEmpty, !ownsState {
+                blockers.append("\(portableRewrites.count) assignment(s) need their relative path made portable, which needs a catalog that holds the assignments.")
+            }
+            var rewritten = Set(rewrites.map(\.oldID))
+            for (assignment, destination) in portableRewrites {
+                let oldID = CatalogStore.eventAssetID(assignment)
+                guard rewritten.insert(oldID).inserted else { continue }
+                var updated = assignment
+                updated.relativePath = PortablePath.sanitize(relativePath: assignment.relativePath)
+                let newID = CatalogStore.eventAssetID(updated)
+                if existingIDs.contains(newID) || rewrites.contains(where: { $0.newID == newID }) {
+                    blockers.append("An assignment already exists for \(updated.relativePath); making \(assignment.relativePath) portable would merge two rows.")
+                }
+                rewrites.append(.init(
+                    oldID: oldID, newID: newID, eventID: assignment.eventID,
+                    oldSourceRootPath: assignment.sourceRootPath, newSourceRootPath: assignment.sourceRootPath,
+                    oldRelativePath: assignment.relativePath, newRelativePath: updated.relativePath,
+                    destination: destination
+                ))
+            }
             catalog.assignmentRewrites = rewrites
         }
         catalog.eventRenames = renameChanges
@@ -625,16 +656,6 @@ extension NASLayoutMigrationPlanner {
                 alignedToCatalog: alignedTotal
             )
         )
-    }
-
-    /// Characters SMB (and exFAT drives) cannot store as themselves.
-    static let nonPortableCharacters = ":\\*?\"<>|"
-    static let nonPortable = CharacterSet(charactersIn: nonPortableCharacters)
-
-    static func isPortable(_ relativePath: String) -> Bool {
-        relativePath.split(separator: "/").allSatisfy { component in
-            component.rangeOfCharacter(from: nonPortable) == nil && !component.hasSuffix(" ") && !component.hasSuffix(".")
-        }
     }
 
     /// The catalog rows that name a moved NAS path: face photos (and their

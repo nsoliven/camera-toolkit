@@ -327,7 +327,9 @@ public struct EventStorageLocations: Sendable {
 
     /// The path of a drive file relative to the drive root it sits under —
     /// the Buffer or private staging — which is also its path under the NAS
-    /// mirror root. Nil for a path under neither root or one that is not
+    /// mirror root, with any component SMB cannot store rewritten by
+    /// `PortablePath` (as `OrganizedArchiveLayout.mirrorRelativePath`
+    /// does). Nil for a path under neither root or one that is not
     /// lexically clean.
     public func mirrorRelativePath(forDrivePath path: String) -> String? {
         let standardized = URL(fileURLWithPath: path).standardizedFileURL.path
@@ -336,7 +338,7 @@ public struct EventStorageLocations: Sendable {
             where standardized.hasPrefix(root + "/") {
             let relative = String(standardized.dropFirst(root.count + 1))
             guard Self.isLexicallyClean(relative), (try? PathSafety.validateRelativePath(relative)) != nil else { return nil }
-            return relative
+            return PortablePath.sanitize(relativePath: relative)
         }
         return nil
     }
