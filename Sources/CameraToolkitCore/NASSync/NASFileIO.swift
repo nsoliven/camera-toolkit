@@ -57,12 +57,15 @@ public enum NASFileIO {
     /// Streams `source` into a new file at `destination` (created
     /// exclusively — never an existing file), hashing the bytes as they
     /// pass, then flushes it to stable storage. Returns the source's
-    /// SHA-256. A short read throws.
+    /// SHA-256. A short read throws. `willFlush` runs once every byte is
+    /// written, just before the flush to stable storage — so a caller can
+    /// time the flush separately from the copy.
     public static func copyNew(
         from source: String,
         to destination: String,
         expectedByteCount: Int64,
-        progress: (Int) -> Void = { _ in }
+        progress: (Int) -> Void = { _ in },
+        willFlush: () -> Void = {}
     ) throws -> String {
         let input = try open(source, O_RDONLY)
         defer { Darwin.close(input) }
@@ -100,6 +103,7 @@ public enum NASFileIO {
                 "Copy stopped early for \((source as NSString).lastPathComponent): \(total) of \(expectedByteCount) bytes. The drive may have disconnected."
             )
         }
+        willFlush()
         // F_FULLFSYNC where the filesystem has it (SMB may not); fsync
         // always, so the share has the bytes before the rename names them.
         _ = fcntl(output, F_FULLFSYNC)

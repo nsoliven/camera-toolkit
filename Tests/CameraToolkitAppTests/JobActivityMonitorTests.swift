@@ -33,52 +33,57 @@ final class JobActivityMonitorTests: XCTestCase {
 
     // MARK: - Monitor
 
-    func testMonitorTurnsByteDeltasIntoARateHistory() {
-        let monitor = JobActivityMonitor()
+    func testMonitorTurnsByteDeltasIntoAReadout() {
+        let monitor = JobActivityMonitor(ceilingResolver: nil)
         let job = JobSnapshot(
             action: .faceScan,
             state: .running,
             processedBytes: 0,
             totalBytes: 1_000_000
         )
-        monitor.tick(job: job)
-        XCTAssertTrue(monitor.readRateHistory.isEmpty, "the first tick only sets the baseline")
+        monitor.tick(job: job, now: 0, wallNow: job.createdAt)
+        XCTAssertNil(monitor.readout(for: job, now: 0).current, "the first tick only sets the baseline")
 
         var moved = job
         moved.processedBytes = 500_000
-        monitor.tick(job: moved)
-        XCTAssertEqual(monitor.readRateHistory.count, 1)
-        XCTAssertGreaterThan(monitor.readRateHistory[0], 0)
-        XCTAssertEqual(monitor.peakReadRate, monitor.readRateHistory[0])
+        monitor.tick(job: moved, now: 1, wallNow: job.createdAt.addingTimeInterval(1))
+        let readout = monitor.readout(for: moved, now: 1)
+        XCTAssertEqual(try XCTUnwrap(readout.current), 0.5, accuracy: 1e-9)
+        XCTAssertEqual(try XCTUnwrap(readout.average), 0.5, accuracy: 1e-9)
+        XCTAssertEqual(readout.points.map(\.value), [0.5])
         XCTAssertNotNil(monitor.estimatedRemaining(for: moved))
     }
 
-    func testMonitorResetsByteHistoryWhenANewJobStarts() {
-        let monitor = JobActivityMonitor()
-        var first = JobSnapshot(action: .faceScan, state: .running, processedBytes: 1_000)
-        monitor.tick(job: first)
-        first.processedBytes = 2_000
-        monitor.tick(job: first)
-        XCTAssertEqual(monitor.readRateHistory.count, 1)
-
-        monitor.tick(job: JobSnapshot(action: .ingestCard, state: .running))
-        XCTAssertTrue(monitor.readRateHistory.isEmpty)
-        XCTAssertEqual(monitor.peakReadRate, 0)
+    func testANewJobGetsItsOwnTrackAndDoesNotResetTheRunningOne() {
+        let monitor = JobActivityMonitor(ceilingResolver: nil)
+        var first = JobSnapshot(action: .syncBuffer, state: .running, processedBytes: 1_000_000, totalBytes: 10_000_000)
+        let second = JobSnapshot(action: .ingestCard, state: .running, processedBytes: 0, totalBytes: 5_000_000)
+        monitor.tick(job: first, now: 0)
+        // Two expanded rows tick the same monitor in turn — the old
+        // monitor wiped its history on every switch.
+        monitor.tick(job: second, now: 0.1)
+        first.processedBytes = 3_000_000
+        monitor.tick(job: first, now: 1)
+        monitor.tick(job: second, now: 1.1)
+        XCTAssertEqual(monitor.readout(for: first, now: 1).points.count, 1)
+        XCTAssertEqual(try XCTUnwrap(monitor.readout(for: first, now: 1).current), 2, accuracy: 1e-9)
+        XCTAssertNil(monitor.readout(for: second, now: 1.1).current)
     }
 
     func testMonitorStopsSamplingFinishedJobs() {
-        let monitor = JobActivityMonitor()
+        let monitor = JobActivityMonitor(ceilingResolver: nil)
         var job = JobSnapshot(
             action: .faceScan,
             state: .running,
             processedBytes: 100,
             totalBytes: 1_000
         )
-        monitor.tick(job: job)
+        monitor.tick(job: job, now: 0)
         job.state = .done
         job.processedBytes = 1_000
-        monitor.tick(job: job)
-        XCTAssertTrue(monitor.readRateHistory.isEmpty, "a finished job reports no rate")
+        monitor.tick(job: job, now: 1)
+        XCTAssertTrue(monitor.readout(for: job, now: 1).points.isEmpty, "a finished job is not sampled")
+        XCTAssertNil(monitor.readout(for: job, now: 1).current, "a finished job has no current speed")
         XCTAssertNil(monitor.estimatedRemaining(for: job))
     }
 

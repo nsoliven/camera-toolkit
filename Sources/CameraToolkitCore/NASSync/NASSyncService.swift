@@ -92,6 +92,16 @@ public struct NASSyncService {
         var limiter = FileOperationProgressLimiter()
         var folderListings: [String: [String: DirectoryListingEntry]] = [:]
         var createdFolders = Set<String>()
+        // Where the time goes, per file: listing and metadata ("Check"),
+        // streaming the copy, flushing it to the share, re-reading it from
+        // the NAS, hashing a drive copy that is already there, renaming it
+        // into place. One clock read per phase change.
+        var phases = JobPhaseTimer(order: ["Check", "Copy", "Flush", "Verify", "Hash", "Rename"])
+        func phase(_ label: String) { phases.begin(label, at: clock()) }
+        func moved(_ count: Int) {
+            doneWork += Int64(count)
+            phases.addBytes(Int64(count))
+        }
 
         func emit(_ index: Int, _ phase: String, _ path: String, force: Bool = false) {
             guard let progress, limiter.shouldEmit(force: force) else { return }
@@ -119,7 +129,8 @@ public struct NASSyncService {
                         unitsDone: Int(doneWork),
                         unitsTotal: Int(totalWork),
                         secondsRemaining: estimator.secondsRemaining(Double(max(totalWork - doneWork, 0)), at: t)
-                    )
+                    ),
+                    phases: phases.snapshot(at: t)
                 )
             ))
         }
@@ -164,6 +175,7 @@ public struct NASSyncService {
                 ))
                 flush()
             }
+            phase("Check")
             emit(index, "Checking NAS", item.relativePath)
             // One listing per destination folder answers "is it there, at
             // what size" for every file in it.
@@ -196,10 +208,13 @@ public struct NASSyncService {
                     continue
                 }
                 do {
+                    phase("Hash")
                     emit(index, "Hashing drive copy", item.relativePath)
-                    let sourceHash = try NASFileIO.sha256(item.sourcePath, uncached: false, expectedByteCount: item.byteCount) { doneWork += Int64($0); emit(index, "Hashing drive copy", item.relativePath) }
+                    let sourceHash = try NASFileIO.sha256(item.sourcePath, uncached: false, expectedByteCount: item.byteCount) { moved($0); emit(index, "Hashing drive copy", item.relativePath) }
+                    phase("Verify")
                     emit(index, "Re-reading NAS copy", item.relativePath)
-                    let nasHash = try NASFileIO.sha256(destination, uncached: true, expectedByteCount: item.byteCount) { doneWork += Int64($0); emit(index, "Re-reading NAS copy", item.relativePath) }
+                    let nasHash = try NASFileIO.sha256(destination, uncached: true, expectedByteCount: item.byteCount) { moved($0); emit(index, "Re-reading NAS copy", item.relativePath) }
+                    phase("Check")
                     if sourceHash == nasHash {
                         report.matchedExisting.append(item.relativePath)
                         record(.verified, sourceHash, nil, nil, true)
@@ -226,26 +241,37 @@ public struct NASSyncService {
                     folderListings[made] = [:]
                 }
                 removeStaleTemporaries(for: name, in: folder, listing: listing(of: folder))
+                phase("Copy")
                 emit(index, "Copying to NAS", item.relativePath)
                 temporaryExists = true
-                let sourceHash = try NASFileIO.copyNew(from: item.sourcePath, to: temporary, expectedByteCount: item.byteCount) { doneWork += Int64($0); emit(index, "Copying to NAS", item.relativePath) }
+                let sourceHash = try NASFileIO.copyNew(
+                    from: item.sourcePath,
+                    to: temporary,
+                    expectedByteCount: item.byteCount,
+                    progress: { moved($0); emit(index, "Copying to NAS", item.relativePath) },
+                    willFlush: { phase("Flush"); emit(index, "Flushing to NAS", item.relativePath, force: true) }
+                )
+                phase("Check")
                 // The drive copy must be the file the plan saw.
                 if let current = LayoutMigrationDisk.lstatEntry(item.sourcePath),
                    current.size != item.byteCount || abs(current.modifiedAt - item.modifiedAt) >= 0.001 {
                     throw ToolkitError.commandFailed("The drive copy changed while it was copied.")
                 }
                 _ = setModificationTime(temporary, item.modifiedAt)
+                phase("Verify")
                 emit(index, "Re-reading NAS copy", item.relativePath)
-                let nasHash = try NASFileIO.sha256(temporary, uncached: true, expectedByteCount: item.byteCount) { doneWork += Int64($0); emit(index, "Re-reading NAS copy", item.relativePath) }
+                let nasHash = try NASFileIO.sha256(temporary, uncached: true, expectedByteCount: item.byteCount) { moved($0); emit(index, "Re-reading NAS copy", item.relativePath) }
                 guard nasHash == sourceHash else {
                     throw ToolkitError.commandFailed("The NAS copy did not verify: its SHA-256 differs from the drive copy's when re-read from the NAS.")
                 }
+                phase("Rename")
                 do {
                     try NASFileIO.renameExclusive(from: temporary, to: destination)
                     temporaryExists = false
                 } catch {
                     // Someone else put a file there meanwhile: compare, never replace.
                     guard LayoutMigrationDisk.lstatEntry(destination) != nil else { throw error }
+                    phase("Verify")
                     let other = try NASFileIO.sha256(destination, uncached: true)
                     if other == sourceHash {
                         report.matchedExisting.append(item.relativePath)
@@ -275,6 +301,7 @@ public struct NASSyncService {
             }
             emit(index + 1, "Verified on NAS", item.relativePath, force: true)
         }
+        phases.end(at: clock())
         flush(force: true)
         return report
     }

@@ -66,6 +66,91 @@ public struct JobWorkEstimate: Codable, Equatable, Hashable, Sendable {
     }
 }
 
+/// Wall time and bytes a job has spent in one named phase so far — "Copy",
+/// "Flush", "Verify", "Rename". Measured with a monotonic clock around
+/// each phase; `bytes` is what moved while that phase was running.
+public struct JobPhaseTotal: Codable, Equatable, Hashable, Sendable {
+    public var label: String
+    public var seconds: Double
+    public var bytes: Int64
+
+    public init(label: String, seconds: Double, bytes: Int64 = 0) {
+        self.label = label
+        self.seconds = seconds
+        self.bytes = bytes
+    }
+
+    /// Bytes per second while this phase was running; nil when it moved
+    /// no bytes or took no measurable time.
+    public var bytesPerSecond: Double? {
+        guard bytes > 0, seconds > 0 else { return nil }
+        return Double(bytes) / seconds
+    }
+}
+
+/// One phase's share of a job's measured time, for the Jobs window's
+/// "Copy 30% · Flush 40% · Verify 25% · Rename 5%" breakdown.
+public struct JobPhaseShare: Equatable, Hashable, Sendable {
+    public var label: String
+    public var seconds: Double
+    /// Exact share of the measured time, 0...1; the shares sum to 1.
+    public var fraction: Double
+    /// Whole percent, rounded so the shown percentages sum to exactly 100.
+    public var percent: Int
+    public var bytesPerSecond: Double?
+}
+
+/// Accumulates per-phase wall time with a monotonic clock, cheaply: one
+/// clock read per phase change, O(1) byte credit per chunk. Beginning a
+/// phase ends the one before, so a job just names what it is doing next.
+public struct JobPhaseTimer: Sendable {
+    public private(set) var totals: [JobPhaseTotal]
+    private var currentIndex: Int?
+    private var currentSince: TimeInterval = 0
+
+    /// `order` fixes the display order; phases first seen later are
+    /// appended.
+    public init(order: [String] = []) {
+        totals = order.map { JobPhaseTotal(label: $0, seconds: 0) }
+    }
+
+    /// The phase running now, if any.
+    public var current: String? { currentIndex.map { totals[$0].label } }
+
+    public mutating func begin(_ label: String, at now: TimeInterval) {
+        if let currentIndex, totals[currentIndex].label == label { return }
+        end(at: now)
+        let index = totals.firstIndex { $0.label == label } ?? {
+            totals.append(JobPhaseTotal(label: label, seconds: 0))
+            return totals.count - 1
+        }()
+        currentIndex = index
+        currentSince = now
+    }
+
+    public mutating func end(at now: TimeInterval) {
+        guard let currentIndex else { return }
+        totals[currentIndex].seconds += max(now - currentSince, 0)
+        self.currentIndex = nil
+    }
+
+    /// Credits bytes to the running phase; ignored between phases.
+    public mutating func addBytes(_ count: Int64) {
+        guard let currentIndex else { return }
+        totals[currentIndex].bytes += count
+    }
+
+    /// Totals including the running phase's time so far — what a progress
+    /// emission reports. Phases with no time and no bytes are left out.
+    public func snapshot(at now: TimeInterval) -> [JobPhaseTotal] {
+        var result = totals
+        if let currentIndex {
+            result[currentIndex].seconds += max(now - currentSince, 0)
+        }
+        return result.filter { $0.seconds > 0 || $0.bytes > 0 }
+    }
+}
+
 /// Best-effort live detail a job reports next to the coarse
 /// `FileOperationProgress` counters — the payload the Jobs window's
 /// activity pane renders. Everything in it is genuinely measured or
@@ -88,6 +173,9 @@ public struct JobTelemetry: Codable, Equatable, Hashable, Sendable {
     /// Units of work and time left, for jobs that can measure them. Nil
     /// for jobs that cannot, and in snapshots from older builds.
     public var work: JobWorkEstimate?
+    /// Where the job's time has gone, per phase, when the job measures it
+    /// (Sync to NAS). Empty for jobs that do not, and in older snapshots.
+    public var phases: [JobPhaseTotal]
 
     public init(
         step: String? = nil,
@@ -95,7 +183,8 @@ public struct JobTelemetry: Codable, Equatable, Hashable, Sendable {
         counters: [JobCounter] = [],
         models: [String] = [],
         facts: [String] = [],
-        work: JobWorkEstimate? = nil
+        work: JobWorkEstimate? = nil,
+        phases: [JobPhaseTotal] = []
     ) {
         self.step = step
         self.activeItems = activeItems
@@ -103,6 +192,51 @@ public struct JobTelemetry: Codable, Equatable, Hashable, Sendable {
         self.models = models
         self.facts = facts
         self.work = work
+        self.phases = phases
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        step = try container.decodeIfPresent(String.self, forKey: .step)
+        activeItems = try container.decodeIfPresent([JobActiveItem].self, forKey: .activeItems) ?? []
+        counters = try container.decodeIfPresent([JobCounter].self, forKey: .counters) ?? []
+        models = try container.decodeIfPresent([String].self, forKey: .models) ?? []
+        facts = try container.decodeIfPresent([String].self, forKey: .facts) ?? []
+        work = try container.decodeIfPresent(JobWorkEstimate.self, forKey: .work)
+        phases = try container.decodeIfPresent([JobPhaseTotal].self, forKey: .phases) ?? []
+    }
+
+    /// Each measured phase's share of the time, in the job's order. The
+    /// fractions sum to 1 and the whole percentages to exactly 100
+    /// (largest-remainder rounding). Empty when nothing was measured.
+    public var phaseShares: [JobPhaseShare] {
+        Self.shares(of: phases)
+    }
+
+    public static func shares(of phases: [JobPhaseTotal]) -> [JobPhaseShare] {
+        let measured = phases.filter { $0.seconds > 0 }
+        let total = measured.reduce(0) { $0 + $1.seconds }
+        guard total > 0 else { return [] }
+        let exact = measured.map { $0.seconds / total * 100 }
+        var percents = exact.map { Int($0.rounded(.down)) }
+        let leftover = 100 - percents.reduce(0, +)
+        let byRemainder = exact.indices.sorted {
+            let a = exact[$0] - Double(percents[$0])
+            let b = exact[$1] - Double(percents[$1])
+            return a != b ? a > b : $0 < $1
+        }
+        for index in byRemainder.prefix(max(leftover, 0)) {
+            percents[index] += 1
+        }
+        return measured.enumerated().map { index, phase in
+            JobPhaseShare(
+                label: phase.label,
+                seconds: phase.seconds,
+                fraction: phase.seconds / total,
+                percent: percents[index],
+                bytesPerSecond: phase.bytesPerSecond
+            )
+        }
     }
 
     public func counter(_ label: String) -> Int? {
