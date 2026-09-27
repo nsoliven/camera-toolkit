@@ -490,6 +490,10 @@ final class EventsWorkspace {
     /// Holds move journals and the capture-time cache.
     let supportFolder: URL
 
+    /// How the NAS share is connected (link, speed test, Wi-Fi guard).
+    /// Inert until `startNASConnection()` — tests never mount or unmount.
+    let nasConnection: NASConnectionModel
+
     /// Background disk work waits at this gate while a speed test is
     /// measuring the volume it would touch — scans, sweeps, capture-date
     /// reads, and tile decodes resume by themselves when the test ends.
@@ -498,11 +502,13 @@ final class EventsWorkspace {
     init(
         model: DashboardModel,
         supportFolder: URL = EventsWorkspace.defaultSupportFolder,
-        driveActivityGate: DriveActivityGate = .shared
+        driveActivityGate: DriveActivityGate = .shared,
+        nasConnection: NASConnectionModel = NASConnectionModel()
     ) {
         self.model = model
         self.supportFolder = supportFolder
         self.driveActivityGate = driveActivityGate
+        self.nasConnection = nasConnection
         // A face-label restore from Settings rewrites face rows behind the
         // workspace; re-read people like after any other face change.
         let observer = NotificationCenter.default.addObserver(
@@ -513,6 +519,7 @@ final class EventsWorkspace {
             MainActor.assumeIsolated { self?.facesRevision &+= 1 }
         }
         faceLabelsRestoredObserver.observers = [observer]
+        nasConnection.isNASInUse = { [weak self] in self?.nasIsInUse ?? true }
     }
 
     @ObservationIgnored private let faceLabelsRestoredObserver = MountObserverBox()
@@ -1690,6 +1697,7 @@ final class EventsWorkspace {
     func refreshConnectivity(mountedVolumes: Set<URL> = []) {
         connectivityRevision &+= 1
         lastConnectivityRefresh = Date()
+        nasConnection.volumesChanged()
         let mountedNow = VolumeInfo.mountedVolumePaths()
         lastConnectivityMountedPaths = mountedNow
 
@@ -3585,22 +3593,55 @@ final class EventsWorkspace {
         return url
     }
 
-    /// Opens the configured SMB share so Finder mounts it (it asks for
-    /// credentials itself); the volume observer refreshes once it mounts.
+    /// Mounts the configured SMB share in the background with the
+    /// keychain's saved password (NetFS, no dialog), falling back to Finder,
+    /// which asks for one. The volume observer refreshes once it mounts.
     func connectToNAS() {
         guard let url = nasShareURL else {
             model.statusMessage = "Set the NAS share address (smb://…) in Settings → Locations, or connect the share in Finder."
             return
         }
-        if !NSWorkspace.shared.open(url) {
+        if nasConnection.isStarted {
+            model.statusMessage = "Connecting to the NAS…"
+            nasConnection.connect()
+        } else if !NSWorkspace.shared.open(url) {
             model.statusMessage = "Could not open \(url.absoluteString)."
         }
+    }
+
+    /// The NAS connection's inputs from Settings.
+    var nasConnectionSettings: NASConnectionSettings {
+        NASConnectionSettings(
+            nasRoot: locations.nasRoot,
+            shareURL: nasShareURL,
+            automatic: model.configuration.nasAutoConnect
+        )
+    }
+
+    /// Launch: status, auto-connect, and the Wi-Fi guard. App only.
+    func startNASConnection() {
+        nasConnection.start(settings: nasConnectionSettings)
+    }
+
+    func nasSettingsChanged() {
+        nasConnection.settingsChanged(nasConnectionSettings)
+    }
+
+    /// True while something may be reading or writing the NAS: any file
+    /// job (sync, Take Off Drive, face scans, moves), a speed test, or a
+    /// card transfer. The guard never unmounts then; the unmount itself
+    /// is a normal one, which macOS refuses while any file is open.
+    var nasIsInUse: Bool {
+        model.isBusy || model.isStorageBenchmarkRunning || model.transferQueue?.state == .running
     }
 
     /// One-way Buffer → NAS copy of the event and its subevents.
     func syncToNAS(_ eventID: UUID) {
         guard let event = event(eventID) else { return }
-        startNASSync(events: eventFamily(eventID), title: eventTitle(event), refresh: [eventID])
+        nasConnection.prepareForNASJob { [weak self] in
+            guard let self else { return }
+            startNASSync(events: eventFamily(eventID), title: eventTitle(event), refresh: [eventID])
+        }
     }
 
     /// One-way Buffer → NAS copy of every event.
@@ -3610,7 +3651,9 @@ final class EventsWorkspace {
             model.statusMessage = "There are no events to sync."
             return
         }
-        startNASSync(events: events, title: "all events", refresh: events.filter { $0.parentEventID == nil }.map(\.id))
+        nasConnection.prepareForNASJob { [weak self] in
+            self?.startNASSync(events: events, title: "all events", refresh: events.filter { $0.parentEventID == nil }.map(\.id))
+        }
     }
 
     private func startNASSync(events: [SavedCameraEvent], title: String, refresh: [UUID]) {
@@ -3741,7 +3784,11 @@ final class EventsWorkspace {
     func confirmRemoval(_ request: RemovalRequest, confirmation: String) {
         pendingRemoval = nil
         switch request.kind {
-        case .drive: removeFromDrive(request.eventID, confirmation: confirmation)
+        case .drive:
+            // Take Off Drive re-reads every NAS copy: over Ethernet if it can.
+            nasConnection.prepareForNASJob { [weak self] in
+                self?.removeFromDrive(request.eventID, confirmation: confirmation)
+            }
         case .source: removeFromSource(request.eventID, confirmation: confirmation)
         }
     }
@@ -4716,6 +4763,14 @@ final class EventsWorkspace {
     /// `FaceIndexService` over the given stacks, and reports progress and
     /// the summary line to the Jobs window.
     private func runFaceScanJob(title: String, stacks: [OrganizeStack], options: FaceScanOptions) {
+        // A scan can read NAS-only files: over Ethernet if it can. Starts
+        // at once when the NAS is not on slow Wi-Fi.
+        nasConnection.prepareForNASJob { [weak self] in
+            self?.startFaceScanJob(title: title, stacks: stacks, options: options)
+        }
+    }
+
+    private func startFaceScanJob(title: String, stacks: [OrganizeStack], options: FaceScanOptions) {
         let analyzerProvider = faceAnalyzerProvider
         guard faceEngineInstalled || analyzerProvider != nil else {
             model.statusMessage = FaceSidecarInstallation.notInstalledMessage
