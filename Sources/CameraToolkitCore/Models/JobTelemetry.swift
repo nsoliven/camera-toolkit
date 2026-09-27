@@ -29,6 +29,43 @@ public struct JobCounter: Codable, Equatable, Hashable, Sendable {
     }
 }
 
+/// A job's own measure of its work — units done, the planned total, and
+/// the time left at the recent rate. A face scan counts one unit per
+/// still and one per planned video frame, so a long clip in flight moves
+/// the bar instead of freezing it until the clip ends.
+public struct JobWorkEstimate: Codable, Equatable, Hashable, Sendable {
+    public var unitsDone: Int
+    /// Planned units; nil while the total cannot be estimated yet.
+    public var unitsTotal: Int?
+    /// True while part of the total is extrapolated (clips not yet opened).
+    public var totalIsEstimate: Bool
+    /// What a unit is — "frames" on a video-only scan, "photos and
+    /// frames" on a mixed one; nil when the file count already says it.
+    public var unitLabel: String?
+    /// Seconds left at the smoothed recent rate; nil while estimating.
+    public var secondsRemaining: Double?
+
+    public init(
+        unitsDone: Int,
+        unitsTotal: Int?,
+        totalIsEstimate: Bool = false,
+        unitLabel: String? = nil,
+        secondsRemaining: Double? = nil
+    ) {
+        self.unitsDone = unitsDone
+        self.unitsTotal = unitsTotal
+        self.totalIsEstimate = totalIsEstimate
+        self.unitLabel = unitLabel
+        self.secondsRemaining = secondsRemaining
+    }
+
+    /// Done over total, 0 while the total is unknown.
+    public var fraction: Double? {
+        guard let unitsTotal, unitsTotal > 0 else { return nil }
+        return min(max(Double(unitsDone) / Double(unitsTotal), 0), 1)
+    }
+}
+
 /// Best-effort live detail a job reports next to the coarse
 /// `FileOperationProgress` counters — the payload the Jobs window's
 /// activity pane renders. Everything in it is genuinely measured or
@@ -48,19 +85,24 @@ public struct JobTelemetry: Codable, Equatable, Hashable, Sendable {
     /// Short facts about how the job is configured — "MED · FAST ·
     /// 10 workers".
     public var facts: [String]
+    /// Units of work and time left, for jobs that can measure them. Nil
+    /// for jobs that cannot, and in snapshots from older builds.
+    public var work: JobWorkEstimate?
 
     public init(
         step: String? = nil,
         activeItems: [JobActiveItem] = [],
         counters: [JobCounter] = [],
         models: [String] = [],
-        facts: [String] = []
+        facts: [String] = [],
+        work: JobWorkEstimate? = nil
     ) {
         self.step = step
         self.activeItems = activeItems
         self.counters = counters
         self.models = models
         self.facts = facts
+        self.work = work
     }
 
     public func counter(_ label: String) -> Int? {

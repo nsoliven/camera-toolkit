@@ -145,6 +145,12 @@ public struct FileOperationProgress: Sendable {
     }
 
     public var fractionComplete: Double {
+        // A job that measures its own work (a face scan's photos + planned
+        // video frames) is further along by that measure — its byte count
+        // is only an estimate for seeked video.
+        if let fraction = telemetry?.work?.fraction {
+            return fraction
+        }
         guard totalBytes > 0 else {
             guard totalFiles > 0 else { return 0 }
             return Double(processedFiles) / Double(totalFiles)

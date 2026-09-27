@@ -230,6 +230,23 @@ public struct FaceIndexService: Sendable {
         func snapshot() -> JobTelemetry {
             telemetry.snapshot(skipped: skipped, models: models, facts: facts)
         }
+        // Work = one unit per still + one per planned video frame; the
+        // time left comes from that, not from estimated video bytes.
+        var photoTokens: [Int] = []
+        var videoTokens: [(token: Int, bytes: Int64)] = []
+        for (index, item) in pending.enumerated() {
+            if item.kind == .video {
+                videoTokens.append((index, item.primary.size))
+            } else {
+                photoTokens.append(index)
+            }
+        }
+        telemetry.planWork(
+            photos: photoTokens,
+            videos: videoTokens,
+            stride: options.videoFrameStride,
+            maximumFrames: options.maximumVideoFrames
+        )
         progress?(FileOperationProgress(
             phase: "Detecting faces",
             processedFiles: 0,
@@ -239,6 +256,21 @@ public struct FaceIndexService: Sendable {
         ))
         let store = self.store
         let items = pending
+        // A clip can run for minutes; report its frames as they land so
+        // the bar and the time left move between file completions.
+        telemetry.onUnitsChanged {
+            guard telemetry.shouldEmit() else { return }
+            progress?(FileOperationProgress(
+                phase: "Detecting faces",
+                processedFiles: telemetry.finishedFiles,
+                totalFiles: total,
+                processedBytes: telemetry.totalBytesRead,
+                totalBytes: totalBytes,
+                bytesPerSecond: telemetry.bytesPerSecond,
+                telemetry: telemetry.snapshot(skipped: skipped, models: models, facts: facts)
+            ))
+        }
+        defer { telemetry.onUnitsChanged(nil) }
         let results = OrganizeScanner.parallelMap(
             count: total,
             width: options.concurrency,
@@ -579,6 +611,7 @@ public struct FaceIndexService: Sendable {
             telemetry?.finish(token, faces: 0, videoFramesRead: 0, failed: true)
             return .failed
         }
+        telemetry?.openVideo(token, duration: sampler.duration, plannedFrames: times.count)
 
         // Frame sampling seeks, it does not stream: charge each decoded
         // frame for the share of the clip it spans (≈ stride/duration of
@@ -592,7 +625,10 @@ public struct FaceIndexService: Sendable {
         var framesRead = 0
         for time in times {
             telemetry?.step(token, .decode)
-            guard let frame = sampler.frame(at: time) else { continue }
+            guard let frame = sampler.frame(at: time) else {
+                telemetry?.noteFrame(token, decoded: false)
+                continue
+            }
             framesRead += 1
             telemetry?.noteReadBytes(bytesPerFrame)
             let size = nativeSize ?? CGSize(width: frame.width, height: frame.height)
@@ -618,6 +654,8 @@ public struct FaceIndexService: Sendable {
                 if let embedding = face.embedding { keptEmbeddings.append(embedding) }
                 faces.append(face)
             }
+            // The frame's unit is done once it is detected and embedded.
+            telemetry?.noteFrame(token, decoded: true)
         }
 
         telemetry?.step(token, .write)

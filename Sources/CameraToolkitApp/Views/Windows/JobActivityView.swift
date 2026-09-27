@@ -135,8 +135,8 @@ struct JobActivityDetail: View {
         let end = job.finishedAt ?? now
         let elapsed = max(end.timeIntervalSince(job.createdAt), 0)
         var text = Self.durationText(elapsed)
-        if job.state == .running, let eta = monitor.estimatedRemaining(for: job) {
-            text += " · ~\(Self.durationText(eta)) left"
+        if let estimate = monitor.remainingEstimate(for: job) {
+            text += " · \(Self.remainingText(estimate))"
         }
         return text
     }
@@ -169,6 +169,15 @@ struct JobActivityDetail: View {
             }
         } else if job.processedFiles > 0 {
             parts.append("\(job.processedFiles.formatted()) files")
+        }
+        if let work = job.telemetry?.work, let label = work.unitLabel {
+            // Video-heavy scans: the frame plan is the honest progress unit.
+            if let total = work.unitsTotal {
+                let approx = work.totalIsEstimate ? "~" : ""
+                parts.append("\(work.unitsDone.formatted()) of \(approx)\(total.formatted()) \(label)")
+            } else {
+                parts.append("\(work.unitsDone.formatted()) \(label)")
+            }
         }
         if job.totalBytes > 0 {
             parts.append("\(job.processedBytes.formattedBytes) of \(job.totalBytes.formattedBytes) read")
@@ -346,6 +355,25 @@ struct JobActivityDetail: View {
         case "upload": .cyan
         default: .secondary
         }
+    }
+
+    /// Anything past this reads as "many hours" — a four-day estimate is
+    /// noise, not information.
+    static let remainingDisplayCap: TimeInterval = 99 * 3600
+
+    /// "~1 h 5 m left", "~12 m left", "under a minute left",
+    /// "estimating…", or "many hours left" past `remainingDisplayCap`.
+    static func remainingText(_ estimate: JobActivityMonitor.RemainingEstimate) -> String {
+        guard case .seconds(let interval) = estimate else { return "estimating…" }
+        guard interval.isFinite, interval <= remainingDisplayCap else { return "many hours left" }
+        let minutes = Int((max(interval, 0) / 60).rounded())
+        if interval < 60 { return "under a minute left" }
+        if minutes >= 60 {
+            let hours = minutes / 60
+            let rest = minutes % 60
+            return rest == 0 ? "~\(hours) h left" : "~\(hours) h \(rest) m left"
+        }
+        return "~\(minutes) m left"
     }
 
     static func durationText(_ interval: TimeInterval) -> String {
