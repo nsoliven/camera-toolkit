@@ -127,14 +127,13 @@ Buffer/<year>/<yyyy-MM-dd event>/
 ├── Private/<year>/<yyyy-MM-dd event>/[…subevent…]/Originals/<Camera>/
 └── _Trash/<batch>/
 
-Photo Library/Originals/<year>/<yyyy-MM-dd event>/<camera>/
-├── RAW/
-├── JPEG/
-├── Video/
-└── Camera Support/
+<NAS root>/<year>/<yyyy-MM-dd event>/          # the same relative paths as the drive
+├── Originals/<Camera>/…
+├── Edited/<folder>/…
+└── <yyyy-MM-dd subevent>/…
 ```
 
-`<Camera>` is the device's display name — `Sony A7V`, `Osmo 360`, `Osmo Nano`. When two different files from one camera share a name, the second is kept as `NAME (2).EXT` and its sidecars take the same suffix. Drives organized before `Originals` existed used `<event>/<camera>/Card Copy/`; the app still reads that layout, and the layout migration (see "Layout migration" in `docs/ARCHITECTURE.md`) moves it into `Originals` with journaled, undoable same-drive renames. The NAS library keeps its `RAW`/`JPEG`/`Video` split for now.
+`<Camera>` is the device's display name — `Sony A7V`, `Osmo 360`, `Osmo Nano`. When two different files from one camera share a name, the second is kept as `NAME (2).EXT` and its sidecars take the same suffix. Drives organized before `Originals` existed used `<event>/<camera>/Card Copy/`; the app still reads that layout, and the layout migration (see "Layout migration" in `docs/ARCHITECTURE.md`) moves it into `Originals` with journaled, undoable same-drive renames. The NAS mirrors the drive: every file sits at the same `<year>/<event>/…` path under the NAS root (Settings → NAS mirror root; by default the library root, or its parent when the library root ends in `Originals`). Private events mirror there too — "Private · NAS only" keeps them out of the shared Buffer and Immich, not off the NAS. Events archived before the mirror layout (`Originals/<year>/<event>/<camera>/RAW|JPEG|Video|Camera Support/`) still show as on the NAS until the NAS layout migration moves them.
 
 ## Keyboard shortcuts
 

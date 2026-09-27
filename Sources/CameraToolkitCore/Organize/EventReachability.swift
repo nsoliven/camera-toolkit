@@ -142,7 +142,7 @@ public enum EventReachability {
         var places: [EventStoragePlace] = [
             EventStoragePlace(role: .buffer, root: locations.bufferRoot, isPrimary: policies.contains(.buffer)),
             EventStoragePlace(role: .privateStaging, root: locations.privateStagingRoot, isPrimary: policies.contains(.archiveOnly)),
-            EventStoragePlace(role: .nas, root: locations.libraryRoot, isPrimary: true),
+            EventStoragePlace(role: .nas, root: locations.nasRoot, isPrimary: true),
         ]
         var sourceRoots = Set<String>()
         for assignment in assignments {

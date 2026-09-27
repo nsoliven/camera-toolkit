@@ -33,7 +33,11 @@ private struct EventAssetRow: Identifiable, Sendable {
     var name: String
     var sourceURL: URL
     var bufferURL: URL
+    /// The NAS mirror copy.
     var archiveURL: URL
+    /// The legacy NAS archive copy, for events archived before the mirror
+    /// layout; presence falls back to it.
+    var legacyArchiveURL: URL?
     var sourcePresence: CatalogPresenceState
     var bufferPresence: CatalogPresenceState
     var archivePresence: CatalogPresenceState
@@ -43,7 +47,10 @@ private struct EventAssetRow: Identifiable, Sendable {
     var archiveExists: Bool { archivePresence == .present }
 
     var bestExistingURL: URL? {
-        if archiveExists { return archiveURL }
+        if archiveExists {
+            if let legacyArchiveURL, !FileManager.default.fileExists(atPath: archiveURL.path) { return legacyArchiveURL }
+            return archiveURL
+        }
         if bufferExists { return bufferURL }
         if sourceExists { return sourceURL }
         return nil
@@ -434,15 +441,9 @@ private struct EventLibraryView: View {
         // The shared resolver keeps subevent folders nested inside their
         // parent event folder on both the Buffer and the library.
         let locations = EventStorageLocations(configuration: model.configuration)
-        let layout = locations.layout(for: event, deviceID: model.configuration.selectedDeviceID)
         let bufferEvent = locations.eventFolder(for: event, policy: .buffer)
-        var editedEvent = locations.libraryRoot
-            .appendingPathComponent("Edited", isDirectory: true)
-            .appendingPathComponent(layout.year, isDirectory: true)
-        for folder in layout.parentEventFolders {
-            editedEvent.appendPathComponent(folder, isDirectory: true)
-        }
-        editedEvent.appendPathComponent(layout.eventFolder, isDirectory: true)
+        // The NAS mirror keeps edits inside the event folder, like the drive.
+        let editedEvent = locations.nasEditedRoot(for: event)
         return (
             bufferEvent.appendingPathComponent(EventStorageLocations.originalsFolderName, isDirectory: true),
             locations.editedRoot(for: event, policy: .buffer),
@@ -635,9 +636,11 @@ private struct EventLibraryView: View {
                 .appendingPathComponent(assignment.relativePath)
             let bufferURL = locations.originalsRoot(for: event, deviceID: deviceID, policy: .buffer)
                 .appendingPathComponent(assignment.relativePath)
-            guard let archiveRelativePath = try? layout.destinationRelativePath(for: assignment.relativePath) else { return nil }
-            let archiveURL = locations.libraryRoot
+            guard let archiveRelativePath = try? layout.mirrorRelativePath(for: assignment.relativePath) else { return nil }
+            let archiveURL = locations.nasRoot
                 .appendingPathComponent(archiveRelativePath)
+            let legacyArchiveURL = (try? layout.legacyArchiveRelativePath(for: assignment.relativePath))
+                .map { locations.libraryRoot.appendingPathComponent($0) }
             let id = CatalogStore.eventAssetID(assignment)
             let cached = cachedAssets[id]
             return EventAssetRow(
@@ -647,6 +650,7 @@ private struct EventLibraryView: View {
                 sourceURL: sourceURL,
                 bufferURL: bufferURL,
                 archiveURL: archiveURL,
+                legacyArchiveURL: legacyArchiveURL,
                 sourcePresence: cached?.sourcePresence?.state ?? .unknown,
                 bufferPresence: cached?.bufferPresence?.state ?? .unknown,
                 archivePresence: cached?.archivePresence?.state ?? .unknown
@@ -679,7 +683,9 @@ private struct EventLibraryView: View {
             if let volumeRoot = volumeRootPath(for: url), !mountedVolumePaths.contains(volumeRoot) {
                 state = .unavailable
             } else {
-                state = fileManager.fileExists(atPath: url.path) ? .present : .missing
+                state = fileManager.fileExists(atPath: url.path)
+                    || (location == .archive && row.legacyArchiveURL.map { fileManager.fileExists(atPath: $0.path) } == true)
+                    ? .present : .missing
             }
             observations.append(
                 CatalogPresenceObservation(

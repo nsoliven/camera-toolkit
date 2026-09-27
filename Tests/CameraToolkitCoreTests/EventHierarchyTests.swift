@@ -112,6 +112,10 @@ final class EventHierarchyTests: XCTestCase {
             )
             XCTAssertEqual(
                 locations.archiveURL(for: assignment, event: grandchild)?.path,
+                root.appendingPathComponent("Library/2026/2026-08-21 TRIP2026/2026-08-23 Matcha/2026-08-24 Latte Art/Originals/Sony A7V/DSC00001.ARW").standardizedFileURL.path
+            )
+            XCTAssertEqual(
+                locations.legacyArchiveURL(for: assignment, event: grandchild)?.path,
                 root.appendingPathComponent("Library/Originals/2026/2026-08-21 TRIP2026/2026-08-23 Matcha/2026-08-24 Latte Art/Sony A7V/RAW/DSC00001.ARW").standardizedFileURL.path
             )
         }

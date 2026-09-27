@@ -35,6 +35,10 @@ final class OrganizeStorageTests: XCTestCase {
             )
             XCTAssertEqual(
                 locations.archiveURL(for: assignment, event: event)?.path,
+                root.appendingPathComponent("Library/2026/2026-08-26 Mountain Trip/Originals/Sony A7V/DSC00001.ARW").standardizedFileURL.path
+            )
+            XCTAssertEqual(
+                locations.legacyArchiveURL(for: assignment, event: event)?.path,
                 root.appendingPathComponent("Library/Originals/2026/2026-08-26 Mountain Trip/Sony A7V/RAW/DSC00001.ARW").standardizedFileURL.path
             )
         }
@@ -471,23 +475,23 @@ final class OrganizeStorageTests: XCTestCase {
 
             // Media-folder routing inside the archive.
             XCTAssertEqual(
-                try layout.destinationRelativePath(for: "DCIM/100MSDCF/DSC00001.ARW"),
+                try layout.legacyArchiveRelativePath(for: "DCIM/100MSDCF/DSC00001.ARW"),
                 "Originals/2026/2026-08-26 Mountain Trip/Sony A7V/RAW/DSC00001.ARW"
             )
             XCTAssertEqual(
-                try layout.destinationRelativePath(for: "DCIM/100MSDCF/DSC00001.XMP"),
+                try layout.legacyArchiveRelativePath(for: "DCIM/100MSDCF/DSC00001.XMP"),
                 "Originals/2026/2026-08-26 Mountain Trip/Sony A7V/RAW/DSC00001.XMP"
             )
             XCTAssertEqual(
-                try layout.destinationRelativePath(for: "DCIM/100MSDCF/DSC00002.JPG"),
+                try layout.legacyArchiveRelativePath(for: "DCIM/100MSDCF/DSC00002.JPG"),
                 "Originals/2026/2026-08-26 Mountain Trip/Sony A7V/JPEG/DSC00002.JPG"
             )
             XCTAssertEqual(
-                try layout.destinationRelativePath(for: "PRIVATE/M4ROOT/CLIP/C0001.MP4"),
+                try layout.legacyArchiveRelativePath(for: "PRIVATE/M4ROOT/CLIP/C0001.MP4"),
                 "Originals/2026/2026-08-26 Mountain Trip/Sony A7V/Video/C0001.MP4"
             )
             XCTAssertEqual(
-                try layout.destinationRelativePath(for: "DCIM/100MSDCF/THMBNL.DAT"),
+                try layout.legacyArchiveRelativePath(for: "DCIM/100MSDCF/THMBNL.DAT"),
                 "Originals/2026/2026-08-26 Mountain Trip/Sony A7V/Camera Support/THMBNL.DAT"
             )
 

@@ -6,6 +6,15 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
     public var archivePath: String
     public var bufferPath: String
     public var cameraLibraryRootPath: String
+    /// The root of the NAS mirror layout: a Buffer file at
+    /// `<year>/<event>/Originals/<Camera>/<subpath>` is archived at the same
+    /// relative path under this folder. Empty means derived from
+    /// `cameraLibraryRootPath` (`derivedArchiveLayoutRoot`); a configuration
+    /// written before the mirror layout gets the derived value on load.
+    public var archiveLayoutRootPath: String
+    /// The SMB share the NAS library lives on (`smb://host/share`), opened
+    /// by "Connect to NAS…" when the share is not mounted. Empty means none.
+    public var nasSMBURL: String
     public var catalogDatabasePath: String
     public var catalogBackupFolderPath: String
     public var configuredLocations: [ConfiguredLocation]
@@ -42,6 +51,8 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         archivePath: String,
         bufferPath: String,
         cameraLibraryRootPath: String = "",
+        archiveLayoutRootPath: String = "",
+        nasSMBURL: String = "",
         catalogDatabasePath: String = "",
         catalogBackupFolderPath: String = "",
         configuredLocations: [ConfiguredLocation] = [],
@@ -69,6 +80,8 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         self.archivePath = archivePath
         self.bufferPath = bufferPath
         self.cameraLibraryRootPath = cameraLibraryRootPath
+        self.archiveLayoutRootPath = archiveLayoutRootPath
+        self.nasSMBURL = nasSMBURL
         self.catalogDatabasePath = catalogDatabasePath
         self.catalogBackupFolderPath = catalogBackupFolderPath
         self.configuredLocations = configuredLocations
@@ -100,6 +113,8 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         case archivePath
         case bufferPath
         case cameraLibraryRootPath
+        case archiveLayoutRootPath
+        case nasSMBURL
         case catalogDatabasePath
         case catalogBackupFolderPath
         case configuredLocations
@@ -138,6 +153,8 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         try values.encode(archivePath, forKey: .archivePath)
         try values.encode(bufferPath, forKey: .bufferPath)
         try values.encode(cameraLibraryRootPath, forKey: .cameraLibraryRootPath)
+        try values.encode(archiveLayoutRootPath, forKey: .archiveLayoutRootPath)
+        try values.encode(nasSMBURL, forKey: .nasSMBURL)
         try values.encode(catalogDatabasePath, forKey: .catalogDatabasePath)
         try values.encode(catalogBackupFolderPath, forKey: .catalogBackupFolderPath)
         try values.encode(configuredLocations, forKey: .configuredLocations)
@@ -176,6 +193,11 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         archivePath = try values.decodeIfPresent(String.self, forKey: .archivePath) ?? defaults.archivePath
         bufferPath = try values.decodeIfPresent(String.self, forKey: .bufferPath) ?? defaults.bufferPath
         cameraLibraryRootPath = try values.decodeIfPresent(String.self, forKey: .cameraLibraryRootPath) ?? defaults.cameraLibraryRootPath
+        // Missing in a configuration from before the mirror layout: the
+        // normalization below derives it from the library root once, and the
+        // next save writes it out, so the setting is explicit from then on.
+        archiveLayoutRootPath = try values.decodeIfPresent(String.self, forKey: .archiveLayoutRootPath) ?? ""
+        nasSMBURL = try values.decodeIfPresent(String.self, forKey: .nasSMBURL) ?? ""
         catalogDatabasePath = try values.decodeIfPresent(String.self, forKey: .catalogDatabasePath) ?? defaults.catalogDatabasePath
         catalogBackupFolderPath = try values.decodeIfPresent(String.self, forKey: .catalogBackupFolderPath) ?? defaults.catalogBackupFolderPath
         configuredLocations = try values.decodeIfPresent([ConfiguredLocation].self, forKey: .configuredLocations) ?? []
@@ -238,6 +260,9 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
             cameraLibraryRootPath = URL(fileURLWithPath: archivePath, isDirectory: true)
                 .deletingLastPathComponent()
                 .path
+        }
+        if archiveLayoutRootPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            archiveLayoutRootPath = Self.derivedArchiveLayoutRoot(cameraLibraryRootPath: cameraLibraryRootPath)
         }
         if catalogBackupFolderPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             catalogBackupFolderPath = libraryFolderPath(.manifests)
@@ -362,6 +387,20 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
     private func defaultLocationName(path: String, fallback: String) -> String {
         let last = URL(fileURLWithPath: path).lastPathComponent
         return last.isEmpty ? fallback : last
+    }
+
+    /// The mirror root a library root implies: the library root itself, or
+    /// its parent when it ends in `Originals` — so a library configured as
+    /// `…/Media/Camera/Originals` mirrors to `…/Media/Camera/<year>/…`
+    /// instead of a confusing `Originals/<year>/<event>/Originals/<Camera>`.
+    public static func derivedArchiveLayoutRoot(cameraLibraryRootPath: String) -> String {
+        let trimmed = cameraLibraryRootPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+        let url = URL(fileURLWithPath: NSString(string: trimmed).expandingTildeInPath, isDirectory: true).standardizedFileURL
+        if url.lastPathComponent == CameraLibraryFolder.originals.rawValue {
+            return url.deletingLastPathComponent().path
+        }
+        return url.path
     }
 
     public func libraryFolderPath(_ folder: CameraLibraryFolder) -> URL {

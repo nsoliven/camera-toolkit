@@ -20,6 +20,10 @@ public struct EventAssetPresence: Identifiable, Hashable, Sendable {
     /// `Originals/<Camera>` yet and the file was found only there.
     public var driveIsLegacyLayout: Bool = false
     public var otherDriveIsLegacyLayout: Bool = false
+    /// True when `archivePath` is the legacy archive copy
+    /// (`Originals/<year>/<event>/<device>/RAW|JPEG|…`): the event was
+    /// archived before the mirror layout and not migrated yet.
+    public var archiveIsLegacyLayout: Bool = false
 
     /// The folder `drivePath` sits in minus the assignment's relative path —
     /// the root to pair with `assignment.relativePath` when the copy is
@@ -68,6 +72,8 @@ public struct EventPresenceSummary: Sendable {
     /// Files found only in the legacy `Card Copy` layout.
     public var onLegacyLayout: Int { assets.count { ($0.drive == .present && $0.driveIsLegacyLayout) || ($0.otherDrive == .present && $0.otherDriveIsLegacyLayout) } }
     public var missingEverywhere: Int { assets.count { $0.bestLocalPath == nil } }
+    /// NAS copies found only in the legacy archive layout.
+    public var onLegacyArchiveLayout: Int { assets.count { $0.archive == .present && $0.archiveIsLegacyLayout } }
 }
 
 public enum EventPresenceScanner {
@@ -141,22 +147,24 @@ public enum EventPresenceScanner {
         assets.reserveCapacity(assignments.count)
         for assignment in assignments {
             if Task<Never, Never>.isCancelled { return nil }
-            let (source, drive, other, archive, legacyDrive, legacyOther) = autoreleasepool {
-                () -> (URL?, URL?, URL?, URL?, URL?, URL?) in
+            let (source, drive, other, archive, legacyDrive, legacyOther, legacyArchive) = autoreleasepool {
+                () -> (URL?, URL?, URL?, URL?, URL?, URL?, URL?) in
                 let valid = isValidRelative(assignment.relativePath)
                 let source = locations.sourceURL(for: assignment)
                 func join(_ root: URL) -> URL? {
                     valid ? root.appendingPathComponent(assignment.relativePath).standardizedFileURL : nil
                 }
-                let archive = try? layout(assignment.deviceID)
-                    .destinationRelativePath(for: assignment.relativePath)
+                let archiveLayout = layout(assignment.deviceID)
+                let archive = try? archiveLayout.mirrorRelativePath(for: assignment.relativePath)
+                let legacyArchive = try? archiveLayout.legacyArchiveRelativePath(for: assignment.relativePath)
                 return (
                     source,
                     join(originalsRoot(policy, assignment.deviceID)),
                     join(originalsRoot(otherPolicy, assignment.deviceID)),
-                    archive.map { locations.libraryRoot.appendingPathComponent($0).standardizedFileURL },
+                    archive.map { locations.nasRoot.appendingPathComponent($0).standardizedFileURL },
                     join(legacyRoot(policy, assignment.deviceID)),
-                    join(legacyRoot(otherPolicy, assignment.deviceID))
+                    join(legacyRoot(otherPolicy, assignment.deviceID)),
+                    legacyArchive.map { locations.libraryRoot.appendingPathComponent($0).standardizedFileURL }
                 )
             }
             if let pauseGate {
@@ -188,21 +196,24 @@ public enum EventPresenceScanner {
             let sourceState = probe(source, assignment.fileSize, mounted)
             let driveResolved = resolve(drive, legacyDrive)
             let otherResolved = resolve(other, legacyOther)
-            let archiveState = probe(archive, assignment.fileSize, mounted)
+            // The NAS: the mirror layout first, then the legacy archive
+            // layout an event archived before the mirror still sits in.
+            let archiveResolved = resolve(archive, legacyArchive)
             assets.append(EventAssetPresence(
                 id: CatalogStore.eventAssetID(assignment),
                 assignment: assignment,
                 sourcePath: source?.path,
                 drivePath: driveResolved.0?.path,
                 otherDrivePath: otherResolved.0?.path,
-                archivePath: archive?.path,
+                archivePath: archiveResolved.0?.path,
                 source: sourceState,
                 drive: driveResolved.1,
                 otherDrive: otherResolved.1,
-                archive: archiveState,
+                archive: archiveResolved.1,
                 sourceIsDriveCopy: sourceIsDrive,
                 driveIsLegacyLayout: driveResolved.2,
-                otherDriveIsLegacyLayout: otherResolved.2
+                otherDriveIsLegacyLayout: otherResolved.2,
+                archiveIsLegacyLayout: archiveResolved.2
             ))
         }
         return EventPresenceSummary(eventID: event.id, policy: policy, assets: assets, checkedAt: Date())

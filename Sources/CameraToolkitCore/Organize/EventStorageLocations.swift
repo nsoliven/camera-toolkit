@@ -58,7 +58,15 @@ public struct EventStorageLocations: Sendable {
     public var bufferRoot: URL
     public var privateStagingRoot: URL
     public var removedFilesRoot: URL
+    /// The NAS library root. The legacy archive layout lives under it at
+    /// `Originals/<year>/<event>/<device>/RAW|JPEG|…` (`legacyArchiveURL`).
     public var libraryRoot: URL
+    /// The NAS mirror root: every drive file's archive copy sits at the same
+    /// `<year>/<event>/…` relative path under it (`archiveURL`,
+    /// `nasMirrorURL(forDrivePath:)`). Private events mirror here too —
+    /// "Private · NAS only" keeps them out of the shared Buffer and Immich,
+    /// not out of the NAS.
+    public var nasRoot: URL
     public var fallbackDeviceID: String
     /// Paths the Trash roots are derived from — every configured location
     /// plus the Buffer, private staging, and library roots.
@@ -85,6 +93,15 @@ public struct EventStorageLocations: Sendable {
         removedFilesRoot = toolkitFolder.appendingPathComponent("_Trash", isDirectory: true)
         libraryRoot = URL(
             fileURLWithPath: NSString(string: configuration.cameraLibraryRootPath).expandingTildeInPath,
+            isDirectory: true
+        ).standardizedFileURL
+        let mirror = configuration.archiveLayoutRootPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        nasRoot = URL(
+            fileURLWithPath: NSString(
+                string: mirror.isEmpty
+                    ? AppConfiguration.derivedArchiveLayoutRoot(cameraLibraryRootPath: configuration.cameraLibraryRootPath)
+                    : mirror
+            ).expandingTildeInPath,
             isDirectory: true
         ).standardizedFileURL
         fallbackDeviceID = configuration.selectedDeviceID
@@ -267,10 +284,66 @@ public struct EventStorageLocations: Sendable {
             .path
     }
 
+    /// `<NAS root>/<year>/<parent…>/<event>` — the same event folder path
+    /// the drive uses, for every storage policy.
+    public func nasEventFolder(for event: SavedCameraEvent) -> URL {
+        nasRoot.appendingPathComponent(layout(for: event, deviceID: nil).mirrorEventFolderPath, isDirectory: true)
+    }
+
+    /// `<NAS event folder>/Originals/<Camera>`.
+    public func nasOriginalsRoot(for event: SavedCameraEvent, deviceID: String?) -> URL {
+        nasRoot.appendingPathComponent(layout(for: event, deviceID: deviceID).mirrorOriginalsPath, isDirectory: true)
+    }
+
+    /// `<NAS event folder>/Edited`.
+    public func nasEditedRoot(for event: SavedCameraEvent) -> URL {
+        nasEventFolder(for: event).appendingPathComponent(Self.editedFolderName, isDirectory: true)
+    }
+
+    /// The legacy archive's event folder,
+    /// `<library>/Originals/<year>/<parent…>/<event>`.
+    public func legacyArchiveEventFolder(for event: SavedCameraEvent) -> URL {
+        libraryRoot
+            .appendingPathComponent(CameraLibraryFolder.originals.rawValue, isDirectory: true)
+            .appendingPathComponent(layout(for: event, deviceID: nil).mirrorEventFolderPath, isDirectory: true)
+    }
+
+    /// The assignment's NAS copy in the mirror layout: the drive's
+    /// `Originals/<Camera>/<relative path>` under the NAS root.
     public func archiveURL(for assignment: PhotoEventAssignment, event: SavedCameraEvent) -> URL? {
         guard let relative = try? layout(for: event, deviceID: assignment.deviceID)
-            .destinationRelativePath(for: assignment.relativePath) else { return nil }
+            .mirrorRelativePath(for: assignment.relativePath) else { return nil }
+        return nasRoot.appendingPathComponent(relative).standardizedFileURL
+    }
+
+    /// Where the legacy archive layout kept the assignment's NAS copy
+    /// (flattened into `RAW`/`JPEG`/`Video`/…). Read as a fallback so events
+    /// archived before the mirror layout still show as on the NAS.
+    public func legacyArchiveURL(for assignment: PhotoEventAssignment, event: SavedCameraEvent) -> URL? {
+        guard let relative = try? layout(for: event, deviceID: assignment.deviceID)
+            .legacyArchiveRelativePath(for: assignment.relativePath) else { return nil }
         return libraryRoot.appendingPathComponent(relative).standardizedFileURL
+    }
+
+    /// The path of a drive file relative to the drive root it sits under —
+    /// the Buffer or private staging — which is also its path under the NAS
+    /// mirror root. Nil for a path under neither root or one that is not
+    /// lexically clean.
+    public func mirrorRelativePath(forDrivePath path: String) -> String? {
+        let standardized = URL(fileURLWithPath: path).standardizedFileURL.path
+        // The longer root first, in case one drive root nests inside the other.
+        for root in [bufferRoot.path, privateStagingRoot.path].sorted(by: { $0.count > $1.count })
+            where standardized.hasPrefix(root + "/") {
+            let relative = String(standardized.dropFirst(root.count + 1))
+            guard Self.isLexicallyClean(relative), (try? PathSafety.validateRelativePath(relative)) != nil else { return nil }
+            return relative
+        }
+        return nil
+    }
+
+    /// The NAS mirror copy of a drive file.
+    public func nasMirrorURL(forDrivePath path: String) -> URL? {
+        mirrorRelativePath(forDrivePath: path).map { nasRoot.appendingPathComponent($0).standardizedFileURL }
     }
 
     /// Lower-cased standardized absolute path used to match files to

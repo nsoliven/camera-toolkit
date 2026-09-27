@@ -139,10 +139,10 @@ public struct OrganizedArchiveLayout: Sendable {
         Self.pathComponent(CameraCatalog.camera(deviceID: deviceID)?.name ?? "", fallback: "Camera")
     }
 
-    /// The device folder of the NAS archive layout
+    /// The device folder of the legacy NAS archive layout
     /// (`Originals/<year>/<event>/<deviceFolder>/RAW`) and of the legacy
-    /// drive layout (`<event>/<deviceFolder>/Card Copy`). The drive's
-    /// current layout uses `cameraFolder`.
+    /// drive layout (`<event>/<deviceFolder>/Card Copy`). The drive and the
+    /// NAS mirror layout use `cameraFolder`.
     public var deviceFolder: String {
         switch deviceID {
         case "sony-a7v": "Sony A7V"
@@ -155,11 +155,34 @@ public struct OrganizedArchiveLayout: Sendable {
         }
     }
 
-    public func destinationRelativePath(for sourcePath: String) throws -> String {
+    /// `<year>/<parent…>/<event>` — the event folder under a drive root or
+    /// the NAS mirror root.
+    public var mirrorEventFolderPath: String { [year, eventFolderPath].joined(separator: "/") }
+
+    /// `<year>/<parent…>/<event>/Originals/<Camera>` under the NAS mirror root.
+    public var mirrorOriginalsPath: String {
+        [mirrorEventFolderPath, EventStorageLocations.originalsFolderName, cameraFolder].joined(separator: "/")
+    }
+
+    /// Where a file of this camera lands under the NAS mirror root: the
+    /// same `<year>/<event>/Originals/<Camera>/<subpath>` it has under the
+    /// drive root. `sourcePath` is the path under `Originals/<Camera>` —
+    /// its subfolders are kept, so two files with one name never collide.
+    public func mirrorRelativePath(for sourcePath: String) throws -> String {
+        try PathSafety.validateRelativePath(sourcePath)
+        return mirrorOriginalsPath + "/" + sourcePath
+    }
+
+    /// The legacy NAS archive layout,
+    /// `Originals/<year>/<event>/<device>/RAW|JPEG|Video|…/<name>`, relative
+    /// to the library root. Read as a fallback only — events archived before
+    /// the mirror layout stay there until the NAS layout migration moves
+    /// them. Flat names: two files with one name collide here.
+    public func legacyArchiveRelativePath(for sourcePath: String) throws -> String {
         try PathSafety.validateRelativePath(sourcePath)
         let fileName = URL(fileURLWithPath: sourcePath).lastPathComponent
         let folder = mediaFolder(for: sourcePath).rawValue
-        return ["Originals", year, eventFolderPath, deviceFolder, folder, fileName]
+        return [CameraLibraryFolder.originals.rawValue, year, eventFolderPath, deviceFolder, folder, fileName]
             .joined(separator: "/")
     }
 
@@ -179,18 +202,15 @@ public struct OrganizedArchiveLayout: Sendable {
         return .support
     }
 
+    /// The mirror folders the given files need, relative to the mirror
+    /// root: `Originals/<Camera>` and every subfolder a file keeps.
     public func requiredFolders(for sourcePaths: [String]) -> [String] {
-        var folders: Set<String> = [
-            ["Originals", year, eventFolderPath, deviceFolder].joined(separator: "/"),
-            ["Edited", year, eventFolderPath, "Masters"].joined(separator: "/"),
-            ["Edited", year, eventFolderPath, "Web"].joined(separator: "/"),
-            ["Edited", year, eventFolderPath, "Social"].joined(separator: "/"),
-            "System/Manifests",
-            "System/Import History"
-        ]
+        var folders: Set<String> = [mirrorOriginalsPath]
         for path in sourcePaths {
-            let media = mediaFolder(for: path).rawValue
-            folders.insert(["Originals", year, eventFolderPath, deviceFolder, media].joined(separator: "/"))
+            let parent = (path as NSString).deletingLastPathComponent
+            if !parent.isEmpty {
+                folders.insert(mirrorOriginalsPath + "/" + parent)
+            }
         }
         return folders.sorted()
     }
@@ -232,7 +252,7 @@ public struct OrganizedArchivePlanner {
 
     public func plan(
         source: URL,
-        libraryRoot: URL,
+        archiveRoot: URL,
         layout: OrganizedArchiveLayout,
         excludes: [String] = DefaultExcludes.all,
         progress: FileOperationProgressHandler? = nil
@@ -240,13 +260,13 @@ public struct OrganizedArchivePlanner {
         let files = try scanner.scan(root: source, excludes: excludes, hashing: true) { update in
             progress?(update.withPhase("Hashing workspace"))
         }
-        return try plan(source: source, sourceFiles: files, libraryRoot: libraryRoot, layout: layout, progress: progress)
+        return try plan(source: source, sourceFiles: files, archiveRoot: archiveRoot, layout: layout, progress: progress)
     }
 
     public func plan(
         source: URL,
         sourceFiles files: [FileRecord],
-        libraryRoot: URL,
+        archiveRoot: URL,
         layout: OrganizedArchiveLayout,
         progress: FileOperationProgressHandler? = nil
     ) throws -> OrganizedArchivePlan {
@@ -254,7 +274,7 @@ public struct OrganizedArchivePlanner {
         let totalFiles = files.count
 
         for (index, file) in files.enumerated() {
-            let relativeDestination = try layout.destinationRelativePath(for: file.path)
+            let relativeDestination = try layout.mirrorRelativePath(for: file.path)
             let sourceHash = try file.sha256 ?? FileScanner.sha256(source.appendingPathComponent(file.path))
             let mapping = OrganizedArchiveMapping(
                 sourcePath: file.path,
@@ -263,7 +283,7 @@ public struct OrganizedArchivePlanner {
                 modifiedAt: file.modifiedAt,
                 sha256: sourceHash
             )
-            let destination = libraryRoot.appendingPathComponent(relativeDestination)
+            let destination = archiveRoot.appendingPathComponent(relativeDestination)
             if fileManager.fileExists(atPath: destination.path) {
                 if try FileScanner.sha256(destination) == mapping.sha256 {
                     plan.existing.append(mapping)
@@ -290,7 +310,7 @@ public struct OrganizedArchivePlanner {
     /// not verified. Copy and archive operations still perform SHA-256 checks.
     public func planMetadata(
         sourceFiles files: [FileRecord],
-        libraryRoot: URL,
+        archiveRoot: URL,
         layout: OrganizedArchiveLayout,
         progress: FileOperationProgressHandler? = nil
     ) throws -> OrganizedArchivePlan {
@@ -298,7 +318,7 @@ public struct OrganizedArchivePlanner {
         let totalFiles = files.count
 
         for (index, file) in files.enumerated() {
-            let relativeDestination = try layout.destinationRelativePath(for: file.path)
+            let relativeDestination = try layout.mirrorRelativePath(for: file.path)
             let mapping = OrganizedArchiveMapping(
                 sourcePath: file.path,
                 destinationPath: relativeDestination,
@@ -306,7 +326,7 @@ public struct OrganizedArchivePlanner {
                 modifiedAt: file.modifiedAt,
                 sha256: ""
             )
-            let destination = libraryRoot.appendingPathComponent(relativeDestination)
+            let destination = archiveRoot.appendingPathComponent(relativeDestination)
             if fileManager.fileExists(atPath: destination.path) {
                 let values = try destination.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
                 if values.isRegularFile == true, Int64(values.fileSize ?? -1) == file.size {
@@ -339,8 +359,9 @@ public struct OrganizedArchiveService {
 
     public func archive(
         source: URL,
-        libraryRoot: URL,
+        archiveRoot: URL,
         plan: OrganizedArchivePlan,
+        manifestFolder: URL,
         progress: FileOperationProgressHandler? = nil
     ) throws -> OrganizedArchiveResult {
         var result = OrganizedArchiveResult(
@@ -350,7 +371,7 @@ public struct OrganizedArchiveService {
         for folder in plan.folders {
             try PathSafety.validateRelativePath(folder)
             try fileManager.createDirectory(
-                at: libraryRoot.appendingPathComponent(folder, isDirectory: true),
+                at: archiveRoot.appendingPathComponent(folder, isDirectory: true),
                 withIntermediateDirectories: true
             )
         }
@@ -365,7 +386,7 @@ public struct OrganizedArchiveService {
             try PathSafety.validateRelativePath(mapping.sourcePath)
             try PathSafety.validateRelativePath(mapping.destinationPath)
             let sourceURL = source.appendingPathComponent(mapping.sourcePath)
-            let destinationURL = libraryRoot.appendingPathComponent(mapping.destinationPath)
+            let destinationURL = archiveRoot.appendingPathComponent(mapping.destinationPath)
             try fileManager.createDirectory(at: destinationURL.deletingLastPathComponent(), withIntermediateDirectories: true)
 
             if fileManager.fileExists(atPath: destinationURL.path) {
@@ -427,14 +448,14 @@ public struct OrganizedArchiveService {
         result.copied.sort()
         result.skippedIdentical = Array(Set(result.skippedIdentical)).sorted()
         result.conflicts = Array(Set(result.conflicts)).sorted()
-        result.manifestPath = try writeManifest(result: result, plan: plan, libraryRoot: libraryRoot)
+        result.manifestPath = try writeManifest(result: result, plan: plan, folder: manifestFolder)
         return result
     }
 
     private func writeManifest(
         result: OrganizedArchiveResult,
         plan: OrganizedArchivePlan,
-        libraryRoot: URL
+        folder: URL
     ) throws -> String {
         struct Manifest: Codable {
             var archivedAt: Date
@@ -443,7 +464,6 @@ public struct OrganizedArchiveService {
             var conflicts: [String]
             var files: [OrganizedArchiveMapping]
         }
-        let folder = libraryRoot.appendingPathComponent("System/Manifests", isDirectory: true)
         try fileManager.createDirectory(at: folder, withIntermediateDirectories: true)
         let formatter = DateFormatter()
         formatter.calendar = Calendar(identifier: .gregorian)

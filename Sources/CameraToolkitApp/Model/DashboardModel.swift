@@ -1878,6 +1878,12 @@ extension DashboardModel {
 private extension AppConfiguration {
     mutating func setCameraLibraryRoot(_ path: String) {
         let root = URL(fileURLWithPath: path, isDirectory: true)
+        // A mirror root that simply followed the old library root follows
+        // the new one; one the user set by hand stays.
+        if archiveLayoutRootPath.isEmpty
+            || archiveLayoutRootPath == Self.derivedArchiveLayoutRoot(cameraLibraryRootPath: cameraLibraryRootPath) {
+            archiveLayoutRootPath = Self.derivedArchiveLayoutRoot(cameraLibraryRootPath: root.path)
+        }
         cameraLibraryRootPath = root.path
         archivePath = root.appendingPathComponent(CameraLibraryFolder.originals.rawValue, isDirectory: true).path
         catalogBackupFolderPath = root

@@ -921,6 +921,7 @@ final class EventsWorkspaceTests: XCTestCase {
                     "card copy": cardCopy,
                     "other drive": try standardized(locations.driveURL(for: assignment, event: owner, policy: other)),
                     "nas": try standardized(locations.archiveURL(for: assignment, event: owner)),
+                    "nas, legacy layout": try standardized(locations.legacyArchiveURL(for: assignment, event: owner)),
                     "card copy, upper case": try literal(cardCopy.path.uppercased()),
                 ]
             }
@@ -944,7 +945,7 @@ final class EventsWorkspaceTests: XCTestCase {
             }
 
             let all: Set<String> = [tagBurst.id, parentBurst.id, single.id]
-            for place in ["source", "card copy", "other drive", "nas", "card copy, upper case"] {
+            for place in ["source", "card copy", "other drive", "nas", "nas, legacy layout", "card copy, upper case"] {
                 let drawn = try stacks(at: place)
                 // Every frame resolves to its own event — the lookup, the
                 // tile's tag dot, and the filter all agree.

@@ -576,14 +576,11 @@ private struct EventActionsMenu: View {
             reveal(workspace.locations.eventFolder(for: event, policy: workspace.resolvedPolicy(for: event)))
         }
         Button("Reveal NAS Folder") {
-            let layout = workspace.locations.layout(for: event, deviceID: nil)
-            var url = workspace.locations.libraryRoot
-                .appendingPathComponent("Originals", isDirectory: true)
-                .appendingPathComponent(layout.year, isDirectory: true)
-            for folder in layout.parentEventFolders {
-                url.appendPathComponent(folder, isDirectory: true)
-            }
-            reveal(url.appendingPathComponent(layout.eventFolder, isDirectory: true))
+            // The mirror folder, or the legacy archive folder of an event
+            // archived before the mirror layout.
+            let mirror = workspace.locations.nasEventFolder(for: event)
+            let legacy = workspace.locations.legacyArchiveEventFolder(for: event)
+            reveal(FileManager.default.fileExists(atPath: mirror.path) || !FileManager.default.fileExists(atPath: legacy.path) ? mirror : legacy)
         }
         Divider()
         Button("Scan for Faces…") {

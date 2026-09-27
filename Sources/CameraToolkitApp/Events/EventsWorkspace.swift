@@ -936,15 +936,20 @@ final class EventsWorkspace {
                     archiveLayouts[layoutKey] = built
                     return built
                 }()
-                if let relative = try? layout.destinationRelativePath(for: assignment.relativePath) {
-                    // `relative` is assembled from validated components and
-                    // sanitized folder names, and `libraryRoot` is
-                    // standardized — the archive key is a string join too.
-                    let joined = locations.libraryRoot.path + "/" + relative
-                    if let key = EventStorageLocations.joinedPathKey(rootPath: locations.libraryRoot.path, relativePath: relative) {
+                // The NAS mirror copy, and the legacy archive copy an event
+                // archived before the mirror layout still has. `relative` is
+                // assembled from validated components and sanitized folder
+                // names, and both roots are standardized — the archive keys
+                // are string joins too.
+                for (root, relative) in [
+                    (locations.nasRoot.path, try? layout.mirrorRelativePath(for: assignment.relativePath)),
+                    (locations.libraryRoot.path, try? layout.legacyArchiveRelativePath(for: assignment.relativePath)),
+                ] {
+                    guard let relative else { continue }
+                    if let key = EventStorageLocations.joinedPathKey(rootPath: root, relativePath: relative) {
                         insert(key, assignment)
                     } else {
-                        insert(EventStorageLocations.pathKey(joined), assignment)
+                        insert(EventStorageLocations.pathKey(root + "/" + relative), assignment)
                     }
                 }
             }
@@ -1752,6 +1757,7 @@ final class EventsWorkspace {
             locations.driveRoot(for: .buffer),
             locations.driveRoot(for: .archiveOnly),
             locations.libraryRoot,
+            locations.nasRoot,
         ].contains { root in
             guard let volume = VolumeInfo.volumeRoot(for: root) else { return false }
             return changedRoots.contains(volume.standardizedFileURL.path)
@@ -2198,16 +2204,12 @@ final class EventsWorkspace {
                 }
             }
         }
-        let oldLayout = locations.layout(for: event, deviceID: nil)
-        var oldNAS = locations.libraryRoot
-            .appendingPathComponent("Originals", isDirectory: true)
-            .appendingPathComponent(oldLayout.year, isDirectory: true)
-        for folder in oldLayout.parentEventFolders {
-            oldNAS.appendPathComponent(folder, isDirectory: true)
+        // The NAS is never renamed from here: its copies keep the old folder
+        // name (mirror or legacy layout) until the next Sync to NAS.
+        let nasNote = [locations.nasEventFolder(for: event), locations.legacyArchiveEventFolder(for: event)].contains {
+            VolumeInfo.isAvailable($0) && fileManager.fileExists(atPath: $0.path)
         }
-        oldNAS.appendPathComponent(oldLayout.eventFolder, isDirectory: true)
-        let nasNote = VolumeInfo.isAvailable(oldNAS) && fileManager.fileExists(atPath: oldNAS.path)
-            ? " NAS copies keep the old folder name until you archive again."
+            ? " NAS copies keep the old folder name until you sync again."
             : ""
         model.statusMessage = "Renamed to \(eventTitle(renamed))." + nasNote
             + (newResolved == oldResolved ? ""
@@ -3573,8 +3575,8 @@ final class EventsWorkspace {
             return
         }
         let locations = self.locations
-        guard VolumeInfo.isAvailable(locations.libraryRoot), FileManager.default.fileExists(atPath: locations.libraryRoot.path) else {
-            model.statusMessage = "The NAS library is not connected: \(locations.libraryRoot.path)"
+        guard VolumeInfo.isAvailable(locations.nasRoot), FileManager.default.fileExists(atPath: locations.nasRoot.path) else {
+            model.statusMessage = "The NAS library is not connected: \(locations.nasRoot.path)"
             return
         }
         var groups: [String: NASArchiveGroup] = [:]
@@ -3630,7 +3632,10 @@ final class EventsWorkspace {
             return
         }
         let archiveGroups = groups.values.sorted { $0.root.path < $1.root.path }
-        let libraryRoot = locations.libraryRoot
+        let archiveRoot = locations.nasRoot
+        let manifestFolder = URL(fileURLWithPath: DashboardModel.expandedPath(model.configuration.catalogDatabasePath))
+            .deletingLastPathComponent()
+            .appendingPathComponent("NAS Archive Manifests", isDirectory: true)
         let fileCount = archiveGroups.reduce(0) { $0 + $1.files.count }
         model.runBackgroundJob(
             action: .syncBuffer,
@@ -3646,12 +3651,12 @@ final class EventsWorkspace {
                     let plan = try OrganizedArchivePlanner().plan(
                         source: group.root,
                         sourceFiles: group.files,
-                        libraryRoot: libraryRoot,
+                        archiveRoot: archiveRoot,
                         layout: layout
                     ) { update in
                         progress(DashboardModel.jobUpdate(from: update, lowerBound: base, upperBound: base + span * 0.3, notePrefix: "Checking NAS", command: ""))
                     }
-                    let result = try OrganizedArchiveService().archive(source: group.root, libraryRoot: libraryRoot, plan: plan) { update in
+                    let result = try OrganizedArchiveService().archive(source: group.root, archiveRoot: archiveRoot, plan: plan, manifestFolder: manifestFolder) { update in
                         progress(DashboardModel.jobUpdate(from: update, lowerBound: base + span * 0.3, upperBound: base + span, notePrefix: "Archiving to NAS", command: ""))
                     }
                     outcome.copied += result.copied.count
