@@ -291,3 +291,42 @@ private struct BoardStatusLine: View {
         .frame(maxWidth: .infinity, minHeight: 16)
     }
 }
+
+/// Where the board's top-chrome pieces landed, for the off-screen layout
+/// harness: the storage strip and the current section's header must stack
+/// and never overlap. Records only in debug builds, and only while a
+/// harness has switched it on; release builds compile it away.
+@MainActor
+enum BoardChromeProbe {
+    struct Entry: Equatable {
+        var frame: CGRect
+        var label: String
+    }
+
+    #if DEBUG
+    static var isEnabled = false
+    static var entries: [String: Entry] = [:]
+    #endif
+}
+
+extension View {
+    /// Reports this view's window frame to `BoardChromeProbe` under `id`.
+    @ViewBuilder
+    func boardChromeProbe(_ id: String, label: String = "") -> some View {
+        #if DEBUG
+        if BoardChromeProbe.isEnabled {
+            onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { frame in
+                BoardChromeProbe.entries[id, default: BoardChromeProbe.Entry(frame: .zero, label: label)].frame = frame
+            }
+            // A new label in the same place changes no geometry.
+            .onChange(of: label, initial: true) { _, label in
+                BoardChromeProbe.entries[id, default: BoardChromeProbe.Entry(frame: .zero, label: label)].label = label
+            }
+        } else {
+            self
+        }
+        #else
+        self
+        #endif
+    }
+}
