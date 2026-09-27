@@ -15,6 +15,18 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
     /// The SMB share the NAS library lives on (`smb://host/share`), opened
     /// by "Connect to NAS…" when the share is not mounted. Empty means none.
     public var nasSMBURL: String
+    /// Sync to NAS: files copied at once (`NASSyncOptions.parallelRange`).
+    public var nasSyncParallelTransfers: Int
+    /// Sync to NAS: verify each copy by hashing it on the NAS over SSH
+    /// instead of re-reading it over SMB. Needs `nasSyncSSHHost` and
+    /// `nasSyncSSHServerPath`; falls back to the SMB re-read without them.
+    public var nasSyncVerifyViaSSH: Bool
+    /// An SSH host alias from `~/.ssh/config`, or `user@host`. The system
+    /// `ssh` runs in batch mode with the user's own keys; no secret is stored.
+    public var nasSyncSSHHost: String
+    /// The server-side path of the SMB share's root folder (e.g.
+    /// `/mnt/<pool>/<dataset>`): `/Volumes/<share>/x` is `<this>/x` on the NAS.
+    public var nasSyncSSHServerPath: String
     public var catalogDatabasePath: String
     public var catalogBackupFolderPath: String
     public var configuredLocations: [ConfiguredLocation]
@@ -53,6 +65,10 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         cameraLibraryRootPath: String = "",
         archiveLayoutRootPath: String = "",
         nasSMBURL: String = "",
+        nasSyncParallelTransfers: Int = NASSyncOptions.defaultParallelTransfers,
+        nasSyncVerifyViaSSH: Bool = false,
+        nasSyncSSHHost: String = "",
+        nasSyncSSHServerPath: String = "",
         catalogDatabasePath: String = "",
         catalogBackupFolderPath: String = "",
         configuredLocations: [ConfiguredLocation] = [],
@@ -82,6 +98,10 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         self.cameraLibraryRootPath = cameraLibraryRootPath
         self.archiveLayoutRootPath = archiveLayoutRootPath
         self.nasSMBURL = nasSMBURL
+        self.nasSyncParallelTransfers = NASSyncOptions.clamp(nasSyncParallelTransfers)
+        self.nasSyncVerifyViaSSH = nasSyncVerifyViaSSH
+        self.nasSyncSSHHost = nasSyncSSHHost
+        self.nasSyncSSHServerPath = nasSyncSSHServerPath
         self.catalogDatabasePath = catalogDatabasePath
         self.catalogBackupFolderPath = catalogBackupFolderPath
         self.configuredLocations = configuredLocations
@@ -115,6 +135,10 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         case cameraLibraryRootPath
         case archiveLayoutRootPath
         case nasSMBURL
+        case nasSyncParallelTransfers
+        case nasSyncVerifyViaSSH
+        case nasSyncSSHHost
+        case nasSyncSSHServerPath
         case catalogDatabasePath
         case catalogBackupFolderPath
         case configuredLocations
@@ -155,6 +179,10 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         try values.encode(cameraLibraryRootPath, forKey: .cameraLibraryRootPath)
         try values.encode(archiveLayoutRootPath, forKey: .archiveLayoutRootPath)
         try values.encode(nasSMBURL, forKey: .nasSMBURL)
+        try values.encode(nasSyncParallelTransfers, forKey: .nasSyncParallelTransfers)
+        try values.encode(nasSyncVerifyViaSSH, forKey: .nasSyncVerifyViaSSH)
+        try values.encode(nasSyncSSHHost, forKey: .nasSyncSSHHost)
+        try values.encode(nasSyncSSHServerPath, forKey: .nasSyncSSHServerPath)
         try values.encode(catalogDatabasePath, forKey: .catalogDatabasePath)
         try values.encode(catalogBackupFolderPath, forKey: .catalogBackupFolderPath)
         try values.encode(configuredLocations, forKey: .configuredLocations)
@@ -198,6 +226,12 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         // next save writes it out, so the setting is explicit from then on.
         archiveLayoutRootPath = try values.decodeIfPresent(String.self, forKey: .archiveLayoutRootPath) ?? ""
         nasSMBURL = try values.decodeIfPresent(String.self, forKey: .nasSMBURL) ?? ""
+        nasSyncParallelTransfers = NASSyncOptions.clamp(
+            try values.decodeIfPresent(Int.self, forKey: .nasSyncParallelTransfers) ?? NASSyncOptions.defaultParallelTransfers
+        )
+        nasSyncVerifyViaSSH = try values.decodeIfPresent(Bool.self, forKey: .nasSyncVerifyViaSSH) ?? false
+        nasSyncSSHHost = try values.decodeIfPresent(String.self, forKey: .nasSyncSSHHost) ?? ""
+        nasSyncSSHServerPath = try values.decodeIfPresent(String.self, forKey: .nasSyncSSHServerPath) ?? ""
         catalogDatabasePath = try values.decodeIfPresent(String.self, forKey: .catalogDatabasePath) ?? defaults.catalogDatabasePath
         catalogBackupFolderPath = try values.decodeIfPresent(String.self, forKey: .catalogBackupFolderPath) ?? defaults.catalogBackupFolderPath
         configuredLocations = try values.decodeIfPresent([ConfiguredLocation].self, forKey: .configuredLocations) ?? []

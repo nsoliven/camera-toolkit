@@ -7,6 +7,7 @@ final class NASSyncTests: XCTestCase {
     override func tearDown() {
         NASFileIO.verificationHashOverride = nil
         NASFileIO.renameExclusivePrimitive = nil
+        NASFileIO.copyCallObserver = nil
         DirectoryListing.override = nil
         super.tearDown()
     }
@@ -124,9 +125,9 @@ final class NASSyncTests: XCTestCase {
             let store = try NASSyncStore(catalogURL: f.catalog)
             let plan = NASSyncPlanner.plan(events: [f.event, f.child], locations: f.locations)
 
-            var verifiedReads: [String] = []
+            let verifiedReads = SyncLocked<[String]>([])
             NASFileIO.verificationHashOverride = { path in
-                verifiedReads.append(path)
+                verifiedReads.mutate { $0.append(path) }
                 return nil
             }
             let report = try NASSyncService(store: store).sync(plan, nasRoot: f.nas)
@@ -137,8 +138,8 @@ final class NASSyncTests: XCTestCase {
             }
             // Every copy was re-read (uncached) before it was renamed in —
             // the temporary, which then became the final file.
-            XCTAssertEqual(verifiedReads.count, expected.count)
-            XCTAssertTrue(verifiedReads.allSatisfy { ($0 as NSString).lastPathComponent.contains(NASSyncPlanner.temporaryMarker) })
+            XCTAssertEqual(verifiedReads.value.count, expected.count)
+            XCTAssertTrue(verifiedReads.value.allSatisfy { ($0 as NSString).lastPathComponent.contains(NASSyncPlanner.temporaryMarker) })
             // No temporaries are left behind.
             let leftovers = LayoutMigrationDisk.walk(f.nas.path, fileManager: .default).filter { $0.name.contains(NASSyncPlanner.temporaryMarker) }
             XCTAssertTrue(leftovers.isEmpty)
@@ -154,11 +155,11 @@ final class NASSyncTests: XCTestCase {
 
             // A second run (a resume after a quit) skips everything already
             // verified without re-reading a byte.
-            verifiedReads = []
+            verifiedReads.mutate { $0 = [] }
             let again = try NASSyncService(store: store).sync(plan, nasRoot: f.nas)
             XCTAssertEqual(Set(again.alreadyVerified), Set(expected.keys))
             XCTAssertTrue(again.copied.isEmpty)
-            XCTAssertTrue(verifiedReads.isEmpty)
+            XCTAssertTrue(verifiedReads.value.isEmpty)
 
             // A drive file changed since: checked again, and a different
             // NAS copy is a conflict, never overwritten.
@@ -239,16 +240,16 @@ final class NASSyncTests: XCTestCase {
         try withTemporaryDirectory { root in
             let f = try fixture(root)
             let expected = try populate(f)
-            var calls = 0
+            let calls = SyncLocked(0)
             NASFileIO.renameExclusivePrimitive = { _, _ in
-                calls += 1
+                calls.mutate { $0 += 1 }
                 errno = ENOTSUP
                 return -1
             }
             let plan = NASSyncPlanner.plan(events: [f.event], locations: f.locations)
             let report = try NASSyncService(store: nil).sync(plan, nasRoot: f.nas)
             XCTAssertTrue(report.succeeded)
-            XCTAssertEqual(calls, plan.items.count)
+            XCTAssertEqual(calls.value, plan.items.count)
             XCTAssertEqual(report.copied.count, plan.items.count)
             for item in plan.items {
                 XCTAssertEqual(try Data(contentsOf: f.nas.appendingPathComponent(item.relativePath)), expected[item.relativePath])

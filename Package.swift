@@ -36,6 +36,11 @@ let package = Package(
             name: "CameraToolkitCatalogRebuilder",
             dependencies: ["CameraToolkitCore"]
         ),
+        // Opt-in Sync to NAS benchmark; never run by the tests or packaged.
+        .executableTarget(
+            name: "CameraToolkitSyncBenchmark",
+            dependencies: ["CameraToolkitCore"]
+        ),
         .testTarget(
             name: "CameraToolkitCoreTests",
             dependencies: [

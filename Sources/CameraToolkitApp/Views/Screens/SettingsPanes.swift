@@ -221,6 +221,37 @@ struct LibrarySettingsPane: View {
                     .frame(minWidth: 220)
                     .help("Connect to NAS… opens this address so Finder mounts the share when it is not connected.")
                 }
+                Stepper(
+                    "Parallel transfers (\(model.configuration.nasSyncParallelTransfers))",
+                    value: Binding(
+                        get: { model.configuration.nasSyncParallelTransfers },
+                        set: { value in model.updateConfiguration { $0.nasSyncParallelTransfers = NASSyncOptions.clamp(value) } }
+                    ),
+                    in: NASSyncOptions.parallelRange
+                )
+                .help("Sync to NAS copies this many files at once. Each copy is still checked by SHA-256 before it gets its real name.")
+                Toggle("Verify on NAS via SSH", isOn: Binding(
+                    get: { model.configuration.nasSyncVerifyViaSSH },
+                    set: { value in model.updateConfiguration { $0.nasSyncVerifyViaSSH = value } }
+                ))
+                .help("Hash each batch of copies on the NAS (sync, then sha256sum) instead of reading every byte back over SMB. Uses the system ssh with your own keys and ~/.ssh/config; nothing secret is stored. Without a host and server path, copies are re-read over SMB.")
+                if model.configuration.nasSyncVerifyViaSSH {
+                    LabeledContent("SSH host") {
+                        TextField("nas (a ~/.ssh/config alias) or user@host", text: Binding(
+                            get: { model.configuration.nasSyncSSHHost },
+                            set: { value in model.updateConfiguration { $0.nasSyncSSHHost = value.trimmingCharacters(in: .whitespacesAndNewlines) } }
+                        ))
+                        .frame(minWidth: 220)
+                    }
+                    LabeledContent("Share path on the NAS") {
+                        TextField("/mnt/pool/dataset", text: Binding(
+                            get: { model.configuration.nasSyncSSHServerPath },
+                            set: { value in model.updateConfiguration { $0.nasSyncSSHServerPath = value.trimmingCharacters(in: .whitespacesAndNewlines) } }
+                        ))
+                        .frame(minWidth: 220)
+                        .help("The folder the SMB share points at, as the NAS sees it: /Volumes/<share>/x is <this path>/x over SSH.")
+                    }
+                }
                 PathSettingRow(
                     title: "Photo list database",
                     path: Binding(

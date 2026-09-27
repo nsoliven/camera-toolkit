@@ -19,111 +19,195 @@ public struct NASSyncReport: Codable, Equatable, Sendable {
     public var stoppedReason: String?
     public var bytesCopied: Int64 = 0
     public var foldersCreated: Int = 0
+    /// NAS copies whose SHA-256 did not match the drive copy's. Each is
+    /// also in `failed`; listed apart because on a pool that has shown
+    /// corruption this must never be read past.
+    public var hashMismatches: [NASSyncIssue] = []
+    /// How the run was configured and where its time went.
+    public var timings = NASSyncTimings()
 
     public var verifiedCount: Int { copied.count + matchedExisting.count + alreadyVerified.count }
     public var succeeded: Bool { conflicts.isEmpty && failed.isEmpty && notAttempted == 0 && stoppedReason == nil }
 }
 
+/// Where a sync's time went. Phase seconds are summed over the parallel
+/// transfers (busy time), so with 4 transfers they can add up to more than
+/// `wallSeconds`.
+public struct NASSyncTimings: Codable, Equatable, Sendable {
+    public var parallelTransfers: Int = 1
+    /// "SMB re-read" or "NAS SHA-256 (<label>)".
+    public var verification: String = ""
+    public var flushEachFile: Bool = false
+    public var wallSeconds: Double = 0
+    /// Listing the NAS folders, creating missing ones, clearing stale temporaries.
+    public var checkSeconds: Double = 0
+    public var copySeconds: Double = 0
+    public var flushSeconds: Double = 0
+    public var verifySeconds: Double = 0
+    public var renameSeconds: Double = 0
+    /// Bytes written to the NAS.
+    public var copyBytes: Int64 = 0
+    /// Bytes verified by re-reading over SMB.
+    public var smbVerifyBytes: Int64 = 0
+    /// Bytes verified by hashing on the NAS.
+    public var remoteVerifyBytes: Int64 = 0
+    public var remoteBatches: Int = 0
+    /// Files the NAS-side hash could not answer for, verified over SMB instead.
+    public var remoteFallbacks: Int = 0
+    /// Why NAS-side hashing fell back, the first time it did.
+    public var remoteFallbackReason: String?
+
+    public init() {}
+
+    /// "Copy 12.3 s · Verify 1.0 s · Rename 0.2 s" — for the Jobs window.
+    public var phaseSummary: String {
+        var parts = [String(format: "Copy %.1f s", copySeconds)]
+        if flushEachFile { parts.append(String(format: "Flush %.1f s", flushSeconds)) }
+        parts.append(String(format: "Verify %.1f s", verifySeconds))
+        parts.append(String(format: "Rename %.1f s", renameSeconds))
+        return parts.joined(separator: " · ")
+    }
+}
+
+/// How Sync to NAS copies and verifies.
+public struct NASSyncOptions: Sendable {
+    public static let parallelRange = 1...8
+    public static let defaultParallelTransfers = 4
+
+    /// Files copied at once. Each transfer holds one `NASFileIO.chunkSize`
+    /// buffer, so memory stays at `chunkSize × parallelTransfers`.
+    public var parallelTransfers: Int {
+        didSet { parallelTransfers = Self.clamp(parallelTransfers) }
+    }
+    public var copy: NASFileIO.CopyOptions
+    /// Hash on the NAS over SSH instead of re-reading over SMB.
+    public var remoteVerifier: NASRemoteVerifier?
+    /// A NAS-side batch is verified once it holds this many files …
+    public var remoteBatchFiles: Int
+    /// … or this many bytes, whichever comes first.
+    public var remoteBatchBytes: Int64
+
+    public init(
+        parallelTransfers: Int = NASSyncOptions.defaultParallelTransfers,
+        copy: NASFileIO.CopyOptions = .fast,
+        remoteVerifier: NASRemoteVerifier? = nil,
+        remoteBatchFiles: Int = 32,
+        remoteBatchBytes: Int64 = 512 * 1024 * 1024
+    ) {
+        self.parallelTransfers = Self.clamp(parallelTransfers)
+        self.copy = copy
+        self.remoteVerifier = remoteVerifier
+        self.remoteBatchFiles = max(1, remoteBatchFiles)
+        self.remoteBatchBytes = max(1, remoteBatchBytes)
+    }
+
+    /// The engine before parallel transfers: one file at a time, uncached
+    /// writes, a flush per file, SMB re-read. For benchmarks.
+    public static let legacy = NASSyncOptions(parallelTransfers: 1, copy: .legacy)
+
+    public static func clamp(_ value: Int) -> Int {
+        min(max(value, parallelRange.lowerBound), parallelRange.upperBound)
+    }
+
+    /// The options the app's settings describe. NAS-side verification needs
+    /// an SSH host and the server path of the share the NAS root is on; the
+    /// local side of that mapping is the mount point of `nasRoot`'s volume.
+    public static func from(configuration: AppConfiguration, nasRoot: URL) -> NASSyncOptions {
+        var options = NASSyncOptions(parallelTransfers: configuration.nasSyncParallelTransfers)
+        let host = configuration.nasSyncSSHHost.trimmingCharacters(in: .whitespacesAndNewlines)
+        let serverPrefix = configuration.nasSyncSSHServerPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        if configuration.nasSyncVerifyViaSSH, !host.isEmpty, serverPrefix.hasPrefix("/"),
+           let mount = (try? nasRoot.resourceValues(forKeys: [.volumeURLKey]))?.volume?.path, mount != "/" {
+            options.remoteVerifier = .ssh(host: host, localPrefix: mount, serverPrefix: serverPrefix)
+        }
+        return options
+    }
+
+    var verificationLabel: String {
+        remoteVerifier.map { "NAS SHA-256 (\($0.label))" } ?? "SMB re-read"
+    }
+}
+
 /// One-way Buffer → NAS copy of the files a `NASSyncPlan` lists, each to the
 /// same relative path under the NAS mirror root.
 ///
-/// Per file:
+/// First, one pass over the plan (NAS folder listings only):
 /// - verified before at the same size and drive mtime, and the NAS copy
 ///   still that size → skipped (a resumed sync does not re-read it);
-/// - a file already at the NAS path → both hashed (the NAS copy with
-///   `F_NOCACHE`); equal is recorded verified, different is a conflict and
-///   is never overwritten;
+/// - something that is not a file, or a file of another size, at the NAS
+///   path → a conflict, never overwritten;
+/// - missing folders are created and this sync's own stale temporaries
+///   cleared.
+///
+/// Then up to `parallelTransfers` files at a time:
+/// - a same-size file already at the NAS path → both hashed (the NAS copy
+///   with `F_NOCACHE`); equal is recorded verified, different is a conflict;
 /// - otherwise streamed into a temporary `.<name>.ctsync-<id>` in the
-///   destination folder (created exclusively), flushed, re-read from the
-///   NAS and hashed; only an exact SHA-256 match is renamed into place —
-///   exclusively, never over a file. A temporary that fails verification is
-///   removed (it is this sync's own partial file, never presented as
-///   complete).
+///   destination folder (created exclusively), hashed as it is read from
+///   the drive. It is then verified — on the NAS over SSH, a batch at a
+///   time, or by re-reading it over SMB — and only an exact SHA-256 match
+///   is renamed into place, exclusively, never over a file. A temporary
+///   that fails verification is removed (it is this sync's own partial
+///   file, never presented as complete) and the file is retried next run.
+///
+/// No file is flushed on its own (see `NASFileIO.copyNew` for why that is
+/// safe): nothing is recorded verified before its hash check.
 ///
 /// A file that fails is recorded and skipped; the job goes on. It stops
-/// early only when the NAS itself disappears, and says how many files were
-/// not attempted.
+/// early only when the NAS itself disappears or the job is stopped, and
+/// says how many files were not attempted.
 public struct NASSyncService {
     public typealias Progress = @Sendable (FileOperationProgress) -> Void
 
     private let store: NASSyncStore?
-    private let now: () -> Date
-    private let clock: () -> TimeInterval
+    private let options: NASSyncOptions
+    private let now: @Sendable () -> Date
+    private let clock: @Sendable () -> TimeInterval
     private let isCancelled: () -> Bool
 
     public init(
         store: NASSyncStore?,
-        now: @escaping () -> Date = { Date() },
-        clock: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+        options: NASSyncOptions = NASSyncOptions(),
+        now: @escaping @Sendable () -> Date = { Date() },
+        clock: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
         isCancelled: @escaping () -> Bool = { Task.isCancelled }
     ) {
         self.store = store
+        self.options = options
         self.now = now
         self.clock = clock
         self.isCancelled = isCancelled
     }
 
     public func sync(_ plan: NASSyncPlan, nasRoot: URL, progress: Progress? = nil) throws -> NASSyncReport {
+        let started = clock()
         let root = nasRoot.standardizedFileURL.path
         guard LayoutMigrationDisk.lstatEntry(root)?.kind == .directory else {
             throw ToolkitError.commandFailed("The NAS folder \(root) is not connected. Nothing was copied.")
         }
         let known = try store?.records(nasRoot: root) ?? [:]
-        var report = NASSyncReport()
-        var pending: [NASSyncRecord] = []
-        func flush(force: Bool = false) {
-            guard force || pending.count >= 64 else { return }
+        let run = NASSyncRun(root: root, plan: plan, options: options, now: now, clock: clock, progress: progress)
+        let store = self.store
+        func flushRecords(force: Bool = false) {
+            let batch = run.takePendingRecords(minimum: force ? 1 : 64)
+            guard !batch.isEmpty else { return }
             do {
-                try store?.upsert(pending)
-                pending.removeAll(keepingCapacity: true)
+                try store?.upsert(batch)
             } catch {
                 // The files themselves are proven on the NAS; a later sync
                 // re-derives any state that did not land.
-                report.stoppedReason = report.stoppedReason ?? "Could not record sync state in the catalog: \(error.localizedDescription)"
+                run.noteCatalogProblem("Could not record sync state in the catalog: \(error.localizedDescription)")
             }
         }
-
-        // Work in bytes: a copy reads the drive copy and re-reads the NAS
-        // copy; a match hashes both. Skips take their bytes off the total.
-        var totalWork = plan.items.reduce(Int64(0)) { $0 + 2 * $1.byteCount }
-        var doneWork: Int64 = 0
-        var estimator = ScanRateEstimator()
-        estimator.start(at: clock())
-        var limiter = FileOperationProgressLimiter()
-        var folderListings: [String: [String: DirectoryListingEntry]] = [:]
-        var createdFolders = Set<String>()
-
-        func emit(_ index: Int, _ phase: String, _ path: String, force: Bool = false) {
-            guard let progress, limiter.shouldEmit(force: force) else { return }
-            let t = clock()
-            estimator.record(units: Double(doneWork), at: t)
-            let counters = [
-                JobCounter(label: "Copied", value: report.copied.count),
-                JobCounter(label: "Already on NAS", value: report.matchedExisting.count + report.alreadyVerified.count),
-                JobCounter(label: "Conflicts", value: report.conflicts.count),
-                JobCounter(label: "Failed", value: report.failed.count),
-            ]
-            progress(FileOperationProgress(
-                phase: phase,
-                currentPath: (path as NSString).lastPathComponent,
-                processedFiles: index,
-                totalFiles: plan.items.count,
-                processedBytes: doneWork,
-                totalBytes: totalWork,
-                bytesPerSecond: 0,
-                telemetry: JobTelemetry(
-                    step: phase,
-                    activeItems: [JobActiveItem(name: (path as NSString).lastPathComponent, path: path, step: phase)],
-                    counters: counters,
-                    work: JobWorkEstimate(
-                        unitsDone: Int(doneWork),
-                        unitsTotal: Int(totalWork),
-                        secondsRemaining: estimator.secondsRemaining(Double(max(totalWork - doneWork, 0)), at: t)
-                    )
-                )
-            ))
+        let tick = {
+            flushRecords()
+            run.emit("Syncing", force: false)
         }
 
+        // 1. Classify every item from folder listings; create folders.
+        var jobs: [NASSyncRun.Job] = []
+        var folderListings: [String: [String: DirectoryListingEntry]] = [:]
+        var createdFolders = Set<String>()
         func listing(of folder: String) -> [String: DirectoryListingEntry]? {
             if let cached = folderListings[folder] { return cached }
             guard let entries = try? DirectoryListing.list(folder) else { return nil }
@@ -131,40 +215,18 @@ public struct NASSyncService {
             folderListings[folder] = byName
             return byName
         }
-
         for (index, item) in plan.items.enumerated() {
-            if isCancelled() {
-                report.notAttempted = plan.items.count - index
-                report.stoppedReason = "Stopped before \(item.relativePath)."
-                break
-            }
             // Relative paths come from the planner, but a stale plan must
             // never escape the root.
             guard EventStorageLocations.isLexicallyClean(item.relativePath),
                   (try? PathSafety.validateRelativePath(item.relativePath)) != nil else {
-                report.failed.append(NASSyncIssue(path: item.relativePath, reason: "Unsafe relative path."))
+                run.finish(item, failure: "Unsafe relative path.", work: 2 * item.byteCount, record: false)
                 continue
             }
             let destination = root + "/" + item.relativePath
             let folder = (destination as NSString).deletingLastPathComponent
             let name = (destination as NSString).lastPathComponent
-            let record = { (state: NASSyncRecord.State, sha: String?, nasSHA: String?, detail: String?, verified: Bool) in
-                pending.append(NASSyncRecord(
-                    nasRoot: root,
-                    relativePath: item.relativePath,
-                    eventID: item.eventID,
-                    byteCount: item.byteCount,
-                    sourceModifiedAt: item.modifiedAt,
-                    sha256: sha,
-                    nasSHA256: nasSHA,
-                    state: state,
-                    detail: detail,
-                    checkedAt: now(),
-                    verifiedAt: verified ? now() : nil
-                ))
-                flush()
-            }
-            emit(index, "Checking NAS", item.relativePath)
+            run.emit("Checking NAS", path: item.relativePath, force: false)
             // One listing per destination folder answers "is it there, at
             // what size" for every file in it.
             let existing = listing(of: folder)?[name]
@@ -175,118 +237,75 @@ public struct NASSyncService {
                previous.byteCount == item.byteCount,
                previous.sourceModifiedAt.map({ abs($0 - item.modifiedAt) < 0.001 }) == true,
                let existing, existing.kind == .file, existing.size == item.byteCount {
-                report.alreadyVerified.append(item.relativePath)
-                totalWork -= 2 * item.byteCount
-                emit(index + 1, "Already verified", item.relativePath)
+                run.finishAlreadyVerified(item)
                 continue
             }
-
             if let existing {
                 guard existing.kind == .file else {
-                    report.conflicts.append(NASSyncIssue(path: item.relativePath, reason: "Something that is not a file is at the NAS path."))
-                    record(.conflict, nil, nil, "not a file on the NAS", false)
-                    totalWork -= 2 * item.byteCount
+                    run.finishConflict(item, reason: "Something that is not a file is at the NAS path.", detail: "not a file on the NAS")
                     continue
                 }
                 guard existing.size == item.byteCount else {
                     let reason = "A different file (\(existing.size) bytes, the drive copy is \(item.byteCount)) is already on the NAS. It was not overwritten."
-                    report.conflicts.append(NASSyncIssue(path: item.relativePath, reason: reason))
-                    record(.conflict, nil, nil, reason, false)
-                    totalWork -= 2 * item.byteCount
+                    run.finishConflict(item, reason: reason, detail: reason)
                     continue
                 }
-                do {
-                    emit(index, "Hashing drive copy", item.relativePath)
-                    let sourceHash = try NASFileIO.sha256(item.sourcePath, uncached: false, expectedByteCount: item.byteCount) { doneWork += Int64($0); emit(index, "Hashing drive copy", item.relativePath) }
-                    emit(index, "Re-reading NAS copy", item.relativePath)
-                    let nasHash = try NASFileIO.sha256(destination, uncached: true, expectedByteCount: item.byteCount) { doneWork += Int64($0); emit(index, "Re-reading NAS copy", item.relativePath) }
-                    if sourceHash == nasHash {
-                        report.matchedExisting.append(item.relativePath)
-                        record(.verified, sourceHash, nil, nil, true)
-                    } else {
-                        let reason = "A different file with the same size is already on the NAS. It was not overwritten."
-                        report.conflicts.append(NASSyncIssue(path: item.relativePath, reason: reason))
-                        record(.conflict, sourceHash, nasHash, reason, false)
-                    }
-                } catch {
-                    report.failed.append(NASSyncIssue(path: item.relativePath, reason: error.localizedDescription))
-                    record(.failed, nil, nil, error.localizedDescription, false)
-                    if nasIsGone(root) { stop(&report, remaining: plan.items.count - index - 1); break }
-                }
-                emit(index + 1, "Checked", item.relativePath, force: true)
+                jobs.append(.init(index: index, item: item, destination: destination, kind: .compareExisting))
                 continue
             }
-
-            // Missing on the NAS: copy, verify by re-reading, rename in.
-            let temporary = (folder as NSString).appendingPathComponent(".\(name)\(NASSyncPlanner.temporaryMarker)\(UUID().uuidString.prefix(8))")
-            var temporaryExists = false
             do {
                 for made in try NASFileIO.makeDirectories(folder) where createdFolders.insert(made).inserted {
-                    report.foldersCreated += 1
+                    run.noteFolderCreated()
                     folderListings[made] = [:]
                 }
-                removeStaleTemporaries(for: name, in: folder, listing: listing(of: folder))
-                emit(index, "Copying to NAS", item.relativePath)
-                temporaryExists = true
-                let sourceHash = try NASFileIO.copyNew(from: item.sourcePath, to: temporary, expectedByteCount: item.byteCount) { doneWork += Int64($0); emit(index, "Copying to NAS", item.relativePath) }
-                // The drive copy must be the file the plan saw.
-                if let current = LayoutMigrationDisk.lstatEntry(item.sourcePath),
-                   current.size != item.byteCount || abs(current.modifiedAt - item.modifiedAt) >= 0.001 {
-                    throw ToolkitError.commandFailed("The drive copy changed while it was copied.")
-                }
-                _ = setModificationTime(temporary, item.modifiedAt)
-                emit(index, "Re-reading NAS copy", item.relativePath)
-                let nasHash = try NASFileIO.sha256(temporary, uncached: true, expectedByteCount: item.byteCount) { doneWork += Int64($0); emit(index, "Re-reading NAS copy", item.relativePath) }
-                guard nasHash == sourceHash else {
-                    throw ToolkitError.commandFailed("The NAS copy did not verify: its SHA-256 differs from the drive copy's when re-read from the NAS.")
-                }
-                do {
-                    try NASFileIO.renameExclusive(from: temporary, to: destination)
-                    temporaryExists = false
-                } catch {
-                    // Someone else put a file there meanwhile: compare, never replace.
-                    guard LayoutMigrationDisk.lstatEntry(destination) != nil else { throw error }
-                    let other = try NASFileIO.sha256(destination, uncached: true)
-                    if other == sourceHash {
-                        report.matchedExisting.append(item.relativePath)
-                        record(.verified, sourceHash, nil, nil, true)
-                    } else {
-                        let reason = "A different file appeared at the NAS path during the copy. It was not overwritten."
-                        report.conflicts.append(NASSyncIssue(path: item.relativePath, reason: reason))
-                        record(.conflict, sourceHash, other, reason, false)
-                    }
-                    unlink(temporary)
-                    temporaryExists = false
-                    emit(index + 1, "Checked", item.relativePath, force: true)
-                    continue
-                }
-                guard LayoutMigrationDisk.lstatEntry(destination).map({ $0.kind == .file && $0.size == item.byteCount }) == true else {
-                    throw ToolkitError.commandFailed("The NAS copy is not at its final path after the rename.")
-                }
-                folderListings[folder]?[name] = DirectoryListingEntry(name: name, kind: .file, size: item.byteCount, modifiedAt: item.modifiedAt, fileID: 0)
-                report.copied.append(item.relativePath)
-                report.bytesCopied += item.byteCount
-                record(.verified, sourceHash, nil, nil, true)
             } catch {
-                if temporaryExists { unlink(temporary) }
-                report.failed.append(NASSyncIssue(path: item.relativePath, reason: error.localizedDescription))
-                record(.failed, nil, nil, error.localizedDescription, false)
-                if nasIsGone(root) { stop(&report, remaining: plan.items.count - index - 1); break }
+                run.finish(item, failure: error.localizedDescription, work: 2 * item.byteCount, record: true)
+                if nasIsGone(root) {
+                    run.noteStop(Self.disconnected)
+                    run.noteNotAttempted(plan.items.count - index - 1)
+                    break
+                }
+                continue
             }
-            emit(index + 1, "Verified on NAS", item.relativePath, force: true)
+            removeStaleTemporaries(for: name, in: folder, listing: listing(of: folder))
+            let temporary = (folder as NSString).appendingPathComponent(".\(name)\(NASSyncPlanner.temporaryMarker)\(UUID().uuidString.prefix(8))")
+            jobs.append(.init(index: index, item: item, destination: destination, kind: .copy(temporary: temporary)))
         }
-        flush(force: true)
-        return report
+        run.addTiming { $0.checkSeconds = clock() - started }
+        flushRecords()
+
+        // 2. Transfers, at most `parallelTransfers` at once.
+        let pool = NASTransferPool(width: options.parallelTransfers)
+        for (position, job) in jobs.enumerated() {
+            if run.isStopped {
+                run.noteNotAttempted(jobs.count - position)
+                break
+            }
+            pool.acquire(tick: tick)
+            if isCancelled() {
+                pool.release()
+                run.noteNotAttempted(jobs.count - position)
+                run.noteStop("Stopped before \(job.item.relativePath).")
+                break
+            }
+            if run.isStopped {
+                pool.release()
+                run.noteNotAttempted(jobs.count - position)
+                break
+            }
+            pool.submitAcquired { run.perform(job) }
+        }
+        pool.waitForAll(tick: tick)
+        // The last partial NAS-side batch.
+        run.verifyRemainingBatch()
+        run.waitForVerification(tick: tick)
+        flushRecords(force: true)
+        run.addTiming { $0.wallSeconds = clock() - started }
+        run.emit("Done", force: true)
+        return run.finalReport()
     }
 
-    private func nasIsGone(_ root: String) -> Bool {
-        LayoutMigrationDisk.lstatEntry(root)?.kind != .directory || !VolumeInfo.isAvailable(URL(fileURLWithPath: root))
-    }
-
-    private func stop(_ report: inout NASSyncReport, remaining: Int) {
-        report.notAttempted = remaining
-        report.stoppedReason = "The NAS disconnected. Sync again once it is back; verified files are skipped."
-    }
+    static let disconnected = "The NAS disconnected. Sync again once it is back; verified files are skipped."
 
     /// A crashed or quit sync can leave its own `.<name>.ctsync-<id>`
     /// temporary behind. Only exactly that pattern, for exactly this file
@@ -298,9 +317,499 @@ public struct NASSyncService {
             unlink((folder as NSString).appendingPathComponent(entry.name))
         }
     }
+}
 
-    private func setModificationTime(_ path: String, _ modifiedAt: Double) -> Bool {
-        let date = Date(timeIntervalSinceReferenceDate: modifiedAt)
-        return (try? FileManager.default.setAttributes([.modificationDate: date], ofItemAtPath: path)) != nil
+func nasIsGone(_ root: String) -> Bool {
+    LayoutMigrationDisk.lstatEntry(root)?.kind != .directory || !VolumeInfo.isAvailable(URL(fileURLWithPath: root))
+}
+
+/// A fixed number of concurrent slots on a global queue. The caller takes a
+/// slot (`acquire`) before it submits; the slot is given back when the work
+/// ends, so no more than `width` pieces of work ever run at once.
+final class NASTransferPool: @unchecked Sendable {
+    let width: Int
+    private let slots: DispatchSemaphore
+    private let group = DispatchGroup()
+    private let queue = DispatchQueue(label: "CameraToolkit.NASSync.transfers", qos: .utility, attributes: .concurrent)
+
+    init(width: Int) {
+        self.width = max(1, width)
+        slots = DispatchSemaphore(value: self.width)
     }
+
+    /// Waits for a free slot, calling `tick` on this thread while it waits.
+    func acquire(tick: () -> Void) {
+        while slots.wait(timeout: .now() + 0.2) == .timedOut { tick() }
+    }
+
+    func release() { slots.signal() }
+
+    func submitAcquired(_ work: @escaping @Sendable () -> Void) {
+        group.enter()
+        queue.async {
+            work()
+            self.slots.signal()
+            self.group.leave()
+        }
+    }
+
+    func waitForAll(tick: () -> Void) {
+        while group.wait(timeout: .now() + 0.2) == .timedOut { tick() }
+    }
+}
+
+/// The shared state of one sync run. Transfers run on pool threads; every
+/// mutation goes through `lock`.
+final class NASSyncRun: @unchecked Sendable {
+    struct Job: Sendable {
+        enum Kind: Sendable {
+            case compareExisting
+            case copy(temporary: String)
+        }
+        var index: Int
+        var item: NASSyncItem
+        var destination: String
+        var kind: Kind
+    }
+
+    /// A temporary written and hashed, waiting for verification.
+    struct Written: Sendable {
+        var job: Job
+        var temporary: String
+        var sourceHash: String
+    }
+
+    let root: String
+    let totalFiles: Int
+    let options: NASSyncOptions
+    let now: @Sendable () -> Date
+    let clock: @Sendable () -> TimeInterval
+    let progress: NASSyncService.Progress?
+
+    private let lock = NSLock()
+    private var report = NASSyncReport()
+    private var pending: [NASSyncRecord] = []
+    private var doneWork: Int64 = 0
+    private var totalWork: Int64
+    private var finishedFiles = 0
+    private var active: [Int: JobActiveItem] = [:]
+    private var stopReason: String?
+    private var nasGone = false
+    private var batch: [Written] = []
+    private var batchBytes: Int64 = 0
+    private var limiter = FileOperationProgressLimiter()
+    private var estimator = ScanRateEstimator()
+    private let verifyQueue = DispatchQueue(label: "CameraToolkit.NASSync.remoteVerify", qos: .utility)
+    private let verifyGroup = DispatchGroup()
+
+    init(root: String, plan: NASSyncPlan, options: NASSyncOptions, now: @escaping @Sendable () -> Date, clock: @escaping @Sendable () -> TimeInterval, progress: NASSyncService.Progress?) {
+        self.root = root
+        self.totalFiles = plan.items.count
+        self.options = options
+        self.now = now
+        self.clock = clock
+        self.progress = progress
+        // Work in bytes: a copy reads the drive copy, then the NAS copy is
+        // read once more (over SMB, or by the NAS itself); a match hashes
+        // both. Skips take their bytes off the total.
+        totalWork = plan.items.reduce(Int64(0)) { $0 + 2 * $1.byteCount }
+        report.timings.parallelTransfers = options.parallelTransfers
+        report.timings.verification = options.verificationLabel
+        report.timings.flushEachFile = options.copy.flushEachFile
+        estimator.start(at: clock())
+    }
+
+    // MARK: State
+
+    var isStopped: Bool { lock.withLock { nasGone || stopReason != nil } }
+
+    func finalReport() -> NASSyncReport {
+        lock.withLock {
+            var final = report
+            final.stoppedReason = stopReason ?? final.stoppedReason
+            return final
+        }
+    }
+
+    func takePendingRecords(minimum: Int) -> [NASSyncRecord] {
+        lock.withLock {
+            guard pending.count >= minimum else { return [] }
+            defer { pending.removeAll(keepingCapacity: true) }
+            return pending
+        }
+    }
+
+    func noteStop(_ reason: String) {
+        lock.withLock { if stopReason == nil { stopReason = reason } }
+    }
+
+    /// Recorded in the report without stopping: the files are proven on
+    /// the NAS either way, and a later sync re-derives the state.
+    func noteCatalogProblem(_ reason: String) {
+        lock.withLock { if report.stoppedReason == nil { report.stoppedReason = reason } }
+    }
+
+    func noteNotAttempted(_ count: Int) {
+        lock.withLock { report.notAttempted += count }
+    }
+
+    func noteFolderCreated() {
+        lock.withLock { report.foldersCreated += 1 }
+    }
+
+    func addTiming(_ change: (inout NASSyncTimings) -> Void) {
+        lock.withLock { change(&report.timings) }
+    }
+
+    private func addWork(_ bytes: Int) {
+        lock.withLock { doneWork += Int64(bytes) }
+    }
+
+    private func appendRecord(_ item: NASSyncItem, _ state: NASSyncRecord.State, sha: String?, nasSHA: String?, detail: String?, verified: Bool) {
+        let timestamp = now()
+        pending.append(NASSyncRecord(
+            nasRoot: root,
+            relativePath: item.relativePath,
+            eventID: item.eventID,
+            byteCount: item.byteCount,
+            sourceModifiedAt: item.modifiedAt,
+            sha256: sha,
+            nasSHA256: nasSHA,
+            state: state,
+            detail: detail,
+            checkedAt: timestamp,
+            verifiedAt: verified ? timestamp : nil
+        ))
+    }
+
+    /// Settles a file that failed; `work` is the part of its planned work
+    /// that will now never be done.
+    func finish(_ item: NASSyncItem, failure: String, work: Int64, record: Bool, mismatch: Bool = false) {
+        lock.withLock {
+            report.failed.append(NASSyncIssue(path: item.relativePath, reason: failure))
+            if mismatch { report.hashMismatches.append(NASSyncIssue(path: item.relativePath, reason: failure)) }
+            if record { appendRecord(item, .failed, sha: nil, nasSHA: nil, detail: failure, verified: false) }
+            totalWork -= work
+            finishedFiles += 1
+        }
+    }
+
+    func finishAlreadyVerified(_ item: NASSyncItem) {
+        lock.withLock {
+            report.alreadyVerified.append(item.relativePath)
+            totalWork -= 2 * item.byteCount
+            finishedFiles += 1
+        }
+        emit("Already verified", path: item.relativePath, force: false)
+    }
+
+    func finishConflict(_ item: NASSyncItem, reason: String, detail: String, sha: String? = nil, nasSHA: String? = nil, unfinishedWork: Int64? = nil) {
+        lock.withLock {
+            report.conflicts.append(NASSyncIssue(path: item.relativePath, reason: reason))
+            appendRecord(item, .conflict, sha: sha, nasSHA: nasSHA, detail: detail, verified: false)
+            totalWork -= unfinishedWork ?? 2 * item.byteCount
+            finishedFiles += 1
+        }
+    }
+
+    private func finishMatched(_ item: NASSyncItem, sha: String) {
+        lock.withLock {
+            report.matchedExisting.append(item.relativePath)
+            appendRecord(item, .verified, sha: sha, nasSHA: nil, detail: nil, verified: true)
+            finishedFiles += 1
+        }
+    }
+
+    private func finishCopied(_ item: NASSyncItem, sha: String) {
+        lock.withLock {
+            report.copied.append(item.relativePath)
+            report.bytesCopied += item.byteCount
+            appendRecord(item, .verified, sha: sha, nasSHA: nil, detail: nil, verified: true)
+            finishedFiles += 1
+        }
+    }
+
+    private func setActive(_ job: Job, _ step: String?) {
+        lock.withLock {
+            if let step {
+                active[job.index] = JobActiveItem(name: (job.item.relativePath as NSString).lastPathComponent, path: job.item.relativePath, step: step)
+            } else {
+                active[job.index] = nil
+            }
+        }
+        emit(step ?? "Syncing", path: job.item.relativePath, force: step == nil)
+    }
+
+    // MARK: Progress
+
+    func emit(_ phase: String, path: String? = nil, force: Bool) {
+        guard let progress else { return }
+        let t = clock()
+        let snapshot: FileOperationProgress? = lock.withLock {
+            guard limiter.shouldEmit(force: force) else { return nil }
+            estimator.record(units: Double(doneWork), at: t)
+            let items = active.sorted { $0.key < $1.key }.map(\.value)
+            let shown = path ?? items.first?.path ?? ""
+            let counters = [
+                JobCounter(label: "Copied", value: report.copied.count),
+                JobCounter(label: "Already on NAS", value: report.matchedExisting.count + report.alreadyVerified.count),
+                JobCounter(label: "Conflicts", value: report.conflicts.count),
+                JobCounter(label: "Failed", value: report.failed.count),
+            ]
+            var facts = ["\(options.parallelTransfers) parallel", "Verify: \(options.verificationLabel)"]
+            if options.copy.flushEachFile { facts.append("Flush per file") }
+            facts.append(report.timings.phaseSummary)
+            return FileOperationProgress(
+                phase: phase,
+                currentPath: (shown as NSString).lastPathComponent,
+                processedFiles: finishedFiles,
+                totalFiles: totalFiles,
+                processedBytes: doneWork,
+                totalBytes: totalWork,
+                bytesPerSecond: 0,
+                telemetry: JobTelemetry(
+                    step: phase,
+                    activeItems: items,
+                    counters: counters,
+                    facts: facts,
+                    work: JobWorkEstimate(
+                        unitsDone: Int(doneWork),
+                        unitsTotal: Int(totalWork),
+                        secondsRemaining: estimator.secondsRemaining(Double(max(totalWork - doneWork, 0)), at: t)
+                    )
+                )
+            )
+        }
+        if let snapshot { progress(snapshot) }
+    }
+
+    // MARK: Work (pool threads)
+
+    func perform(_ job: Job) {
+        switch job.kind {
+        case .compareExisting: compareExisting(job)
+        case .copy(let temporary): copy(job, temporary: temporary)
+        }
+    }
+
+    private func failed(_ job: Job, _ error: Error, work: Int64, mismatch: Bool = false) {
+        finish(job.item, failure: error.localizedDescription, work: work, record: true, mismatch: mismatch)
+        if nasIsGone(root) {
+            lock.withLock {
+                nasGone = true
+                if stopReason == nil { stopReason = NASSyncService.disconnected }
+            }
+        }
+    }
+
+    private func compareExisting(_ job: Job) {
+        let item = job.item
+        var done: Int64 = 0
+        do {
+            setActive(job, "Hashing drive copy")
+            let start = clock()
+            let sourceHash = try NASFileIO.sha256(item.sourcePath, uncached: false, expectedByteCount: item.byteCount) { self.addWork($0); done += Int64($0); self.emit("Hashing drive copy", force: false) }
+            setActive(job, "Re-reading NAS copy")
+            let nasHash = try NASFileIO.sha256(job.destination, uncached: true, expectedByteCount: item.byteCount) { self.addWork($0); done += Int64($0); self.emit("Re-reading NAS copy", force: false) }
+            addTiming { $0.verifySeconds += self.clock() - start; $0.smbVerifyBytes += item.byteCount }
+            if sourceHash == nasHash {
+                finishMatched(item, sha: sourceHash)
+            } else {
+                let reason = "A different file with the same size is already on the NAS. It was not overwritten."
+                finishConflict(item, reason: reason, detail: reason, sha: sourceHash, nasSHA: nasHash, unfinishedWork: 0)
+            }
+        } catch {
+            failed(job, error, work: 2 * item.byteCount - done)
+        }
+        setActive(job, nil)
+    }
+
+    private func copy(_ job: Job, temporary: String) {
+        let item = job.item
+        var done: Int64 = 0
+        do {
+            setActive(job, "Copying to NAS")
+            let result: NASFileIO.CopyResult
+            do {
+                result = try NASFileIO.copyNew(from: item.sourcePath, to: temporary, expectedByteCount: item.byteCount, options: options.copy, clock: clock) {
+                    self.addWork($0)
+                    done += Int64($0)
+                    self.emit("Copying to NAS", force: false)
+                }
+            } catch {
+                unlink(temporary)
+                throw error
+            }
+            addTiming {
+                $0.copySeconds += result.copySeconds
+                $0.flushSeconds += result.flushSeconds
+                $0.copyBytes += item.byteCount
+            }
+            // The drive copy must be the file the plan saw.
+            if let current = LayoutMigrationDisk.lstatEntry(item.sourcePath),
+               current.size != item.byteCount || abs(current.modifiedAt - item.modifiedAt) >= 0.001 {
+                unlink(temporary)
+                throw ToolkitError.commandFailed("The drive copy changed while it was copied.")
+            }
+            _ = setModificationTime(temporary, item.modifiedAt)
+            let written = Written(job: job, temporary: temporary, sourceHash: result.sha256)
+            if options.remoteVerifier != nil {
+                setActive(job, nil)
+                enqueueForRemoteVerification(written)
+                return
+            }
+            verifyOverSMBAndPlace(written)
+        } catch {
+            failed(job, error, work: 2 * item.byteCount - done)
+            setActive(job, nil)
+        }
+    }
+
+    /// Re-reads the temporary over SMB (uncached) and renames it in on a match.
+    private func verifyOverSMBAndPlace(_ written: Written) {
+        let job = written.job
+        let item = job.item
+        var done: Int64 = 0
+        do {
+            setActive(job, "Re-reading NAS copy")
+            let start = clock()
+            let nasHash = try NASFileIO.sha256(written.temporary, uncached: true, expectedByteCount: item.byteCount) {
+                self.addWork($0)
+                done += Int64($0)
+                self.emit("Re-reading NAS copy", force: false)
+            }
+            addTiming { $0.verifySeconds += self.clock() - start; $0.smbVerifyBytes += item.byteCount }
+            try check(written, nasHash: nasHash, how: "when re-read from the NAS")
+            try place(written)
+        } catch let error as MismatchError {
+            failed(job, error, work: item.byteCount - done, mismatch: true)
+        } catch {
+            unlink(written.temporary)
+            failed(job, error, work: item.byteCount - done)
+        }
+        setActive(job, nil)
+    }
+
+    private struct MismatchError: LocalizedError {
+        var message: String
+        var errorDescription: String? { message }
+    }
+
+    private func check(_ written: Written, nasHash: String, how: String) throws {
+        guard nasHash == written.sourceHash else {
+            unlink(written.temporary)
+            throw MismatchError(message: "SHA-256 MISMATCH: the NAS copy did not verify — its SHA-256 (\(nasHash)) differs from the drive copy's (\(written.sourceHash)) \(how). The NAS copy was removed; the drive copy is untouched and the next sync copies it again.")
+        }
+    }
+
+    /// Renames a verified temporary into place, never over a file.
+    private func place(_ written: Written) throws {
+        let job = written.job
+        let item = job.item
+        let start = clock()
+        defer { addTiming { $0.renameSeconds += self.clock() - start } }
+        do {
+            try NASFileIO.renameExclusive(from: written.temporary, to: job.destination)
+        } catch {
+            // Someone else put a file there meanwhile: compare, never replace.
+            guard LayoutMigrationDisk.lstatEntry(job.destination) != nil else { throw error }
+            let other = try NASFileIO.sha256(job.destination, uncached: true)
+            unlink(written.temporary)
+            if other == written.sourceHash {
+                finishMatched(item, sha: written.sourceHash)
+            } else {
+                let reason = "A different file appeared at the NAS path during the copy. It was not overwritten."
+                finishConflict(item, reason: reason, detail: reason, sha: written.sourceHash, nasSHA: other, unfinishedWork: 0)
+            }
+            return
+        }
+        guard LayoutMigrationDisk.lstatEntry(job.destination).map({ $0.kind == .file && $0.size == item.byteCount }) == true else {
+            throw ToolkitError.commandFailed("The NAS copy is not at its final path after the rename.")
+        }
+        finishCopied(item, sha: written.sourceHash)
+    }
+
+    // MARK: NAS-side verification
+
+    private func enqueueForRemoteVerification(_ written: Written) {
+        let full: [Written]? = lock.withLock {
+            batch.append(written)
+            batchBytes += written.job.item.byteCount
+            guard batch.count >= options.remoteBatchFiles || batchBytes >= options.remoteBatchBytes else { return nil }
+            defer { batch = []; batchBytes = 0 }
+            return batch
+        }
+        if let full { submitRemote(full) }
+    }
+
+    func verifyRemainingBatch() {
+        let rest: [Written] = lock.withLock {
+            defer { batch = []; batchBytes = 0 }
+            return batch
+        }
+        if !rest.isEmpty { submitRemote(rest) }
+    }
+
+    func waitForVerification(tick: () -> Void) {
+        while verifyGroup.wait(timeout: .now() + 0.2) == .timedOut { tick() }
+    }
+
+    private func submitRemote(_ written: [Written]) {
+        verifyGroup.enter()
+        verifyQueue.async {
+            self.verifyRemote(written)
+            self.verifyGroup.leave()
+        }
+    }
+
+    /// One `sync` + `sha256sum` on the NAS for the whole batch. A file the
+    /// NAS could not answer for (SSH down, path not mapped) is re-read over
+    /// SMB instead; only a hash that differs fails a file.
+    private func verifyRemote(_ written: [Written]) {
+        guard let verifier = options.remoteVerifier else { return }
+        for entry in written { setActive(entry.job, "Hashing on NAS") }
+        let start = clock()
+        var hashes: [String: String] = [:]
+        var failure: String?
+        do {
+            hashes = try verifier.hashes(localPaths: written.map(\.temporary))
+        } catch {
+            failure = error.localizedDescription
+        }
+        let elapsed = clock() - start
+        addTiming {
+            $0.verifySeconds += elapsed
+            $0.remoteBatches += 1
+        }
+        for entry in written {
+            let item = entry.job.item
+            guard let nasHash = hashes[entry.temporary] else {
+                addTiming {
+                    $0.remoteFallbacks += 1
+                    if $0.remoteFallbackReason == nil {
+                        $0.remoteFallbackReason = failure ?? "The NAS could not hash \((entry.temporary as NSString).lastPathComponent) at its mapped server path."
+                    }
+                }
+                verifyOverSMBAndPlace(entry)
+                continue
+            }
+            addWork(Int(item.byteCount))
+            addTiming { $0.remoteVerifyBytes += item.byteCount }
+            do {
+                try check(entry, nasHash: nasHash, how: "when hashed on the NAS")
+                try place(entry)
+            } catch let error as MismatchError {
+                failed(entry.job, error, work: 0, mismatch: true)
+            } catch {
+                unlink(entry.temporary)
+                failed(entry.job, error, work: 0)
+            }
+            setActive(entry.job, nil)
+        }
+    }
+}
+
+private func setModificationTime(_ path: String, _ modifiedAt: Double) -> Bool {
+    let date = Date(timeIntervalSinceReferenceDate: modifiedAt)
+    return (try? FileManager.default.setAttributes([.modificationDate: date], ofItemAtPath: path)) != nil
 }

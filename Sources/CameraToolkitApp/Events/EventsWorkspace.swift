@@ -3624,17 +3624,18 @@ final class EventsWorkspace {
         let catalogURL = URL(fileURLWithPath: DashboardModel.expandedPath(model.configuration.catalogDatabasePath))
         let reportsFolder = catalogURL.deletingLastPathComponent().appendingPathComponent("NAS Sync", isDirectory: true)
         let nasRoot = locations.nasRoot
+        let options = NASSyncOptions.from(configuration: model.configuration, nasRoot: nasRoot)
         model.runBackgroundJob(
             action: .syncBuffer,
             runningNote: "Syncing \(title) to the NAS",
             logTitle: "Synced \(title) to the NAS",
-            logDetail: "Copied only files missing on the NAS, each to the same path it has on the drive, and re-read every copy from the NAS to check its SHA-256. Existing files were never overwritten.",
+            logDetail: "Copied only files missing on the NAS, each to the same path it has on the drive, \(options.parallelTransfers) at a time, and checked every copy's SHA-256 against the drive copy's (\(options.remoteVerifier == nil ? "re-read from the NAS" : "hashed on the NAS over SSH")) before naming it. Existing files were never overwritten.",
             destinationPath: nasRoot.path,
             operation: { progress in
                 progress(BackgroundJobUpdate(progress: 0.02, note: "Sync to NAS: listing the drive folders"))
                 let plan = NASSyncPlanner.plan(events: events, locations: locations)
                 let store = try? NASSyncStore(catalogURL: catalogURL)
-                let report = try NASSyncService(store: store).sync(plan, nasRoot: nasRoot) { update in
+                let report = try NASSyncService(store: store, options: options).sync(plan, nasRoot: nasRoot) { update in
                     progress(DashboardModel.jobUpdate(from: update, lowerBound: 0.03, upperBound: 0.99, notePrefix: "Sync to NAS", command: ""))
                 }
                 let reportPath = Self.writeNASSyncReport(report, plan: plan, title: title, to: reportsFolder)
@@ -3645,7 +3646,11 @@ final class EventsWorkspace {
                     Task { await self?.refreshEvent(eventID) }
                 }
                 let report = outcome.report
-                var parts = ["\(report.copied.count) copied and verified", "\(report.matchedExisting.count + report.alreadyVerified.count) already on the NAS"]
+                var parts: [String] = []
+                if !report.hashMismatches.isEmpty {
+                    parts.append("\(report.hashMismatches.count) NAS cop\(report.hashMismatches.count == 1 ? "y" : "ies") did NOT match the drive's SHA-256 (removed; check the NAS pool's health)")
+                }
+                parts += ["\(report.copied.count) copied and verified", "\(report.matchedExisting.count + report.alreadyVerified.count) already on the NAS"]
                 if !report.conflicts.isEmpty { parts.append("\(report.conflicts.count) conflict(s) left untouched") }
                 if !report.failed.isEmpty { parts.append("\(report.failed.count) failed and skipped") }
                 if report.notAttempted > 0 { parts.append("\(report.notAttempted) not attempted") }

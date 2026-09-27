@@ -50,6 +50,22 @@ public struct NASSyncPlan: Sendable {
     /// the event with `--migrate-nas-layout`, then sync verifies it.
     public var inLegacyLayout: [String] = []
 
+    public init(
+        items: [NASSyncItem],
+        outsideLayout: [String] = [],
+        skippedJunk: Int = 0,
+        refused: [NASSyncIssue] = [],
+        unreadable: [NASSyncIssue] = [],
+        inLegacyLayout: [String] = []
+    ) {
+        self.items = items
+        self.outsideLayout = outsideLayout
+        self.skippedJunk = skippedJunk
+        self.refused = refused
+        self.unreadable = unreadable
+        self.inLegacyLayout = inLegacyLayout
+    }
+
     public var totalBytes: Int64 { items.reduce(0) { $0 + $1.byteCount } }
 }
 

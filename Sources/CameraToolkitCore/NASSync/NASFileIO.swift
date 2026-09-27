@@ -54,23 +54,84 @@ public enum NASFileIO {
         return hex(hasher.finalize())
     }
 
+    /// How `copyNew` treats caches and durability. `.fast` is what Sync to
+    /// NAS uses; `.legacy` is the engine before it (kept for benchmarks and
+    /// as a switch of last resort).
+    public struct CopyOptions: Sendable, Equatable {
+        /// `F_FULLFSYNC` + `fsync` on every file before it is closed. Over
+        /// SMB each becomes an SMB2 FLUSH, which a ZFS server answers with
+        /// a ZIL commit — on a pool without a SLOG, a synchronous write to
+        /// the data disks per file.
+        public var flushEachFile: Bool
+        /// `F_NOCACHE` on the destination. On smbfs this turns off
+        /// write-behind, so every chunk is a synchronous round trip.
+        public var uncachedWrite: Bool
+        /// `F_NOCACHE` on the source (the drive). Off in `.fast`: in the
+        /// benchmark (150 files, 4 transfers, 3 runs each) it made no
+        /// measurable difference either way, and the NAS, not the drive,
+        /// is the bottleneck.
+        public var uncachedSourceRead: Bool
+
+        public init(flushEachFile: Bool, uncachedWrite: Bool, uncachedSourceRead: Bool) {
+            self.flushEachFile = flushEachFile
+            self.uncachedWrite = uncachedWrite
+            self.uncachedSourceRead = uncachedSourceRead
+        }
+
+        public static let fast = CopyOptions(flushEachFile: false, uncachedWrite: false, uncachedSourceRead: false)
+        public static let legacy = CopyOptions(flushEachFile: true, uncachedWrite: true, uncachedSourceRead: true)
+    }
+
+    public struct CopyResult: Sendable, Equatable {
+        /// SHA-256 of the bytes read from the source (and written).
+        public var sha256: String
+        /// Seconds spent reading and writing.
+        public var copySeconds: Double
+        /// Seconds spent in `F_FULLFSYNC`/`fsync` (zero without a flush).
+        public var flushSeconds: Double
+    }
+
+    /// Test seam: told about every cache or durability call `copyNew`
+    /// issues — "F_NOCACHE source", "F_NOCACHE destination", "F_FULLFSYNC",
+    /// "fsync" — so a test can prove the sync copy path issues no flush.
+    nonisolated(unsafe) static var copyCallObserver: (@Sendable (String) -> Void)?
+
     /// Streams `source` into a new file at `destination` (created
     /// exclusively — never an existing file), hashing the bytes as they
-    /// pass, then flushes it to stable storage. Returns the source's
-    /// SHA-256. A short read throws.
+    /// pass. Returns the source's SHA-256. A short read throws.
+    ///
+    /// With `.fast` options the bytes are *not* flushed to stable storage
+    /// here: the NAS commits them with its next transaction group (ZFS: at
+    /// most ~5 s later). A power loss on the NAS inside that window can
+    /// lose the file, which is safe because nothing is recorded as
+    /// verified until its SHA-256 has been checked after the write, the
+    /// temporary name only becomes the real name after that check, and a
+    /// drive copy is never removed without a verified NAS copy (Take Off
+    /// Drive re-hashes the NAS copy again). The SSH verifier also asks the
+    /// NAS to commit (`sync`) once per batch before it hashes.
     public static func copyNew(
         from source: String,
         to destination: String,
         expectedByteCount: Int64,
+        options: CopyOptions = .fast,
+        clock: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
         progress: (Int) -> Void = { _ in }
-    ) throws -> String {
+    ) throws -> CopyResult {
+        let observer = copyCallObserver
+        let started = clock()
         let input = try open(source, O_RDONLY)
         defer { Darwin.close(input) }
-        _ = fcntl(input, F_NOCACHE, 1)
+        if options.uncachedSourceRead {
+            observer?("F_NOCACHE source")
+            _ = fcntl(input, F_NOCACHE, 1)
+        }
         let output = try open(destination, O_WRONLY | O_CREAT | O_EXCL, 0o644)
         var closed = false
         defer { if !closed { Darwin.close(output) } }
-        _ = fcntl(output, F_NOCACHE, 1)
+        if options.uncachedWrite {
+            observer?("F_NOCACHE destination")
+            _ = fcntl(output, F_NOCACHE, 1)
+        }
         var hasher = SHA256()
         var total: Int64 = 0
         let buffer = UnsafeMutableRawPointer.allocate(byteCount: chunkSize, alignment: 16)
@@ -100,13 +161,26 @@ public enum NASFileIO {
                 "Copy stopped early for \((source as NSString).lastPathComponent): \(total) of \(expectedByteCount) bytes. The drive may have disconnected."
             )
         }
-        // F_FULLFSYNC where the filesystem has it (SMB may not); fsync
-        // always, so the share has the bytes before the rename names them.
-        _ = fcntl(output, F_FULLFSYNC)
-        guard Darwin.fsync(output) == 0 else { throw DirectoryListing.posix(errno, "flush", destination) }
+        let copied = clock()
+        var flushed = copied
+        if options.flushEachFile {
+            // F_FULLFSYNC where the filesystem has it (SMB may not); fsync
+            // always, so the share has the bytes before the rename names them.
+            observer?("F_FULLFSYNC")
+            _ = fcntl(output, F_FULLFSYNC)
+            observer?("fsync")
+            guard Darwin.fsync(output) == 0 else { throw DirectoryListing.posix(errno, "flush", destination) }
+            flushed = clock()
+        }
         closed = true
+        // close() still reports a failed write-behind on smbfs.
         guard Darwin.close(output) == 0 else { throw DirectoryListing.posix(errno, "close", destination) }
-        return hex(hasher.finalize())
+        let end = clock()
+        return CopyResult(
+            sha256: hex(hasher.finalize()),
+            copySeconds: (copied - started) + (end - flushed),
+            flushSeconds: flushed - copied
+        )
     }
 
     /// Renames without ever replacing an existing file: `renamex_np` with
