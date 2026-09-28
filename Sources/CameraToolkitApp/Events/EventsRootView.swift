@@ -600,178 +600,48 @@ private struct SidebarFooter: View {
         let detail = job?.note
             ?? model.transferQueue?.sidebarSummary.detail
             ?? (model.pendingTransferFileCount > 0 ? "\(model.pendingTransferFileCount) waiting" : nil)
-        VStack(alignment: .leading, spacing: 6) {
-            NASStatusFooterRow(connection: workspace.nasConnection)
-            GlassEffectContainer(spacing: 8) {
-                HStack(spacing: 8) {
-                    Button {
-                        TransferQueueWindowController.shared.show(model: model)
-                    } label: {
-                        HStack(spacing: 6) {
-                            Label("Jobs", systemImage: "list.bullet.clipboard")
-                                .symbolVariant(job != nil ? .fill : .none)
-                            if let job {
-                                ProgressView(value: job.progress)
-                                    .frame(width: 44)
-                            } else if let detail {
-                                Text(detail)
-                                    .foregroundStyle(.secondary)
-                                    .lineLimit(1)
-                            }
+        GlassEffectContainer(spacing: 8) {
+            HStack(spacing: 8) {
+                Button {
+                    TransferQueueWindowController.shared.show(model: model)
+                } label: {
+                    HStack(spacing: 6) {
+                        Label("Jobs", systemImage: "list.bullet.clipboard")
+                            .symbolVariant(job != nil ? .fill : .none)
+                        if let job {
+                            ProgressView(value: job.progress)
+                                .frame(width: 44)
+                        } else if let detail {
+                            Text(detail)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
                         }
                     }
-                    .buttonStyle(.glass)
-                    .help(detail.map { "Jobs — \($0)" } ?? "Show copy, archive, and scan jobs")
-                    Spacer(minLength: 0)
-                    Menu {
-                        Button(workspace.faceEngineInstalled ? "People…" : "People… (Face Engine Missing)") {
-                            PeopleWindowController.shared.show(model: model, workspace: workspace)
-                        }
-                        Button("Trash…") { TrashWindowController.shared.show(model: model) }
-                        Button("Storage Speed Tests…") { StorageBenchmarkWindowController.shared.show(model: model) }
-                        Divider()
-                        Button("Setup Guide…") { workspace.startGuide() }
-                        Button("Settings…") { CameraToolkitConfigWindow.shared.show(model: model) }
-                    } label: {
-                        Label("More", systemImage: "gearshape")
-                            .labelStyle(.iconOnly)
-                    }
-                    .menuIndicator(.hidden)
-                    .buttonStyle(.glass)
-                    .buttonBorderShape(.circle)
-                    .help("People, Trash, Speed Tests, the setup guide, and Settings")
                 }
+                .buttonStyle(.glass)
+                .help(detail.map { "Jobs — \($0)" } ?? "Show copy, archive, and scan jobs")
+                Spacer(minLength: 0)
+                Menu {
+                    Button(workspace.faceEngineInstalled ? "People…" : "People… (Face Engine Missing)") {
+                        PeopleWindowController.shared.show(model: model, workspace: workspace)
+                    }
+                    Button("Trash…") { TrashWindowController.shared.show(model: model) }
+                    Button("Storage Speed Tests…") { StorageBenchmarkWindowController.shared.show(model: model) }
+                    Divider()
+                    Button("Setup Guide…") { workspace.startGuide() }
+                    Button("Settings…") { CameraToolkitConfigWindow.shared.show(model: model) }
+                } label: {
+                    Label("More", systemImage: "gearshape")
+                        .labelStyle(.iconOnly)
+                }
+                .menuIndicator(.hidden)
+                .buttonStyle(.glass)
+                .buttonBorderShape(.circle)
+                .help("People, Trash, Speed Tests, the setup guide, and Settings")
             }
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
-    }
-}
-
-/// Always-visible NAS line: how the share is connected and how fast it
-/// last measured ("NAS · Ethernet 1 GbE · 75 MB/s"), with Connect when it
-/// is offline and the Wi-Fi banner when a wired link would be faster.
-/// Reads the published status only — no filesystem calls here.
-private struct NASStatusFooterRow: View {
-    let connection: NASConnectionModel
-
-    var body: some View {
-        let status = connection.status
-        if status.phase != .notConfigured {
-            VStack(alignment: .leading, spacing: 6) {
-                if status.isOnSlowWiFi, status.banner != nil || status.isWaitingToReconnect {
-                    NASWiFiBanner(status: status, connection: connection)
-                }
-                HStack(spacing: 6) {
-                    Button {
-                        connection.statusClicked()
-                    } label: {
-                        Label {
-                            Text(status.title)
-                                .lineLimit(1)
-                                .truncationMode(.middle)
-                        } icon: {
-                            Image(systemName: symbol(for: status))
-                                .foregroundStyle(tint(for: status))
-                        }
-                        .font(.caption)
-                        .foregroundStyle(status.phase == .connected ? Color.primary : Color.secondary)
-                    }
-                    .buttonStyle(.borderless)
-                    .help(help(for: status))
-                    .accessibilityLabel(status.title)
-                    Spacer(minLength: 0)
-                    if status.phase == .connecting || status.phase == .reconnecting || status.isTestingSpeed {
-                        ProgressView()
-                            .controlSize(.mini)
-                    } else if status.phase == .offline, status.hasShareURL {
-                        Button("Connect") { connection.connect() }
-                            .controlSize(.small)
-                            .buttonStyle(.glass)
-                            .help("Mount the NAS share with the password saved in your keychain (Finder asks when there is none)")
-                    }
-                }
-            }
-        }
-    }
-
-    private func symbol(for status: NASConnectionStatus) -> String {
-        switch status.phase {
-        case .offline, .notConfigured: return "externaldrive.badge.xmark"
-        case .connecting, .reconnecting: return "arrow.triangle.2.circlepath"
-        case .notSMB: return "externaldrive"
-        case .connected:
-            switch status.snapshot?.sessionKind {
-            case .wifi: return "wifi.exclamationmark"
-            case .ethernet: return "cable.connector"
-            case .thunderbolt: return "bolt.horizontal"
-            case .other, nil: return "server.rack"
-            }
-        }
-    }
-
-    private func tint(for status: NASConnectionStatus) -> Color {
-        guard status.phase == .connected else { return .secondary }
-        return status.snapshot?.sessionKind == .wifi ? .orange : .green
-    }
-
-    private func help(for status: NASConnectionStatus) -> String {
-        var text = status.detail(now: Date())
-        if status.phase == .connected {
-            let hint = "Click to run the speed test again (at most every 30 minutes)."
-            text = text.isEmpty ? hint : text + "\n" + hint
-        }
-        return text.isEmpty ? status.title : text
-    }
-}
-
-/// "NAS is connected over Wi-Fi (slow)." with the button that waits for
-/// NAS jobs to finish and then reconnects over Ethernet. Never blocks.
-private struct NASWiFiBanner: View {
-    let status: NASConnectionStatus
-    let connection: NASConnectionModel
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Label("NAS is connected over Wi-Fi (slow).", systemImage: "wifi.exclamationmark")
-                .font(.callout.weight(.semibold))
-                .fixedSize(horizontal: false, vertical: true)
-            if let reason = reasonText {
-                Text(reason)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            if status.isWaitingToReconnect {
-                HStack(spacing: 6) {
-                    ProgressView()
-                        .controlSize(.mini)
-                    Text("Waiting for NAS jobs to finish…")
-                        .font(.caption)
-                    Spacer(minLength: 0)
-                    Button("Cancel") { connection.cancelReconnect() }
-                        .controlSize(.small)
-                }
-            } else {
-                Button("Reconnect over Ethernet") { connection.reconnectOverEthernet() }
-                    .controlSize(.small)
-                    .help("Waits until no job uses the NAS, then disconnects the share and mounts it again over the wired link")
-            }
-        }
-        .padding(8)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
-    }
-
-    private var reasonText: String? {
-        switch status.banner {
-        case .nasInUse: "A job is using the NAS, so it was not reconnected."
-        case .gaveUp: "Two reconnects did not move it to Ethernet."
-        case .rateLimited: status.message
-        case .automaticOff: "Automatic reconnects are off in Settings."
-        case .noShareAddress: "Set the NAS share address in Settings to reconnect it."
-        case nil: nil
-        }
     }
 }
 

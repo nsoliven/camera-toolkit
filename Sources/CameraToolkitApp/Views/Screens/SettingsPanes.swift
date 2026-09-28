@@ -219,14 +219,8 @@ struct LibrarySettingsPane: View {
                         set: { value in model.updateConfiguration { $0.nasSMBURL = value.trimmingCharacters(in: .whitespacesAndNewlines) } }
                     ))
                     .frame(minWidth: 220)
-                    .help("Connect to NAS… mounts this share with the password saved in your keychain, or opens it in Finder to ask for one.")
+                    .help("Connect to NAS… opens this address so Finder mounts the share when it is not connected.")
                 }
-                Toggle("Connect to the NAS automatically", isOn: Binding(
-                    get: { model.configuration.nasAutoConnect },
-                    set: { value in model.updateConfiguration { $0.nasAutoConnect = value } }
-                ))
-                .disabled(NASConnectionSettings.shareURL(from: model.configuration.nasSMBURL) == nil)
-                .help("At launch, mount the share with the keychain's saved password when it is not connected. When the share is on Wi-Fi while an Ethernet link to the NAS is up, reconnect it over Ethernet when no job is using the NAS. Needs the NAS share address above.")
                 Stepper(
                     "Parallel transfers (\(model.configuration.nasSyncParallelTransfers))",
                     value: Binding(
