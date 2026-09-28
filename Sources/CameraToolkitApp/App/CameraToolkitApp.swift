@@ -274,6 +274,10 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate, NSMenuIte
         TrashWindowController.shared.show(model: model)
     }
 
+    @objc func openDuplicates(_ sender: Any?) {
+        DuplicatesWindowController.shared.show(model: model, workspace: CameraToolkitRuntime.workspace)
+    }
+
     @objc func openCatalogInspector(_ sender: Any?) {
         CatalogInspectorWindowController.shared.show(model: model)
     }

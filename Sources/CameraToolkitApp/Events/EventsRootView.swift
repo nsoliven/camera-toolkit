@@ -628,6 +628,7 @@ private struct SidebarFooter: View {
                             PeopleWindowController.shared.show(model: model, workspace: workspace)
                         }
                         Button("Trash…") { TrashWindowController.shared.show(model: model) }
+                        Button("Duplicates…") { DuplicatesWindowController.shared.show(model: model, workspace: workspace) }
                         Button("Storage Speed Tests…") { StorageBenchmarkWindowController.shared.show(model: model) }
                         Divider()
                         Button("Setup Guide…") { workspace.startGuide() }
@@ -639,7 +640,7 @@ private struct SidebarFooter: View {
                     .menuIndicator(.hidden)
                     .buttonStyle(.glass)
                     .buttonBorderShape(.circle)
-                    .help("People, Trash, Speed Tests, the setup guide, and Settings")
+                    .help("People, Trash, Duplicates, Speed Tests, the setup guide, and Settings")
                 }
             }
         }

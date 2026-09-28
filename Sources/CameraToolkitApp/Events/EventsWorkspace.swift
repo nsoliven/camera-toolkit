@@ -204,12 +204,6 @@ private struct EventRefreshOutput: Sendable {
     var immich: [String: ImmichCatalogStatus]
 }
 
-private struct PlannedReassignment: Sendable {
-    var removed: PhotoEventAssignment
-    var added: PhotoEventAssignment
-    var moveSourcePath: String?
-}
-
 /// The slice of `EventAssetPresence` a move or return needs, in a form the
 /// app can also synthesize from the catalog alone when the presence sweep
 /// has not landed yet — the scanner's own value type is read-only outside
@@ -487,8 +481,13 @@ final class EventsWorkspace {
     @ObservationIgnored private var eventsByIDCache: (revision: Int, byID: [UUID: SavedCameraEvent])?
     @ObservationIgnored private let mountObservers = MountObserverBox()
 
-    /// Holds move journals and the capture-time cache.
+    /// Holds move journals, the capture-time cache, and the duplicate
+    /// review's hash cache.
     let supportFolder: URL
+
+    /// The Duplicates window's scan and choices, shared with the event
+    /// boards' "identical copies" notice. Observable on its own.
+    @ObservationIgnored private(set) lazy var duplicateReview = DuplicateReviewModel(workspace: self)
 
     /// How the NAS share is connected (link, speed test, Wi-Fi guard).
     /// Inert until `startNASConnection()` — tests never mount or unmount.
@@ -3324,6 +3323,11 @@ final class EventsWorkspace {
         }
     }
 
+    /// A name the target already has is decided by content, not by name:
+    /// the job re-hashes both files. An identical copy merges — the
+    /// target's file stays and the extra one goes to the drive's `_Trash` —
+    /// and a different photo moves in under a free "(N)" name
+    /// (`EventMoveService`). Only a file that cannot be read stays behind.
     private func moveLoadedStacks(_ targetStacks: [OrganizeStack], from: SavedCameraEvent, to: SavedCameraEvent) {
         let sourceEventID = from.id
         let targetEventID = to.id
@@ -3339,27 +3343,24 @@ final class EventsWorkspace {
         }
         let locations = self.locations
         let targetPolicy = locations.resolvedPolicy(for: to)
-        var targetNames = Set(model.configuration.photoEventAssignments
-            .filter { $0.eventID == targetEventID }
-            .map { $0.relativePath.lowercased() })
+        let targetOther: EventStoragePolicy = targetPolicy == .buffer ? .archiveOnly : .buffer
+        var targetByName: [String: PhotoEventAssignment] = [:]
+        for assignment in model.configuration.photoEventAssignments where assignment.eventID == targetEventID {
+            let name = assignment.relativePath.lowercased()
+            if targetByName[name] == nil { targetByName[name] = assignment }
+        }
 
-        var plans: [PlannedReassignment] = []
-        var collisions = 0
-        var alreadyThere = 0
+        var items: [EventMoveItem] = []
+        // Names this batch already brings in, with where that file is now,
+        // so two incoming files with one name are compared with each other.
+        var claimed: [String: String] = [:]
         for asset in assets {
             // A family board's stacks can already belong to the target —
             // a subevent section on the parent's board dropped back onto
             // that subevent moves nothing.
-            guard asset.assignment.eventID != targetEventID else {
-                alreadyThere += 1
-                continue
-            }
+            guard asset.assignment.eventID != targetEventID else { continue }
             var moved = asset.assignment
             moved.eventID = targetEventID
-            guard targetNames.insert(moved.relativePath.lowercased()).inserted else {
-                collisions += 1
-                continue
-            }
             var moveSource: String?
             if asset.sourceIsDriveCopy {
                 if let path = [asset.drive == .present ? asset.drivePath : nil, asset.otherDrive == .present ? asset.otherDrivePath : nil]
@@ -3372,24 +3373,43 @@ final class EventsWorkspace {
             } else if asset.otherDrive == .present {
                 moveSource = asset.otherDrivePath
             }
-            plans.append(PlannedReassignment(removed: asset.assignment, added: moved, moveSourcePath: moveSource))
+            let move = moveSource.flatMap { source in
+                locations.driveURL(for: moved, event: to, policy: targetPolicy).map {
+                    DriveMove(sourcePath: source, destinationPath: $0.path, byteCount: moved.fileSize)
+                }
+            }
+            let currentPath = moveSource ?? (asset.source == .present ? asset.sourcePath : nil)
+            let name = moved.relativePath.lowercased()
+            var takenBy: [String] = []
+            if let existing = targetByName[name] {
+                takenBy = [
+                    locations.driveURL(for: existing, event: to, policy: targetPolicy),
+                    locations.driveURL(for: existing, event: to, policy: targetOther),
+                    locations.sourceURL(for: existing)
+                ].compactMap { $0?.path }
+            } else if let earlier = claimed[name] {
+                takenBy = [earlier]
+            } else {
+                claimed[name] = currentPath ?? ""
+            }
+            items.append(EventMoveItem(
+                removed: asset.assignment,
+                added: moved,
+                move: move,
+                currentPath: currentPath,
+                takenBy: takenBy
+            ))
         }
-        guard !plans.isEmpty else {
-            model.statusMessage = alreadyThere > 0 && collisions == 0
-                ? "Those files already belong to \(eventTitle(to)). Nothing moved."
-                : "\(eventTitle(to)) already has files with those names. Nothing moved."
+        guard !items.isEmpty else {
+            model.statusMessage = "Those files already belong to \(eventTitle(to)). Nothing moved."
             return
         }
         noteRecent(targetEventID)
 
-        let moves = plans.compactMap { plan -> DriveMove? in
-            guard let source = plan.moveSourcePath,
-                  let destination = locations.driveURL(for: plan.added, event: to, policy: targetPolicy) else { return nil }
-            return DriveMove(sourcePath: source, destinationPath: destination.path, byteCount: plan.added.fileSize)
-        }
-        let collisionNote = collisions > 0 ? " \(collisions) file(s) stayed because \(eventTitle(to)) already has that name." : ""
-        guard !moves.isEmpty else {
-            let change = AssignmentChange(title: "Move to \(eventTitle(to))", removed: plans.map(\.removed), added: plans.map(\.added))
+        let title = "Move to \(eventTitle(to))"
+        // Only catalog entries change: no rename and no name to compare.
+        guard items.contains(where: { $0.move != nil || !$0.takenBy.isEmpty }) else {
+            let change = AssignmentChange(title: title, removed: items.map(\.removed), added: items.map(\.added))
             // The stacks are already on the source board with real paths
             // and dates — the target board gains them in place.
             applyAssignmentChange(
@@ -3398,52 +3418,92 @@ final class EventsWorkspace {
                 addedItems: targetStacks.flatMap(\.items)
             )
             pushUndo(change)
-            model.statusMessage = "Moved \(plans.count) file(s) from \(eventTitle(from)) to \(eventTitle(to)).\(collisionNote)"
+            var outcome = EventMoveOutcome()
+            outcome.moved = items
+            model.statusMessage = EventMoveWording.summary(outcome, from: eventTitle(from), to: eventTitle(to))
             return
         }
 
+        // Files other assignments still use are never trashed as a spare
+        // copy — the merge only drops this assignment. Keep Both names
+        // also avoid every path the target's catalog already claims.
+        var protectedKeys: Set<String> = []
+        var takenKeys: Set<String> = []
+        if items.contains(where: { !$0.takenBy.isEmpty }) {
+            let leaving = Set(items.map { CatalogStore.eventAssetID($0.removed) })
+            for assignment in model.configuration.photoEventAssignments where !leaving.contains(CatalogStore.eventAssetID(assignment)) {
+                protectedKeys.insert(Self.sourceKey(assignment))
+            }
+            for item in items where !item.takenBy.isEmpty && hasOtherAssignment(pointingLike: item.removed) {
+                if let path = item.currentPath { protectedKeys.insert(EventStorageLocations.pathKey(path)) }
+            }
+            for assignment in targetByName.values {
+                if let path = locations.impliedDrivePath(for: assignment, event: to, policy: targetPolicy) {
+                    takenKeys.insert(EventStorageLocations.pathKey(path))
+                }
+            }
+        }
+        var trashEventIDs: [String: UUID] = [:]
+        for item in items {
+            if let path = item.currentPath { trashEventIDs[EventStorageLocations.pathKey(path)] = sourceEventID }
+        }
+        let trashContext = TrashContext(
+            locationName: eventTitle(from),
+            deviceID: nil,
+            eventIDsByPathKey: trashEventIDs,
+            eventNamesByID: [sourceEventID: eventTitle(from)],
+            personNamesByPathKey: [:],
+            captureDatesByPathKey: [:]
+        )
         let journalFolder = self.journalFolder
         let boundaries = [locations.bufferRoot, locations.privateStagingRoot]
-        let title = "Move to \(eventTitle(to))"
-        let removed = plans.map(\.removed)
-        let added = plans.map(\.added)
+        let fallbackTrashRoot = locations.removedFilesRoot
+        let fromTitle = eventTitle(from)
+        let toTitle = eventTitle(to)
+        let moveItems = items
+        let protectedPathKeys = protectedKeys
+        let takenPathKeys = takenKeys
         model.runBackgroundJob(
             action: .organize,
-            runningNote: "Moving \(moves.count) file(s) from \(eventTitle(from)) to \(eventTitle(to))",
+            runningNote: "Moving \(ApplyPlanOverview.plural(items.count, "file")) from \(fromTitle) to \(toTitle)",
             logTitle: title,
-            logDetail: "Renamed originals between event folders on the same drive. NAS copies were not changed.",
+            logDetail: "Renamed originals between event folders on the same drive. Names already in the event were compared by content: identical copies merged and their extra copy went to _Trash; different photos moved in under a free “(N)” name. Nothing was replaced. NAS copies were not changed.",
             operation: { progress in
-                try DriveMoveService().apply(
-                    moves,
+                try EventMoveService(trash: MediaTrashService(removedFilesRoot: fallbackTrashRoot)).move(
+                    moveItems,
                     title: title,
                     journalFolder: journalFolder,
-                    removedAssignments: removed,
-                    addedAssignments: added,
-                    pruneBoundaries: boundaries
+                    pruneBoundaries: boundaries,
+                    protectedPathKeys: protectedPathKeys,
+                    takenPathKeys: takenPathKeys,
+                    trashContext: trashContext
                 ) { update in
                     progress(DashboardModel.jobUpdate(from: update, notePrefix: "Moving", command: ""))
                 }
             },
-            completion: { [weak self] report in
+            completion: { [weak self] outcome in
                 guard let self else { return "" }
-                let failedSources = Set(report.skipped.map { EventStorageLocations.pathKey($0.move.sourcePath) })
-                let applied = plans.filter { plan in
-                    guard let source = plan.moveSourcePath else { return true }
-                    return !failedSources.contains(EventStorageLocations.pathKey(source))
-                }
                 applyAssignmentChange(
-                    AssignmentChange(title: title, removed: applied.map(\.removed), added: applied.map(\.added)),
+                    AssignmentChange(title: title, removed: outcome.removedAssignments, added: outcome.addedAssignments),
                     touching: targetEventID
                 )
+                // No journal means no rename ran, so only catalog entries
+                // moved: those undo from the sort stack instead.
+                if outcome.report.journalPath == nil, !outcome.moved.isEmpty {
+                    pushUndo(AssignmentChange(title: title, removed: outcome.moved.map(\.removed), added: outcome.moved.map(\.added)))
+                }
+                let trashed = (outcome.trashBatch?.entries ?? []).map { EventStorageLocations.pathKey($0.originalAbsolutePath) }
                 removeFilesFromEventBoards(
-                    Set(report.moved.map { EventStorageLocations.pathKey($0.sourcePath) }),
+                    Set(outcome.report.moved.map { EventStorageLocations.pathKey($0.sourcePath) } + trashed),
                     events: [sourceEventID]
                 )
-                retargetMovedPaths(report.moved)
+                retargetMovedPaths(outcome.report.moved)
                 refreshLatestJournal()
                 refreshBoth(sourceEventID, targetEventID)
-                let skippedNote = report.skipped.isEmpty ? "" : " \(report.skipped.count) could not move: \(report.skipped[0].reason)"
-                return "Moved \(applied.count) file(s) to \(eventTitle(to)).\(skippedNote)\(collisionNote)"
+                if !trashed.isEmpty {
+                    Self.postTrashChanged(rescanUnsorted: false)
+                }
+                return EventMoveWording.summary(outcome, from: fromTitle, to: toTitle)
             }
         )
     }
@@ -4176,6 +4236,100 @@ final class EventsWorkspace {
                     : "Moved \(batch.entries.count) files to Trash — restorable from the Trash window.\(skippedNote)"
             }
         )
+    }
+
+    // MARK: - Duplicates
+
+    /// "Keep in X only" from the Duplicates window. `DuplicateResolver`
+    /// re-hashes the kept and the dropped copies first and refuses any that
+    /// no longer match; matching copies go to the drive's `_Trash` in one
+    /// restorable batch. Only then does the catalog drop the removed
+    /// assignments — one save, one transaction — and their location and
+    /// Immich rows cascade away with them. A file another assignment still
+    /// points at stays on disk and only loses the dropped assignment.
+    @discardableResult
+    func resolveDuplicates(
+        _ resolutions: [DuplicateResolution],
+        onFinish: @escaping @MainActor (DuplicateResolutionOutcome) -> Void
+    ) -> Bool {
+        let dropping = resolutions.flatMap { resolution in
+            resolution.group.copies.filter { resolution.drop.contains($0.owner) }
+        }
+        guard !dropping.isEmpty else { return false }
+        guard !model.isBusy, !model.isStorageBenchmarkRunning else {
+            model.statusMessage = "Another file job is already running. Wait for it to finish, then try again."
+            return false
+        }
+        let leaving = Set(dropping.compactMap(\.assignment).map(CatalogStore.eventAssetID))
+        var protectedKeys: Set<String> = []
+        for assignment in model.configuration.photoEventAssignments where !leaving.contains(CatalogStore.eventAssetID(assignment)) {
+            protectedKeys.insert(Self.sourceKey(assignment))
+        }
+        for copy in dropping {
+            if let assignment = copy.assignment, hasOtherAssignment(pointingLike: assignment) {
+                protectedKeys.insert(copy.pathKey)
+            }
+        }
+        var eventIDs: [String: UUID] = [:]
+        for copy in dropping {
+            if let id = copy.owner.eventID { eventIDs[copy.pathKey] = id }
+        }
+        var captureDates: [String: Date] = [:]
+        for copy in dropping {
+            if let date = copy.captureDate { captureDates[copy.pathKey] = date }
+        }
+        let context = TrashContext(
+            locationName: "Duplicates",
+            deviceID: nil,
+            eventIDsByPathKey: eventIDs,
+            eventNamesByID: trashEventNames(for: eventIDs),
+            personNamesByPathKey: [:],
+            captureDatesByPathKey: captureDates
+        )
+        let fallbackTrashRoot = locations.removedFilesRoot
+        let protected = protectedKeys
+        return model.runBackgroundJob(
+            action: .organize,
+            runningNote: "Rechecking \(DuplicateReviewWording.copies(dropping.count)) before moving them to Trash",
+            logTitle: "Removed duplicate copies",
+            logDetail: "Re-hashed the kept and the removed copy of every group before moving anything. Matching extra copies were renamed into the drive-local .Camera Toolkit/_Trash folder with a manifest — restorable from the Trash window. Copies that changed or could not be read were left in place.",
+            operation: { progress in
+                try DuplicateResolver(trash: MediaTrashService(removedFilesRoot: fallbackTrashRoot)).resolve(
+                    resolutions,
+                    protectedPathKeys: protected,
+                    context: context
+                ) { update in
+                    progress(DashboardModel.jobUpdate(from: update, notePrefix: "Rechecking", command: ""))
+                }
+            },
+            completion: { [weak self] outcome in
+                guard let self else { return "" }
+                if !outcome.removedAssignments.isEmpty {
+                    applyAssignmentChange(
+                        AssignmentChange(title: "Remove duplicate copies", removed: outcome.removedAssignments, added: []),
+                        touching: nil
+                    )
+                }
+                let trashedKeys = Set(outcome.trashed.map(\.pathKey))
+                removeFilesFromEventBoards(trashedKeys, events: [])
+                for (id, state) in sources {
+                    if let result = state.result {
+                        sources[id]?.result = result.removingFiles(withPathKeys: trashedKeys)
+                    }
+                }
+                if outcome.trashBatch != nil {
+                    Self.postTrashChanged(rescanUnsorted: false)
+                }
+                // Board edits match files by name, size and date, so the
+                // kept copy's tile can drop out with the removed one —
+                // reload every open board the groups touched.
+                for eventID in Set(resolutions.flatMap { $0.group.owners.compactMap(\.eventID) }) where eventStacks[eventID] != nil {
+                    Task { await self.refreshEvent(eventID) }
+                }
+                onFinish(outcome)
+                return DuplicateReviewWording.resolutionSummary(outcome)
+            }
+        ) != nil
     }
 
     /// The event's display title for every event ID a trash run recorded —

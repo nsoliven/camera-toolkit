@@ -244,6 +244,7 @@ struct EventBoardView: View {
                 event: event,
                 summary: workspace.presence[eventID]
             ).misplacedNotice
+            DuplicateBoardNotice(model: model, workspace: workspace, review: workspace.duplicateReview, eventID: eventID)
             FlowLayout(horizontalSpacing: 8, verticalSpacing: 8) {
                 ForEach(subevents) { subevent in
                     SubeventChip(
@@ -1071,5 +1072,39 @@ struct NoMatchesView: View {
             }
         }
         .frame(maxHeight: .infinity)
+    }
+}
+
+/// Shown once a duplicate scan found photos this event holds as
+/// byte-identical copies of photos somewhere else — the same pattern as
+/// the storage notices above it. Opens the Duplicates window on the pair.
+private struct DuplicateBoardNotice: View {
+    let model: DashboardModel
+    let workspace: EventsWorkspace
+    @Bindable var review: DuplicateReviewModel
+    let eventID: UUID
+
+    var body: some View {
+        let shared = review.sharedGroups(forEvent: eventID)
+        if !shared.isEmpty {
+            HStack(spacing: 8) {
+                Image(systemName: "doc.on.doc.fill")
+                    .foregroundStyle(.orange)
+                Text(DuplicateReviewWording.boardNotice(
+                    count: shared.count,
+                    partners: review.partners(ofEvent: eventID).map(review.title)
+                ))
+                .font(.callout)
+                .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 8)
+                Button("Review Duplicates…") {
+                    DuplicatesWindowController.shared.show(model: model, workspace: workspace, focusingEvent: eventID)
+                }
+                .buttonStyle(.glass)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 7)
+            .background(Color.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
+        }
     }
 }

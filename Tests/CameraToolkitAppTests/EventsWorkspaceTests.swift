@@ -3076,11 +3076,17 @@ final class EventsWorkspaceTests: XCTestCase {
             workspace.moveStacks([stack.id], fromEvent: eventID, toEvent: eventID)
             XCTAssertTrue(model.statusMessage.contains("already in"))
 
+            // The target lists the name but its file is nowhere to compare
+            // against, so the photo stays — and the line says why.
             workspace.moveStacks([stack.id], fromEvent: eventID, toEvent: targetID)
-            XCTAssertTrue(model.statusMessage.contains("already has files with those names"))
-            XCTAssertTrue(model.statusMessage.contains("Nothing moved"))
+            try await waitUntil { !model.isBusy && model.statusMessage.contains("stayed") }
+            XCTAssertEqual(
+                model.statusMessage,
+                "Nothing moved to Japan 2026. 1 stayed in Sample Trip 2026: the file already using the name DSC00001.ARW could not be found to compare."
+            )
             XCTAssertNil(workspace.latestMoveJournalTitle)
             XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
+            XCTAssertEqual(model.configuration.photoEventAssignments.filter { $0.eventID == eventID }.count, 1)
         }
     }
 
@@ -3502,7 +3508,7 @@ extension EventsWorkspaceTests {
             XCTAssertTrue(FileManager.default.fileExists(atPath: cardCopy(root, event: "2026-08-26 Beach Day").appendingPathComponent("DSC00003.ARW").path))
             XCTAssertFalse(FileManager.default.fileExists(atPath: clean.path))
             let status = try XCTUnwrap(model.statusMessage)
-            XCTAssertTrue(status.hasPrefix("Moved 1 file(s)"), status)
+            XCTAssertTrue(status.hasPrefix("Moved 1 file "), status)
             XCTAssertTrue(status.contains("a different DSC00001.ARW is already in Beach Day — open Apply to resolve."), status)
             XCTAssertEqual(try String(contentsOf: existing, encoding: .utf8), "an older, different photo")
 
@@ -3728,6 +3734,170 @@ private final class EventPathProbeBox: @unchecked Sendable {
             _parkedCalls += 1
             _onMainThread = _onMainThread || Thread.isMainThread
             return _parkedCalls == 1
+        }
+    }
+}
+
+// MARK: - Move to Event decides taken names by content; duplicate review
+
+extension EventsWorkspaceTests {
+    /// One event's file on the board, with its assignment.
+    private func placeEventFile(
+        _ model: DashboardModel,
+        _ workspace: EventsWorkspace,
+        event eventID: UUID,
+        name: String,
+        date: String,
+        subseconds: String,
+        root: URL
+    ) throws -> (url: URL, assignment: PhotoEventAssignment) {
+        let event = try XCTUnwrap(workspace.event(eventID))
+        let folder = workspace.locations.originalsRoot(for: event, deviceID: "sony-a7v", policy: workspace.resolvedPolicy(for: event))
+        let url = try writeOrganizerARW(folder.appendingPathComponent(name), date, subseconds)
+        let assignment = PhotoEventAssignment(
+            sourceRootPath: root.appendingPathComponent("Drive/Unsorted A7V", isDirectory: true).path,
+            relativePath: name,
+            fileSize: Int64(try XCTUnwrap(try url.resourceValues(forKeys: [.fileSizeKey]).fileSize)),
+            modifiedAt: Date(),
+            eventID: eventID,
+            deviceID: "sony-a7v"
+        )
+        model.updateConfiguration { $0.photoEventAssignments.append(assignment) }
+        return (url, assignment)
+    }
+
+    /// The same name in the target is decided by bytes: the identical copy
+    /// merges (its spare goes to Trash), the different photo moves in as
+    /// "(2)", and a free name moves as usual — in one sentence.
+    func testMoveStacksMergesIdenticalCopiesAndKeepsBothForDifferentPhotos() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let fromID = try XCTUnwrap(workspace.createEvent(name: "Sample Trip 2026", date: organizerDay("2026-08-26"), policy: .buffer))
+            let toID = try XCTUnwrap(workspace.createEvent(name: "Japan 2026", date: organizerDay("2026-08-27"), policy: .buffer))
+            let same = try placeEventFile(model, workspace, event: fromID, name: "DSC00001.ARW", date: "2026:08:26 10:00:00", subseconds: "000", root: root)
+            let reused = try placeEventFile(model, workspace, event: fromID, name: "DSC00002.ARW", date: "2026:08:26 11:00:00", subseconds: "000", root: root)
+            let free = try placeEventFile(model, workspace, event: fromID, name: "DSC00003.ARW", date: "2026:08:26 12:00:00", subseconds: "000", root: root)
+            let theirs = try placeEventFile(model, workspace, event: toID, name: "DSC00001.ARW", date: "2026:08:26 10:00:00", subseconds: "000", root: root)
+            // Sony reused the number: same size, different picture.
+            let older = try placeEventFile(model, workspace, event: toID, name: "DSC00002.ARW", date: "2026:08:26 11:00:00", subseconds: "500", root: root)
+
+            let reusedBytes = try Data(contentsOf: reused.url)
+            let olderBytes = try Data(contentsOf: older.url)
+            XCTAssertNotEqual(reusedBytes, olderBytes)
+            XCTAssertEqual(reusedBytes.count, olderBytes.count)
+
+            await workspace.refreshEvent(fromID)
+            let stacks = try XCTUnwrap(workspace.eventStacks[fromID])
+            XCTAssertEqual(stacks.flatMap(\.files).count, 3)
+            workspace.moveStacks(Set(stacks.map(\.id)), fromEvent: fromID, toEvent: toID)
+            try await waitUntil { !model.isBusy && model.statusMessage.hasPrefix("Moved") }
+
+            XCTAssertEqual(
+                model.statusMessage,
+                "Moved 3 photos to Japan 2026 (1 was already there, so its extra copy went to Trash). 1 had the same name as a different photo and was kept as DSC00002 (2).ARW."
+            )
+            let target = try XCTUnwrap(workspace.event(toID))
+            let targetFolder = workspace.locations.originalsRoot(for: target, deviceID: "sony-a7v", policy: .buffer)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: same.url.path))
+            XCTAssertTrue(FileManager.default.fileExists(atPath: theirs.url.path))
+            XCTAssertEqual(try Data(contentsOf: targetFolder.appendingPathComponent("DSC00002 (2).ARW")), reusedBytes)
+            XCTAssertEqual(try Data(contentsOf: older.url), olderBytes)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: reused.url.path))
+            XCTAssertTrue(FileManager.default.fileExists(atPath: targetFolder.appendingPathComponent("DSC00003.ARW").path))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: free.url.path))
+
+            XCTAssertTrue(model.configuration.photoEventAssignments.filter { $0.eventID == fromID }.isEmpty)
+            XCTAssertEqual(
+                Set(model.configuration.photoEventAssignments.filter { $0.eventID == toID }.map(\.relativePath)),
+                ["DSC00001.ARW", "DSC00002.ARW", "DSC00002 (2).ARW", "DSC00003.ARW"]
+            )
+
+            // The extra copy is in Trash, tagged with the event it left.
+            let trashed = MediaTrashService(removedFilesRoot: workspace.locations.removedFilesRoot)
+                .listItems(under: workspace.locations.trashRoots())
+            XCTAssertEqual(trashed.map(\.fileName), ["DSC00001.ARW"])
+            XCTAssertEqual(trashed.first?.eventID, fromID)
+
+            // Undo puts the renames back; the merged copy stays restorable from Trash.
+            workspace.undoLastMove()
+            try await waitUntil { !model.isBusy && workspace.latestMoveJournalTitle == nil }
+            XCTAssertTrue(FileManager.default.fileExists(atPath: reused.url.path))
+            XCTAssertTrue(FileManager.default.fileExists(atPath: free.url.path))
+            XCTAssertTrue(FileManager.default.fileExists(atPath: older.url.path))
+        }
+    }
+
+    /// Scan → pair → Keep in the shared event only: the private event's
+    /// identical copy goes to Trash, its assignment leaves the catalog, and
+    /// the board notice clears.
+    func testDuplicateReviewScansAndKeepsOnlyTheChosenEventsCopy() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let sharedID = try XCTUnwrap(workspace.createEvent(name: "Beach Day", date: organizerDay("2026-08-26"), policy: .buffer))
+            let privateID = try XCTUnwrap(workspace.createEvent(name: "Hotel Night", date: organizerDay("2026-08-26"), policy: .archiveOnly))
+            let kept = try placeEventFile(model, workspace, event: sharedID, name: "DSC00001.ARW", date: "2026:08:26 10:00:00", subseconds: "000", root: root)
+            let copy = try placeEventFile(model, workspace, event: privateID, name: "DSC00001.ARW", date: "2026:08:26 10:00:00", subseconds: "000", root: root)
+            // Same name, other picture: listed, never offered for Trash.
+            _ = try placeEventFile(model, workspace, event: sharedID, name: "DSC06987.ARW", date: "2026:08:26 11:00:00", subseconds: "000", root: root)
+            _ = try placeEventFile(model, workspace, event: privateID, name: "DSC06987.ARW", date: "2026:08:26 11:00:00", subseconds: "700", root: root)
+            XCTAssertTrue(copy.url.path.contains("/.Camera Toolkit/Private/"))
+
+            let review = workspace.duplicateReview
+            review.scan()
+            try await waitUntil { !review.isScanning && review.report != nil }
+            let pair = DuplicateOwnerPair(.event(sharedID), .event(privateID))
+            XCTAssertEqual(review.pairs.map(\.pair), [pair])
+            XCTAssertEqual(review.collisionPairs.first?.collisions.map(\.fileName), ["DSC06987.ARW"])
+            XCTAssertEqual(review.sharedGroups(forEvent: privateID).count, 1)
+            XCTAssertTrue(review.isPrivate(.event(privateID)))
+            XCTAssertEqual(review.selection, .identical(pair))
+
+            review.requestKeep(.event(sharedID), in: pair, groups: try XCTUnwrap(review.summary(for: pair)).groups)
+            let request = try XCTUnwrap(review.pending)
+            XCTAssertEqual(request.trashCount, 1)
+            XCTAssertTrue(DuplicateReviewWording.confirmation(request, keepName: "Beach Day", dropName: "Hotel Night")
+                .hasPrefix("1 copy (\(copy.assignment.fileSize.formattedBytes)) in Hotel Night will move to the drive’s Trash. The copies in Beach Day stay."))
+            review.confirm(request)
+            try await waitUntil { !model.isBusy && review.pairs.isEmpty }
+
+            XCTAssertTrue(FileManager.default.fileExists(atPath: kept.url.path))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: copy.url.path))
+            let remaining = model.configuration.photoEventAssignments
+            XCTAssertTrue(remaining.contains(kept.assignment))
+            XCTAssertFalse(remaining.contains(copy.assignment))
+            XCTAssertTrue(review.sharedGroups(forEvent: privateID).isEmpty)
+            XCTAssertTrue(model.statusMessage.hasPrefix("Moved 1 copy"), model.statusMessage)
+            let trashed = MediaTrashService(removedFilesRoot: workspace.locations.removedFilesRoot)
+                .listItems(under: workspace.locations.trashRoots())
+            XCTAssertEqual(trashed.map(\.eventID), [privateID])
+
+            // A rescan answers from the hash cache and finds nothing left.
+            review.scan()
+            try await waitUntil { !review.isScanning }
+            XCTAssertTrue(review.pairs.isEmpty)
+            XCTAssertEqual(review.report?.hashedFiles, 0)
+        }
+    }
+
+    func testKeepBothStopsFlaggingAPairAcrossScans() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let a = try XCTUnwrap(workspace.createEvent(name: "Beach Day", date: organizerDay("2026-08-26"), policy: .buffer))
+            let b = try XCTUnwrap(workspace.createEvent(name: "Beach Day Extras", date: organizerDay("2026-08-26"), policy: .buffer))
+            let first = try placeEventFile(model, workspace, event: a, name: "DSC00001.ARW", date: "2026:08:26 10:00:00", subseconds: "000", root: root)
+            let second = try placeEventFile(model, workspace, event: b, name: "DSC00001.ARW", date: "2026:08:26 10:00:00", subseconds: "000", root: root)
+            let review = workspace.duplicateReview
+            review.scan()
+            try await waitUntil { !review.isScanning && review.report != nil }
+            let groups = try XCTUnwrap(review.pairs.first).groups
+            review.keepBoth(groups)
+            XCTAssertTrue(review.pairs.isEmpty)
+            XCTAssertEqual(review.reviewedCount, 1)
+
+            try await Task.sleep(for: .milliseconds(200))
+            review.scan()
+            try await waitUntil { !review.isScanning }
+            XCTAssertTrue(review.pairs.isEmpty)
+            XCTAssertEqual(review.reviewedCount, 1)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: first.url.path))
+            XCTAssertTrue(FileManager.default.fileExists(atPath: second.url.path))
         }
     }
 }

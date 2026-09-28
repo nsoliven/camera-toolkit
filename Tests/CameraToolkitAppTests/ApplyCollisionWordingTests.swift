@@ -77,7 +77,7 @@ final class ApplyCollisionWordingTests: XCTestCase {
         let plan = plan(duplicates: [collision(.identicalCopy, "DSC00002.ARW")])
         XCTAssertEqual(
             ApplyStatusWording.afterApply(movedCount: 0, movedBytes: 0, skipped: [], plan: plan),
-            "Moved 0 file(s) (Zero KB) into their events. 1 photo is already in Beach Day (identical copy) — open Apply to resolve."
+            "Moved 0 files (Zero KB) into their events. 1 photo is already in Beach Day (identical copy) — open Apply to resolve."
         )
         // A name taken between planning and the rename still points at Apply.
         let raced = DriveMoveIssue(
@@ -86,7 +86,7 @@ final class ApplyCollisionWordingTests: XCTestCase {
         )
         XCTAssertEqual(
             ApplyStatusWording.afterApply(movedCount: 2, movedBytes: 0, skipped: [raced], plan: self.plan()),
-            "Moved 2 file(s) (Zero KB) into their events. 1 left in place: a file with the same name is already in the event — open Apply to resolve."
+            "Moved 2 files (Zero KB) into their events. 1 left in place: a file with the same name is already in the event — open Apply to resolve."
         )
     }
 

@@ -88,7 +88,7 @@ enum ApplyStatusWording {
         skipped: [DriveMoveIssue],
         plan: OrganizeApplyPlan
     ) -> String {
-        var text = "Moved \(movedCount) file(s) (\(movedBytes.formattedBytes)) into their events."
+        var text = "Moved \(ApplyPlanOverview.plural(movedCount, "file")) (\(movedBytes.formattedBytes)) into their events."
         if let first = skipped.first {
             let taken = skipped.count { $0.reason.contains("already exists") }
             if taken == skipped.count {

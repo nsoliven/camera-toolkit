@@ -9,6 +9,7 @@ enum CameraToolkitPopOutWindow: CaseIterable {
     case photoDatabase
     case keyboardShortcuts
     case trash
+    case duplicates
     case people
 
     var minimumContentSize: NSSize {
@@ -20,6 +21,7 @@ enum CameraToolkitPopOutWindow: CaseIterable {
         case .photoDatabase: NSSize(width: 820, height: 540)
         case .keyboardShortcuts: NSSize(width: 620, height: 480)
         case .trash: NSSize(width: 760, height: 520)
+        case .duplicates: NSSize(width: 820, height: 480)
         case .people: NSSize(width: 640, height: 440)
         }
     }
