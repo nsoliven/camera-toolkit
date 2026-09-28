@@ -214,10 +214,12 @@ struct LibrarySettingsPane: View {
                 )
                 .help("Sync to NAS puts every drive file at the same <year>/<event>/… path under this folder. Events archived before the mirror layout stay readable where they are.")
                 LabeledContent("NAS share") {
-                    TextField("smb://nas.local/share", text: Binding(
+                    TextField("", text: Binding(
                         get: { model.configuration.nasSMBURL },
                         set: { value in model.updateConfiguration { $0.nasSMBURL = value.trimmingCharacters(in: .whitespacesAndNewlines) } }
-                    ))
+                    ), prompt: Text("smb://nas.local/share"))
+                    .labelsHidden()
+                    .textFieldStyle(.roundedBorder)
                     .frame(minWidth: 220)
                     .help("Connect to NAS… mounts this share with the password saved in your keychain, or opens it in Finder to ask for one.")
                 }
@@ -243,17 +245,21 @@ struct LibrarySettingsPane: View {
                 .help("Hash each batch of copies on the NAS (sync, then sha256sum) instead of reading every byte back over SMB. Uses the system ssh with your own keys and ~/.ssh/config; nothing secret is stored. Without a host and server path, copies are re-read over SMB.")
                 if model.configuration.nasSyncVerifyViaSSH {
                     LabeledContent("SSH host") {
-                        TextField("nas (a ~/.ssh/config alias) or user@host", text: Binding(
+                        TextField("", text: Binding(
                             get: { model.configuration.nasSyncSSHHost },
                             set: { value in model.updateConfiguration { $0.nasSyncSSHHost = value.trimmingCharacters(in: .whitespacesAndNewlines) } }
-                        ))
+                        ), prompt: Text("nas or user@host"))
+                        .labelsHidden()
+                        .textFieldStyle(.roundedBorder)
                         .frame(minWidth: 220)
                     }
                     LabeledContent("Share path on the NAS") {
-                        TextField("/mnt/pool/dataset", text: Binding(
+                        TextField("", text: Binding(
                             get: { model.configuration.nasSyncSSHServerPath },
                             set: { value in model.updateConfiguration { $0.nasSyncSSHServerPath = value.trimmingCharacters(in: .whitespacesAndNewlines) } }
-                        ))
+                        ), prompt: Text("/mnt/pool/dataset"))
+                        .labelsHidden()
+                        .textFieldStyle(.roundedBorder)
                         .frame(minWidth: 220)
                         .help("The folder the SMB share points at, as the NAS sees it: /Volumes/<share>/x is <this path>/x over SSH.")
                     }
