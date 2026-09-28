@@ -174,6 +174,29 @@ final class NASFastSyncTests: XCTestCase {
         }
     }
 
+    /// Files already on the NAS are compared with a hash taken on the NAS,
+    /// not by re-reading them over SMB; a different file is still a conflict.
+    func testSSHVerificationChecksFilesAlreadyOnTheNASWithoutReReadingThem() throws {
+        try withTemporaryDirectory { root in
+            let f = try fixture(root, count: 5)
+            for (relative, data) in f.contents {
+                try writeFile(f.nas.appendingPathComponent(relative), data)
+            }
+            let different = try XCTUnwrap(f.plan.items.first)
+            try writeFile(f.nas.appendingPathComponent(different.relativePath), Data((0..<Int(different.byteCount)).map { _ in 7 }))
+            let verifier = NASRemoteVerifier(localPrefix: f.nas.path, serverPrefix: f.server.path, label: "test", transport: try localTransport(root, syncLog: root.appendingPathComponent("sync.log")))
+            let recorder = ProgressRecorder()
+            let report = try NASSyncService(store: nil, options: NASSyncOptions(parallelTransfers: 4, remoteVerifier: verifier)).sync(f.plan, nasRoot: f.nas, progress: recorder.handler)
+            XCTAssertEqual(Set(report.matchedExisting), Set(f.contents.keys).subtracting([different.relativePath]))
+            XCTAssertEqual(report.conflicts.map(\.path), [different.relativePath])
+            XCTAssertTrue(report.copied.isEmpty)
+            let telemetry = try XCTUnwrap(recorder.updates.last?.telemetry)
+            let byLabel = Dictionary(uniqueKeysWithValues: telemetry.phases.map { ($0.label, $0) })
+            XCTAssertNil(byLabel["Verify"], "nothing was re-read over SMB")
+            XCTAssertEqual(byLabel[NASSyncRun.remoteVerifyPhase]?.bytes, f.plan.totalBytes)
+        }
+    }
+
     /// One row per transfer: a file takes the lowest free row, a finished
     /// transfer's row is reused by the next file, a row never blinks out
     /// between files, and every row carries its bytes and speed.

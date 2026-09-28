@@ -765,12 +765,35 @@ final class NASSyncRun: @unchecked Sendable {
         let item = job.item
         var done: Int64 = 0
         do {
-            show(slot, job, step: "Hashing drive copy", phase: "Hashing", timing: "Hash")
+            // With SSH verification the NAS hashes its copy on its own disk
+            // while this Mac hashes the drive copy, so nothing crosses the
+            // link; a file the NAS cannot answer for is re-read over SMB.
+            let remote = options.remoteVerifier.map { verifier in
+                RemoteHash(verifier: verifier, path: job.destination)
+            }
+            show(slot, job, step: remote == nil ? "Hashing drive copy" : "Hashing drive copy and NAS copy", phase: "Hashing", timing: "Hash")
             let start = clock()
             let sourceHash = try NASFileIO.sha256(item.sourcePath, uncached: false, expectedByteCount: item.byteCount) { self.addWork($0, "Hash", slot: slot); done += Int64($0); self.emit("Hashing drive copy", force: false) }
-            show(slot, job, step: "Re-reading NAS copy", phase: "Verifying", timing: "Verify")
-            let nasHash = try NASFileIO.sha256(job.destination, uncached: true, expectedByteCount: item.byteCount) { self.addWork($0, "Verify", slot: slot); done += Int64($0); self.emit("Re-reading NAS copy", force: false) }
-            addTiming { $0.verifySeconds += self.clock() - start; $0.smbVerifyBytes += item.byteCount }
+            let nasHash: String
+            if let remote, let hash = remote.wait() {
+                addWork(Int(item.byteCount), Self.remoteVerifyPhase, slot: slot)
+                done += item.byteCount
+                addTiming {
+                    $0.verifySeconds += self.clock() - start
+                    $0.remoteVerifyBytes += item.byteCount
+                }
+                nasHash = hash
+            } else {
+                if let remote {
+                    addTiming {
+                        $0.remoteFallbacks += 1
+                        if $0.remoteFallbackReason == nil { $0.remoteFallbackReason = remote.failure }
+                    }
+                }
+                show(slot, job, step: "Re-reading NAS copy", phase: "Verifying", timing: "Verify")
+                nasHash = try NASFileIO.sha256(job.destination, uncached: true, expectedByteCount: item.byteCount) { self.addWork($0, "Verify", slot: slot); done += Int64($0); self.emit("Re-reading NAS copy", force: false) }
+                addTiming { $0.verifySeconds += self.clock() - start; $0.smbVerifyBytes += item.byteCount }
+            }
             if sourceHash == nasHash {
                 finishMatched(item, sha: sourceHash)
             } else {
@@ -989,6 +1012,34 @@ final class NASSyncRun: @unchecked Sendable {
             }
         }
         release(lane, outcome: "Verified")
+    }
+}
+
+/// One NAS-side hash running in the background while the drive copy is
+/// hashed here. `wait()` is nil when the NAS could not answer.
+private final class RemoteHash: @unchecked Sendable {
+    private let group = DispatchGroup()
+    private var hash: String?
+    private(set) var failure: String?
+
+    init(verifier: NASRemoteVerifier, path: String) {
+        group.enter()
+        DispatchQueue.global(qos: .utility).async {
+            do {
+                self.hash = try verifier.hashes(localPaths: [path])[path]
+                if self.hash == nil {
+                    self.failure = "The NAS could not hash \((path as NSString).lastPathComponent) at its mapped server path."
+                }
+            } catch {
+                self.failure = error.localizedDescription
+            }
+            self.group.leave()
+        }
+    }
+
+    func wait() -> String? {
+        group.wait()
+        return hash
     }
 }
 
