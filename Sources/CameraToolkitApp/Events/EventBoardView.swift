@@ -238,6 +238,12 @@ struct EventBoardView: View {
                 summary: workspace.presence[eventID]
             ))
             .guideHighlight(.storageStrip, in: workspace)
+            EventStorageSlots(
+                model: model,
+                workspace: workspace,
+                event: event,
+                summary: workspace.presence[eventID]
+            ).misplacedNotice
             FlowLayout(horizontalSpacing: 8, verticalSpacing: 8) {
                 ForEach(subevents) { subevent in
                     SubeventChip(
@@ -769,6 +775,38 @@ struct EventStorageSlots {
             if offline {
                 checkAgainButton
             }
+        }
+    }
+
+    /// Files in the wrong half of the drive for this event's setting — a
+    /// private event's copies still in the shared Buffer, or a shared
+    /// event's still in Private staging. Changing the setting never moves
+    /// files, so say so on the board instead of only in the lock menu.
+    @ViewBuilder var misplacedNotice: some View {
+        let policy = workspace.resolvedPolicy(for: event)
+        let misplaced = assets.count { $0.otherDrive == .present }
+        if let summary, !summary.driveOffline, misplaced > 0 {
+            HStack(spacing: 8) {
+                Image(systemName: policy == .archiveOnly ? "lock.open.fill" : "externaldrive.badge.exclamationmark")
+                    .foregroundStyle(.purple)
+                Text(policy == .archiveOnly
+                    ? "\(misplaced) \(misplaced == 1 ? "photo is" : "photos are") still in the shared Buffer, where everyone can see \(misplaced == 1 ? "it" : "them"). This event is private — move \(misplaced == 1 ? "it" : "them") to hide \(misplaced == 1 ? "it" : "them")."
+                    : "\(misplaced) \(misplaced == 1 ? "photo is" : "photos are") still in Private staging. This event is shared — put \(misplaced == 1 ? "it" : "them") on the Buffer.")
+                    .font(.callout)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 8)
+                Button(policy == .buffer ? "Put on Buffer…" : "Move to Private…") {
+                    workspace.prepareApply(
+                        eventIDs: workspace.eventFamily(event.id).map(\.id),
+                        title: policy == .buffer ? "Put \(event.name) on the Buffer" : "Move \(event.name) to Private staging"
+                    )
+                }
+                .buttonStyle(.glass)
+                .disabled(model.isBusy)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 7)
+            .background(Color.purple.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
         }
     }
 

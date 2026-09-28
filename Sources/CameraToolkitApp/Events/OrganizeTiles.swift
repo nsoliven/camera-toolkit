@@ -214,7 +214,7 @@ enum TileLocationBadge {
     var label: String {
         switch self {
         case .onSource: "On source"
-        case .inBuffer: "Still in Buffer"
+        case .inBuffer: "Not in Private yet"
         case .inPrivate: "In Private"
         case .nasOnly: "NAS only"
         }
