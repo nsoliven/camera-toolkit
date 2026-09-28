@@ -572,104 +572,7 @@ struct BoardGroupHeader: View {
                 .padding(.trailing, 6)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        // No background of its own: in the content it sits between tiles,
-        // and in the top bar the scroll edge effect is its backdrop.
-    }
-}
-
-/// Which section's header the board's top bar shows. The grid feeds it the
-/// in-content header positions (they change only on layout) and the
-/// visible top (on scroll); only `BoardStickyHeader` reads `currentID`, so
-/// scrolling past a day re-renders that one header and never the grid.
-@MainActor
-@Observable
-final class BoardStickyHeaderState {
-    private(set) var currentID: String?
-    @ObservationIgnored private var order: [String] = []
-    @ObservationIgnored private var sectionForStack: [String: Int] = [:]
-    @ObservationIgnored private var headerTops: [String: CGFloat] = [:]
-    @ObservationIgnored private var visibleTop: CGFloat = 0
-    @ObservationIgnored private var firstVisibleSectionID: String?
-
-    func setSections(_ sections: [OrganizeBoardSection]) {
-        let ids = sections.map(\.id)
-        order = ids
-        var map: [String: Int] = [:]
-        for (index, section) in sections.enumerated() {
-            for stack in section.group.stacks { map[stack.id] = index }
-        }
-        sectionForStack = map
-        let kept = Set(ids)
-        headerTops = headerTops.filter { kept.contains($0.key) }
-        refresh()
-    }
-
-    func setHeaderTop(_ top: CGFloat, for id: String) {
-        guard headerTops[id] != top else { return }
-        headerTops[id] = top
-        refresh()
-    }
-
-    func setVisibleTop(_ top: CGFloat) {
-        guard top != visibleTop else { return }
-        visibleTop = top
-        refresh()
-    }
-
-    /// The scroll targets on screen — tiles, rows and burst expansions.
-    func setVisibleStacks(_ ids: [String]) {
-        let first = ids.compactMap { id in
-            sectionForStack[id] ?? sectionForStack[String(id.dropLast("-expansion".count))]
-        }.min()
-        let next = first.map { order[$0] }
-        guard next != firstVisibleSectionID else { return }
-        firstVisibleSectionID = next
-        refresh()
-    }
-
-    /// Forgets every position — a different board or layout mode.
-    func reset() {
-        headerTops = [:]
-        visibleTop = 0
-        firstVisibleSectionID = nil
-        refresh()
-    }
-
-    private func refresh() {
-        let next = OrganizeBoardPlan.stickySectionID(
-            order: order,
-            headerTops: headerTops,
-            visibleTop: visibleTop,
-            firstVisibleSectionID: firstVisibleSectionID
-        )
-        if next != currentID { currentID = next }
-    }
-}
-
-/// The current section's header, in a bar above the board's scroll view.
-/// It shares the toolbar's scroll edge effect (and any bar above it, like
-/// the event board's storage strip), so the chrome is one surface: tiles
-/// scroll under all of it, and no header ever draws over another layer.
-struct BoardStickyHeader: View {
-    let state: BoardStickyHeaderState
-    let sections: [OrganizeBoardSection]
-    let horizontalPadding: CGFloat
-    let onToggleCollapse: (OrganizeBoardSection) -> Void
-    let onSelect: (OrganizeBoardSection) -> Void
-
-    var body: some View {
-        if let section = sections.first(where: { $0.id == state.currentID }) ?? sections.first {
-            BoardGroupHeader(
-                group: section.group,
-                isCollapsed: section.isCollapsed,
-                onToggleCollapse: { onToggleCollapse(section) },
-                onSelect: { onSelect(section) }
-            )
-            .padding(.horizontal, horizontalPadding)
-            .accessibilityElement(children: .contain)
-            .accessibilityIdentifier("boardStickyHeader")
-            .boardChromeProbe("boardStickyHeader", label: section.group.title)
-        }
+        .background(.bar)
     }
 }
 
@@ -1010,11 +913,6 @@ struct OrganizeGrid<MenuContent: View>: View {
     @Environment(\.appearsActive) private var appearsActive
     /// Which list row shows its `···` menu; only the menu slots observe it.
     @State private var hover = BoardHoverState()
-    /// Which section's header sits in the top bar; only that bar reads it.
-    @State private var sticky = BoardStickyHeaderState()
-    /// Content coordinates for in-content header positions — stable while
-    /// scrolling, so a header reports only when the layout moves it.
-    private static var contentSpace: String { "OrganizeGridContent" }
 
     /// Accent selection while the window is active, grey only in the
     /// background — independent of which control has keyboard focus.
@@ -1040,38 +938,7 @@ struct OrganizeGrid<MenuContent: View>: View {
                     listBoard(orderedIDs: orderedIDs)
                 }
             }
-            // The current section's header rides in a bar rather than as a
-            // pinned header inside the content: a pinned header needs its
-            // own backdrop, which never matched the edge effect above it
-            // and let tiles show between the two. As a bar it joins the
-            // toolbar's (and the storage strip's) edge effect instead.
-            .safeAreaBar(edge: .top) {
-                BoardStickyHeader(
-                    state: sticky,
-                    sections: sections,
-                    horizontalPadding: mode == .tiles ? 16 : 0,
-                    onToggleCollapse: { section in
-                        workspace.setGroupCollapsed(section.id, collapsed: !section.isCollapsed)
-                    },
-                    onSelect: { section in
-                        workspace.selectStacks(section.group.stacks.map(\.id))
-                        isFocused = true
-                    }
-                )
-            }
-            // A firm, even backdrop under the whole top chrome — a soft edge
-            // fades out before the lower bars and leaves their text over
-            // bare tiles.
-            .scrollEdgeEffectStyle(.hard, for: .top)
-            .onScrollGeometryChange(for: CGFloat.self, of: { $0.contentOffset.y + $0.contentInsets.top }) { _, top in
-                sticky.setVisibleTop(top)
-            }
-            .onScrollTargetVisibilityChange(idType: String.self, threshold: 0.01) { ids in
-                sticky.setVisibleStacks(ids)
-            }
-            .onChange(of: groups.map { "\($0.id)#\($0.stacks.count)" }, initial: true) { sticky.setSections(sections) }
-            .onChange(of: containerID) { sticky.reset() }
-            .onChange(of: mode) { sticky.reset() }
+            .scrollEdgeEffectStyle(.soft, for: .top)
             .focusable()
             .focused($isFocused)
             .focusEffectDisabled()
@@ -1094,7 +961,8 @@ struct OrganizeGrid<MenuContent: View>: View {
         LazyVGrid(
             columns: [GridItem(.adaptive(minimum: tileWidth, maximum: tileWidth * 1.3), spacing: 12, alignment: .top)],
             alignment: .leading,
-            spacing: 14
+            spacing: 14,
+            pinnedViews: [.sectionHeaders]
         ) {
             ForEach(sections) { section in
                 Section {
@@ -1107,13 +975,21 @@ struct OrganizeGrid<MenuContent: View>: View {
                         }
                     }
                 } header: {
-                    inlineHeader(section)
+                    BoardGroupHeader(
+                        group: section.group,
+                        isCollapsed: section.isCollapsed,
+                        onToggleCollapse: {
+                            workspace.setGroupCollapsed(section.id, collapsed: !section.isCollapsed)
+                        },
+                        onSelect: {
+                            workspace.selectStacks(section.group.stacks.map(\.id))
+                            isFocused = true
+                        }
+                    )
                 }
             }
         }
-        .scrollTargetLayout()
         .padding(16)
-        .coordinateSpace(.named(Self.contentSpace))
         .background {
             GeometryReader { geometry in
                 Color.clear
@@ -1124,7 +1000,7 @@ struct OrganizeGrid<MenuContent: View>: View {
     }
 
     private func listBoard(orderedIDs: [String]) -> some View {
-        LazyVStack(spacing: 2) {
+        LazyVStack(spacing: 2, pinnedViews: [.sectionHeaders]) {
             ForEach(sections) { section in
                 Section {
                     ForEach(section.visibleStacks) { stack in
@@ -1136,38 +1012,21 @@ struct OrganizeGrid<MenuContent: View>: View {
                         }
                     }
                 } header: {
-                    inlineHeader(section)
+                    BoardGroupHeader(
+                        group: section.group,
+                        isCollapsed: section.isCollapsed,
+                        onToggleCollapse: {
+                            workspace.setGroupCollapsed(section.id, collapsed: !section.isCollapsed)
+                        },
+                        onSelect: {
+                            workspace.selectStacks(section.group.stacks.map(\.id))
+                            isFocused = true
+                        }
+                    )
                 }
             }
         }
-        .scrollTargetLayout()
         .padding(.vertical, 8)
-        .coordinateSpace(.named(Self.contentSpace))
-    }
-
-    /// A section's header inside the content. The first section's lives
-    /// only in the top bar — it is current until the second header scrolls
-    /// up, so drawing it here too would show it twice.
-    @ViewBuilder
-    private func inlineHeader(_ section: OrganizeBoardSection) -> some View {
-        if section.id != groups.first?.id {
-            BoardGroupHeader(
-                group: section.group,
-                isCollapsed: section.isCollapsed,
-                onToggleCollapse: {
-                    workspace.setGroupCollapsed(section.id, collapsed: !section.isCollapsed)
-                },
-                onSelect: {
-                    workspace.selectStacks(section.group.stacks.map(\.id))
-                    isFocused = true
-                }
-            )
-            .onGeometryChange(for: CGFloat.self) { proxy in
-                proxy.frame(in: .named(Self.contentSpace)).minY
-            } action: { top in
-                sticky.setHeaderTop(top, for: section.id)
-            }
-        }
     }
 
     private func expansion(_ stack: OrganizeStack, compact: Bool = false) -> some View {

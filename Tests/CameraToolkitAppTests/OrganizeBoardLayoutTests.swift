@@ -256,49 +256,4 @@ final class OrganizeBoardLayoutTests: XCTestCase {
             OrganizeRouteLabel.breadcrumb(for: "/Elsewhere/X")
         )
     }
-
-    // MARK: - Sticky section header
-
-    func testStickySectionStartsOnTheFirstSection() {
-        let order = ["a", "b", "c"]
-        XCTAssertEqual(OrganizeBoardPlan.stickySectionID(order: order, headerTops: [:], visibleTop: 0), "a")
-        XCTAssertEqual(OrganizeBoardPlan.stickySectionID(order: order, headerTops: ["b": 900, "c": 1800], visibleTop: 0), "a")
-        XCTAssertNil(OrganizeBoardPlan.stickySectionID(order: [], headerTops: [:], visibleTop: 0))
-    }
-
-    func testStickySectionSwitchesWhenTheNextHeaderReachesTheTop() {
-        let order = ["a", "b", "c"]
-        let tops: [String: CGFloat] = ["b": 900, "c": 1800]
-        XCTAssertEqual(OrganizeBoardPlan.stickySectionID(order: order, headerTops: tops, visibleTop: 899), "a")
-        XCTAssertEqual(OrganizeBoardPlan.stickySectionID(order: order, headerTops: tops, visibleTop: 900), "b")
-        XCTAssertEqual(OrganizeBoardPlan.stickySectionID(order: order, headerTops: tops, visibleTop: 1799), "b")
-        XCTAssertEqual(OrganizeBoardPlan.stickySectionID(order: order, headerTops: tops, visibleTop: 5000), "c")
-        // Scrolling back up hands the bar back.
-        XCTAssertEqual(OrganizeBoardPlan.stickySectionID(order: order, headerTops: tops, visibleTop: 10), "a")
-    }
-
-    func testStickySectionSkipsHeadersNeverLaidOut() {
-        let order = ["a", "b", "c", "d"]
-        // "c" was never laid out; "d" is still below the top.
-        XCTAssertEqual(OrganizeBoardPlan.stickySectionID(order: order, headerTops: ["b": 900, "d": 3000], visibleTop: 2000), "b")
-    }
-
-    func testStickySectionFollowsTheFirstVisibleTileAfterALongJump() {
-        let order = ["a", "b", "c"]
-        // Jumped to the end: "c"'s header was never laid out, its tiles are on screen.
-        XCTAssertEqual(
-            OrganizeBoardPlan.stickySectionID(order: order, headerTops: ["b": 900], visibleTop: 2200, firstVisibleSectionID: "c"),
-            "c"
-        )
-        // A visible tile further up never pulls the bar backwards.
-        XCTAssertEqual(
-            OrganizeBoardPlan.stickySectionID(order: order, headerTops: ["b": 900], visibleTop: 1000, firstVisibleSectionID: "a"),
-            "b"
-        )
-        // A section whose header is known and still below the top waits for it.
-        XCTAssertEqual(
-            OrganizeBoardPlan.stickySectionID(order: order, headerTops: ["b": 900, "c": 1800], visibleTop: 1000, firstVisibleSectionID: "c"),
-            "b"
-        )
-    }
 }

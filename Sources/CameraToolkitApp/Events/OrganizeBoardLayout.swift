@@ -296,37 +296,6 @@ enum OrganizeBoardPlan {
     static func sections(for groups: [OrganizeBoardGroup], collapsedIDs: Set<String>) -> [OrganizeBoardSection] {
         groups.map { OrganizeBoardSection(group: $0, isCollapsed: collapsedIDs.contains($0.id)) }
     }
-
-    /// The section whose header belongs in the board's top bar: the last
-    /// one, in board order, whose in-content header has reached the top of
-    /// the visible area (`visibleTop`, in the board's content coordinates).
-    /// The first section has no in-content header, so it is current until
-    /// the second header arrives. Headers the lazy board never laid out
-    /// have no recorded top and are skipped — so after a long jump, the
-    /// section of the first visible tile (`firstVisibleSectionID`) wins
-    /// when it is further down and its own header has never been seen.
-    static func stickySectionID(
-        order: [String],
-        headerTops: [String: CGFloat],
-        visibleTop: CGFloat,
-        firstVisibleSectionID: String? = nil
-    ) -> String? {
-        var current = order.first
-        var currentIndex = 0
-        for (index, id) in order.enumerated().dropFirst() {
-            guard let top = headerTops[id] else { continue }
-            guard top <= visibleTop + 0.5 else { break }
-            current = id
-            currentIndex = index
-        }
-        if let visible = firstVisibleSectionID,
-           headerTops[visible] == nil,
-           let visibleIndex = order.firstIndex(of: visible),
-           visibleIndex > currentIndex {
-            return visible
-        }
-        return current
-    }
 }
 
 /// Short, readable path labels for source → destination diagrams. A path

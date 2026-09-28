@@ -237,9 +237,6 @@ struct EventBoardView: View {
                 event: event,
                 summary: workspace.presence[eventID]
             ))
-            .accessibilityElement(children: .contain)
-            .accessibilityIdentifier("eventStorageStrip")
-            .boardChromeProbe("eventStorageStrip")
             .guideHighlight(.storageStrip, in: workspace)
             FlowLayout(horizontalSpacing: 8, verticalSpacing: 8) {
                 ForEach(subevents) { subevent in
