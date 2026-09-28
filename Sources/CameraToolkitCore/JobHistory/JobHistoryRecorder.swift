@@ -322,11 +322,15 @@ public final class JobHistoryRecorder: @unchecked Sendable {
         lock.withLock {
             guard !finished else { return }
             finished = true
+            // The caller's snapshot can trail the progress this recorder
+            // already heard (the window's copy is updated on the main
+            // actor after the job's own thread reported), so it only ever
+            // raises the counts.
             if let totals, !totalsPinned {
-                job.totalFiles = totals.totalFiles
-                job.totalBytes = totals.totalBytes
+                job.totalFiles = max(job.totalFiles, totals.totalFiles)
+                job.totalBytes = max(job.totalBytes, totals.totalBytes)
                 if !reportNoted {
-                    job.bytesDone = totals.processedBytes
+                    job.bytesDone = max(job.bytesDone, totals.processedBytes)
                 }
             }
             job.outcome = outcome
