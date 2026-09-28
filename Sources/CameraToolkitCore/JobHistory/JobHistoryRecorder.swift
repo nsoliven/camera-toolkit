@@ -151,7 +151,12 @@ public final class JobHistoryRecorder: @unchecked Sendable {
         startClock = clock()
         lastFlush = startClock
         job = JobHistoryJob(id: id, kind: kind, title: title, startedAt: startedAt, configuration: configuration)
-        // The running row lands at once, so a crash still leaves a trace.
+    }
+
+    /// The job has really started: its running row is written now, so a
+    /// crash or quit still leaves a trace. A recorder that is never started
+    /// writes nothing until the job reports something.
+    public func start() {
         queue.async { self.flushOnQueue() }
     }
 

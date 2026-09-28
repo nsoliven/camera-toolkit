@@ -38,10 +38,20 @@ private struct TransferQueueView: View {
     /// next job starts.
     @State private var dismissedLiveJobIDs: Set<UUID> = []
     @State private var monitor = JobActivityMonitor()
+    /// The window shows past jobs instead of this session's.
+    @State private var showingHistory = false
+    @State private var history: JobHistoryBrowser
+
+    init(model: DashboardModel) {
+        self.model = model
+        _history = State(initialValue: JobHistoryBrowser(model: model))
+    }
 
     var body: some View {
         Group {
-            if let queue = model.transferQueue {
+            if showingHistory {
+                JobHistoryView(model: model, browser: history)
+            } else if let queue = model.transferQueue {
                 queueContent(queue)
             } else if !model.pendingTransferBatches.isEmpty || !model.jobs.isEmpty {
                 idleContent
@@ -77,6 +87,9 @@ private struct TransferQueueView: View {
     /// The transfer's phase and counts while one exists, else what the
     /// window is waiting on.
     private var windowSubtitle: String {
+        if showingHistory {
+            return "History"
+        }
         if let queue = model.transferQueue {
             return "\(queue.phase) · \(queueSummary(queue))"
         }
@@ -91,6 +104,23 @@ private struct TransferQueueView: View {
 
     @ToolbarContentBuilder
     private var toolbar: some ToolbarContent {
+        if model.jobHistoryURL != nil {
+            ToolbarItem(placement: .navigation) {
+                Picker("View", selection: $showingHistory) {
+                    Text("Now").tag(false)
+                    Text("History").tag(true)
+                }
+                .pickerStyle(.segmented)
+                .help("This session's jobs, or every recorded job with its whole speed chart and files")
+            }
+        }
+        if !showingHistory {
+            liveToolbar
+        }
+    }
+
+    @ToolbarContentBuilder
+    private var liveToolbar: some ToolbarContent {
         if let queue = model.transferQueue {
             ToolbarItem {
                 Button("Speed Guide", systemImage: "gauge.with.dots.needle.50percent") {
@@ -222,7 +252,7 @@ private struct TransferQueueView: View {
             List {
                 ForEach(jobs) { job in
                     DisclosureGroup(isExpanded: expansionBinding(job)) {
-                        JobActivityDetail(job: job, monitor: monitor)
+                        JobActivityDetail(job: job, monitor: monitor, wholeJobSamples: wholeJobSamples(job))
                     } label: {
                         jobRow(job)
                     }
@@ -231,6 +261,14 @@ private struct TransferQueueView: View {
             .listStyle(.inset)
             .frame(maxHeight: model.transferQueue == nil ? .infinity : (anyExpanded ? 340 : 150))
         }
+    }
+
+    /// The job's recorded samples, while this session still holds its
+    /// recorder — the source of the chart's "Whole job" range, so the full
+    /// run survives closing and reopening the window.
+    private func wholeJobSamples(_ job: JobSnapshot) -> (() -> [JobHistorySample])? {
+        guard let recorder = model.jobHistoryRecorders[job.id] else { return nil }
+        return { recorder.samples() }
     }
 
     private var firstLiveJobID: UUID? {

@@ -3668,17 +3668,21 @@ final class EventsWorkspace {
         let reportsFolder = catalogURL.deletingLastPathComponent().appendingPathComponent("NAS Sync", isDirectory: true)
         let nasRoot = locations.nasRoot
         let options = NASSyncOptions.from(configuration: model.configuration, nasRoot: nasRoot)
+        // Sync to NAS feeds its own recorder: per-second speed from the
+        // engine, and a row per file.
+        let recorder = model.makeHistoryRecorder(action: .syncBuffer, title: "Synced \(title) to the NAS")
         model.runBackgroundJob(
             action: .syncBuffer,
             runningNote: "Syncing \(title) to the NAS",
             logTitle: "Synced \(title) to the NAS",
             logDetail: "Copied only files missing on the NAS, each to the same path it has on the drive, \(options.parallelTransfers) at a time, and checked every copy's SHA-256 against the drive copy's (\(options.remoteVerifier == nil ? "re-read from the NAS" : "hashed on the NAS over SSH")) before naming it. Existing files were never overwritten.",
             destinationPath: nasRoot.path,
+            history: recorder,
             operation: { progress in
                 progress(BackgroundJobUpdate(progress: 0.02, note: "Sync to NAS: listing the drive folders"))
                 let plan = NASSyncPlanner.plan(events: events, locations: locations)
                 let store = try? NASSyncStore(catalogURL: catalogURL)
-                let report = try NASSyncService(store: store, options: options).sync(plan, nasRoot: nasRoot) { update in
+                let report = try NASSyncService(store: store, options: options, recorder: recorder).sync(plan, nasRoot: nasRoot) { update in
                     progress(DashboardModel.jobUpdate(from: update, lowerBound: 0.03, upperBound: 0.99, notePrefix: "Sync to NAS", command: ""))
                 }
                 let reportPath = Self.writeNASSyncReport(report, plan: plan, title: title, to: reportsFolder)

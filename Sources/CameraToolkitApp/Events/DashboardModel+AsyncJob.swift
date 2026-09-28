@@ -19,7 +19,12 @@ extension DashboardModel {
         isBusy = true
         statusMessage = runningNote
 
-        let jobID = UUID()
+        let recorder = makeHistoryRecorder(action: action, title: logTitle)
+        let jobID = recorder?.jobID ?? UUID()
+        if let recorder {
+            jobHistoryRecorders[jobID] = recorder
+            recorder.start()
+        }
         jobs.insert(
             JobSnapshot(
                 id: jobID,
@@ -34,6 +39,7 @@ extension DashboardModel {
         beginJobActivity(id: jobID, reason: "\(logTitle) — a Camera Toolkit file job")
 
         let progressHandler: @Sendable (BackgroundJobUpdate) -> Void = { [weak self] update in
+            recorder?.observe(update.historyObservation)
             Task { @MainActor in
                 self?.updateJob(id: jobID, update: update)
             }

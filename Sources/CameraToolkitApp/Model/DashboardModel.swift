@@ -146,6 +146,15 @@ final class DashboardModel {
     /// config.json path.
     @ObservationIgnored var catalogStateMode: CatalogStateMode = .legacy
     @ObservationIgnored var lastCatalogBackupAt: Date?
+    /// Records jobs into `job-history.sqlite` beside the catalog. Only the
+    /// live app turns it on; tests and previews never write one.
+    @ObservationIgnored var jobHistoryEnabled = false
+    /// This session's job recorders by job id: the running job's, and the
+    /// last few finished ones so their whole-run chart stays drawable.
+    @ObservationIgnored var jobHistoryRecorders: [UUID: JobHistoryRecorder] = [:]
+    @ObservationIgnored var jobHistoryFinishedOrder: [UUID] = []
+    /// Increments when a recorded job ends, so the History list reloads.
+    var jobHistoryRevision: Int = 0
 
     init(
         jobs: [JobSnapshot],
@@ -240,6 +249,8 @@ final class DashboardModel {
         model.scheduleCatalogSync(configuration: configuration)
         model.removeStaleSpeedTestFiles()
         model.scheduleLaunchCatalogBackup()
+        model.jobHistoryEnabled = true
+        model.openJobHistorySoon()
         return model
     }
 
@@ -1444,6 +1455,9 @@ extension DashboardModel {
         sourcePath: String? = nil,
         destinationPath: String? = nil,
         tracksTransferQueue: Bool = false,
+        /// A recorder the job feeds itself (Sync to NAS); without one the
+        /// job is recorded from its progress updates.
+        history: JobHistoryRecorder? = nil,
         /// Runs after the job settles — done, failed, or cancelled — so
         /// callers can clear bookkeeping the success-only `completion`
         /// cannot cover.
@@ -1459,7 +1473,14 @@ extension DashboardModel {
         isBusy = true
         statusMessage = runningNote
 
-        let jobID = UUID()
+        let recorder = history ?? makeHistoryRecorder(action: action, title: logTitle)
+        let jobID = recorder?.jobID ?? UUID()
+        if let recorder {
+            jobHistoryRecorders[jobID] = recorder
+            recorder.start()
+        }
+        // A job that feeds its own recorder is not sampled twice.
+        let sampledRecorder = history == nil ? recorder : nil
         let startedJob = JobSnapshot(
             id: jobID,
             action: action,
@@ -1475,6 +1496,7 @@ extension DashboardModel {
         beginJobActivity(id: jobID, reason: "\(logTitle) — a Camera Toolkit file job")
 
         let progressHandler: @Sendable (BackgroundJobUpdate) -> Void = { [weak self] update in
+            sampledRecorder?.observe(update.historyObservation)
             Task { @MainActor in
                 guard let self else { return }
                 self.updateJob(id: jobID, update: update)
@@ -1599,6 +1621,7 @@ extension DashboardModel {
             jobs[index].note = note
             jobs[index].finishedAt = Date()
         }
+        finishJobHistory(id: id, state: state, note: note)
 
         recordActivity(
             action: action,

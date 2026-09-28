@@ -16,6 +16,11 @@ struct JobActivityDetail: View {
     var sampling = true
     /// Uptime the snapshot harness pins "now" to.
     var fixedUptime: TimeInterval?
+    /// The job's recorded samples so far, for the chart's "Whole job"
+    /// range; nil hides the range toggle (a job this session did not
+    /// record, the snapshot harness).
+    var wholeJobSamples: (() -> [JobHistorySample])?
+    @AppStorage("jobs.throughputChartRange") private var chartRange = ThroughputChartRange.recent
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: 1)) { context in
@@ -244,14 +249,29 @@ struct JobActivityDetail: View {
     /// the link's ceiling, and — for jobs that time their phases — where
     /// the time goes.
     private func throughputCard(now: TimeInterval) -> some View {
-        let readout = monitor.readout(for: job, now: now)
+        let live = monitor.readout(for: job, now: now)
+        let wholeJob = chartRange == .wholeJob ? wholeJobSamples : nil
+        let readout = wholeJob.map { samples in
+            live.wholeJob(samples: samples(), elapsed: max((job.finishedAt ?? Date()).timeIntervalSince(job.createdAt), 0))
+        } ?? live
         return VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .top, spacing: 16) {
-                readouts(readout)
+                readouts(live)
                 Spacer(minLength: 12)
+                if wholeJobSamples != nil {
+                    Picker("Chart range", selection: $chartRange) {
+                        Text("Last 3 min").tag(ThroughputChartRange.recent)
+                        Text("Whole job").tag(ThroughputChartRange.wholeJob)
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .controlSize(.small)
+                    .fixedSize()
+                    .help("Show the last three minutes, or every second of this job from its recorded history")
+                }
                 hardwareStrip
             }
-            ThroughputChart(readout: readout)
+            ThroughputChart(readout: readout, wholeJob: wholeJob != nil)
                 .frame(height: 132)
             if let telemetry = job.telemetry, !telemetry.phaseShares.isEmpty {
                 PhaseBreakdown(shares: telemetry.phaseShares)
@@ -450,7 +470,7 @@ struct JobActivityDetail: View {
         return "~\(minutes) m left"
     }
 
-    static func durationText(_ interval: TimeInterval) -> String {
+    nonisolated static func durationText(_ interval: TimeInterval) -> String {
         let seconds = Int(max(interval, 0).rounded())
         if seconds >= 3600 {
             return String(format: "%d:%02d:%02d", seconds / 3600, seconds / 60 % 60, seconds % 60)
@@ -499,6 +519,13 @@ struct Sparkline: View {
     }
 }
 
+/// The throughput chart's time range: the rolling live window, or every
+/// recorded second of the job.
+enum ThroughputChartRange: String {
+    case recent
+    case wholeJob
+}
+
 /// One labelled readout: a fixed-width number that never blanks between
 /// samples (a held value fades instead), its unit, and what it measures.
 struct ThroughputValue: View {
@@ -541,6 +568,8 @@ struct ThroughputValue: View {
 /// along x, and the link's expected ceiling as a dashed rule.
 struct ThroughputChart: View {
     let readout: JobThroughputReadout
+    /// Drawn over the whole job rather than the rolling window.
+    var wholeJob = false
 
     static let seriesColors: [String: Color] = [
         "Throughput": .blue,
@@ -635,7 +664,7 @@ struct ThroughputChart: View {
                 }
             }
         }
-        .accessibilityLabel("Throughput over the last \(Int(JobThroughputTrack.chartWindow / 60)) minutes")
+        .accessibilityLabel(wholeJob ? "Throughput over the whole job" : "Throughput over the last \(Int(JobThroughputTrack.chartWindow / 60)) minutes")
     }
 
     static func axisNumber(_ value: Double) -> String {
@@ -643,9 +672,12 @@ struct ThroughputChart: View {
     }
 
     /// Tick spacing for elapsed time: every 15 s for a young job, 30 s
-    /// once the window is full.
+    /// once the window is full, and a round step for about six ticks over
+    /// a whole job.
     static func xStride(_ domain: ClosedRange<Double>) -> Double {
-        domain.upperBound - domain.lowerBound > 120 ? 30 : 15
+        let span = domain.upperBound - domain.lowerBound
+        if span > JobThroughputTrack.chartWindow { return max(JobHistoryChartMath.timeStride(span), 30) }
+        return span > 120 ? 30 : 15
     }
 }
 

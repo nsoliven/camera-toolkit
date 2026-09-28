@@ -148,6 +148,9 @@ final class JobHistoryTests: XCTestCase {
             let clock = ManualClock()
             let recorder = JobHistoryRecorder(store: store, kind: "syncBuffer", title: "Batching", clock: { clock.read() })
             recorder.drain()
+            XCTAssertNil(try store.job(id: recorder.jobID), "nothing is written before the job starts")
+            recorder.start()
+            recorder.drain()
             XCTAssertEqual(try store.job(id: recorder.jobID)?.outcome, .running, "the running row lands at once")
 
             // 10 MB/s over the link, reported four times a second.

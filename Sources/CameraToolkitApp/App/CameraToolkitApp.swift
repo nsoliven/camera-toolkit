@@ -88,6 +88,7 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate, NSMenuIte
     func applicationWillTerminate(_ notification: Notification) {
         NotificationCenter.default.removeObserver(self)
         model.flushConfigurationSave()
+        model.flushJobHistory()
         // Fold the catalog's WAL back into the main file so the database
         // on disk is complete on its own after quit.
         CatalogDatabase.checkpointAndCloseAll()
