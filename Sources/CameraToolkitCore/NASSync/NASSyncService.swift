@@ -33,7 +33,7 @@ public struct NASSyncReport: Codable, Equatable, Sendable {
 /// Where a sync's time went. Phase seconds are summed over the parallel
 /// transfers (busy time), so with 4 transfers they can add up to more than
 /// `wallSeconds`.
-public struct NASSyncTimings: Codable, Equatable, Sendable {
+public struct NASSyncTimings: Codable, Equatable, Hashable, Sendable {
     public var parallelTransfers: Int = 1
     /// "SMB re-read" or "NAS SHA-256 (<label>)".
     public var verification: String = ""
@@ -156,11 +156,16 @@ public struct NASSyncOptions: Sendable {
 /// A file that fails is recorded and skipped; the job goes on. It stops
 /// early only when the NAS itself disappears or the job is stopped, and
 /// says how many files were not attempted.
+///
+/// A `JobHistoryRecorder`, when given, is fed the same progress the Jobs
+/// window gets and one row per file as it settles. It only listens: what
+/// is copied, verified and reported is the same with or without one.
 public struct NASSyncService {
     public typealias Progress = @Sendable (FileOperationProgress) -> Void
 
     private let store: NASSyncStore?
     private let options: NASSyncOptions
+    private let recorder: JobHistoryRecorder?
     private let now: @Sendable () -> Date
     private let clock: @Sendable () -> TimeInterval
     private let isCancelled: () -> Bool
@@ -168,12 +173,14 @@ public struct NASSyncService {
     public init(
         store: NASSyncStore?,
         options: NASSyncOptions = NASSyncOptions(),
+        recorder: JobHistoryRecorder? = nil,
         now: @escaping @Sendable () -> Date = { Date() },
         clock: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
         isCancelled: @escaping () -> Bool = { Task.isCancelled }
     ) {
         self.store = store
         self.options = options
+        self.recorder = recorder
         self.now = now
         self.clock = clock
         self.isCancelled = isCancelled
@@ -186,7 +193,17 @@ public struct NASSyncService {
             throw ToolkitError.commandFailed("The NAS folder \(root) is not connected. Nothing was copied.")
         }
         let known = try store?.records(nasRoot: root) ?? [:]
-        let run = NASSyncRun(root: root, plan: plan, options: options, now: now, clock: clock, progress: progress)
+        let recorder = self.recorder
+        recorder?.setTotals(files: plan.items.count, bytes: plan.totalBytes)
+        // The recorder hears every emission the caller does.
+        var reported = progress
+        if let recorder {
+            reported = { @Sendable update in
+                recorder.observe(update)
+                progress?(update)
+            }
+        }
+        let run = NASSyncRun(root: root, plan: plan, options: options, now: now, clock: clock, progress: reported, recorder: recorder)
         run.time("Check", lane: NASSyncRun.checkLane)
         let store = self.store
         func flushRecords(force: Bool = false) {
@@ -305,7 +322,15 @@ public struct NASSyncService {
         flushRecords(force: true)
         run.addTiming { $0.wallSeconds = clock() - started }
         run.emit("Done", force: true)
-        return run.finalReport()
+        let report = run.finalReport()
+        recorder?.noteSyncReport(
+            report,
+            phases: run.phaseTotals(),
+            transferBytes: run.transferredBytes,
+            configuration: run.configuration,
+            verifyMethod: options.remoteVerifier == nil ? "smb" : "ssh"
+        )
+        return report
     }
 
     static let disconnected = "The NAS disconnected. Sync again once it is back; verified files are skipped."
@@ -388,6 +413,7 @@ final class NASSyncRun: @unchecked Sendable {
     let now: @Sendable () -> Date
     let clock: @Sendable () -> TimeInterval
     let progress: NASSyncService.Progress?
+    let recorder: JobHistoryRecorder?
 
     private let lock = NSLock()
     private var report = NASSyncReport()
@@ -414,14 +440,28 @@ final class NASSyncRun: @unchecked Sendable {
     private var limiter = FileOperationProgressLimiter(minimumInterval: 0.25)
     private let verifyQueue = DispatchQueue(label: "CameraToolkit.NASSync.remoteVerify", qos: .utility)
     private let verifyGroup = DispatchGroup()
+    /// Per-file timing for the recorder's file rows, by relative path.
+    /// Only kept when there is a recorder.
+    private var traces: [String: FileTrace] = [:]
 
-    init(root: String, plan: NASSyncPlan, options: NASSyncOptions, now: @escaping @Sendable () -> Date, clock: @escaping @Sendable () -> TimeInterval, progress: NASSyncService.Progress?) {
+    /// When a file took a transfer, which one, and how long its copy and
+    /// verification took.
+    struct FileTrace: Sendable {
+        var start: Double
+        var slot: Int
+        var copySeconds: Double?
+        var verifySeconds: Double?
+        var verifyMethod: String?
+    }
+
+    init(root: String, plan: NASSyncPlan, options: NASSyncOptions, now: @escaping @Sendable () -> Date, clock: @escaping @Sendable () -> TimeInterval, progress: NASSyncService.Progress?, recorder: JobHistoryRecorder? = nil) {
         self.root = root
         self.totalFiles = plan.items.count
         self.options = options
         self.now = now
         self.clock = clock
         self.progress = progress
+        self.recorder = recorder
         // Work in bytes: a copy reads the drive copy, then the NAS copy is
         // read once more (over SMB, or by the NAS itself); a match hashes
         // both. Skips take their bytes off the total.
@@ -481,7 +521,8 @@ final class NASSyncRun: @unchecked Sendable {
     /// The lowest transfer row no file is using. The pool never runs more
     /// than `parallelTransfers` jobs, so one is always free.
     private func takeSlot(for job: Job) -> Int {
-        lock.withLock {
+        let start = recorder?.elapsed()
+        return lock.withLock {
             let slot = (0..<options.parallelTransfers).first { rows[$0]?.busy != true } ?? 0
             // Claimed in the same lock, so two transfers never share a row.
             // The row's meter and byte history carry over to the next file.
@@ -494,6 +535,7 @@ final class NASSyncRun: @unchecked Sendable {
             row.bytesTotal = job.item.byteCount
             row.busy = true
             rows[slot] = row
+            if let start { traces[job.item.relativePath] = FileTrace(start: start, slot: slot) }
             return slot
         }
     }
@@ -554,6 +596,44 @@ final class NASSyncRun: @unchecked Sendable {
             final.stoppedReason = stopReason ?? final.stoppedReason
             return final
         }
+    }
+
+    /// Busy time and bytes per phase so far, for the recorder's summary.
+    func phaseTotals() -> [JobPhaseTotal] {
+        let t = clock()
+        return lock.withLock { phases.snapshot(at: t) }
+    }
+
+    var transferredBytes: Int64 { lock.withLock { transferBytes } }
+
+    /// Adds to the file's trace; nothing without a recorder.
+    private func trace(_ item: NASSyncItem, _ change: (inout FileTrace) -> Void) {
+        guard recorder != nil else { return }
+        lock.withLock {
+            guard var trace = traces[item.relativePath] else { return }
+            change(&trace)
+            traces[item.relativePath] = trace
+        }
+    }
+
+    /// Hands the recorder the settled file's row. Called after the lock
+    /// that settled it is released; nothing without a recorder.
+    private func settle(_ item: NASSyncItem, _ outcome: JobHistoryItemOutcome, error: String? = nil) {
+        guard let recorder else { return }
+        let end = recorder.elapsed()
+        let trace = lock.withLock { traces.removeValue(forKey: item.relativePath) }
+        recorder.fileSettled(JobHistoryItem(
+            relativePath: item.relativePath,
+            byteCount: item.byteCount,
+            start: trace?.start,
+            end: end,
+            slot: trace?.slot,
+            outcome: outcome,
+            verifyMethod: trace?.verifyMethod,
+            copySeconds: trace?.copySeconds,
+            verifySeconds: trace?.verifySeconds,
+            error: error
+        ))
     }
 
     func takePendingRecords(minimum: Int) -> [NASSyncRecord] {
@@ -627,6 +707,7 @@ final class NASSyncRun: @unchecked Sendable {
             totalWork -= work
             finishedFiles += 1
         }
+        settle(item, .failed, error: failure)
     }
 
     func finishAlreadyVerified(_ item: NASSyncItem) {
@@ -635,6 +716,7 @@ final class NASSyncRun: @unchecked Sendable {
             totalWork -= 2 * item.byteCount
             finishedFiles += 1
         }
+        settle(item, .alreadyVerified)
         emit("Already verified", path: item.relativePath, force: false)
     }
 
@@ -645,6 +727,7 @@ final class NASSyncRun: @unchecked Sendable {
             totalWork -= unfinishedWork ?? 2 * item.byteCount
             finishedFiles += 1
         }
+        settle(item, .conflict, error: reason)
     }
 
     private func finishMatched(_ item: NASSyncItem, sha: String) {
@@ -653,6 +736,7 @@ final class NASSyncRun: @unchecked Sendable {
             appendRecord(item, .verified, sha: sha, nasSHA: nil, detail: nil, verified: true)
             finishedFiles += 1
         }
+        settle(item, .matched)
     }
 
     private func finishCopied(_ item: NASSyncItem, sha: String) {
@@ -662,6 +746,7 @@ final class NASSyncRun: @unchecked Sendable {
             appendRecord(item, .verified, sha: sha, nasSHA: nil, detail: nil, verified: true)
             finishedFiles += 1
         }
+        settle(item, .copied)
     }
 
     // MARK: Progress
@@ -778,10 +863,12 @@ final class NASSyncRun: @unchecked Sendable {
             if let remote, let hash = remote.wait() {
                 addWork(Int(item.byteCount), Self.remoteVerifyPhase, slot: slot)
                 done += item.byteCount
+                let seconds = clock() - start
                 addTiming {
-                    $0.verifySeconds += self.clock() - start
+                    $0.verifySeconds += seconds
                     $0.remoteVerifyBytes += item.byteCount
                 }
+                trace(item) { $0.verifySeconds = seconds; $0.verifyMethod = "ssh" }
                 nasHash = hash
             } else {
                 if let remote {
@@ -792,7 +879,9 @@ final class NASSyncRun: @unchecked Sendable {
                 }
                 show(slot, job, step: "Re-reading NAS copy", phase: "Verifying", timing: "Verify")
                 nasHash = try NASFileIO.sha256(job.destination, uncached: true, expectedByteCount: item.byteCount) { self.addWork($0, "Verify", slot: slot); done += Int64($0); self.emit("Re-reading NAS copy", force: false) }
-                addTiming { $0.verifySeconds += self.clock() - start; $0.smbVerifyBytes += item.byteCount }
+                let seconds = clock() - start
+                addTiming { $0.verifySeconds += seconds; $0.smbVerifyBytes += item.byteCount }
+                trace(item) { $0.verifySeconds = seconds; $0.verifyMethod = "smb" }
             }
             if sourceHash == nasHash {
                 finishMatched(item, sha: sourceHash)
@@ -838,6 +927,7 @@ final class NASSyncRun: @unchecked Sendable {
                 $0.flushSeconds += result.flushSeconds
                 $0.copyBytes += item.byteCount
             }
+            trace(item) { $0.copySeconds = result.copySeconds + result.flushSeconds }
             // The drive copy must be the file the plan saw.
             if let current = LayoutMigrationDisk.lstatEntry(item.sourcePath),
                current.size != item.byteCount || abs(current.modifiedAt - item.modifiedAt) >= 0.001 {
@@ -873,7 +963,9 @@ final class NASSyncRun: @unchecked Sendable {
                 done += Int64($0)
                 self.emit("Re-reading NAS copy", force: false)
             }
-            addTiming { $0.verifySeconds += self.clock() - start; $0.smbVerifyBytes += item.byteCount }
+            let seconds = clock() - start
+            addTiming { $0.verifySeconds += seconds; $0.smbVerifyBytes += item.byteCount }
+            trace(item) { $0.verifySeconds = ($0.verifySeconds ?? 0) + seconds; $0.verifyMethod = "smb" }
             try check(written, nasHash: nasHash, how: "when re-read from the NAS")
             try place(written, slot: slot)
         } catch let error as MismatchError {
@@ -1001,6 +1093,10 @@ final class NASSyncRun: @unchecked Sendable {
             }
             addWork(Int(item.byteCount), Self.remoteVerifyPhase, slot: lane)
             addTiming { $0.remoteVerifyBytes += item.byteCount }
+            // One NAS call answers the whole batch; each file is charged
+            // its share of it by size.
+            let share = batchBytes > 0 ? elapsed * Double(item.byteCount) / Double(batchBytes) : elapsed / Double(written.count)
+            trace(item) { $0.verifySeconds = share; $0.verifyMethod = "ssh" }
             do {
                 try check(entry, nasHash: nasHash, how: "when hashed on the NAS")
                 try place(entry, slot: lane)

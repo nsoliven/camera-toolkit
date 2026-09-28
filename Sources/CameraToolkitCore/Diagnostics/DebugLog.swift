@@ -55,6 +55,7 @@ public enum DebugSubsystem: String, Codable, Sendable {
     case apply
     case video
     case resource
+    case history
 }
 
 public enum DebugOutcome: String, Codable, Sendable {
