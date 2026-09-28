@@ -1,0 +1,322 @@
+import Foundation
+
+/// What two files with one name turn out to be, decided by content.
+public enum MoveConflictVerdict: Equatable, Sendable {
+    /// Both names reach one file on disk (a hard link, a case variant).
+    case sameFile
+    /// Byte-identical: the photo is already there.
+    case identical
+    /// Different bytes: a different photo that happens to share the name
+    /// (Sony reuses frame numbers).
+    case different
+    /// One side could not be read, so nothing is decided.
+    case unreadable(String)
+}
+
+public enum MoveConflictCheck {
+    public typealias Hasher = @Sendable (URL) throws -> String
+
+    /// Size first; a streamed SHA-256 of both files only when the sizes
+    /// match. Never guesses: a file that cannot be read is `.unreadable`.
+    public static func classify(
+        incomingPath: String,
+        existingPath: String,
+        hasher: Hasher = { try FileScanner.sha256($0) }
+    ) -> MoveConflictVerdict {
+        guard let incoming = DuplicateFileFacts.read(incomingPath) else {
+            return .unreadable("\((incomingPath as NSString).lastPathComponent) is no longer where the board last saw it.")
+        }
+        guard let existing = DuplicateFileFacts.read(existingPath) else {
+            return .unreadable("the file already using the name \((existingPath as NSString).lastPathComponent) could not be found to compare.")
+        }
+        if incoming.identity == existing.identity { return .sameFile }
+        guard incoming.byteCount == existing.byteCount else { return .different }
+        do {
+            return try hasher(URL(fileURLWithPath: incomingPath)) == hasher(URL(fileURLWithPath: existingPath))
+                ? .identical
+                : .different
+        } catch {
+            return .unreadable("\((incomingPath as NSString).lastPathComponent) could not be read to compare: \(error.localizedDescription)")
+        }
+    }
+}
+
+/// One file of a Move to Event.
+public struct EventMoveItem: Sendable {
+    /// The file's assignment in the event it leaves.
+    public var removed: PhotoEventAssignment
+    /// The same file's assignment in the event it joins.
+    public var added: PhotoEventAssignment
+    /// The rename into the target's folder. Nil when the file is not on
+    /// the drive yet and only its catalog entry moves.
+    public var move: DriveMove?
+    /// Where the file is now — the rename's source, else the folder it was
+    /// sorted from — for comparing against a taken name.
+    public var currentPath: String?
+    /// Set when the target's catalog already lists this name: every place
+    /// that file may be, the first that exists is compared.
+    public var takenBy: [String]
+
+    public init(removed: PhotoEventAssignment, added: PhotoEventAssignment, move: DriveMove?, currentPath: String?, takenBy: [String] = []) {
+        self.removed = removed
+        self.added = added
+        self.move = move
+        self.currentPath = currentPath
+        self.takenBy = takenBy
+    }
+
+    public var fileName: String { (added.relativePath as NSString).lastPathComponent }
+}
+
+public struct EventMoveKeptBoth: Sendable {
+    public var item: EventMoveItem
+    /// The free name it moved in under, e.g. `DSC06987 (2).ARW`.
+    public var newName: String
+
+    public init(item: EventMoveItem, newName: String) {
+        self.item = item
+        self.newName = newName
+    }
+}
+
+public struct EventMoveStay: Sendable {
+    public var item: EventMoveItem
+    public var reason: String
+
+    public init(item: EventMoveItem, reason: String) {
+        self.item = item
+        self.reason = reason
+    }
+}
+
+public struct EventMoveOutcome: Sendable {
+    public var report = DriveMoveReport()
+    /// The catalog change to save: everything that moved, kept both, or
+    /// merged into a copy the target already had.
+    public var removedAssignments: [PhotoEventAssignment] = []
+    public var addedAssignments: [PhotoEventAssignment] = []
+    /// Moved under their own name, on disk or in the catalog only.
+    public var moved: [EventMoveItem] = []
+    /// The target already had these exact bytes. The extra copy went to
+    /// Trash (or was the target's own file) and the assignment merged.
+    public var merged: [EventMoveItem] = []
+    /// How many of `merged` sent a spare copy to Trash.
+    public var mergedToTrash = 0
+    public var trashBatch: MediaTrashBatch?
+    /// Different photos whose name was taken, moved in under a free name.
+    /// Sidecars that travel with them are in `moved`.
+    public var keptBoth: [EventMoveKeptBoth] = []
+    /// Left exactly where they were, with the reason.
+    public var stayed: [EventMoveStay] = []
+
+    public init() {}
+}
+
+/// Move to Event, decided by content rather than by name. A name already
+/// taken in the target is compared byte for byte (re-hashed now, never from
+/// a cache):
+///
+/// - identical — the photo is already there. The target's copy stays, the
+///   extra copy is renamed into the drive's `_Trash` (manifest first,
+///   restorable from the Trash window), and the assignment merges;
+/// - different — moved in under Apply's non-clobbering Keep Both name,
+///   `DSC06987 (2).ARW`, with its sidecars under the same number;
+/// - unreadable — left in place with the reason.
+///
+/// Plain moves and Keep Both renames are one journaled `DriveMoveService`
+/// job, so one Undo reverses them. Nothing is ever replaced.
+public struct EventMoveService {
+    public typealias Hasher = MoveConflictCheck.Hasher
+
+    private let trash: MediaTrashService
+    private let hasher: Hasher
+
+    public init(trash: MediaTrashService, hasher: @escaping Hasher = { try FileScanner.sha256($0) }) {
+        self.trash = trash
+        self.hasher = hasher
+    }
+
+    /// `protectedPathKeys`: files other assignments still use — an
+    /// identical copy there merges but is never trashed. `takenPathKeys`:
+    /// target paths the catalog already claims, avoided by Keep Both names
+    /// even when no file is there yet.
+    public func move(
+        _ items: [EventMoveItem],
+        title: String,
+        journalFolder: URL?,
+        pruneBoundaries: [URL] = [],
+        protectedPathKeys: Set<String> = [],
+        takenPathKeys: Set<String> = [],
+        trashContext: TrashContext = TrashContext(),
+        progress: FileOperationProgressHandler? = nil
+    ) throws -> EventMoveOutcome {
+        var outcome = EventMoveOutcome()
+        var plain: [EventMoveItem] = []
+        var keep: [EventMoveItem] = []
+        var toTrash: [EventMoveItem] = []
+
+        // A destination already on disk is a taken name even when the
+        // target's catalog does not list it.
+        var checked = 0
+        var takenOnDiskOnly: Set<String> = []
+        for var item in items {
+            if item.takenBy.isEmpty, let move = item.move, DriveMoveService.exists(move.destinationPath) {
+                item.takenBy = [move.destinationPath]
+                takenOnDiskOnly.insert(CatalogStore.eventAssetID(item.removed))
+            }
+            guard !item.takenBy.isEmpty else {
+                plain.append(item)
+                continue
+            }
+            checked += 1
+            progress?(FileOperationProgress(
+                phase: "Comparing",
+                currentPath: item.fileName,
+                processedFiles: checked,
+                totalFiles: items.count,
+                processedBytes: 0,
+                totalBytes: 0
+            ))
+            guard let incoming = item.currentPath else {
+                outcome.stayed.append(EventMoveStay(item: item, reason: "it is not on the drive or in its folder, so it could not be compared"))
+                continue
+            }
+            guard let existing = item.takenBy.first(where: DriveMoveService.isRegularFile) else {
+                outcome.stayed.append(EventMoveStay(item: item, reason: "the file already using the name \(item.fileName) could not be found to compare"))
+                continue
+            }
+            switch MoveConflictCheck.classify(incomingPath: incoming, existingPath: existing, hasher: hasher) {
+            case .sameFile:
+                outcome.merged.append(item)
+            case .identical:
+                if protectedPathKeys.contains(EventStorageLocations.pathKey(incoming)) {
+                    outcome.merged.append(item)
+                } else {
+                    toTrash.append(item)
+                }
+            case .different:
+                if item.move != nil {
+                    keep.append(item)
+                } else {
+                    outcome.stayed.append(EventMoveStay(
+                        item: item,
+                        reason: "a different photo named \(item.fileName) is already there, and this one is not on the drive yet to be renamed"
+                    ))
+                }
+            case .unreadable(let reason):
+                outcome.stayed.append(EventMoveStay(item: item, reason: reason))
+            }
+        }
+
+        // Sidecars and twins travel with a renamed photo under the same
+        // number, so an XMP never pairs with the other photo.
+        let heldKeys = Set(keep.compactMap { $0.move.map { ApplyCollisionCheck.groupKey($0.sourcePath) } })
+        var companions: [EventMoveItem] = []
+        plain.removeAll { item in
+            guard let move = item.move, heldKeys.contains(ApplyCollisionCheck.groupKey(move.sourcePath)) else { return false }
+            companions.append(item)
+            return true
+        }
+
+        let plainMoves = plain.compactMap(\.move)
+        var renamedItems: [(item: EventMoveItem, renamed: EventMoveItem, isConflict: Bool)] = []
+        let keepAll = keep.map { ($0, true) } + companions.map { ($0, false) }
+        if !keepAll.isEmpty {
+            let moves = keepAll.compactMap(\.0.move)
+            let taken = takenPathKeys
+            if let renamed = KeepBothNaming.renamedMoves(
+                for: moves,
+                reserved: plainMoves,
+                exists: { DriveMoveService.exists($0) || taken.contains(EventStorageLocations.pathKey($0)) }
+            ) {
+                let bySource = Dictionary(renamed.map { ($0.sourcePath, $0) }, uniquingKeysWith: { first, _ in first })
+                for (item, isConflict) in keepAll {
+                    guard let move = item.move, let newMove = bySource[move.sourcePath] else { continue }
+                    var renamedItem = item
+                    let newName = (newMove.destinationPath as NSString).lastPathComponent
+                    let folder = (item.added.relativePath as NSString).deletingLastPathComponent
+                    renamedItem.added.relativePath = folder.isEmpty ? newName : (folder as NSString).appendingPathComponent(newName)
+                    renamedItem.move = newMove
+                    renamedItems.append((item, renamedItem, isConflict))
+                }
+            } else {
+                for (item, _) in keepAll {
+                    outcome.stayed.append(EventMoveStay(item: item, reason: "no free “(N)” name was found next to \(item.fileName)"))
+                }
+            }
+        }
+
+        let journaled = plain + renamedItems.map(\.renamed)
+        outcome.report = try DriveMoveService().apply(
+            plainMoves + renamedItems.compactMap(\.renamed.move),
+            title: title,
+            journalFolder: journalFolder,
+            removedAssignments: journaled.map(\.removed),
+            addedAssignments: journaled.map(\.added),
+            pruneBoundaries: pruneBoundaries,
+            progress: progress
+        )
+        let failed = Dictionary(
+            outcome.report.skipped.map { (EventStorageLocations.pathKey($0.move.sourcePath), $0.reason) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        func failure(_ item: EventMoveItem) -> String? {
+            item.move.flatMap { failed[EventStorageLocations.pathKey($0.sourcePath)] }
+        }
+        for item in plain {
+            if let reason = failure(item) {
+                outcome.stayed.append(EventMoveStay(item: item, reason: reason))
+            } else {
+                outcome.moved.append(item)
+            }
+        }
+        for entry in renamedItems {
+            if let reason = failure(entry.renamed) {
+                outcome.stayed.append(EventMoveStay(item: entry.item, reason: reason))
+            } else if entry.isConflict {
+                outcome.keptBoth.append(EventMoveKeptBoth(
+                    item: entry.renamed,
+                    newName: (entry.renamed.added.relativePath as NSString).lastPathComponent
+                ))
+            } else {
+                outcome.moved.append(entry.renamed)
+            }
+        }
+
+        if !toTrash.isEmpty {
+            let files = toTrash.compactMap { item -> OrganizeFile? in
+                guard let path = item.currentPath, let facts = DuplicateFileFacts.read(path) else { return nil }
+                return OrganizeFile(path: path, size: facts.byteCount, modifiedAt: facts.modifiedAt)
+            }
+            let batch = files.isEmpty
+                ? nil
+                : try trash.trash(
+                    files: files,
+                    originRoot: DuplicateResolver.commonFolder(of: files.map(\.path)),
+                    context: trashContext
+                )
+            let trashed = Set((batch?.entries ?? []).map { EventStorageLocations.pathKey($0.originalAbsolutePath) })
+            let skipped = Dictionary(
+                (batch?.skipped ?? []).map { (EventStorageLocations.pathKey($0.path), $0.reason) },
+                uniquingKeysWith: { first, _ in first }
+            )
+            for item in toTrash {
+                let key = item.currentPath.map(EventStorageLocations.pathKey) ?? ""
+                if trashed.contains(key) {
+                    outcome.merged.append(item)
+                    outcome.mergedToTrash += 1
+                } else {
+                    outcome.stayed.append(EventMoveStay(item: item, reason: skipped[key] ?? "its extra copy could not be moved to Trash"))
+                }
+            }
+            outcome.trashBatch = batch.flatMap { $0.entries.isEmpty ? nil : $0 }
+        }
+
+        outcome.removedAssignments = (outcome.moved + outcome.keptBoth.map(\.item) + outcome.merged).map(\.removed)
+        // A merge keeps the target's own entry. Only a name taken on disk
+        // alone — a file the target's catalog did not list yet — adopts it.
+        outcome.addedAssignments = (outcome.moved + outcome.keptBoth.map(\.item)).map(\.added)
+            + outcome.merged.filter { takenOnDiskOnly.contains(CatalogStore.eventAssetID($0.removed)) }.map(\.added)
+        return outcome
+    }
+}
