@@ -758,6 +758,11 @@ private struct JobHistoryHoverReadout: View {
                 Text(machineLine(sample))
                     .font(.caption2.monospacedDigit())
                     .foregroundStyle(.secondary)
+                if let estimate = estimateLine(sample) {
+                    Text(estimate)
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
             }
             if !inFlight.isEmpty {
                 Text("IN FLIGHT (\(inFlight.count))")
@@ -785,6 +790,15 @@ private struct JobHistoryHoverReadout: View {
         .padding(8)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 7))
         .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(.quaternary, lineWidth: 1))
+    }
+
+    /// "Said ~10 m left · finished 8 m later"
+    private func estimateLine(_ sample: JobHistorySample) -> String? {
+        guard let remaining = sample.secondsRemaining else { return nil }
+        return JobHistoryEstimateText.line(
+            remaining: remaining,
+            error: detail.job.endedAt == nil ? nil : sample.estimateError(actualDuration: detail.job.duration())
+        )
     }
 
     /// "3 transfers busy · CPU 23% · GPU 4%"
@@ -997,5 +1011,17 @@ private struct JobHistoryCell<Content: View>: View {
                 }
             }
             .help(JobHistoryText.item(row.item))
+    }
+}
+
+/// How a recorded time-left estimate reads next to what really happened.
+enum JobHistoryEstimateText {
+    static func line(remaining: Double, error: Double?) -> String {
+        let said = "Said ~\(JobActivityDetail.durationText(remaining.rounded())) left"
+        guard let error else { return said }
+        // Within a minute (or 5 %) of the real end counts as on time.
+        if abs(error) < max(60, remaining * 0.05) { return said + " · on time" }
+        let off = JobActivityDetail.durationText(abs(error).rounded())
+        return said + (error > 0 ? " · finished \(off) sooner" : " · finished \(off) later")
     }
 }

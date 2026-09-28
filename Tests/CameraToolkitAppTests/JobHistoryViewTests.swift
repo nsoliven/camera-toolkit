@@ -199,4 +199,11 @@ final class JobHistoryViewTests: XCTestCase {
         XCTAssertEqual(job.summary?.note, "Copied 3 files.")
         XCTAssertNotNil(job.endedAt)
     }
+
+    func testARecordedEstimateReadsAgainstTheRealEnd() {
+        XCTAssertEqual(JobHistoryEstimateText.line(remaining: 600, error: nil), "Said ~\(JobActivityDetail.durationText(600)) left")
+        XCTAssertTrue(JobHistoryEstimateText.line(remaining: 600, error: 20).hasSuffix("on time"))
+        XCTAssertTrue(JobHistoryEstimateText.line(remaining: 600, error: -600).hasSuffix("finished \(JobActivityDetail.durationText(600)) later"))
+        XCTAssertTrue(JobHistoryEstimateText.line(remaining: 3_600, error: 900).hasSuffix("finished \(JobActivityDetail.durationText(900)) sooner"))
+    }
 }

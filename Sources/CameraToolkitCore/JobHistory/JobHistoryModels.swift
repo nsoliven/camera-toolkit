@@ -175,6 +175,9 @@ public struct JobHistorySample: Codable, Equatable, Hashable, Sendable {
     public var transferBytes: Int64?
     public var doneBytes: Int64
     public var doneFiles: Int
+    /// What the Jobs window said was left at this second ("~10 m left"),
+    /// so a finished job shows how far off each estimate was.
+    public var secondsRemaining: Double?
 
     public init(
         t: Double,
@@ -189,7 +192,8 @@ public struct JobHistorySample: Codable, Equatable, Hashable, Sendable {
         gpu: Double? = nil,
         transferBytes: Int64? = nil,
         doneBytes: Int64 = 0,
-        doneFiles: Int = 0
+        doneFiles: Int = 0,
+        secondsRemaining: Double? = nil
     ) {
         self.t = t
         self.combined = combined
@@ -204,6 +208,13 @@ public struct JobHistorySample: Codable, Equatable, Hashable, Sendable {
         self.transferBytes = transferBytes
         self.doneBytes = doneBytes
         self.doneFiles = doneFiles
+        self.secondsRemaining = secondsRemaining
+    }
+
+    /// When this second's estimate said the job would end, minus when it
+    /// really ended: positive means it finished sooner than estimated.
+    public func estimateError(actualDuration: Double) -> Double? {
+        secondsRemaining.map { t + $0 - actualDuration }
     }
 
     /// The chart series this sample carries, by the live chart's names.

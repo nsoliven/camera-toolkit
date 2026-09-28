@@ -136,6 +136,9 @@ public final class JobHistoryStore: @unchecked Sendable {
             CREATE INDEX job_items_job_id ON job_items(job_id, started_at);
             """)
         }
+        migrator.registerMigration("v2-estimates") { db in
+            try db.execute(sql: "ALTER TABLE job_samples ADD COLUMN seconds_remaining REAL")
+        }
         return migrator
     }
 
@@ -182,14 +185,14 @@ public final class JobHistoryStore: @unchecked Sendable {
             let sampleStatement = try db.cachedStatement(sql: """
             INSERT INTO job_samples(
                 job_id, t, combined_mbps, copy_mbps, verify_mbps, hash_mbps, remote_verify_mbps, files_per_second,
-                active_transfers, cpu, gpu, transfer_bytes, done_bytes, done_files
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                active_transfers, cpu, gpu, transfer_bytes, done_bytes, done_files, seconds_remaining
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """)
             for sample in samples {
                 try sampleStatement.execute(arguments: [
                     id, sample.t, sample.combined, sample.copy, sample.verify, sample.hash, sample.remoteVerify,
                     sample.filesPerSecond, sample.activeTransfers, sample.cpu, sample.gpu, sample.transferBytes,
-                    sample.doneBytes, sample.doneFiles,
+                    sample.doneBytes, sample.doneFiles, sample.secondsRemaining,
                 ])
             }
             let itemStatement = try db.cachedStatement(sql: """
@@ -272,7 +275,8 @@ public final class JobHistoryStore: @unchecked Sendable {
                     gpu: row["gpu"],
                     transferBytes: row["transfer_bytes"],
                     doneBytes: row["done_bytes"],
-                    doneFiles: row["done_files"]
+                    doneFiles: row["done_files"],
+                    secondsRemaining: row["seconds_remaining"]
                 )
             }
         }

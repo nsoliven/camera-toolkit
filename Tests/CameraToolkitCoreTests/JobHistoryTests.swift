@@ -35,7 +35,7 @@ final class JobHistoryTests: XCTestCase {
             try store.insert(job)
             let samples = [
                 JobHistorySample(t: 1, combined: nil, activeTransfers: 4, doneBytes: 10, doneFiles: 0),
-                JobHistorySample(t: 2, combined: 112.5, copy: 60, verify: 58, hash: nil, remoteVerify: nil, filesPerSecond: 1.5, activeTransfers: 3, cpu: 0.2, gpu: nil, transferBytes: 1_000, doneBytes: 900, doneFiles: 1),
+                JobHistorySample(t: 2, combined: 112.5, copy: 60, verify: 58, hash: nil, remoteVerify: nil, filesPerSecond: 1.5, activeTransfers: 3, cpu: 0.2, gpu: nil, transferBytes: 1_000, doneBytes: 900, doneFiles: 1, secondsRemaining: 600),
             ]
             let items = [
                 JobHistoryItem(relativePath: "2026/Event/Originals/Cam/A.ARW", byteCount: 1_000, start: 0.5, end: 1.5, slot: 0, outcome: .copied, verifyMethod: "smb", copySeconds: 0.6, verifySeconds: 0.3),
@@ -68,6 +68,14 @@ final class JobHistoryTests: XCTestCase {
         }
     }
 
+    /// A recorded estimate says how far off it was once the job ended.
+    func testEachSecondsEstimateIsComparedWithTheRealEnd() {
+        let sample = JobHistorySample(t: 6_355, secondsRemaining: 600)
+        XCTAssertEqual(sample.estimateError(actualDuration: 6_955), 0)
+        XCTAssertEqual(sample.estimateError(actualDuration: 7_555), -600, "finished 10 min later than it said")
+        XCTAssertNil(JobHistorySample(t: 5).estimateError(actualDuration: 10), "no estimate yet")
+    }
+
     func testMigrationsCreateIndexedTablesAndReopeningIsIdempotent() throws {
         try withStore { url, store in
             try store.insert(JobHistoryJob(kind: "faceScan", title: "Scanned faces", startedAt: Date(), outcome: .succeeded))
@@ -79,7 +87,7 @@ final class JobHistoryTests: XCTestCase {
             }
             XCTAssertTrue(Set(indexes).isSuperset(of: ["job_samples_job_id", "job_items_job_id", "jobs_started_at"]), "\(indexes)")
             let migrations = try writer.read { db in try String.fetchAll(db, sql: "SELECT identifier FROM grdb_migrations") }
-            XCTAssertEqual(migrations, ["v1"])
+            XCTAssertEqual(migrations, ["v1", "v2-estimates"])
             let journal = try writer.read { db in try String.fetchOne(db, sql: "PRAGMA journal_mode") }
             XCTAssertEqual(journal, "wal")
         }

@@ -252,7 +252,8 @@ public final class JobHistoryRecorder: @unchecked Sendable {
             activeTransfers: active,
             transferBytes: observation.telemetry?.transferBytes,
             doneBytes: observation.processedBytes,
-            doneFiles: observation.processedFiles
+            doneFiles: observation.processedFiles,
+            secondsRemaining: observation.telemetry?.work?.secondsRemaining
         )
     }
 
