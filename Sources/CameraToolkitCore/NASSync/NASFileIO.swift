@@ -286,11 +286,14 @@ public enum NASFileIO {
     }
 
     /// Renames without ever replacing an existing file: `renamex_np` with
-    /// `RENAME_EXCL`, and where the filesystem does not support that (SMB
-    /// often answers `ENOTSUP`), a check that the destination is free, then
-    /// a plain rename. The check-then-rename window is the best an SMB
-    /// client can do; callers hold the destination folder alone (the app
-    /// quit, one job at a time).
+    /// `RENAME_EXCL`, and where the filesystem does not support that, a
+    /// claimed name. smbfs answers `EEXIST` when the destination exists but
+    /// `ENOTSUP` when it is free, and its plain `rename` replaces an existing
+    /// file (measured on the NAS share), so a check-then-rename could replace
+    /// a file created in between. Instead the name is claimed with an
+    /// exclusive create — an empty file (`O_EXCL`) or folder (`mkdir`), which
+    /// the server refuses when the name exists — and the rename then replaces
+    /// only that placeholder.
     public static func renameExclusive(from source: String, to destination: String) throws {
         let result = renameExclusivePrimitive.map { $0(source, destination) }
             ?? renamex_np(source, destination, UInt32(RENAME_EXCL))
@@ -298,16 +301,48 @@ public enum NASFileIO {
         let code = errno
         switch code {
         case ENOTSUP, EINVAL:
-            var info = stat()
-            guard lstat(destination, &info) != 0 else {
-                throw ToolkitError.commandFailed("A file already exists at \(destination). Nothing was replaced.")
-            }
-            guard Darwin.rename(source, destination) == 0 else {
-                throw DirectoryListing.posix(errno, "rename", source)
-            }
+            try renameOntoClaimedName(from: source, to: destination)
         case EEXIST:
             throw ToolkitError.commandFailed("A file already exists at \(destination). Nothing was replaced.")
         default:
+            throw DirectoryListing.posix(code, "rename", source)
+        }
+    }
+
+    /// Claims `destination` with an exclusive create, then renames onto the
+    /// placeholder. On a failed rename the placeholder is removed only while
+    /// it is still the empty file or folder this call made.
+    static func renameOntoClaimedName(from source: String, to destination: String) throws {
+        var sourceInfo = stat()
+        guard lstat(source, &sourceInfo) == 0 else { throw DirectoryListing.posix(errno, "rename", source) }
+        let isFolder = (sourceInfo.st_mode & S_IFMT) == S_IFDIR
+        if isFolder {
+            guard mkdir(destination, 0o755) == 0 else {
+                if errno == EEXIST {
+                    throw ToolkitError.commandFailed("A file already exists at \(destination). Nothing was replaced.")
+                }
+                throw DirectoryListing.posix(errno, "claim", destination)
+            }
+        } else {
+            let placeholder = Darwin.open(destination, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0o600)
+            guard placeholder >= 0 else {
+                if errno == EEXIST {
+                    throw ToolkitError.commandFailed("A file already exists at \(destination). Nothing was replaced.")
+                }
+                throw DirectoryListing.posix(errno, "claim", destination)
+            }
+            Darwin.close(placeholder)
+        }
+        guard Darwin.rename(source, destination) == 0 else {
+            let code = errno
+            var info = stat()
+            if lstat(destination, &info) == 0 {
+                if isFolder, (info.st_mode & S_IFMT) == S_IFDIR {
+                    _ = rmdir(destination)  // Fails, harmlessly, unless still empty.
+                } else if !isFolder, (info.st_mode & S_IFMT) == S_IFREG, info.st_size == 0 {
+                    _ = unlink(destination)
+                }
+            }
             throw DirectoryListing.posix(code, "rename", source)
         }
     }
