@@ -27,9 +27,11 @@ struct JobHistoryView: View {
     var body: some View {
         HSplitView {
             JobHistoryList(browser: browser, selection: $selection)
-                .frame(minWidth: 250, idealWidth: 290, maxWidth: 400, maxHeight: .infinity)
+                // 220 + the divider + 440 stays under the window's 720
+                // minimum; more and the detail pane runs off the edge.
+                .frame(minWidth: 220, idealWidth: 290, maxWidth: 400, maxHeight: .infinity)
             detailPane
-                .frame(minWidth: 540, maxWidth: .infinity, maxHeight: .infinity)
+                .frame(minWidth: 440, maxWidth: .infinity, maxHeight: .infinity)
         }
         .task(id: model.jobHistoryRevision) {
             await browser.reload()
@@ -483,6 +485,9 @@ private struct JobHistoryChartCard: View {
             } else {
                 JobHistoryPlot(detail: detail, zoom: $zoom, hover: hover)
                     .frame(minHeight: 160, maxHeight: .infinity)
+                    // Legend, axes and the hover readout stay inside the
+                    // card's slot even across a zoom redraw.
+                    .clipped()
                 JobHistoryOverview(chart: detail.chart, zoom: $zoom)
                     .frame(height: 30)
             }

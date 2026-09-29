@@ -97,6 +97,9 @@ struct JobThroughputReadout: Equatable {
     var filesPerSecond: Double?
     /// Video frames per second, for face scans that decode clips.
     var framesPerSecond: Double?
+    /// True when `filesPerSecond` is the whole-job average rather than the
+    /// smoothed live rate.
+    var wholeJobRate = false
     var points: [ThroughputPoint] = []
     /// Series in legend order — "Copy (write)", "Verify (re-read)".
     var series: [String] = []
