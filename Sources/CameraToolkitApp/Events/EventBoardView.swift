@@ -17,6 +17,9 @@ struct EventBoardView: View {
     @State private var previewStackID: String?
     @State private var previewFrameIndex = 0
     @State private var showAllPeople = false
+    /// The board's measured height, which limits how tall its top bar's
+    /// notices and chips may grow before they scroll.
+    @State private var boardHeight: Double?
     /// The filter popover — owned here, outside the bottom bar's
     /// `ViewThatFits`, so a candidate swap cannot re-present it mid-layout.
     @State private var showFilters = false
@@ -149,6 +152,11 @@ struct EventBoardView: View {
                     showInspector: $showInspector
                 )
             }
+            // Measured outside both bars, so the top bar's limit never
+            // depends on the top bar's own height.
+            .onGeometryChange(for: Double.self) { $0.size.height.rounded() } action: { height in
+                boardHeight = height
+            }
             // The task keys on the event and its storage policy only —
             // assignment writes patch the open board in place, so a count
             // change must not tear the grid down and rebuild it.
@@ -238,49 +246,55 @@ struct EventBoardView: View {
                 summary: workspace.presence[eventID]
             ))
             .guideHighlight(.storageStrip, in: workspace)
-            EventStorageSlots(
-                model: model,
-                workspace: workspace,
-                event: event,
-                summary: workspace.presence[eventID]
-            ).misplacedNotice
-            DuplicateBoardNotice(model: model, workspace: workspace, review: workspace.duplicateReview, eventID: eventID)
-            FlowLayout(horizontalSpacing: 8, verticalSpacing: 8) {
-                ForEach(subevents) { subevent in
-                    SubeventChip(
-                        event: subevent,
-                        isFiltering: workspace.search.excludedEventIDs.contains(subevent.id),
-                        onToggle: { workspace.search.toggleEventExclusion(subevent.id) }
-                    )
-                }
-                ForEach(shown) { person in
-                    PersonChip(person: person)
-                }
-                if people.count > Self.collapsedPeopleCount {
-                    Button(showAllPeople ? "Show Less" : "Show \(people.count - Self.collapsedPeopleCount) More") {
-                        showAllPeople.toggle()
+            // The strip stays put; the notices and chips under it scroll
+            // once they would take more than their share of the board.
+            BoardBarScrollRegion(maxHeight: OrganizeChromeSizing.boardAccessoryHeightLimit(boardHeight: boardHeight)) {
+                VStack(alignment: .leading, spacing: 8) {
+                    EventStorageSlots(
+                        model: model,
+                        workspace: workspace,
+                        event: event,
+                        summary: workspace.presence[eventID]
+                    ).misplacedNotice
+                    DuplicateBoardNotice(model: model, workspace: workspace, review: workspace.duplicateReview, eventID: eventID)
+                    FlowLayout(horizontalSpacing: 8, verticalSpacing: 8) {
+                        ForEach(subevents) { subevent in
+                            SubeventChip(
+                                event: subevent,
+                                isFiltering: workspace.search.excludedEventIDs.contains(subevent.id),
+                                onToggle: { workspace.search.toggleEventExclusion(subevent.id) }
+                            )
+                        }
+                        ForEach(shown) { person in
+                            PersonChip(person: person)
+                        }
+                        if people.count > Self.collapsedPeopleCount {
+                            Button(showAllPeople ? "Show Less" : "Show \(people.count - Self.collapsedPeopleCount) More") {
+                                showAllPeople.toggle()
+                            }
+                            .buttonStyle(.borderless)
+                            .controlSize(.small)
+                        }
+                        if cameras.count > 1 {
+                            ForEach(cameras) { entry in
+                                CameraChip(
+                                    camera: entry.camera,
+                                    count: entry.stackCount,
+                                    isOn: workspace.search.isCameraChipOn(entry.id),
+                                    onToggle: { workspace.search.toggleCameraChip(entry.id) }
+                                )
+                            }
+                        }
                     }
-                    .buttonStyle(.borderless)
-                    .controlSize(.small)
-                }
-                if cameras.count > 1 {
-                    ForEach(cameras) { entry in
-                        CameraChip(
-                            camera: entry.camera,
-                            count: entry.stackCount,
-                            isOn: workspace.search.isCameraChipOn(entry.id),
-                            onToggle: { workspace.search.toggleCameraChip(entry.id) }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    if !workspace.search.rowsWithValues.isEmpty {
+                        OrganizeFilterHotLinks(
+                            workspace: workspace,
+                            stacks: workspace.eventStacks[eventID] ?? [],
+                            search: $workspace.search
                         )
                     }
                 }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            if !workspace.search.rowsWithValues.isEmpty {
-                OrganizeFilterHotLinks(
-                    workspace: workspace,
-                    stacks: workspace.eventStacks[eventID] ?? [],
-                    search: $workspace.search
-                )
             }
         }
         .padding(.horizontal, 16)

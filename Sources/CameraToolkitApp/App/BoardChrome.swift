@@ -45,6 +45,41 @@ struct BoardToolbarTitle: View {
     }
 }
 
+/// Part of a board's top bar that scrolls once it reaches `maxHeight`:
+/// short content keeps its own height, taller content stops at the limit
+/// and scrolls inside it. A safe-area bar is laid out at its content's full
+/// height, so without this a bar with many chips outgrows the window.
+struct BoardBarScrollRegion<Content: View>: View {
+    let maxHeight: CGFloat
+    @ViewBuilder let content: () -> Content
+
+    var body: some View {
+        HeightLimitedLayout(maxHeight: maxHeight) {
+            ScrollView(.vertical) {
+                content()
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .scrollBounceBehavior(.basedOnSize)
+        }
+    }
+}
+
+/// Sizes its one subview to the subview's own height (its content's height,
+/// for a vertical `ScrollView`) up to `maxHeight`, in one layout pass.
+private struct HeightLimitedLayout: Layout {
+    let maxHeight: CGFloat
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        guard let subview = subviews.first else { return .zero }
+        let natural = subview.sizeThatFits(ProposedViewSize(width: proposal.width, height: nil))
+        return CGSize(width: proposal.width ?? natural.width, height: min(natural.height, maxHeight))
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        subviews.first?.place(at: bounds.origin, anchor: .topLeading, proposal: ProposedViewSize(bounds.size))
+    }
+}
+
 /// Filter · tiles/list · Sort · Group · tile size · hide sorted — the
 /// board's view controls as one floating glass capsule. Sort and Group are
 /// separate, labelled menus ("Sort: Largest Bursts", "Group: Day"); compact

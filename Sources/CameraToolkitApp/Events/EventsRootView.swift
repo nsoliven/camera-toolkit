@@ -81,9 +81,15 @@ struct EventsRootView: View {
         } detail: {
             // minWidth 0 + clipped: a board too wide for the window is cut
             // on its own right edge instead of pushing the whole window
-            // wider and cutting the sidebar off on the left.
+            // wider and cutting the sidebar off on the left. minHeight 0
+            // does the same vertically: the split view measures this column
+            // at its minimum width, where the board's top bar wraps every
+            // chip and notice word onto its own line, and a column minimum
+            // taller than the window made the hosting view lay the whole
+            // split view out taller than the window — sidebar rows under
+            // the traffic lights, the storage strip under the toolbar.
             detail
-                .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity)
+                .frame(minWidth: 0, maxWidth: .infinity, minHeight: 0, maxHeight: .infinity, alignment: .top)
                 .clipped()
                 // On the detail column, outside the per-board `.id`, so the
                 // field keeps its text and focus across selection changes
