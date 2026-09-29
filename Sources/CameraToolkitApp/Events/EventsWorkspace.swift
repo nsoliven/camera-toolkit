@@ -520,6 +520,11 @@ final class EventsWorkspace {
     /// The Sync All sheet's "Reconcile NAS after moves" switch and the
     /// counts it shows (read from records, never from the NAS).
     var syncAllReconcile = true
+    /// Whether the Buffer (or private staging) is connected. Without it
+    /// nothing can be proven stale, so the switch is greyed out and the
+    /// reconcile step does not run; read when the sheet opens and again
+    /// whenever its counts refresh.
+    var syncAllDriveMounted = true
     var reconcilePreview: NASReconcilePreview?
     /// NAS renames journaled and not applied yet — the NAS was away or a
     /// job held the gate. Kept in memory (recounted at launch and after
@@ -2620,21 +2625,30 @@ final class EventsWorkspace {
         // and idle. A connected NAS that has no folder for the event owes
         // nothing. Copies in the old archive layout keep their folder name.
         var nasNote = ""
-        if let owed = NASMoveFollower.folderRename(from: event, to: renamed, locations: locations),
-           !nasIsConnected || fileManager.fileExists(atPath: locations.nasRoot.appendingPathComponent(owed.from).path) {
+        // Always queued, even when the NAS has no folder at the old name
+        // yet: a second rename before the first one ran finds it named for
+        // the first rename, which is still queued — skipping it left the NAS
+        // folder at the first name for good. Queued in order they run in
+        // order; a folder the NAS never had is recorded as absent.
+        if let batch = NASMoveFollower.folderRenameBatch(
+            from: event, to: renamed, locations: locations, title: "Rename \(eventTitle(event)) on the NAS"
+        ) {
+            let folderIsThere = fileManager.fileExists(atPath: locations.nasRoot.appendingPathComponent(batch.ops[0].from).path)
+            let queuedBefore = pendingNASRenameCount > 0
             let journalFolder = self.journalFolder
             let nasRoot = locations.nasRoot
-            let title = "Rename \(eventTitle(event)) on the NAS"
             Task { @MainActor [weak self] in
                 let queued = await Task.detached(priority: .userInitiated) {
-                    Self.queueNASRenames([owed], title: title, origin: .folderRename, nasRoot: nasRoot, journalFolder: journalFolder)
+                    Self.queueNASRenames(batch.ops, title: batch.title, origin: .folderRename, nasRoot: nasRoot, journalFolder: journalFolder)
                 }.value
                 self?.noteNASRenamesQueued(queued)
                 self?.drainNASRenames()
             }
-            nasNote = nasIsConnected
-                ? " The NAS folder is renamed to match next."
-                : " The NAS folder will be renamed when the NAS is connected."
+            if !nasIsConnected {
+                nasNote = " The NAS folder will be renamed when the NAS is connected."
+            } else if folderIsThere || queuedBefore {
+                nasNote = " The NAS folder is renamed to match next."
+            }
         }
         if VolumeInfo.isAvailable(locations.legacyArchiveEventFolder(for: event)),
            fileManager.fileExists(atPath: locations.legacyArchiveEventFolder(for: event).path) {
@@ -2910,7 +2924,7 @@ final class EventsWorkspace {
             var cancelled = false
             // What Sync to NAS verified under this family's NAS folder —
             // one catalog read, so presence can say "verified <date>".
-            let nasVerified = NASSyncStore.verifiedDates(
+            let nasFacts = NASSyncStore.verifiedFacts(
                 catalogURL: catalogURL,
                 nasRoot: locations.nasRoot.path,
                 prefixes: [locations.layout(for: event, deviceID: nil).mirrorEventFolderPath]
@@ -2924,7 +2938,7 @@ final class EventsWorkspace {
                     mountedVolumes: mounted,
                     probe: probe,
                     pauseGate: gate,
-                    nasVerified: nasVerified,
+                    nasFacts: nasFacts,
                     archiveListing: archiveListing
                 ) else { cancelled = true; break }
                 memberSummaries[member.id] = memberSummary
@@ -4134,7 +4148,7 @@ final class EventsWorkspace {
             if move == nil, asset.archive == .present, !asset.archiveIsLegacyLayout, let archive = asset.archivePath,
                let target = paths.archiveURL(for: moved, event: to)?.path,
                let from = locations.nasRelativePath(archive), let toPath = locations.nasRelativePath(target) {
-                nasCopy = NASCopyMove(from: from, to: toPath)
+                nasCopy = NASCopyMove(from: from, to: toPath, driveDestination: paths.driveURL(for: moved, event: to, policy: targetPolicy)?.path)
             }
             let name = Self.nameKey(moved.relativePath)
             var takenBy: [String] = []
@@ -4469,8 +4483,11 @@ final class EventsWorkspace {
         // with the job — off the main actor — from a snapshot, and only
         // when a name is actually taken.
         let needsClashInputs = items.contains { !$0.takenBy.isEmpty }
+        // A file only the NAS has may find its new name taken on the NAS: the
+        // "(N)" name it gets then avoids the target's catalog names too.
+        let needsTargetNames = needsClashInputs || items.contains { $0.nasCopy != nil }
         let assignmentsSnapshot = needsClashInputs ? model.configuration.photoEventAssignments : []
-        let targetAssignments = needsClashInputs ? Array(assignmentsByName(inEvent: targetEventID).values) : []
+        let targetAssignments = needsTargetNames ? Array(assignmentsByName(inEvent: targetEventID).values) : []
         let toEvent = move.to
         let moveID = move.id
         let folders = eventFolderSnapshot(move.sourceIDs.union([move.to.id]))
@@ -4497,13 +4514,18 @@ final class EventsWorkspace {
                     for item in items where !item.takenBy.isEmpty && Self.hasOtherAssignment(pointingLike: item.removed, in: assignmentsSnapshot) {
                         if let path = item.currentPath { protectedKeys.insert(EventStorageLocations.pathKey(path)) }
                     }
+                }
+                if needsTargetNames {
                     for assignment in targetAssignments {
                         if let path = locations.impliedDrivePath(for: assignment, event: toEvent, policy: targetPolicy) {
                             takenKeys.insert(EventStorageLocations.pathKey(path))
                         }
                     }
                 }
-                let outcome = try EventMoveService(trash: MediaTrashService(removedFilesRoot: fallbackTrashRoot)).move(
+                let outcome = try EventMoveService(
+                    trash: MediaTrashService(removedFilesRoot: fallbackTrashRoot),
+                    nasCheck: EventMoveNASCheck(locations: locations)
+                ).move(
                     items,
                     title: title,
                     journalFolder: journalFolder,
@@ -5010,7 +5032,9 @@ final class EventsWorkspace {
         if nasIsConnected, stale, !nasPresence.isChecking {
             nasPresence.refresh(.manual)
         }
-        syncAllReconcile = true
+        // The switch keeps what the owner last chose; it is only greyed out
+        // (and ignored) while the drive is away.
+        syncAllDriveMounted = NASCatchUp.driveIsMounted(locations)
         reconcilePreview = nil
         syncAllRequest = SyncAllToNASRequest()
         refreshReconcilePreview()
@@ -5074,12 +5098,17 @@ final class EventsWorkspace {
             return
         }
         nasConnection.prepareForNASJob { [weak self] in
-            let reconcile = self?.syncAllReconcile ?? false
-            self?.startNASSync(
+            // With the drive away nothing can be proven stale, so nothing is
+            // set aside whatever the switch says; the renames that only put
+            // a moved copy where the catalog looks still run.
+            guard let self else { return }
+            let driveMounted = NASCatchUp.driveIsMounted(locations)
+            let reconcile = driveMounted && syncAllReconcile
+            startNASSync(
                 events: events,
                 title: "all events",
                 refresh: events.filter { $0.parentEventID == nil }.map(\.id),
-                catchUp: reconcile,
+                catchUp: reconcile || !driveMounted,
                 reconcile: reconcile
             )
         }
@@ -5108,6 +5137,10 @@ final class EventsWorkspace {
         let nasPresence = self.nasPresence
         let renameQueue = nasRenameQueue
         let assignments = model.configuration.photoEventAssignments
+        // Only the events being synced are repaired: a NAS-only photo whose
+        // copy is not where the catalog looks is renamed into place.
+        let syncedIDs = Set(events.map(\.id))
+        let repairable = assignments.filter { syncedIDs.contains($0.eventID) }
         model.runBackgroundJob(
             action: .syncBuffer,
             runningNote: "Syncing \(title) to the NAS",
@@ -5127,7 +5160,7 @@ final class EventsWorkspace {
                 // second time; then the drive is planned, and NAS copies of
                 // files moved before the NAS followed are renamed into place.
                 let prepared = try follower.prepareSync(
-                    events: events, locations: locations, nasRoot: nasRoot, ownedKeys: owned, catchUp: catchUp
+                    events: events, locations: locations, nasRoot: nasRoot, ownedKeys: owned, catchUp: catchUp, assignments: repairable
                 ) { update in
                     progress(DashboardModel.jobUpdate(from: update, lowerBound: 0.02, upperBound: 0.03, notePrefix: "Sync to NAS", command: ""))
                 }
@@ -5165,6 +5198,12 @@ final class EventsWorkspace {
                 if !report.failed.isEmpty { parts.append("\(report.failed.count) failed and skipped") }
                 if report.notAttempted > 0 { parts.append("\(report.notAttempted) not attempted") }
                 if !outcome.plan.outsideLayout.isEmpty { parts.append("\(outcome.plan.outsideLayout.count) folder(s) outside Originals/Edited not synced") }
+                if !outcome.plan.unownedFolders.isEmpty {
+                    parts.append("\(outcome.plan.unownedFolders.count) event folder(s) on the drive belong to no event in the catalog (an older Buffer under old event names?) — not synced or touched; listed in the report")
+                }
+                if report.clearedTemporaries > 0 {
+                    parts.append("\(report.clearedTemporaries) leftover temporary file(s) from an interrupted sync cleared on the NAS")
+                }
                 if !outcome.plan.inLegacyLayout.isEmpty {
                     parts.append("\(outcome.plan.inLegacyLayout.count) already on the NAS in the old archive layout, not copied again (run the NAS layout migration for this event, then sync)")
                 }
@@ -5193,6 +5232,7 @@ final class EventsWorkspace {
             var unreadable: [NASSyncIssue]
             var skippedJunk: Int
             var inLegacyLayout: [String]
+            var unownedFolders: [String]
         }
         do {
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
@@ -5211,7 +5251,8 @@ final class EventsWorkspace {
                 refused: plan.refused,
                 unreadable: plan.unreadable,
                 skippedJunk: plan.skippedJunk,
-                inLegacyLayout: plan.inLegacyLayout
+                inLegacyLayout: plan.inLegacyLayout,
+                unownedFolders: plan.unownedFolders
             )).write(to: url, options: .withoutOverwriting)
             return url.path
         } catch {

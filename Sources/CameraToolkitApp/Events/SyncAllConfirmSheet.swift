@@ -84,6 +84,12 @@ struct SyncAllConfirmSheet: View {
             Button("Check Again") { presence.refresh(.manual) }
                 .disabled(presence.isChecking || !workspace.nasIsConnected)
                 .help("List the NAS again now")
+            Button("Verify NAS Copies") {
+                onCancel()
+                workspace.verifyNASCopies()
+            }
+            .disabled(blocker != nil)
+            .help("Re-hash every NAS copy Sync to NAS verified and compare it with the recorded SHA-256. Nothing is deleted or replaced.")
             Button("Sync All", action: onConfirm)
                 .buttonStyle(.borderedProminent)
                 .keyboardShortcut(.defaultAction)
@@ -98,8 +104,16 @@ struct SyncAllConfirmSheet: View {
     private var reconcileSection: some View {
         @Bindable var workspace = workspace
         let preview = workspace.reconcilePreview
+        let driveMounted = workspace.syncAllDriveMounted
         VStack(alignment: .leading, spacing: 4) {
-            Toggle("Reconcile NAS after moves", isOn: $workspace.syncAllReconcile)
+            Toggle("Reconcile NAS after moves", isOn: driveMounted ? $workspace.syncAllReconcile : .constant(false))
+                .disabled(!driveMounted)
+            if !driveMounted {
+                Text("The Buffer isn't connected, so nothing can be proven stale and nothing is set aside. NAS copies that a move left behind are still renamed to where the catalog looks for them.")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             Text(reconcileDetail(preview))
                 .font(.caption)
                 .foregroundStyle(.secondary)

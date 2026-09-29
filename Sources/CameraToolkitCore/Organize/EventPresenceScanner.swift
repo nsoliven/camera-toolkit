@@ -118,6 +118,7 @@ public enum EventPresenceScanner {
         probe: PresenceProbe? = nil,
         pauseGate: DriveActivityGate? = nil,
         nasVerified: [String: Date]? = nil,
+        nasFacts: [String: NASSyncStore.VerifiedFact]? = nil,
         archiveListing: NASTreeListing? = nil
     ) -> EventPresenceSummary? {
         let mounted = mountedVolumes ?? VolumeInfo.mountedVolumePaths()
@@ -249,6 +250,31 @@ public enum EventPresenceScanner {
                 return legacyState == .present ? (legacyArchive, .present, true) : (archive, .missing, false)
             }
             let archiveResolved = resolveArchive()
+            // "Verified" is a record's word about a file, so it only counts
+            // for the file in front of us: the record must be about a copy of
+            // this size, and — when a drive copy is here — about that drive
+            // copy's modification time. A different file that happens to sit
+            // at the same path, or a drive file replaced since, must not
+            // inherit a verification (Take Off Drive relies on it).
+            var verifiedAt: Date?
+            if archiveResolved.1 == .present, !archiveResolved.2, let mirrorKey {
+                if let nasFacts {
+                    if let fact = nasFacts[mirrorKey], fact.byteCount == assignment.fileSize {
+                        let driveCopy = [driveResolved, otherResolved].first { $0.1 == .present && !$0.2 }?.0
+                        if let driveCopy {
+                            let modified = (try? driveCopy.resourceValues(forKeys: [.contentModificationDateKey]))?
+                                .contentModificationDate?.timeIntervalSinceReferenceDate
+                            if let recorded = fact.sourceModifiedAt, let modified, abs(recorded - modified) < 0.001 {
+                                verifiedAt = fact.verifiedAt
+                            }
+                        } else {
+                            verifiedAt = fact.verifiedAt
+                        }
+                    }
+                } else {
+                    verifiedAt = nasVerified?[mirrorKey]
+                }
+            }
             assets.append(EventAssetPresence(
                 id: CatalogStore.eventAssetID(assignment),
                 assignment: assignment,
@@ -264,9 +290,7 @@ public enum EventPresenceScanner {
                 driveIsLegacyLayout: driveResolved.2,
                 otherDriveIsLegacyLayout: otherResolved.2,
                 archiveIsLegacyLayout: archiveResolved.2,
-                archiveVerifiedAt: archiveResolved.1 == .present && !archiveResolved.2
-                    ? mirrorKey.flatMap { nasVerified?[$0] }
-                    : nil
+                archiveVerifiedAt: verifiedAt
             ))
         }
         return EventPresenceSummary(eventID: event.id, policy: policy, assets: assets, checkedAt: Date())

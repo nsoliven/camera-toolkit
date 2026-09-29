@@ -49,6 +49,11 @@ public struct NASRename: Codable, Equatable, Hashable, Sendable {
     public var detail: String?
     /// Where the stale copy went (relative to the NAS root), for `.merged`.
     public var stalePath: String?
+    /// How many times the rename was tried and the share answered with a
+    /// transient error (a dropped session, `EIO`, a stale handle). Such a
+    /// rename stays `.pending` — the copy is still at `from` — until it
+    /// succeeds or `NASMoveFollower.maxAttempts` runs out. Nil: never.
+    public var attempts: Int?
 
     public init(
         kind: Kind = .file,
@@ -59,8 +64,10 @@ public struct NASRename: Codable, Equatable, Hashable, Sendable {
         previousEventID: UUID? = nil,
         state: State = .pending,
         detail: String? = nil,
-        stalePath: String? = nil
+        stalePath: String? = nil,
+        attempts: Int? = nil
     ) {
+        self.attempts = attempts
         self.kind = kind
         self.from = from
         self.to = to

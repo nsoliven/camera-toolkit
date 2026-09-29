@@ -26,7 +26,7 @@ final class NASMoveFollowerTests: XCTestCase {
         var configuration: AppConfiguration
 
         func follower(remote: NASRemoteVerifier? = nil, isCancelled: @escaping @Sendable () -> Bool = { false }) -> NASMoveFollower {
-            NASMoveFollower(store: store, remoteVerifier: remote, queue: queue, isCancelled: isCancelled)
+            NASMoveFollower(store: store, remoteVerifier: remote, queue: queue, retryDelay: 0, isCancelled: isCancelled)
         }
 
         func mirror(_ event: SavedCameraEvent, _ name: String) throws -> String {
@@ -362,7 +362,6 @@ final class NASMoveFollowerTests: XCTestCase {
             let keeper = try seed(w, w.eventB, "IMG_0001.ARW", content, onDrive: false)
             let report = try moveOnDrive(w, stale, to: w.eventB)
             var renames = batch(w, report)
-            for path in w.files(under: w.nas) { chmod(w.nas.appendingPathComponent(path).path, 0o000) }
 
             let result = try w.follower().apply(&renames, nasRoot: w.nas)
 
@@ -404,7 +403,11 @@ final class NASMoveFollowerTests: XCTestCase {
         }
     }
 
-    func testRecordsAloneNeverCallTheRemoteHasher() throws {
+    /// Two matching records used to prove a merge without reading either
+    /// copy. A copy verified once can hold other bytes now (the NAS pool has
+    /// shown rare corruption), so bytes decide: with SSH set up both copies
+    /// are hashed on the NAS, even when both records exist and agree.
+    func testMatchingRecordsAloneNeverProveAMergeTheNASHashesBothCopies() throws {
         try withTemporaryDirectory { root in
             let w = try world(root)
             let stale = try seed(w, w.eventA, "IMG_0001.ARW", data(1))
@@ -414,7 +417,8 @@ final class NASMoveFollowerTests: XCTestCase {
             let commands = SyncLocked<[String]>([])
             let result = try w.follower(remote: try localVerifier(w, commands: commands)).apply(&renames, nasRoot: w.nas)
             XCTAssertEqual(result.merged, 1)
-            XCTAssertTrue(commands.value.isEmpty)
+            XCTAssertEqual(commands.value.count, 1, "one NAS-side hash command for the pair")
+            XCTAssertTrue(commands.value[0].contains("sha256sum"))
         }
     }
 

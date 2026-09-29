@@ -49,6 +49,15 @@ public struct NASSyncPlan: Sendable {
     /// copied again — that would duplicate the event on the NAS; migrate
     /// the event with `--migrate-nas-layout`, then sync verifies it.
     public var inLegacyLayout: [String] = []
+    /// Event folders on the Buffer (`<year>/<event>`) that no event in the
+    /// catalog owns — typically an old Buffer plugged back in whose folders
+    /// carry event names that have since been renamed. Never synced and
+    /// never touched: they are only reported, for the owner to decide.
+    public var unownedFolders: [String] = []
+    /// The NAS mirror folder (relative to the NAS root) of every event being
+    /// synced, for the sync to look inside for its own leftover
+    /// temporaries. Empty for a plan not made by the planner.
+    public var eventFolders: [String] = []
 
     public init(
         items: [NASSyncItem],
@@ -56,7 +65,9 @@ public struct NASSyncPlan: Sendable {
         skippedJunk: Int = 0,
         refused: [NASSyncIssue] = [],
         unreadable: [NASSyncIssue] = [],
-        inLegacyLayout: [String] = []
+        inLegacyLayout: [String] = [],
+        unownedFolders: [String] = [],
+        eventFolders: [String] = []
     ) {
         self.items = items
         self.outsideLayout = outsideLayout
@@ -64,6 +75,8 @@ public struct NASSyncPlan: Sendable {
         self.refused = refused
         self.unreadable = unreadable
         self.inLegacyLayout = inLegacyLayout
+        self.unownedFolders = unownedFolders
+        self.eventFolders = eventFolders
     }
 
     public var totalBytes: Int64 { items.reduce(0) { $0 + $1.byteCount } }
@@ -128,7 +141,39 @@ public enum NASSyncPlanner {
             skipLegacyCopies(&plan, events: events, locations: locations)
         }
         plan.items.sort { $0.relativePath < $1.relativePath }
+        plan.unownedFolders = unownedEventFolders(events: events + locations.events, locations: locations)
+        plan.eventFolders = Array(Set(events.map {
+            PortablePath.sanitize(relativePath: locations.layout(for: $0, deviceID: nil).mirrorEventFolderPath)
+        })).sorted()
         return plan
+    }
+
+    /// Event folders on the drive (`<year>/<event>`) that no event of the
+    /// catalog maps to. Compared by name the way the volume does — any case,
+    /// any Unicode composition. Two directory listings per year folder at
+    /// most; read-only.
+    static func unownedEventFolders(events: [SavedCameraEvent], locations: EventStorageLocations) -> [String] {
+        var owned = Set<String>()
+        for event in events {
+            for policy in EventStoragePolicy.allCases {
+                owned.insert(NASSyncStore.pathKey(locations.eventFolder(for: event, policy: policy).standardizedFileURL.path))
+            }
+        }
+        var found: [String] = []
+        for root in [locations.bufferRoot, locations.privateStagingRoot] {
+            let rootPath = root.standardizedFileURL.path
+            guard LayoutMigrationDisk.lstatEntry(rootPath)?.kind == .directory,
+                  let years = try? DirectoryListing.list(rootPath) else { continue }
+            for year in years where year.kind == .directory && year.name.count == 4 && year.name.allSatisfy(\.isNumber) {
+                let yearPath = rootPath + "/" + year.name
+                guard let children = try? DirectoryListing.list(yearPath) else { continue }
+                for child in children where child.kind == .directory && !isJunk(child.name) {
+                    let path = yearPath + "/" + child.name
+                    if !owned.contains(NASSyncStore.pathKey(path)) { found.append(path) }
+                }
+            }
+        }
+        return found.sorted()
     }
 
     /// Drops items whose legacy archive copy (flattened name, same size)

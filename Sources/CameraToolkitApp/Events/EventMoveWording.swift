@@ -43,6 +43,13 @@ enum EventMoveWording {
                 : "\(count) had the same name as different \(noun)s and were kept with a new name.")
         }
 
+        if let first = outcome.nasRenamed.first {
+            let count = outcome.nasRenamed.count
+            sentences.append(count == 1
+                ? "1 \(noun) only the NAS has came in as \(first.newName), because the NAS already held a different file under its name."
+                : "\(count) \(noun)s only the NAS has came in under a new name, because the NAS already held different files under theirs.")
+        }
+
         if let first = outcome.stayed.first {
             let count = outcome.stayed.count
             let reasons = Set(outcome.stayed.map(\.reason))
