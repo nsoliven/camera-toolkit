@@ -20,7 +20,8 @@ struct JobActivityDetail: View {
     /// range; nil hides the range toggle (a job this session did not
     /// record, the snapshot harness).
     var wholeJobSamples: (() -> [JobHistorySample])?
-    @AppStorage("jobs.throughputChartRange") private var chartRange = ThroughputChartRange.recent
+    static let chartRangeDefaultsKey = "jobs.throughputChartRange"
+    @AppStorage(JobActivityDetail.chartRangeDefaultsKey) private var chartRange = ThroughputChartRange.recent
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: 1)) { context in
@@ -114,6 +115,8 @@ struct JobActivityDetail: View {
                 Text(timingText(now: now))
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .fixedSize()
             }
             Text(job.telemetry?.step ?? (job.note.isEmpty ? job.action.displayName : job.note))
                 .font(.caption)
@@ -155,6 +158,8 @@ struct JobActivityDetail: View {
             Text(timingText(now: now))
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .fixedSize()
         }
 
         // A parallel job's other in-flight files — the per-worker view.
@@ -204,9 +209,11 @@ struct JobActivityDetail: View {
                 .tint(job.state.tint)
             HStack(spacing: 6) {
                 Text(countsText)
+                    .lineLimit(2)
                 Spacer(minLength: 8)
                 Text(job.progress.formatted(.percent.precision(.fractionLength(0))))
                     .foregroundStyle(.secondary)
+                    .fixedSize()
             }
             .font(.caption.monospacedDigit())
         }
@@ -255,30 +262,51 @@ struct JobActivityDetail: View {
             live.wholeJob(samples: samples(), elapsed: max((job.finishedAt ?? Date()).timeIntervalSince(job.createdAt), 0))
         } ?? live
         return VStack(alignment: .leading, spacing: 10) {
-            HStack(alignment: .top, spacing: 16) {
-                readouts(live)
-                Spacer(minLength: 12)
-                if wholeJobSamples != nil {
-                    Picker("Chart range", selection: $chartRange) {
-                        Text("Last 3 min").tag(ThroughputChartRange.recent)
-                        Text("Whole job").tag(ThroughputChartRange.wholeJob)
-                    }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
-                    .controlSize(.small)
-                    .fixedSize()
-                    .help("Show the last three minutes, or every second of this job from its recorded history")
-                }
+            // Metrics, range picker and hardware share one row while the
+            // card is wide enough; narrower, the picker and hardware drop
+            // to a second row instead of squeezing past the card's edge.
+            // A custom Layout rather than ViewThatFits: ViewThatFits
+            // renders every variant, and a second live segmented picker
+            // inside a table row makes AppKit's accessibility walk
+            // re-enter the view graph until the pane hangs.
+            MetricsRowLayout {
+                readouts(readout)
+                rangePicker
                 hardwareStrip
             }
             ThroughputChart(readout: readout, wholeJob: wholeJob != nil)
-                .frame(height: 132)
+                // A range switch changes every scale and series at once;
+                // rebuild the chart instead of animating its axis marks
+                // between domains, and never let the marks paint outside
+                // the slot. The ticks reuse the same view, like the
+                // transfer rows.
+                .id(chartRange)
+                .transaction { $0.animation = nil }
+                .frame(maxWidth: .infinity, minHeight: 132, maxHeight: 132)
+                .clipped()
             if let telemetry = job.telemetry, !telemetry.phaseShares.isEmpty {
                 PhaseBreakdown(shares: telemetry.phaseShares)
             }
         }
         .padding(12)
         .background(.background.secondary, in: RoundedRectangle(cornerRadius: 10))
+    }
+
+    /// The "Last 3 min / Whole job" switch; absent for jobs this session
+    /// did not record (the toggle needs the recorder's samples).
+    @ViewBuilder
+    private var rangePicker: some View {
+        if wholeJobSamples != nil {
+            Picker("Chart range", selection: $chartRange) {
+                Text("Last 3 min").tag(ThroughputChartRange.recent)
+                Text("Whole job").tag(ThroughputChartRange.wholeJob)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .controlSize(.small)
+            .fixedSize()
+            .help("Show the last three minutes, or every second of this job from its recorded history")
+        }
     }
 
     private func readouts(_ readout: JobThroughputReadout) -> some View {
@@ -301,7 +329,7 @@ struct JobActivityDetail: View {
             }
             ThroughputValue(value: average, unit: unit, caption: combined ? "average · combined" : "average", prominent: !(job.state == .running || job.state == .queued), help: "Everything this job has moved, over its elapsed time" + (combined ? ", all parallel transfers together" : ""))
             if let files = readout.filesPerSecond {
-                ThroughputValue(value: JobThroughputFormat.itemRate(files), unit: filesUnit, caption: "files", faded: readout.isHeld, help: "Finished files per second, smoothed")
+                ThroughputValue(value: JobThroughputFormat.itemRate(files), unit: filesUnit, caption: "files", faded: readout.isHeld, help: readout.wholeJobRate ? "Files finished per second over the whole job so far" : "Finished files per second, smoothed")
             }
             if let frames = readout.framesPerSecond {
                 ThroughputValue(value: JobThroughputFormat.itemRate(frames), unit: "frames/s", caption: "video", help: "Video frames decoded per second, smoothed")
@@ -344,13 +372,17 @@ struct JobActivityDetail: View {
                 Text(label)
                     .font(.caption2.weight(.bold))
                     .foregroundStyle(.secondary)
+                    // "CPU" must never fold to one letter per line.
+                    .fixedSize()
                 Text(fraction.map { "\(Int(($0 * 100).rounded()))%" } ?? JobThroughputFormat.placeholder)
                     .font(.caption.monospacedDigit())
-                    .frame(width: 32, alignment: .trailing)
+                    .lineLimit(1)
+                    .frame(minWidth: 32, alignment: .trailing)
             }
             Sparkline(samples: history, tint: .secondary, fixedPeak: 1)
                 .frame(width: 64, height: 14)
         }
+        .fixedSize()
         .help(help)
     }
 
@@ -359,11 +391,14 @@ struct JobActivityDetail: View {
             Text("THERMAL")
                 .font(.caption2.weight(.bold))
                 .foregroundStyle(.secondary)
+                .lineLimit(1)
             Text(thermalLabel)
                 .font(.caption)
                 .foregroundStyle(thermalColor)
+                .lineLimit(1)
                 .frame(height: 14)
         }
+        .fixedSize()
         .help("System thermal state" + (monitor.hardware.lowPowerMode ? " · Low Power Mode is on" : ""))
     }
 
@@ -414,6 +449,7 @@ struct JobActivityDetail: View {
             Text(value)
                 .font(.caption.monospaced())
                 .foregroundStyle(.secondary)
+                .lineLimit(2)
                 .textSelection(.enabled)
         }
     }
@@ -548,9 +584,12 @@ struct ThroughputValue: View {
                     .monospacedDigit()
                     .contentTransition(.numericText())
                     .foregroundStyle(value == nil ? .tertiary : .primary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.6)
                 Text(unit)
                     .font(.caption.weight(.medium))
                     .foregroundStyle(.secondary)
+                    .lineLimit(1)
             }
             .opacity(faded ? 0.45 : 1)
             .animation(.easeInOut(duration: 0.4), value: faded)
@@ -559,6 +598,60 @@ struct ThroughputValue: View {
         // and the "held" caption come and go.
         .frame(minWidth: prominent ? 132 : 96, alignment: .leading)
         .help(help)
+    }
+}
+
+/// The speed card's header: readouts on the left, the range picker and
+/// the hardware strip on the right — all on one row while they fit, and
+/// on two rows (readouts above, picker and hardware below) when they do
+/// not, so the pane never needs more width than the window gives it.
+/// Each subview is laid out once — unlike `ViewThatFits`, which would
+/// keep a second copy of the segmented picker alive and make AppKit's
+/// accessibility walk re-enter the table's view graph until it hangs.
+private struct MetricsRowLayout: Layout {
+    var spacing = 16.0
+    var rowSpacing = 8.0
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let sizes = subviews.map { $0.sizeThatFits(.unspecified) }
+        let rowHeight = sizes.map(\.height).max() ?? 0
+        let oneRow = sizes.map(\.width).reduce(0, +) + spacing * CGFloat(max(sizes.count - 1, 0))
+        guard let limit = proposal.width, oneRow > limit, sizes.count > 1 else {
+            return CGSize(width: min(oneRow, proposal.width ?? oneRow), height: rowHeight)
+        }
+        let secondHeight = sizes.dropFirst().map(\.height).max() ?? 0
+        // Folded, the row claims the offered width so its second line
+        // reaches the card's right edge like the single row does.
+        return CGSize(
+            width: limit,
+            height: sizes[0].height + rowSpacing + secondHeight
+        )
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        let sizes = subviews.map { $0.sizeThatFits(.unspecified) }
+        let oneRow = sizes.map(\.width).reduce(0, +) + spacing * CGFloat(max(sizes.count - 1, 0))
+        if oneRow <= bounds.width || subviews.count < 2 {
+            // One row: the readouts lead, the rest trail in order.
+            subviews[0].place(at: bounds.origin, anchor: .topLeading, proposal: .init(sizes[0]))
+            placeTrailing(subviews, sizes: sizes, in: bounds, y: bounds.minY, from: 1)
+        } else {
+            // Two rows: readouts above, picker and hardware below, still
+            // trailing and still in order.
+            subviews[0].place(at: bounds.origin, anchor: .topLeading, proposal: .init(sizes[0]))
+            placeTrailing(subviews, sizes: sizes, in: bounds, y: bounds.minY + sizes[0].height + rowSpacing, from: 1)
+        }
+    }
+
+    /// Lays out `subviews[from...]` at `bounds`' trailing edge, in index
+    /// order left to right.
+    private func placeTrailing(_ subviews: Subviews, sizes: [CGSize], in bounds: CGRect, y: CGFloat, from start: Int) {
+        var trailing = bounds.maxX
+        for index in subviews.indices.dropFirst(start).reversed() {
+            trailing -= sizes[index].width
+            subviews[index].place(at: CGPoint(x: trailing, y: y), anchor: .topLeading, proposal: .init(sizes[index]))
+            trailing -= spacing
+        }
     }
 }
 
@@ -722,10 +815,12 @@ struct TransferRow: View {
             Text(JobThroughputFormat.sizeProgress(done: item.bytesDone ?? 0, total: item.bytesTotal ?? 0))
                 .font(.caption2.monospacedDigit())
                 .foregroundStyle(.secondary)
+                .lineLimit(1)
                 .frame(width: 128, alignment: .trailing)
             Text("\(JobThroughputFormat.rate(JobThroughputFormat.megabytes(item.bytesPerSecond ?? 0))) MB/s")
                 .font(.caption.monospacedDigit())
-                .frame(width: 76, alignment: .trailing)
+                .lineLimit(1)
+                .frame(width: 84, alignment: .trailing)
         }
         .accessibilityElement(children: .combine)
     }

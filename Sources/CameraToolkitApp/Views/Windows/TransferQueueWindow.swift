@@ -27,7 +27,7 @@ final class TransferQueueWindowController: NSObject, NSWindowDelegate {
     }
 }
 
-private struct TransferQueueView: View {
+struct TransferQueueView: View {
     @Bindable var model: DashboardModel
     @State private var showingSpeedGuide = false
     @State private var showingSourceCleanup = false

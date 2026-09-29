@@ -144,6 +144,15 @@ extension JobThroughputReadout {
         let peak = readout.points.map(\.value).max() ?? 0
         readout.yUpper = StableScale.nice(max(peak * 1.15, (ceiling?.megabytesPerSecond ?? 0) * 1.1, 1))
         readout.xDomain = domain
+        // The FILES readout follows the range too: the whole-job average
+        // (files done over the job's wall time), the same way "average"
+        // already averages bytes. The smoothed live rate reads wrong here —
+        // a resumed sync settling thousands of already-verified files in
+        // its first seconds holds a huge rate that says nothing about the
+        // run the chart shows.
+        let filesDone = samples.map(\.doneFiles).max() ?? 0
+        readout.filesPerSecond = elapsed >= 1 && filesDone > 0 ? Double(filesDone) / elapsed : nil
+        readout.wholeJobRate = true
         return readout
     }
 }
