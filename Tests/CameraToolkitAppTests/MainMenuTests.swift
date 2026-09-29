@@ -1,4 +1,5 @@
 import AppKit
+import CameraToolkitCore
 @testable import CameraToolkitApp
 import XCTest
 
@@ -32,7 +33,6 @@ final class MainMenuTests: XCTestCase {
             (#selector(NSText.cut(_:)), "⌘X"),
             (#selector(NSText.copy(_:)), "⌘C"),
             (#selector(NSText.paste(_:)), "⌘V"),
-            (Selector(("redo:")), "⇧⌘Z"),
             (#selector(NSWindow.performClose(_:)), "⌘W"),
             (#selector(NSApplication.hide(_:)), "⌘H"),
             (#selector(NSApplication.hideOtherApplications(_:)), "⌥⌘H"),
@@ -45,6 +45,39 @@ final class MainMenuTests: XCTestCase {
             XCTAssertNil(item?.target, "\(action) must be nil-targeted")
             if let expected { XCTAssertEqual(item.flatMap(chord), expected, "\(action)") }
         }
+    }
+
+    /// ⌘Z and ⇧⌘Z reach the one undo history; a text field keeps its own.
+    func testUndoAndRedoAreTheAppsOwnAndNameTheirAction() {
+        let undo = items.first { $0.action == #selector(MainMenuActions.undoOrText(_:)) }
+        let redo = items.first { $0.action == #selector(MainMenuActions.redoOrText(_:)) }
+        XCTAssertEqual(undo.flatMap(chord), "⌘Z")
+        XCTAssertEqual(redo.flatMap(chord), "⇧⌘Z")
+        XCTAssertEqual(undo?.title, "Undo")
+        XCTAssertEqual(redo?.title, "Redo")
+        XCTAssertNil(items.first { $0.action == Selector(("redo:")) }, "Redo is no longer a bare responder-chain item that only text fields answer")
+
+        XCTAssertEqual(MainMenu.undoTitle(typing: false, next: "Undo Move to Lakeside (12 files)"), "Undo Move to Lakeside (12 files)")
+        XCTAssertEqual(MainMenu.redoTitle(typing: false, next: "Redo Rename Beach Day"), "Redo Rename Beach Day")
+        XCTAssertEqual(MainMenu.undoTitle(typing: false, next: nil), "Undo", "nothing to undo")
+        XCTAssertEqual(MainMenu.redoTitle(typing: false, next: nil), "Redo")
+        XCTAssertEqual(MainMenu.undoTitle(typing: true, next: "Undo Move to Lakeside (12 files)"), "Undo", "typing: the field's own Undo")
+        XCTAssertEqual(MainMenu.redoTitle(typing: true, next: "Redo Rename Beach Day"), "Redo")
+    }
+
+    /// The titles come from the history: newest Undo, newest Redo, the file count.
+    func testTheWorkspaceNamesTheNextUndoAndRedoForTheMenu() throws {
+        let library = try AuditLibrary.make()
+        defer { library.tearDown() }
+        let workspace = library.workspace
+        XCTAssertNil(workspace.undoMenuTitle)
+        workspace.recordUndo("Sort into Beach Day", detail: UndoEntry.fileCount(3), .files(UndoFilesAction()))
+        workspace.recordUndo("Move to Lakeside", detail: UndoEntry.fileCount(12), .files(UndoFilesAction()))
+        XCTAssertEqual(workspace.undoMenuTitle, "Undo Move to Lakeside (12 files)")
+        XCTAssertNil(workspace.redoMenuTitle)
+        workspace.undoHistory.completeUndo(try XCTUnwrap(workspace.undoHistory.nextUndo))
+        XCTAssertEqual(workspace.undoMenuTitle, "Undo Sort into Beach Day (3 files)")
+        XCTAssertEqual(workspace.redoMenuTitle, "Redo Move to Lakeside (12 files)")
     }
 
     /// The Keyboard Shortcuts window promises these chords; the menu must

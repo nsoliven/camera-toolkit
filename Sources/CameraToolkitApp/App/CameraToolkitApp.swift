@@ -78,6 +78,9 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate, NSMenuIte
             name: .cameraToolkitShowTransferQueue,
             object: nil
         )
+        TrashWindowController.shared.onRestored = { report in
+            CameraToolkitRuntime.workspace.reinstateTrashedAssignments(report)
+        }
         CameraToolkitMainWindow.shared.show(model: model)
         if model.transferQueue != nil || !model.pendingTransferBatches.isEmpty {
             TransferQueueWindowController.shared.show(model: model)
@@ -89,6 +92,7 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate, NSMenuIte
         NotificationCenter.default.removeObserver(self)
         model.flushConfigurationSave()
         model.flushJobHistory()
+        CameraToolkitRuntime.workspace.flushUndoHistory()
         // Fold the catalog's WAL back into the main file so the database
         // on disk is complete on its own after quit.
         CatalogDatabase.checkpointAndCloseAll()
@@ -139,9 +143,14 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate, NSMenuIte
         switch menuItem.action {
         case #selector(performBrowserCommand(_:)):
             return !typing && (boardIsKey || keyWindow == TrashWindowController.windowIdentifier)
-        case #selector(undoSortOrText(_:)):
-            menuItem.title = typing ? "Undo" : "Undo Sort"
-            return typing || (boardIsKey && CameraToolkitRuntime.workspace.canUndoSort)
+        case #selector(undoOrText(_:)):
+            let workspace = CameraToolkitRuntime.workspace
+            menuItem.title = MainMenu.undoTitle(typing: typing, next: workspace.undoMenuTitle)
+            return typing || (historyWindowIsKey(keyWindow) && workspace.canUndo)
+        case #selector(redoOrText(_:)):
+            let workspace = CameraToolkitRuntime.workspace
+            menuItem.title = MainMenu.redoTitle(typing: typing, next: workspace.redoMenuTitle)
+            return typing || (historyWindowIsKey(keyWindow) && workspace.canRedo)
         case #selector(selectAllOnBoardOrText(_:)):
             return typing || boardIsKey || keyWindow == TrashWindowController.windowIdentifier
         case #selector(toggleSidebar(_:)):
@@ -164,6 +173,13 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate, NSMenuIte
         default:
             return true
         }
+    }
+
+    /// The one history answers ⌘Z from the board and from the windows whose
+    /// changes are in it: People (face changes), Duplicates and Trash.
+    private func historyWindowIsKey(_ identifier: String?) -> Bool {
+        BrowserCommand.targetsMainWindow(keyWindowIdentifier: identifier)
+            || ["CameraToolkitPeopleWindow", "CameraToolkitDuplicatesWindow", TrashWindowController.windowIdentifier].contains(identifier)
     }
 
     private var boardMode: OrganizeBoardMode {
@@ -234,12 +250,22 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate, NSMenuIte
         BrowserCommand.post(command)
     }
 
-    /// ⌘Z undoes typing in a field and the last sort everywhere else.
-    @objc func undoSortOrText(_ sender: Any?) {
+    /// ⌘Z undoes typing in a field and the newest action everywhere else.
+    @objc func undoOrText(_ sender: Any?) {
         if KeyboardTextFocus.isTypingInTextField() {
             NSApp.sendAction(Selector(("undo:")), to: nil, from: sender)
         } else {
-            NotificationCenter.default.post(name: .cameraToolkitUndoSort, object: nil)
+            NotificationCenter.default.post(name: .cameraToolkitUndo, object: nil)
+        }
+    }
+
+    /// ⌘⇧Z redoes typing in a field and the action that was just undone
+    /// everywhere else.
+    @objc func redoOrText(_ sender: Any?) {
+        if KeyboardTextFocus.isTypingInTextField() {
+            NSApp.sendAction(Selector(("redo:")), to: nil, from: sender)
+        } else {
+            NotificationCenter.default.post(name: .cameraToolkitRedo, object: nil)
         }
     }
 

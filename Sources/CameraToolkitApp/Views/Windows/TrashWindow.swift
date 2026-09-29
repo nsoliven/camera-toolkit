@@ -13,6 +13,11 @@ final class TrashWindowController: NSObject, NSWindowDelegate {
 
     private var window: NSWindow?
 
+    /// Called with what a restore brought back, so the events get back the
+    /// catalog entries their files dropped when they went to Trash. Set at
+    /// launch; returns how many entries were put back.
+    var onRestored: (@MainActor (MediaTrashRestoreReport) -> Int)?
+
     func show(model: DashboardModel) {
         if let window {
             CameraToolkitWindowFactory.present(window)
@@ -561,7 +566,7 @@ struct TrashBrowserView: View {
                 }
             },
             completion: { report in
-                let summary = Self.restoreSummary(report)
+                let summary = Self.restoreSummary(report, reinstated: TrashWindowController.shared.onRestored?(report) ?? 0)
                 message = summary
                 NotificationCenter.default.post(name: .cameraToolkitMediaTrashChanged, object: nil)
                 return summary
@@ -583,7 +588,7 @@ struct TrashBrowserView: View {
                 }
             },
             completion: { report in
-                let summary = Self.restoreSummary(report)
+                let summary = Self.restoreSummary(report, reinstated: TrashWindowController.shared.onRestored?(report) ?? 0)
                 message = summary
                 NotificationCenter.default.post(name: .cameraToolkitMediaTrashChanged, object: nil)
                 return summary
@@ -591,8 +596,12 @@ struct TrashBrowserView: View {
         )
     }
 
-    private static func restoreSummary(_ report: MediaTrashRestoreReport) -> String {
+    /// `reinstated`: catalog entries put back on their events with the files.
+    private static func restoreSummary(_ report: MediaTrashRestoreReport, reinstated: Int = 0) -> String {
         var parts = ["Restored \(report.restored.count) file(s) (\(report.restoredBytes.formattedBytes)) back to where they lived."]
+        if reinstated > 0 {
+            parts.append("\(reinstated) put back on \(reinstated == 1 ? "its" : "their") event\(reinstated == 1 ? "" : "s").")
+        }
         if !report.conflicts.isEmpty {
             parts.append("\(report.conflicts.count) stayed in Trash because a file already exists at the original path.")
         }
@@ -866,7 +875,7 @@ struct EmptyTrashSheet: View {
             }
 
             Label {
-                Text("This permanently deletes every batch inside the _Trash folders on your configured drives and the removed-files folder. Files anywhere else are never touched.")
+                Text("This permanently deletes every batch inside the _Trash folders on your configured drives and the removed-files folder. Files anywhere else are never touched. \(UndoScopeWording.emptyTrash)")
             } icon: {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .foregroundStyle(.orange)

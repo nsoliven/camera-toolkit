@@ -61,7 +61,7 @@ struct SyncAllConfirmSheet: View {
                 .font(.callout)
                 .fixedSize(horizontal: false, vertical: true)
             }
-            Text("Copies only files missing on the NAS, each to the same path it has on the drive, and checks every copy's SHA-256 before naming it. Nothing on the NAS is overwritten.")
+            Text("Copies only files missing on the NAS, each to the same path it has on the drive, and checks every copy's SHA-256 before naming it. Nothing on the NAS is overwritten. \(UndoScopeWording.syncToNAS)")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)

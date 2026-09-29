@@ -372,7 +372,7 @@ struct SetupGuidePanel: View {
             GuideBullet(symbol: "number", text: "Press 1–3 to send the selected photos to the numbered event in the bar above the photos. Event… searches the rest.")
             GuideBullet(symbol: "hand.draw", text: "Or drag tiles onto an event in the sidebar.")
             GuideBullet(symbol: "n.square", text: "Press N to make a new event from what’s selected.")
-            GuideBullet(symbol: "arrow.uturn.left", text: "Command-Z undoes a sort. Sorting never moves files by itself.")
+            GuideBullet(symbol: "arrow.uturn.left", text: "Command-Z takes back the newest action and Shift-Command-Z puts it back. Sorting never moves files by itself.")
         }
     }
 

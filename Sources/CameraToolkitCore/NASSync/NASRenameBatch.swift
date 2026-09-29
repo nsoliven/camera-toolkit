@@ -105,6 +105,9 @@ public struct NASRenameBatch: Codable, Identifiable, Equatable, Sendable {
     public var ops: [NASRename]
     /// Set when the move was undone: the batch is closed.
     public var undoneAt: Date?
+    /// Set when Redo of the move queued this batch's renames again: the
+    /// batch is spent, so a later Redo does not queue them twice.
+    public var redoneAt: Date?
     public var completedAt: Date?
 
     public init(
@@ -145,6 +148,38 @@ public struct NASRenameQueue: Sendable {
 
     public init(journalFolder: URL) {
         self.folder = journalFolder.appendingPathComponent(Self.folderName, isDirectory: true)
+    }
+
+    /// One lock per queue folder, shared by everything in the process that
+    /// applies, undoes or redoes batches: an Undo that cancels a queued rename
+    /// waits for a job that is renaming, and the job that reads a batch after
+    /// it sees the cancellation. Recursive — an Undo applies its own reverse.
+    public var lock: NSRecursiveLock {
+        Self.registry.lock(for: folder.standardizedFileURL.path)
+    }
+
+    private final class LockRegistry: @unchecked Sendable {
+        private let guardLock = NSLock()
+        private var locks: [String: NSRecursiveLock] = [:]
+
+        func lock(for path: String) -> NSRecursiveLock {
+            guardLock.withLock {
+                if let existing = locks[path] { return existing }
+                let made = NSRecursiveLock()
+                locks[path] = made
+                return made
+            }
+        }
+    }
+
+    private static let registry = LockRegistry()
+
+    /// The batch as it is on disk now, or nil when it was never saved. A batch
+    /// in memory can be stale — an Undo may have closed or cancelled it since
+    /// it was read — and saving it back would undo the Undo.
+    public func load(_ batch: NASRenameBatch) -> NASRenameBatch? {
+        guard let data = try? Data(contentsOf: url(for: batch)) else { return nil }
+        return try? JSONDecoder().decode(NASRenameBatch.self, from: data)
     }
 
     /// The file a batch lives in; stable for a batch, so saving overwrites.

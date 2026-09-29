@@ -80,25 +80,6 @@ extension EventsWorkspace {
         }
     }
 
-    /// Reverses the NAS renames queued under `moveJournalID` — the undo of a
-    /// change that had no drive move to journal (a photo only the NAS has).
-    /// Applied now when the NAS is there, queued when it is not.
-    func undoNASRenames(moveJournalID: UUID) {
-        let queue = nasRenameQueue
-        let nasRoot = locations.nasRoot
-        let catalogURL = URL(fileURLWithPath: DashboardModel.expandedPath(model.configuration.catalogDatabasePath))
-        Task { @MainActor [weak self] in
-            let done = await Task.detached(priority: .userInitiated) { () -> (NASUndoResult, Int)? in
-                let follower = NASMoveFollower(store: try? NASSyncStore(catalogURL: catalogURL), queue: queue)
-                guard let undone = try? follower.undo(moveJournalID: moveJournalID, nasRoot: nasRoot) else { return nil }
-                return (undone, queue.pendingRenameCount(nasRoot: nasRoot.path))
-            }.value
-            guard let self, let (undone, remaining) = done else { return }
-            nasRenamesApplied(undone.follow, remaining: remaining)
-            model.statusMessage += NASFollowWording.undone(undone)
-        }
-    }
-
     /// A job queued renames: the count is kept in memory so a finished job
     /// need not read the journal folder to know whether the NAS owes any.
     func noteNASRenamesQueued(_ count: Int) {

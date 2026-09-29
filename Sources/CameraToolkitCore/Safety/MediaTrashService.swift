@@ -20,6 +20,10 @@ public struct TrashContext: Sendable {
     /// Capture dates the board already knew, keyed like `eventIDsByPathKey`.
     /// Files without one fall back to the batch's trash date when filtered.
     public var captureDatesByPathKey: [String: Date]
+    /// The catalog entries that stop describing each file once it is in the
+    /// Trash, keyed like `eventIDsByPathKey`. Recorded in the manifest so a
+    /// restore — from the Trash window or an Undo — can put them back.
+    public var assignmentsByPathKey: [String: [PhotoEventAssignment]]
 
     public init(
         locationName: String? = nil,
@@ -27,7 +31,8 @@ public struct TrashContext: Sendable {
         eventIDsByPathKey: [String: UUID] = [:],
         eventNamesByID: [UUID: String] = [:],
         personNamesByPathKey: [String: [String]] = [:],
-        captureDatesByPathKey: [String: Date] = [:]
+        captureDatesByPathKey: [String: Date] = [:],
+        assignmentsByPathKey: [String: [PhotoEventAssignment]] = [:]
     ) {
         self.locationName = locationName
         self.deviceID = deviceID
@@ -35,6 +40,7 @@ public struct TrashContext: Sendable {
         self.eventNamesByID = eventNamesByID
         self.personNamesByPathKey = personNamesByPathKey
         self.captureDatesByPathKey = captureDatesByPathKey
+        self.assignmentsByPathKey = assignmentsByPathKey
     }
 }
 
@@ -58,6 +64,11 @@ public struct MediaTrashEntry: Codable, Hashable, Sendable {
     public var capturedAt: Date?
     public var deviceID: String?
     public var size: Int64
+    /// The event entries that were dropped from the catalog when this file
+    /// went to Trash. Restoring the file puts them back (when their event
+    /// still exists and nothing else owns the file). Empty for batches
+    /// written before this was recorded — those restore files only.
+    public var droppedAssignments: [PhotoEventAssignment]
 
     public init(
         trashedRelativePath: String,
@@ -68,7 +79,8 @@ public struct MediaTrashEntry: Codable, Hashable, Sendable {
         personNames: [String] = [],
         capturedAt: Date? = nil,
         deviceID: String? = nil,
-        size: Int64
+        size: Int64,
+        droppedAssignments: [PhotoEventAssignment] = []
     ) {
         self.trashedRelativePath = trashedRelativePath
         self.originalAbsolutePath = originalAbsolutePath
@@ -79,6 +91,7 @@ public struct MediaTrashEntry: Codable, Hashable, Sendable {
         self.capturedAt = capturedAt
         self.deviceID = deviceID
         self.size = size
+        self.droppedAssignments = droppedAssignments
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -91,6 +104,7 @@ public struct MediaTrashEntry: Codable, Hashable, Sendable {
         case capturedAt
         case deviceID
         case size
+        case droppedAssignments
     }
 
     /// Manifests written before the tag fields existed decode with empty
@@ -106,6 +120,61 @@ public struct MediaTrashEntry: Codable, Hashable, Sendable {
         capturedAt = try container.decodeIfPresent(Date.self, forKey: .capturedAt)
         deviceID = try container.decodeIfPresent(String.self, forKey: .deviceID)
         size = try container.decode(Int64.self, forKey: .size)
+        droppedAssignments = (try container.decodeIfPresent([StoredAssignment].self, forKey: .droppedAssignments) ?? [])
+            .map(\.assignment)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(trashedRelativePath, forKey: .trashedRelativePath)
+        try container.encode(originalAbsolutePath, forKey: .originalAbsolutePath)
+        try container.encodeIfPresent(originalLocationName, forKey: .originalLocationName)
+        try container.encodeIfPresent(eventID, forKey: .eventID)
+        try container.encodeIfPresent(eventName, forKey: .eventName)
+        try container.encode(personNames, forKey: .personNames)
+        try container.encodeIfPresent(capturedAt, forKey: .capturedAt)
+        try container.encodeIfPresent(deviceID, forKey: .deviceID)
+        try container.encode(size, forKey: .size)
+        if !droppedAssignments.isEmpty {
+            try container.encode(droppedAssignments.map(StoredAssignment.init), forKey: .droppedAssignments)
+        }
+    }
+
+    /// An assignment as the manifest keeps it. The manifest's dates are
+    /// whole-second ISO 8601, but an assignment's identity rounds its
+    /// modification time — a truncated date could name a different entry and
+    /// a restore would add a second one — so the time is stored as the
+    /// exact number of seconds.
+    private struct StoredAssignment: Codable {
+        var sourceRootPath: String
+        var relativePath: String
+        var fileSize: Int64
+        var modifiedAt: Double
+        var eventID: UUID
+        var deviceID: String?
+        var immichUploadOverride: Bool?
+
+        init(_ assignment: PhotoEventAssignment) {
+            sourceRootPath = assignment.sourceRootPath
+            relativePath = assignment.relativePath
+            fileSize = assignment.fileSize
+            modifiedAt = assignment.modifiedAt.timeIntervalSince1970
+            eventID = assignment.eventID
+            deviceID = assignment.deviceID
+            immichUploadOverride = assignment.immichUploadOverride
+        }
+
+        var assignment: PhotoEventAssignment {
+            PhotoEventAssignment(
+                sourceRootPath: sourceRootPath,
+                relativePath: relativePath,
+                fileSize: fileSize,
+                modifiedAt: Date(timeIntervalSince1970: modifiedAt),
+                eventID: eventID,
+                deviceID: deviceID,
+                immichUploadOverride: immichUploadOverride
+            )
+        }
     }
 }
 
@@ -372,6 +441,9 @@ public struct MediaTrashRestoreReport: Sendable {
     /// Path → reason for files that could not move back.
     public var failed: [String: String] = [:]
     public var restoredBytes: Int64 = 0
+    /// The manifest entries whose file went back, so the caller can put the
+    /// catalog entries they recorded back too.
+    public var restoredEntries: [MediaTrashEntry] = []
 
     public init() {}
 }
@@ -763,6 +835,7 @@ public struct MediaTrashService {
                 try DriveMoveService.renameExclusive(from: source.path, to: destination.path)
                 DriveMoveService.moveAppleDoubleIfNeeded(from: source.path, to: destination.path)
                 report.restored.append(entry.originalAbsolutePath)
+                report.restoredEntries.append(entry)
                 report.restoredBytes += entry.size
             } catch {
                 report.failed[entry.originalAbsolutePath] = error.localizedDescription
@@ -840,7 +913,8 @@ public struct MediaTrashService {
             personNames: context.personNamesByPathKey[key] ?? [],
             capturedAt: context.captureDatesByPathKey[key],
             deviceID: context.deviceID,
-            size: move.file.size
+            size: move.file.size,
+            droppedAssignments: context.assignmentsByPathKey[key] ?? []
         )
     }
 

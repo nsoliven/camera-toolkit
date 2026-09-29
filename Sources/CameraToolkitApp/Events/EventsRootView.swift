@@ -159,8 +159,11 @@ struct EventsRootView: View {
             }
         }
         .onAppear { workspace.start() }
-        .onReceive(NotificationCenter.default.publisher(for: .cameraToolkitUndoSort)) { _ in
-            workspace.undoLastSort()
+        .onReceive(NotificationCenter.default.publisher(for: .cameraToolkitUndo)) { _ in
+            workspace.undo()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .cameraToolkitRedo)) { _ in
+            workspace.redo()
         }
         .onReceive(NotificationCenter.default.publisher(for: .cameraToolkitStorageLocationsChanged)) { _ in
             workspace.discoverDriveEvents()

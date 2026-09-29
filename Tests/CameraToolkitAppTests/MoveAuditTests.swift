@@ -19,6 +19,15 @@ final class MoveAuditTests: XCTestCase {
         library.workspace.moveStacks(Set(stacks.map(\.id)), fromEvent: library.id(from), toEvent: library.id(to))
     }
 
+    /// Takes the newest entry off the history, as if that change had been made
+    /// by something that does not register one (an older build, a Finder
+    /// rename) — the entries below it then meet a world they did not expect.
+    private func forgetNewestUndo(_ library: AuditLibrary) {
+        if let newest = library.workspace.undoHistory.nextUndo {
+            library.workspace.undoHistory.remove(newest.id)
+        }
+    }
+
     // MARK: - Undo
 
     /// Two files move; one name is taken again before Undo. The file that
@@ -506,8 +515,10 @@ final class MoveAuditTests: XCTestCase {
 
     // MARK: - Undo after an event changed
 
-    /// The event a move left was renamed since: undoing would recreate the old
+    /// The event a move left was renamed since — by something the history
+    /// does not know (an older build, Finder): undoing would recreate the old
     /// folder and drop the file into it while the event looks in the new one.
+    /// The move stays in the history, and nothing is recreated.
     func testUndoAfterTheSourceEventWasRenamedRefusesAndRecreatesNothing() async throws {
         let library = try AuditLibrary.make()
         defer { library.tearDown() }
@@ -521,14 +532,45 @@ final class MoveAuditTests: XCTestCase {
 
         library.workspace.renameEvent(library.id("a"), name: "Beach Days", date: AuditLibrary.day, policy: .buffer, parentEventID: nil)
         try await library.settle()
-        library.workspace.undoLastMove()
+        forgetNewestUndo(library)
+        library.workspace.undo()
         try await library.settle()
         XCTAssertTrue(library.model.statusMessage.contains("was renamed or moved since"), library.model.statusMessage)
         XCTAssertFalse(library.exists(oldFolder.path), "the old folder was not recreated")
         XCTAssertEqual(library.assignments("b").map(\.relativePath), ["DSC00001.ARW"])
         XCTAssertTrue(library.assignments("a").isEmpty)
-        XCTAssertNil(library.workspace.latestMoveJournalTitle, "the journal no longer stands in front of older changes")
+        XCTAssertEqual(library.workspace.latestMoveJournalTitle, "Move to Hotel Night", "the move is still there to undo once the rename is undone — it is not abandoned")
         XCTAssertTrue(library.exists(library.folder("b").appendingPathComponent("DSC00001.ARW").path))
+    }
+
+    /// The same sequence with the rename made here: it is the newest entry,
+    /// so it is the first thing ⌘Z takes back; the second ⌘Z takes back the
+    /// move — nothing was abandoned on the way.
+    func testUndoingARenameThenTheMoveBeforeItReturnsBothWithoutAbandoningTheMove() async throws {
+        let library = try AuditLibrary.make()
+        defer { library.tearDown() }
+        twoEvents(library)
+        let file = try library.place("a", name: "DSC00001.ARW", content: photo("1"))
+        await library.open("a", "b")
+        try click(library, [file.url.path], from: "a", to: "b")
+        try await library.settle()
+
+        library.workspace.renameEvent(library.id("a"), name: "Beach Days", date: AuditLibrary.day, policy: .buffer, parentEventID: nil)
+        try await library.settle()
+        XCTAssertEqual(library.workspace.undoMenuTitle, "Undo Rename Beach Day")
+
+        library.workspace.undo()
+        try await library.settle()
+        XCTAssertEqual(library.event("a").name, "Beach Day")
+        XCTAssertEqual(library.workspace.undoMenuTitle, "Undo Move to Hotel Night (1 file)")
+
+        library.workspace.undo()
+        try await library.settle()
+        XCTAssertEqual(library.assignments("a").map(\.relativePath), ["DSC00001.ARW"])
+        XCTAssertTrue(library.assignments("b").isEmpty)
+        XCTAssertTrue(library.exists(file.url.path), "the file is back where it started")
+        XCTAssertFalse(library.workspace.canUndo)
+        XCTAssertEqual(library.workspace.redoMenuTitle, "Redo Move to Hotel Night (1 file)")
     }
 
     /// Undoing a move into an event that was deleted since would put entries
@@ -543,10 +585,12 @@ final class MoveAuditTests: XCTestCase {
         try await library.settle()
         library.workspace.deleteEmptyEvent(library.id("a"))
         XCTAssertNil(library.workspace.event(library.id("a")), "Beach Day is empty now, so it deletes")
+        forgetNewestUndo(library)
 
-        library.workspace.undoLastMove()
+        library.workspace.undo()
         try await library.settle()
         XCTAssertTrue(library.model.statusMessage.contains("was deleted since"), library.model.statusMessage)
+        XCTAssertNil(library.workspace.latestMoveJournalTitle, "it can never run, so it stops standing in front of older changes")
         XCTAssertEqual(library.model.configuration.photoEventAssignments.count, 1)
         XCTAssertEqual(library.assignments("b").map(\.relativePath), ["DSC00001.ARW"])
         for assignment in library.model.configuration.photoEventAssignments {
@@ -573,8 +617,9 @@ final class MoveAuditTests: XCTestCase {
         let renamedCopy = try nasCopy(library, of: library.assignments("b")[0], in: "b")
         try await library.waitUntil(timeout: 20, "the NAS folder never followed") { library.exists(renamedCopy.path) }
         try await library.settle()
+        forgetNewestUndo(library)
 
-        library.workspace.undoLastSort()
+        library.workspace.undo()
         try await library.settle()
         XCTAssertTrue(library.model.statusMessage.contains("was renamed or moved since"), library.model.statusMessage)
         XCTAssertEqual(library.assignments("b").count, 1)
@@ -711,10 +756,38 @@ final class MoveAuditTests: XCTestCase {
         XCTAssertTrue(library.exists(landed.path))
         XCTAssertFalse(library.exists(photo.path))
 
-        workspace.undoLastSort()
+        // Something that does not register (an older build's Apply) sits on
+        // top: the Apply's entry is not in the history, so the sort is next.
+        forgetNewestUndo(library)
+        workspace.undo()
         XCTAssertEqual(library.assignments("a").count, 1, "the entry stays")
         XCTAssertTrue(library.model.statusMessage.contains("Return to Unsorted"), library.model.statusMessage)
         XCTAssertTrue(library.exists(landed.path))
+    }
+
+    /// The same sequence in order: the first ⌘Z takes the Apply back (the
+    /// file returns to the card), the second takes the sort back.
+    func testUndoingAnApplyThenItsSortWorksInOrder() async throws {
+        let (library, location, photo) = try await cardLibrary()
+        defer { library.tearDown() }
+        let workspace = library.workspace
+        let result = try XCTUnwrap(workspace.sources[location.id]?.result)
+        workspace.assign(stackIDs: Set(result.stacks.map(\.id)), from: location.id, to: library.id("a"))
+        workspace.prepareApply(sourceLocationID: location.id)
+        try await library.waitUntil("the plan never appeared") { workspace.pendingApplyPlan != nil }
+        workspace.performApply(try XCTUnwrap(workspace.pendingApplyPlan))
+        try await library.settle()
+        let landed = library.folder("a").appendingPathComponent("DSC00001.ARW")
+        XCTAssertTrue(library.exists(landed.path))
+
+        workspace.undo()
+        try await library.settle()
+        XCTAssertTrue(library.exists(photo.path), "the Apply's rename went back")
+        XCTAssertEqual(library.assignments("a").count, 1, "the sort is still there")
+        workspace.undo()
+        try await library.settle()
+        XCTAssertTrue(library.assignments("a").isEmpty, "then the sort")
+        XCTAssertTrue(library.exists(photo.path))
     }
 
     // MARK: - Trash from an event
@@ -946,10 +1019,11 @@ final class MoveAuditTests: XCTestCase {
         try await library.settle()
         XCTAssertEqual(library.assignments("c").map(\.relativePath), ["CARD_1.ARW"])
 
-        // Undo the first move: its rename goes back, but its catalog-only
-        // entry for the card photo is not put back — the photo moved on since
-        // and would be assigned twice.
-        library.workspace.undoLastMove()
+        // Undo the first move with the second missing from the history: its
+        // rename goes back, but its catalog-only entry for the card photo is
+        // not put back — the photo moved on since and would be assigned twice.
+        forgetNewestUndo(library)
+        library.workspace.undo()
         try await library.settle()
         let owners = library.model.configuration.photoEventAssignments.filter { $0.relativePath == "CARD_1.ARW" }
         XCTAssertEqual(owners.count, 1, "the card photo is assigned once: \(owners.map { library.key(of: $0.eventID) })")
@@ -980,17 +1054,21 @@ final class MoveAuditTests: XCTestCase {
         try await waitForDisk("the merge never reached the catalog")
         XCTAssertEqual(library.assignments("b").count, 2)
 
-        library.workspace.undoLastMove()
+        library.workspace.undo()
         try await library.settle()
         try await waitForDisk("the undo never reached the catalog")
-        XCTAssertEqual(library.assignments("a").map(\.relativePath), ["DSC00002.ARW"], "the merged copy is not brought back by Undo")
+        XCTAssertEqual(
+            library.assignments("a").map(\.relativePath).sorted(), ["DSC00001.ARW", "DSC00002.ARW"],
+            "Undo brings the merged copy back too: its entry, and the spare copy out of Trash"
+        )
+        XCTAssertTrue(library.exists(same.url.path))
 
         await library.open("a")
         let tile = try XCTUnwrap(library.stack(at: other.url.path, on: "a"))
         library.workspace.returnToUnsorted([tile.id], eventID: library.id("a"))
         try await library.settle()
         try await waitForDisk("the return never reached the catalog")
-        XCTAssertTrue(library.assignments("a").isEmpty)
+        XCTAssertEqual(library.assignments("a").map(\.relativePath), ["DSC00001.ARW"])
     }
 
     /// Two clicks queued behind one job, each bringing a file of the same name

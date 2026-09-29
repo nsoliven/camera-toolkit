@@ -52,6 +52,15 @@ Use `scripts/package-app.sh --install` only when the user asks to refresh the in
 - Preserve the existing Finder-style browser and Photomator-opening behavior when changing catalog or thumbnail features.
 - Preserve unrelated dirty or untracked files. Stage and commit only files in the requested scope.
 
+## Undo History
+
+- Every user-visible action that can be taken back registers one `UndoEntry` in `EventsWorkspace.undoHistory` (`EventsWorkspace+Undo.swift`) when it finishes; ⌘Z always takes the newest, ⌘⇧Z redoes. Do not add a second undo stack.
+- Undo and Redo of anything that touches files run as jobs, reuse the action's refusals, and never replace or delete a file: a moved file is renamed back, a trashed file is restored to the path its manifest records, NAS copies follow through journaled exclusive renames.
+- Entries replay only what they recorded (journal id, Trash batch, NAS batch ids, catalog rows, face row snapshots). Persist new kinds through `UndoHistoryStore`; keep memory-only ones to `UndoAction.session`.
+- A journal's Undo or Redo is marked (`pendingStep`) before its first rename and closed (`DriveMoveService.finishStep`) only after the catalog and the NAS copies followed; a launch replays whatever is unfinished. NAS renames, Undo and Redo of one queue folder run under one lock and re-read their batch from disk.
+- With a drive unplugged or wiped, a step acts on the NAS copies and the catalog only when every file it names has a NAS copy that followed it (`driveLagging` records that the drive is one step behind); otherwise it changes nothing and says which volume it needs.
+- Remove from Source, Take Off Drive (its copies wait in Trash), Empty Trash, Sync to NAS, Immich upload and Settings are deliberately outside Undo; their confirmations say so.
+
 ## Verification
 
 - Run the full Swift test suite for code changes.

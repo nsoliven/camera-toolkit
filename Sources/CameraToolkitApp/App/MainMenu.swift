@@ -10,7 +10,8 @@ import AppKit
     func addFolderOrCard(_ sender: Any?)
     func syncAllToNAS(_ sender: Any?)
     func performBrowserCommand(_ sender: NSMenuItem)
-    func undoSortOrText(_ sender: Any?)
+    func undoOrText(_ sender: Any?)
+    func redoOrText(_ sender: Any?)
     func selectAllOnBoardOrText(_ sender: Any?)
     func toggleSidebar(_ sender: Any?)
     func toggleInspector(_ sender: Any?)
@@ -59,6 +60,18 @@ enum MainMenu {
     }
 
     static let appName = "Camera Toolkit"
+
+    /// Edit ▸ Undo: a text field's own Undo while typing, else what ⌘Z will
+    /// do — "Undo Move to Lakeside (12 files)" — or a plain "Undo" when the
+    /// history is empty. `next` is the history's own "Undo …" title.
+    static func undoTitle(typing: Bool, next: String?) -> String {
+        typing ? "Undo" : (next ?? "Undo")
+    }
+
+    /// Edit ▸ Redo, the same way.
+    static func redoTitle(typing: Bool, next: String?) -> String {
+        typing ? "Redo" : (next ?? "Redo")
+    }
 
     static func make(target: MainMenuActions?) -> NSMenu {
         let main = NSMenu()
@@ -111,8 +124,10 @@ enum MainMenu {
 
     private static func editMenu(_ target: MainMenuActions?) -> NSMenu {
         let menu = NSMenu(title: "Edit")
-        menu.addItem(item("Undo", #selector(MainMenuActions.undoSortOrText(_:)), "z", to: target))
-        menu.addItem(item("Redo", Selector(("redo:")), "z", [.command, .shift]))
+        // Both name what they will do ("Undo Move to Lakeside (12 files)") once the
+        // app delegate validates them; text fields keep their own Undo/Redo.
+        menu.addItem(item("Undo", #selector(MainMenuActions.undoOrText(_:)), "z", to: target))
+        menu.addItem(item("Redo", #selector(MainMenuActions.redoOrText(_:)), "z", [.command, .shift], to: target))
         menu.addItem(.separator())
         menu.addItem(item("Cut", #selector(NSText.cut(_:)), "x"))
         menu.addItem(item("Copy", #selector(NSText.copy(_:)), "c"))
