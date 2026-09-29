@@ -985,6 +985,55 @@ final class NASMoveFollowerTests: XCTestCase {
         }
     }
 
+    /// An edit exported unchanged is byte-identical to its original but has
+    /// no assignment by design: it is never a leftover of a move.
+    func testReconcileNeverSetsAsideAnEditedFileIdenticalToItsOriginal() throws {
+        try withTemporaryDirectory { root in
+            let w = try world(root)
+            let content = data(1)
+            let original = try seed(w, w.eventA, "IMG_0001.ARW", content)
+            let originals = original.relative.components(separatedBy: "/\(EventStorageLocations.originalsFolderName)/")[0]
+            let edited = "\(originals)/\(EventStorageLocations.editedFolderName)/Picks/IMG_0001.ARW"
+            try writeFile(w.nas.appendingPathComponent(edited), content)
+            try w.store.upsert([NASSyncRecord(
+                nasRoot: w.nas.path, relativePath: edited, eventID: w.eventA.id, byteCount: Int64(content.count),
+                sourceModifiedAt: 1_000, sha256: sha(content), state: .verified,
+                checkedAt: Date(timeIntervalSinceReferenceDate: 900_000_000), verifiedAt: Date(timeIntervalSinceReferenceDate: 900_000_000)
+            )])
+            let plan = NASSyncPlanner.plan(events: w.configuration.savedEvents, locations: w.locations)
+
+            let analysis = NASCatchUp.analyze(plan: plan, records: try w.store.records(nasRoot: w.nas.path), ownedKeys: [], locations: w.locations)
+            XCTAssertTrue(analysis.staleDuplicates.isEmpty, "\(analysis.staleDuplicates.map(\.stale.relativePath))")
+            let result = try w.follower().reconcile(plan: plan, ownedKeys: [], locations: w.locations, nasRoot: w.nas)
+            XCTAssertEqual(result.changed, 0, result.summary)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: w.nas.appendingPathComponent(edited).path))
+            XCTAssertTrue(staleFiles(w).isEmpty)
+        }
+    }
+
+    /// With the drive away nothing proves a NAS path is a leftover, so
+    /// reconcile sets nothing aside — the Buffer is usually unplugged.
+    func testReconcileSetsNothingAsideWhileTheDriveIsAway() throws {
+        try withTemporaryDirectory { root in
+            let w = try world(root)
+            let content = data(1)
+            let stale = try seed(w, w.eventA, "IMG_0001.ARW", content, onDrive: false)
+            let right = try seed(w, w.eventB, "IMG_0001.ARW", content, onDrive: false)
+            for folder in [w.locations.bufferRoot, w.locations.privateStagingRoot] {
+                try? FileManager.default.removeItem(at: folder)
+            }
+            let plan = NASSyncPlanner.plan(events: w.configuration.savedEvents, locations: w.locations)
+            let owned: Set<String> = [NASSyncStore.pathKey(right.relative)]
+
+            let analysis = NASCatchUp.analyze(plan: plan, records: try w.store.records(nasRoot: w.nas.path), ownedKeys: owned, locations: w.locations)
+            XCTAssertTrue(analysis.staleDuplicates.isEmpty)
+            let result = try w.follower().reconcile(plan: plan, ownedKeys: owned, locations: w.locations, nasRoot: w.nas)
+            XCTAssertEqual(result.changed, 0, result.summary)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: stale.nas.path), "kept until the drive can prove it is a leftover")
+            XCTAssertTrue(staleFiles(w).isEmpty)
+        }
+    }
+
     // MARK: Listing and store
 
     func testTheListingFollowsRenamesAndFolderRenames() {

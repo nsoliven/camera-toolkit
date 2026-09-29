@@ -77,13 +77,19 @@ public enum NASCatchUp {
                 DriveMoveService.exists(root.path + "/" + relative)
             }
         }
+        // Ownership is only provable with the drive present: with it away
+        // (the usual case — the Buffer is temporary) nothing is an orphan.
+        let driveMounted = [locations.bufferRoot, locations.privateStagingRoot].contains { DriveMoveService.exists($0.path) }
         var orphans: [NASSyncRecord] = []
         var keepers: [String: NASSyncRecord] = [:]
         for record in records.values.sorted(by: { $0.pathKey < $1.pathKey }) {
             guard record.state == .verified, record.sha256 != nil, NASMoveFollower.isEventPath(record.relativePath) else { continue }
             if ownedKeys.contains(record.pathKey) || planKeys.contains(record.pathKey) || onDrive(record.relativePath) {
                 if keepers[identity(record)] == nil { keepers[identity(record)] = record }
-            } else {
+            } else if driveMounted, isOriginalsPath(record.relativePath) {
+                // Only originals are owned through assignments. Edited
+                // files, sidecar folders and anything else have no
+                // assignment by design and are never leftovers.
                 orphans.append(record)
             }
         }
@@ -158,6 +164,13 @@ public enum NASCatchUp {
         duplicates.map {
             NASRename(from: $0.stale.relativePath, to: $0.keeper.relativePath, byteCount: $0.stale.byteCount, eventID: $0.keeper.eventID)
         }
+    }
+
+    /// `<year>/<event>/[<subevent>/]Originals/<camera>/…` — the only files
+    /// an assignment owns, so the only ones that can be left behind by a
+    /// move. `Edited/` and other folders are never orphans.
+    static func isOriginalsPath(_ relativePath: String) -> Bool {
+        relativePath.split(separator: "/").dropLast().contains { $0 == EventStorageLocations.originalsFolderName }
     }
 
     private static func identity(_ record: NASSyncRecord) -> String {
