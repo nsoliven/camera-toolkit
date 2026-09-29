@@ -65,6 +65,7 @@ struct SyncAllConfirmSheet: View {
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+            reconcileSection
             if let note = presence.note {
                 Text(note)
                     .font(.caption)
@@ -88,6 +89,43 @@ struct SyncAllConfirmSheet: View {
                 .keyboardShortcut(.defaultAction)
                 .disabled(blocker != nil)
         }
+    }
+
+    /// "Reconcile NAS after moves": what the sync renames on the NAS
+    /// instead of copying, and the stale duplicates it sets aside. Counts
+    /// come from Sync to NAS's records and the drive, not from the NAS.
+    @ViewBuilder
+    private var reconcileSection: some View {
+        @Bindable var workspace = workspace
+        let preview = workspace.reconcilePreview
+        VStack(alignment: .leading, spacing: 4) {
+            Toggle("Reconcile NAS after moves", isOn: $workspace.syncAllReconcile)
+            Text(reconcileDetail(preview))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func reconcileDetail(_ preview: NASReconcilePreview?) -> String {
+        var lines: [String] = []
+        if let preview {
+            if preview.renames > 0 {
+                lines.append("\(NASPendingText.files(preview.renames)) (\(preview.renameBytes.formattedBytes)) will be renamed on the NAS from the old path instead of copied.")
+            }
+            if preview.staleDuplicates > 0 {
+                lines.append("\(NASPendingText.files(preview.staleDuplicates)) (\(preview.staleBytes.formattedBytes)) stale duplicate\(preview.staleDuplicates == 1 ? "" : "s") of files already at their right path will be set aside in .Camera Toolkit/_Stale Copies on the NAS — never deleted.")
+            }
+            if preview.renames == 0, preview.staleDuplicates == 0 {
+                lines.append("Nothing found: no NAS copy waits at an old path and no stale duplicate is on the NAS.")
+            }
+            if preview.queuedRenames > 0 {
+                lines.append("\(preview.queuedRenames.formatted()) rename\(preview.queuedRenames == 1 ? "" : "s") queued by earlier moves are applied first, whatever this is set to.")
+            }
+        } else {
+            lines.append("Looking for NAS copies left at old paths by earlier moves…")
+        }
+        return lines.joined(separator: " ")
     }
 
     private func subtitle(_ report: NASPresenceReport?) -> String {

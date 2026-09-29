@@ -200,7 +200,20 @@ final class NASPresenceModel {
     func jobFinished(_ action: JobAction) {
         guard action != .syncBuffer else { return }
         // Renames on the drives never write the NAS: recount, do not list.
-        refresh(action == .organize ? .bufferChanged : .jobFinished)
+        // NAS renames patched the listing themselves (`noteRenamed`).
+        refresh(action == .organize || action == .nasRename ? .bufferChanged : .jobFinished)
+    }
+
+    /// NAS copies were renamed to follow drive moves: the listing follows
+    /// them now and the counts are redone from it — local work only — so a
+    /// moved file counts as on the NAS again without listing the NAS.
+    func noteRenamed(_ result: NASFollowResult) {
+        guard isEnabled, result.changed > 0 else { return }
+        if var patched = listing {
+            result.patch(&patched)
+            listing = patched
+        }
+        refresh(.bufferChanged)
     }
 
     /// Sync to NAS just proved these files on the NAS: the listing learns
