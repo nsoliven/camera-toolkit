@@ -653,8 +653,10 @@ private struct EventActionsMenu: View {
             Task { await workspace.refreshEvent(eventID) }
         }
         Divider()
-        Button("Undo Last Move") { workspace.undoLastMove() }
-            .disabled(workspace.latestMoveJournalTitle == nil || model.isBusy)
+        Button(workspace.undoMenuTitle ?? "Undo") { workspace.undo() }
+            .disabled(!workspace.canUndo || model.isBusy)
+        Button(workspace.redoMenuTitle ?? "Redo") { workspace.redo() }
+            .disabled(!workspace.canRedo || model.isBusy)
         Button("Delete Empty Event", role: .destructive) { workspace.deleteEmptyEvent(eventID) }
             .disabled(workspace.assignmentCount(for: eventID) > 0)
     }
@@ -901,6 +903,7 @@ struct EventStorageSlots {
                 .fixedSize()
                 Button("Upload") { workspace.uploadToImmich(event.id) }
                     .disabled(model.isBusy || summary == nil)
+                    .help(UndoScopeWording.immichUpload)
             }
         }
     }

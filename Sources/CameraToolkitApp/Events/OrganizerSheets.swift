@@ -347,6 +347,10 @@ struct RemovalConfirmSheet: View {
         ) {
             Text(explanation)
                 .fixedSize(horizontal: false, vertical: true)
+            Text(request.kind == .drive ? UndoScopeWording.takeOffDrive : UndoScopeWording.removeFromSource)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
             Text("\(request.fileCount) file\(request.fileCount == 1 ? "" : "s") · \(request.byteCount.formattedBytes)")
                 .font(.callout.monospacedDigit())
                 .foregroundStyle(.secondary)

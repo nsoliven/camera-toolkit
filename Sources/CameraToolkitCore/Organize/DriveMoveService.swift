@@ -47,6 +47,19 @@ public struct DriveMoveJournal: Codable, Sendable {
     /// somewhere else — renamed, re-dated or re-parented — instead of putting
     /// files and NAS copies back under the old name.
     public var eventFolders: [String: String]?
+    /// The indices in `moves` Undo has put back so far — what Redo renames
+    /// forward again. Nil in journals undone before Redo existed (Redo then
+    /// takes every move the journal completed).
+    public var undoneIndices: [Int]?
+    /// An Undo or Redo of this journal that has begun: "undo" or "redo". Set
+    /// before the first rename and cleared (`finishStep`) only once the
+    /// catalog and the NAS copies have followed the drive — so a crash
+    /// anywhere in between is replayed at the next launch instead of leaving
+    /// the catalog behind the drive's files.
+    public var pendingStep: String?
+    /// The drive renames of `pendingStep` are all done (the catalog and the
+    /// NAS copies may not be yet).
+    public var driveStepDone: Bool?
 
     public var completedMoves: [DriveMove] {
         completedIndices.compactMap { moves.indices.contains($0) ? moves[$0] : nil }
@@ -75,6 +88,33 @@ public struct DriveMoveJournal: Codable, Sendable {
         for position in 0..<max(removedAssignments.count, addedAssignments.count) {
             if position < indices.count, let move = indices[position], !wentBack.contains(move) { continue }
             if position < addedAssignments.count, !isCurrent(addedAssignments[position]) { continue }
+            if position < removedAssignments.count { removed.append(removedAssignments[position]) }
+            if position < addedAssignments.count { added.append(addedAssignments[position]) }
+        }
+        return (removed, added)
+    }
+
+    /// The catalog entries Redo should swap forward after re-applying the
+    /// moves at `redone`: those whose file went forward again and those that
+    /// only ever moved in the catalog. `removed` are entries to take out,
+    /// `added` are entries to put in. `isCurrent` says whether an entry the
+    /// action originally removed is in the catalog now — one a later change
+    /// already replaced is left alone.
+    public func assignmentsToReapply(
+        redone: [Int],
+        fullyRedone: Bool,
+        isCurrent: (PhotoEventAssignment) -> Bool = { _ in true }
+    ) -> (removed: [PhotoEventAssignment], added: [PhotoEventAssignment]) {
+        guard let indices = assignmentMoveIndices else {
+            guard fullyRedone else { return ([], []) }
+            return (removedAssignments, addedAssignments)
+        }
+        let wentForward = Set(redone)
+        var removed: [PhotoEventAssignment] = []
+        var added: [PhotoEventAssignment] = []
+        for position in 0..<max(removedAssignments.count, addedAssignments.count) {
+            if position < indices.count, let move = indices[position], !wentForward.contains(move) { continue }
+            if position < removedAssignments.count, !isCurrent(removedAssignments[position]) { continue }
             if position < removedAssignments.count { removed.append(removedAssignments[position]) }
             if position < addedAssignments.count { added.append(addedAssignments[position]) }
         }
@@ -212,6 +252,13 @@ public struct DriveMoveService {
             )
         }
         var report = DriveMoveReport(journalPath: journalURL.path, journalID: journal.id)
+        // An Undo that was interrupted (a crash, a pulled cable) left some files
+        // already back; the journal remembers that one began, so those count as
+        // reversed now and the catalog follows them too.
+        let resuming = journal.pendingStep == "undo" && journal.driveStepDone == false
+        journal.pendingStep = "undo"
+        journal.driveStepDone = false
+        try Self.write(journal, to: journalURL)
         // Renames a crash or a pulled cable finished after the last progress
         // write: the file is at its destination, gone from its source, and
         // only ever after the last recorded one (moves run in order).
@@ -229,6 +276,12 @@ public struct DriveMoveService {
         var reversed: [DriveMove] = []
         for index in completed.reversed() where journal.moves.indices.contains(index) {
             let move = journal.moves[index]
+            if resuming, !Self.exists(move.destinationPath), Self.isRegularFile(move.sourcePath),
+               (try? fileManager.attributesOfItem(atPath: move.sourcePath)[.size] as? Int64) == move.byteCount {
+                // Already back: a step that began before this one moved it.
+                report.reversedIndices.append(index)
+                continue
+            }
             indexBySource[URL(fileURLWithPath: move.destinationPath).standardizedFileURL.path] = index
             reversed.append(DriveMove(sourcePath: move.destinationPath, destinationPath: move.sourcePath, byteCount: move.byteCount))
         }
@@ -261,12 +314,105 @@ public struct DriveMoveService {
         // be undone — the report names what stayed.
         let wentBack = Set(report.reversedIndices)
         let remaining = completed.filter { !wentBack.contains($0) }
+        // What Redo will rename forward again: every move that went back,
+        // now and in earlier partial attempts.
+        journal.undoneIndices = Array(Set(journal.undoneIndices ?? []).union(wentBack)).sorted()
         if remaining.isEmpty || report.reversedIndices.isEmpty {
             journal.undoneAt = Date()
         } else {
             journal.completedIndices = remaining
         }
+        if report.reversedIndices.isEmpty {
+            // Nothing went back, so there is no catalog or NAS step to finish.
+            journal.pendingStep = nil
+            journal.driveStepDone = nil
+        } else {
+            journal.driveStepDone = true
+        }
         try Self.write(journal, to: journalURL)
+        pruneEmptyFolders(folders, boundaries: pruneBoundaries)
+        return (report, journal)
+    }
+
+    /// Renames forward again what `undo` put back: every move of the
+    /// journal that went back, in the order they first ran. Exclusive like
+    /// every rename here — a name taken since is skipped and reported, never
+    /// replaced. The journal is open again (undoable) as soon as anything
+    /// went forward; moves that could not stay listed for another Redo.
+    /// `report.reversedIndices` names the moves that were re-applied.
+    public func redo(
+        journalURL: URL,
+        pruneBoundaries: [URL] = [],
+        progress: FileOperationProgressHandler? = nil
+    ) throws -> (report: DriveMoveReport, journal: DriveMoveJournal) {
+        var journal = try Self.read(journalURL)
+        guard journal.undoneAt != nil else {
+            throw ToolkitError.commandFailed("That change is not undone, so there is nothing to redo.")
+        }
+        if let barrier = Self.layoutMigrationBarrier(in: journalURL.deletingLastPathComponent()),
+           journal.createdAt < barrier.completedAt {
+            throw ToolkitError.commandFailed(
+                "“\(journal.title)” was recorded before the drive moved to the Originals layout; its paths no longer exist, so it can't be redone. Nothing was changed."
+            )
+        }
+        var report = DriveMoveReport(journalPath: journalURL.path, journalID: journal.id)
+        // A Redo that was interrupted left some files already forward; they
+        // count as re-applied now, so the catalog follows them too.
+        let resuming = journal.pendingStep == "redo" && journal.driveStepDone == false
+        journal.pendingStep = "redo"
+        journal.driveStepDone = false
+        try Self.write(journal, to: journalURL)
+        let indices = (journal.undoneIndices ?? journal.completedIndices)
+            .filter { journal.moves.indices.contains($0) }
+            .sorted()
+        var indexBySource: [String: Int] = [:]
+        var forward: [DriveMove] = []
+        for index in indices {
+            let move = journal.moves[index]
+            if resuming, !Self.exists(move.sourcePath), Self.isRegularFile(move.destinationPath),
+               (try? fileManager.attributesOfItem(atPath: move.destinationPath)[.size] as? Int64) == move.byteCount {
+                report.reversedIndices.append(index)
+                continue
+            }
+            indexBySource[URL(fileURLWithPath: move.sourcePath).standardizedFileURL.path] = index
+            forward.append(move)
+        }
+        let planned = preflight(forward, report: &report)
+        var folders: Set<String> = []
+        for (position, move) in planned.enumerated() {
+            do {
+                try fileManager.createDirectory(
+                    at: URL(fileURLWithPath: move.destinationPath).deletingLastPathComponent(),
+                    withIntermediateDirectories: true
+                )
+                try Self.renameExclusive(from: move.sourcePath, to: move.destinationPath)
+                Self.moveAppleDoubleIfNeeded(from: move.sourcePath, to: move.destinationPath)
+                report.moved.append(move)
+                if let original = indexBySource[move.sourcePath] { report.reversedIndices.append(original) }
+                folders.insert((move.sourcePath as NSString).deletingLastPathComponent)
+            } catch {
+                report.skipped.append(DriveMoveIssue(move: move, reason: error.localizedDescription))
+            }
+            progress?(FileOperationProgress(
+                phase: "Redoing move",
+                currentPath: (move.destinationPath as NSString).lastPathComponent,
+                processedFiles: position + 1,
+                totalFiles: planned.count
+            ))
+        }
+        let didGoForward = Set(report.reversedIndices)
+        if !didGoForward.isEmpty {
+            journal.completedIndices = Array(Set(journal.completedIndices).union(didGoForward)).sorted()
+            let rest = indices.filter { !didGoForward.contains($0) }
+            journal.undoneIndices = rest.isEmpty ? nil : rest
+            journal.undoneAt = nil
+            journal.driveStepDone = true
+            try Self.write(journal, to: journalURL)
+        } else {
+            journal.pendingStep = nil
+            journal.driveStepDone = nil
+            try Self.write(journal, to: journalURL)
+        }
         pruneEmptyFolders(folders, boundaries: pruneBoundaries)
         return (report, journal)
     }
@@ -288,6 +434,27 @@ public struct DriveMoveService {
         }
         try fileManager.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
         try Self.renameExclusive(from: sourcePath, to: destinationPath)
+    }
+
+    /// The Undo or Redo of this journal is complete: the catalog and the NAS
+    /// copies followed the drive. Until this is written, a launch replays the
+    /// step (`pendingStep`).
+    public static func finishStep(journalURL: URL) throws {
+        var journal = try read(journalURL)
+        guard journal.pendingStep != nil else { return }
+        journal.pendingStep = nil
+        journal.driveStepDone = nil
+        try write(journal, to: journalURL)
+    }
+
+    /// The journals in `folder`, newest first, whose Undo or Redo began and
+    /// has not been finished — what a launch has to replay.
+    public static func interruptedSteps(in folder: URL, limit: Int = 60) -> [(url: URL, journal: DriveMoveJournal)] {
+        var found: [(url: URL, journal: DriveMoveJournal)] = []
+        for url in journals(in: folder).prefix(limit) {
+            if let journal = try? read(url), journal.pendingStep != nil { found.append((url, journal)) }
+        }
+        return found
     }
 
     /// Closes a journal that can no longer be undone (an event it names was

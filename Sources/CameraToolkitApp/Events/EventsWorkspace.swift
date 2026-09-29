@@ -4,7 +4,8 @@ import Foundation
 import Observation
 
 extension Notification.Name {
-    static let cameraToolkitUndoSort = Notification.Name("CameraToolkit.UndoSort")
+    static let cameraToolkitUndo = Notification.Name("CameraToolkit.Undo")
+    static let cameraToolkitRedo = Notification.Name("CameraToolkit.Redo")
     /// Posted after a Trash batch is restored so unsorted boards rescan and
     /// show the files that came back.
     static let cameraToolkitMediaTrashChanged = Notification.Name("CameraToolkit.MediaTrashChanged")
@@ -182,7 +183,7 @@ struct DeviceChoice: Identifiable, Hashable {
     }
 }
 
-private struct AssignmentChange {
+struct AssignmentChange {
     var title: String
     var removed: [PhotoEventAssignment]
     var added: [PhotoEventAssignment]
@@ -526,7 +527,6 @@ final class EventsWorkspace {
     /// each run) so a finished job need not read the journal folder.
     var pendingNASRenameCount = 0
     var pendingTrash: PendingTrashRequest?
-    var latestMoveJournalTitle: String?
     /// Bursts currently expanded inline in the board.
     var expandedStackIDs: Set<String> = []
     /// Board groups (day/folder/kind/event sections) the user collapsed.
@@ -538,18 +538,30 @@ final class EventsWorkspace {
     /// ask about connectivity re-render after a mount, unmount, or manual
     /// refresh.
     private(set) var connectivityRevision = 0
-    private var assignmentUndoStack: [AssignmentChange] = []
-    /// How many catalog-only changes (sorts, unsorts, moves of files not on
-    /// the drive) `undoLastSort` can still take back.
-    var undoableSortCount: Int { assignmentUndoStack.count }
+    /// Every undoable action in the order it finished — one list, so ⌘Z
+    /// always takes back the newest and ⌘⇧Z puts it back. Recorded by the
+    /// completions that finish an action (`recordUndo`), replayed by
+    /// `undo()` / `redo()`, kept across a relaunch (`loadUndoHistory`).
+    /// See `EventsWorkspace+Undo.swift`.
+    var undoHistory = UndoHistory()
+    /// Undo and Redo of changes whose inverse lives in memory only.
+    @ObservationIgnored var undoSessionHandlers: [UUID: UndoSessionHandlers] = [:]
+    /// The history file is read once per workspace, however often the window appears.
+    @ObservationIgnored var undoHistoryLoaded = false
+    /// Writes `undoHistory` to `undo-history.sqlite` off the main actor.
+    @ObservationIgnored private(set) lazy var undoPersistence = UndoPersistence(
+        store: UndoHistoryStore(url: supportFolder.appendingPathComponent(UndoHistoryStore.fileName))
+    )
 
     @ObservationIgnored private var selectionAnchorID: String?
     @ObservationIgnored private var indexRevision = -1
     @ObservationIgnored private var indexCount = -1
-    @ObservationIgnored private var assignmentsByPathKey: [String: PhotoEventAssignment] = [:]
+    @ObservationIgnored var assignmentsByPathKey: [String: PhotoEventAssignment] = [:]
     /// Clicked Move to Event batches that have not landed: tiles already
     /// moved in memory, rename running or queued behind another job.
     @ObservationIgnored private var pendingMoves: [PendingEventMove] = []
+    /// A clicked move has not landed yet — the history is not final until it does.
+    var hasPendingMoves: Bool { !pendingMoves.isEmpty }
     /// Boards touched by moves that were queued together. Each landing
     /// re-read them while the next move's tiles were still laid over them, so
     /// they are read once more when the queue is empty.
@@ -1013,8 +1025,6 @@ final class EventsWorkspace {
         return a.name < b.name
     }
 
-    var canUndoSort: Bool { !assignmentUndoStack.isEmpty }
-
     func event(_ id: UUID) -> SavedCameraEvent? {
         model.configuration.savedEvents.first { $0.id == id }
     }
@@ -1140,7 +1150,7 @@ final class EventsWorkspace {
         }
     }
 
-    private func refreshIndexIfNeeded() {
+    func refreshIndexIfNeeded() {
         let assignments = model.configuration.photoEventAssignments
         guard indexRevision != model.catalogStateRevision || indexCount != assignments.count else { return }
         var index: [String: PhotoEventAssignment] = [:]
@@ -1807,7 +1817,7 @@ final class EventsWorkspace {
 
     func start() {
         observeVolumeChanges()
-        refreshLatestJournal()
+        Task { await loadUndoHistory() }
         discoverDriveEvents()
         scheduleRosterWarm()
     }
@@ -2180,7 +2190,7 @@ final class EventsWorkspace {
         }
         applyAssignmentChange(change, touching: eventID, addedItems: eligibleItems)
         noteRecent(eventID)
-        pushUndo(change)
+        recordAssignmentUndo(change)
         let skipped = files.count - eligible.count
         model.statusMessage = "Sorted \(stacks.count) item\(stacks.count == 1 ? "" : "s") (\(eligible.count) file\(eligible.count == 1 ? "" : "s")) into \(eventTitle(event)). Nothing moves until you press Apply."
             + (skipped > 0 ? " \(skipped) file(s) already live in another event's folder and were left alone." : "")
@@ -2202,62 +2212,11 @@ final class EventsWorkspace {
         }
         let change = AssignmentChange(title: "Unsort", removed: removable, added: [])
         applyAssignmentChange(change, touching: nil)
-        pushUndo(change)
+        recordAssignmentUndo(change)
         model.statusMessage = "Unsorted \(removable.count) file\(removable.count == 1 ? "" : "s")."
     }
 
-    func undoLastSort() {
-        guard let change = assignmentUndoStack.popLast() else {
-            model.statusMessage = "Nothing to undo."
-            return
-        }
-        // An event it names was deleted since: entries put back into it would
-        // belong to nothing.
-        let known = Set(model.configuration.savedEvents.map(\.id))
-        if change.removed.contains(where: { !known.contains($0.eventID) }) {
-            refuseMove("Undo “\(change.title)”", "“\(change.title)” can't be undone: one of its events was deleted since. Nothing was changed.")
-            return
-        }
-        // Its NAS copies were renamed to paths under the events' folders as they
-        // were; once an event moved, undoing would rename them back under the
-        // old names.
-        if change.nasLink != nil, let renamed = eventMoved(since: change.eventFolders ?? [:]) {
-            refuseMove(
-                "Undo “\(change.title)”",
-                "“\(change.title)” can't be undone: \(eventTitle(renamed)) was renamed or moved since, so its NAS copies are not where the move left them. Nothing was changed."
-            )
-            return
-        }
-        // Applied since: an entry whose file now has a copy in its event's
-        // folder cannot just disappear from the catalog — that would leave
-        // the copy in the folder with nothing recording it.
-        let locations = self.locations
-        let events = Set(change.added.map(\.eventID))
-        let inCatalog = Set(model.configuration.photoEventAssignments.lazy
-            .filter { events.contains($0.eventID) }
-            .map(CatalogStore.eventAssetID))
-        let kept = change.added.filter { inCatalog.contains(CatalogStore.eventAssetID($0)) && hasDriveCopy($0, locations: locations) }
-        guard kept.isEmpty else {
-            refuseMove(
-                "Undo “\(change.title)”",
-                "\(ApplyPlanOverview.plural(kept.count, "file")) from “\(change.title)” already have a copy in their event's folder, so it can't be undone here. Open the event and use Return to Unsorted.",
-                files: kept.map { ($0.relativePath as NSString).lastPathComponent }
-            )
-            return
-        }
-        applyAssignmentChange(AssignmentChange(title: change.title, removed: change.added, added: change.removed), touching: nil)
-        model.statusMessage = "Undid “\(change.title)”."
-        if let link = change.nasLink { undoNASRenames(moveJournalID: link) }
-    }
-
-    private func pushUndo(_ change: AssignmentChange) {
-        assignmentUndoStack.append(change)
-        if assignmentUndoStack.count > 50 {
-            assignmentUndoStack.removeFirst(assignmentUndoStack.count - 50)
-        }
-    }
-
-    private func hasDriveCopy(_ assignment: PhotoEventAssignment, locations: EventStorageLocations) -> Bool {
+    func hasDriveCopy(_ assignment: PhotoEventAssignment, locations: EventStorageLocations) -> Bool {
         guard let event = event(assignment.eventID) else { return false }
         let sourceKey = locations.sourceURL(for: assignment).map { EventStorageLocations.pathKey($0.path) }
         return EventStoragePolicy.allCases.contains { policy in
@@ -2270,7 +2229,7 @@ final class EventsWorkspace {
     /// `patchBoards: false` is for a caller that already moved the tiles
     /// itself (an optimistic Move to Event) and only needs the catalog and
     /// the lookup indexes brought in step.
-    private func applyAssignmentChange(
+    func applyAssignmentChange(
         _ change: AssignmentChange,
         touching eventID: UUID?,
         addedItems: [OrganizeItem] = [],
@@ -2318,7 +2277,7 @@ final class EventsWorkspace {
 
     /// `FaceIndexStore.fileKey` for a catalog assignment — name, byte
     /// count, mtime; the identity that survives the file moving folders.
-    private static func fileKey(_ assignment: PhotoEventAssignment) -> String {
+    static func fileKey(_ assignment: PhotoEventAssignment) -> String {
         FaceIndexStore.fileKey(
             fileName: (assignment.relativePath as NSString).lastPathComponent,
             byteCount: assignment.fileSize,
@@ -2428,6 +2387,7 @@ final class EventsWorkspace {
         )
         model.updateConfiguration { $0.savedEvents.append(event) }
         noteRecent(event.id)
+        recordUndo("Create \(eventTitle(event))", .config(.events(UndoEventsChange(created: [event]))))
         model.statusMessage = "Created \(eventTitle(event)). Sort photos into it, then press Apply."
         return event.id
     }
@@ -2476,6 +2436,7 @@ final class EventsWorkspace {
         }
         model.updateConfiguration { $0.savedEvents.removeAll { $0.id == eventID } }
         if selection == .event(eventID) { selection = nil }
+        recordUndo("Delete \(title)", .config(.events(UndoEventsChange(deleted: [event]))))
         model.statusMessage = "Deleted the empty event \(event.name)."
     }
 
@@ -2497,9 +2458,17 @@ final class EventsWorkspace {
     /// `nil` leaves the policy unset: a subevent then follows its parent's
     /// setting, and a top-level event resolves to the shared Buffer.
     func setPolicy(_ eventID: UUID, _ policy: EventStoragePolicy?) {
+        let before = event(eventID)
         model.updateConfiguration { configuration in
             guard let index = configuration.savedEvents.firstIndex(where: { $0.id == eventID }) else { return }
             configuration.savedEvents[index].storagePolicy = policy
+        }
+        if let before, let after = event(eventID), before.storagePolicy != after.storagePolicy {
+            let setting = policy == .archiveOnly ? "Private" : (policy == .buffer ? "Shared" : "Follow Parent")
+            recordUndo(
+                "Set \(eventTitle(before)) to \(setting)",
+                .config(.events(UndoEventsChange(edited: [UndoEventPair(before: before, after: after)])))
+            )
         }
         switch policy {
         case .archiveOnly:
@@ -2620,18 +2589,21 @@ final class EventsWorkspace {
         // and idle. A connected NAS that has no folder for the event owes
         // nothing. Copies in the old archive layout keep their folder name.
         var nasNote = ""
+        var nasLink: UUID?
         if let owed = NASMoveFollower.folderRename(from: event, to: renamed, locations: locations),
            !nasIsConnected || fileManager.fileExists(atPath: locations.nasRoot.appendingPathComponent(owed.from).path) {
-            let journalFolder = self.journalFolder
-            let nasRoot = locations.nasRoot
+            let link = UUID()
+            nasLink = link
             let title = "Rename \(eventTitle(event)) on the NAS"
-            Task { @MainActor [weak self] in
-                let queued = await Task.detached(priority: .userInitiated) {
-                    Self.queueNASRenames([owed], title: title, origin: .folderRename, nasRoot: nasRoot, journalFolder: journalFolder)
-                }.value
-                self?.noteNASRenamesQueued(queued)
-                self?.drainNASRenames()
-            }
+            // Journaled now, under an id the history's Undo of this rename
+            // reverses — the batch is one small file, so it is written before
+            // the rename is registered instead of racing an immediate Undo.
+            let queued = Self.queueNASRenames(
+                [owed], title: title, origin: .folderRename, moveJournalID: link,
+                nasRoot: locations.nasRoot, journalFolder: journalFolder
+            )
+            noteNASRenamesQueued(queued)
+            drainNASRenames()
             nasNote = nasIsConnected
                 ? " The NAS folder is renamed to match next."
                 : " The NAS folder will be renamed when the NAS is connected."
@@ -2648,6 +2620,14 @@ final class EventsWorkspace {
         let boardsAfter = Set(eventStacks.keys.filter { !scopeIDs($0).isDisjoint(with: touchedIDs) })
         for boardID in touchedIDs.union(boardsBefore).union(boardsAfter) {
             Task { await refreshEvent(boardID) }
+        }
+        if let after = self.event(eventID) {
+            recordEventEditUndo(
+                before: event, after: after,
+                folderMoves: moved.map { UndoFolderMove(old: $0.0.standardizedFileURL.path, new: $0.1.standardizedFileURL.path, caseOnly: $0.2) },
+                touchedEventIDs: touchedIDs,
+                nasLink: nasLink
+            )
         }
     }
 
@@ -3379,6 +3359,7 @@ final class EventsWorkspace {
                 },
                 completion: { [weak self] report in
                     self?.noteNASRenamesQueued(queuedRenames.count)
+                    self?.recordJournalUndo(title: title, report: report)
                     self?.didMove(report: report, events: affectedEvents)
                     if !trash.isEmpty { self?.requestTrashApplyDuplicates(trash) }
                     return ApplyStatusWording.afterApply(
@@ -3540,6 +3521,7 @@ final class EventsWorkspace {
                     AssignmentChange(title: title, removed: outcome.removedAssignments, added: outcome.addedAssignments),
                     touching: nil
                 )
+                recordJournalUndo(title: title, report: outcome.report)
                 didMove(report: outcome.report, events: affectedEvents)
                 // Only the files that really moved stop counting as blocked;
                 // a row left here still is.
@@ -3627,6 +3609,7 @@ final class EventsWorkspace {
                     AssignmentChange(title: title, removed: outcome.removedAssignments, added: outcome.addedAssignments),
                     touching: nil
                 )
+                recordJournalUndo(title: title, report: outcome.report)
                 didMove(report: outcome.report, events: affectedEvents)
                 for eventID in affectedEvents {
                     applyConflictSourceKeys[eventID] = nil
@@ -3658,20 +3641,16 @@ final class EventsWorkspace {
         }
     }
 
+    /// The Undo menu reads the undo history, which every finished action
+    /// records itself. This only offers a journal the history does not know
+    /// (one an earlier build wrote), in time order.
     func refreshLatestJournal() {
-        latestMoveJournalTitle = DriveMoveService.latestUndoableJournal(in: self.journalFolder)?.journal.title
+        discoverLatestJournal()
     }
 
-    /// `refreshLatestJournal` with the folder read off the main actor.
-    func refreshLatestJournalInBackground() {
-        let folder = journalFolder
-        Task { @MainActor [weak self] in
-            let title = await Task.detached(priority: .userInitiated) {
-                DriveMoveService.latestUndoableJournal(in: folder)?.journal.title
-            }.value
-            self?.latestMoveJournalTitle = title
-        }
-    }
+    /// Kept for callers that used to read the journal folder in the
+    /// background — the history already knows.
+    func refreshLatestJournalInBackground() {}
 
     /// A rename batch landed, straight from the move report: every stack
     /// the boards already show repoints at the destination paths and the
@@ -3680,7 +3659,7 @@ final class EventsWorkspace {
     /// its old path. Called in the same update that records the move —
     /// `refreshEvent` still runs afterwards to restat the library; the
     /// preview is already correct before that finishes.
-    private func retargetMovedPaths(_ moved: [DriveMove]) {
+    func retargetMovedPaths(_ moved: [DriveMove]) {
         guard !moved.isEmpty else { return }
         TileImageLoader.shared.retarget(moves: moved)
         var destinations: [String: String] = [:]
@@ -3694,153 +3673,6 @@ final class EventsWorkspace {
         }
     }
 
-    func undoLastMove() {
-        guard let latest = DriveMoveService.latestUndoableJournal(in: self.journalFolder) else {
-            latestMoveJournalTitle = nil
-            model.statusMessage = "There is no move to undo."
-            return
-        }
-        // An event the move names was deleted since: its files cannot go
-        // back into a folder no event owns, and the catalog entries would
-        // point at nothing. The journal is closed so it stops blocking the
-        // older changes behind it.
-        let known = Set(model.configuration.savedEvents.map(\.id))
-        if (latest.journal.removedAssignments + latest.journal.addedAssignments).contains(where: { !known.contains($0.eventID) }) {
-            try? DriveMoveService.abandon(journalURL: latest.url)
-            refreshLatestJournal()
-            refuseMove(
-                "Undo “\(latest.journal.title)”",
-                "“\(latest.journal.title)” can't be undone: one of its events was deleted since. Nothing was changed, and it was dropped from Undo. Move the files back with Move to Event."
-            )
-            return
-        }
-        // An event it names was renamed, re-dated or re-parented since: its
-        // folder is somewhere else now, and undoing would recreate the old
-        // folder and put the files into it while the event looks in the new
-        // one.
-        if let renamed = eventRenamedSince(latest.journal) {
-            try? DriveMoveService.abandon(journalURL: latest.url)
-            refreshLatestJournal()
-            refuseMove(
-                "Undo “\(latest.journal.title)”",
-                "“\(latest.journal.title)” can't be undone: \(eventTitle(renamed)) was renamed or moved since, so its files are not where the move left them. Nothing was changed, and it was dropped from Undo."
-            )
-            return
-        }
-        // A drive that is not there cannot give its files back, and trying
-        // would spend the journal on nothing: say which one and wait.
-        let mounted = VolumeInfo.mountedVolumePaths()
-        let absent = latest.journal.moves
-            .flatMap { [$0.sourcePath, $0.destinationPath] }
-            .first { !VolumeInfo.isAvailable(URL(fileURLWithPath: $0), mountedVolumes: mounted) }
-        if let absent {
-            let drive = VolumeInfo.volumeRoot(for: URL(fileURLWithPath: absent))?.lastPathComponent ?? absent
-            refuseMove(
-                "Undo “\(latest.journal.title)”",
-                "“\(latest.journal.title)” can't be undone while \(drive) isn't connected. Connect it and undo again — nothing was changed."
-            )
-            return
-        }
-        let url = latest.url
-        let locations = self.locations
-        let boundaries = [locations.bufferRoot, locations.privateStagingRoot]
-        let nasRoot = locations.nasRoot
-        // Entries that only moved in the catalog (a photo only the NAS has)
-        // have no drive rename to go back, but their NAS copy does.
-        // Only those still assigned where the move put them: one a later change
-        // moved on keeps its NAS copy where that change put it.
-        let currentIDs = Set(model.configuration.photoEventAssignments.map(CatalogStore.eventAssetID))
-        var catalogOnlyMirrorKeys: Set<String> = []
-        for (position, index) in (latest.journal.assignmentMoveIndices ?? []).enumerated()
-        where index == nil && position < latest.journal.addedAssignments.count {
-            let added = latest.journal.addedAssignments[position]
-            if currentIDs.contains(CatalogStore.eventAssetID(added)),
-               let owner = event(added.eventID), let url = locations.archiveURL(for: added, event: owner),
-               let relative = locations.nasRelativePath(url.path) {
-                catalogOnlyMirrorKeys.insert(NASSyncStore.pathKey(relative))
-            }
-        }
-        let catalogOnly = catalogOnlyMirrorKeys
-        let journalFolder = self.journalFolder
-        let catalogURL = URL(fileURLWithPath: DashboardModel.expandedPath(model.configuration.catalogDatabasePath))
-        model.runBackgroundJob(
-            action: .organize,
-            runningNote: "Undoing “\(latest.journal.title)”",
-            logTitle: "Undid a move",
-            logDetail: "Renamed files back to where they were. Nothing was replaced. NAS copies that were renamed to follow the move are renamed back; while the NAS is away that is queued.",
-            operation: { progress in
-                let undone = try DriveMoveService().undo(journalURL: url, pruneBoundaries: boundaries) { update in
-                    progress(DashboardModel.jobUpdate(from: update, notePrefix: "Undoing", command: ""))
-                }
-                // The move's NAS renames are journaled under the same id. Only
-                // the ones whose drive file really went back are reversed —
-                // the NAS follows the drive, wherever the drive file is.
-                let reversedMirrorKeys = Set(undone.report.moved.compactMap {
-                    locations.mirrorRelativePath(forDrivePath: $0.sourcePath).map(NASSyncStore.pathKey)
-                }).union(catalogOnly)
-                let queue = NASRenameQueue(journalFolder: journalFolder)
-                var nas = NASUndoResult()
-                do {
-                    nas = try NASMoveFollower(store: try? NASSyncStore(catalogURL: catalogURL), queue: queue)
-                        .undo(moveJournalID: undone.journal.id, nasRoot: nasRoot, reversedMirrorKeys: reversedMirrorKeys)
-                } catch {
-                    DebugLog.shared.log("nas.rename.undo", subsystem: .apply, level: .error, outcome: .error, error: error.localizedDescription)
-                }
-                return (report: undone.report, journal: undone.journal, nas: nas, remaining: queue.pendingRenameCount(nasRoot: nasRoot.path))
-            },
-            completion: { [weak self] outcome in
-                guard let self else { return "" }
-                nasRenamesApplied(outcome.nas.follow, remaining: outcome.remaining)
-                retargetMovedPaths(outcome.report.moved)
-                let journal = outcome.journal
-                // Only the catalog entries whose file went back swap back: an
-                // entry left pointing at the event it left, with its file
-                // still in the event it joined, would be a file the app
-                // cannot find.
-                let current = Set(model.configuration.photoEventAssignments.map(CatalogStore.eventAssetID))
-                let restore = journal.assignmentsToRestore(
-                    reversed: outcome.report.reversedIndices,
-                    fullyUndone: outcome.report.skipped.isEmpty,
-                    isCurrent: { current.contains(CatalogStore.eventAssetID($0)) }
-                )
-                if !restore.added.isEmpty || !restore.removed.isEmpty {
-                    applyAssignmentChange(
-                        AssignmentChange(title: journal.title, removed: restore.added, added: restore.removed),
-                        touching: nil
-                    )
-                }
-                refreshLatestJournal()
-                for location in unsortedLocations where sources[location.id]?.result != nil {
-                    scan(location, force: true)
-                }
-                // Files come back under their old names (a Keep Both "(2)" name
-                // goes back to the plain one), which a board patch cannot match
-                // to its tiles — every board that draws them is read again.
-                for boardID in boardsShowing(Set(journal.addedAssignments.map(\.eventID) + journal.removedAssignments.map(\.eventID))) {
-                    Task { await self.refreshEvent(boardID) }
-                }
-                if case .event(let eventID) = selection {
-                    Task { await self.refreshEvent(eventID) }
-                }
-                var line = "Moved \(outcome.report.moved.count) file(s) back."
-                if let first = outcome.report.skipped.first {
-                    let count = outcome.report.skipped.count
-                    let names = outcome.report.skipped.map { "\(($0.move.sourcePath as NSString).lastPathComponent) — \($0.reason)" }
-                    let again = journal.undoneAt == nil ? " Undo tries them again." : ""
-                    line += " \(count) could not move back and stayed where they are (\(first.reason.trimmingCharacters(in: CharacterSet(charactersIn: ".")))).\(again)"
-                    model.recordActivity(
-                        action: .organize,
-                        state: .failed,
-                        title: "Undo “\(journal.title)” — \(ApplyPlanOverview.plural(count, "file")) stayed",
-                        summary: line,
-                        detail: Self.fileNameList(names)
-                    )
-                }
-                return line + NASFollowWording.undone(outcome.nas)
-            }
-        )
-    }
-
     /// The first event a journal's renames name whose folder is no longer the
     /// one the rename used — each rename's source is the drive path of the
     /// entry it moved out of, its destination the drive path of the entry it
@@ -3848,7 +3680,7 @@ final class EventsWorkspace {
     /// checked.
     /// The first event whose folder is no longer the recorded one (event id →
     /// folder path), or nil when they all are.
-    private func eventMoved(since recorded: [String: String]) -> SavedCameraEvent? {
+    func eventMoved(since recorded: [String: String]) -> SavedCameraEvent? {
         let locations = self.locations
         for (idText, path) in recorded {
             guard let id = UUID(uuidString: idText), let owner = event(id) else { continue }
@@ -3857,7 +3689,7 @@ final class EventsWorkspace {
         return nil
     }
 
-    private func eventRenamedSince(_ journal: DriveMoveJournal) -> SavedCameraEvent? {
+    func eventRenamedSince(_ journal: DriveMoveJournal) -> SavedCameraEvent? {
         let locations = self.locations
         // The folders the events kept when the action ran, where recorded.
         if let renamed = eventMoved(since: journal.eventFolders ?? [:]) { return renamed }
@@ -3923,13 +3755,13 @@ final class EventsWorkspace {
 
     /// The events and every open board whose family includes one of them —
     /// the boards that draw those events' files.
-    private func boardsShowing(_ events: Set<UUID>) -> Set<UUID> {
+    func boardsShowing(_ events: Set<UUID>) -> Set<UUID> {
         Set(eventStacks.keys.filter { !scopeIDs($0).isDisjoint(with: events) }).union(events)
     }
 
     /// A click that moved nothing: the status line now, and an activity-log
     /// entry so the reason and the files are still there later.
-    private func refuseMove(_ title: String, _ message: String, files: [String] = []) {
+    func refuseMove(_ title: String, _ message: String, files: [String] = []) {
         model.statusMessage = message
         model.recordActivity(
             action: .organize,
@@ -4194,7 +4026,7 @@ final class EventsWorkspace {
             applyAssignmentChange(change, touching: targetEventID, patchBoards: false)
             stampBoards(of: move)
             landedMoveCount += 1
-            pushUndo(change)
+            recordAssignmentUndo(change)
             var outcome = EventMoveOutcome()
             outcome.moved = items
             model.statusMessage = summaryLine(outcome, move: move)
@@ -4431,7 +4263,7 @@ final class EventsWorkspace {
     }
 
     /// Where each of these events keeps its folder right now, for a journal.
-    private func eventFolderSnapshot(_ ids: Set<UUID>) -> [String: String] {
+    func eventFolderSnapshot(_ ids: Set<UUID>) -> [String: String] {
         let locations = self.locations
         var folders: [String: String] = [:]
         for id in ids {
@@ -4449,8 +4281,15 @@ final class EventsWorkspace {
         let targetPolicy = locations.resolvedPolicy(for: move.to)
         let title = move.title
         var trashEventIDs: [String: UUID] = [:]
+        // The entry a spare copy stops having when it goes to Trash, written
+        // into the manifest so restoring the copy brings it back.
+        var trashAssignments: [String: [PhotoEventAssignment]] = [:]
         for item in items {
-            if let path = item.currentPath { trashEventIDs[EventStorageLocations.pathKey(path)] = item.removed.eventID }
+            if let path = item.currentPath {
+                let key = EventStorageLocations.pathKey(path)
+                trashEventIDs[key] = item.removed.eventID
+                trashAssignments[key, default: []].append(item.removed)
+            }
         }
         let trashContext = TrashContext(
             locationName: eventTitle(move.from),
@@ -4458,7 +4297,8 @@ final class EventsWorkspace {
             eventIDsByPathKey: trashEventIDs,
             eventNamesByID: move.sourceTitles,
             personNamesByPathKey: [:],
-            captureDatesByPathKey: [:]
+            captureDatesByPathKey: [:],
+            assignmentsByPathKey: trashAssignments
         )
         let journalFolder = self.journalFolder
         let boundaries = [locations.bufferRoot, locations.privateStagingRoot]
@@ -4473,6 +4313,9 @@ final class EventsWorkspace {
         let targetAssignments = needsClashInputs ? Array(assignmentsByName(inEvent: targetEventID).values) : []
         let toEvent = move.to
         let moveID = move.id
+        // The NAS renames the merged copies owe are journaled under this id,
+        // so Undo of the move reverses them.
+        let mergeLink = UUID()
         let folders = eventFolderSnapshot(move.sourceIDs.union([move.to.id]))
         let nasRoot = locations.nasRoot
         let queuedRenames = NASQueuedRenames()
@@ -4524,7 +4367,7 @@ final class EventsWorkspace {
                     nasRoot: nasRoot, journalFolder: journalFolder
                 ))
                 queuedRenames.add(Self.queueNASRenames(
-                    owed.merges, title: "\(title) (merged duplicates)", origin: .merge,
+                    owed.merges, title: "\(title) (merged duplicates)", origin: .merge, moveJournalID: mergeLink,
                     nasRoot: nasRoot, journalFolder: journalFolder
                 ))
                 return outcome
@@ -4532,7 +4375,7 @@ final class EventsWorkspace {
             completion: { [weak self] outcome in
                 guard let self else { return "" }
                 noteNASRenamesQueued(queuedRenames.count)
-                return landMove(moveID, outcome: outcome, fromTitle: fromTitle, toTitle: toTitle)
+                return landMove(moveID, mergeLink: mergeLink, outcome: outcome, fromTitle: fromTitle, toTitle: toTitle)
                     + NASFollowWording.queued(queuedRenames.count, connected: nasIsConnected)
             }
         )
@@ -4548,7 +4391,7 @@ final class EventsWorkspace {
     /// which is what "not on the NAS" already means). A move that merged,
     /// renamed a clash, or left files behind falls back to re-reading the
     /// boards it touched.
-    private func landMove(_ moveID: UUID, outcome: EventMoveOutcome, fromTitle: String, toTitle: String) -> String {
+    private func landMove(_ moveID: UUID, mergeLink: UUID, outcome: EventMoveOutcome, fromTitle: String, toTitle: String) -> String {
         guard let index = pendingMoves.firstIndex(where: { $0.id == moveID }) else {
             return EventMoveWording.summary(outcome, from: fromTitle, to: toTitle)
         }
@@ -4571,17 +4414,17 @@ final class EventsWorkspace {
             touching: move.to.id,
             patchBoards: false
         )
-        // No journal means no rename ran, so only catalog entries
-        // moved: those undo from the sort stack instead.
-        if outcome.report.journalPath == nil, !outcome.moved.isEmpty {
-            pushUndo(AssignmentChange(
-                title: title,
-                removed: outcome.moved.map(\.removed),
-                added: outcome.moved.map(\.added),
-                nasLink: outcome.moved.contains { $0.nasCopy != nil } ? moveID : nil,
-                eventFolders: outcome.moved.contains { $0.nasCopy != nil } ? eventFolderSnapshot(move.sourceIDs.union([move.to.id])) : nil
-            ))
-        }
+        // One history entry for the whole click: the journal's renames, the
+        // entries of files that only moved in the catalog, the copies that
+        // merged (their entries and the spare copy in Trash), and the NAS
+        // renames the move and the merges owe.
+        recordMoveUndo(
+            title: title,
+            moveID: moveID,
+            mergeLink: mergeLink,
+            outcome: outcome,
+            eventFolders: eventFolderSnapshot(move.sourceIDs.union([move.to.id]))
+        )
         let trashed = (outcome.trashBatch?.entries ?? []).map { EventStorageLocations.pathKey($0.originalAbsolutePath) }
         let plainMove = outcome.stayed.isEmpty && outcome.keptBoth.isEmpty && outcome.merged.isEmpty && trashed.isEmpty
             && !move.overlapped
@@ -4617,9 +4460,6 @@ final class EventsWorkspace {
                 Self.postTrashChanged(rescanUnsorted: false)
             }
         }
-        // Reading the journal folder is disk work; the Undo menu learns of
-        // the new journal a moment later instead of holding the main actor.
-        refreshLatestJournalInBackground()
         return summaryLine(outcome, move: move)
     }
 
@@ -4869,7 +4709,7 @@ final class EventsWorkspace {
             // The open board drops the stacks in place — a refresh would
             // only re-derive what the patch already applied.
             applyAssignmentChange(change, touching: nil)
-            pushUndo(change)
+            recordAssignmentUndo(change)
             model.statusMessage = "Returned \(removed.count) file(s) from \(eventTitle(event)) to Unsorted. \(notes)"
             return
         }
@@ -4905,6 +4745,7 @@ final class EventsWorkspace {
                 let failed = Set(report.skipped.map { EventStorageLocations.pathKey($0.move.destinationPath) })
                 let applied = removed.filter { !failed.contains(Self.sourceKey($0)) }
                 applyAssignmentChange(AssignmentChange(title: title, removed: applied, added: []), touching: nil)
+                recordJournalUndo(title: title, report: report)
                 // A path is one file: it leaves every board that draws it, the
                 // family boards above the owner's included.
                 removeFilesFromEventBoards(
@@ -5470,8 +5311,9 @@ final class EventsWorkspace {
         // Capture each file's current event so the manifest records where it
         // lived. The assignments are dropped when the job says which files
         // really went to Trash — a file that stayed in place keeps its event.
-        // Not pushed onto the sort undo stack: undoing would restore
-        // assignments for files that are in the Trash.
+        // The history entry (`recordTrashUndo`) carries the dropped entries
+        // with the Trash batch: Undo restores the files first and puts the
+        // entries back only for the files that really came back.
         var eventIDs: [String: UUID] = [:]
         var droppable: [String: PhotoEventAssignment] = [:]
         for file in files {
@@ -5491,7 +5333,8 @@ final class EventsWorkspace {
             eventIDsByPathKey: eventIDs,
             eventNamesByID: trashEventNames(for: eventIDs),
             personNamesByPathKey: trashPersonNames(for: files),
-            captureDatesByPathKey: trashCaptureDates(for: items)
+            captureDatesByPathKey: trashCaptureDates(for: items),
+            assignmentsByPathKey: droppable.mapValues { [$0] }
         )
         let originRoot = URL(fileURLWithPath: DashboardModel.expandedPath(location.path), isDirectory: true).standardizedFileURL
         let fallbackTrashRoot = locations.removedFilesRoot
@@ -5522,6 +5365,7 @@ final class EventsWorkspace {
                 if !dropped.isEmpty {
                     applyAssignmentChange(AssignmentChange(title: "Move to Trash", removed: dropped, added: []), touching: nil)
                 }
+                recordTrashUndo(title: "Move to Trash", batch: batch, dropped: dropped, originRoot: originRoot.path)
                 if let result = sources[locationID]?.result {
                     sources[locationID]?.result = result.removingFiles(withPathKeys: movedKeys)
                 }
@@ -5581,7 +5425,8 @@ final class EventsWorkspace {
             eventIDsByPathKey: eventIDs,
             eventNamesByID: trashEventNames(for: eventIDs),
             personNamesByPathKey: trashPersonNames(for: files),
-            captureDatesByPathKey: trashCaptureDates(for: items)
+            captureDatesByPathKey: trashCaptureDates(for: items),
+            assignmentsByPathKey: droppable.mapValues { [$0] }
         )
         let originRoot = locations.eventFolder(for: event, policy: resolvedPolicy(for: event))
         let fallbackTrashRoot = locations.removedFilesRoot
@@ -5608,6 +5453,7 @@ final class EventsWorkspace {
                 if !dropped.isEmpty {
                     applyAssignmentChange(AssignmentChange(title: "Move to Trash", removed: dropped, added: []), touching: nil)
                 }
+                recordTrashUndo(title: "Move to Trash", batch: batch, dropped: dropped, originRoot: originRoot.path)
                 if let stacks = eventStacks[eventID] {
                     let remaining = stacks.flatMap(\.items).filter { item in
                         !item.files.contains { movedKeys.contains($0.pathKey) }
@@ -5679,8 +5525,10 @@ final class EventsWorkspace {
             if let id = copy.owner.eventID { eventIDs[copy.pathKey] = id }
         }
         var captureDates: [String: Date] = [:]
+        var droppedAssignments: [String: [PhotoEventAssignment]] = [:]
         for copy in dropping {
             if let date = copy.captureDate { captureDates[copy.pathKey] = date }
+            if let assignment = copy.assignment { droppedAssignments[copy.pathKey, default: []].append(assignment) }
         }
         let context = TrashContext(
             locationName: "Duplicates",
@@ -5688,8 +5536,12 @@ final class EventsWorkspace {
             eventIDsByPathKey: eventIDs,
             eventNamesByID: trashEventNames(for: eventIDs),
             personNamesByPathKey: [:],
-            captureDatesByPathKey: captureDates
+            captureDatesByPathKey: captureDates,
+            assignmentsByPathKey: droppedAssignments
         )
+        // The set-aside NAS copies are journaled under this id, so Undo of
+        // the resolution brings them back out of the NAS stale folder.
+        let nasLink = UUID()
         let fallbackTrashRoot = locations.removedFilesRoot
         let protected = protectedKeys
         let locations = self.locations
@@ -5712,7 +5564,7 @@ final class EventsWorkspace {
                 // copy's: set aside on the NAS (never deleted) when it runs.
                 queuedRenames.add(Self.queueNASRenames(
                     NASMoveFollower.renames(forDuplicates: resolutions, outcome: outcome, locations: locations),
-                    title: "Removed duplicate copies", origin: .merge,
+                    title: "Removed duplicate copies", origin: .merge, moveJournalID: nasLink,
                     nasRoot: locations.nasRoot, journalFolder: journalFolder
                 ))
                 return outcome
@@ -5726,6 +5578,7 @@ final class EventsWorkspace {
                         touching: nil
                     )
                 }
+                recordDuplicatesUndo(outcome: outcome, nasLink: nasLink, eventFolders: eventFolderSnapshot(Set(eventIDs.values)))
                 let trashedKeys = Set(outcome.trashed.map(\.pathKey))
                 removeFilesFromEventBoards(trashedKeys, events: [])
                 for (id, state) in sources {
@@ -5794,7 +5647,7 @@ final class EventsWorkspace {
 
     /// Drop trashed files from cached event boards immediately so a tagged
     /// burst cannot linger after Unsorted Trash.
-    private func removeFilesFromEventBoards(_ pathKeys: Set<String>, events: Set<UUID>) {
+    func removeFilesFromEventBoards(_ pathKeys: Set<String>, events: Set<UUID>) {
         guard !pathKeys.isEmpty else { return }
         let ids = events.isEmpty ? Set(eventStacks.keys) : events
         let splits = model.configuration.burstSplits
@@ -5831,7 +5684,9 @@ final class EventsWorkspace {
     func splitItems(_ items: [OrganizeItem]) {
         let keys = items.map(\.primary.pathKey)
         guard !keys.isEmpty else { return }
-        model.updateConfiguration { $0.burstSplits.append(BurstSplit(memberPathKeys: keys)) }
+        let split = BurstSplit(memberPathKeys: keys)
+        model.updateConfiguration { $0.burstSplits.append(split) }
+        recordUndo("Split Burst", detail: "\(items.count) frame\(items.count == 1 ? "" : "s")", .config(.burstSplit(split)))
         let splits = model.configuration.burstSplits
         for id in Array(sources.keys) {
             if let result = sources[id]?.result {
@@ -5886,6 +5741,7 @@ final class EventsWorkspace {
                 : "Nothing to rotate in the selection."
             return
         }
+        let orientationsBefore = model.configuration.displayOrientations
         model.updateConfiguration { configuration in
             for stack in stacks {
                 configuration.displayOrientations = DisplayRotation.rotatedMap(
@@ -5894,6 +5750,15 @@ final class EventsWorkspace {
                     to: stack
                 )
             }
+        }
+        let orientationsAfter = model.configuration.displayOrientations
+        let orientationChanges = Set(orientationsBefore.keys).union(orientationsAfter.keys)
+            .filter { orientationsBefore[$0] != orientationsAfter[$0] }
+            .sorted()
+            .map { UndoOrientationChange(key: $0, before: orientationsBefore[$0], after: orientationsAfter[$0]) }
+        if !orientationChanges.isEmpty {
+            let direction = abs(delta) == 2 ? "180°" : (delta > 0 ? "90° Clockwise" : "90° Counter-Clockwise")
+            recordUndo("Rotate \(direction)", detail: stacks.count == 1 ? nil : "\(stacks.count) bursts", .config(.orientations(orientationChanges)))
         }
         for file in rotated {
             TileImageLoader.shared.invalidate(url: file.url)
@@ -6039,7 +5904,7 @@ final class EventsWorkspace {
 
     /// Bumped whenever face rows change so people chips and the People
     /// window re-read the catalog.
-    private(set) var facesRevision = 0 {
+    var facesRevision = 0 {
         // Face review writes only the catalog; let the debounced backup
         // know a session is under way.
         didSet {
@@ -6291,6 +6156,13 @@ final class EventsWorkspace {
                 updated.burstGrouping = outcome.grouping
                 updated.visualLinks = outcome.links
                 sources[id]?.result = updated
+                // The grouping lives in memory (a rescan makes it again), so
+                // its undo does too: gone after a relaunch.
+                recordSessionUndo(
+                    "Regroup Bursts on \(location.name)",
+                    undo: { [weak self] in self?.sources[id]?.result = result },
+                    redo: { [weak self] in self?.sources[id]?.result = updated }
+                )
                 let bursts = outcome.stacks.count { $0.isBurst }
                 return "Regrouped \(location.name): \(outcome.stacks.count) item(s), \(bursts) burst(s). Nothing moved."
             }
@@ -6712,7 +6584,9 @@ final class EventsWorkspace {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
         let person = try? faceStore.createPerson(name: trimmed, isRoster: true)
-        if person != nil {
+        if let person {
+            // The row did not exist before: Undo removes it.
+            recordUndo("Add \(trimmed) to People", .faces(FaceSnapshot(personIDs: [person.id])))
             facesRevision &+= 1
             model.statusMessage = "Added \(trimmed) to the people list."
         }
@@ -6723,9 +6597,11 @@ final class EventsWorkspace {
     /// owner's call, so the face becomes frozen and its embedding is pinned
     /// as a match reference when one exists. Confirmed faces are untouched.
     func tagFace(_ faceID: UUID, as personID: UUID) {
+        let undo = beginFaceUndo(people: [personID], faces: [faceID])
         try? faceStore.assignFace(faceID, to: personID, state: .confirmed, score: nil)
         try? faceStore.addTemplate(personID: personID, faceID: faceID)
         try? faceStore.refreshFaceCounts()
+        recordFaceUndo(undo, "Tag Face as \(person(personID)?.name ?? "Person")")
         facesRevision &+= 1
         model.statusMessage = "Tagged. The photo file was not modified."
     }
@@ -6759,7 +6635,10 @@ final class EventsWorkspace {
     func renamePerson(_ personID: UUID, name: String) {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        let undo = beginFaceUndo(people: [personID])
+        let oldName = person(personID)?.name
         try? faceStore.renamePerson(personID, name: trimmed)
+        recordFaceUndo(undo, "Rename \(oldName ?? "Person") to \(trimmed)")
         facesRevision &+= 1
         model.statusMessage = "Renamed to \(trimmed)."
     }
@@ -6770,8 +6649,10 @@ final class EventsWorkspace {
         guard sourceID != targetID,
               let source = try? faceStore.person(sourceID),
               let target = try? faceStore.person(targetID) else { return }
+        let undo = beginFaceUndo(expandingPeople: [sourceID], people: [targetID])
         try? faceStore.mergePerson(sourceID, into: targetID)
         try? faceStore.refreshFaceCounts()
+        recordFaceUndo(undo, "Merge \(source.name) into \(target.name)", detail: "\(source.faceCount) face\(source.faceCount == 1 ? "" : "s")")
         facesRevision &+= 1
         model.statusMessage = "Merged \(source.name) into \(target.name)."
     }
@@ -6780,7 +6661,10 @@ final class EventsWorkspace {
     /// group again rather than disappearing. Confirmed faces keep their
     /// frozen state.
     func demotePerson(_ personID: UUID) {
+        let undo = beginFaceUndo(expandingPeople: [personID])
+        let name = person(personID)?.name ?? "Person"
         try? faceStore.demoteFromRoster(personID)
+        recordFaceUndo(undo, "Move \(name) to the Inbox")
         facesRevision &+= 1
         model.statusMessage = "Moved to the Inbox — the confirmed faces stay grouped there."
     }
@@ -6792,7 +6676,9 @@ final class EventsWorkspace {
     func nameGroup(_ personID: UUID, name: String) {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        let undo = beginFaceUndo(expandingPeople: [personID])
         try? faceStore.promoteGroup(personID, name: trimmed, templateCap: FaceScanOptions().templateCap)
+        recordFaceUndo(undo, "Approve \(trimmed)")
         facesRevision &+= 1
         model.statusMessage = "Approved \(trimmed) — only the faces in this cluster were confirmed."
     }
@@ -6809,7 +6695,9 @@ final class EventsWorkspace {
                 model.statusMessage = "\(person.name) is an approved person — only Inbox rows can be junked."
                 return
             }
+            let undo = beginFaceUndo(expandingPeople: [personID])
             try faceStore.deletePersonAndFaces(personID)
+            recordFaceUndo(undo, "Remove \(person.name)", detail: "\(person.faceCount) face\(person.faceCount == 1 ? "" : "s")")
             facesRevision &+= 1
             model.statusMessage = "Removed \(person.name). Nothing on disk was touched."
         } catch {
@@ -6821,8 +6709,10 @@ final class EventsWorkspace {
     /// scan grade, and every other face stay untouched.
     func junkFace(_ faceID: UUID) {
         do {
+            let undo = beginFaceUndo(faces: [faceID])
             try faceStore.deleteFaces([faceID])
             try faceStore.refreshFaceCounts()
+            recordFaceUndo(undo, "Remove Face")
             facesRevision &+= 1
             model.statusMessage = "Face removed from the index. The photo was not touched."
         } catch {
@@ -6837,6 +6727,7 @@ final class EventsWorkspace {
     func confirmFace(_ faceID: UUID) {
         do {
             guard let face = try faceStore.face(id: faceID) else { return }
+            let undo = beginFaceUndo(faces: [faceID])
             if let personID = face.personID,
                let person = try faceStore.person(personID),
                !person.isRoster,
@@ -6850,6 +6741,7 @@ final class EventsWorkspace {
                 }
             }
             try faceStore.refreshFaceCounts()
+            recordFaceUndo(undo, "Confirm Face")
             facesRevision &+= 1
         } catch {
             model.statusMessage = "Could not confirm the face: \(error.localizedDescription)"
@@ -6870,7 +6762,9 @@ final class EventsWorkspace {
             }
             let person = face.personID.flatMap { try? faceStore.person($0) }
             let personName = person?.suggestedPersonName ?? person?.name
+            let undo = beginFaceUndo(faces: [faceID])
             try FaceIndexService(catalogURL: catalogDatabaseURL).reject([faceID])
+            recordFaceUndo(undo, "Reject Face" + (personName.map { " for \($0)" } ?? ""))
             facesRevision &+= 1
             model.statusMessage = personName.map {
                 "Removed from \($0) — it will not be matched back. The photo was not touched."
@@ -6883,7 +6777,9 @@ final class EventsWorkspace {
     /// Pins a face as a match reference — the reviewed views of a person
     /// that future scans compare new faces against.
     func pinTemplate(_ faceID: UUID, for personID: UUID) {
+        let undo = beginFaceUndo(people: [personID])
         try? faceStore.addTemplate(personID: personID, faceID: faceID)
+        recordFaceUndo(undo, "Pin Match Reference")
         facesRevision &+= 1
         model.statusMessage = "Pinned as a match reference for future scans."
     }
@@ -6893,7 +6789,9 @@ final class EventsWorkspace {
     /// the person stops being the cover automatically. Catalog only —
     /// no photo is written to.
     func setCoverFace(_ faceID: UUID, for personID: UUID) {
+        let undo = beginFaceUndo(people: [personID])
         guard (try? faceStore.setCoverFace(personID: personID, faceID: faceID)) == true else { return }
+        recordFaceUndo(undo, "Change Cover")
         facesRevision &+= 1
         model.statusMessage = "Cover updated."
     }
@@ -6957,7 +6855,7 @@ final class EventsWorkspace {
     }
 }
 
-private extension Array where Element == OrganizeStack {
+extension Array where Element == OrganizeStack {
     /// Reuses the previous board's stack ids wherever a rebuilt stack holds
     /// the same files (matched by path keys). A rename repoints paths inside
     /// the stacks already on the board, so the id a preview or selection is

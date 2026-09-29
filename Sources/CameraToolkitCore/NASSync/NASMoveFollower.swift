@@ -339,6 +339,10 @@ public struct NASMoveFollower {
         progress: Progress? = nil
     ) throws -> NASUndoResult {
         guard let queue else { return NASUndoResult() }
+        // Nothing renames while the queue is being changed, and the batches
+        // are read after any renames that were running have saved.
+        queue.lock.lock()
+        defer { queue.lock.unlock() }
         var undone = NASUndoResult()
         for var batch in queue.batches(forMoveJournal: moveJournalID) where batch.undoneAt == nil {
             let wanted: (NASRename) -> Bool = { op in
@@ -372,6 +376,109 @@ public struct NASMoveFollower {
         return undone
     }
 
+    /// The NAS paths (each rename's `to`, as `NASSyncStore.pathKey`) that an
+    /// Undo of this move can reverse right now: the copy was renamed, merged
+    /// into a copy the event had, or its rename is still queued. A move
+    /// whose file has no NAS copy that followed it is not in the set.
+    /// Undo when the drive is not there uses it to act on the NAS alone,
+    /// and only where there is a NAS copy to act on.
+    public func reversibleTargets(moveJournalID: UUID) -> Set<String> {
+        guard let queue else { return [] }
+        var targets: Set<String> = []
+        for batch in queue.batches(forMoveJournal: moveJournalID) where batch.undoneAt == nil {
+            for op in batch.ops {
+                switch op.state {
+                case .pending, .renamed, .merged: targets.insert(NASSyncStore.pathKey(op.to))
+                default: continue
+                }
+            }
+        }
+        return targets
+    }
+
+    /// The renames an Undo can reverse right now, as `NASSyncStore.pathKey`s
+    /// of each one's old and new path — for a step that has to decide which
+    /// of the move's files have a NAS copy to act on.
+    public func reversibleRenames(moveJournalID: UUID) -> [(from: String, to: String)] {
+        guard let queue else { return [] }
+        var renames: [(from: String, to: String)] = []
+        for batch in queue.batches(forMoveJournal: moveJournalID) where batch.undoneAt == nil {
+            for op in batch.ops {
+                switch op.state {
+                case .pending, .renamed, .merged:
+                    renames.append((NASSyncStore.pathKey(op.from), NASSyncStore.pathKey(op.to)))
+                default: continue
+                }
+            }
+        }
+        return renames
+    }
+
+    /// Like `reversibleTargets`, for Redo: the targets of batches Undo closed
+    /// and Redo has not queued again.
+    public func redoableTargets(moveJournalID: UUID) -> Set<String> {
+        guard let queue else { return [] }
+        var targets: Set<String> = []
+        for batch in queue.batches(forMoveJournal: moveJournalID)
+        where batch.undoneAt != nil && batch.redoneAt == nil && batch.origin != .undo {
+            for op in batch.ops {
+                switch op.state {
+                case .renamed, .merged, .cancelled: targets.insert(NASSyncStore.pathKey(op.to))
+                default: continue
+                }
+            }
+        }
+        return targets
+    }
+
+    /// Redo of a move on the NAS: every batch of the move that Undo closed
+    /// is queued again as a new batch (same move id, so the next Undo
+    /// reverses it too) and applied now when the NAS is there, queued when it
+    /// is not. Only renames that ran — or were still waiting — come back; a
+    /// rename that never applied (absent, differs, failed) stays as it was.
+    /// A closed batch is marked spent, so a second Redo never queues twice.
+    public func redo(
+        moveJournalID: UUID,
+        nasRoot: URL,
+        progress: Progress? = nil
+    ) throws -> NASUndoResult {
+        guard let queue else { return NASUndoResult() }
+        queue.lock.lock()
+        defer { queue.lock.unlock() }
+        var redone = NASUndoResult()
+        for var closed in queue.batches(forMoveJournal: moveJournalID)
+        where closed.undoneAt != nil && closed.redoneAt == nil && closed.origin != .undo {
+            var ops: [NASRename] = []
+            for op in closed.ops {
+                switch op.state {
+                case .renamed, .merged, .cancelled:
+                    ops.append(NASRename(
+                        kind: op.kind, from: op.from, to: op.to, byteCount: op.byteCount,
+                        eventID: op.eventID, previousEventID: op.previousEventID
+                    ))
+                default:
+                    continue
+                }
+            }
+            closed.redoneAt = now()
+            try queue.save(closed)
+            guard !ops.isEmpty else { continue }
+            var again = NASRenameBatch(
+                title: closed.title,
+                origin: closed.origin,
+                createdAt: now(),
+                nasRoot: closed.nasRoot,
+                moveJournalID: moveJournalID,
+                ops: ops
+            )
+            try queue.save(again)
+            let result = try apply(&again, nasRoot: nasRoot, progress: progress)
+            redone.follow.add(result)
+            redone.queued += again.pendingCount
+        }
+        return redone
+    }
+
     // MARK: Applying
 
     /// Applies every queued batch for `nasRoot`, oldest first. Returns
@@ -379,6 +486,8 @@ public struct NASMoveFollower {
     public func applyPending(nasRoot: URL, progress: Progress? = nil) throws -> NASFollowResult {
         var total = NASFollowResult()
         guard let queue else { return total }
+        queue.lock.lock()
+        defer { queue.lock.unlock() }
         let root = nasRoot.standardizedFileURL.path
         for var batch in queue.pending(nasRoot: root) {
             let result = try apply(&batch, nasRoot: nasRoot, progress: progress)
@@ -395,6 +504,14 @@ public struct NASMoveFollower {
     public func apply(_ batch: inout NASRenameBatch, nasRoot: URL, progress: Progress? = nil) throws -> NASFollowResult {
         var result = NASFollowResult()
         let root = nasRoot.standardizedFileURL.path
+        // One applier or Undo at a time per queue, and the copy on disk is the
+        // truth: an Undo that ran since this batch was read has closed or
+        // cancelled it, and saving the stale copy back would undo the Undo.
+        let queueLock = queue?.lock
+        queueLock?.lock()
+        defer { queueLock?.unlock() }
+        if let onDisk = queue?.load(batch) { batch = onDisk }
+        if batch.undoneAt != nil { return result }
         // Written before anything else — even with the NAS away — so the
         // renames are queued on disk and a crash leaves the journal.
         try queue?.save(batch)

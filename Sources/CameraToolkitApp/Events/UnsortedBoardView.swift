@@ -309,14 +309,14 @@ struct UnsortedBoardView: View {
             // Trailing: undo, and the one commit step.
             HStack(spacing: 6) {
                 Button {
-                    workspace.undoLastSort()
+                    workspace.undo()
                 } label: {
                     Label("Undo", systemImage: "arrow.uturn.backward")
                 }
                 .labelStyle(.iconOnly)
                 .buttonStyle(.glass)
-                .disabled(!workspace.canUndoSort)
-                .help("Undo the last sort (⌘Z)")
+                .disabled(!workspace.canUndo)
+                .help((workspace.undoMenuTitle ?? "Undo") + " (⌘Z)")
                 // Apply only opens the plan sheet; nothing moves until the
                 // plan is confirmed there.
                 Button("Apply…") {
@@ -622,10 +622,14 @@ private struct UnsortedActionsMenu: View {
         Button("Reveal in Finder") {
             NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: DashboardModel.expandedPath(location.path))])
         }
-        Button(workspace.latestMoveJournalTitle.map { "Undo “\($0)”" } ?? "Undo Last Move") {
-            workspace.undoLastMove()
+        Button(workspace.undoMenuTitle ?? "Undo") {
+            workspace.undo()
         }
-        .disabled(workspace.latestMoveJournalTitle == nil || model.isBusy)
+        .disabled(!workspace.canUndo || model.isBusy)
+        Button(workspace.redoMenuTitle ?? "Redo") {
+            workspace.redo()
+        }
+        .disabled(!workspace.canRedo || model.isBusy)
         Divider()
         Button("Move to Trash…", role: .destructive) {
             workspace.trash(stackIDs: workspace.targetStackIDs(), from: location.id)

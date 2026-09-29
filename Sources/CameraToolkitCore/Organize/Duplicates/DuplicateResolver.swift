@@ -184,7 +184,7 @@ public struct DuplicateResolver {
 
     /// The deepest folder every path sits under, so a non-volume Trash
     /// batch keeps the files' folder structure instead of flattening it.
-    static func commonFolder(of paths: [String]) -> URL? {
+    public static func commonFolder(of paths: [String]) -> URL? {
         guard var common = paths.first.map({ ($0 as NSString).deletingLastPathComponent.split(separator: "/") }) else { return nil }
         for path in paths.dropFirst() {
             let parts = (path as NSString).deletingLastPathComponent.split(separator: "/")

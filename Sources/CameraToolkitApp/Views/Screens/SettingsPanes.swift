@@ -539,7 +539,7 @@ struct AdvancedSettingsPane: View {
             } header: {
                 Text("Local App Data")
             } footer: {
-                Text("API keys are stored in macOS Keychain. Paths and preferences are stored locally.")
+                Text("API keys are stored in macOS Keychain. Paths and preferences are stored locally. \(UndoScopeWording.settings)")
             }
         }
     }
