@@ -4,6 +4,17 @@
 
 This repository is the canonical source for the native Swift Camera Toolkit app and its non-destructive camera-media workflow.
 
+## Never Store Personal Information
+
+This repository is public. Nothing personal goes into it — not in code, tests, fixtures, docs, comments, scripts, commit messages, or branch names.
+
+- Never write real people's names (the owner, family, friends, anyone shown in photos), real event or trip names, real places tied to the owner's life, real file names from the owner's library, media inventories, or face/person data.
+- Never write machine- or network-specific details: user home paths, volume or drive names, NAS share names and server paths, hostnames, IP addresses, usernames, SSH hosts, email addresses, API keys, or tokens.
+- Briefs, bug reports, screenshots, and logs will often contain real names and paths. Treat them as private context: reproduce the shape of the problem with neutral fixtures instead — people such as "Alex" and "Sam", events such as "Trip 2026", "Beach Day", or "Family Party", volumes such as `/Volumes/Buffer` and `/Volumes/nas_share`, and generated file names such as `DSC00001.ARW`.
+- Personal helper scripts that hard-code the owner's paths or events stay outside the repository, or untracked and git-ignored.
+- Before committing, run `scripts/audit-public-repo.sh`. It also checks the owner's private term list when one exists outside the repository; never copy that list into the repository.
+- If personal information is found in the repository or its history, stop and tell the user. Removing it requires rewriting history, which only the user can approve.
+
 ## Commands
 
 Run from the repository root:
@@ -31,7 +42,7 @@ Use `scripts/package-app.sh --install` only when the user asks to refresh the in
 - Treat files under the user's Camera Toolkit Application Support folder as live state. Create timestamped backups and stop concurrent app writes before atomically replacing configuration or catalog files.
 - Build and validate candidate files separately before installation. Require JSON decode success, `PRAGMA integrity_check = ok`, zero foreign-key violations, and exact expected event and assignment counts.
 - Preserve unrelated events and assignments during scoped reconciliation. Replace only roots explicitly included in the approved plan.
-- Do not commit personal paths, event names, media inventories, local databases, API keys, tokens, or other machine-specific state to this public repository.
+- Do not commit local databases, configuration, or any other machine-specific state (see Never Store Personal Information).
 
 ## Implementation Rules
 
