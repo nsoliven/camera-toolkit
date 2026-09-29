@@ -187,6 +187,15 @@ public final class NASSyncStore: @unchecked Sendable {
         return (try? store.verifiedDates(nasRoot: nasRoot, prefixes: prefixes)) ?? [:]
     }
 
+    /// `records` without creating anything, for the NAS presence index: an
+    /// absent catalog or a catalog without the table answers empty.
+    public static func existingRecords(catalogURL: URL, nasRoot: String, prefixes: [String]? = nil) -> [String: NASSyncRecord] {
+        guard FileManager.default.fileExists(atPath: catalogURL.path),
+              let writer = try? CatalogDatabase.writer(for: catalogURL),
+              (try? writer.read({ try $0.tableExists(tableName) })) == true else { return [:] }
+        return (try? NASSyncStore(unchecked: catalogURL).records(nasRoot: nasRoot, prefixes: prefixes)) ?? [:]
+    }
+
     private init(unchecked catalogURL: URL) {
         self.catalogURL = catalogURL
     }

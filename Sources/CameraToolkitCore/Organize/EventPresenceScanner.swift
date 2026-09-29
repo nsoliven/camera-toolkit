@@ -105,6 +105,11 @@ public enum EventPresenceScanner {
     /// surrounding task is cancelled mid-sweep so a stale pass can be
     /// dropped instead of published. When `pauseGate` is set the sweep waits
     /// at it before touching a volume that a speed test is measuring.
+    ///
+    /// `archiveListing`, when it covers a file's NAS mirror folder, answers
+    /// the NAS place from memory instead of a stat over SMB — the same
+    /// listing the NAS presence index counts from, so the board and the
+    /// sidebar agree. A file it does not cover is probed as before.
     public static func scan(
         event: SavedCameraEvent,
         assignments: [PhotoEventAssignment],
@@ -112,7 +117,8 @@ public enum EventPresenceScanner {
         mountedVolumes: Set<String>? = nil,
         probe: PresenceProbe? = nil,
         pauseGate: DriveActivityGate? = nil,
-        nasVerified: [String: Date]? = nil
+        nasVerified: [String: Date]? = nil,
+        archiveListing: NASTreeListing? = nil
     ) -> EventPresenceSummary? {
         let mounted = mountedVolumes ?? VolumeInfo.mountedVolumePaths()
         let policy = locations.resolvedPolicy(for: event)
@@ -129,6 +135,15 @@ public enum EventPresenceScanner {
         var legacyRoots: [String: URL] = [:]
         var layouts: [String: OrganizedArchiveLayout] = [:]
         var validRelative: [String: Bool] = [:]
+        // With a listing, the legacy archive is only probed per file when
+        // the event has a legacy folder at all — one stat per event.
+        var legacyArchiveEventExists: Bool?
+        func hasLegacyArchiveFolder() -> Bool {
+            if let known = legacyArchiveEventExists { return known }
+            let exists = LayoutMigrationDisk.lstatEntry(locations.legacyArchiveEventFolder(for: event).path)?.kind == .directory
+            legacyArchiveEventExists = exists
+            return exists
+        }
 
         func originalsRoot(_ policy: EventStoragePolicy, _ deviceID: String?) -> URL {
             let key = "\(policy.rawValue)\u{0}\(deviceID ?? "")"
@@ -165,6 +180,7 @@ public enum EventPresenceScanner {
         for assignment in assignments {
             if Task<Never, Never>.isCancelled { return nil }
             var mirrorKey: String?
+            var mirrorRelative: String?
             let (source, drive, other, archive, legacyDrive, legacyOther, legacyArchive) = autoreleasepool {
                 () -> (URL?, URL?, URL?, URL?, URL?, URL?, URL?) in
                 let valid = isValidRelative(assignment.relativePath)
@@ -176,6 +192,7 @@ public enum EventPresenceScanner {
                 let archive = try? archiveLayout.mirrorRelativePath(for: assignment.relativePath)
                 let legacyArchive = try? archiveLayout.legacyArchiveRelativePath(for: assignment.relativePath)
                 mirrorKey = archive.map(NASSyncStore.pathKey)
+                mirrorRelative = archive
                 return (
                     source,
                     join(originalsRoot(policy, assignment.deviceID)),
@@ -217,7 +234,21 @@ public enum EventPresenceScanner {
             let otherResolved = resolve(other, legacyOther)
             // The NAS: the mirror layout first, then the legacy archive
             // layout an event archived before the mirror still sits in.
-            let archiveResolved = resolve(archive, legacyArchive)
+            func resolveArchive() -> (URL?, CatalogPresenceState, Bool) {
+                guard let archiveListing, let archive, let mirrorRelative,
+                      archiveListing.root == locations.nasRoot.path,
+                      archiveListing.covers(mirrorRelative),
+                      VolumeInfo.isAvailable(archive, mountedVolumes: mounted) else {
+                    return resolve(archive, legacyArchive)
+                }
+                if let entry = archiveListing.entry(mirrorRelative), entry.size == assignment.fileSize {
+                    return (archive, .present, false)
+                }
+                guard let legacyArchive, hasLegacyArchiveFolder() else { return (archive, .missing, false) }
+                let legacyState = probe(legacyArchive, assignment.fileSize, mounted)
+                return legacyState == .present ? (legacyArchive, .present, true) : (archive, .missing, false)
+            }
+            let archiveResolved = resolveArchive()
             assets.append(EventAssetPresence(
                 id: CatalogStore.eventAssetID(assignment),
                 assignment: assignment,
