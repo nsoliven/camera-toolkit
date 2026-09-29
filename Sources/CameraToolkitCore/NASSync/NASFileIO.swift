@@ -43,6 +43,42 @@ public enum NASFileIO {
         [EBADF, ENOTCONN, EIO, ESTALE, ETIMEDOUT, ECONNRESET].contains(code)
     }
 
+    /// A rename, claim or folder creation the filesystem refused for a
+    /// reason that is not a dropped session. Carries the code so a caller
+    /// can tell "the folder went away" (`ENOENT`) from the rest.
+    public struct POSIXFailure: LocalizedError, Equatable, Sendable {
+        public var operation: String
+        public var path: String
+        public var code: Int32
+
+        public var errorDescription: String? {
+            "Could not \(operation) \(path): \(String(cString: strerror(code)))"
+        }
+    }
+
+    /// The error for a failed rename, claim or folder creation: transient
+    /// (`TransientIOError`) when a dropped or re-established SMB session may
+    /// have caused it, else a `POSIXFailure`. Both read like the plain
+    /// message they replace.
+    static func namespaceFailure(_ code: Int32, _ operation: String, _ path: String) -> Error {
+        isTransient(code)
+            ? TransientIOError(operation: operation, path: path, code: code)
+            : POSIXFailure(operation: operation, path: path, code: code)
+    }
+
+    /// The errno an error carries, when it is one of this file's typed
+    /// failures.
+    public static func code(of error: Error) -> Int32? {
+        if let transient = error as? TransientIOError { return transient.code }
+        if let failure = error as? POSIXFailure { return failure.code }
+        return nil
+    }
+
+    /// Whether `error` is a session hiccup a retry may clear.
+    public static func isTransient(_ error: Error) -> Bool {
+        code(of: error).map(isTransient) ?? false
+    }
+
     /// The error for a failed operation on the destination: transient when
     /// the SMB session may have caused it, else a plain failure.
     static func failure(_ code: Int32, _ operation: String, _ path: String) -> Error {
@@ -305,7 +341,7 @@ public enum NASFileIO {
         case EEXIST:
             throw ToolkitError.commandFailed("A file already exists at \(destination). Nothing was replaced.")
         default:
-            throw DirectoryListing.posix(code, "rename", source)
+            throw namespaceFailure(code, "rename", source)
         }
     }
 
@@ -314,14 +350,14 @@ public enum NASFileIO {
     /// it is still the empty file or folder this call made.
     static func renameOntoClaimedName(from source: String, to destination: String) throws {
         var sourceInfo = stat()
-        guard lstat(source, &sourceInfo) == 0 else { throw DirectoryListing.posix(errno, "rename", source) }
+        guard lstat(source, &sourceInfo) == 0 else { throw namespaceFailure(errno, "rename", source) }
         let isFolder = (sourceInfo.st_mode & S_IFMT) == S_IFDIR
         if isFolder {
             guard mkdir(destination, 0o755) == 0 else {
                 if errno == EEXIST {
                     throw ToolkitError.commandFailed("A file already exists at \(destination). Nothing was replaced.")
                 }
-                throw DirectoryListing.posix(errno, "claim", destination)
+                throw namespaceFailure(errno, "claim", destination)
             }
         } else {
             let placeholder = Darwin.open(destination, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0o600)
@@ -329,7 +365,7 @@ public enum NASFileIO {
                 if errno == EEXIST {
                     throw ToolkitError.commandFailed("A file already exists at \(destination). Nothing was replaced.")
                 }
-                throw DirectoryListing.posix(errno, "claim", destination)
+                throw namespaceFailure(errno, "claim", destination)
             }
             Darwin.close(placeholder)
         }
@@ -343,7 +379,7 @@ public enum NASFileIO {
                     _ = unlink(destination)
                 }
             }
-            throw DirectoryListing.posix(code, "rename", source)
+            throw namespaceFailure(code, "rename", source)
         }
     }
 
@@ -365,7 +401,7 @@ public enum NASFileIO {
         var made: [String] = []
         for directory in missing.reversed() {
             guard mkdir(directory, 0o755) == 0 || errno == EEXIST else {
-                throw DirectoryListing.posix(errno, "create", directory)
+                throw namespaceFailure(errno, "create", directory)
             }
             made.append(directory)
         }

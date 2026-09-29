@@ -14,10 +14,14 @@ public struct NASFollowResult: Equatable, Sendable {
     public var absent = 0
     /// A different file sits at the new path; both left untouched.
     public var differs: [NASSyncIssue] = []
-    /// Same size at the new path, identity not provable without reading
-    /// the files; both left, Sync to NAS compares them.
+    /// Same size at the new path and the two copies could not both be read
+    /// to compare them; both left exactly as they are.
     public var unproven: [NASSyncIssue] = []
     public var failed: [NASSyncIssue] = []
+    /// Renames the share refused with a transient error (a dropped session,
+    /// `EIO`, a stale handle): tried again within the run, and left queued
+    /// for the next one. The copy has not moved.
+    public var deferred: [NASSyncIssue] = []
     /// Left queued because the NAS went away or the job was stopped.
     public var notAttempted = 0
     public var stoppedReason: String?
@@ -37,9 +41,9 @@ public struct NASFollowResult: Equatable, Sendable {
     /// Renames, merges, and folder renames: what changed on the NAS.
     public var changed: Int { renamed + merged + foldersRenamed }
     public var isEmpty: Bool {
-        changed == 0 && absent == 0 && differs.isEmpty && unproven.isEmpty && failed.isEmpty && notAttempted == 0
+        changed == 0 && absent == 0 && differs.isEmpty && unproven.isEmpty && failed.isEmpty && deferred.isEmpty && notAttempted == 0
     }
-    public var succeeded: Bool { failed.isEmpty && differs.isEmpty && unproven.isEmpty && notAttempted == 0 && stoppedReason == nil }
+    public var succeeded: Bool { failed.isEmpty && differs.isEmpty && unproven.isEmpty && deferred.isEmpty && notAttempted == 0 && stoppedReason == nil }
 
     public mutating func add(_ other: NASFollowResult) {
         renamed += other.renamed
@@ -49,6 +53,7 @@ public struct NASFollowResult: Equatable, Sendable {
         differs += other.differs
         unproven += other.unproven
         failed += other.failed
+        deferred += other.deferred
         notAttempted += other.notAttempted
         stoppedReason = stoppedReason ?? other.stoppedReason
         catalogProblem = catalogProblem ?? other.catalogProblem
@@ -78,8 +83,9 @@ public struct NASFollowResult: Equatable, Sendable {
         if foldersRenamed > 0 { parts.append("renamed \(foldersRenamed) event folder\(foldersRenamed == 1 ? "" : "s") on the NAS") }
         if merged > 0 { parts.append("set aside \(merged) stale duplicate\(merged == 1 ? "" : "s") on the NAS") }
         if !differs.isEmpty { parts.append("\(differs.count) left untouched (a different file is already at the new name)") }
-        if !unproven.isEmpty { parts.append("\(unproven.count) left for Sync to NAS to compare") }
+        if !unproven.isEmpty { parts.append("\(unproven.count) left untouched (the two copies could not both be read to compare them)") }
         if !failed.isEmpty { parts.append("\(failed.count) could not be renamed") }
+        if !deferred.isEmpty { parts.append("\(deferred.count) hit a network error and stay queued to be tried again") }
         if notAttempted > 0 { parts.append("\(notAttempted) still queued") }
         return parts
     }
@@ -137,23 +143,33 @@ public struct NASMoveFollower {
     /// nothing here is ever emptied by the app.
     public static let staleFolderPath = "\(EventStorageLocations.toolkitFolderName)/_Stale Copies"
 
+    /// Tries a rename gets in one run when the share answers with a
+    /// transient error, and over all runs before it is given up as failed.
+    public static let attemptsPerRun = 2
+    public static let maxAttempts = 6
+
     private let store: NASSyncStore?
     private let remoteVerifier: NASRemoteVerifier?
     private let queue: NASRenameQueue?
     private let now: @Sendable () -> Date
     private let isCancelled: @Sendable () -> Bool
+    private let retryDelay: TimeInterval
 
+    /// `retryDelay`: how long a rename waits before its second try in one
+    /// run after a transient share error.
     public init(
         store: NASSyncStore?,
         remoteVerifier: NASRemoteVerifier? = nil,
         queue: NASRenameQueue? = nil,
         now: @escaping @Sendable () -> Date = { Date() },
+        retryDelay: TimeInterval = 1,
         isCancelled: @escaping @Sendable () -> Bool = { Task.isCancelled }
     ) {
         self.store = store
         self.remoteVerifier = remoteVerifier
         self.queue = queue
         self.now = now
+        self.retryDelay = max(0, retryDelay)
         self.isCancelled = isCancelled
     }
 
@@ -290,6 +306,24 @@ public struct NASMoveFollower {
         let to = mirrorEventFolder(of: renamed, locations: locations)
         guard NASSyncStore.pathKey(from) != NASSyncStore.pathKey(to) else { return nil }
         return NASRename(kind: .folder, from: from, to: to, eventID: renamed.id, previousEventID: old.id)
+    }
+
+    /// The batch an event rename owes the NAS, to be saved to the queue
+    /// right away: always, whether or not the NAS is connected and whether
+    /// or not its folder is at the old name *yet*. A second rename before
+    /// the first one ran finds no folder at its old name — that is the
+    /// first rename's, still queued — and skipping it stranded the NAS
+    /// folder at the first name for good. Queued in order, the two run in
+    /// order; when the NAS never had the folder the op is recorded as
+    /// `.absent`, which is harmless.
+    public static func folderRenameBatch(
+        from old: SavedCameraEvent,
+        to renamed: SavedCameraEvent,
+        locations: EventStorageLocations,
+        title: String
+    ) -> NASRenameBatch? {
+        guard let owed = folderRename(from: old, to: renamed, locations: locations) else { return nil }
+        return NASRenameBatch(title: title, origin: .folderRename, nasRoot: locations.nasRoot.path, ops: [owed])
     }
 
     // MARK: Undo
@@ -560,15 +594,29 @@ public struct NASMoveFollower {
                     totalFiles: batch.ops.filter { $0.kind == .file }.count
                 ))
             }
-            switch op.kind {
-            case .file:
-                performFile(&op, run: &run, result: &result)
-            case .folder:
-                performFolder(&op, run: &run, result: &result)
+            func perform() {
+                switch op.kind {
+                case .file:
+                    performFile(&op, run: &run, result: &result)
+                case .folder:
+                    performFolder(&op, run: &run, result: &result)
+                }
+            }
+            perform()
+            // One transient error on a rename (a dropped session, `EIO`, a
+            // stale handle) must not strand the copy: the op is still
+            // pending, so it is tried once more from a fresh call — with
+            // its destination folder made again — before the run moves on.
+            // Whatever is still pending stays queued for the next run.
+            var triesThisRun = 1
+            while op.state == .pending, triesThisRun < Self.attemptsPerRun, !isCancelled(), !nasIsGone(root) {
+                triesThisRun += 1
+                if retryDelay > 0 { Thread.sleep(forTimeInterval: retryDelay) }
+                perform()
             }
             // A dropped share fails renames with odd errors: the op stays
             // queued and the run stops, rather than losing the rename.
-            if op.state == .failed || (op.state == .absent && LayoutMigrationDisk.lstatEntry(root)?.kind != .directory),
+            if op.state == .failed || op.state == .pending || (op.state == .absent && LayoutMigrationDisk.lstatEntry(root)?.kind != .directory),
                nasIsGone(root) {
                 result.stoppedReason = "The NAS disconnected; the remaining renames stay queued."
                 break
@@ -659,7 +707,43 @@ public struct NASMoveFollower {
         case (_, .differs): result.differs.append(NASSyncIssue(path: op.to, reason: op.detail ?? "A different file is at the new path."))
         case (_, .unproven): result.unproven.append(NASSyncIssue(path: op.to, reason: op.detail ?? "Identity could not be proven."))
         case (_, .failed): result.failed.append(NASSyncIssue(path: op.from, reason: op.detail ?? "Could not rename."))
+        case (_, .pending) where op.attempts != nil:
+            result.deferred.append(NASSyncIssue(path: op.from, reason: op.detail ?? "The share refused the rename; it stays queued."))
         default: break
+        }
+    }
+
+    /// A rename or folder creation the share refused. A session hiccup
+    /// (`EIO`, `ESTALE`, a dropped connection…) leaves the copy exactly
+    /// where it was, so the op stays `.pending` and is counted; only after
+    /// `maxAttempts` — or for any other error — is it `.failed`.
+    private func fail(_ op: inout NASRename, _ error: Error) {
+        guard NASFileIO.isTransient(error) else {
+            op.state = .failed
+            op.detail = error.localizedDescription
+            return
+        }
+        let attempts = (op.attempts ?? 0) + 1
+        op.attempts = attempts
+        if attempts >= Self.maxAttempts {
+            op.state = .failed
+            op.detail = error.localizedDescription + " Tried \(attempts) times."
+        } else {
+            op.state = .pending
+            op.detail = error.localizedDescription + " (attempt \(attempts); it stays queued.)"
+        }
+    }
+
+    /// `mkdir -p` and the exclusive rename, with the destination folder made
+    /// again once if the share lost it between the two.
+    private func renameCreatingFolders(from fromPath: String, to toPath: String) throws {
+        let folder = (toPath as NSString).deletingLastPathComponent
+        try NASFileIO.makeDirectories(folder)
+        do {
+            try NASFileIO.renameExclusive(from: fromPath, to: toPath)
+        } catch where NASFileIO.code(of: error) == ENOENT && LayoutMigrationDisk.lstatEntry(fromPath) != nil {
+            try NASFileIO.makeDirectories(folder)
+            try NASFileIO.renameExclusive(from: fromPath, to: toPath)
         }
     }
 
@@ -724,16 +808,14 @@ public struct NASMoveFollower {
                 op.detail = "A different file of the same size is already at the new path. Both left untouched."
             case nil:
                 op.state = .unproven
-                op.detail = "A file of the same size is already at the new path and no hash proves it identical. Both left untouched; Sync to NAS compares them."
+                op.detail = "A file of the same size is already at the new path and the two copies could not both be read to compare them. Both left untouched."
             }
             return
         }
         do {
-            try NASFileIO.makeDirectories((toPath as NSString).deletingLastPathComponent)
-            try NASFileIO.renameExclusive(from: fromPath, to: toPath)
+            try renameCreatingFolders(from: fromPath, to: toPath)
         } catch {
-            op.state = .failed
-            op.detail = error.localizedDescription
+            fail(&op, error)
             return
         }
         op.state = .renamed
@@ -747,11 +829,9 @@ public struct NASMoveFollower {
     private func setAside(_ op: inout NASRename, run: inout Run, fromPath: String) {
         let stale = run.staleFolder + "/" + op.from
         do {
-            try NASFileIO.makeDirectories(((run.root + "/" + stale) as NSString).deletingLastPathComponent)
-            try NASFileIO.renameExclusive(from: fromPath, to: run.root + "/" + stale)
+            try renameCreatingFolders(from: fromPath, to: run.root + "/" + stale)
         } catch {
-            op.state = .failed
-            op.detail = error.localizedDescription
+            fail(&op, error)
             return
         }
         op.state = .merged
@@ -762,20 +842,34 @@ public struct NASMoveFollower {
         run.sourceFolders.insert((fromPath as NSString).deletingLastPathComponent)
     }
 
-    /// True/false when the two files' identity is known without reading
-    /// anything on this Mac; nil when it is not.
+    /// True/false when the two copies' identity is known; nil when one of
+    /// them could not be read.
+    ///
+    /// Bytes decide, never records. The NAS has shown rare corruption: a
+    /// copy that was verified once can hold other bytes now, and a merge
+    /// that trusted two matching records would keep the damaged file at the
+    /// owned path and set the good one aside. So both copies are hashed
+    /// *now* — on the NAS itself when SSH is set up (only the answer
+    /// crosses the wire), else by re-reading them over SMB. A record can
+    /// only rule a pair out: two verified records with different hashes
+    /// mean "different", which leaves both files where they are.
     private func identical(_ op: NASRename, size: Int64, fromPath: String, toPath: String, records: RecordCache) -> Bool? {
         if let old = records.record(NASSyncStore.pathKey(op.from)), let new = records.record(NASSyncStore.pathKey(op.to)),
            old.state == .verified, new.state == .verified, old.byteCount == size, new.byteCount == size,
-           let oldHash = old.sha256, let newHash = new.sha256 {
-            return oldHash == newHash
+           let oldHash = old.sha256, let newHash = new.sha256, oldHash != newHash {
+            return false
         }
         // Hashed on the NAS itself: only the answer crosses the wire.
         if let remoteVerifier, let hashes = try? remoteVerifier.hashes(localPaths: [fromPath, toPath]),
            let oldHash = hashes[fromPath], let newHash = hashes[toPath] {
             return oldHash == newHash
         }
-        return nil
+        // No SSH (or it could not answer): read both over SMB, uncached.
+        guard !isCancelled(),
+              let oldHash = try? NASFileIO.sha256(fromPath, uncached: true, expectedByteCount: size),
+              !isCancelled(),
+              let newHash = try? NASFileIO.sha256(toPath, uncached: true, expectedByteCount: size) else { return nil }
+        return oldHash == newHash
     }
 
     // MARK: Folders
@@ -814,11 +908,9 @@ public struct NASMoveFollower {
         }
         guard let new = LayoutMigrationDisk.lstatEntry(toPath) else {
             do {
-                try NASFileIO.makeDirectories((toPath as NSString).deletingLastPathComponent)
-                try NASFileIO.renameExclusive(from: fromPath, to: toPath)
+                try renameCreatingFolders(from: fromPath, to: toPath)
             } catch {
-                op.state = .failed
-                op.detail = error.localizedDescription
+                fail(&op, error)
                 return
             }
             do {

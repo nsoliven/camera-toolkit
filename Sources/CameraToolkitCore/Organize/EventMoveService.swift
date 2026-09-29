@@ -46,10 +46,14 @@ public enum MoveConflictCheck {
 public struct NASCopyMove: Sendable, Equatable {
     public var from: String
     public var to: String
+    /// Where the file would sit on the drive under its new event — the path
+    /// a "(N)" name is checked against when the NAS already holds the name.
+    public var driveDestination: String?
 
-    public init(from: String, to: String) {
+    public init(from: String, to: String, driveDestination: String? = nil) {
         self.from = from
         self.to = to
+        self.driveDestination = driveDestination
     }
 }
 
@@ -130,6 +134,9 @@ public struct EventMoveOutcome: Sendable {
     /// Different photos whose name was taken, moved in under a free name.
     /// Sidecars that travel with them are in `moved`.
     public var keptBoth: [EventMoveKeptBoth] = []
+    /// Photos only the NAS has that came in under a free "(N)" name because
+    /// the NAS already held their name. Also in `moved`.
+    public var nasRenamed: [EventMoveKeptBoth] = []
     /// Left exactly where they were, with the reason.
     public var stayed: [EventMoveStay] = []
 
@@ -154,10 +161,25 @@ public struct EventMoveService {
 
     private let trash: MediaTrashService
     private let hasher: Hasher
+    private let nasCheck: EventMoveNASCheck?
 
-    public init(trash: MediaTrashService, hasher: @escaping Hasher = { try FileScanner.sha256($0) }) {
+    /// `nasCheck` lets the move see what the NAS holds at the names it is
+    /// about to take. The NAS copy of a moved file is renamed to the new
+    /// path; when the NAS already holds a *different* file there — debris
+    /// of an older Buffer, another photo the catalog never listed — that
+    /// rename can only be refused, and the entry would point at the other
+    /// file (or at nothing). So a photo whose new NAS name is taken by a
+    /// different file moves in under a free "(N)" name, checked against the
+    /// drive, the catalog and the NAS. A photo only the NAS has (no drive
+    /// copy to compare) is never guessed identical: it also takes a free name.
+    public init(
+        trash: MediaTrashService,
+        hasher: @escaping Hasher = { try FileScanner.sha256($0) },
+        nasCheck: EventMoveNASCheck? = nil
+    ) {
         self.trash = trash
         self.hasher = hasher
+        self.nasCheck = nasCheck
     }
 
     /// `protectedPathKeys`: files other assignments still use — an
@@ -179,18 +201,42 @@ public struct EventMoveService {
         var plain: [EventMoveItem] = []
         var keep: [EventMoveItem] = []
         var toTrash: [EventMoveItem] = []
+        var nasKeptBoth: Set<String> = []
+        // Names this batch already takes, on the drive and on the NAS.
+        var claimedDrive = Set(items.compactMap { $0.move?.destinationPath.lowercased() })
+        var claimedNAS = Set(items.compactMap { $0.move == nil ? $0.nasCopy.map { NASSyncStore.pathKey($0.to) } : nil })
 
         // A destination already on disk is a taken name even when the
         // target's catalog does not list it.
         var checked = 0
         var takenOnDiskOnly: Set<String> = []
         for var item in items {
+            if item.move == nil, item.takenBy.isEmpty, let copy = item.nasCopy, let nasCheck, nasCheck.holds(copy.to) {
+                guard let renamed = Self.nasKeepBothName(
+                    for: item, copy: copy, nasHolds: nasCheck.holds, takenPathKeys: takenPathKeys,
+                    claimedDrive: claimedDrive, claimedNAS: claimedNAS
+                ) else {
+                    outcome.stayed.append(EventMoveStay(item: item, reason: "the NAS already has a different file named \(item.fileName) there, and no free “(N)” name was found next to it"))
+                    continue
+                }
+                if let drive = renamed.nasCopy?.driveDestination { claimedDrive.insert(drive.lowercased()) }
+                if let nas = renamed.nasCopy { claimedNAS.insert(NASSyncStore.pathKey(nas.to)) }
+                nasKeptBoth.insert(CatalogStore.eventAssetID(item.removed))
+                plain.append(renamed)
+                continue
+            }
             if item.takenBy.isEmpty, let move = item.move, DriveMoveService.exists(move.destinationPath) {
                 item.takenBy = [move.destinationPath]
                 takenOnDiskOnly.insert(CatalogStore.eventAssetID(item.removed))
             }
             guard !item.takenBy.isEmpty else {
-                plain.append(item)
+                // The drive and the catalog say the name is free; the NAS
+                // may hold a different file at the mirror of it.
+                if let move = item.move, let nasCheck, nasCheck.wouldClash(move, byteCount: item.removed.fileSize, hasher: hasher) {
+                    keep.append(item)
+                } else {
+                    plain.append(item)
+                }
                 continue
             }
             checked += 1
@@ -249,10 +295,20 @@ public struct EventMoveService {
         if !keepAll.isEmpty {
             let moves = keepAll.compactMap(\.0.move)
             let taken = takenPathKeys
+            let nasCheck = self.nasCheck
+            // Photos only the NAS has move in under their own names too:
+            // a "(N)" name must not take one of theirs.
+            let nasOnlyReserved = plain.compactMap { item -> DriveMove? in
+                guard item.move == nil, let copy = item.nasCopy, let destination = copy.driveDestination else { return nil }
+                return DriveMove(sourcePath: copy.from, destinationPath: destination, byteCount: item.removed.fileSize)
+            }
             if let renamed = KeepBothNaming.renamedMoves(
                 for: moves,
-                reserved: plainMoves,
-                exists: { DriveMoveService.exists($0) || taken.contains(EventStorageLocations.pathKey($0)) }
+                reserved: plainMoves + nasOnlyReserved,
+                exists: {
+                    DriveMoveService.exists($0) || taken.contains(EventStorageLocations.pathKey($0))
+                        || nasCheck?.holdsMirror(ofDrivePath: $0) == true
+                }
             ) {
                 let bySource = Dictionary(renamed.map { ($0.sourcePath, $0) }, uniquingKeysWith: { first, _ in first })
                 for (item, isConflict) in keepAll {
@@ -293,6 +349,12 @@ public struct EventMoveService {
         for item in plain {
             if let reason = failure(item) {
                 outcome.stayed.append(EventMoveStay(item: item, reason: reason))
+            } else if nasKeptBoth.contains(CatalogStore.eventAssetID(item.removed)) {
+                // Counted as moved (the catalog change and its Undo are
+                // one change, NAS rename included) and listed apart so the
+                // status line can say the name changed.
+                outcome.moved.append(item)
+                outcome.nasRenamed.append(EventMoveKeptBoth(item: item, newName: item.fileName))
             } else {
                 outcome.moved.append(item)
             }
@@ -354,5 +416,44 @@ public struct EventMoveService {
         outcome.addedAssignments = (outcome.moved + outcome.keptBoth.map(\.item)).map(\.added)
             + outcome.merged.filter { takenOnDiskOnly.contains(CatalogStore.eventAssetID($0.removed)) }.map(\.added)
         return outcome
+    }
+
+
+    /// The item with the lowest free `name (N).ext` (N ≥ 2) that no NAS
+    /// file, catalog entry, drive file or other move of this batch uses.
+    /// Its assignment and its NAS rename both carry the new name.
+    static func nasKeepBothName(
+        for item: EventMoveItem,
+        copy: NASCopyMove,
+        nasHolds: (String) -> Bool,
+        takenPathKeys: Set<String>,
+        claimedDrive: Set<String>,
+        claimedNAS: Set<String>
+    ) -> EventMoveItem? {
+        let assignmentFolder = (item.added.relativePath as NSString).deletingLastPathComponent
+        let assignmentLeaf = (item.added.relativePath as NSString).lastPathComponent
+        let nasFolder = (copy.to as NSString).deletingLastPathComponent
+        let nasLeaf = (copy.to as NSString).lastPathComponent
+        for number in 2...999 {
+            let newNASPath = nasFolder.isEmpty
+                ? KeepBothNaming.suffixed(nasLeaf, number)
+                : (nasFolder as NSString).appendingPathComponent(KeepBothNaming.suffixed(nasLeaf, number))
+            var newDrive: String?
+            if let drive = copy.driveDestination {
+                let folder = (drive as NSString).deletingLastPathComponent
+                newDrive = (folder as NSString).appendingPathComponent(KeepBothNaming.suffixed((drive as NSString).lastPathComponent, number))
+            }
+            if nasHolds(newNASPath) || claimedNAS.contains(NASSyncStore.pathKey(newNASPath)) { continue }
+            if let newDrive {
+                if claimedDrive.contains(newDrive.lowercased()) || takenPathKeys.contains(EventStorageLocations.pathKey(newDrive))
+                    || DriveMoveService.exists(newDrive) { continue }
+            }
+            var renamed = item
+            let newLeaf = KeepBothNaming.suffixed(assignmentLeaf, number)
+            renamed.added.relativePath = assignmentFolder.isEmpty ? newLeaf : (assignmentFolder as NSString).appendingPathComponent(newLeaf)
+            renamed.nasCopy = NASCopyMove(from: copy.from, to: newNASPath, driveDestination: newDrive)
+            return renamed
+        }
+        return nil
     }
 }

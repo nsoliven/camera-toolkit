@@ -150,6 +150,45 @@ extension EventsWorkspace {
         )
     }
 
+    /// "Verify NAS Copies": re-hashes every copy Sync to NAS recorded as
+    /// verified — on the NAS itself over SSH when that is set up, else by
+    /// re-reading it — and compares with the recorded SHA-256. The NAS has
+    /// had rare corruption, and a record only says what a file was once.
+    /// Reports what changed; never deletes, moves or overwrites a file (a
+    /// copy that no longer matches just stops counting as verified).
+    func verifyNASCopies() {
+        guard syncAllBlocker == nil else {
+            model.statusMessage = syncAllBlocker ?? ""
+            return
+        }
+        let nasRoot = locations.nasRoot
+        let configuration = model.configuration
+        let catalogURL = URL(fileURLWithPath: DashboardModel.expandedPath(configuration.catalogDatabasePath))
+        let nasPresence = self.nasPresence
+        nasConnection.prepareForNASJob { [weak self] in
+            guard let self else { return }
+            model.runBackgroundJob(
+                action: .verifyManifest,
+                runningNote: "Verifying the NAS copies against their recorded SHA-256",
+                logTitle: "Verified NAS copies",
+                logDetail: "Re-hashed every NAS copy Sync to NAS had recorded as verified (on the NAS over SSH, or by re-reading it over SMB) and compared it with the recorded SHA-256. Nothing was deleted, moved or overwritten; a copy that no longer matches stops counting as verified and is listed as a different file by the next sync.",
+                destinationPath: nasRoot.path,
+                operation: { progress in
+                    let store = try NASSyncStore(catalogURL: catalogURL)
+                    let remote = NASSyncOptions.from(configuration: configuration, nasRoot: nasRoot).remoteVerifier
+                    return try NASVerifyScrub(store: store, remoteVerifier: remote).run(nasRoot: nasRoot) { update in
+                        progress(DashboardModel.jobUpdate(from: update, notePrefix: "Verifying NAS copies", command: ""))
+                    }
+                },
+                completion: { report in
+                    nasPresence.refresh(.bufferChanged)
+                    guard report.succeeded else { throw ToolkitError.commandFailed(report.summary) }
+                    return report.summary
+                }
+            )
+        }
+    }
+
     /// NAS renames ran (from the queue, a sync, or an Undo): the counts and
     /// the NAS listing follow, without listing the NAS again.
     func nasRenamesApplied(_ result: NASFollowResult, remaining: Int) {
@@ -168,6 +207,7 @@ extension EventsWorkspace {
     /// The Sync All confirmation's counts, read from the presence answer's
     /// pending files and the catalog's records — no NAS access.
     func refreshReconcilePreview() {
+        syncAllDriveMounted = NASCatchUp.driveIsMounted(locations)
         guard let report = nasPresence.report else {
             reconcilePreview = nil
             return
