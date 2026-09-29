@@ -113,6 +113,8 @@ final class FaceSidecarProcess: @unchecked Sendable {
     private let process: Process
     private let input: FileHandle
     private let output: FileHandle
+    /// The sidecar's stderr, read by a handler that must come off at EOF.
+    private let errorOutput: FileHandle
     private var buffer: [UInt8] = []
     private var recentStderr: [String] = []
     private let stderrLock = NSLock()
@@ -150,9 +152,17 @@ final class FaceSidecarProcess: @unchecked Sendable {
         // property must exist before the read helpers below touch `self`.
         ready = ReadyInfo(pack: "", insightface: "", onnxruntime: "", providers: [])
 
-        stderrPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+        errorOutput = stderrPipe.fileHandleForReading
+        errorOutput.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
-            guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
+            // End of file: the sidecar closed stderr (it exited). A handler
+            // left installed is called again at once with empty data,
+            // forever — each finished face scan left a core spinning.
+            guard !data.isEmpty else {
+                handle.readabilityHandler = nil
+                return
+            }
+            guard let text = String(data: data, encoding: .utf8) else { return }
             self?.noteStderr(text)
         }
         do {
@@ -182,7 +192,7 @@ final class FaceSidecarProcess: @unchecked Sendable {
     var isRunning: Bool { process.isRunning }
 
     func terminate() {
-        input.readabilityHandler = nil
+        errorOutput.readabilityHandler = nil
         try? input.close()
         if process.isRunning { process.terminate() }
     }
