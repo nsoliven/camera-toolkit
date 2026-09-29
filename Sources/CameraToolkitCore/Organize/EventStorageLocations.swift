@@ -251,14 +251,14 @@ public struct EventStorageLocations: Sendable {
     public func sourceURL(for assignment: PhotoEventAssignment) -> URL? {
         guard (try? PathSafety.validateRelativePath(assignment.relativePath)) != nil else { return nil }
         return URL(fileURLWithPath: NSString(string: assignment.sourceRootPath).expandingTildeInPath, isDirectory: true)
-            .appendingPathComponent(assignment.relativePath)
+            .appending(path: assignment.relativePath, directoryHint: .notDirectory)
             .standardizedFileURL
     }
 
     public func driveURL(for assignment: PhotoEventAssignment, event: SavedCameraEvent, policy: EventStoragePolicy) -> URL? {
         guard (try? PathSafety.validateRelativePath(assignment.relativePath)) != nil else { return nil }
         return originalsRoot(for: event, deviceID: assignment.deviceID, policy: policy)
-            .appendingPathComponent(assignment.relativePath)
+            .appending(path: assignment.relativePath, directoryHint: .notDirectory)
             .standardizedFileURL
     }
 
@@ -280,7 +280,7 @@ public struct EventStorageLocations: Sendable {
     public func impliedDrivePath(for assignment: PhotoEventAssignment, event: SavedCameraEvent, policy: EventStoragePolicy) -> String? {
         guard (try? PathSafety.validateRelativePath(assignment.relativePath)) != nil else { return nil }
         return originalsRoot(for: event, deviceID: assignment.deviceID, policy: policy)
-            .appendingPathComponent(assignment.relativePath)
+            .appending(path: assignment.relativePath, directoryHint: .notDirectory)
             .path
     }
 

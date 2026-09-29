@@ -130,10 +130,33 @@ struct OrganizeBoardGroup: Identifiable, Sendable {
     var id: String
     var title: String
     var symbol: String?
-    var stacks: [OrganizeStack]
+    var stacks: [OrganizeStack] {
+        didSet { totals = Totals(stacks) }
+    }
+    /// Counted once per change: every visible header asks on every draw.
+    private var totals: Totals
 
-    var frameCount: Int { stacks.reduce(0) { $0 + $1.items.count } }
-    var byteCount: Int64 { stacks.reduce(Int64(0)) { $0 + $1.byteCount } }
+    private struct Totals: Sendable {
+        var frames = 0
+        var bytes: Int64 = 0
+        init(_ stacks: [OrganizeStack]) {
+            for stack in stacks {
+                frames += stack.items.count
+                bytes += stack.byteCount
+            }
+        }
+    }
+
+    init(id: String, title: String, symbol: String?, stacks: [OrganizeStack]) {
+        self.id = id
+        self.title = title
+        self.symbol = symbol
+        self.stacks = stacks
+        self.totals = Totals(stacks)
+    }
+
+    var frameCount: Int { totals.frames }
+    var byteCount: Int64 { totals.bytes }
     var subtitle: String {
         "\(stacks.count) item\(stacks.count == 1 ? "" : "s") · \(frameCount) frame\(frameCount == 1 ? "" : "s") · \(byteCount.formattedBytes)"
     }

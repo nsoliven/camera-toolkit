@@ -61,7 +61,11 @@ public struct EventAssetPresence: Identifiable, Hashable, Sendable {
 public struct EventPresenceSummary: Sendable {
     public var eventID: UUID
     public var policy: EventStoragePolicy
-    public var assets: [EventAssetPresence]
+    public var assets: [EventAssetPresence] {
+        // Any change to the assets drops the memoized counts; the next
+        // read counts once, in one pass.
+        didSet { countsBox = CountsBox() }
+    }
     public var checkedAt: Date
 
     public init(eventID: UUID, policy: EventStoragePolicy, assets: [EventAssetPresence], checkedAt: Date) {
@@ -71,25 +75,111 @@ public struct EventPresenceSummary: Sendable {
         self.checkedAt = checkedAt
     }
 
+    /// Every count the board's storage strip and inspector read. A family
+    /// board holds ~15,000 assets and each of these used to walk (and copy)
+    /// all of them on every body evaluation — so a switch to the board paid
+    /// for a dozen full passes. They are one pass now, done once per change.
+    private struct Counts: Sendable {
+        var totalBytes: Int64 = 0
+        var onSource = 0
+        var sourceOffline = 0
+        var onDrive = 0
+        var onOtherDrive = 0
+        var onArchive = 0
+        var archiveOffline = false
+        var driveOffline = false
+        var onLegacyLayout = 0
+        var missingEverywhere = 0
+        var onLegacyArchiveLayout = 0
+        var verifiedOnArchive = 0
+        var oldestArchiveVerification: Date?
+        var separateSource = 0
+        var freeableFromSource = 0
+        var needsDrive = 0
+        var removableFromDrive = 0
+        var onEitherDrive = 0
+
+        init(_ assets: [EventAssetPresence]) {
+            for asset in assets {
+                totalBytes += asset.assignment.fileSize
+                if asset.isOnSeparateSource { onSource += 1 }
+                if !asset.sourceIsDriveCopy && asset.source == .unavailable { sourceOffline += 1 }
+                if asset.drive == .present { onDrive += 1 }
+                if asset.otherDrive == .present { onOtherDrive += 1 }
+                if asset.archive == .present { onArchive += 1 }
+                if asset.archive == .unavailable { archiveOffline = true }
+                if asset.drive == .unavailable { driveOffline = true }
+                if (asset.drive == .present && asset.driveIsLegacyLayout) || (asset.otherDrive == .present && asset.otherDriveIsLegacyLayout) {
+                    onLegacyLayout += 1
+                }
+                if asset.bestLocalPath == nil { missingEverywhere += 1 }
+                if !asset.sourceIsDriveCopy { separateSource += 1 }
+                if asset.isOnSeparateSource && asset.drive == .present { freeableFromSource += 1 }
+                if asset.drive != .present && (asset.otherDrive == .present || asset.isOnSeparateSource) { needsDrive += 1 }
+                let onEither = asset.drive == .present || asset.otherDrive == .present
+                if onEither { onEitherDrive += 1 }
+                if onEither && asset.archiveIsTrusted { removableFromDrive += 1 }
+                if asset.archive == .present {
+                    if asset.archiveIsLegacyLayout { onLegacyArchiveLayout += 1 }
+                    if let verified = asset.archiveVerifiedAt {
+                        verifiedOnArchive += 1
+                        if let oldest = oldestArchiveVerification {
+                            if verified < oldest { oldestArchiveVerification = verified }
+                        } else {
+                            oldestArchiveVerification = verified
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private final class CountsBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var counts: Counts?
+
+        func value(for assets: [EventAssetPresence]) -> Counts {
+            lock.lock()
+            defer { lock.unlock() }
+            if let counts { return counts }
+            let built = Counts(assets)
+            counts = built
+            return built
+        }
+    }
+
+    private var countsBox = CountsBox()
+    private var counts: Counts { countsBox.value(for: assets) }
+
     public var total: Int { assets.count }
-    public var totalBytes: Int64 { assets.reduce(Int64(0)) { $0 + $1.assignment.fileSize } }
-    public var onSource: Int { assets.count { $0.isOnSeparateSource } }
-    public var sourceOffline: Int { assets.count { !$0.sourceIsDriveCopy && $0.source == .unavailable } }
-    public var onDrive: Int { assets.count { $0.drive == .present } }
-    public var onOtherDrive: Int { assets.count { $0.otherDrive == .present } }
-    public var onArchive: Int { assets.count { $0.archive == .present } }
-    public var archiveOffline: Bool { assets.contains { $0.archive == .unavailable } }
-    public var driveOffline: Bool { assets.contains { $0.drive == .unavailable } }
+    public var totalBytes: Int64 { counts.totalBytes }
+    public var onSource: Int { counts.onSource }
+    public var sourceOffline: Int { counts.sourceOffline }
+    public var onDrive: Int { counts.onDrive }
+    public var onOtherDrive: Int { counts.onOtherDrive }
+    public var onArchive: Int { counts.onArchive }
+    public var archiveOffline: Bool { counts.archiveOffline }
+    public var driveOffline: Bool { counts.driveOffline }
     /// Files found only in the legacy `Card Copy` layout.
-    public var onLegacyLayout: Int { assets.count { ($0.drive == .present && $0.driveIsLegacyLayout) || ($0.otherDrive == .present && $0.otherDriveIsLegacyLayout) } }
-    public var missingEverywhere: Int { assets.count { $0.bestLocalPath == nil } }
+    public var onLegacyLayout: Int { counts.onLegacyLayout }
+    public var missingEverywhere: Int { counts.missingEverywhere }
     /// NAS copies found only in the legacy archive layout.
-    public var onLegacyArchiveLayout: Int { assets.count { $0.archive == .present && $0.archiveIsLegacyLayout } }
+    public var onLegacyArchiveLayout: Int { counts.onLegacyArchiveLayout }
     /// NAS mirror copies Sync to NAS verified by re-reading them.
-    public var verifiedOnArchive: Int { assets.count { $0.archive == .present && $0.archiveVerifiedAt != nil } }
+    public var verifiedOnArchive: Int { counts.verifiedOnArchive }
     /// The oldest verification among them — "verified <date>" is only as
     /// fresh as the least recently checked file.
-    public var oldestArchiveVerification: Date? { assets.compactMap { $0.archive == .present ? $0.archiveVerifiedAt : nil }.min() }
+    public var oldestArchiveVerification: Date? { counts.oldestArchiveVerification }
+    /// Files whose source is a separate card or folder rather than a copy
+    /// already on the drive.
+    public var separateSource: Int { counts.separateSource }
+    /// Separate-source files that also have their drive copy — Free Up Source.
+    public var freeableFromSource: Int { counts.freeableFromSource }
+    /// Files not on the policy drive yet but somewhere to copy them from.
+    public var needsDrive: Int { counts.needsDrive }
+    /// Files on a drive whose NAS copy is verified — Take Off Drive.
+    public var removableFromDrive: Int { counts.removableFromDrive }
+    public var onEitherDrive: Int { counts.onEitherDrive }
 }
 
 public enum EventPresenceScanner {
@@ -186,7 +276,7 @@ public enum EventPresenceScanner {
                 let valid = isValidRelative(assignment.relativePath)
                 let source = locations.sourceURL(for: assignment)
                 func join(_ root: URL) -> URL? {
-                    valid ? root.appendingPathComponent(assignment.relativePath).standardizedFileURL : nil
+                    valid ? root.appending(path: assignment.relativePath, directoryHint: .notDirectory).standardizedFileURL : nil
                 }
                 let archiveLayout = layout(assignment.deviceID)
                 let archive = try? archiveLayout.mirrorRelativePath(for: assignment.relativePath)
@@ -197,10 +287,10 @@ public enum EventPresenceScanner {
                     source,
                     join(originalsRoot(policy, assignment.deviceID)),
                     join(originalsRoot(otherPolicy, assignment.deviceID)),
-                    archive.map { locations.nasRoot.appendingPathComponent($0).standardizedFileURL },
+                    archive.map { locations.nasRoot.appending(path: $0, directoryHint: .notDirectory).standardizedFileURL },
                     join(legacyRoot(policy, assignment.deviceID)),
                     join(legacyRoot(otherPolicy, assignment.deviceID)),
-                    legacyArchive.map { locations.libraryRoot.appendingPathComponent($0).standardizedFileURL }
+                    legacyArchive.map { locations.libraryRoot.appending(path: $0, directoryHint: .notDirectory).standardizedFileURL }
                 )
             }
             if let pauseGate {

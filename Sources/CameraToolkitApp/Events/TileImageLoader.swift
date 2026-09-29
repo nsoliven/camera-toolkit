@@ -51,6 +51,14 @@ final class TileImageLoader: @unchecked Sendable {
     /// A small separate limit keeps a couple of zoomed frames on hand.
     private let previewCache = NSCache<NSString, Box>()
     private let queue: OperationQueue
+    /// Decodes of files on a network volume (the NAS) run here instead:
+    /// three at a time, so browsing a share never floods it with the six
+    /// concurrent SMB reads the local queue allows. A cancelled decode (its
+    /// tile scrolled away) is dropped from this queue without being read, so
+    /// what is on screen is what gets fetched.
+    private let networkQueue: OperationQueue
+    private let volumeLock = NSLock()
+    private var networkVolumes: [String: Bool] = [:]
     private let lock = NSLock()
     private var inFlight: [String: WaiterGroup] = [:]
     /// Decodes wait at this gate while a speed test is measuring the volume
@@ -65,14 +73,28 @@ final class TileImageLoader: @unchecked Sendable {
     /// reference to keep delivering.
     private var memoryPressureSource: (any DispatchSourceMemoryPressure)?
 
-    init(driveActivityGate: DriveActivityGate = .shared) {
+    /// Answers "is there a file at this path?" for redirect resolution. It
+    /// only ever runs on a decode's background path — never from
+    /// `cachedImage`, which the tile calls on the main actor. Injectable so a
+    /// test can prove that.
+    private let fileExists: @Sendable (String) -> Bool
+
+    init(
+        driveActivityGate: DriveActivityGate = .shared,
+        fileExists: @escaping @Sendable (String) -> Bool = { FileManager.default.fileExists(atPath: $0) }
+    ) {
         self.driveActivityGate = driveActivityGate
+        self.fileExists = fileExists
         cache.totalCostLimit = 320 * 1_024 * 1_024
         previewCache.totalCostLimit = 192 * 1_024 * 1_024
         queue = OperationQueue()
         queue.name = "CameraToolkit.TileImageLoader"
         queue.maxConcurrentOperationCount = 6
         queue.qualityOfService = .userInitiated
+        networkQueue = OperationQueue()
+        networkQueue.name = "CameraToolkit.TileImageLoader.network"
+        networkQueue.maxConcurrentOperationCount = 3
+        networkQueue.qualityOfService = .userInitiated
         let source = DispatchSource.makeMemoryPressureSource(
             eventMask: [.warning, .critical],
             queue: .global(qos: .utility)
@@ -119,19 +141,17 @@ final class TileImageLoader: @unchecked Sendable {
     var tileCacheCostLimit: Int { cache.totalCostLimit }
     var previewCacheCostLimit: Int { previewCache.totalCostLimit }
 
+    /// A pure memory lookup — no filesystem call, ever. A tile asks this on
+    /// the main actor for every cache miss, and a stat there can park the
+    /// window on a slow or stale network mount. A miss goes to `image`,
+    /// which follows rename redirects on its own background path.
+    ///
     /// `orientation` is the display rotation in quarter-turns clockwise (see
     /// `DisplayRotation`). It is part of the cache key so a rotated decode
-    /// never joins or reuses an unrotated one. The asked-for path is checked
-    /// before `resolvedURL` — its `fileExists` stat is only worth paying on
-    /// a miss.
+    /// never joins or reuses an unrotated one.
     func cachedImage(for url: URL, maximumPixelSize: Int, orientation: Int = 0) -> CGImage? {
         let bucket = Self.bucket(for: maximumPixelSize)
-        if let hit = store(for: bucket).object(forKey: key(url, bucket, orientation) as NSString) {
-            return hit.image
-        }
-        let resolved = resolvedURL(for: url)
-        guard resolved != url else { return nil }
-        return store(for: bucket).object(forKey: key(resolved, bucket, orientation) as NSString)?.image
+        return store(for: bucket).object(forKey: key(url, bucket, orientation) as NSString)?.image
     }
 
     /// Wall-clock bound on a single decode wait. A read stuck on a dead or
@@ -167,7 +187,14 @@ final class TileImageLoader: @unchecked Sendable {
             return cached.image
         }
 
-        let group = joinGroup(cacheKey: cacheKey, url: resolved, bucket: bucket, orientation: orientation, priority: priority)
+        let group = joinGroup(
+            cacheKey: cacheKey,
+            url: resolved,
+            bucket: bucket,
+            orientation: orientation,
+            priority: priority,
+            onNetwork: isOnNetworkVolume(resolved)
+        )
         let id = UUID()
         let timeoutTask = Task.detached(priority: .utility) { [weak self] in
             try? await Task.sleep(for: timeout)
@@ -191,7 +218,8 @@ final class TileImageLoader: @unchecked Sendable {
         url: URL,
         bucket: Int,
         orientation: Int,
-        priority: Operation.QueuePriority
+        priority: Operation.QueuePriority,
+        onNetwork: Bool = false
     ) -> WaiterGroup {
         lock.lock()
         defer { lock.unlock() }
@@ -206,8 +234,28 @@ final class TileImageLoader: @unchecked Sendable {
         group.operation.completionBlock = { [weak self] in
             self?.finish(group: group)
         }
-        queue.addOperation(group.operation)
+        (onNetwork ? networkQueue : queue).addOperation(group.operation)
         return group
+    }
+
+    /// Whether the file lives on a network volume (`/Volumes/<name>` whose
+    /// volume is not local). Asked once per volume, from the decode's
+    /// background path — never from the main actor.
+    private func isOnNetworkVolume(_ url: URL) -> Bool {
+        let parts = url.pathComponents
+        guard parts.count > 2, parts[1] == "Volumes" else { return false }
+        let root = "/Volumes/\(parts[2])"
+        volumeLock.lock()
+        if let known = networkVolumes[root] {
+            volumeLock.unlock()
+            return known
+        }
+        volumeLock.unlock()
+        let isLocal = (try? URL(fileURLWithPath: root, isDirectory: true).resourceValues(forKeys: [.volumeIsLocalKey]).volumeIsLocal) ?? true
+        volumeLock.lock()
+        networkVolumes[root] = !isLocal
+        volumeLock.unlock()
+        return !isLocal
     }
 
     /// Lock-guarded wait registration: parks the continuation on the group,
@@ -344,7 +392,7 @@ final class TileImageLoader: @unchecked Sendable {
     /// redirect to wherever the file landed — a request for it decodes the
     /// destination, so the vacated path never reports a decode failure.
     private func resolvedURL(for url: URL) -> URL {
-        guard !FileManager.default.fileExists(atPath: url.path) else { return url }
+        guard !fileExists(url.path) else { return url }
         lock.lock()
         var path = url.path
         var hops = 0
@@ -360,11 +408,18 @@ final class TileImageLoader: @unchecked Sendable {
     /// orientations — so a display-rotation change frees its stale bitmaps
     /// instead of waiting for the cost limit to evict them.
     func invalidate(url: URL) {
-        let url = resolvedURL(for: url)
-        for bucket in Self.buckets {
-            let store = store(for: bucket)
-            for orientation in 0..<4 {
-                store.removeObject(forKey: key(url, bucket, orientation) as NSString)
+        // Both the asked-for path and wherever a rename redirected it — no
+        // stat, so a rotate never waits on the volume.
+        var urls = [url]
+        lock.lock()
+        if let destination = redirects[url.path] { urls.append(URL(filePath: destination, directoryHint: .notDirectory)) }
+        lock.unlock()
+        for url in urls {
+            for bucket in Self.buckets {
+                let store = store(for: bucket)
+                for orientation in 0..<4 {
+                    store.removeObject(forKey: key(url, bucket, orientation) as NSString)
+                }
             }
         }
     }

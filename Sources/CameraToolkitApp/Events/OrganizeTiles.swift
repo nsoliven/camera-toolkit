@@ -262,6 +262,9 @@ struct TileThumbnail: View {
     /// Display rotation in quarter-turns clockwise; part of the task id so a
     /// "Rotate Burst" change re-decodes this tile without a rescan.
     var orientation: Int = 0
+    /// Part of the task id: a change re-runs a decode that failed while the
+    /// file's volume was away.
+    var retryToken: Int = 0
 
     @Environment(\.displayScale) private var displayScale
     @State private var image: CGImage?
@@ -285,7 +288,7 @@ struct TileThumbnail: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .task(id: "\(url.path)#\(TileImageLoader.bucket(for: pixelSize))#\(orientation)") {
+        .task(id: "\(url.path)#\(TileImageLoader.bucket(for: pixelSize))#\(orientation)#\(retryToken)") {
             if let cached = TileImageLoader.shared.cachedImage(for: url, maximumPixelSize: pixelSize, orientation: orientation) {
                 image = cached
                 failed = false
@@ -397,12 +400,15 @@ struct StackTileView: View {
     /// pass it so the badge does something sensible everywhere.
     var onPlay: (() -> Void)? = nil
     var onOpen: (() -> Void)? = nil
+    /// Changes when a drive or the NAS comes or goes, so a thumbnail that
+    /// could not be read while its place was away tries again.
+    var retryToken: Int = 0
 
     var body: some View {
         let shape = RoundedRectangle(cornerRadius: BoardMetrics.tileRadius, style: .continuous)
         VStack(alignment: .leading, spacing: 5) {
             ZStack {
-                TileThumbnail(url: stack.coverItem.primary.url, kind: stack.kind, pointSize: width, orientation: orientation)
+                TileThumbnail(url: stack.coverItem.primary.url, kind: stack.kind, pointSize: width, orientation: orientation, retryToken: retryToken)
                     .frame(width: width, height: width * 2 / 3)
                     .clipped()
                 VStack {
@@ -908,6 +914,15 @@ struct OrganizeGrid<MenuContent: View>: View {
 
     @FocusState private var isFocused: Bool
     @State private var columns = 1
+    /// Restores the board's own scroll position when it is opened again.
+    @State private var scrollPosition = ScrollPosition()
+    /// The saved offset still to be put back. The grid is lazy, so its
+    /// content is not tall enough to scroll that far until it has laid out;
+    /// the restore waits for that, then scrolls once. Until it is done the
+    /// grid's own (top) offset is not recorded over the saved one.
+    @State private var pendingScrollRestore: Double?
+    @State private var scrollRestoreStarted = false
+    @State private var lastScrollInset = 0.0
     /// One grid-level read of the window's active state — tiles get the
     /// result as a plain Bool rather than each reading the environment.
     @Environment(\.appearsActive) private var appearsActive
@@ -927,6 +942,20 @@ struct OrganizeGrid<MenuContent: View>: View {
         OrganizeBoardPlan.sections(for: groups, collapsedIDs: workspace.collapsedGroupIDs)
     }
 
+    /// Reads the board's saved scroll offset once, when the grid first
+    /// reports or appears — whichever is first.
+    private func beginScrollRestore() {
+        guard !scrollRestoreStarted else { return }
+        scrollRestoreStarted = true
+        let saved = workspace.savedScrollOffset(for: board)
+        pendingScrollRestore = saved > 0 ? saved : nil
+    }
+
+    /// The sidebar row this grid is the board of.
+    private var board: EventsSidebarSelection {
+        origin == .event ? .event(containerID) : .unsorted(containerID)
+    }
+
     var body: some View {
         let ordered = sections.flatMap(\.visibleStacks)
         let orderedIDs = ordered.map(\.id)
@@ -939,13 +968,48 @@ struct OrganizeGrid<MenuContent: View>: View {
                 }
             }
             .scrollEdgeEffectStyle(.soft, for: .top)
+            .scrollPosition($scrollPosition)
+            .onScrollGeometryChange(for: ScrollMetrics.self) { geometry in
+                ScrollMetrics(
+                    offset: Double(geometry.contentOffset.y + geometry.contentInsets.top),
+                    reach: Double(geometry.contentSize.height - geometry.containerSize.height + geometry.contentInsets.top + geometry.contentInsets.bottom),
+                    inset: Double(geometry.contentInsets.top)
+                )
+            } action: { _, metrics in
+                // The first report of a fresh grid may come before onAppear:
+                // it must read the saved offset before anything overwrites it.
+                beginScrollRestore()
+                lastScrollInset = metrics.inset
+                if let target = pendingScrollRestore {
+                    // Content that reaches the saved offset: scroll there now.
+                    if metrics.reach >= target {
+                        pendingScrollRestore = nil
+                        scrollPosition.scrollTo(y: CGFloat(target - metrics.inset))
+                    }
+                    return
+                }
+                workspace.noteScrollOffset(metrics.offset, board: board)
+            }
             .focusable()
             .focused($isFocused)
             .focusEffectDisabled()
             .onKeyPress(phases: .down) { press in
                 handleKey(press, ordered: ordered, orderedIDs: orderedIDs, proxy: proxy)
             }
-            .onAppear { isFocused = true }
+            .onAppear {
+                isFocused = true
+                beginScrollRestore()
+            }
+            // A board that never grows tall enough (it shrank, or is still
+            // loading) is put as far down as it goes after a moment, and the
+            // wait ends so the offset is tracked again.
+            .task(id: pendingScrollRestore != nil) {
+                guard pendingScrollRestore != nil else { return }
+                try? await Task.sleep(for: .seconds(1.5))
+                guard let target = pendingScrollRestore, !Task.isCancelled else { return }
+                pendingScrollRestore = nil
+                scrollPosition.scrollTo(y: CGFloat(target - lastScrollInset))
+            }
             // Return in the toolbar search field hands the keyboard back.
             .onChange(of: workspace.boardFocusRequest) { isFocused = true }
             .onChange(of: workspace.focusedStackID) { _, id in
@@ -1061,7 +1125,8 @@ struct OrganizeGrid<MenuContent: View>: View {
             orientation: orientationForFile(stack.coverItem.primary),
             onExpand: { workspace.setExpanded(stack.id, expanded: true) },
             onPlay: { onOpen(stack, 0) },
-            onOpen: { onOpen(stack, 0) }
+            onOpen: { onOpen(stack, 0) },
+            retryToken: workspace.connectivityRevision
         )
         .id(stack.id)
         .onTapGesture {
@@ -1121,12 +1186,11 @@ struct OrganizeGrid<MenuContent: View>: View {
 
     private func select(_ stack: OrganizeStack, orderedIDs: [String]) {
         isFocused = true
-        let flags = NSEvent.modifierFlags
-        workspace.select(
+        workspace.click(
             stackID: stack.id,
             orderedIDs: orderedIDs,
-            extend: flags.contains(.shift),
-            toggle: flags.contains(.command)
+            modifiers: NSEvent.modifierFlags,
+            clickCount: NSApp.currentEvent?.clickCount ?? 1
         )
     }
 
@@ -2336,4 +2400,14 @@ private struct PreviewGlassToggle: View {
         .help(help)
         .accessibilityAddTraits(isOn ? .isSelected : [])
     }
+}
+
+
+/// What the grid reports about its scroll view: where it is, how far it can
+/// go, and the top inset the offset is measured from.
+struct ScrollMetrics: Equatable {
+    var offset: Double
+    /// The largest offset the content currently allows.
+    var reach: Double
+    var inset: Double
 }
