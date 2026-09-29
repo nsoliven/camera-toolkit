@@ -679,6 +679,9 @@ private struct SidebarFooter: View {
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
+        // The footer is the list's bottom inset; keep its height its own
+        // (see NASSyncAllFooterRow) so relayouts never nudge the list.
+        .fixedSize(horizontal: false, vertical: true)
     }
 }
 
@@ -737,6 +740,11 @@ private struct NASSyncAllFooterRow: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .buttonStyle(.glass)
+        // One fixed height whatever the sidebar's width mid-relayout: a
+        // footer height that wobbles while the split view resizes changes
+        // the list's bottom inset, and the list then scrolls a little
+        // further each time (rows creeping under the traffic lights).
+        .fixedSize(horizontal: false, vertical: true)
         .disabled(blocker != nil)
         .help(blocker ?? help(presence))
         .accessibilityLabel("Sync All to NAS, \(detail)")
