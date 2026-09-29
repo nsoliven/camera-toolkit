@@ -169,6 +169,8 @@ public enum JobAction: String, Codable, CaseIterable, Sendable {
     case organize
     case immichUpload
     case faceScan
+    /// NAS copies renamed to follow files moved on the drive.
+    case nasRename
 }
 
 public struct JobSnapshot: Identifiable, Codable, Hashable, Sendable {

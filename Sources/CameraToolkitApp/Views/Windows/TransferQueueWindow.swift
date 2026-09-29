@@ -368,6 +368,7 @@ struct TransferQueueView: View {
             switch job.action {
             case .faceScan: return "person.crop.rectangle.stack"
             case .organize: return "rectangle.3.group"
+            case .nasRename: return "arrow.left.arrow.right"
             case .ingestCard: return "arrow.down.circle"
             case .freeUp: return "trash"
             case .immichScan, .immichUpload: return "square.and.arrow.up"
@@ -838,6 +839,7 @@ extension JobAction {
         case .organize: "Organize"
         case .immichUpload: "Immich Upload"
         case .faceScan: "Face Scan"
+        case .nasRename: "NAS Rename"
         }
     }
 }

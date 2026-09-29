@@ -334,6 +334,10 @@ private struct NASSyncJobOutcome: Sendable {
     var report: NASSyncReport
     var plan: NASSyncPlan
     var reportPath: String?
+    /// Renames the sync applied before it copied: queued ones, NAS copies
+    /// of files moved earlier, and stale duplicates set aside after.
+    var follow = NASFollowResult()
+    var queuedRenamesLeft = 0
 }
 
 private struct ImmichCandidate: Sendable {
@@ -456,6 +460,14 @@ final class EventsWorkspace {
     var applyConflictSourceKeys: [UUID: Set<String>] = [:]
     var pendingRemoval: RemovalRequest?
     var syncAllRequest: SyncAllToNASRequest?
+    /// The Sync All sheet's "Reconcile NAS after moves" switch and the
+    /// counts it shows (read from records, never from the NAS).
+    var syncAllReconcile = true
+    var reconcilePreview: NASReconcilePreview?
+    /// NAS renames journaled and not applied yet — the NAS was away or a
+    /// job held the gate. Kept in memory (recounted at launch and after
+    /// each run) so a finished job need not read the journal folder.
+    var pendingNASRenameCount = 0
     var pendingTrash: PendingTrashRequest?
     var latestMoveJournalTitle: String?
     /// Bursts currently expanded inline in the board.
@@ -628,6 +640,9 @@ final class EventsWorkspace {
         model.onJobFinished = { [weak self] action in
             self?.nasPresence.jobFinished(action)
             self?.startPendingMoves()
+            // Queued NAS renames run once the gate is free — never right
+            // after a NAS rename job, so a stopped one is not restarted.
+            if action != .nasRename { self?.drainNASRenames() }
         }
     }
 
@@ -1899,6 +1914,8 @@ final class EventsWorkspace {
         lastConnectivityRefresh = Date()
         nasConnection.volumesChanged()
         nasPresence.refresh(.mounted)
+        // The NAS may have just mounted: apply what moves left queued.
+        drainNASRenames()
         let mountedNow = VolumeInfo.mountedVolumePaths()
         lastConnectivityMountedPaths = mountedNow
 
@@ -2411,13 +2428,31 @@ final class EventsWorkspace {
                 }
             }
         }
-        // The NAS is never renamed from here: its copies keep the old folder
-        // name (mirror or legacy layout) until the next Sync to NAS.
-        let nasNote = [locations.nasEventFolder(for: event), locations.legacyArchiveEventFolder(for: event)].contains {
-            VolumeInfo.isAvailable($0) && fileManager.fileExists(atPath: $0.path)
+        // The NAS folder follows: one folder rename on the NAS, journaled
+        // and queued now, applied by a NAS job as soon as the NAS is there
+        // and idle. A connected NAS that has no folder for the event owes
+        // nothing. Copies in the old archive layout keep their folder name.
+        var nasNote = ""
+        if let owed = NASMoveFollower.folderRename(from: event, to: renamed, locations: locations),
+           !nasIsConnected || fileManager.fileExists(atPath: locations.nasRoot.appendingPathComponent(owed.from).path) {
+            let journalFolder = self.journalFolder
+            let nasRoot = locations.nasRoot
+            let title = "Rename \(eventTitle(event)) on the NAS"
+            Task { @MainActor [weak self] in
+                let queued = await Task.detached(priority: .userInitiated) {
+                    Self.queueNASRenames([owed], title: title, origin: .folderRename, nasRoot: nasRoot, journalFolder: journalFolder)
+                }.value
+                self?.noteNASRenamesQueued(queued)
+                self?.drainNASRenames()
+            }
+            nasNote = nasIsConnected
+                ? " The NAS folder is renamed to match next."
+                : " The NAS folder will be renamed when the NAS is connected."
         }
-            ? " NAS copies keep the old folder name until you sync again."
-            : ""
+        if VolumeInfo.isAvailable(locations.legacyArchiveEventFolder(for: event)),
+           fileManager.fileExists(atPath: locations.legacyArchiveEventFolder(for: event).path) {
+            nasNote += " Copies in the old NAS archive layout keep the old folder name."
+        }
         model.statusMessage = "Renamed to \(eventTitle(renamed))." + nasNote
             + (newResolved == oldResolved ? ""
                 : newResolved == .archiveOnly
@@ -3087,6 +3122,8 @@ final class EventsWorkspace {
         let boundaries = plan.pruneBoundaries
         let title = plan.title
         let affectedEvents = plan.groups.map(\.event.id)
+        let locations = self.locations
+        let queuedRenames = NASQueuedRenames()
 
         if !moves.isEmpty {
             let jobID = model.runBackgroundJob(
@@ -3095,7 +3132,7 @@ final class EventsWorkspace {
                 logTitle: title,
                 logDetail: "Renamed files on the same drive. No file bytes were rewritten and nothing was replaced.",
                 operation: { progress in
-                    try DriveMoveService().apply(
+                    let report = try DriveMoveService().apply(
                         moves,
                         title: title,
                         journalFolder: journalFolder,
@@ -3103,8 +3140,18 @@ final class EventsWorkspace {
                     ) { update in
                         progress(DashboardModel.jobUpdate(from: update, notePrefix: "Organizing", command: ""))
                     }
+                    // Files that already sat in an event folder (a drive
+                    // move between events) owe the NAS the same rename;
+                    // files coming from Unsorted owe nothing.
+                    queuedRenames.add(Self.queueNASRenames(
+                        NASMoveFollower.renames(forMoves: report.moved, locations: locations),
+                        title: title, origin: .move, moveJournalID: report.journalID,
+                        nasRoot: locations.nasRoot, journalFolder: journalFolder
+                    ))
+                    return report
                 },
                 completion: { [weak self] report in
+                    self?.noteNASRenamesQueued(queuedRenames.count)
                     self?.didMove(report: report, events: affectedEvents)
                     if !trash.isEmpty { self?.requestTrashApplyDuplicates(trash) }
                     return ApplyStatusWording.afterApply(
@@ -3312,13 +3359,15 @@ final class EventsWorkspace {
         let title = "Keep both in \(plan.groups.first { !$0.conflicts.isEmpty }.map { eventTitle($0.event) } ?? "the event")"
         let affectedEvents = plan.groups.filter { !$0.conflicts.isEmpty }.map(\.event.id)
         let remaining = plan.fileCount
+        let locations = self.locations
+        let queuedRenames = NASQueuedRenames()
         model.runBackgroundJob(
             action: .organize,
             runningNote: "Moving \(conflicts.count) file(s) in under a new name",
             logTitle: title,
             logDetail: "Renamed files on the same drive to a free “(N)” name next to the file that already had their name. Nothing was replaced.",
             operation: { progress in
-                try DriveMoveService().keepBoth(
+                let outcome = try DriveMoveService().keepBoth(
                     conflicts,
                     title: title,
                     journalFolder: journalFolder,
@@ -3326,9 +3375,16 @@ final class EventsWorkspace {
                 ) { update in
                     progress(DashboardModel.jobUpdate(from: update, notePrefix: "Moving", command: ""))
                 }
+                queuedRenames.add(Self.queueNASRenames(
+                    NASMoveFollower.renames(forMoves: outcome.report.moved, locations: locations),
+                    title: title, origin: .move, moveJournalID: outcome.report.journalID,
+                    nasRoot: locations.nasRoot, journalFolder: journalFolder
+                ))
+                return outcome
             },
             completion: { [weak self] outcome in
                 guard let self else { return "" }
+                noteNASRenamesQueued(queuedRenames.count)
                 applyAssignmentChange(
                     AssignmentChange(title: title, removed: outcome.removedAssignments, added: outcome.addedAssignments),
                     touching: nil
@@ -3408,18 +3464,32 @@ final class EventsWorkspace {
         }
         let url = latest.url
         let boundaries = [locations.bufferRoot, locations.privateStagingRoot]
+        let nasRoot = locations.nasRoot
+        let journalFolder = self.journalFolder
+        let catalogURL = URL(fileURLWithPath: DashboardModel.expandedPath(model.configuration.catalogDatabasePath))
         model.runBackgroundJob(
             action: .organize,
             runningNote: "Undoing “\(latest.journal.title)”",
             logTitle: "Undid a move",
-            logDetail: "Renamed files back to where they were. Nothing was replaced.",
+            logDetail: "Renamed files back to where they were. Nothing was replaced. NAS copies that were renamed to follow the move are renamed back; while the NAS is away that is queued.",
             operation: { progress in
-                try DriveMoveService().undo(journalURL: url, pruneBoundaries: boundaries) { update in
+                let undone = try DriveMoveService().undo(journalURL: url, pruneBoundaries: boundaries) { update in
                     progress(DashboardModel.jobUpdate(from: update, notePrefix: "Undoing", command: ""))
                 }
+                // The move's NAS renames are journaled under the same id.
+                let queue = NASRenameQueue(journalFolder: journalFolder)
+                var nas = NASUndoResult()
+                do {
+                    nas = try NASMoveFollower(store: try? NASSyncStore(catalogURL: catalogURL), queue: queue)
+                        .undo(moveJournalID: undone.journal.id, nasRoot: nasRoot)
+                } catch {
+                    DebugLog.shared.log("nas.rename.undo", subsystem: .apply, level: .error, outcome: .error, error: error.localizedDescription)
+                }
+                return (report: undone.report, journal: undone.journal, nas: nas, remaining: queue.pendingRenameCount(nasRoot: nasRoot.path))
             },
             completion: { [weak self] outcome in
                 guard let self else { return "" }
+                nasRenamesApplied(outcome.nas.follow, remaining: outcome.remaining)
                 retargetMovedPaths(outcome.report.moved)
                 let journal = outcome.journal
                 if !journal.addedAssignments.isEmpty || !journal.removedAssignments.isEmpty {
@@ -3439,6 +3509,7 @@ final class EventsWorkspace {
                     Task { await self.refreshEvent(eventID) }
                 }
                 return "Moved \(outcome.report.moved.count) file(s) back." + (outcome.report.skipped.isEmpty ? "" : " \(outcome.report.skipped.count) could not move back.")
+                    + NASFollowWording.undone(outcome.nas)
             }
         )
     }
@@ -3808,11 +3879,13 @@ final class EventsWorkspace {
         let targetAssignments = needsClashInputs ? Array(assignmentsByName(inEvent: targetEventID).values) : []
         let toEvent = move.to
         let moveID = move.id
+        let nasRoot = locations.nasRoot
+        let queuedRenames = NASQueuedRenames()
         return model.runBackgroundJob(
             action: .organize,
             runningNote: "Moving \(ApplyPlanOverview.plural(items.count, "file")) from \(fromTitle) to \(toTitle)",
             logTitle: title,
-            logDetail: "Renamed originals between event folders on the same drive. Names already in the event were compared by content: identical copies merged and their extra copy went to _Trash; different photos moved in under a free “(N)” name. Nothing was replaced. NAS copies were not changed.",
+            logDetail: "Renamed originals between event folders on the same drive. Names already in the event were compared by content: identical copies merged and their extra copy went to _Trash; different photos moved in under a free “(N)” name. Nothing was replaced. The NAS copies are renamed to match by a separate NAS Rename job (queued, and applied when the NAS is connected).",
             onSettled: { [weak self] in self?.settleMove(moveID, fromTitle: fromTitle, toTitle: toTitle) },
             operation: { progress in
                 // Files other assignments still use are never trashed as a
@@ -3835,7 +3908,7 @@ final class EventsWorkspace {
                         }
                     }
                 }
-                return try EventMoveService(trash: MediaTrashService(removedFilesRoot: fallbackTrashRoot)).move(
+                let outcome = try EventMoveService(trash: MediaTrashService(removedFilesRoot: fallbackTrashRoot)).move(
                     items,
                     title: title,
                     journalFolder: journalFolder,
@@ -3846,10 +3919,25 @@ final class EventsWorkspace {
                 ) { update in
                     progress(DashboardModel.jobUpdate(from: update, notePrefix: "Moving", command: ""))
                 }
+                // The NAS owes the same renames. Journaled here, in the
+                // background, right after the drive move landed; a NAS job
+                // applies them as soon as the NAS is there and idle.
+                let owed = NASMoveFollower.renames(forEventMove: outcome, locations: locations)
+                queuedRenames.add(Self.queueNASRenames(
+                    owed.moves, title: title, origin: .move, moveJournalID: outcome.report.journalID,
+                    nasRoot: nasRoot, journalFolder: journalFolder
+                ))
+                queuedRenames.add(Self.queueNASRenames(
+                    owed.merges, title: "\(title) (merged duplicates)", origin: .merge,
+                    nasRoot: nasRoot, journalFolder: journalFolder
+                ))
+                return outcome
             },
             completion: { [weak self] outcome in
                 guard let self else { return "" }
+                noteNASRenamesQueued(queuedRenames.count)
                 return landMove(moveID, outcome: outcome, fromTitle: fromTitle, toTitle: toTitle)
+                    + NASFollowWording.queued(queuedRenames.count, connected: nasIsConnected)
             }
         )
     }
@@ -4214,6 +4302,7 @@ final class EventsWorkspace {
         nasConnection.start(settings: nasConnectionSettings)
         nasPresence.isEnabled = true
         nasPresence.refresh(.launch)
+        refreshNASRenameBacklog()
     }
 
     func nasSettingsChanged() {
@@ -4233,7 +4322,9 @@ final class EventsWorkspace {
         guard let event = event(eventID) else { return }
         nasConnection.prepareForNASJob { [weak self] in
             guard let self else { return }
-            startNASSync(events: eventFamily(eventID), title: eventTitle(event), refresh: [eventID])
+            // One event's sync renames what moved into place instead of
+            // copying it; the stale-duplicate sweep is Sync All's.
+            startNASSync(events: eventFamily(eventID), title: eventTitle(event), refresh: [eventID], catchUp: true, reconcile: false)
         }
     }
 
@@ -4250,7 +4341,10 @@ final class EventsWorkspace {
         if nasIsConnected, stale, !nasPresence.isChecking {
             nasPresence.refresh(.manual)
         }
+        syncAllReconcile = true
+        reconcilePreview = nil
         syncAllRequest = SyncAllToNASRequest()
+        refreshReconcilePreview()
     }
 
     /// Why Sync All to NAS cannot start right now, or nil when it can.
@@ -4292,6 +4386,7 @@ final class EventsWorkspace {
     /// A new NAS presence answer: the open board re-reads its NAS place
     /// from the listing when its family's numbers moved.
     private func nasPresenceChanged(from old: NASPresenceReport?, to new: NASPresenceReport) {
+        if syncAllRequest != nil { refreshReconcilePreview() }
         guard case .event(let eventID) = selection, presence[eventID] != nil else { return }
         // A recount from the drive alone (a move, an Apply) learned nothing
         // new about the NAS, and the board was patched or re-read by the
@@ -4310,11 +4405,23 @@ final class EventsWorkspace {
             return
         }
         nasConnection.prepareForNASJob { [weak self] in
-            self?.startNASSync(events: events, title: "all events", refresh: events.filter { $0.parentEventID == nil }.map(\.id))
+            let reconcile = self?.syncAllReconcile ?? false
+            self?.startNASSync(
+                events: events,
+                title: "all events",
+                refresh: events.filter { $0.parentEventID == nil }.map(\.id),
+                catchUp: reconcile,
+                reconcile: reconcile
+            )
         }
     }
 
-    private func startNASSync(events: [SavedCameraEvent], title: String, refresh: [UUID]) {
+    /// `catchUp`: NAS copies of files moved before the NAS followed them
+    /// are renamed to their new paths instead of copied again. `reconcile`:
+    /// after the copy, stale NAS duplicates of files already at their right
+    /// path are set aside (never deleted). Renames queued by moves are
+    /// always applied first.
+    private func startNASSync(events: [SavedCameraEvent], title: String, refresh: [UUID], catchUp: Bool, reconcile: Bool) {
         let locations = self.locations
         // A live check: the user just asked, so the cached answer may be old.
         guard VolumeInfo.isAvailable(locations.nasRoot), FileManager.default.fileExists(atPath: locations.nasRoot.path) else {
@@ -4330,6 +4437,8 @@ final class EventsWorkspace {
         // engine, and a row per file.
         let recorder = model.makeHistoryRecorder(action: .syncBuffer, title: "Synced \(title) to the NAS")
         let nasPresence = self.nasPresence
+        let renameQueue = nasRenameQueue
+        let assignments = model.configuration.photoEventAssignments
         model.runBackgroundJob(
             action: .syncBuffer,
             runningNote: "Syncing \(title) to the NAS",
@@ -4341,16 +4450,35 @@ final class EventsWorkspace {
             // folders again — unthrottled, and only those.
             onSettled: { nasPresence.refresh(.syncFinished, scope: events) },
             operation: { progress in
-                progress(BackgroundJobUpdate(progress: 0.02, note: "Sync to NAS: listing the drive folders"))
-                let plan = NASSyncPlanner.plan(events: events, locations: locations)
+                progress(BackgroundJobUpdate(progress: 0.02, note: "Sync to NAS: renaming NAS copies of moved files"))
                 let store = try? NASSyncStore(catalogURL: catalogURL)
+                let follower = NASMoveFollower(store: store, remoteVerifier: options.remoteVerifier, queue: renameQueue)
+                let owned = NASCatchUp.ownedKeys(assignments: assignments, locations: locations)
+                // Queued renames first, so a moved file is never copied a
+                // second time; then the drive is planned, and NAS copies of
+                // files moved before the NAS followed are renamed into place.
+                let prepared = try follower.prepareSync(
+                    events: events, locations: locations, nasRoot: nasRoot, ownedKeys: owned, catchUp: catchUp
+                ) { update in
+                    progress(DashboardModel.jobUpdate(from: update, lowerBound: 0.02, upperBound: 0.03, notePrefix: "Sync to NAS", command: ""))
+                }
+                let plan = prepared.plan
+                var follow = prepared.follow
+                progress(BackgroundJobUpdate(progress: 0.03, note: "Sync to NAS: copying"))
                 let report = try NASSyncService(store: store, options: options, recorder: recorder).sync(plan, nasRoot: nasRoot) { update in
                     progress(DashboardModel.jobUpdate(from: update, lowerBound: 0.03, upperBound: 0.99, notePrefix: "Sync to NAS", command: ""))
                 }
+                if reconcile, !Task.isCancelled {
+                    follow.add(try follower.reconcile(plan: plan, ownedKeys: owned, locations: locations, nasRoot: nasRoot))
+                }
                 let reportPath = Self.writeNASSyncReport(report, plan: plan, title: title, to: reportsFolder)
-                return NASSyncJobOutcome(report: report, plan: plan, reportPath: reportPath)
+                return NASSyncJobOutcome(
+                    report: report, plan: plan, reportPath: reportPath, follow: follow,
+                    queuedRenamesLeft: renameQueue.pendingRenameCount(nasRoot: nasRoot.path)
+                )
             },
             completion: { [weak self] outcome in
+                self?.nasRenamesApplied(outcome.follow, remaining: outcome.queuedRenamesLeft)
                 // What the sync proved on the NAS counts at once, before
                 // the folders are listed again.
                 let proven = Set(outcome.report.copied + outcome.report.matchedExisting + outcome.report.alreadyVerified)
@@ -4372,6 +4500,7 @@ final class EventsWorkspace {
                     parts.append("\(outcome.plan.inLegacyLayout.count) already on the NAS in the old archive layout, not copied again (run the NAS layout migration for this event, then sync)")
                 }
                 if !outcome.plan.unreadable.isEmpty { parts.append("\(outcome.plan.unreadable.count) drive folder(s) unreadable") }
+                parts.insert(contentsOf: outcome.follow.clauses, at: 0)
                 var summary = "Sync to NAS for \(title): " + parts.joined(separator: ", ") + "."
                 if let stopped = report.stoppedReason { summary += " " + stopped }
                 if let path = outcome.reportPath, !report.succeeded { summary += " Details: \(path)" }
@@ -4894,22 +5023,34 @@ final class EventsWorkspace {
         )
         let fallbackTrashRoot = locations.removedFilesRoot
         let protected = protectedKeys
+        let locations = self.locations
+        let journalFolder = self.journalFolder
+        let queuedRenames = NASQueuedRenames()
         return model.runBackgroundJob(
             action: .organize,
             runningNote: "Rechecking \(DuplicateReviewWording.copies(dropping.count)) before moving them to Trash",
             logTitle: "Removed duplicate copies",
             logDetail: "Re-hashed the kept and the removed copy of every group before moving anything. Matching extra copies were renamed into the drive-local .Camera Toolkit/_Trash folder with a manifest — restorable from the Trash window. Copies that changed or could not be read were left in place.",
             operation: { progress in
-                try DuplicateResolver(trash: MediaTrashService(removedFilesRoot: fallbackTrashRoot)).resolve(
+                let outcome = try DuplicateResolver(trash: MediaTrashService(removedFilesRoot: fallbackTrashRoot)).resolve(
                     resolutions,
                     protectedPathKeys: protected,
                     context: context
                 ) { update in
                     progress(DashboardModel.jobUpdate(from: update, notePrefix: "Rechecking", command: ""))
                 }
+                // A removed copy's NAS twin is a stale duplicate of the kept
+                // copy's: set aside on the NAS (never deleted) when it runs.
+                queuedRenames.add(Self.queueNASRenames(
+                    NASMoveFollower.renames(forDuplicates: resolutions, outcome: outcome, locations: locations),
+                    title: "Removed duplicate copies", origin: .merge,
+                    nasRoot: locations.nasRoot, journalFolder: journalFolder
+                ))
+                return outcome
             },
             completion: { [weak self] outcome in
                 guard let self else { return "" }
+                noteNASRenamesQueued(queuedRenames.count)
                 if !outcome.removedAssignments.isEmpty {
                     applyAssignmentChange(
                         AssignmentChange(title: "Remove duplicate copies", removed: outcome.removedAssignments, added: []),

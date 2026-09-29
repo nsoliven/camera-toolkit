@@ -112,40 +112,152 @@ public final class NASSyncStore: @unchecked Sendable {
         guard !records.isEmpty else { return }
         try writer().write { db in
             for record in records {
-                try db.execute(
-                    sql: """
-                    INSERT INTO nas_sync_files(
-                        nas_root, path_key, relative_path, event_id, byte_count, source_modified_at,
-                        sha256, nas_sha256, state, detail, checked_at, verified_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(nas_root, path_key) DO UPDATE SET
-                        relative_path = excluded.relative_path,
-                        event_id = excluded.event_id,
-                        byte_count = excluded.byte_count,
-                        source_modified_at = excluded.source_modified_at,
-                        sha256 = excluded.sha256,
-                        nas_sha256 = excluded.nas_sha256,
-                        state = excluded.state,
-                        detail = excluded.detail,
-                        checked_at = excluded.checked_at,
-                        verified_at = excluded.verified_at
-                    """,
-                    arguments: [
-                        Self.standardizedRoot(record.nasRoot),
-                        record.pathKey,
-                        record.relativePath,
-                        record.eventID?.uuidString,
-                        record.byteCount,
-                        record.sourceModifiedAt,
-                        record.sha256,
-                        record.nasSHA256,
-                        record.state.rawValue,
-                        record.detail,
-                        Self.timestamp(record.checkedAt),
-                        record.verifiedAt.map(Self.timestamp),
-                    ]
-                )
+                try Self.insert(record, root: Self.standardizedRoot(record.nasRoot), into: db)
             }
+        }
+    }
+
+    private static func insert(_ record: NASSyncRecord, root: String, into db: Database) throws {
+        try db.execute(
+            sql: """
+            INSERT INTO nas_sync_files(
+                nas_root, path_key, relative_path, event_id, byte_count, source_modified_at,
+                sha256, nas_sha256, state, detail, checked_at, verified_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(nas_root, path_key) DO UPDATE SET
+                relative_path = excluded.relative_path,
+                event_id = excluded.event_id,
+                byte_count = excluded.byte_count,
+                source_modified_at = excluded.source_modified_at,
+                sha256 = excluded.sha256,
+                nas_sha256 = excluded.nas_sha256,
+                state = excluded.state,
+                detail = excluded.detail,
+                checked_at = excluded.checked_at,
+                verified_at = excluded.verified_at
+            """,
+            arguments: [
+                root,
+                record.pathKey,
+                record.relativePath,
+                record.eventID?.uuidString,
+                record.byteCount,
+                record.sourceModifiedAt,
+                record.sha256,
+                record.nasSHA256,
+                record.state.rawValue,
+                record.detail,
+                timestamp(record.checkedAt),
+                record.verifiedAt.map(timestamp),
+            ]
+        )
+    }
+
+    /// The records at exactly these paths (`pathKey`s), for a job that
+    /// touches a few files and must not read the whole table.
+    public func records(nasRoot: String, pathKeys: some Collection<String>) throws -> [String: NASSyncRecord] {
+        let root = Self.standardizedRoot(nasRoot)
+        let keys = Array(Set(pathKeys))
+        guard !keys.isEmpty else { return [:] }
+        return try writer().read { db in
+            guard try db.tableExists(Self.tableName) else { return [:] }
+            var result: [String: NASSyncRecord] = [:]
+            // SQLite caps the number of bound parameters per statement.
+            for start in stride(from: 0, to: keys.count, by: 400) {
+                let chunk = Array(keys[start..<min(start + 400, keys.count)])
+                let marks = Array(repeating: "?", count: chunk.count).joined(separator: ",")
+                let rows = try Row.fetchAll(
+                    db,
+                    sql: "SELECT * FROM nas_sync_files WHERE nas_root = ? AND path_key IN (\(marks))",
+                    arguments: StatementArguments([root] + chunk)
+                )
+                for row in rows {
+                    let record = Self.record(row)
+                    result[record.pathKey] = record
+                }
+            }
+            return result
+        }
+    }
+
+    /// A record that follows its file to a new NAS path.
+    public struct RecordMove: Equatable, Sendable {
+        public var from: String
+        public var to: String
+        /// The event the file belongs to now, when it changed.
+        public var eventID: UUID?
+        /// False when the new path already holds the identical file: its
+        /// own record then stays, and only the old path's record goes.
+        public var replaceExisting: Bool
+
+        public init(from: String, to: String, eventID: UUID? = nil, replaceExisting: Bool = true) {
+            self.from = from
+            self.to = to
+            self.eventID = eventID
+            self.replaceExisting = replaceExisting
+        }
+    }
+
+    /// Renames records in one transaction: each record at `from` moves to
+    /// `to` with its hash, size, and times untouched, so the file stays
+    /// "verified on the NAS" and the next sync does not copy it. A `from`
+    /// with no record is skipped. Returns how many records moved.
+    @discardableResult
+    public func relocate(nasRoot: String, _ moves: [RecordMove]) throws -> Int {
+        guard !moves.isEmpty else { return 0 }
+        let root = Self.standardizedRoot(nasRoot)
+        return try writer().write { db in
+            guard try db.tableExists(Self.tableName) else { return 0 }
+            var moved = 0
+            for move in moves {
+                let fromKey = Self.pathKey(move.from)
+                let toKey = Self.pathKey(move.to)
+                guard let row = try Row.fetchOne(
+                    db,
+                    sql: "SELECT * FROM nas_sync_files WHERE nas_root = ? AND path_key = ?",
+                    arguments: [root, fromKey]
+                ) else { continue }
+                var record = Self.record(row)
+                try db.execute(sql: "DELETE FROM nas_sync_files WHERE nas_root = ? AND path_key = ?", arguments: [root, fromKey])
+                if !move.replaceExisting,
+                   try Bool.fetchOne(
+                       db,
+                       sql: "SELECT EXISTS(SELECT 1 FROM nas_sync_files WHERE nas_root = ? AND path_key = ?)",
+                       arguments: [root, toKey]
+                   ) == true { continue }
+                record.relativePath = move.to
+                if let eventID = move.eventID { record.eventID = eventID }
+                try Self.insert(record, root: root, into: db)
+                moved += 1
+            }
+            return moved
+        }
+    }
+
+    /// A whole folder was renamed on the NAS: every record under `from`
+    /// moves under `to`, in one transaction. A record already at a target
+    /// path is replaced (there is none: the folder did not exist).
+    @discardableResult
+    public func relocateFolder(nasRoot: String, from: String, to: String) throws -> Int {
+        let root = Self.standardizedRoot(nasRoot)
+        let prefix = Self.pathKey(from)
+        return try writer().write { db in
+            guard try db.tableExists(Self.tableName) else { return 0 }
+            let rows = try Row.fetchAll(
+                db,
+                sql: "SELECT * FROM nas_sync_files WHERE nas_root = ? AND substr(path_key, 1, ?) = ?",
+                arguments: [root, prefix.count + 1, prefix + "/"]
+            )
+            let records = rows.map(Self.record)
+            try db.execute(
+                sql: "DELETE FROM nas_sync_files WHERE nas_root = ? AND substr(path_key, 1, ?) = ?",
+                arguments: [root, prefix.count + 1, prefix + "/"]
+            )
+            for var record in records {
+                record.relativePath = to + "/" + record.relativePath.dropFirst(from.count + 1)
+                try Self.insert(record, root: root, into: db)
+            }
+            return records.count
         }
     }
 

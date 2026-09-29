@@ -134,6 +134,40 @@ public struct NASTreeListing: Codable, Equatable, Sendable {
         }
     }
 
+    /// The NAS renamed `from` to `to` (a file): the listing follows, so
+    /// counts stay right without listing the NAS again. The entry keeps its
+    /// size and time; it is only placed at `to` when the listing covers
+    /// that folder (else the path is unknown, not missing).
+    public mutating func recordRenamed(from: String, to: String) {
+        guard let entry = entries.removeValue(forKey: Self.key(from)) else { return }
+        if covers(to) { entries[Self.key(to)] = entry }
+    }
+
+    /// The NAS renamed the folder `from` to `to`: entries and coverage
+    /// under it are re-keyed.
+    public mutating func recordFolderRenamed(from: String, to: String) {
+        let old = Self.key(Self.trimmed(from))
+        let new = Self.key(Self.trimmed(to))
+        func rekeyed(_ key: String) -> String? {
+            key == old ? new : (key.hasPrefix(old + "/") ? new + key.dropFirst(old.count) : nil)
+        }
+        for (key, entry) in entries {
+            guard let moved = rekeyed(key) else { continue }
+            entries[key] = nil
+            entries[moved] = entry
+        }
+        for (key, date) in coverage {
+            guard let moved = rekeyed(key) else { continue }
+            coverage[key] = nil
+            coverage[moved] = date
+        }
+    }
+
+    /// The NAS trashed a stale copy: it is no longer at `path`.
+    public mutating func recordRemoved(_ path: String) {
+        entries[Self.key(path)] = nil
+    }
+
     static func trimmed(_ folder: String) -> String {
         var value = folder
         while value.hasPrefix("./") { value.removeFirst(2) }

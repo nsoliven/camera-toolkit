@@ -46,6 +46,9 @@ public struct DriveMoveReport: Sendable {
     public var moved: [DriveMove] = []
     public var skipped: [DriveMoveIssue] = []
     public var journalPath: String?
+    /// The journal's id, set when one was written — what NAS renames
+    /// recorded for this move are linked to, so its Undo reverses them.
+    public var journalID: UUID?
 
     public var movedBytes: Int64 { moved.reduce(Int64(0)) { $0 + $1.byteCount } }
 }
@@ -88,6 +91,7 @@ public struct DriveMoveService {
             try Self.write(journal, to: url)
             journalURL = url
             report.journalPath = url.path
+            report.journalID = journal.id
         }
 
         let totalBytes = planned.reduce(Int64(0)) { $0 + $1.byteCount }
@@ -146,7 +150,7 @@ public struct DriveMoveService {
                 "“\(journal.title)” was recorded before the drive moved to the Originals layout; its paths no longer exist, so it can't be undone. Nothing was changed."
             )
         }
-        var report = DriveMoveReport(journalPath: journalURL.path)
+        var report = DriveMoveReport(journalPath: journalURL.path, journalID: journal.id)
         let reversed = journal.completedMoves.reversed().map {
             DriveMove(sourcePath: $0.destinationPath, destinationPath: $0.sourcePath, byteCount: $0.byteCount)
         }

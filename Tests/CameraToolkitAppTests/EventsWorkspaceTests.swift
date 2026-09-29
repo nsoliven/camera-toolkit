@@ -3793,7 +3793,7 @@ extension EventsWorkspaceTests {
 
             XCTAssertEqual(
                 model.statusMessage,
-                "Moved 3 photos to Japan 2026 (1 was already there, so its extra copy went to Trash). 1 had the same name as a different photo and was kept as DSC00002 (2).ARW."
+                "Moved 3 photos to Japan 2026 (1 was already there, so its extra copy went to Trash). 1 had the same name as a different photo and was kept as DSC00002 (2).ARW. 3 NAS copies will be renamed when the NAS is connected."
             )
             let target = try XCTUnwrap(workspace.event(toID))
             let targetFolder = workspace.locations.originalsRoot(for: target, deviceID: "sony-a7v", policy: .buffer)
