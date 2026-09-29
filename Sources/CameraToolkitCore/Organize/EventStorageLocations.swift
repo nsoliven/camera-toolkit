@@ -344,9 +344,12 @@ public struct EventStorageLocations: Sendable {
     }
 
     /// A path under the NAS root, relative to it; nil for any other path.
+    /// Nothing is stat'ed: `URL(fileURLWithPath:)` asks the filesystem
+    /// whether the path is a directory, and this path is on the share —
+    /// Move to Event asks once per file, on the main actor.
     public func nasRelativePath(_ path: String) -> String? {
         let root = nasRoot.path + "/"
-        let standardized = URL(fileURLWithPath: path).standardizedFileURL.path
+        let standardized = URL(filePath: path, directoryHint: .notDirectory).standardizedFileURL.path
         return standardized.hasPrefix(root) ? String(standardized.dropFirst(root.count)) : nil
     }
 

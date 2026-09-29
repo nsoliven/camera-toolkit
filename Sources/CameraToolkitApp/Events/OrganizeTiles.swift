@@ -957,6 +957,7 @@ struct OrganizeGrid<MenuContent: View>: View {
     }
 
     var body: some View {
+        let _ = BoardRenderCounter.hit(.grid)
         let ordered = sections.flatMap(\.visibleStacks)
         let orderedIDs = ordered.map(\.id)
         ScrollViewReader { proxy in
@@ -1104,6 +1105,7 @@ struct OrganizeGrid<MenuContent: View>: View {
     }
 
     private func tile(_ stack: OrganizeStack, orderedIDs: [String]) -> some View {
+        BoardRenderCounter.hit(.gridTile)
         let assigned = eventForStack(stack)
         return StackTileView(
             stack: stack,
@@ -1135,13 +1137,16 @@ struct OrganizeGrid<MenuContent: View>: View {
         .simultaneousGesture(TapGesture(count: 2).onEnded { onOpen(stack, 0) })
         .accessibilityAction { select(stack, orderedIDs: orderedIDs) }
         .accessibilityAction(named: "Preview") { onOpen(stack, 0) }
-        .draggable(workspace.dragPayload(for: stack.id, origin: origin, containerID: containerID)) {
+        .onDrag {
+            dragProvider(for: stack)
+        } preview: {
             dragPreview(for: stack)
         }
         .contextMenu { menu(stack) }
     }
 
     private func row(_ stack: OrganizeStack, orderedIDs: [String]) -> some View {
+        BoardRenderCounter.hit(.gridTile)
         let assigned = eventForStack(stack)
         let isFocusedRow = workspace.focusedStackID == stack.id
         return StackRowView(
@@ -1178,10 +1183,20 @@ struct OrganizeGrid<MenuContent: View>: View {
         .simultaneousGesture(TapGesture(count: 2).onEnded { onOpen(stack, 0) })
         .accessibilityAction { select(stack, orderedIDs: orderedIDs) }
         .accessibilityAction(named: "Preview") { onOpen(stack, 0) }
-        .draggable(workspace.dragPayload(for: stack.id, origin: origin, containerID: containerID)) {
+        .onDrag {
+            dragProvider(for: stack)
+        } preview: {
             dragPreview(for: stack)
         }
         .contextMenu { menu(stack) }
+    }
+
+    /// What a drag of this tile carries, built when a drag starts. The
+    /// payload names every selected stack, so building it in each tile's
+    /// body (as `.draggable(_:)` does) encoded the whole selection once per
+    /// tile per render — ~1,200 times on a family board.
+    private func dragProvider(for stack: OrganizeStack) -> NSItemProvider {
+        NSItemProvider(object: workspace.dragPayload(for: stack.id, origin: origin, containerID: containerID) as NSString)
     }
 
     private func select(_ stack: OrganizeStack, orderedIDs: [String]) {

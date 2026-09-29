@@ -62,7 +62,7 @@ final class NASFollowMovesTests: XCTestCase {
         XCTAssertTrue(oldNAS.allSatisfy(exists))
         workspace.refreshConnectivity()
         try await waitUntil { !model.isBusy && workspace.pendingNASRenameCount == 0 && model.jobs.contains { $0.action == .nasRename && $0.state == .done } }
-        XCTAssertTrue(model.statusMessage.hasPrefix("Renamed \(files.count) copies on the NAS"), model.statusMessage)
+        XCTAssertTrue(model.statusMessage.contains("Renamed \(files.count) copies on the NAS"), model.statusMessage)
         XCTAssertTrue(oldNAS.allSatisfy { !exists($0) })
         for file in files {
             XCTAssertTrue(exists(try nasPath(library, drivePath: workspace.locations.originalsRoot(for: workspace.event(library.harborID)!, deviceID: "sony-a7v", policy: .buffer).appendingPathComponent(file.name).path)))

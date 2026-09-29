@@ -53,6 +53,7 @@ struct EventBoardView: View {
     }
 
     var body: some View {
+        let _ = BoardRenderCounter.hit(.board)
         if let event = workspace.event(eventID) {
             let stacks = workspace.eventStacks[eventID]
             // One grouping pass per render — the board, the toolbar count,
@@ -681,6 +682,10 @@ struct EventStorageSlots {
     let event: SavedCameraEvent
     let summary: EventPresenceSummary?
 
+    /// The summary's counts, taken once when its rows were set — a render
+    /// reads these instead of walking ~15,000 rows per slot.
+    private var counts: EventPresenceCounts { summary?.counts ?? EventPresenceCounts() }
+
     /// Re-checks connections and re-probes where this event's files are. Used
     /// on slots that are showing Offline.
     private var checkAgainButton: some View {
@@ -692,22 +697,21 @@ struct EventStorageSlots {
     }
 
     var source: StorageSlot<some View> {
-        // Counts are memoized on the summary — one pass per change, not one
-        // per body evaluation of a 15,000-file board.
-        let separateCount = summary?.separateSource ?? 0
-        let onSource = summary?.onSource ?? 0
-        let offline = summary?.sourceOffline ?? 0
-        let freeable = summary?.freeableFromSource ?? 0
+        let counts = counts
+        let separate = counts.separateSource
+        let onSource = counts.onSource
+        let offline = counts.sourceOffline
+        let freeable = counts.freeable
         let value: String
         let detail: String
         if summary == nil {
             value = "Checking…"
             detail = "Looking at the card or unsorted folder"
-        } else if separateCount == 0 {
+        } else if separate == 0 {
             value = "—"
-            detail = (summary?.total ?? 0) == 0 ? "No files yet" : "Already organized on the drive"
+            detail = counts.total == 0 ? "No files yet" : "Already organized on the drive"
         } else {
-            value = "\(onSource) of \(separateCount)"
+            value = "\(onSource) of \(separate)"
             detail = offline > 0
                 ? "\(offline) on a disconnected card or drive"
                 : (onSource == 0 ? "Nothing left on the card or unsorted folder" : "Still on the card or unsorted folder")
@@ -733,12 +737,13 @@ struct EventStorageSlots {
 
     var drive: StorageSlot<some View> {
         let policy = workspace.resolvedPolicy(for: event)
-        let total = summary?.total ?? 0
-        let onDrive = summary?.onDrive ?? 0
-        let onOther = summary?.onOtherDrive ?? 0
-        let needsDrive = summary?.needsDrive ?? 0
-        let removable = summary?.removableFromDrive ?? 0
-        let offline = summary?.driveOffline ?? false
+        let counts = counts
+        let total = counts.total
+        let onDrive = counts.onDrive
+        let onOther = counts.onOtherDrive
+        let needsDrive = counts.needsDrive
+        let removable = counts.removable
+        let offline = counts.driveOffline
         let detail: String
         if summary == nil {
             detail = "Checking the drive"
@@ -790,8 +795,8 @@ struct EventStorageSlots {
     /// files, so say so on the board instead of only in the lock menu.
     @ViewBuilder var misplacedNotice: some View {
         let policy = workspace.resolvedPolicy(for: event)
-        let misplaced = summary?.onOtherDrive ?? 0
-        if let summary, !summary.driveOffline, misplaced > 0 {
+        let misplaced = counts.onOtherDrive
+        if summary != nil, !counts.driveOffline, misplaced > 0 {
             HStack(spacing: 8) {
                 Image(systemName: policy == .archiveOnly ? "lock.open.fill" : "externaldrive.badge.exclamationmark")
                     .foregroundStyle(.purple)
@@ -817,19 +822,20 @@ struct EventStorageSlots {
     }
 
     var nas: StorageSlot<some View> {
-        let total = summary?.total ?? 0
-        let onNAS = summary?.onArchive ?? 0
-        let verified = summary?.verifiedOnArchive ?? 0
-        let legacy = summary?.onLegacyArchiveLayout ?? 0
-        let offline = summary?.archiveOffline ?? false
-        let onDrive = summary?.onEitherDrive ?? 0
+        let counts = counts
+        let total = counts.total
+        let onNAS = counts.onArchive
+        let verified = counts.verifiedOnArchive
+        let legacy = counts.onLegacyArchiveLayout
+        let offline = counts.archiveOffline
+        let onDrive = counts.onEitherDrive
         // The presence index counts every file Sync to NAS would copy —
         // edits and sidecars too, which have no assignment here.
         let indexedPending = workspace.nasPendingFamilyTotals(for: event.id)?.pendingFiles ?? 0
         let detail: String
         if offline {
             detail = workspace.nasShareURL == nil ? "Connect the NAS share to sync" : "Not connected — Connect to NAS…"
-        } else if total > 0, verified == total, let date = summary?.oldestArchiveVerification {
+        } else if total > 0, verified == total, let date = counts.oldestArchiveVerification {
             detail = "On NAS ✓ verified \(date.formatted(date: .abbreviated, time: .shortened))"
         } else if total > 0, onNAS == total, indexedPending > 0 {
             detail = "On NAS · \(NASPendingText.files(indexedPending)) of edits or sidecars not on the NAS yet"
@@ -876,7 +882,7 @@ struct EventStorageSlots {
             tint: .teal,
             value: event.sendsToImmich ? "\(present) sent" : "Off",
             detail: event.sendsToImmich ? albumText : "This event stays out of Immich",
-            state: event.sendsToImmich ? (present > 0 && present >= (summary?.total ?? 0) ? .complete : .partial) : .unknown
+            state: event.sendsToImmich ? (present > 0 && present >= counts.total ? .complete : .partial) : .unknown
         ) {
             Toggle("Send", isOn: Binding(
                 get: { event.sendsToImmich },
@@ -904,6 +910,7 @@ struct EventStorageSummary: View {
     let slots: EventStorageSlots
 
     var body: some View {
+        let _ = BoardRenderCounter.hit(.storageStrip)
         HStack(spacing: 6) {
             item(slots.source)
             item(slots.drive)
@@ -983,6 +990,7 @@ struct EventInfoInspector: View {
     let event: SavedCameraEvent
 
     var body: some View {
+        let _ = BoardRenderCounter.hit(.inspector)
         let slots = EventStorageSlots(model: model, workspace: workspace, event: event, summary: workspace.presence[event.id])
         let files = workspace.assignmentCount(for: event.id)
         let people = workspace.eventPeople(event.id)

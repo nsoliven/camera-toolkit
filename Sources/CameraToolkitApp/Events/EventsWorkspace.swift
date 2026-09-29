@@ -298,10 +298,37 @@ private struct PendingEventMove {
         self.movedOwners = ownerByKey.filter { $0.value != to.id }
         self.sourceTitles = sourceTitles
     }
+}
 
-    /// The board's own event is the only owner: the tiles it shows are
-    /// exactly the tiles the source's board shows.
-    var isFromOwnBoard: Bool { sourceIDs == [from.id] }
+/// A moved file's NAS copy that the queued rename will bring to its new path.
+struct PendingNASArrival {
+    /// The presence row of the file at its new assignment.
+    var assetID: String
+    /// Where the NAS copy sits now (lowercased): the rename that brings it
+    /// over must start there, or it is some other rename.
+    var fromKey: String?
+    /// The row's key in `eventAssetsByPathKey` (its drive path, lowercased).
+    /// Nil for a file with no drive copy, whose row is keyed by its NAS path.
+    var driveKey: String?
+    /// When Sync to NAS last verified the copy at its old path — the rename
+    /// carries the sync record along, so the copy stays verified.
+    var verifiedAt: Date?
+    /// Set when the NAS copy is the file's only copy (the Buffer is away):
+    /// its tiles, rows and badge entries move to the new NAS path with it.
+    var nasOnly: NASOnlyArrival?
+}
+
+/// What follows a NAS-only file when its queued rename runs.
+struct NASOnlyArrival {
+    var oldAssetID: String
+    /// The tile's `pathKey` and the badge index's key at the old NAS path.
+    var oldKey: String
+    var oldPath: String
+    var newPath: String
+    var newKey: String
+    /// The file's presence row at its new assignment and NAS path.
+    var row: EventAssetPresence
+    var targetEventID: UUID
 }
 
 /// A grid built from the catalog-implied `Originals/<Camera>` paths, before any
@@ -675,6 +702,21 @@ final class EventsWorkspace {
     @ObservationIgnored private var pendingSelectionCollapse: Task<Void, Never>?
     /// How long that wait is; a test shortens it.
     @ObservationIgnored var selectionCollapseDelay: TimeInterval = BoardClickPolicy.doubleClickInterval
+    /// How many board reads (`refreshEvent`) have started — what a test
+    /// compares to prove a move did not re-read the boards it patched.
+    @ObservationIgnored private(set) var boardReadCount = 0
+    /// How many times the assignment lookups were rebuilt from every
+    /// assignment — ~750 ms on the main actor at 17,000 rows.
+    @ObservationIgnored private(set) var assignmentIndexRebuildCount = 0
+    /// The move's summary line, and what the status line said with its
+    /// queued-NAS-renames sentence on it: when the NAS renames run right
+    /// behind the move, the status line keeps the summary and adds theirs.
+    @ObservationIgnored var lastMoveStatusLine: (base: String, full: String)?
+    /// NAS copies that will sit at a moved file's new mirror path once their
+    /// queued rename runs, by that path (lowercased) — what lets the finished
+    /// rename patch the NAS column of just those rows instead of re-reading
+    /// every open board.
+    @ObservationIgnored var pendingNASArrivals: [String: PendingNASArrival] = [:]
     @ObservationIgnored private var indexRevision = -1
     @ObservationIgnored private var indexCount = -1
     @ObservationIgnored var assignmentsByPathKey: [String: PhotoEventAssignment] = [:]
@@ -1377,7 +1419,8 @@ final class EventsWorkspace {
 
     func refreshIndexIfNeeded() {
         let assignments = model.configuration.photoEventAssignments
-        guard indexRevision != model.catalogStateRevision || indexCount != assignments.count else { return }
+        guard indexRevision != model.assignmentIndexRevision || indexCount != assignments.count else { return }
+        assignmentIndexRebuildCount += 1
         var index: [String: PhotoEventAssignment] = [:]
         index.reserveCapacity(assignments.count * 2)
         var counts: [UUID: Int] = [:]
@@ -1411,14 +1454,14 @@ final class EventsWorkspace {
         assignmentCounts = counts
         assignmentBytes = bytes
         assignmentsByEventAndName = [:]
-        indexRevision = model.catalogStateRevision
+        indexRevision = model.assignmentIndexRevision
         indexCount = assignments.count
     }
 
     /// Whether the lookup indexes match the catalog right now — read
     /// before a catalog change so `patchAssignmentIndex` knows it may patch.
     private var assignmentIndexIsCurrent: Bool {
-        indexRevision == model.catalogStateRevision && indexCount == model.configuration.photoEventAssignments.count
+        indexRevision == model.assignmentIndexRevision && indexCount == model.configuration.photoEventAssignments.count
     }
 
     /// Brings the lookup indexes in step with a catalog change that just
@@ -1460,7 +1503,7 @@ final class EventsWorkspace {
                 assignmentsByEventAndName[assignment.eventID]?[name] = assignment
             }
         }
-        indexRevision = model.catalogStateRevision
+        indexRevision = model.assignmentIndexRevision
         indexCount = model.configuration.photoEventAssignments.count
     }
 
@@ -2360,8 +2403,12 @@ final class EventsWorkspace {
         selectionAnchorID = next
     }
 
+    /// How many drag payloads were built — one per drag, none per render.
+    @ObservationIgnored private(set) var dragPayloadBuildCount = 0
+
     func dragPayload(for stackID: String, origin: OrganizeDragPayload.Origin, containerID: UUID) -> String {
-        OrganizeDragPayload(origin: origin, containerID: containerID, stackIDs: Array(targetStackIDs(including: stackID))).encoded
+        dragPayloadBuildCount += 1
+        return OrganizeDragPayload(origin: origin, containerID: containerID, stackIDs: Array(targetStackIDs(including: stackID))).encoded
     }
 
     @discardableResult
@@ -3186,6 +3233,7 @@ final class EventsWorkspace {
     func refreshEvent(_ eventID: UUID) async {
         guard let event = event(eventID) else { return }
         refreshesInFlight += 1
+        boardReadCount += 1
         defer { refreshesInFlight -= 1 }
         let generation = UUID()
         refreshGenerations[eventID] = generation
@@ -4764,11 +4812,15 @@ final class EventsWorkspace {
                 stacks = Self.inserting(incoming, into: stacks)
                 move.joinedBoards.append(boardID)
             }
-            // A move clicked on a family board cuts stacks the other boards
-            // (a subevent's, the target's) may cut differently — a burst
-            // whose frames belong to two events — so they are re-read from
-            // the catalog once it lands instead of trusting the ids.
-            if cutDifferently || (boardID != move.from.id && !move.isFromOwnBoard) { move.truthBoards.append(boardID) }
+            // A board that cuts the moved stacks differently from the clicked
+            // one — a burst whose frames belong to two events, or ids the
+            // board does not hold — is re-read from the catalog once the
+            // move lands instead of trusting the ids. A board that cut them
+            // the same is not: a move clicked on a family board used to
+            // re-read every other board it touched (~1 s of stalls on a
+            // 15,000-file family), and `MoveBoardTruthTests` proves those
+            // boards already match a fresh read without it.
+            if cutDifferently { move.truthBoards.append(boardID) }
             // A sweep or build still running for this board would publish
             // the old arrangement over the tiles that just moved. It is
             // dropped, and the board is re-checked once the move settles.
@@ -5032,8 +5084,10 @@ final class EventsWorkspace {
             completion: { [weak self] outcome in
                 guard let self else { return "" }
                 noteNASRenamesQueued(queuedRenames.count)
-                return landMove(moveID, mergeLink: mergeLink, outcome: outcome, fromTitle: fromTitle, toTitle: toTitle)
-                    + NASFollowWording.queued(queuedRenames.count, connected: nasIsConnected)
+                let line = landMove(moveID, mergeLink: mergeLink, outcome: outcome, fromTitle: fromTitle, toTitle: toTitle)
+                let full = line + NASFollowWording.queued(queuedRenames.count, connected: nasIsConnected)
+                lastMoveStatusLine = (line, full)
+                return full
             }
         )
     }
@@ -5089,11 +5143,11 @@ final class EventsWorkspace {
         if plainMove {
             retargetMovedStacks(moves: outcome.report.moved)
             stampBoards(of: move)
-            // The storage strip follows in its own turn, so the frame that
-            // shows the tiles at their new paths is not also the one that
-            // rewrites the family's presence rows.
-            let moved = outcome.moved
-            Task { @MainActor [weak self] in self?.patchPresence(afterMoving: moved, move: move) }
+            // The storage strip's rows follow in this same turn: one frame
+            // draws the tiles at their new paths, the counts, and the strip,
+            // instead of one board redraw per piece.
+            patchPresence(afterMoving: outcome.moved, move: move)
+            recordNASOnlyArrivals(outcome.moved, move: move)
             for boardID in move.leftBoards + move.joinedBoards where eventStacks[boardID] != nil {
                 refreshEditTags(for: boardID)
             }
@@ -5217,6 +5271,15 @@ final class EventsWorkspace {
                 }
             }
             asset.archivePath = paths.archiveURL(for: item.added, event: move.to)?.path
+            if let archivePath = asset.archivePath, old.archive == .present, !old.archiveIsLegacyLayout {
+                pendingNASArrivals[archivePath.lowercased()] = PendingNASArrival(
+                    assetID: asset.id,
+                    fromKey: old.archivePath?.lowercased(),
+                    driveKey: drive.destinationPath.lowercased(),
+                    verifiedAt: old.archiveVerifiedAt,
+                    nasOnly: nil
+                )
+            }
             if asset.archive != .unavailable { asset.archive = .missing }
             asset.archiveIsLegacyLayout = false
             asset.archiveVerifiedAt = nil
@@ -5225,17 +5288,29 @@ final class EventsWorkspace {
             newAssets.append((drive.destinationPath.lowercased(), asset))
         }
         guard !replacements.isEmpty else { return }
-        // A board held a file's source when it still has the row for it —
-        // on a family board the source is whichever subevent owned the
-        // file, so the row itself is the answer, not the clicked event.
+        installPresenceRows(replacing: replacements, oldKeys: oldKeys, newRows: newAssets, targetEventID: move.to.id)
+    }
+
+    /// Swaps each moved file's presence row for its row at the new
+    /// assignment, on every board and summary. A board held a file's source
+    /// when it still has the row for it — on a family board the source is
+    /// whichever subevent owned the file, so the row itself is the answer,
+    /// not the clicked event. The new rows join the boards whose family holds
+    /// the target.
+    private func installPresenceRows(
+        replacing replacements: [String: EventAssetPresence],
+        oldKeys: [String],
+        newRows: [(key: String, asset: EventAssetPresence)],
+        targetEventID: UUID
+    ) {
         for boardID in Array(eventAssetsByPathKey.keys) {
-            let holdsTarget = scopeIDs(boardID).contains(move.to.id)
+            let holdsTarget = scopeIDs(boardID).contains(targetEventID)
             for key in oldKeys { eventAssetsByPathKey[boardID]?[key] = nil }
-            if holdsTarget { for entry in newAssets { eventAssetsByPathKey[boardID]?[entry.key] = entry.asset } }
+            if holdsTarget { for entry in newRows { eventAssetsByPathKey[boardID]?[entry.key] = entry.asset } }
         }
         for eventID in Array(presence.keys) {
             guard var summary = presence[eventID] else { continue }
-            let holdsTarget = scopeIDs(eventID).contains(move.to.id)
+            let holdsTarget = scopeIDs(eventID).contains(targetEventID)
             var next: [EventAssetPresence] = []
             next.reserveCapacity(summary.assets.count)
             var replaced: Set<String> = []
@@ -5253,6 +5328,157 @@ final class EventsWorkspace {
             guard next.count != summary.assets.count || !replaced.isEmpty || holdsTarget else { continue }
             summary.assets = next
             presence[eventID] = summary
+        }
+    }
+
+    /// Files with no drive copy — the Buffer is away, the NAS copy is the
+    /// file — have nothing to rename on the drive; their NAS copy owes the
+    /// rename. Notes what that rename will change (the tile's path, the
+    /// presence row, the badge index) so it can be patched in place when
+    /// it runs, and lets lookups by the old NAS path keep answering with
+    /// the new assignment until then. Nothing is stat'ed: every path here is
+    /// a string join, because the paths are on the share.
+    private func recordNASOnlyArrivals(_ moved: [EventMoveItem], move: PendingEventMove) {
+        let candidates = moved.filter { $0.move == nil && $0.nasCopy != nil }
+        guard !candidates.isEmpty else { return }
+        let locations = self.locations
+        var paths = EventPathCache(locations: locations)
+        let nasRoot = locations.nasRoot.path
+        let targetPolicy = locations.resolvedPolicy(for: move.to)
+        let otherPolicy: EventStoragePolicy = targetPolicy == .buffer ? .archiveOnly : .buffer
+        for item in candidates {
+            guard let copy = item.nasCopy,
+                  EventStorageLocations.isLexicallyClean(copy.from), EventStorageLocations.isLexicallyClean(copy.to) else { continue }
+            let oldPath = nasRoot + "/" + copy.from
+            let newPath = nasRoot + "/" + copy.to
+            let oldKey = oldPath.lowercased()
+            guard let old = eventAssetsByPathKey.values.lazy.compactMap({ $0[oldKey] }).first,
+                  old.archive == .present, !old.archiveIsLegacyLayout else { continue }
+            var row = old
+            row.id = CatalogStore.eventAssetID(item.added)
+            row.assignment = item.added
+            row.drivePath = Self.lexicalPath(paths.originalsRootPath(move.to, item.added.deviceID, targetPolicy), item.added.relativePath)
+            row.otherDrivePath = Self.lexicalPath(paths.originalsRootPath(move.to, item.added.deviceID, otherPolicy), item.added.relativePath)
+            row.driveIsLegacyLayout = false
+            row.otherDriveIsLegacyLayout = false
+            row.archivePath = newPath
+            let arrival = NASOnlyArrival(
+                oldAssetID: CatalogStore.eventAssetID(item.removed),
+                oldKey: oldKey,
+                oldPath: oldPath,
+                newPath: newPath,
+                newKey: newPath.lowercased(),
+                row: row,
+                targetEventID: move.to.id
+            )
+            pendingNASArrivals[arrival.newKey] = PendingNASArrival(
+                assetID: row.id, fromKey: oldKey, driveKey: nil, verifiedAt: old.archiveVerifiedAt, nasOnly: arrival
+            )
+            // The tile still points at the old NAS path until the rename runs.
+            if assignmentsByPathKey[oldKey] == nil { assignmentsByPathKey[oldKey] = item.added }
+        }
+    }
+
+    /// `root/relative` for a clean relative path, else nil.
+    private static func lexicalPath(_ root: String, _ relative: String) -> String? {
+        EventStorageLocations.isLexicallyClean(relative) ? root + "/" + relative : nil
+    }
+
+    /// The queued NAS renames of moved files ran: the NAS column of just
+    /// those files follows, from the rename result, on every summary and
+    /// badge index that holds them — no board is re-read. False when the
+    /// result holds anything this cannot answer from the move (a folder
+    /// rename, a rename another move's Undo or a catch-up queued, a file
+    /// left because a different one is at its new name): the caller then
+    /// re-reads the boards, as it always did.
+    func patchPresence(afterNASRenames result: NASFollowResult) -> Bool {
+        guard result.foldersRenamed == 0, result.differs.isEmpty, result.unproven.isEmpty else { return false }
+        let nasRoot = locations.nasRoot.path
+        var arrivals: [String: PendingNASArrival] = [:]
+        var consumed: [String] = []
+        for op in result.applied {
+            guard op.kind == .file,
+                  let key = EventStorageLocations.joinedPathKey(rootPath: nasRoot, relativePath: op.to) else { return false }
+            switch op.state {
+            case .renamed, .merged:
+                guard let arrival = pendingNASArrivals[key],
+                      arrival.fromKey == nil || arrival.fromKey == EventStorageLocations.joinedPathKey(rootPath: nasRoot, relativePath: op.from)
+                else { return false }
+                arrivals[arrival.assetID] = arrival
+                consumed.append(key)
+            case .absent:
+                // Nothing was on the NAS to bring over: the row already says so.
+                consumed.append(key)
+            case .failed, .pending, .cancelled:
+                continue
+            default:
+                return false
+            }
+        }
+        for key in consumed { pendingNASArrivals[key] = nil }
+        guard !arrivals.isEmpty else { return true }
+        let nasOnly = arrivals.values.compactMap(\.nasOnly)
+        if !nasOnly.isEmpty { applyNASOnlyArrivals(nasOnly) }
+        for eventID in Array(presence.keys) {
+            guard var summary = presence[eventID] else { continue }
+            var next = summary.assets
+            var changed = false
+            for index in next.indices where next[index].archive == .missing {
+                guard let arrival = arrivals[next[index].id] else { continue }
+                next[index].archive = .present
+                next[index].archiveVerifiedAt = arrival.verifiedAt
+                next[index].archiveIsLegacyLayout = false
+                changed = true
+            }
+            guard changed else { continue }
+            summary.assets = next
+            presence[eventID] = summary
+        }
+        for boardID in Array(eventAssetsByPathKey.keys) {
+            for arrival in arrivals.values {
+                guard let driveKey = arrival.driveKey,
+                      var row = eventAssetsByPathKey[boardID]?[driveKey], row.archive == .missing else { continue }
+                row.archive = .present
+                row.archiveVerifiedAt = arrival.verifiedAt
+                row.archiveIsLegacyLayout = false
+                eventAssetsByPathKey[boardID]?[driveKey] = row
+            }
+        }
+        return true
+    }
+
+    /// The NAS renames of files with no drive copy ran: their tiles point at
+    /// the new NAS path, their rows and badge entries are the new
+    /// assignment's, on every board — from strings, with no stat of the share.
+    private func applyNASOnlyArrivals(_ arrivals: [NASOnlyArrival]) {
+        var destinations: [String: String] = [:]
+        var moves: [DriveMove] = []
+        for arrival in arrivals {
+            destinations[arrival.oldKey] = arrival.newPath
+            moves.append(DriveMove(sourcePath: arrival.oldPath, destinationPath: arrival.newPath, byteCount: arrival.row.assignment.fileSize))
+            if assignmentsByPathKey[arrival.oldKey]?.eventID == arrival.row.assignment.eventID { assignmentsByPathKey[arrival.oldKey] = nil }
+        }
+        TileImageLoader.shared.retarget(moves: moves, standardized: true)
+        for boardID in Array(eventStacks.keys) {
+            guard var stacks = eventStacks[boardID] else { continue }
+            var changed = false
+            for index in stacks.indices where stacks[index].items.contains(where: { item in
+                destinations[item.primary.pathKey] != nil || item.companions.contains { destinations[$0.pathKey] != nil }
+            }) {
+                stacks[index] = stacks[index].retargetingPaths(destinations, literal: true)
+                changed = true
+            }
+            if changed { eventStacks[boardID] = stacks }
+        }
+        // Rows are grouped by the event they were moved to: each set of rows
+        // joins the boards whose family holds that event.
+        for (targetID, group) in Dictionary(grouping: arrivals, by: \.targetEventID) {
+            installPresenceRows(
+                replacing: Dictionary(group.map { ($0.oldAssetID, $0.row) }, uniquingKeysWith: { first, _ in first }),
+                oldKeys: group.map(\.oldKey),
+                newRows: group.map { ($0.newKey, $0.row) },
+                targetEventID: targetID
+            )
         }
     }
 

@@ -120,6 +120,13 @@ final class DashboardModel {
     /// bump `configurationRevision` alone, so a slider or server URL never
     /// rebuilds the assignment-derived indexes.
     var catalogStateRevision: Int = 0
+    /// Increments only when a catalog change moves what the workspace's
+    /// assignment lookups are built from: the assignments themselves, or an
+    /// event's name, date, storage policy or parent (which decide where its
+    /// files live). An event's last-used stamp, its Immich settings, or a
+    /// new event with no files leave it alone — rebuilding those lookups
+    /// walks every assignment on the main actor.
+    var assignmentIndexRevision: Int = 0
     var sourceCleanupMessage: String?
     var sourceCleanupError: String?
     var activeJob: JobSnapshot? {
@@ -1083,8 +1090,10 @@ extension DashboardModel {
                 }
                 configuration = reloaded
                 configurationRevision &+= 1
-                if CatalogOwnedState(configuration: reloaded) != ownedBefore {
+                let ownedAfter = CatalogOwnedState(configuration: reloaded)
+                if ownedAfter != ownedBefore {
                     catalogStateRevision &+= 1
+                    if Self.assignmentIndexInputsDiffer(from: ownedBefore, to: ownedAfter) { assignmentIndexRevision &+= 1 }
                 }
                 configMessage = "Config reloaded at \(Self.defaultConfigurationURL.path)."
                 notes.append("config")
@@ -1689,8 +1698,10 @@ extension DashboardModel {
         guard next != configuration else { return }
         configuration = next
         configurationRevision &+= 1
-        if CatalogOwnedState(configuration: next) != catalogBefore {
+        let catalogAfter = CatalogOwnedState(configuration: next)
+        if catalogAfter != catalogBefore {
             catalogStateRevision &+= 1
+            if Self.assignmentIndexInputsDiffer(from: catalogBefore, to: catalogAfter) { assignmentIndexRevision &+= 1 }
         }
         noteCatalogWrite()
         scheduleConfigurationSave()
@@ -1749,10 +1760,38 @@ extension DashboardModel {
         }
         configurationRevision &+= 1
         catalogStateRevision &+= 1
+        assignmentIndexRevision &+= 1
         noteCatalogWrite()
         scheduleConfigurationSave()
         scheduleCatalogSync(configuration: configuration)
         return (actuallyRemoved, actuallyAdded)
+    }
+
+    /// Whether going from `before` to `after` changes anything the
+    /// assignment lookup indexes are built from — see `assignmentIndexRevision`.
+    /// Anything it cannot rule out (an event removed or reshaped, a new one
+    /// that already has files) answers true.
+    nonisolated static func assignmentIndexInputsDiffer(from before: CatalogOwnedState, to after: CatalogOwnedState) -> Bool {
+        if before.photoEventAssignments != after.photoEventAssignments { return true }
+        var previous: [UUID: SavedCameraEvent] = [:]
+        for event in before.savedEvents { previous[event.id] = event }
+        var added: Set<UUID> = []
+        var matched = 0
+        for event in after.savedEvents {
+            guard let old = previous[event.id] else {
+                added.insert(event.id)
+                continue
+            }
+            matched += 1
+            if old.name != event.name || old.eventDate != event.eventDate
+                || old.storagePolicy != event.storagePolicy || old.parentEventID != event.parentEventID {
+                return true
+            }
+        }
+        // An event that is gone leaves its rows without an owner.
+        if matched != before.savedEvents.count { return true }
+        // A new event has no files unless orphaned rows already named it.
+        return !added.isEmpty && after.photoEventAssignments.contains { added.contains($0.eventID) }
     }
 
     /// Config JSON writes are debounced so a burst of mutations (sorting,

@@ -33,6 +33,12 @@ enum NASFollowWording {
     }
 }
 
+/// What a NAS rename job said about itself, for its `onSettled` to read.
+@MainActor
+private final class NASStatusLine {
+    var text: String?
+}
+
 /// The Sync All confirmation's counts for "Reconcile NAS after moves":
 /// answered from the catalog's records and the drive, without the NAS.
 struct NASReconcilePreview: Equatable, Sendable {
@@ -109,12 +115,22 @@ extension EventsWorkspace {
         let configuration = model.configuration
         let catalogURL = URL(fileURLWithPath: DashboardModel.expandedPath(configuration.catalogDatabasePath))
         let count = pendingNASRenameCount
+        // Right behind a move, its summary stays the status line and the
+        // NAS part is added to it, instead of replacing it.
+        let carried = lastMoveStatusLine.flatMap { $0.full == model.statusMessage ? $0.base : nil }
+        let nasLine = NASStatusLine()
         model.runBackgroundJob(
             action: .nasRename,
             runningNote: "Renaming \(count.formatted()) NAS cop\(count == 1 ? "y" : "ies") to match the drive",
             logTitle: "Renamed NAS copies to match moved files",
             logDetail: "Renamed each moved file's copy on the NAS with an exclusive server-side rename — no file was read, copied, or replaced — and moved its Sync to NAS record with it. A new path that already held the identical file kept it, and the stale copy was set aside under .Camera Toolkit/_Stale Copies on the NAS; a different file was left untouched. Every rename is journaled, so Undo of the move reverses it.",
             destinationPath: nasRoot.path,
+            onSettled: { [weak model = self.model] in
+                // The job's own row keeps its own sentence; only the status
+                // line carries the move's.
+                guard let model, let carried, let text = nasLine.text, model.statusMessage == text else { return }
+                model.statusMessage = carried + " " + text
+            },
             operation: { progress in
                 let store = try? NASSyncStore(catalogURL: catalogURL)
                 let remote = NASSyncOptions.from(configuration: configuration, nasRoot: nasRoot).remoteVerifier
@@ -128,6 +144,7 @@ extension EventsWorkspace {
                 let (result, remaining) = outcome
                 self?.nasRenamesApplied(result, remaining: remaining)
                 guard result.failed.isEmpty else { throw ToolkitError.commandFailed(result.summary) }
+                nasLine.text = result.summary
                 return result.summary
             }
         )
@@ -138,8 +155,10 @@ extension EventsWorkspace {
     func nasRenamesApplied(_ result: NASFollowResult, remaining: Int) {
         pendingNASRenameCount = remaining
         nasPresence.noteRenamed(result)
-        // Every open board's NAS place was read before the copies moved.
-        if result.changed > 0 {
+        // Every open board's NAS place was read before the copies moved. The
+        // renames of a plain move are patched into the rows they belong to;
+        // anything else re-reads the boards.
+        if result.changed > 0, !patchPresence(afterNASRenames: result) {
             for eventID in Array(eventStacks.keys) where presence[eventID] != nil {
                 Task { await refreshEvent(eventID) }
             }

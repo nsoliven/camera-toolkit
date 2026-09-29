@@ -58,100 +58,96 @@ public struct EventAssetPresence: Identifiable, Hashable, Sendable {
     public var isOnSeparateSource: Bool { !sourceIsDriveCopy && source == .present }
 }
 
+/// Every count the storage strip, the sidebar rows, the inspector and the
+/// misplaced-files notice read, taken in one pass over a summary's rows.
+/// A summary of a big family board holds ~15k rows; the views that show it
+/// re-render on every state change, so they read these numbers instead of
+/// walking the rows themselves.
+public struct EventPresenceCounts: Equatable, Sendable {
+    public var total = 0
+    public var totalBytes: Int64 = 0
+    /// Files that were not adopted from a folder already on the drive.
+    public var separateSource = 0
+    /// Of those, the ones still on the card or unsorted folder.
+    public var onSource = 0
+    public var sourceOffline = 0
+    /// On the card and already on the drive: safe to free from the card.
+    public var freeable = 0
+    public var onDrive = 0
+    public var onOtherDrive = 0
+    /// Not on the drive the policy points at, but on the other drive or a card.
+    public var needsDrive = 0
+    /// On a drive with a NAS copy that Sync to NAS verified.
+    public var removable = 0
+    public var onEitherDrive = 0
+    public var driveOffline = false
+    public var onArchive = 0
+    public var onLegacyLayout = 0
+    public var onLegacyArchiveLayout = 0
+    public var verifiedOnArchive = 0
+    public var oldestArchiveVerification: Date?
+    public var archiveOffline = false
+    public var missingEverywhere = 0
+
+    public init() {}
+
+    public init(_ assets: [EventAssetPresence]) {
+        for asset in assets {
+            total += 1
+            totalBytes += asset.assignment.fileSize
+            if !asset.sourceIsDriveCopy {
+                separateSource += 1
+                if asset.source == .present {
+                    onSource += 1
+                    if asset.drive == .present { freeable += 1 }
+                }
+                if asset.source == .unavailable { sourceOffline += 1 }
+            }
+            if asset.drive == .present { onDrive += 1 }
+            if asset.otherDrive == .present { onOtherDrive += 1 }
+            if asset.drive != .present, asset.otherDrive == .present || asset.isOnSeparateSource { needsDrive += 1 }
+            if asset.drive == .present || asset.otherDrive == .present {
+                onEitherDrive += 1
+                if asset.archiveIsTrusted { removable += 1 }
+            }
+            if asset.drive == .unavailable { driveOffline = true }
+            if (asset.drive == .present && asset.driveIsLegacyLayout) || (asset.otherDrive == .present && asset.otherDriveIsLegacyLayout) {
+                onLegacyLayout += 1
+            }
+            if asset.archive == .present {
+                onArchive += 1
+                if asset.archiveIsLegacyLayout { onLegacyArchiveLayout += 1 }
+                if let verifiedAt = asset.archiveVerifiedAt {
+                    verifiedOnArchive += 1
+                    oldestArchiveVerification = oldestArchiveVerification.map { min($0, verifiedAt) } ?? verifiedAt
+                }
+            }
+            if asset.archive == .unavailable { archiveOffline = true }
+            if asset.bestLocalPath == nil { missingEverywhere += 1 }
+        }
+    }
+}
+
 public struct EventPresenceSummary: Sendable {
     public var eventID: UUID
     public var policy: EventStoragePolicy
+    /// Setting the rows recounts them: `counts` always describes `assets`.
     public var assets: [EventAssetPresence] {
-        // Any change to the assets drops the memoized counts; the next
-        // read counts once, in one pass.
-        didSet { countsBox = CountsBox() }
+        didSet { counts = EventPresenceCounts(assets) }
     }
     public var checkedAt: Date
+    /// One pass over `assets`, kept with them — read by every render.
+    public private(set) var counts: EventPresenceCounts
 
     public init(eventID: UUID, policy: EventStoragePolicy, assets: [EventAssetPresence], checkedAt: Date) {
         self.eventID = eventID
         self.policy = policy
         self.assets = assets
         self.checkedAt = checkedAt
+        self.counts = EventPresenceCounts(assets)
     }
 
-    /// Every count the board's storage strip and inspector read. A family
-    /// board holds ~15,000 assets and each of these used to walk (and copy)
-    /// all of them on every body evaluation — so a switch to the board paid
-    /// for a dozen full passes. They are one pass now, done once per change.
-    private struct Counts: Sendable {
-        var totalBytes: Int64 = 0
-        var onSource = 0
-        var sourceOffline = 0
-        var onDrive = 0
-        var onOtherDrive = 0
-        var onArchive = 0
-        var archiveOffline = false
-        var driveOffline = false
-        var onLegacyLayout = 0
-        var missingEverywhere = 0
-        var onLegacyArchiveLayout = 0
-        var verifiedOnArchive = 0
-        var oldestArchiveVerification: Date?
-        var separateSource = 0
-        var freeableFromSource = 0
-        var needsDrive = 0
-        var removableFromDrive = 0
-        var onEitherDrive = 0
-
-        init(_ assets: [EventAssetPresence]) {
-            for asset in assets {
-                totalBytes += asset.assignment.fileSize
-                if asset.isOnSeparateSource { onSource += 1 }
-                if !asset.sourceIsDriveCopy && asset.source == .unavailable { sourceOffline += 1 }
-                if asset.drive == .present { onDrive += 1 }
-                if asset.otherDrive == .present { onOtherDrive += 1 }
-                if asset.archive == .present { onArchive += 1 }
-                if asset.archive == .unavailable { archiveOffline = true }
-                if asset.drive == .unavailable { driveOffline = true }
-                if (asset.drive == .present && asset.driveIsLegacyLayout) || (asset.otherDrive == .present && asset.otherDriveIsLegacyLayout) {
-                    onLegacyLayout += 1
-                }
-                if asset.bestLocalPath == nil { missingEverywhere += 1 }
-                if !asset.sourceIsDriveCopy { separateSource += 1 }
-                if asset.isOnSeparateSource && asset.drive == .present { freeableFromSource += 1 }
-                if asset.drive != .present && (asset.otherDrive == .present || asset.isOnSeparateSource) { needsDrive += 1 }
-                let onEither = asset.drive == .present || asset.otherDrive == .present
-                if onEither { onEitherDrive += 1 }
-                if onEither && asset.archiveIsTrusted { removableFromDrive += 1 }
-                if asset.archive == .present {
-                    if asset.archiveIsLegacyLayout { onLegacyArchiveLayout += 1 }
-                    if let verified = asset.archiveVerifiedAt {
-                        verifiedOnArchive += 1
-                        if let oldest = oldestArchiveVerification {
-                            if verified < oldest { oldestArchiveVerification = verified }
-                        } else {
-                            oldestArchiveVerification = verified
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    private final class CountsBox: @unchecked Sendable {
-        private let lock = NSLock()
-        private var counts: Counts?
-
-        func value(for assets: [EventAssetPresence]) -> Counts {
-            lock.lock()
-            defer { lock.unlock() }
-            if let counts { return counts }
-            let built = Counts(assets)
-            counts = built
-            return built
-        }
-    }
-
-    private var countsBox = CountsBox()
-    private var counts: Counts { countsBox.value(for: assets) }
-
-    public var total: Int { assets.count }
+    public var total: Int { counts.total }
     public var totalBytes: Int64 { counts.totalBytes }
     public var onSource: Int { counts.onSource }
     public var sourceOffline: Int { counts.sourceOffline }
@@ -174,11 +170,11 @@ public struct EventPresenceSummary: Sendable {
     /// already on the drive.
     public var separateSource: Int { counts.separateSource }
     /// Separate-source files that also have their drive copy — Free Up Source.
-    public var freeableFromSource: Int { counts.freeableFromSource }
+    public var freeableFromSource: Int { counts.freeable }
     /// Files not on the policy drive yet but somewhere to copy them from.
     public var needsDrive: Int { counts.needsDrive }
     /// Files on a drive whose NAS copy is verified — Take Off Drive.
-    public var removableFromDrive: Int { counts.removableFromDrive }
+    public var removableFromDrive: Int { counts.removable }
     public var onEitherDrive: Int { counts.onEitherDrive }
 }
 
