@@ -58,38 +58,112 @@ public struct EventAssetPresence: Identifiable, Hashable, Sendable {
     public var isOnSeparateSource: Bool { !sourceIsDriveCopy && source == .present }
 }
 
+/// Every count the storage strip, the sidebar rows, the inspector and the
+/// misplaced-files notice read, taken in one pass over a summary's rows.
+/// A summary of a big family board holds ~15k rows; the views that show it
+/// re-render on every state change, so they read these numbers instead of
+/// walking the rows themselves.
+public struct EventPresenceCounts: Equatable, Sendable {
+    public var total = 0
+    /// Files that were not adopted from a folder already on the drive.
+    public var separateSource = 0
+    /// Of those, the ones still on the card or unsorted folder.
+    public var onSource = 0
+    public var sourceOffline = 0
+    /// On the card and already on the drive: safe to free from the card.
+    public var freeable = 0
+    public var onDrive = 0
+    public var onOtherDrive = 0
+    /// Not on the drive the policy points at, but on the other drive or a card.
+    public var needsDrive = 0
+    /// On a drive with a NAS copy that Sync to NAS verified.
+    public var removable = 0
+    public var onEitherDrive = 0
+    public var driveOffline = false
+    public var onArchive = 0
+    public var onLegacyLayout = 0
+    public var onLegacyArchiveLayout = 0
+    public var verifiedOnArchive = 0
+    public var oldestArchiveVerification: Date?
+    public var archiveOffline = false
+    public var missingEverywhere = 0
+
+    public init() {}
+
+    public init(_ assets: [EventAssetPresence]) {
+        for asset in assets {
+            total += 1
+            if !asset.sourceIsDriveCopy {
+                separateSource += 1
+                if asset.source == .present {
+                    onSource += 1
+                    if asset.drive == .present { freeable += 1 }
+                }
+                if asset.source == .unavailable { sourceOffline += 1 }
+            }
+            if asset.drive == .present { onDrive += 1 }
+            if asset.otherDrive == .present { onOtherDrive += 1 }
+            if asset.drive != .present, asset.otherDrive == .present || asset.isOnSeparateSource { needsDrive += 1 }
+            if asset.drive == .present || asset.otherDrive == .present {
+                onEitherDrive += 1
+                if asset.archiveIsTrusted { removable += 1 }
+            }
+            if asset.drive == .unavailable { driveOffline = true }
+            if (asset.drive == .present && asset.driveIsLegacyLayout) || (asset.otherDrive == .present && asset.otherDriveIsLegacyLayout) {
+                onLegacyLayout += 1
+            }
+            if asset.archive == .present {
+                onArchive += 1
+                if asset.archiveIsLegacyLayout { onLegacyArchiveLayout += 1 }
+                if let verifiedAt = asset.archiveVerifiedAt {
+                    verifiedOnArchive += 1
+                    oldestArchiveVerification = oldestArchiveVerification.map { min($0, verifiedAt) } ?? verifiedAt
+                }
+            }
+            if asset.archive == .unavailable { archiveOffline = true }
+            if asset.bestLocalPath == nil { missingEverywhere += 1 }
+        }
+    }
+}
+
 public struct EventPresenceSummary: Sendable {
     public var eventID: UUID
     public var policy: EventStoragePolicy
-    public var assets: [EventAssetPresence]
+    /// Setting the rows recounts them: `counts` always describes `assets`.
+    public var assets: [EventAssetPresence] {
+        didSet { counts = EventPresenceCounts(assets) }
+    }
     public var checkedAt: Date
+    /// One pass over `assets`, kept with them — read by every render.
+    public private(set) var counts: EventPresenceCounts
 
     public init(eventID: UUID, policy: EventStoragePolicy, assets: [EventAssetPresence], checkedAt: Date) {
         self.eventID = eventID
         self.policy = policy
         self.assets = assets
         self.checkedAt = checkedAt
+        self.counts = EventPresenceCounts(assets)
     }
 
-    public var total: Int { assets.count }
+    public var total: Int { counts.total }
     public var totalBytes: Int64 { assets.reduce(Int64(0)) { $0 + $1.assignment.fileSize } }
-    public var onSource: Int { assets.count { $0.isOnSeparateSource } }
-    public var sourceOffline: Int { assets.count { !$0.sourceIsDriveCopy && $0.source == .unavailable } }
-    public var onDrive: Int { assets.count { $0.drive == .present } }
-    public var onOtherDrive: Int { assets.count { $0.otherDrive == .present } }
-    public var onArchive: Int { assets.count { $0.archive == .present } }
-    public var archiveOffline: Bool { assets.contains { $0.archive == .unavailable } }
-    public var driveOffline: Bool { assets.contains { $0.drive == .unavailable } }
+    public var onSource: Int { counts.onSource }
+    public var sourceOffline: Int { counts.sourceOffline }
+    public var onDrive: Int { counts.onDrive }
+    public var onOtherDrive: Int { counts.onOtherDrive }
+    public var onArchive: Int { counts.onArchive }
+    public var archiveOffline: Bool { counts.archiveOffline }
+    public var driveOffline: Bool { counts.driveOffline }
     /// Files found only in the legacy `Card Copy` layout.
-    public var onLegacyLayout: Int { assets.count { ($0.drive == .present && $0.driveIsLegacyLayout) || ($0.otherDrive == .present && $0.otherDriveIsLegacyLayout) } }
-    public var missingEverywhere: Int { assets.count { $0.bestLocalPath == nil } }
+    public var onLegacyLayout: Int { counts.onLegacyLayout }
+    public var missingEverywhere: Int { counts.missingEverywhere }
     /// NAS copies found only in the legacy archive layout.
-    public var onLegacyArchiveLayout: Int { assets.count { $0.archive == .present && $0.archiveIsLegacyLayout } }
+    public var onLegacyArchiveLayout: Int { counts.onLegacyArchiveLayout }
     /// NAS mirror copies Sync to NAS verified by re-reading them.
-    public var verifiedOnArchive: Int { assets.count { $0.archive == .present && $0.archiveVerifiedAt != nil } }
+    public var verifiedOnArchive: Int { counts.verifiedOnArchive }
     /// The oldest verification among them — "verified <date>" is only as
     /// fresh as the least recently checked file.
-    public var oldestArchiveVerification: Date? { assets.compactMap { $0.archive == .present ? $0.archiveVerifiedAt : nil }.min() }
+    public var oldestArchiveVerification: Date? { counts.oldestArchiveVerification }
 }
 
 public enum EventPresenceScanner {

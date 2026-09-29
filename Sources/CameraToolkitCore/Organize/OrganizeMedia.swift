@@ -304,21 +304,30 @@ extension OrganizeStack {
     /// bound to it follow the files instead of losing the stack
     /// mid-rename. `destinations` maps `OrganizeFile.pathKey` of the
     /// vacated path to the file's new standardized absolute path.
-    public func retargetingPaths(_ destinations: [String: String]) -> OrganizeStack {
+    ///
+    /// `literal` says the destinations are already final spellings — a clean
+    /// path under a standardized root — so no path key is derived by asking
+    /// the filesystem (`URL(fileURLWithPath:)` stats the path). A file on a
+    /// network share needs this: each stat is a round trip.
+    public func retargetingPaths(_ destinations: [String: String], literal: Bool = false) -> OrganizeStack {
         guard !destinations.isEmpty else { return self }
         var stack = self
         for itemIndex in stack.items.indices {
-            retarget(&stack.items[itemIndex].primary, destinations: destinations)
+            retarget(&stack.items[itemIndex].primary, destinations: destinations, literal: literal)
             for fileIndex in stack.items[itemIndex].companions.indices {
-                retarget(&stack.items[itemIndex].companions[fileIndex], destinations: destinations)
+                retarget(&stack.items[itemIndex].companions[fileIndex], destinations: destinations, literal: literal)
             }
         }
         return stack
     }
 
-    private func retarget(_ file: inout OrganizeFile, destinations: [String: String]) {
+    private func retarget(_ file: inout OrganizeFile, destinations: [String: String], literal: Bool) {
         guard let destination = destinations[file.pathKey] else { return }
-        file.path = destination
+        if literal {
+            file = OrganizeFile(literalPath: destination, size: file.size, modifiedAt: file.modifiedAt)
+        } else {
+            file.path = destination
+        }
     }
 }
 

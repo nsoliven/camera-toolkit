@@ -279,9 +279,12 @@ struct EventsRootView: View {
         )
     }
 
+    /// Built only while it is shown: a hidden inspector that still builds
+    /// walks the open event's storage counts on every state change — the
+    /// move freeze's 12%.
     @ViewBuilder
     private var inspector: some View {
-        if case .event(let id) = workspace.selection, let event = workspace.event(id) {
+        if showInspector, case .event(let id) = workspace.selection, let event = workspace.event(id) {
             EventInfoInspector(model: model, workspace: workspace, event: event)
         }
     }

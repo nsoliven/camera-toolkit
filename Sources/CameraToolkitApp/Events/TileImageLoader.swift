@@ -305,13 +305,16 @@ final class TileImageLoader: @unchecked Sendable {
     /// longer there, cached bitmaps move to the new path's keys, and an
     /// in-flight decode's result lands there too. Called once per move
     /// report — a path this move vacated is not a decode failure.
-    func retarget(moves: [DriveMove]) {
+    ///
+    /// `standardized` says the paths are already standardized — the paths of
+    /// files on the NAS, which must not be resolved on the main actor.
+    func retarget(moves: [DriveMove], standardized: Bool = false) {
         guard !moves.isEmpty else { return }
         lock.lock()
         defer { lock.unlock() }
         for move in moves {
-            let source = URL(fileURLWithPath: move.sourcePath).standardizedFileURL.path
-            let destination = URL(fileURLWithPath: move.destinationPath).standardizedFileURL.path
+            let source = standardized ? move.sourcePath : URL(fileURLWithPath: move.sourcePath).standardizedFileURL.path
+            let destination = standardized ? move.destinationPath : URL(fileURLWithPath: move.destinationPath).standardizedFileURL.path
             guard source != destination else { continue }
             // Chained moves collapse: anything that pointed at the path this
             // move just vacated now points where the file actually landed.

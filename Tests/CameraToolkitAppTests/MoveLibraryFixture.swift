@@ -44,6 +44,10 @@ struct MoveLibrary {
     let elsewhereID: UUID
     /// The next event to move things into — a sibling in the same family.
     var targetID: UUID { harborID }
+    /// The subevent a move leaves and the sibling it joins, by neutral names
+    /// for tests that describe the move rather than the fixture's events.
+    var sourceSubeventID: UUID { islandID }
+    var targetSubeventID: UUID { harborID }
 
     var catalogURL: URL { root.appendingPathComponent("CameraToolkit/catalog.sqlite") }
 
