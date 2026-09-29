@@ -212,6 +212,20 @@ public struct OrganizeFile: Codable, Hashable, Sendable {
         )
     }
 
+    /// The file is its path, size, and modification time. `pathKey` and
+    /// `url` are derived from `path`, so comparing them too only made
+    /// every board comparison pay for `URL ==` — the dominant cost of
+    /// checking a 15,000-file board for changes.
+    public static func == (lhs: OrganizeFile, rhs: OrganizeFile) -> Bool {
+        lhs.path == rhs.path && lhs.size == rhs.size && lhs.modifiedAt == rhs.modifiedAt
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(path)
+        hasher.combine(size)
+        hasher.combine(modifiedAt)
+    }
+
     private static func makeURL(_ path: String) -> URL {
         URL(filePath: path, directoryHint: .notDirectory)
     }

@@ -182,25 +182,28 @@ public struct OrganizedArchiveLayout: Sendable {
     /// them. Flat names: two files with one name collide here.
     public func legacyArchiveRelativePath(for sourcePath: String) throws -> String {
         try PathSafety.validateRelativePath(sourcePath)
-        let fileName = URL(fileURLWithPath: sourcePath).lastPathComponent
+        let fileName = (sourcePath as NSString).lastPathComponent
         let folder = mediaFolder(for: sourcePath).rawValue
         return [CameraLibraryFolder.originals.rawValue, year, eventFolderPath, deviceFolder, folder, fileName]
             .joined(separator: "/")
     }
 
-    public func mediaFolder(for path: String) -> OrganizedMediaFolder {
-        let ext = URL(fileURLWithPath: path).pathExtension.lowercased()
-        let sonyRAW = Set(["arw", "cr2", "cr3", "nef", "nrw", "orf", "raf", "rw2", "pef", "srw"])
-        let photos = Set(["jpg", "jpeg", "heic", "heif", "png", "tif", "tiff", "webp"])
-        let video = Set(["mp4", "mov", "m4v", "mts", "m2ts", "mxf", "avi", "insv", "lrf", "lrv", "osv"])
-        let audio = Set(["wav", "mp3", "m4a", "aac"])
+    /// The extension sets, built once: this runs per file in the presence
+    /// sweep and the assignment index (tens of thousands of times), and
+    /// rebuilding four `Set`s per call cost more than the rest of the path.
+    private static let sonyRAWExtensions: Set<String> = ["arw", "cr2", "cr3", "nef", "nrw", "orf", "raf", "rw2", "pef", "srw"]
+    private static let photoExtensions: Set<String> = ["jpg", "jpeg", "heic", "heif", "png", "tif", "tiff", "webp"]
+    private static let videoExtensions: Set<String> = ["mp4", "mov", "m4v", "mts", "m2ts", "mxf", "avi", "insv", "lrf", "lrv", "osv"]
+    private static let audioExtensions: Set<String> = ["wav", "mp3", "m4a", "aac"]
 
+    public func mediaFolder(for path: String) -> OrganizedMediaFolder {
+        let ext = (path as NSString).pathExtension.lowercased()
         if ext == "xmp" { return deviceID == "osmo-360" ? .photos : .raw }
-        if sonyRAW.contains(ext) { return deviceID == "osmo-360" ? .photos : .raw }
+        if Self.sonyRAWExtensions.contains(ext) { return deviceID == "osmo-360" ? .photos : .raw }
         if ext == "dng" { return deviceID == "osmo-360" ? .photos : .raw }
-        if photos.contains(ext) { return deviceID == "osmo-360" ? .photos : .jpeg }
-        if video.contains(ext) { return .video }
-        if audio.contains(ext) { return .audio }
+        if Self.photoExtensions.contains(ext) { return deviceID == "osmo-360" ? .photos : .jpeg }
+        if Self.videoExtensions.contains(ext) { return .video }
+        if Self.audioExtensions.contains(ext) { return .audio }
         return .support
     }
 
