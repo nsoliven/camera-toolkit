@@ -136,6 +136,46 @@ final class MainWindowLayoutTests: XCTestCase {
         }
     }
 
+    /// Toggling the inspector, resizing the window and hiding the sidebar
+    /// are layout changes — none of them may touch the selection.
+    func testInspectorResizeAndSidebarToggleKeepTheSelection() async throws {
+        try await inspectorResizeAndSidebarToggleKeepTheSelection(bufferPlugged: true)
+    }
+
+    /// The same with the Buffer unplugged: the board is drawn from the
+    /// catalog at the NAS mirror paths, and the layout changes still leave
+    /// the selection alone.
+    func testInspectorResizeAndSidebarToggleKeepTheSelectionWithTheBufferAbsent() async throws {
+        try await inspectorResizeAndSidebarToggleKeepTheSelection(bufferPlugged: false)
+    }
+
+    private func inspectorResizeAndSidebarToggleKeepTheSelection(bufferPlugged: Bool) async throws {
+        try await makeLibrary(subevents: 2)
+        if !bufferPlugged {
+            model.updateConfiguration { $0.bufferPath = "/Volumes/CTAbsent-\(UUID().uuidString.prefix(8))/Camera Buffer" }
+        }
+        let window = try await openEventBoard()
+        try await settle(window)
+        let stacks = try XCTUnwrap(workspace.eventStacks[eventID])
+        let chosen = Set(stacks.prefix(5).map(\.id))
+        XCTAssertEqual(chosen.count, 5)
+        workspace.selectStacks(Array(stacks.prefix(5).map(\.id)))
+        for inspector in [true, false] {
+            UserDefaults.standard.set(inspector, forKey: EventInfoInspector.visibilityDefaultsKey)
+            for size in Self.sizes {
+                window.setContentSize(size)
+                try await settle(window)
+                XCTAssertEqual(workspace.selectedStackIDs, chosen, "size \(size), inspector \(inspector)")
+            }
+            model.isSidebarCollapsed = true
+            try await settle(window)
+            XCTAssertEqual(workspace.selectedStackIDs, chosen, "sidebar hidden, inspector \(inspector)")
+            model.isSidebarCollapsed = false
+            try await settle(window)
+            XCTAssertEqual(workspace.selectedStackIDs, chosen, "sidebar shown, inspector \(inspector)")
+        }
+    }
+
     /// The unsorted board and the welcome screen at the minimum size.
     func testOtherScreensFitTheMinimumWindow() async throws {
         try await makeLibrary(subevents: 8)

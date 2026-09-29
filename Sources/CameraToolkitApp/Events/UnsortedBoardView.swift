@@ -347,7 +347,7 @@ struct UnsortedBoardView: View {
             badge: { _ in nil },
             orientationForFile: { workspace.displayTurns(for: $0) },
             onOpen: { stack, frame in
-                workspace.select(stackID: stack.id, orderedIDs: [], extend: false, toggle: false)
+                workspace.focus(stackID: stack.id)
                 previewFrameIndex = frame
                 previewStackID = stack.id
             },

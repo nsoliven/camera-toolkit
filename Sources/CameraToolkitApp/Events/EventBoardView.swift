@@ -65,11 +65,14 @@ struct EventBoardView: View {
             let title = workspace.eventTitle(event)
             let reachability = workspace.eventReachability[eventID]
             VStack(spacing: 0) {
-                if let reachability, reachability.isOffline || stacks?.isEmpty == true {
-                    // Terminal, not a spinner: nothing reachable holds the
-                    // event's files, and the report says which drives to
-                    // plug in.
-                    offlineState(event, reachability)
+                if workspace.eventBoardShowsPlaceholders(eventID) {
+                    // Files this event owns are on their way and a drive
+                    // that holds them is up: blank tiles, not a verdict.
+                    BoardPlaceholderGrid(
+                        title: "Loading \(event.name)…",
+                        count: workspace.assignmentCount(for: eventID),
+                        tileWidth: tileWidth
+                    )
                 } else if stacks != nil {
                     if groups.isEmpty {
                         if workspace.search.isEmpty {
@@ -161,7 +164,7 @@ struct EventBoardView: View {
             // assignment writes patch the open board in place, so a count
             // change must not tear the grid down and rebuild it.
             .task(id: "\(eventID.uuidString)-\(workspace.resolvedPolicy(for: event).rawValue)") {
-                await workspace.refreshEvent(eventID)
+                await workspace.refreshEventIfStale(eventID)
             }
             .onReceive(NotificationCenter.default.publisher(for: BrowserCommand.notification)) { notification in
                 guard let raw = notification.object as? String, let command = BrowserCommand(rawValue: raw) else { return }
@@ -199,11 +202,16 @@ struct EventBoardView: View {
     /// and keeps loading files and capture dates behind it.
     private var loadingNote: String? {
         if let queued = workspace.queuedMoveNote(for: eventID) { return queued }
-        if let reachability = workspace.eventReachability[eventID], !reachability.isOffline {
-            // Partly mounted: the board loads what is reachable and says
-            // what is not, instead of waiting on it.
-            let places = reachability.offlinePlaces
-            return "\(reachability.offlineList) \(places.count == 1 ? "isn't" : "aren't") connected — showing what's reachable."
+        // The Buffer is a buffer: it is not always plugged in, so its absence
+        // is never a notice. Only the permanent library (the NAS) or a card
+        // being away is worth a line, and never a blocking one — the grid is
+        // already up and its tiles fill in when the place answers.
+        if let reachability = workspace.eventReachability[eventID] {
+            let away = reachability.offlinePlaces.filter { $0.role == .nas || $0.role == .card }
+            if !away.isEmpty {
+                let list = away.map(\.displayName).formatted(.list(type: .and))
+                return "\(list) \(away.count == 1 ? "isn't" : "aren't") connected — photos appear as it comes back."
+            }
         }
         if let remaining = workspace.eventBuildRemainders[eventID], remaining > 0 {
             return "First photos are up — the remaining \(remaining.formatted()) files are still loading."
@@ -304,26 +312,6 @@ struct EventBoardView: View {
         .onChange(of: eventID) { _, _ in showAllPeople = false }
     }
 
-    /// The board's answer when the event's drives are unplugged (or a share
-    /// is not answering): which places are missing, what to plug in, and
-    /// a Retry. A mount notification re-checks on its own.
-    private func offlineState(_ event: SavedCameraEvent, _ reachability: EventReachabilityReport) -> some View {
-        let count = workspace.assignmentCount(for: eventID)
-        return ContentUnavailableView {
-            Label("Drives Not Connected", systemImage: "externaldrive.badge.xmark")
-        } description: {
-            Text("\(event.name) is on drives that aren't connected: \(reachability.offlineList). \(reachability.remedySentence)"
-                + (count > 0 ? " \(count.formatted()) file\(count == 1 ? "" : "s") are waiting in the catalog." : ""))
-        } actions: {
-            Button("Retry") {
-                Task { await workspace.refreshEvent(eventID) }
-            }
-            .help("Check again whether this event's drives and the NAS are connected")
-        }
-        .frame(maxHeight: .infinity)
-        .accessibilityIdentifier("eventBoardOffline")
-    }
-
     private func emptyState(_ event: SavedCameraEvent) -> some View {
         let count = workspace.assignmentCount(for: eventID)
         return ContentUnavailableView {
@@ -359,7 +347,7 @@ struct EventBoardView: View {
             badge: { workspace.badge(for: $0, in: eventID) },
             orientationForFile: { workspace.displayTurns(for: $0) },
             onOpen: { stack, frame in
-                workspace.select(stackID: stack.id, orderedIDs: [], extend: false, toggle: false)
+                workspace.focus(stackID: stack.id)
                 previewFrameIndex = frame
                 previewStackID = stack.id
             },
@@ -691,8 +679,6 @@ struct EventStorageSlots {
     let event: SavedCameraEvent
     let summary: EventPresenceSummary?
 
-    private var assets: [EventAssetPresence] { summary?.assets ?? [] }
-
     /// Re-checks connections and re-probes where this event's files are. Used
     /// on slots that are showing Offline.
     private var checkAgainButton: some View {
@@ -704,20 +690,22 @@ struct EventStorageSlots {
     }
 
     var source: StorageSlot<some View> {
-        let separate = assets.filter { !$0.sourceIsDriveCopy }
-        let onSource = separate.count { $0.source == .present }
-        let offline = separate.count { $0.source == .unavailable }
-        let freeable = separate.count { $0.source == .present && $0.drive == .present }
+        // Counts are memoized on the summary — one pass per change, not one
+        // per body evaluation of a 15,000-file board.
+        let separateCount = summary?.separateSource ?? 0
+        let onSource = summary?.onSource ?? 0
+        let offline = summary?.sourceOffline ?? 0
+        let freeable = summary?.freeableFromSource ?? 0
         let value: String
         let detail: String
         if summary == nil {
             value = "Checking…"
             detail = "Looking at the card or unsorted folder"
-        } else if separate.isEmpty {
+        } else if separateCount == 0 {
             value = "—"
-            detail = assets.isEmpty ? "No files yet" : "Already organized on the drive"
+            detail = (summary?.total ?? 0) == 0 ? "No files yet" : "Already organized on the drive"
         } else {
-            value = "\(onSource) of \(separate.count)"
+            value = "\(onSource) of \(separateCount)"
             detail = offline > 0
                 ? "\(offline) on a disconnected card or drive"
                 : (onSource == 0 ? "Nothing left on the card or unsorted folder" : "Still on the card or unsorted folder")
@@ -743,11 +731,11 @@ struct EventStorageSlots {
 
     var drive: StorageSlot<some View> {
         let policy = workspace.resolvedPolicy(for: event)
-        let total = assets.count
-        let onDrive = assets.count { $0.drive == .present }
-        let onOther = assets.count { $0.otherDrive == .present }
-        let needsDrive = assets.count { $0.drive != .present && ($0.otherDrive == .present || $0.isOnSeparateSource) }
-        let removable = assets.count { ($0.drive == .present || $0.otherDrive == .present) && $0.archiveIsTrusted }
+        let total = summary?.total ?? 0
+        let onDrive = summary?.onDrive ?? 0
+        let onOther = summary?.onOtherDrive ?? 0
+        let needsDrive = summary?.needsDrive ?? 0
+        let removable = summary?.removableFromDrive ?? 0
         let offline = summary?.driveOffline ?? false
         let detail: String
         if summary == nil {
@@ -800,7 +788,7 @@ struct EventStorageSlots {
     /// files, so say so on the board instead of only in the lock menu.
     @ViewBuilder var misplacedNotice: some View {
         let policy = workspace.resolvedPolicy(for: event)
-        let misplaced = assets.count { $0.otherDrive == .present }
+        let misplaced = summary?.onOtherDrive ?? 0
         if let summary, !summary.driveOffline, misplaced > 0 {
             HStack(spacing: 8) {
                 Image(systemName: policy == .archiveOnly ? "lock.open.fill" : "externaldrive.badge.exclamationmark")
@@ -827,12 +815,12 @@ struct EventStorageSlots {
     }
 
     var nas: StorageSlot<some View> {
-        let total = assets.count
-        let onNAS = assets.count { $0.archive == .present }
+        let total = summary?.total ?? 0
+        let onNAS = summary?.onArchive ?? 0
         let verified = summary?.verifiedOnArchive ?? 0
         let legacy = summary?.onLegacyArchiveLayout ?? 0
         let offline = summary?.archiveOffline ?? false
-        let onDrive = assets.count { $0.drive == .present || $0.otherDrive == .present }
+        let onDrive = summary?.onEitherDrive ?? 0
         // The presence index counts every file Sync to NAS would copy —
         // edits and sidecars too, which have no assignment here.
         let indexedPending = workspace.nasPendingFamilyTotals(for: event.id)?.pendingFiles ?? 0
@@ -886,7 +874,7 @@ struct EventStorageSlots {
             tint: .teal,
             value: event.sendsToImmich ? "\(present) sent" : "Off",
             detail: event.sendsToImmich ? albumText : "This event stays out of Immich",
-            state: event.sendsToImmich ? (present > 0 && present >= assets.count ? .complete : .partial) : .unknown
+            state: event.sendsToImmich ? (present > 0 && present >= (summary?.total ?? 0) ? .complete : .partial) : .unknown
         ) {
             Toggle("Send", isOn: Binding(
                 get: { event.sendsToImmich },

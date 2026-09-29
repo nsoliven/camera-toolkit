@@ -1861,6 +1861,9 @@ final class EventsWorkspaceTests: XCTestCase {
             }
             model.updateConfiguration { $0.photoEventAssignments.append(contentsOf: assignments) }
 
+            // A family this small is normally drawn whole on the first screen;
+            // this test is about the partial first screen a big one gets.
+            workspace.wholeBoardFirstScreenLimit = 0
             let firstScreen = Set(assignments.prefix(EventsWorkspace.firstScreenFileLimit).map(\.relativePath))
             let box = EventPathProbeBox()
             let gate = DispatchSemaphore(value: 0)
@@ -1947,7 +1950,9 @@ final class EventsWorkspaceTests: XCTestCase {
             try await waitUntil { box.readCalls > 0 }
             XCTAssertEqual(workspace.eventStacks[eventID]?.flatMap(\.files).count, fileCount)
             XCTAssertNil(workspace.eventBuildRemainders[eventID])
-            XCTAssertEqual(workspace.eventDateReadRemainders[eventID], fileCount - EventsWorkspace.firstScreenFileLimit)
+            // The first screen reads nothing (cache hits only), so every file's
+            // date is still owed when the dated pass starts.
+            XCTAssertEqual(workspace.eventDateReadRemainders[eventID], fileCount)
             XCTAssertFalse(box.onMainThread)
 
             gate.signal()

@@ -11,9 +11,12 @@ final class EventBoardOfflineTests: XCTestCase {
     /// The reported hang: the Buffer and the NAS are both unplugged. Before
     /// the fix pass one and the build skipped the offline drive, the empty
     /// sweep equalled the empty build, and `eventStacks` was never assigned
-    /// — the board spun on "Loading…" forever. Now the refresh reaches a
-    /// terminal offline state, naming both drives, answered from the mount
-    /// table: no place root on an unmounted volume is ever stat'ed.
+    /// — the board spun on "Loading…" forever. Now the board is the
+    /// catalog's whole grid (drawn at the NAS mirror paths, tiles blank —
+    /// the Buffer is a buffer and is not always plugged in, so nothing
+    /// offline is a blocking screen), the report names both drives as chips
+    /// and a status line, and it is answered from the mount table: no place
+    /// root on an unmounted volume is ever stat'ed.
     ///
     /// "Quickly" is proven structurally rather than by a tight stopwatch
     /// (which flaked on a busy machine): any probe of a `/Volumes` root
@@ -56,7 +59,8 @@ final class EventBoardOfflineTests: XCTestCase {
 
             let elapsed = try XCTUnwrap(clock.elapsed, "the offline report was never published")
             XCTAssertLessThan(elapsed, 5.0, "reachability → offline state must not wait on a disk or a timeout, took \(elapsed)s")
-            XCTAssertEqual(workspace.eventStacks[eventID], [])
+            XCTAssertEqual(workspace.eventStacks[eventID]?.flatMap(\.files).count, 5_000, "an offline report never empties the board")
+            XCTAssertFalse(workspace.eventBoardShowsPlaceholders(eventID))
             let report = try XCTUnwrap(workspace.eventReachability[eventID])
             XCTAssertTrue(report.isOffline)
             XCTAssertFalse(report.anyReachable)
@@ -81,9 +85,8 @@ final class EventBoardOfflineTests: XCTestCase {
         }
     }
 
-    /// The offline state lands before the four-place sweep finishes: even
-    /// with the sweep's per-file probe parked, the board is already
-    /// terminal.
+    /// The grid lands before the four-place sweep finishes: even with the
+    /// sweep's per-file probe parked, the board is already up.
     func testOfflineStatePublishesBeforeTheSweepAnswers() async throws {
         let buffer = "/Volumes/CTOfflineBuffer-\(UUID().uuidString.prefix(8))"
         let nas = "/Volumes/CTOfflineNAS-\(UUID().uuidString.prefix(8))"
@@ -100,10 +103,10 @@ final class EventBoardOfflineTests: XCTestCase {
             }
             let refresh = Task { await workspace.refreshEvent(eventID) }
             try await waitUntil(timeout: 5) { workspace.eventReachability[eventID]?.isOffline == true }
-            XCTAssertEqual(workspace.eventStacks[eventID], [])
+            XCTAssertEqual(workspace.eventStacks[eventID]?.flatMap(\.files).count, 10)
             for _ in 0..<50 { gate.signal() }
             await refresh.value
-            XCTAssertEqual(workspace.eventStacks[eventID], [])
+            XCTAssertEqual(workspace.eventStacks[eventID]?.flatMap(\.files).count, 10)
         }
     }
 
@@ -191,10 +194,11 @@ final class EventBoardOfflineTests: XCTestCase {
         }
     }
 
-    /// The direct regression: the Buffer is unplugged but the NAS answers
-    /// and holds nothing. The report is not "all offline" (the NAS is
-    /// reachable), so it is the sweep that must leave the board a terminal
-    /// empty grid — it used to leave `eventStacks` nil forever.
+    /// The Buffer is unplugged, the NAS answers and does not hold the files
+    /// (it is a stand-in for a share still being filled). Loading ends — it
+    /// used to leave `eventStacks` nil forever — and the board is the
+    /// catalog's grid, not an empty screen: a place that is away cannot say a
+    /// file is gone.
     func testUnpluggedBufferWithEmptyReachableNASStillEndsLoading() async throws {
         let buffer = "/Volumes/CTOfflineBuffer-\(UUID().uuidString.prefix(8))"
         try await withSandbox(bufferVolume: buffer, nasVolume: nil) { _, model, workspace in
@@ -203,13 +207,14 @@ final class EventBoardOfflineTests: XCTestCase {
                 configuration.photoEventAssignments += (0..<50).map { assignment($0, eventID: eventID, source: "/Volumes/CTOfflineCard/DCIM") }
             }
             await workspace.refreshEvent(eventID)
-            XCTAssertEqual(workspace.eventStacks[eventID], [])
+            XCTAssertEqual(workspace.eventStacks[eventID]?.flatMap(\.files).count, 50)
             let report = try XCTUnwrap(workspace.eventReachability[eventID])
             XCTAssertTrue(report.anyReachable)
             XCTAssertTrue(report.offlinePlaces.contains { $0.role == .buffer })
             XCTAssertNil(workspace.eventBuildRemainders[eventID])
             XCTAssertNil(workspace.eventDateReadRemainders[eventID])
             XCTAssertFalse(workspace.isCheckingFiles(for: eventID))
+            XCTAssertTrue(workspace.eventsLoading.isEmpty)
         }
     }
 
@@ -239,15 +244,19 @@ final class EventBoardOfflineTests: XCTestCase {
             workspace.captureDateReadProbe = { _ in nil }
 
             await workspace.refreshEvent(eventID)
-            XCTAssertEqual(workspace.eventStacks[eventID], [])
+            XCTAssertEqual(workspace.eventStacks[eventID]?.flatMap(\.files).count, 12, "the catalog's grid is up with the Buffer away")
             XCTAssertEqual(workspace.eventReachability[eventID]?.offlinePlaces.first?.role, .buffer)
 
             mount.insert(volume)
             workspace.refreshConnectivity(mountedVolumes: [URL(fileURLWithPath: volume, isDirectory: true)])
             try await waitUntil(timeout: 10) {
-                workspace.eventStacks[eventID]?.flatMap(\.files).count == 12
+                workspace.presence[eventID]?.onDrive == 12
+                    && workspace.eventStacks[eventID]?.flatMap(\.files).allSatisfy { $0.path.hasPrefix(volume) } == true
                     && !workspace.isCheckingFiles(for: eventID)
             }
+            // The tiles moved from the NAS mirror paths to the drive's.
+            XCTAssertEqual(workspace.eventStacks[eventID]?.flatMap(\.files).count, 12)
+            XCTAssertTrue(workspace.eventStacks[eventID]?.flatMap(\.files).allSatisfy { $0.path.hasPrefix(volume) } == true)
             XCTAssertFalse(workspace.eventReachability[eventID]?.isOffline ?? false)
             XCTAssertFalse(workspace.eventReachability[eventID]?.offlinePlaces.contains { $0.role == .buffer } ?? false)
             XCTAssertEqual(workspace.presence[eventID]?.onDrive, 12)
@@ -268,14 +277,14 @@ final class EventBoardOfflineTests: XCTestCase {
             cancelled.cancel()
             await cancelled.value
             try await waitUntil(timeout: 5) { !workspace.isCheckingFiles(for: eventID) }
-            XCTAssertEqual(workspace.eventStacks[eventID], [])
+            XCTAssertEqual(workspace.eventStacks[eventID]?.flatMap(\.files).count, 200)
 
             workspace.eventStacks[eventID] = nil
             let first = Task { await workspace.refreshEvent(eventID) }
             let second = Task { await workspace.refreshEvent(eventID) }
             await first.value
             await second.value
-            XCTAssertEqual(workspace.eventStacks[eventID], [])
+            XCTAssertEqual(workspace.eventStacks[eventID]?.flatMap(\.files).count, 200)
             XCTAssertNil(workspace.eventBuildRemainders[eventID])
             XCTAssertNil(workspace.eventDateReadRemainders[eventID])
             XCTAssertFalse(workspace.isCheckingFiles(for: eventID))

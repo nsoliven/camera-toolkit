@@ -272,7 +272,8 @@ public struct OrganizeItem: Identifiable, Hashable, Sendable {
     }
 
     public var files: [OrganizeFile] { [primary] + companions }
-    public var byteCount: Int64 { files.reduce(Int64(0)) { $0 + $1.size } }
+    /// No temporary array: a board header sums this over thousands of items.
+    public var byteCount: Int64 { companions.reduce(primary.size) { $0 + $1.size } }
 }
 
 public struct OrganizeStack: Identifiable, Hashable, Sendable {
@@ -291,7 +292,15 @@ public struct OrganizeStack: Identifiable, Hashable, Sendable {
     public var burstLabel: String? {
         items.first?.burstPrefix.map { String($0.dropLast()) }
     }
-    public var files: [OrganizeFile] { items.flatMap(\.files) }
+    public var files: [OrganizeFile] {
+        var all: [OrganizeFile] = []
+        all.reserveCapacity(fileCount)
+        for item in items {
+            all.append(item.primary)
+            all.append(contentsOf: item.companions)
+        }
+        return all
+    }
     public var fileCount: Int { items.reduce(0) { $0 + 1 + $1.companions.count } }
     public var byteCount: Int64 { items.reduce(Int64(0)) { $0 + $1.byteCount } }
     public var kind: OrganizeMediaKind { items.first?.kind ?? .other }
