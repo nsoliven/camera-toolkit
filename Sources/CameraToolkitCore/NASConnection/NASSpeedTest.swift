@@ -146,7 +146,7 @@ public struct NASSpeedTester: Sendable {
     private func timeWrite(to path: String, body: (Int32) throws -> Void) throws -> Double {
         let start = DispatchTime.now().uptimeNanoseconds
         // O_EXCL: a name collision fails instead of touching another file.
-        let fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0o600)
+        let fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0o600)
         guard fd >= 0 else { throw Self.posixError("create", path) }
         do {
             try body(fd)
@@ -160,7 +160,7 @@ public struct NASSpeedTester: Sendable {
 
     private func timeRead(from path: String, expected: Int64) throws -> Double {
         let start = DispatchTime.now().uptimeNanoseconds
-        let fd = open(path, O_RDONLY)
+        let fd = open(path, O_RDONLY | O_CLOEXEC)
         guard fd >= 0 else { throw Self.posixError("open", path) }
         defer { close(fd) }
         // Bypass the client's cache so the bytes come back over the wire.

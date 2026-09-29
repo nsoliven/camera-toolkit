@@ -475,6 +475,11 @@ public enum NASRemoteShell {
         process.standardOutput = out
         process.standardError = err
         try process.run()
+        // The read ends are closed when this returns (see `NASRemoteVerifier.run`).
+        defer {
+            try? out.fileHandleForReading.close()
+            try? err.fileHandleForReading.close()
+        }
         let errBox = ErrorOutput()
         let errDone = DispatchSemaphore(value: 0)
         DispatchQueue.global(qos: .utility).async {

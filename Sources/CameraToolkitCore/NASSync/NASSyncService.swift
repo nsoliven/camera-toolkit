@@ -23,11 +23,35 @@ public struct NASSyncReport: Codable, Equatable, Sendable {
     /// also in `failed`; listed apart because on a pool that has shown
     /// corruption this must never be read past.
     public var hashMismatches: [NASSyncIssue] = []
+    /// Files whose first copy hit a transient SMB failure (a descriptor the
+    /// share invalidated, a reset connection) and were copied again from a
+    /// fresh open after a short delay. A file that then verified is in
+    /// `copied`; one that failed again is also in `failed`.
+    public var retried: [NASSyncIssue] = []
     /// How the run was configured and where its time went.
     public var timings = NASSyncTimings()
 
     public var verifiedCount: Int { copied.count + matchedExisting.count + alreadyVerified.count }
     public var succeeded: Bool { conflicts.isEmpty && failed.isEmpty && notAttempted == 0 && stoppedReason == nil }
+}
+
+extension NASSyncReport {
+    /// Reports written before `retried` existed still decode.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        copied = try container.decodeIfPresent([String].self, forKey: .copied) ?? []
+        matchedExisting = try container.decodeIfPresent([String].self, forKey: .matchedExisting) ?? []
+        alreadyVerified = try container.decodeIfPresent([String].self, forKey: .alreadyVerified) ?? []
+        conflicts = try container.decodeIfPresent([NASSyncIssue].self, forKey: .conflicts) ?? []
+        failed = try container.decodeIfPresent([NASSyncIssue].self, forKey: .failed) ?? []
+        notAttempted = try container.decodeIfPresent(Int.self, forKey: .notAttempted) ?? 0
+        stoppedReason = try container.decodeIfPresent(String.self, forKey: .stoppedReason)
+        bytesCopied = try container.decodeIfPresent(Int64.self, forKey: .bytesCopied) ?? 0
+        foldersCreated = try container.decodeIfPresent(Int.self, forKey: .foldersCreated) ?? 0
+        hashMismatches = try container.decodeIfPresent([NASSyncIssue].self, forKey: .hashMismatches) ?? []
+        retried = try container.decodeIfPresent([NASSyncIssue].self, forKey: .retried) ?? []
+        timings = try container.decodeIfPresent(NASSyncTimings.self, forKey: .timings) ?? NASSyncTimings()
+    }
 }
 
 /// Where a sync's time went. Phase seconds are summed over the parallel
@@ -56,6 +80,9 @@ public struct NASSyncTimings: Codable, Equatable, Hashable, Sendable {
     public var remoteFallbacks: Int = 0
     /// Why NAS-side hashing fell back, the first time it did.
     public var remoteFallbackReason: String?
+    /// Files copied a second time after a transient SMB failure (nil: none;
+    /// optional so history rows written before it existed still decode).
+    public var transientRetries: Int?
 
     public init() {}
 
@@ -86,14 +113,19 @@ public struct NASSyncOptions: Sendable {
     public var remoteBatchFiles: Int
     /// … or this many bytes, whichever comes first.
     public var remoteBatchBytes: Int64
+    /// How long a file waits before its one retry after a transient SMB
+    /// failure (see `NASFileIO.TransientIOError`).
+    public var retryDelay: TimeInterval
 
     public init(
         parallelTransfers: Int = NASSyncOptions.defaultParallelTransfers,
         copy: NASFileIO.CopyOptions = .fast,
         remoteVerifier: NASRemoteVerifier? = nil,
         remoteBatchFiles: Int = 32,
-        remoteBatchBytes: Int64 = 512 * 1024 * 1024
+        remoteBatchBytes: Int64 = 512 * 1024 * 1024,
+        retryDelay: TimeInterval = 3
     ) {
+        self.retryDelay = max(0, retryDelay)
         self.parallelTransfers = Self.clamp(parallelTransfers)
         self.copy = copy
         self.remoteVerifier = remoteVerifier
@@ -895,33 +927,51 @@ final class NASSyncRun: @unchecked Sendable {
         release(slot, outcome: outcome(of: item))
     }
 
-    private func copy(_ job: Job, temporary: String, slot: Int) {
+    private func copy(_ job: Job, temporary firstTemporary: String, slot: Int) {
         let item = job.item
         var done: Int64 = 0
         do {
             show(slot, job, step: "Copying to NAS", phase: "Copying", timing: "Copy")
-            let result: NASFileIO.CopyResult
-            do {
-                result = try NASFileIO.copyNew(
-                    from: item.sourcePath,
-                    to: temporary,
-                    expectedByteCount: item.byteCount,
-                    options: options.copy,
-                    clock: clock,
-                    progress: {
-                        self.addWork($0, "Copy", slot: slot)
-                        done += Int64($0)
-                        self.emit("Copying to NAS", force: false)
-                    },
-                    // Only the legacy engine flushes; the fast one never calls this.
-                    willFlush: {
-                        self.show(slot, job, step: "Flushing to NAS", phase: "Flushing", done: item.byteCount, timing: "Flush")
+            var temporary = firstTemporary
+            var retried = false
+            var copied: NASFileIO.CopyResult?
+            while copied == nil {
+                do {
+                    copied = try NASFileIO.copyNew(
+                        from: item.sourcePath,
+                        to: temporary,
+                        expectedByteCount: item.byteCount,
+                        options: options.copy,
+                        clock: clock,
+                        progress: {
+                            self.addWork($0, "Copy", slot: slot)
+                            done += Int64($0)
+                            self.emit("Copying to NAS", force: false)
+                        },
+                        // Only the legacy engine flushes; the fast one never calls this.
+                        willFlush: {
+                            self.show(slot, job, step: "Flushing to NAS", phase: "Flushing", done: item.byteCount, timing: "Flush")
+                        }
+                    )
+                } catch {
+                    // By path, never through a descriptor: this sync's own
+                    // partial file is never presented as complete.
+                    unlink(temporary)
+                    guard !retried, let transient = error as? NASFileIO.TransientIOError, canRetryCopy() else {
+                        if retried {
+                            throw ToolkitError.commandFailed("\(error.localizedDescription) The copy had already been retried once.")
+                        }
+                        throw error
                     }
-                )
-            } catch {
-                unlink(temporary)
-                throw error
+                    retried = true
+                    noteRetry(item, transient, redoing: done)
+                    done = 0
+                    Thread.sleep(forTimeInterval: options.retryDelay)
+                    temporary = Self.freshTemporary(replacing: temporary)
+                    show(slot, job, step: "Copying to NAS again", phase: "Copying", timing: "Copy")
+                }
             }
+            guard let result = copied else { throw ToolkitError.commandFailed("The copy did not finish.") }
             addTiming {
                 $0.copySeconds += result.copySeconds
                 $0.flushSeconds += result.flushSeconds
@@ -947,6 +997,32 @@ final class NASSyncRun: @unchecked Sendable {
             failed(job, error, work: 2 * item.byteCount - done)
             release(slot, outcome: "Failed")
         }
+    }
+
+    /// A retry only makes sense while the share is still mounted and the
+    /// job has not been stopped; otherwise the failure stands.
+    private func canRetryCopy() -> Bool {
+        !isStopped && !nasIsGone(root)
+    }
+
+    /// Records a retry in the report and the timings. The bytes the failed
+    /// attempt already counted are added to the total work, so progress
+    /// never runs past 100 % while they are copied again.
+    private func noteRetry(_ item: NASSyncItem, _ error: NASFileIO.TransientIOError, redoing bytes: Int64) {
+        lock.withLock {
+            report.retried.append(NASSyncIssue(
+                path: item.relativePath,
+                reason: "\(error.localizedDescription) The temporary was removed and the file was copied again from a fresh open after \(Int(options.retryDelay.rounded())) s."
+            ))
+            report.timings.transientRetries = (report.timings.transientRetries ?? 0) + 1
+            totalWork += bytes
+        }
+    }
+
+    /// A new `.<name>.ctsync-<id>` next to the one that failed, so the retry
+    /// never meets a leftover of the first attempt.
+    static func freshTemporary(replacing temporary: String) -> String {
+        String(temporary.dropLast(8)) + UUID().uuidString.prefix(8)
     }
 
     /// Re-reads the temporary over SMB (uncached) and renames it in on a match.

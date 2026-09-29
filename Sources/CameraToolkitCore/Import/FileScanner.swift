@@ -97,7 +97,7 @@ enum StreamingFileIO {
     private static func openDescriptor(_ url: URL, flags: Int32) throws -> Int32 {
         let descriptor = url.withUnsafeFileSystemRepresentation { path -> Int32 in
             guard let path else { return -1 }
-            return Darwin.open(path, flags)
+            return Darwin.open(path, flags | O_CLOEXEC)
         }
         guard descriptor >= 0 else {
             throw posixError(operation: "open", url: url)

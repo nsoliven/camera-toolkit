@@ -170,7 +170,8 @@ final class NASConnectionModel {
     /// is safe, then start the job. Starts it right away when there is
     /// nothing to fix, and after at most `timeout` either way.
     func prepareForNASJob(timeout: Duration = .seconds(45), then start: @escaping @MainActor () -> Void) {
-        guard let controller, status.isOnSlowWiFi else {
+        // Also while a reconnect or speed test runs: the job waits for it.
+        guard let controller, status.isOnSlowWiFi || status.phase == .reconnecting || status.isTestingSpeed else {
             start()
             return
         }

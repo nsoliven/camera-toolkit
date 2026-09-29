@@ -85,6 +85,61 @@ final class NASConnectionControllerTests: XCTestCase {
         XCTAssertEqual(tester.runs, 0, "no speed test while a NAS job runs")
     }
 
+    /// The job starts while the guard's checks are hopping between actors:
+    /// the last look, right before the unmount, sees it and backs off.
+    func testAJobThatStartsJustBeforeTheUnmountStopsTheReconnect() async {
+        let network = FakeNetwork(mounted: true, sessionOnWiFi: true)
+        let mounter = FakeMounter(network: network)
+        let reads = Flag()
+        let count = SyncLocked(0)
+        let controller = NASConnectionController(
+            inspector: NASConnectionInspector(probe: network),
+            mounter: mounter,
+            speedTester: FakeSpeedTester(),
+            limiter: NASReconnectRateLimiter(minimumInterval: 0, maximumFailures: 2),
+            isNASInUse: {
+                // Idle for the guard's own reads, busy from the reconnect's
+                // first look on (launch: guard, then reconnect's two checks).
+                let n = count.mutateReturning { $0 += 1; return $0 }
+                reads.value = n >= 3
+                return n >= 3
+            },
+            onChange: { _ in }
+        )
+        await controller.start(settings: settings)
+        XCTAssertTrue(reads.value, "the reconnect did look again")
+        XCTAssertEqual(mounter.calls, [], "the share was never unmounted under a job")
+        let banner = await controller.status.banner
+        XCTAssertEqual(banner, .nasInUse)
+    }
+
+    /// A job that would start while a speed test owns the share waits for it.
+    func testPrepareForNASJobWaitsForARunningSpeedTest() async throws {
+        let network = FakeNetwork(mounted: true, sessionOnWiFi: false)
+        let tester = BlockingSpeedTester()
+        let controller = NASConnectionController(
+            inspector: NASConnectionInspector(probe: network),
+            mounter: FakeMounter(network: network),
+            speedTester: tester,
+            isNASInUse: { false },
+            onChange: { _ in }
+        )
+        let settings = self.settings
+        let started = Task { await controller.start(settings: settings) }
+        await Task.detached { tester.waitUntilEntered() }.value
+        let prepared = Flag()
+        let preparing = Task {
+            await controller.prepareForNASJob()
+            prepared.value = true
+        }
+        try await Task.sleep(for: .milliseconds(700))
+        XCTAssertFalse(prepared.value, "the job must not start while the speed test runs")
+        tester.release.signal()
+        await started.value
+        await preparing.value
+        XCTAssertTrue(prepared.value)
+    }
+
     func testWiredSessionDoesNothing() async {
         let network = FakeNetwork(mounted: true, sessionOnWiFi: false)
         let mounter = FakeMounter(network: network)
@@ -391,6 +446,22 @@ final class FakeMounter: NASVolumeMounting, @unchecked Sendable {
         if unmountFails { throw CocoaError(.fileWriteNoPermission) }
         network.mounted = false
     }
+}
+
+/// A speed test that holds the share until the test lets it go.
+final class BlockingSpeedTester: NASSpeedTesting, @unchecked Sendable {
+    let entered = DispatchSemaphore(value: 0)
+    let release = DispatchSemaphore(value: 0)
+
+    func run(root: URL) throws -> NASSpeedTestResult {
+        entered.signal()
+        release.wait()
+        return NASSpeedTestResult(bytes: 75_000_000, writeSeconds: 1, readSeconds: 0.8, smallWriteSeconds: 0.004, smallReadSeconds: 0.002, finishedAt: Date())
+    }
+
+    func waitUntilEntered() { entered.wait() }
+
+    func removeStaleTestFiles(in root: URL) -> [String] { [] }
 }
 
 final class FakeSpeedTester: NASSpeedTesting, @unchecked Sendable {

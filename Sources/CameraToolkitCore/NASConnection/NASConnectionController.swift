@@ -163,6 +163,9 @@ public struct NASConnectionStatus: Sendable, Equatable {
 /// app observes `onChange`.
 public actor NASConnectionController {
     public static let onDemandSpeedTestInterval: TimeInterval = 30 * 60
+    /// How long `prepareForNASJob` waits for a reconnect or speed test that
+    /// is already running.
+    static let busyWait: Duration = .seconds(40)
 
     private let inspector: NASConnectionInspector
     private let mounter: any NASVolumeMounting
@@ -258,6 +261,14 @@ public actor NASConnectionController {
     /// Before a NAS job: move a Wi-Fi session to Ethernet first when that
     /// is safe. Returns once the share is as good as it will get.
     public func prepareForNASJob() async {
+        // A reconnect or speed test in flight owns the share: a job that
+        // started now would open files on a mount being unmounted, or race
+        // the test's own writes. Wait for it (at most `busyWait`).
+        var waited: Duration = .zero
+        while isBusy, waited < Self.busyWait {
+            try? await Task.sleep(for: .milliseconds(250))
+            waited += .milliseconds(250)
+        }
         guard !isBusy else { return }
         await inspectNow()
         guard !isBusy else { return }
@@ -426,11 +437,20 @@ public actor NASConnectionController {
         }
         guard !isBusy else { return false }
         isBusy = true
+        defer { isBusy = false }
+        // Look again now that the share is claimed and right before it is
+        // touched: a job may have started while the checks above hopped
+        // between actors, and an unmount between two of its files would
+        // succeed and pull the share from under it.
+        guard !(await isNASInUse()) else {
+            status.banner = .nasInUse
+            publish()
+            return false
+        }
         limiter.recordAttempt(at: now(), userRequested: userRequested)
         status.phase = .reconnecting
         status.message = nil
         publish()
-        defer { isBusy = false }
 
         do {
             try await mounter.unmount(mountPoint: mountPoint)

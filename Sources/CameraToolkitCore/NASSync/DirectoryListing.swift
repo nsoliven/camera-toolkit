@@ -41,7 +41,7 @@ public enum DirectoryListing {
 
     public static func list(_ path: String) throws -> [DirectoryListingEntry] {
         if let override { return try override(path) }
-        let descriptor = open(path, O_RDONLY | O_DIRECTORY)
+        let descriptor = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
         guard descriptor >= 0 else { throw posix(errno, "list", path) }
         defer { close(descriptor) }
         do {

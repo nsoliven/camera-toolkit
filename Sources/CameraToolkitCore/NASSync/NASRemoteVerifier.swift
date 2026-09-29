@@ -138,10 +138,11 @@ public struct NASRemoteVerifier: Sendable {
 
     /// Runs a process to completion, reading both pipes concurrently so a
     /// large output never deadlocks, and killing it after `timeout`.
-    static func run(executable: String, arguments: [String], timeout: TimeInterval) throws -> CommandResult {
+    static func run(executable: String, arguments: [String], environment: [String: String]? = nil, timeout: TimeInterval) throws -> CommandResult {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
+        if let environment { process.environment = environment }
         process.standardInput = FileHandle.nullDevice
         let out = Pipe()
         let err = Pipe()
@@ -159,6 +160,14 @@ public struct NASRemoteVerifier: Sendable {
         DispatchQueue.global().async {
             collected.setErr(err.fileHandleForReading.readDataToEndOfFile())
             group.leave()
+        }
+        // The read ends are closed here, once both readers are done — not
+        // whenever an autorelease pool that holds the Pipe next drains, which
+        // on a thread that never drains one leaves two descriptors open per
+        // process for good.
+        defer {
+            try? out.fileHandleForReading.close()
+            try? err.fileHandleForReading.close()
         }
         if group.wait(timeout: .now() + timeout) == .timedOut {
             process.terminate()

@@ -16,6 +16,76 @@ public enum NASFileIO {
     /// returning a hash replaces the real one.
     nonisolated(unsafe) static var verificationHashOverride: ((String) -> String?)?
 
+    /// Test seam: what `copyNew` calls to close its output. Nil calls
+    /// `Darwin.close`. A test uses it to make a close fail the way smbfs
+    /// does — the descriptor is gone and `errno` says why.
+    nonisolated(unsafe) static var closePrimitive: ((Int32) -> Int32)?
+
+    /// A failure a dropped or re-established SMB session can cause and a
+    /// fresh attempt does not repeat: `EBADF`, `ENOTCONN`, `EIO`, `ESTALE`,
+    /// `ETIMEDOUT`, `ECONNRESET` while writing, flushing or closing the
+    /// destination — or a descriptor that stopped being the one this copy
+    /// opened. The temporary is removed by path and the file tried once
+    /// more from a fresh open; the retry is verified like any other copy.
+    public struct TransientIOError: LocalizedError, Equatable, Sendable {
+        public var operation: String
+        public var path: String
+        public var code: Int32
+        public var detail: String?
+
+        public var errorDescription: String? {
+            let base = "Could not \(operation) \(path): \(String(cString: strerror(code)))"
+            return detail.map { "\(base) (\($0))" } ?? base
+        }
+    }
+
+    public static func isTransient(_ code: Int32) -> Bool {
+        [EBADF, ENOTCONN, EIO, ESTALE, ETIMEDOUT, ECONNRESET].contains(code)
+    }
+
+    /// The error for a failed operation on the destination: transient when
+    /// the SMB session may have caused it, else a plain failure.
+    static func failure(_ code: Int32, _ operation: String, _ path: String) -> Error {
+        isTransient(code)
+            ? TransientIOError(operation: operation, path: path, code: code)
+            : DirectoryListing.posix(code, operation, path)
+    }
+
+    /// The path the kernel reports for an open descriptor (`F_GETPATH`);
+    /// nil when the descriptor is not open or the filesystem cannot say.
+    static func path(of descriptor: Int32) -> String? {
+        var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+        guard fcntl(descriptor, F_GETPATH, &buffer) == 0 else { return nil }
+        return String(cString: buffer)
+    }
+
+    /// Whether a descriptor a copy opened still is that file: compared with
+    /// the path the kernel gave right after the open, so symlinks and
+    /// `/private` aliases never matter.
+    struct DescriptorOwnership {
+        let descriptor: Int32
+        let expectedPath: String?
+        let label: String
+
+        init(_ descriptor: Int32, label: String) {
+            self.descriptor = descriptor
+            self.expectedPath = NASFileIO.path(of: descriptor)
+            self.label = label
+        }
+
+        /// Nil while the descriptor is still ours (or the filesystem cannot
+        /// say, so nothing is claimed); else why it is not.
+        func loss() -> String? {
+            guard let expectedPath else { return nil }
+            let now = NASFileIO.path(of: descriptor)
+            if now == expectedPath { return nil }
+            if now == nil {
+                return errno == EBADF ? "descriptor \(descriptor) (\(label)) is not open" : nil
+            }
+            return "descriptor \(descriptor) (\(label)) now names another file"
+        }
+    }
+
     static func open(_ path: String, _ flags: Int32, _ mode: mode_t = 0) throws -> Int32 {
         let descriptor = Darwin.open(path, flags | O_CLOEXEC, mode)
         guard descriptor >= 0 else { throw DirectoryListing.posix(errno, "open", path) }
@@ -125,14 +195,34 @@ public enum NASFileIO {
         let observer = copyCallObserver
         let started = clock()
         let input = try open(source, O_RDONLY)
-        defer { Darwin.close(input) }
+        // A descriptor that stopped being ours is never closed: closing its
+        // number would close somebody else's file.
+        var ownsInput = true
+        defer { if ownsInput { Darwin.close(input) } }
+        let inputOwnership = DescriptorOwnership(input, label: "drive copy")
         if options.uncachedSourceRead {
             observer?("F_NOCACHE source")
             _ = fcntl(input, F_NOCACHE, 1)
         }
         let output = try open(destination, O_WRONLY | O_CREAT | O_EXCL, 0o644)
-        var closed = false
-        defer { if !closed { Darwin.close(output) } }
+        var ownsOutput = true
+        defer { if ownsOutput { Darwin.close(output) } }
+        let outputOwnership = DescriptorOwnership(output, label: "NAS temporary")
+        /// Throws, touching neither descriptor, when one of them is no
+        /// longer the file this copy opened. Checked before every chunk, so
+        /// a descriptor lost mid-copy stops the writes at the next chunk.
+        func requireOwnership() throws {
+            if let lost = inputOwnership.loss() {
+                ownsInput = false
+                observer?("descriptor lost: \(lost)")
+                throw TransientIOError(operation: "read", path: source, code: EBADF, detail: lost)
+            }
+            if let lost = outputOwnership.loss() {
+                ownsOutput = false
+                observer?("descriptor lost: \(lost)")
+                throw TransientIOError(operation: "write", path: destination, code: EBADF, detail: lost)
+            }
+        }
         if options.uncachedWrite {
             observer?("F_NOCACHE destination")
             _ = fcntl(output, F_NOCACHE, 1)
@@ -142,6 +232,7 @@ public enum NASFileIO {
         let buffer = UnsafeMutableRawPointer.allocate(byteCount: chunkSize, alignment: 16)
         defer { buffer.deallocate() }
         while true {
+            try requireOwnership()
             let count = Darwin.read(input, buffer, chunkSize)
             if count < 0 {
                 if errno == EINTR { continue }
@@ -153,8 +244,9 @@ public enum NASFileIO {
             while written < count {
                 let result = Darwin.write(output, buffer.advanced(by: written), count - written)
                 if result < 0 {
-                    if errno == EINTR { continue }
-                    throw DirectoryListing.posix(errno, "write", destination)
+                    let code = errno
+                    if code == EINTR { continue }
+                    throw failure(code, "write", destination)
                 }
                 written += result
             }
@@ -166,6 +258,7 @@ public enum NASFileIO {
                 "Copy stopped early for \((source as NSString).lastPathComponent): \(total) of \(expectedByteCount) bytes. The drive may have disconnected."
             )
         }
+        try requireOwnership()
         let copied = clock()
         var flushed = copied
         if options.flushEachFile {
@@ -175,12 +268,15 @@ public enum NASFileIO {
             observer?("F_FULLFSYNC")
             _ = fcntl(output, F_FULLFSYNC)
             observer?("fsync")
-            guard Darwin.fsync(output) == 0 else { throw DirectoryListing.posix(errno, "flush", destination) }
+            guard Darwin.fsync(output) == 0 else { throw failure(errno, "flush", destination) }
             flushed = clock()
         }
-        closed = true
-        // close() still reports a failed write-behind on smbfs.
-        guard Darwin.close(output) == 0 else { throw DirectoryListing.posix(errno, "close", destination) }
+        try requireOwnership()
+        // close() still reports a failed write-behind on smbfs. The
+        // descriptor is gone whatever it answers, so it is never closed twice.
+        ownsOutput = false
+        let closeResult = closePrimitive?(output) ?? Darwin.close(output)
+        guard closeResult == 0 else { throw failure(errno, "close", destination) }
         let end = clock()
         return CopyResult(
             sha256: hex(hasher.finalize()),

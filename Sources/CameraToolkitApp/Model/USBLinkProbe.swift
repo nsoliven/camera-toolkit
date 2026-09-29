@@ -44,6 +44,7 @@ enum USBLinkProbe {
 
             do {
                 try process.run()
+                defer { try? output.fileHandleForReading.close() }
                 let data = output.fileHandleForReading.readDataToEndOfFile()
                 process.waitUntilExit()
                 guard process.terminationStatus == 0 else { return [] }

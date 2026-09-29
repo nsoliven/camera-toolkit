@@ -124,6 +124,7 @@ enum ShellCommand {
         process.standardError = FileHandle.nullDevice
         do {
             try process.run()
+            defer { try? pipe.fileHandleForReading.close() }
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
             process.waitUntilExit()
             guard process.terminationStatus == 0 else { return nil }
