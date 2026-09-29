@@ -143,7 +143,11 @@ public enum ApplyCollisionCheck {
     /// `DSC0001.ARW`, `DSC0001.XMP` and `DSC0001.ARW.xmp` share one key.
     public static func groupKey(_ path: String) -> String {
         let folder = (path as NSString).deletingLastPathComponent.lowercased()
-        return folder + "\u{0}" + KeepBothNaming.split((path as NSString).lastPathComponent).base.lowercased()
+        let name = (path as NSString).lastPathComponent
+        // A Sony clip sidecar (`C0167M01.XML`) belongs to its clip
+        // (`C0167.MP4`): one group, so they are renamed together.
+        let base = KeepBothNaming.sonySidecar(name)?.clip ?? KeepBothNaming.split(name).base
+        return folder + "\u{0}" + base.lowercased()
     }
 }
 
@@ -157,8 +161,26 @@ public enum KeepBothNaming {
     }
 
     public static func suffixed(_ name: String, _ number: Int) -> String {
+        // The number goes on the clip's name, before the `M01`, so the
+        // sidecar still pairs with the renamed clip: `C0167 (2)M01.XML`.
+        if let sidecar = sonySidecar(name) {
+            return "\(sidecar.clip) (\(number))\(sidecar.marker)\(sidecar.rest)"
+        }
         let parts = split(name)
         return "\(parts.base) (\(number))\(parts.rest)"
+    }
+
+    /// `C0167M01.XML` → clip `C0167`, marker `M01`, rest `.XML`; nil for
+    /// anything that is not a companion file named like a Sony clip sidecar.
+    static func sonySidecar(_ name: String) -> (clip: String, marker: String, rest: String)? {
+        let parts = split(name)
+        // `rest` is ".XML" — a leading dot alone reads as a hidden name.
+        let ext = (("x" + parts.rest) as NSString).pathExtension.lowercased()
+        guard OrganizeFileClassifier.companionExtensions.contains(ext),
+              parts.base.count > 4 else { return nil }
+        let marker = parts.base.suffix(3)
+        guard marker.first == "M" || marker.first == "m", marker.dropFirst().allSatisfy(\.isNumber) else { return nil }
+        return (String(parts.base.dropLast(3)), String(marker), parts.rest)
     }
 
     /// Picks the lowest number ≥ 2 that is free for every member of each
@@ -248,6 +270,7 @@ extension DriveMoveService {
         }
         var removed: [PhotoEventAssignment] = []
         var added: [PhotoEventAssignment] = []
+        var pairSources: [String?] = []
         var assignmentBySource: [String: (old: PhotoEventAssignment, new: PhotoEventAssignment)] = [:]
         for (conflict, move) in zip(conflicts, renamed) {
             guard let old = conflict.assignment else { continue }
@@ -257,6 +280,7 @@ extension DriveMoveService {
             new.relativePath = folder.isEmpty ? newName : (folder as NSString).appendingPathComponent(newName)
             removed.append(old)
             added.append(new)
+            pairSources.append(move.sourcePath)
             assignmentBySource[URL(fileURLWithPath: move.sourcePath).standardizedFileURL.path] = (old, new)
         }
         let report = try apply(
@@ -265,6 +289,7 @@ extension DriveMoveService {
             journalFolder: journalFolder,
             removedAssignments: removed,
             addedAssignments: added,
+            assignmentMoveSources: pairSources,
             pruneBoundaries: pruneBoundaries,
             progress: progress
         )

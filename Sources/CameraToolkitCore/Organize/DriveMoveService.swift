@@ -36,9 +36,44 @@ public struct DriveMoveJournal: Codable, Sendable {
     /// Configuration assignments this action added.
     public var addedAssignments: [PhotoEventAssignment]
     public var undoneAt: Date?
+    /// For each catalog entry the action changed — `removedAssignments[i]`
+    /// and `addedAssignments[i]` — the index in `moves` of the rename that
+    /// carries its file: nil when only the catalog entry moved, `-1` when its
+    /// rename was planned but refused. Undo swaps back only the entries whose
+    /// file really went back. Nil in journals written before this existed.
+    public var assignmentMoveIndices: [Int?]?
 
     public var completedMoves: [DriveMove] {
         completedIndices.compactMap { moves.indices.contains($0) ? moves[$0] : nil }
+    }
+
+    /// The catalog entries Undo should swap back after reversing the moves at
+    /// `reversed`: those whose file went back and those that only ever moved
+    /// in the catalog. A journal without per-entry indices swaps everything
+    /// only when every move went back. `removed` are entries to put back,
+    /// `added` are entries to take out. `isCurrent` says whether an entry the
+    /// action added is still in the catalog: when a later change moved that
+    /// file on again, its old entry is not put back — the file would be
+    /// assigned twice.
+    public func assignmentsToRestore(
+        reversed: [Int],
+        fullyUndone: Bool,
+        isCurrent: (PhotoEventAssignment) -> Bool = { _ in true }
+    ) -> (removed: [PhotoEventAssignment], added: [PhotoEventAssignment]) {
+        guard let indices = assignmentMoveIndices else {
+            guard fullyUndone else { return ([], []) }
+            return (removedAssignments, addedAssignments)
+        }
+        let wentBack = Set(reversed)
+        var removed: [PhotoEventAssignment] = []
+        var added: [PhotoEventAssignment] = []
+        for position in 0..<max(removedAssignments.count, addedAssignments.count) {
+            if position < indices.count, let move = indices[position], !wentBack.contains(move) { continue }
+            if position < addedAssignments.count, !isCurrent(addedAssignments[position]) { continue }
+            if position < removedAssignments.count { removed.append(removedAssignments[position]) }
+            if position < addedAssignments.count { added.append(addedAssignments[position]) }
+        }
+        return (removed, added)
     }
 }
 
@@ -49,6 +84,8 @@ public struct DriveMoveReport: Sendable {
     /// The journal's id, set when one was written — what NAS renames
     /// recorded for this move are linked to, so its Undo reverses them.
     public var journalID: UUID?
+    /// For an Undo: the indices in the journal's `moves` that were reversed.
+    public var reversedIndices: [Int] = []
 
     public var movedBytes: Int64 { moved.reduce(Int64(0)) { $0 + $1.byteCount } }
 }
@@ -69,12 +106,22 @@ public struct DriveMoveService {
         journalFolder: URL?,
         removedAssignments: [PhotoEventAssignment] = [],
         addedAssignments: [PhotoEventAssignment] = [],
+        assignmentMoveSources: [String?]? = nil,
         pruneBoundaries: [URL] = [],
         progress: FileOperationProgressHandler? = nil
     ) throws -> DriveMoveReport {
         var report = DriveMoveReport()
         let planned = preflight(moves, report: &report)
 
+        // Which planned rename carries each catalog entry's file (by the
+        // path it moves from), so Undo can swap back exactly those.
+        let plannedIndex = Dictionary(planned.enumerated().map { ($1.sourcePath, $0) }, uniquingKeysWith: { first, _ in first })
+        let moveIndices: [Int?]? = assignmentMoveSources.map { sources in
+            sources.map { source in
+                guard let source else { return nil }
+                return plannedIndex[URL(fileURLWithPath: source).standardizedFileURL.path] ?? -1
+            }
+        }
         var journal = DriveMoveJournal(
             id: UUID(),
             title: title,
@@ -82,7 +129,8 @@ public struct DriveMoveService {
             moves: planned,
             completedIndices: [],
             removedAssignments: removedAssignments,
-            addedAssignments: addedAssignments
+            addedAssignments: addedAssignments,
+            assignmentMoveIndices: moveIndices
         )
         var journalURL: URL?
         if let journalFolder, !planned.isEmpty {
@@ -98,6 +146,10 @@ public struct DriveMoveService {
         var processedBytes: Int64 = 0
         var limiter = FileOperationProgressLimiter()
         var sourceFolders: Set<String> = []
+        // How often progress is written down: often enough that a crash or a
+        // pulled cable leaves an Undo that knows most of what was renamed,
+        // rarely enough that a very large move does not rewrite a huge file.
+        let flushEvery = max(10, planned.count / 20)
 
         for (index, move) in planned.enumerated() {
             do {
@@ -112,7 +164,7 @@ public struct DriveMoveService {
             } catch {
                 report.skipped.append(DriveMoveIssue(move: move, reason: error.localizedDescription))
             }
-            if let journalURL, journal.completedIndices.count % 250 == 0, !journal.completedIndices.isEmpty {
+            if let journalURL, journal.completedIndices.count % flushEvery == 0, !journal.completedIndices.isEmpty {
                 try? Self.write(journal, to: journalURL)
             }
             if limiter.shouldEmit(force: index + 1 == planned.count) {
@@ -127,8 +179,10 @@ public struct DriveMoveService {
             }
         }
 
-        if let journalURL {
-            try Self.write(journal, to: journalURL)
+        // The renames are done. A journal that cannot be rewritten now must
+        // not throw the report away — the catalog has to hear what moved.
+        if let journalURL, (try? Self.write(journal, to: journalURL)) == nil {
+            try? Self.write(journal, to: journalURL)
         }
         pruneEmptyFolders(sourceFolders, boundaries: pruneBoundaries)
         return report
@@ -151,8 +205,25 @@ public struct DriveMoveService {
             )
         }
         var report = DriveMoveReport(journalPath: journalURL.path, journalID: journal.id)
-        let reversed = journal.completedMoves.reversed().map {
-            DriveMove(sourcePath: $0.destinationPath, destinationPath: $0.sourcePath, byteCount: $0.byteCount)
+        // Renames a crash or a pulled cable finished after the last progress
+        // write: the file is at its destination, gone from its source, and
+        // only ever after the last recorded one (moves run in order).
+        var completed = journal.completedIndices
+        let lastRecorded = completed.max() ?? -1
+        for index in journal.moves.indices where index > lastRecorded {
+            let move = journal.moves[index]
+            if !Self.exists(move.sourcePath), Self.isRegularFile(move.destinationPath),
+               (try? fileManager.attributesOfItem(atPath: move.destinationPath)[.size] as? Int64) == move.byteCount {
+                completed.append(index)
+            }
+        }
+        completed.sort()
+        var indexBySource: [String: Int] = [:]
+        var reversed: [DriveMove] = []
+        for index in completed.reversed() where journal.moves.indices.contains(index) {
+            let move = journal.moves[index]
+            indexBySource[URL(fileURLWithPath: move.destinationPath).standardizedFileURL.path] = index
+            reversed.append(DriveMove(sourcePath: move.destinationPath, destinationPath: move.sourcePath, byteCount: move.byteCount))
         }
         let planned = preflight(reversed, report: &report)
         var folders: Set<String> = []
@@ -165,6 +236,7 @@ public struct DriveMoveService {
                 try Self.renameExclusive(from: move.sourcePath, to: move.destinationPath)
                 Self.moveAppleDoubleIfNeeded(from: move.sourcePath, to: move.destinationPath)
                 report.moved.append(move)
+                if let original = indexBySource[move.sourcePath] { report.reversedIndices.append(original) }
                 folders.insert((move.sourcePath as NSString).deletingLastPathComponent)
             } catch {
                 report.skipped.append(DriveMoveIssue(move: move, reason: error.localizedDescription))
@@ -176,7 +248,17 @@ public struct DriveMoveService {
                 totalFiles: planned.count
             ))
         }
-        journal.undoneAt = Date()
+        // Moves that could not go back (a name was taken, a drive dropped)
+        // keep the journal open so Undo can be tried again for just those;
+        // an attempt that got nowhere closes it, so older changes can still
+        // be undone — the report names what stayed.
+        let wentBack = Set(report.reversedIndices)
+        let remaining = completed.filter { !wentBack.contains($0) }
+        if remaining.isEmpty || report.reversedIndices.isEmpty {
+            journal.undoneAt = Date()
+        } else {
+            journal.completedIndices = remaining
+        }
         try Self.write(journal, to: journalURL)
         pruneEmptyFolders(folders, boundaries: pruneBoundaries)
         return (report, journal)
@@ -201,6 +283,40 @@ public struct DriveMoveService {
         try Self.renameExclusive(from: sourcePath, to: destinationPath)
     }
 
+    /// Closes a journal that can no longer be undone (an event it names was
+    /// deleted) so it stops standing in front of the older changes. No file
+    /// is touched; the journal stays on disk, marked undone.
+    public static func abandon(journalURL: URL) throws {
+        var journal = try read(journalURL)
+        journal.undoneAt = Date()
+        try write(journal, to: journalURL)
+    }
+
+    /// Renames a folder to the same name in another letter case (`Beach day` →
+    /// `Beach Day`), which the volume sees as one folder: it goes through a
+    /// temporary name in the same parent, and comes back if the second step
+    /// fails. `moveFolder` refuses this — its destination "exists".
+    public func renameFolderChangingCase(from source: URL, to destination: URL) throws {
+        let sourcePath = source.standardizedFileURL.path
+        let destinationPath = destination.standardizedFileURL.path
+        guard sourcePath.lowercased() == destinationPath.lowercased() else {
+            throw ToolkitError.commandFailed("\(source.lastPathComponent) and \(destination.lastPathComponent) are not the same name.")
+        }
+        var isDirectory: ObjCBool = false
+        guard fileManager.fileExists(atPath: sourcePath, isDirectory: &isDirectory), isDirectory.boolValue else {
+            throw ToolkitError.notDirectory(sourcePath)
+        }
+        let parent = source.deletingLastPathComponent().standardizedFileURL
+        let temporary = parent.appendingPathComponent(".rename-\(UUID().uuidString)").path
+        try Self.renameExclusive(from: sourcePath, to: temporary)
+        do {
+            try Self.renameExclusive(from: temporary, to: destinationPath)
+        } catch {
+            try? Self.renameExclusive(from: temporary, to: sourcePath)
+            throw error
+        }
+    }
+
     public static func journals(in folder: URL) -> [URL] {
         let urls = (try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? []
         return urls.filter { $0.pathExtension == "json" }.sorted { $0.lastPathComponent > $1.lastPathComponent }
@@ -209,7 +325,8 @@ public struct DriveMoveService {
     public static func latestUndoableJournal(in folder: URL) -> (url: URL, journal: DriveMoveJournal)? {
         let barrier = layoutMigrationBarrier(in: folder)
         for url in journals(in: folder) {
-            if let journal = try? read(url), journal.undoneAt == nil, !journal.completedIndices.isEmpty {
+            if let journal = try? read(url), journal.undoneAt == nil,
+               !journal.completedIndices.isEmpty || firstMoveLooksDone(journal) {
                 // Journals older than the layout migration name Card Copy
                 // paths; undoing one would swap assignments back while the
                 // files stay in Originals.
@@ -218,6 +335,14 @@ public struct DriveMoveService {
             }
         }
         return nil
+    }
+
+    /// A run that died before its first progress write recorded nothing, yet
+    /// its first rename may have happened: the file is at the destination and
+    /// gone from the source. Such a journal is still an Undo.
+    private static func firstMoveLooksDone(_ journal: DriveMoveJournal) -> Bool {
+        guard let first = journal.moves.first else { return false }
+        return !exists(first.sourcePath) && isRegularFile(first.destinationPath)
     }
 
     /// Written into the journal folder by the layout migration: Apply

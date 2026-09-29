@@ -343,6 +343,13 @@ public struct EventStorageLocations: Sendable {
         return nil
     }
 
+    /// A path under the NAS root, relative to it; nil for any other path.
+    public func nasRelativePath(_ path: String) -> String? {
+        let root = nasRoot.path + "/"
+        let standardized = URL(fileURLWithPath: path).standardizedFileURL.path
+        return standardized.hasPrefix(root) ? String(standardized.dropFirst(root.count)) : nil
+    }
+
     /// The NAS mirror copy of a drive file.
     public func nasMirrorURL(forDrivePath path: String) -> URL? {
         mirrorRelativePath(forDrivePath: path).map { nasRoot.appendingPathComponent($0).standardizedFileURL }

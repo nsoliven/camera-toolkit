@@ -41,6 +41,18 @@ public enum MoveConflictCheck {
     }
 }
 
+/// A NAS copy that has to follow its file into another event's folder,
+/// as paths relative to the NAS root.
+public struct NASCopyMove: Sendable, Equatable {
+    public var from: String
+    public var to: String
+
+    public init(from: String, to: String) {
+        self.from = from
+        self.to = to
+    }
+}
+
 /// One file of a Move to Event.
 public struct EventMoveItem: Sendable {
     /// The file's assignment in the event it leaves.
@@ -56,13 +68,25 @@ public struct EventMoveItem: Sendable {
     /// Set when the target's catalog already lists this name: every place
     /// that file may be, the first that exists is compared.
     public var takenBy: [String]
+    /// For a file with no drive copy to rename — one only the NAS has — the
+    /// rename its NAS copy owes. A file with a drive rename leaves this nil:
+    /// the NAS follows the drive move.
+    public var nasCopy: NASCopyMove?
 
-    public init(removed: PhotoEventAssignment, added: PhotoEventAssignment, move: DriveMove?, currentPath: String?, takenBy: [String] = []) {
+    public init(
+        removed: PhotoEventAssignment,
+        added: PhotoEventAssignment,
+        move: DriveMove?,
+        currentPath: String?,
+        takenBy: [String] = [],
+        nasCopy: NASCopyMove? = nil
+    ) {
         self.removed = removed
         self.added = added
         self.move = move
         self.currentPath = currentPath
         self.takenBy = takenBy
+        self.nasCopy = nasCopy
     }
 
     public var fileName: String { (added.relativePath as NSString).lastPathComponent }
@@ -253,6 +277,7 @@ public struct EventMoveService {
             journalFolder: journalFolder,
             removedAssignments: journaled.map(\.removed),
             addedAssignments: journaled.map(\.added),
+            assignmentMoveSources: journaled.map { $0.move?.sourcePath },
             pruneBoundaries: pruneBoundaries,
             progress: progress
         )
@@ -288,13 +313,22 @@ public struct EventMoveService {
                 guard let path = item.currentPath, let facts = DuplicateFileFacts.read(path) else { return nil }
                 return OrganizeFile(path: path, size: facts.byteCount, modifiedAt: facts.modifiedAt)
             }
-            let batch = files.isEmpty
-                ? nil
-                : try trash.trash(
-                    files: files,
-                    originRoot: DuplicateResolver.commonFolder(of: files.map(\.path)),
-                    context: trashContext
-                )
+            // The renames above already happened, so a Trash that cannot be
+            // written must not throw the whole move away: the catalog has to
+            // hear about what moved. The extra copies simply stay put.
+            var trashFailure: String?
+            var batch: MediaTrashBatch?
+            if !files.isEmpty {
+                do {
+                    batch = try trash.trash(
+                        files: files,
+                        originRoot: DuplicateResolver.commonFolder(of: files.map(\.path)),
+                        context: trashContext
+                    )
+                } catch {
+                    trashFailure = "its extra copy could not be moved to Trash: \(error.localizedDescription)"
+                }
+            }
             let trashed = Set((batch?.entries ?? []).map { EventStorageLocations.pathKey($0.originalAbsolutePath) })
             let skipped = Dictionary(
                 (batch?.skipped ?? []).map { (EventStorageLocations.pathKey($0.path), $0.reason) },
@@ -306,7 +340,7 @@ public struct EventMoveService {
                     outcome.merged.append(item)
                     outcome.mergedToTrash += 1
                 } else {
-                    outcome.stayed.append(EventMoveStay(item: item, reason: skipped[key] ?? "its extra copy could not be moved to Trash"))
+                    outcome.stayed.append(EventMoveStay(item: item, reason: skipped[key] ?? trashFailure ?? "its extra copy could not be moved to Trash"))
                 }
             }
             outcome.trashBatch = batch.flatMap { $0.entries.isEmpty ? nil : $0 }

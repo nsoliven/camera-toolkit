@@ -246,12 +246,12 @@ public final class NASSyncStore: @unchecked Sendable {
             let rows = try Row.fetchAll(
                 db,
                 sql: "SELECT * FROM nas_sync_files WHERE nas_root = ? AND substr(path_key, 1, ?) = ?",
-                arguments: [root, prefix.count + 1, prefix + "/"]
+                arguments: [root, (prefix + "/").unicodeScalars.count, prefix + "/"]
             )
             let records = rows.map(Self.record)
             try db.execute(
                 sql: "DELETE FROM nas_sync_files WHERE nas_root = ? AND substr(path_key, 1, ?) = ?",
-                arguments: [root, prefix.count + 1, prefix + "/"]
+                arguments: [root, (prefix + "/").unicodeScalars.count, prefix + "/"]
             )
             for var record in records {
                 record.relativePath = to + "/" + record.relativePath.dropFirst(from.count + 1)
@@ -274,7 +274,7 @@ public final class NASSyncStore: @unchecked Sendable {
                     rows += try Row.fetchAll(
                         db,
                         sql: "SELECT * FROM nas_sync_files WHERE nas_root = ? AND substr(path_key, 1, ?) = ?",
-                        arguments: [root, prefix.count + 1, prefix + "/"]
+                        arguments: [root, (prefix + "/").unicodeScalars.count, prefix + "/"]
                     )
                 }
             } else {

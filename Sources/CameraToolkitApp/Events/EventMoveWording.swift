@@ -7,7 +7,10 @@ enum EventMoveWording {
     /// "Moved 40 photos to Beach Day (4 were already there, so their extra
     /// copies went to Trash). 2 had the same name as different photos and
     /// were kept with a new name. 1 stayed in Hotel Night: …"
-    static func summary(_ outcome: EventMoveOutcome, from: String, to: String) -> String {
+    /// `titles` names each file's own event: a move clicked on a family board
+    /// leaves files behind in whichever subevent held them, and the line
+    /// says that one, not the board's.
+    static func summary(_ outcome: EventMoveOutcome, from: String, to: String, titles: [UUID: String] = [:]) -> String {
         let all = outcome.moved + outcome.keptBoth.map(\.item) + outcome.merged + outcome.stayed.map(\.item)
         let noun = all.allSatisfy { isPhoto($0.fileName) } ? "photo" : "file"
         let merged = outcome.merged.count
@@ -43,7 +46,9 @@ enum EventMoveWording {
         if let first = outcome.stayed.first {
             let count = outcome.stayed.count
             let reasons = Set(outcome.stayed.map(\.reason))
-            let lead = count == 1 ? "1 stayed in \(from)" : "\(count) stayed in \(from)"
+            let owners = Set(outcome.stayed.map(\.item.removed.eventID))
+            let home = owners.count == 1 ? titles[owners.first!] ?? from : from
+            let lead = count == 1 ? "1 stayed in \(home)" : "\(count) stayed in \(home)"
             let reason = trimmed(first.reason)
             sentences.append(reasons.count == 1 || count == 1
                 ? "\(lead): \(reason)."

@@ -219,12 +219,28 @@ public struct NASMoveFollower {
             eventIDs[key] = item.added.eventID
             previousIDs[key] = item.removed.eventID
         }
-        let moves = renames(
+        var moves = renames(
             forMoves: outcome.report.moved,
             locations: locations,
             eventIDsByDestination: eventIDs,
             previousEventIDs: previousIDs
         )
+        // A file only the NAS has moved in the catalog alone; its NAS copy
+        // has no drive move to follow, so it owes its own rename.
+        var seen = Set(moves.map { NASSyncStore.pathKey($0.from) })
+        for item in outcome.moved {
+            guard item.move == nil, let copy = item.nasCopy,
+                  NASSyncStore.pathKey(copy.from) != NASSyncStore.pathKey(copy.to),
+                  isEventPath(copy.from), isEventPath(copy.to),
+                  seen.insert(NASSyncStore.pathKey(copy.from)).inserted else { continue }
+            moves.append(NASRename(
+                from: copy.from,
+                to: copy.to,
+                byteCount: item.removed.fileSize,
+                eventID: item.added.eventID,
+                previousEventID: item.removed.eventID
+            ))
+        }
         let trashed = Set((outcome.trashBatch?.entries ?? []).map { EventStorageLocations.pathKey($0.originalAbsolutePath) })
         var mergeMoves: [DriveMove] = []
         var mergeEvents: [String: UUID] = [:]
@@ -311,16 +327,42 @@ public struct NASMoveFollower {
     /// Undo of a move on the NAS. Renames of the move that never ran are
     /// dropped; the ones that ran are reversed by a new batch, applied now
     /// when the NAS is there and queued when it is not.
-    public func undo(moveJournalID: UUID, nasRoot: URL, progress: Progress? = nil) throws -> NASUndoResult {
+    ///
+    /// `reversedMirrorKeys`, when given, are `NASSyncStore.pathKey`s of the
+    /// NAS paths (each rename's `to`) whose drive move really went back. A
+    /// rename whose drive move stayed where it is keeps its NAS copy where it
+    /// is too — the NAS follows the drive — and its batch stays open.
+    public func undo(
+        moveJournalID: UUID,
+        nasRoot: URL,
+        reversedMirrorKeys: Set<String>? = nil,
+        progress: Progress? = nil
+    ) throws -> NASUndoResult {
         guard let queue else { return NASUndoResult() }
         var undone = NASUndoResult()
         for var batch in queue.batches(forMoveJournal: moveJournalID) where batch.undoneAt == nil {
-            for index in batch.ops.indices where batch.ops[index].state == .pending {
-                batch.ops[index].state = .cancelled
-                undone.cancelled += 1
+            let wanted: (NASRename) -> Bool = { op in
+                reversedMirrorKeys.map { $0.contains(NASSyncStore.pathKey(op.to)) } ?? true
             }
-            batch.undoneAt = now()
-            let reverse = Self.inverse(of: batch, now: now())
+            var reversedOps: [NASRename] = []
+            var leftOpen = false
+            for index in batch.ops.indices {
+                switch batch.ops[index].state {
+                case .pending, .renamed, .merged:
+                    guard wanted(batch.ops[index]) else { leftOpen = true; continue }
+                    if batch.ops[index].state == .pending {
+                        batch.ops[index].state = .cancelled
+                        undone.cancelled += 1
+                    }
+                    reversedOps.append(batch.ops[index])
+                default:
+                    continue
+                }
+            }
+            if !leftOpen { batch.undoneAt = now() }
+            var selected = batch
+            selected.ops = reversedOps
+            let reverse = Self.inverse(of: selected, now: now())
             try queue.save(batch)
             guard var reverse else { continue }
             let result = try apply(&reverse, nasRoot: nasRoot, progress: progress)

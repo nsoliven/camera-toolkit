@@ -80,7 +80,15 @@ final class DashboardModel {
     var configMessage: String = "Config is saved automatically."
     var statusMessage: String = "Ready. Choose folders in Settings to begin."
     var isBusy: Bool = false
-    var isStorageBenchmarkRunning: Bool = false
+    var isStorageBenchmarkRunning: Bool = false {
+        // A speed test holds the job gate without being a job, so nothing
+        // calls `onJobFinished` when it lets go — work that queued behind
+        // it (a clicked Move to Event, NAS renames) hears it here instead
+        // of waiting for some other job to end.
+        didSet {
+            if oldValue, !isStorageBenchmarkRunning { onGateReleased?() }
+        }
+    }
     var immichAPIKeyDraft: String = ""
     var immichConnectionStatus: String = "Not connected. Add your server URL and API key in Config."
     var immichConnectionReport: ImmichConnectionReport?
@@ -154,6 +162,9 @@ final class DashboardModel {
     /// after them.
     @ObservationIgnored var onJobStarted: (@MainActor (JobAction) -> Void)?
     @ObservationIgnored var onJobFinished: (@MainActor (JobAction) -> Void)?
+    /// Heard when a speed test releases the job gate (see
+    /// `isStorageBenchmarkRunning`).
+    @ObservationIgnored var onGateReleased: (@MainActor () -> Void)?
     /// This session's job recorders by job id: the running job's, and the
     /// last few finished ones so their whole-run chart stays drawable.
     @ObservationIgnored var jobHistoryRecorders: [UUID: JobHistoryRecorder] = [:]

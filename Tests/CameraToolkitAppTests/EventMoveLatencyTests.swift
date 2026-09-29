@@ -166,7 +166,7 @@ final class EventMoveLatencyTests: XCTestCase {
 
         try await waitUntil { !model.isBusy && model.statusMessage.contains("did not happen") }
         XCTAssertTrue(model.statusMessage.contains("went back to Trip 2026 / Island"), model.statusMessage)
-        XCTAssertTrue(model.statusMessage.contains("Nothing was changed on disk or in the catalog"), model.statusMessage)
+        XCTAssertTrue(model.statusMessage.contains("The catalog was not changed"), model.statusMessage)
         // Back on the source board, gone from the target, counts restored.
         XCTAssertEqual(Set(try XCTUnwrap(workspace.eventStacks[library.islandID]).map(\.id)), Set(islandStacks))
         XCTAssertEqual(Set(try XCTUnwrap(workspace.eventStacks[library.harborID]).map(\.id)), Set(harborStacks))

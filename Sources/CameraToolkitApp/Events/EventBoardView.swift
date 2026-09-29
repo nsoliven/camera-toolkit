@@ -198,6 +198,7 @@ struct EventBoardView: View {
     /// Loading progress for the status caption — the board fills in first
     /// and keeps loading files and capture dates behind it.
     private var loadingNote: String? {
+        if let queued = workspace.queuedMoveNote(for: eventID) { return queued }
         if let reachability = workspace.eventReachability[eventID], !reachability.isOffline {
             // Partly mounted: the board loads what is reachable and says
             // what is not, instead of waiting on it.
