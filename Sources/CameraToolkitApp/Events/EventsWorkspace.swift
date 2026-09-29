@@ -80,6 +80,12 @@ struct RemovalRequest: Identifiable {
     var byteCount: Int64
 }
 
+/// The Sync All to NAS confirmation. Its numbers are read live from
+/// `nasPresence`, so Check Again updates the open sheet.
+struct SyncAllToNASRequest: Identifiable {
+    let id = UUID()
+}
+
 /// Confirmation before organizer Trash. Files are not moved until the user
 /// confirms. Destinations are the volume-local `_Trash` folders, never Finder.
 struct PendingTrashRequest: Identifiable {
@@ -375,6 +381,7 @@ final class EventsWorkspace {
     /// Per event: sorted files whose event name is taken by another file.
     var applyConflictSourceKeys: [UUID: Set<String>] = [:]
     var pendingRemoval: RemovalRequest?
+    var syncAllRequest: SyncAllToNASRequest?
     var pendingTrash: PendingTrashRequest?
     var latestMoveJournalTitle: String?
     /// Bursts currently expanded inline in the board.
@@ -493,6 +500,10 @@ final class EventsWorkspace {
     /// Inert until `startNASConnection()` — tests never mount or unmount.
     let nasConnection: NASConnectionModel
 
+    /// Which event files are not on the NAS yet, kept current in the
+    /// background. Inert until `startNASConnection()`, like the connection.
+    let nasPresence = NASPresenceModel()
+
     /// Background disk work waits at this gate while a speed test is
     /// measuring the volume it would touch — scans, sweeps, capture-date
     /// reads, and tile decodes resume by themselves when the test ends.
@@ -519,6 +530,10 @@ final class EventsWorkspace {
         }
         faceLabelsRestoredObserver.observers = [observer]
         nasConnection.isNASInUse = { [weak self] in self?.nasIsInUse ?? true }
+        nasPresence.context = { [weak self] in self?.nasPresenceContext }
+        nasPresence.onReportChanged = { [weak self] old, new in self?.nasPresenceChanged(from: old, to: new) }
+        model.onJobStarted = { [weak self] _ in self?.nasPresence.pauseForJob() }
+        model.onJobFinished = { [weak self] action in self?.nasPresence.jobFinished(action) }
     }
 
     @ObservationIgnored private let faceLabelsRestoredObserver = MountObserverBox()
@@ -1529,6 +1544,7 @@ final class EventsWorkspace {
     }
 
     func selectionChanged() {
+        if case .event = selection { nasPresence.refresh(.boardOpened) }
         selectedStackIDs = []
         focusedStackID = nil
         selectionAnchorID = nil
@@ -1697,6 +1713,7 @@ final class EventsWorkspace {
         connectivityRevision &+= 1
         lastConnectivityRefresh = Date()
         nasConnection.volumesChanged()
+        nasPresence.refresh(.mounted)
         let mountedNow = VolumeInfo.mountedVolumePaths()
         lastConnectivityMountedPaths = mountedNow
 
@@ -2307,6 +2324,9 @@ final class EventsWorkspace {
         let probe = presenceProbe
         let dateReadProbe = captureDateReadProbe
         let gate = driveActivityGate
+        // The NAS listing the sidebar counts from, when it is fresh: the
+        // sweep answers the NAS place from it instead of a stat per file.
+        let archiveListing = nasPresence.boardListing()
 
         // The catalog state this pipeline proves itself against. A grid
         // that already reflects it — every build landed, no pending date
@@ -2489,7 +2509,8 @@ final class EventsWorkspace {
                     mountedVolumes: mounted,
                     probe: probe,
                     pauseGate: gate,
-                    nasVerified: nasVerified
+                    nasVerified: nasVerified,
+                    archiveListing: archiveListing
                 ) else { cancelled = true; break }
                 memberSummaries[member.id] = memberSummary
             }
@@ -3681,6 +3702,8 @@ final class EventsWorkspace {
     /// Launch: status, auto-connect, and the Wi-Fi guard. App only.
     func startNASConnection() {
         nasConnection.start(settings: nasConnectionSettings)
+        nasPresence.isEnabled = true
+        nasPresence.refresh(.launch)
     }
 
     func nasSettingsChanged() {
@@ -3702,6 +3725,67 @@ final class EventsWorkspace {
             guard let self else { return }
             startNASSync(events: eventFamily(eventID), title: eventTitle(event), refresh: [eventID])
         }
+    }
+
+    /// Sync All to NAS: the confirmation first, listing each event's files
+    /// not on the NAS yet. A stale or records-only answer is re-checked
+    /// while the sheet is open.
+    func requestSyncAllToNAS() {
+        guard !model.configuration.savedEvents.isEmpty else {
+            model.statusMessage = "There are no events to sync."
+            return
+        }
+        let report = nasPresence.report
+        let stale = report?.listedAt.map { Date().timeIntervalSince($0) > NASPresenceSchedule.automaticInterval } ?? true
+        if nasIsConnected, stale, !nasPresence.isChecking {
+            nasPresence.refresh(.manual)
+        }
+        syncAllRequest = SyncAllToNASRequest()
+    }
+
+    /// Why Sync All to NAS cannot start right now, or nil when it can.
+    var syncAllBlocker: String? {
+        if model.configuration.savedEvents.isEmpty { return "There are no events to sync." }
+        if !nasIsConnected {
+            return nasShareURL == nil
+                ? "The NAS is not connected. Mount the share in Finder, or set its smb:// address in Settings → Locations."
+                : "The NAS is not connected — Connect to NAS first."
+        }
+        if model.isBusy { return "Another file job is running. Sync All once it has finished." }
+        return nil
+    }
+
+    /// Files of this event's own folder not on the NAS yet, per the NAS
+    /// presence index; nil before it has answered.
+    func nasPendingTotals(for eventID: UUID) -> NASPresenceTotals? {
+        nasPresence.report?.byEvent[eventID]
+    }
+
+    /// The same for the event and its subevents — what its board covers.
+    func nasPendingFamilyTotals(for eventID: UUID) -> NASPresenceTotals? {
+        nasPresence.report?.totals(for: scopeIDs(eventID))
+    }
+
+    /// The inputs of a NAS presence check, read when it starts.
+    private var nasPresenceContext: NASPresenceContext {
+        let locations = self.locations
+        return NASPresenceContext(
+            events: model.configuration.savedEvents,
+            locations: locations,
+            catalogURL: URL(fileURLWithPath: DashboardModel.expandedPath(model.configuration.catalogDatabasePath)),
+            configuration: model.configuration,
+            nasAvailable: nasIsConnected,
+            nasJobRunning: nasIsInUse
+        )
+    }
+
+    /// A new NAS presence answer: the open board re-reads its NAS place
+    /// from the listing when its family's numbers moved.
+    private func nasPresenceChanged(from old: NASPresenceReport?, to new: NASPresenceReport) {
+        guard case .event(let eventID) = selection, presence[eventID] != nil else { return }
+        let family = scopeIDs(eventID)
+        guard old?.totals(for: family) != new.totals(for: family) || old?.listedAt == nil && new.listedAt != nil else { return }
+        Task { await refreshEvent(eventID) }
     }
 
     /// One-way Buffer → NAS copy of every event.
@@ -3731,6 +3815,7 @@ final class EventsWorkspace {
         // Sync to NAS feeds its own recorder: per-second speed from the
         // engine, and a row per file.
         let recorder = model.makeHistoryRecorder(action: .syncBuffer, title: "Synced \(title) to the NAS")
+        let nasPresence = self.nasPresence
         model.runBackgroundJob(
             action: .syncBuffer,
             runningNote: "Syncing \(title) to the NAS",
@@ -3738,6 +3823,9 @@ final class EventsWorkspace {
             logDetail: "Copied only files missing on the NAS, each to the same path it has on the drive, \(options.parallelTransfers) at a time, and checked every copy's SHA-256 against the drive copy's (\(options.remoteVerifier == nil ? "re-read from the NAS" : "hashed on the NAS over SSH")) before naming it. Existing files were never overwritten.",
             destinationPath: nasRoot.path,
             history: recorder,
+            // Settled either way (done, failed, stopped): list the synced
+            // folders again — unthrottled, and only those.
+            onSettled: { nasPresence.refresh(.syncFinished, scope: events) },
             operation: { progress in
                 progress(BackgroundJobUpdate(progress: 0.02, note: "Sync to NAS: listing the drive folders"))
                 let plan = NASSyncPlanner.plan(events: events, locations: locations)
@@ -3749,6 +3837,10 @@ final class EventsWorkspace {
                 return NASSyncJobOutcome(report: report, plan: plan, reportPath: reportPath)
             },
             completion: { [weak self] outcome in
+                // What the sync proved on the NAS counts at once, before
+                // the folders are listed again.
+                let proven = Set(outcome.report.copied + outcome.report.matchedExisting + outcome.report.alreadyVerified)
+                self?.nasPresence.noteSynced(outcome.plan.items.filter { proven.contains($0.relativePath) })
                 for eventID in refresh {
                     Task { await self?.refreshEvent(eventID) }
                 }

@@ -186,7 +186,7 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate, NSMenuIte
 
     @objc func syncAllToNAS(_ sender: Any?) {
         CameraToolkitMainWindow.shared.show(model: model)
-        CameraToolkitRuntime.workspace.syncAllToNAS()
+        CameraToolkitRuntime.workspace.requestSyncAllToNAS()
     }
 
     @objc func toggleSidebar(_ sender: Any?) {

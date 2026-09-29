@@ -50,14 +50,22 @@ public struct NASTreeListing: Codable, Equatable, Sendable {
         relativePath.precomposedStringWithCanonicalMapping.lowercased()
     }
 
-    /// The covered folder `relativePath` sits under, if any — the deepest one.
+    /// The covered folder `relativePath` sits under, if any — the deepest
+    /// one. Walks up the path's own folders, so it costs the path's depth,
+    /// not the number of covered folders.
     public func coveringFolder(_ relativePath: String) -> String? {
-        let path = Self.key(relativePath)
-        var best: String?
-        for folder in coverage.keys where folder.isEmpty || path.hasPrefix(folder + "/") {
-            if best == nil || folder.count > best!.count { best = folder }
+        Self.enclosingFolder(of: Self.key(relativePath)) { coverage[$0] != nil }
+    }
+
+    /// The deepest folder of `key` (a `key(_:)` path; "" is the root) for
+    /// which `matches` holds.
+    static func enclosingFolder(of key: String, where matches: (String) -> Bool) -> String? {
+        var folder = Substring(key)
+        while let slash = folder.lastIndex(of: "/") {
+            folder = folder[..<slash]
+            if matches(String(folder)) { return String(folder) }
         }
-        return best
+        return matches("") ? "" : nil
     }
 
     public func covers(_ relativePath: String) -> Bool { coveringFolder(relativePath) != nil }
@@ -90,22 +98,31 @@ public struct NASTreeListing: Codable, Equatable, Sendable {
             self = newer
             return
         }
-        let replaced = Array(newer.coverage.keys)
+        let replaced = Set(newer.coverage.keys)
         if replaced.contains("") {
             entries = [:]
             coverage = [:]
         } else {
             entries = entries.filter { key, _ in
-                !replaced.contains { key.hasPrefix($0 + "/") }
+                Self.enclosingFolder(of: key, where: replaced.contains) == nil
             }
             // A folder nested in a relisted one is covered by it now.
             coverage = coverage.filter { folder, _ in
-                !replaced.contains { folder == $0 || folder.hasPrefix($0 + "/") }
+                !replaced.contains(folder) && Self.enclosingFolder(of: folder, where: replaced.contains) == nil
             }
         }
         entries.merge(newer.entries) { _, new in new }
         coverage.merge(newer.coverage) { _, new in new }
         method = newer.method
+    }
+
+    /// The same listing, trusting only folders listed at or after `date`:
+    /// paths under an older listing become unknown (not covered), so a
+    /// caller probes them instead of believing a stale answer.
+    public func trusting(listedSince date: Date) -> NASTreeListing {
+        var copy = self
+        copy.coverage = coverage.filter { $0.value >= date }
+        return copy
     }
 
     /// Sync to NAS just proved these files on the NAS (copied, matched, or

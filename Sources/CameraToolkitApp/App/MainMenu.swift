@@ -96,7 +96,7 @@ enum MainMenu {
         menu.addItem(item("New Event…", #selector(MainMenuActions.newEvent(_:)), "n", to: target))
         menu.addItem(item("Add Folder or Card…", #selector(MainMenuActions.addFolderOrCard(_:)), to: target))
         menu.addItem(.separator())
-        menu.addItem(item("Sync All Events to NAS", #selector(MainMenuActions.syncAllToNAS(_:)), to: target))
+        menu.addItem(item("Sync All Events to NAS…", #selector(MainMenuActions.syncAllToNAS(_:)), to: target))
         menu.addItem(.separator())
         menu.addItem(browserItem("Open in Photomator", .openSelection, "o", target: target))
         menu.addItem(browserItem("Preview", .previewSelection, "y", target: target))

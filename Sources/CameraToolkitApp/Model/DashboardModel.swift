@@ -149,6 +149,11 @@ final class DashboardModel {
     /// Records jobs into `job-history.sqlite` beside the catalog. Only the
     /// live app turns it on; tests and previews never write one.
     @ObservationIgnored var jobHistoryEnabled = false
+    /// Hears every background job start and finish (after `isBusy` has
+    /// changed) — the NAS presence check pauses for jobs and recounts
+    /// after them.
+    @ObservationIgnored var onJobStarted: (@MainActor (JobAction) -> Void)?
+    @ObservationIgnored var onJobFinished: (@MainActor (JobAction) -> Void)?
     /// This session's job recorders by job id: the running job's, and the
     /// last few finished ones so their whole-run chart stays drawable.
     @ObservationIgnored var jobHistoryRecorders: [UUID: JobHistoryRecorder] = [:]
@@ -1472,6 +1477,7 @@ extension DashboardModel {
 
         isBusy = true
         statusMessage = runningNote
+        onJobStarted?(action)
 
         let recorder = history ?? makeHistoryRecorder(action: action, title: logTitle)
         let jobID = recorder?.jobID ?? UUID()
@@ -1633,6 +1639,7 @@ extension DashboardModel {
         endJobActivity(id: id)
         isBusy = false
         storageCapacityRevision &+= 1
+        onJobFinished?(action)
     }
 
     func recordActivity(action: JobAction, state: JobState, title: String, summary: String, detail: String) {

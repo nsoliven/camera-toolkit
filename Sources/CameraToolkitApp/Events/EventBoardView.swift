@@ -818,11 +818,16 @@ struct EventStorageSlots {
         let legacy = summary?.onLegacyArchiveLayout ?? 0
         let offline = summary?.archiveOffline ?? false
         let onDrive = assets.count { $0.drive == .present || $0.otherDrive == .present }
+        // The presence index counts every file Sync to NAS would copy —
+        // edits and sidecars too, which have no assignment here.
+        let indexedPending = workspace.nasPendingFamilyTotals(for: event.id)?.pendingFiles ?? 0
         let detail: String
         if offline {
             detail = workspace.nasShareURL == nil ? "Connect the NAS share to sync" : "Not connected — Connect to NAS…"
         } else if total > 0, verified == total, let date = summary?.oldestArchiveVerification {
             detail = "On NAS ✓ verified \(date.formatted(date: .abbreviated, time: .shortened))"
+        } else if total > 0, onNAS == total, indexedPending > 0 {
+            detail = "On NAS · \(NASPendingText.files(indexedPending)) of edits or sidecars not on the NAS yet"
         } else if total > 0, onNAS == total {
             detail = legacy > 0
                 ? "On NAS · \(legacy) in the old archive layout"
@@ -844,7 +849,7 @@ struct EventStorageSlots {
                         .help("Open the configured NAS share so Finder mounts it")
                 }
                 checkAgainButton
-            } else if onDrive > 0 || verified < onNAS {
+            } else if onDrive > 0 || verified < onNAS || indexedPending > 0 {
                 Button("Sync to NAS") { workspace.syncToNAS(event.id) }
                     .disabled(model.isBusy)
                     .help("Copy only the files missing on the NAS, each to the same path it has on the drive, and re-read every copy from the NAS to check its SHA-256. Existing files are never overwritten.")

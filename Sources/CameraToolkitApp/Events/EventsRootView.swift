@@ -222,6 +222,16 @@ struct EventsRootView: View {
                 onConfirm: { workspace.confirmRemoval(request, confirmation: $0) }
             )
         }
+        .sheet(item: $workspace.syncAllRequest) { _ in
+            SyncAllConfirmSheet(
+                workspace: workspace,
+                onCancel: { workspace.syncAllRequest = nil },
+                onConfirm: {
+                    workspace.syncAllRequest = nil
+                    workspace.syncAllToNAS()
+                }
+            )
+        }
         .sheet(item: $workspace.faceScanRequest) { request in
             switch request.subject {
             case .location(let locationID):
@@ -485,11 +495,17 @@ struct EventsSidebar: View {
             details.append("NAS \(summary.onArchive) of \(summary.total)")
         }
         if isPrivate { details.append("Private · NAS only") }
+        // The event's own folder, so a parent and its subevents never
+        // count one file twice.
+        let nasTotals = workspace.nasPendingTotals(for: event.id)
+        let nasPending = nasTotals?.pendingFiles ?? 0
+        if let nasTotals, nasPending > 0 { details.append(NASPendingText.badgeHelp(nasTotals)) }
         return EventSidebarRow(
             name: event.name,
             color: EventPalette.color(for: event.id),
             isPrivate: isPrivate,
             fileCount: count,
+            nasPending: nasPending,
             depth: depth,
             isDropTarget: targetedEventID == event.id,
             help: details.joined(separator: " · ")
@@ -563,14 +579,22 @@ private struct EventSidebarRow: View {
     let color: Color
     let isPrivate: Bool
     let fileCount: Int
+    /// Files of this event not on the NAS yet; 0 shows nothing.
+    var nasPending = 0
     let depth: Int
     let isDropTarget: Bool
     let help: String
 
     var body: some View {
         Label {
-            Text(name)
-                .lineLimit(1)
+            HStack(spacing: 4) {
+                Text(name)
+                    .lineLimit(1)
+                if nasPending > 0 {
+                    Spacer(minLength: 4)
+                    NASPendingBadge(count: nasPending)
+                }
+            }
         } icon: {
             Image(systemName: isPrivate ? "lock.fill" : "circle.fill")
                 .imageScale(isPrivate ? .medium : .small)
@@ -602,6 +626,9 @@ private struct SidebarFooter: View {
             ?? (model.pendingTransferFileCount > 0 ? "\(model.pendingTransferFileCount) waiting" : nil)
         VStack(alignment: .leading, spacing: 6) {
             NASStatusFooterRow(connection: workspace.nasConnection)
+            if !model.configuration.savedEvents.isEmpty {
+                NASSyncAllFooterRow(workspace: workspace)
+            }
             GlassEffectContainer(spacing: 8) {
                 HStack(spacing: 8) {
                     Button {
@@ -646,6 +673,74 @@ private struct SidebarFooter: View {
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
+    }
+}
+
+/// A sidebar event's "not on the NAS yet" mark: an up arrow and the count.
+private struct NASPendingBadge: View {
+    let count: Int
+
+    var body: some View {
+        HStack(spacing: 1) {
+            Image(systemName: "arrow.up")
+                .imageScale(.small)
+            Text(NASPendingText.badge(count))
+        }
+        .font(.caption2.monospacedDigit().weight(.semibold))
+        .foregroundStyle(.orange)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(NASPendingText.files(count)) not on the NAS")
+    }
+}
+
+/// "Sync All to NAS" with what is not on the NAS yet — "312 files · 48 GB
+/// not on NAS" — from the background presence index. Opens the
+/// confirmation; disabled, with the reason as its help, while the NAS is
+/// offline or another job runs. Reads published state only.
+private struct NASSyncAllFooterRow: View {
+    let workspace: EventsWorkspace
+
+    var body: some View {
+        let presence = workspace.nasPresence
+        let blocker = workspace.syncAllBlocker
+        let pending = presence.report?.total.pendingFiles ?? 0
+        let synced = presence.report.map { $0.total.isSynced && $0.total.files > 0 } ?? false
+        let detail = NASPendingText.syncAllDetail(report: presence.report, isChecking: presence.isChecking, nasAvailable: workspace.nasIsConnected)
+        Button {
+            workspace.requestSyncAllToNAS()
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: synced ? "checkmark.circle" : "arrow.up.to.line.circle")
+                    .imageScale(.large)
+                    .foregroundStyle(pending > 0 ? Color.orange : Color.secondary)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Sync All to NAS")
+                        .lineLimit(1)
+                    Text(detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                Spacer(minLength: 0)
+                if presence.isChecking {
+                    ProgressView()
+                        .controlSize(.mini)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .buttonStyle(.glass)
+        .disabled(blocker != nil)
+        .help(blocker ?? help(presence))
+        .accessibilityLabel("Sync All to NAS, \(detail)")
+    }
+
+    private func help(_ presence: NASPresenceModel) -> String {
+        var lines = ["Copy every event's files that are not on the NAS yet, verifying each copy's SHA-256. Existing files are never overwritten."]
+        if let report = presence.report { lines.append("Counts \(NASPendingText.freshness(report, now: Date())).") }
+        if let note = presence.note { lines.append(note) }
+        return lines.joined(separator: "\n")
     }
 }
 
