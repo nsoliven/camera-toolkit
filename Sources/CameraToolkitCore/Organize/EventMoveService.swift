@@ -172,6 +172,7 @@ public struct EventMoveService {
         protectedPathKeys: Set<String> = [],
         takenPathKeys: Set<String> = [],
         trashContext: TrashContext = TrashContext(),
+        eventFolders: [String: String]? = nil,
         progress: FileOperationProgressHandler? = nil
     ) throws -> EventMoveOutcome {
         var outcome = EventMoveOutcome()
@@ -278,6 +279,7 @@ public struct EventMoveService {
             removedAssignments: journaled.map(\.removed),
             addedAssignments: journaled.map(\.added),
             assignmentMoveSources: journaled.map { $0.move?.sourcePath },
+            eventFolders: eventFolders,
             pruneBoundaries: pruneBoundaries,
             progress: progress
         )

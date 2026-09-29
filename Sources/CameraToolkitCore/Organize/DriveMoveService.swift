@@ -42,6 +42,11 @@ public struct DriveMoveJournal: Codable, Sendable {
     /// rename was planned but refused. Undo swaps back only the entries whose
     /// file really went back. Nil in journals written before this existed.
     public var assignmentMoveIndices: [Int?]?
+    /// Where each event the action touched kept its folder when it ran
+    /// (event id → folder path). Undo refuses once an event's folder is
+    /// somewhere else — renamed, re-dated or re-parented — instead of putting
+    /// files and NAS copies back under the old name.
+    public var eventFolders: [String: String]?
 
     public var completedMoves: [DriveMove] {
         completedIndices.compactMap { moves.indices.contains($0) ? moves[$0] : nil }
@@ -107,6 +112,7 @@ public struct DriveMoveService {
         removedAssignments: [PhotoEventAssignment] = [],
         addedAssignments: [PhotoEventAssignment] = [],
         assignmentMoveSources: [String?]? = nil,
+        eventFolders: [String: String]? = nil,
         pruneBoundaries: [URL] = [],
         progress: FileOperationProgressHandler? = nil
     ) throws -> DriveMoveReport {
@@ -130,7 +136,8 @@ public struct DriveMoveService {
             completedIndices: [],
             removedAssignments: removedAssignments,
             addedAssignments: addedAssignments,
-            assignmentMoveIndices: moveIndices
+            assignmentMoveIndices: moveIndices,
+            eventFolders: eventFolders
         )
         var journalURL: URL?
         if let journalFolder, !planned.isEmpty {

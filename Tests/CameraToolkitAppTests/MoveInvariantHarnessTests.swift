@@ -382,6 +382,11 @@ final class MoveInvariantHarnessTests: XCTestCase {
             }
 
             try await library.settle()
+            // The NAS is connected here, so its renames drain on their own — a
+            // NAS Rename job that starts after the step would make the next
+            // click (an Undo, say) answer "another job is running".
+            try await library.waitUntil(timeout: 30, "the NAS renames never drained") { workspace.pendingNASRenameCount == 0 && workspace.isQuiet }
+            try await library.settle()
             if ProcessInfo.processInfo.environment["AUDIT_VERBOSE"] != nil {
                 print("AUDIT seed \(seed) step \(step): \(log.suffix(2).joined(separator: " ;; ")) | \(model.statusMessage) | sortDepth=\(workspace.undoableSortCount) tracked=\(undoables.map { ($0.kind == .sort ? "S" : "J") + ($0.exact ? "" : "~") }.joined()) trash=\(trashCount(library))")
             }

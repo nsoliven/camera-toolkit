@@ -554,6 +554,34 @@ final class MoveAuditTests: XCTestCase {
         }
     }
 
+    /// A photo only the NAS has moved between events; the target event is
+    /// renamed (its NAS folder follows); undoing the move would rename the NAS
+    /// copy back under the old folder name, away from where the event looks.
+    func testUndoingAMoveOfAPhotoOnlyTheNASHasAfterARenameRefuses() async throws {
+        let library = try AuditLibrary.make()
+        defer { library.tearDown() }
+        twoEvents(library)
+        try FileManager.default.createDirectory(at: library.nasRoot, withIntermediateDirectories: true)
+        let only = try library.placeOnNASOnly("a", name: "DSC00001.ARW", content: photo("1"))
+        library.workspace.refreshConnectivity()
+        await library.open("a", "b")
+        try click(library, [only.url.path], from: "a", to: "b")
+        try await library.settle()
+        try await library.waitUntil(timeout: 20, "the NAS copy never followed") { library.workspace.isQuiet && library.workspace.pendingNASRenameCount == 0 }
+
+        library.workspace.renameEvent(library.id("b"), name: "Hotel Nights", date: AuditLibrary.day.addingTimeInterval(86_400), policy: .buffer, parentEventID: nil)
+        let renamedCopy = try nasCopy(library, of: library.assignments("b")[0], in: "b")
+        try await library.waitUntil(timeout: 20, "the NAS folder never followed") { library.exists(renamedCopy.path) }
+        try await library.settle()
+
+        library.workspace.undoLastSort()
+        try await library.settle()
+        XCTAssertTrue(library.model.statusMessage.contains("was renamed or moved since"), library.model.statusMessage)
+        XCTAssertEqual(library.assignments("b").count, 1)
+        XCTAssertTrue(library.exists(renamedCopy.path))
+        XCTAssertFalse(library.exists(only.url.path), "nothing was recreated under the old name")
+    }
+
     /// Renaming a subevent moves its folder; the family board above it must
     /// draw the files at their new paths.
     func testRenamingASubeventUpdatesTheFamilyBoard() async throws {

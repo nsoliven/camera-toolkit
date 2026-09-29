@@ -189,6 +189,9 @@ private struct AssignmentChange {
     /// The NAS renames queued for this change (their batches carry this id as
     /// their move id), so undoing it brings the NAS copies back too.
     var nasLink: UUID?
+    /// Where the events it touched kept their folders, recorded with `nasLink`
+    /// so Undo can tell the NAS copies' paths are still the event's.
+    var eventFolders: [String: String]?
 }
 
 /// `EventStorageLocations`' per-file path helpers with the per-event work
@@ -551,6 +554,9 @@ final class EventsWorkspace {
     /// re-read them while the next move's tiles were still laid over them, so
     /// they are read once more when the queue is empty.
     @ObservationIgnored private var boardsToRecheck: Set<UUID> = []
+    /// Moves landed so far — a click that waited for its board to load can
+    /// tell whether another move landed in the meantime.
+    @ObservationIgnored private var landedMoveCount = 0
     @ObservationIgnored private var assignmentsByEventAndName: [UUID: [String: PhotoEventAssignment]] = [:]
     /// Files whose Move to Event is clicked but not yet renamed, by their
     /// board path key → the event they are headed to. The catalog changes
@@ -2212,6 +2218,16 @@ final class EventsWorkspace {
             refuseMove("Undo “\(change.title)”", "“\(change.title)” can't be undone: one of its events was deleted since. Nothing was changed.")
             return
         }
+        // Its NAS copies were renamed to paths under the events' folders as they
+        // were; once an event moved, undoing would rename them back under the
+        // old names.
+        if change.nasLink != nil, let renamed = eventMoved(since: change.eventFolders ?? [:]) {
+            refuseMove(
+                "Undo “\(change.title)”",
+                "“\(change.title)” can't be undone: \(eventTitle(renamed)) was renamed or moved since, so its NAS copies are not where the move left them. Nothing was changed."
+            )
+            return
+        }
         // Applied since: an entry whose file now has a copy in its event's
         // folder cannot just disappear from the catalog — that would leave
         // the copy in the folder with nothing recording it.
@@ -3731,11 +3747,15 @@ final class EventsWorkspace {
         let nasRoot = locations.nasRoot
         // Entries that only moved in the catalog (a photo only the NAS has)
         // have no drive rename to go back, but their NAS copy does.
+        // Only those still assigned where the move put them: one a later change
+        // moved on keeps its NAS copy where that change put it.
+        let currentIDs = Set(model.configuration.photoEventAssignments.map(CatalogStore.eventAssetID))
         var catalogOnlyMirrorKeys: Set<String> = []
         for (position, index) in (latest.journal.assignmentMoveIndices ?? []).enumerated()
         where index == nil && position < latest.journal.addedAssignments.count {
             let added = latest.journal.addedAssignments[position]
-            if let owner = event(added.eventID), let url = locations.archiveURL(for: added, event: owner),
+            if currentIDs.contains(CatalogStore.eventAssetID(added)),
+               let owner = event(added.eventID), let url = locations.archiveURL(for: added, event: owner),
                let relative = locations.nasRelativePath(url.path) {
                 catalogOnlyMirrorKeys.insert(NASSyncStore.pathKey(relative))
             }
@@ -3826,9 +3846,22 @@ final class EventsWorkspace {
     /// entry it moved out of, its destination the drive path of the entry it
     /// moved in. Journals from before entries carried their rename are not
     /// checked.
-    private func eventRenamedSince(_ journal: DriveMoveJournal) -> SavedCameraEvent? {
-        guard let indices = journal.assignmentMoveIndices else { return nil }
+    /// The first event whose folder is no longer the recorded one (event id →
+    /// folder path), or nil when they all are.
+    private func eventMoved(since recorded: [String: String]) -> SavedCameraEvent? {
         let locations = self.locations
+        for (idText, path) in recorded {
+            guard let id = UUID(uuidString: idText), let owner = event(id) else { continue }
+            if locations.eventFolder(for: owner, policy: locations.resolvedPolicy(for: owner)).path != path { return owner }
+        }
+        return nil
+    }
+
+    private func eventRenamedSince(_ journal: DriveMoveJournal) -> SavedCameraEvent? {
+        let locations = self.locations
+        // The folders the events kept when the action ran, where recorded.
+        if let renamed = eventMoved(since: journal.eventFolders ?? [:]) { return renamed }
+        guard let indices = journal.assignmentMoveIndices else { return nil }
         let completed = Set(journal.completedIndices)
         func matches(_ path: String, _ assignment: PhotoEventAssignment) -> Bool {
             guard let event = event(assignment.eventID) else { return true }
@@ -3919,10 +3952,13 @@ final class EventsWorkspace {
     /// (or starts one) and then runs the same move — it is never dropped.
     private func queueMove(_ stackIDs: Set<String>, from: SavedCameraEvent, to: SavedCameraEvent) {
         model.statusMessage = "Move to \(eventTitle(to)) queued — \(eventTitle(from)) is still loading. It runs as soon as the board appears."
+        let landedAtClick = landedMoveCount
         Task { @MainActor [weak self] in
             guard let self else { return }
             await waitForBoard(from.id)
-            moveLoadedStacks(visibleSelection(stackIDs, on: from.id), from: from, to: to)
+            // A move that landed while this click waited for its board has
+            // patched the boards this one is about to patch: read them again.
+            moveLoadedStacks(visibleSelection(stackIDs, on: from.id), from: from, to: to, overlapsEarlier: landedMoveCount != landedAtClick)
         }
     }
 
@@ -4024,7 +4060,12 @@ final class EventsWorkspace {
     /// (`startPendingMoves`) — queued, with a line saying behind what, when
     /// another job holds the gate. The catalog changes when the rename
     /// lands, not before.
-    private func moveLoadedStacks(_ targetStacks: [OrganizeStack], from: SavedCameraEvent, to: SavedCameraEvent) {
+    private func moveLoadedStacks(
+        _ targetStacks: [OrganizeStack],
+        from: SavedCameraEvent,
+        to: SavedCameraEvent,
+        overlapsEarlier: Bool = false
+    ) {
         let targetEventID = to.id
         let title = "Move to \(eventTitle(to))"
         let selectedNames = targetStacks.flatMap(\.files).map(\.name)
@@ -4152,13 +4193,14 @@ final class EventsWorkspace {
             endOptimisticMove(move)
             applyAssignmentChange(change, touching: targetEventID, patchBoards: false)
             stampBoards(of: move)
+            landedMoveCount += 1
             pushUndo(change)
             var outcome = EventMoveOutcome()
             outcome.moved = items
             model.statusMessage = summaryLine(outcome, move: move)
             return
         }
-        if !pendingMoves.isEmpty {
+        if !pendingMoves.isEmpty || overlapsEarlier {
             move.overlapped = true
             for index in pendingMoves.indices { pendingMoves[index].overlapped = true }
         }
@@ -4388,6 +4430,18 @@ final class EventsWorkspace {
         }
     }
 
+    /// Where each of these events keeps its folder right now, for a journal.
+    private func eventFolderSnapshot(_ ids: Set<UUID>) -> [String: String] {
+        let locations = self.locations
+        var folders: [String: String] = [:]
+        for id in ids {
+            if let event = event(id) {
+                folders[id.uuidString] = locations.eventFolder(for: event, policy: locations.resolvedPolicy(for: event)).path
+            }
+        }
+        return folders
+    }
+
     private func runMoveJob(_ move: PendingEventMove) -> UUID? {
         let targetEventID = move.to.id
         let items = itemsWithCurrentNameClashes(move)
@@ -4419,6 +4473,7 @@ final class EventsWorkspace {
         let targetAssignments = needsClashInputs ? Array(assignmentsByName(inEvent: targetEventID).values) : []
         let toEvent = move.to
         let moveID = move.id
+        let folders = eventFolderSnapshot(move.sourceIDs.union([move.to.id]))
         let nasRoot = locations.nasRoot
         let queuedRenames = NASQueuedRenames()
         return model.runBackgroundJob(
@@ -4455,7 +4510,8 @@ final class EventsWorkspace {
                     pruneBoundaries: boundaries,
                     protectedPathKeys: protectedKeys,
                     takenPathKeys: takenKeys,
-                    trashContext: trashContext
+                    trashContext: trashContext,
+                    eventFolders: folders
                 ) { update in
                     progress(DashboardModel.jobUpdate(from: update, notePrefix: "Moving", command: ""))
                 }
@@ -4497,6 +4553,7 @@ final class EventsWorkspace {
             return EventMoveWording.summary(outcome, from: fromTitle, to: toTitle)
         }
         pendingMoves[index].isLanded = true
+        landedMoveCount += 1
         let move = pendingMoves[index]
         let title = move.title
         if !outcome.stayed.isEmpty {
@@ -4521,7 +4578,8 @@ final class EventsWorkspace {
                 title: title,
                 removed: outcome.moved.map(\.removed),
                 added: outcome.moved.map(\.added),
-                nasLink: outcome.moved.contains { $0.nasCopy != nil } ? moveID : nil
+                nasLink: outcome.moved.contains { $0.nasCopy != nil } ? moveID : nil,
+                eventFolders: outcome.moved.contains { $0.nasCopy != nil } ? eventFolderSnapshot(move.sourceIDs.union([move.to.id])) : nil
             ))
         }
         let trashed = (outcome.trashBatch?.entries ?? []).map { EventStorageLocations.pathKey($0.originalAbsolutePath) }
@@ -4822,6 +4880,7 @@ final class EventsWorkspace {
         let plannedMoves = moves
         let plannedRemoved = removed
         let plannedSources = removedSources
+        let plannedFolders = eventFolderSnapshot(owners)
         model.runBackgroundJob(
             action: .organize,
             runningNote: "Returning \(moves.count) file(s) to their unsorted folders",
@@ -4835,6 +4894,7 @@ final class EventsWorkspace {
                     removedAssignments: plannedRemoved,
                     addedAssignments: [],
                     assignmentMoveSources: plannedSources,
+                    eventFolders: plannedFolders,
                     pruneBoundaries: boundaries
                 ) { update in
                     progress(DashboardModel.jobUpdate(from: update, notePrefix: "Returning", command: ""))
