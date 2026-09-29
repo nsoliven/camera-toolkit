@@ -1686,6 +1686,64 @@ extension DashboardModel {
         scheduleCatalogSync(configuration: next)
     }
 
+    /// Swaps assignments in place — the catalog change a move or a sort is —
+    /// without `updateConfiguration`'s whole-configuration copy and two
+    /// full-library comparisons (`removed` and `added` are known to differ,
+    /// so there is nothing to compare). One pass over the assignments that
+    /// looks at each element's event id first, so only the few rows that
+    /// can match ever build an asset-id string. An added row whose asset id
+    /// the library already has is skipped, exactly as before.
+    /// Returns what actually changed: the rows that were there to remove
+    /// and the rows that were new.
+    @discardableResult
+    func replaceAssignments(
+        removing removed: [PhotoEventAssignment],
+        adding added: [PhotoEventAssignment],
+        touching eventID: UUID? = nil
+    ) -> (removed: [PhotoEventAssignment], added: [PhotoEventAssignment]) {
+        guard !removed.isEmpty || !added.isEmpty else { return ([], []) }
+        let removedIDs = Set(removed.map(CatalogStore.eventAssetID))
+        let removedEvents = Set(removed.map(\.eventID))
+        let addedEvents = Set(added.map(\.eventID))
+        let watchedEvents = removedEvents.union(addedEvents)
+        var existingInAddedEvents: Set<String> = []
+        var actuallyRemoved: [PhotoEventAssignment] = []
+        var actuallyAdded: [PhotoEventAssignment] = []
+        var index = 0
+        var assignments = configuration.photoEventAssignments
+        configuration.photoEventAssignments = []
+        var kept = 0
+        while index < assignments.count {
+            let assignment = assignments[index]
+            index += 1
+            if watchedEvents.contains(assignment.eventID) {
+                let id = CatalogStore.eventAssetID(assignment)
+                if removedEvents.contains(assignment.eventID), removedIDs.contains(id) {
+                    actuallyRemoved.append(assignment)
+                    continue
+                }
+                if addedEvents.contains(assignment.eventID) { existingInAddedEvents.insert(id) }
+            }
+            assignments[kept] = assignment
+            kept += 1
+        }
+        assignments.removeLast(assignments.count - kept)
+        for assignment in added where existingInAddedEvents.insert(CatalogStore.eventAssetID(assignment)).inserted {
+            assignments.append(assignment)
+            actuallyAdded.append(assignment)
+        }
+        configuration.photoEventAssignments = assignments
+        if let eventID, let position = configuration.savedEvents.firstIndex(where: { $0.id == eventID }) {
+            configuration.savedEvents[position].lastUsedAt = Date()
+        }
+        configurationRevision &+= 1
+        catalogStateRevision &+= 1
+        noteCatalogWrite()
+        scheduleConfigurationSave()
+        scheduleCatalogSync(configuration: configuration)
+        return (actuallyRemoved, actuallyAdded)
+    }
+
     /// Config JSON writes are debounced so a burst of mutations (sorting,
     /// event edits, Settings changes) costs one disk write shortly after the
     /// last change. The write runs on the main actor, so saves stay in order;

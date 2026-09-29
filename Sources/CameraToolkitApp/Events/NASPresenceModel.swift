@@ -14,6 +14,11 @@ enum NASPresenceTrigger: String, Sendable {
     /// A file job other than Sync to NAS finished — drive files may have
     /// changed, so the counts are redone; the NAS itself was not written.
     case jobFinished
+    /// A job that only renamed files on the drives (a move, an Apply)
+    /// finished: what is not on the NAS is recounted from the drive plan
+    /// and Sync to NAS's records, and the NAS is never listed for it —
+    /// nothing on it changed.
+    case bufferChanged
     /// Sync to NAS finished: its folders are listed again, unthrottled.
     case syncFinished
     /// Check Again.
@@ -23,7 +28,7 @@ enum NASPresenceTrigger: String, Sendable {
     var isAutomatic: Bool { self != .manual && self != .syncFinished }
 
     /// Whether the counts are worth redoing even when the NAS is not listed.
-    var recountsWithoutListing: Bool { self == .launch || self == .jobFinished }
+    var recountsWithoutListing: Bool { self == .launch || self == .jobFinished || self == .bufferChanged }
 }
 
 /// When a NAS presence check may list the NAS. Pure, so the throttle can
@@ -127,10 +132,11 @@ final class NASPresenceModel {
             switch trigger {
             case .boardOpened: 0
             case .mounted: 1
-            case .jobFinished: 2
-            case .launch: 3
-            case .syncFinished: 4
-            case .manual: 5
+            case .bufferChanged: 2
+            case .jobFinished: 3
+            case .launch: 4
+            case .syncFinished: 5
+            case .manual: 6
             }
         }
     }
@@ -143,6 +149,18 @@ final class NASPresenceModel {
             request = waiting.merged(with: request)
         }
         guard let context = context?() else { return }
+        // A drive-only change recounts from local data. It waits behind a
+        // running check or NAS job like any other, but is never a reason
+        // to list the NAS.
+        if request.trigger == .bufferChanged {
+            guard !context.nasJobRunning, !isChecking else {
+                waiting = request
+                return
+            }
+            waiting = nil
+            start(request, context: context, list: false)
+            return
+        }
         let decision = NASPresenceSchedule.decide(
             trigger: request.trigger,
             now: now(),
@@ -181,7 +199,8 @@ final class NASPresenceModel {
     /// A job finished. Sync to NAS asks for its own scoped check instead.
     func jobFinished(_ action: JobAction) {
         guard action != .syncBuffer else { return }
-        refresh(.jobFinished)
+        // Renames on the drives never write the NAS: recount, do not list.
+        refresh(action == .organize ? .bufferChanged : .jobFinished)
     }
 
     /// Sync to NAS just proved these files on the NAS: the listing learns

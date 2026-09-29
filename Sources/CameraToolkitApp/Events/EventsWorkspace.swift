@@ -188,6 +188,80 @@ private struct AssignmentChange {
     var added: [PhotoEventAssignment]
 }
 
+/// `EventStorageLocations`' per-file path helpers with the per-event work
+/// done once: `originalsRoot` and `layout` rebuild the event's folder chain
+/// and format its dates on every call, which dominated planning a move —
+/// one root per (event, camera, drive) and one layout per (event, camera)
+/// answer every file after that with a string join.
+private struct EventPathCache {
+    let locations: EventStorageLocations
+    private var roots: [String: URL] = [:]
+    private var layouts: [String: OrganizedArchiveLayout] = [:]
+
+    init(locations: EventStorageLocations) {
+        self.locations = locations
+    }
+
+    private mutating func originalsRoot(_ event: SavedCameraEvent, _ deviceID: String?, _ policy: EventStoragePolicy) -> URL {
+        let key = "\(event.id.uuidString)\u{0}\(deviceID ?? "")\u{0}\(policy.rawValue)"
+        if let cached = roots[key] { return cached }
+        let built = locations.originalsRoot(for: event, deviceID: deviceID, policy: policy)
+        roots[key] = built
+        return built
+    }
+
+    mutating func originalsRootPath(_ event: SavedCameraEvent, _ deviceID: String?, _ policy: EventStoragePolicy) -> String {
+        originalsRoot(event, deviceID, policy).path
+    }
+
+    /// `EventStorageLocations.driveURL`, without the per-file root rebuild.
+    mutating func driveURL(for assignment: PhotoEventAssignment, event: SavedCameraEvent, policy: EventStoragePolicy) -> URL? {
+        guard (try? PathSafety.validateRelativePath(assignment.relativePath)) != nil else { return nil }
+        return originalsRoot(event, assignment.deviceID, policy)
+            .appendingPathComponent(assignment.relativePath, isDirectory: false)
+            .standardizedFileURL
+    }
+
+    /// `EventStorageLocations.archiveURL`, without the per-file layout.
+    mutating func archiveURL(for assignment: PhotoEventAssignment, event: SavedCameraEvent) -> URL? {
+        let key = "\(event.id.uuidString)\u{0}\(assignment.deviceID ?? "")"
+        let layout = layouts[key] ?? {
+            let built = locations.layout(for: event, deviceID: assignment.deviceID)
+            layouts[key] = built
+            return built
+        }()
+        guard let relative = try? layout.mirrorRelativePath(for: assignment.relativePath) else { return nil }
+        return locations.nasRoot.appendingPathComponent(relative, isDirectory: false).standardizedFileURL
+    }
+}
+
+/// One clicked Move to Event, from the click until its rename settles.
+private struct PendingEventMove {
+    let id = UUID()
+    var from: SavedCameraEvent
+    var to: SavedCameraEvent
+    var title: String
+    var items: [EventMoveItem]
+    /// The stacks as the source board showed them at the click.
+    var stacks: [OrganizeStack]
+    /// Boards the stacks left / joined, and boards whose running sweep the
+    /// click dropped (they are re-checked when the move settles).
+    var leftBoards: [UUID] = []
+    var joinedBoards: [UUID] = []
+    var interruptedBoards: [UUID] = []
+    var overlayKeys: [String] = []
+    var isRunning = false
+    var isLanded = false
+
+    init(from: SavedCameraEvent, to: SavedCameraEvent, title: String, items: [EventMoveItem], stacks: [OrganizeStack]) {
+        self.from = from
+        self.to = to
+        self.title = title
+        self.items = items
+        self.stacks = stacks
+    }
+}
+
 /// A grid built from the catalog-implied `Originals/<Camera>` paths, before any
 /// place has been probed. Pass one of an event open paints the first
 /// screen of one of these; the deferred pass builds the whole event's.
@@ -401,6 +475,19 @@ final class EventsWorkspace {
     @ObservationIgnored private var indexRevision = -1
     @ObservationIgnored private var indexCount = -1
     @ObservationIgnored private var assignmentsByPathKey: [String: PhotoEventAssignment] = [:]
+    /// Clicked Move to Event batches that have not landed: tiles already
+    /// moved in memory, rename running or queued behind another job.
+    @ObservationIgnored private var pendingMoves: [PendingEventMove] = []
+    @ObservationIgnored private var assignmentsByEventAndName: [UUID: [String: PhotoEventAssignment]] = [:]
+    /// Files whose Move to Event is clicked but not yet renamed, by their
+    /// board path key → the event they are headed to. The catalog changes
+    /// only when the rename lands (a crash between the two must never leave
+    /// an assignment pointing at a folder the file is not in); until then
+    /// the boards and counts read through this overlay.
+    private(set) var moveOverlayRevision = 0
+    @ObservationIgnored private var optimisticOwners: [String: UUID] = [:]
+    @ObservationIgnored private var optimisticCounts: [UUID: Int] = [:]
+    @ObservationIgnored private var optimisticBytes: [UUID: Int64] = [:]
     @ObservationIgnored private var assignmentCounts: [UUID: Int] = [:]
     @ObservationIgnored private var assignmentBytes: [UUID: Int64] = [:]
     @ObservationIgnored private var eventAssetsByPathKey: [UUID: [String: EventAssetPresence]] = [:]
@@ -532,8 +619,16 @@ final class EventsWorkspace {
         nasConnection.isNASInUse = { [weak self] in self?.nasIsInUse ?? true }
         nasPresence.context = { [weak self] in self?.nasPresenceContext }
         nasPresence.onReportChanged = { [weak self] old, new in self?.nasPresenceChanged(from: old, to: new) }
-        model.onJobStarted = { [weak self] _ in self?.nasPresence.pauseForJob() }
-        model.onJobFinished = { [weak self] action in self?.nasPresence.jobFinished(action) }
+        // A job that only renames files on the drives never writes the
+        // NAS, so it neither pauses a NAS listing nor triggers a new one.
+        model.onJobStarted = { [weak self] action in
+            guard action != .organize else { return }
+            self?.nasPresence.pauseForJob()
+        }
+        model.onJobFinished = { [weak self] action in
+            self?.nasPresence.jobFinished(action)
+            self?.startPendingMoves()
+        }
     }
 
     @ObservationIgnored private let faceLabelsRestoredObserver = MountObserverBox()
@@ -872,10 +967,86 @@ final class EventsWorkspace {
         return paths
     }
 
-    static func sourceKey(_ assignment: PhotoEventAssignment) -> String {
+    nonisolated static func sourceKey(_ assignment: PhotoEventAssignment) -> String {
         EventStorageLocations.pathKey(
-            (DashboardModel.expandedPath(assignment.sourceRootPath) as NSString).appendingPathComponent(assignment.relativePath)
+            (NSString(string: assignment.sourceRootPath).expandingTildeInPath as NSString).appendingPathComponent(assignment.relativePath)
         )
+    }
+
+    /// Every place one assignment's file can be drawn from, as path keys:
+    /// its own source path first, then the implied `Originals/<Camera>`
+    /// (or legacy `Card Copy`) copies on either drive and the NAS mirror
+    /// and legacy archive copies. `pathKey` walks the filesystem — realpath
+    /// stats every component, and a NAS path answers in milliseconds — but
+    /// every root joined here was standardized once already (the drive and
+    /// staging roots at `EventStorageLocations.init`, the source roots
+    /// below), so for a clean relative path the key is a string join plus a
+    /// lowercase; only a rare unclean one pays for realpath. One root per
+    /// event and camera — building it per file redoes the date formatting
+    /// 13,000 times.
+    private struct AssignmentKeyBuilder {
+        let locations: EventStorageLocations
+        var sourceRoots: [String: String] = [:]
+        var cardRoots: [String: String] = [:]
+        var archiveLayouts: [String: OrganizedArchiveLayout] = [:]
+
+        init(locations: EventStorageLocations) {
+            self.locations = locations
+        }
+
+        mutating func sourceKey(for assignment: PhotoEventAssignment) -> String {
+            let rootPath: String
+            if let cached = sourceRoots[assignment.sourceRootPath] {
+                rootPath = cached
+            } else {
+                rootPath = URL(fileURLWithPath: NSString(string: assignment.sourceRootPath).expandingTildeInPath, isDirectory: true)
+                    .standardizedFileURL.path
+                sourceRoots[assignment.sourceRootPath] = rootPath
+            }
+            return EventStorageLocations.joinedPathKey(rootPath: rootPath, relativePath: assignment.relativePath)
+                ?? EventStorageLocations.pathKey(rootPath + "/" + assignment.relativePath)
+        }
+
+        /// The copies the board's tiles point at instead of the import
+        /// path. Empty when the owner is unknown or the path is unsafe.
+        mutating func impliedKeys(for assignment: PhotoEventAssignment, owner: SavedCameraEvent?) -> [String] {
+            guard let owner, (try? PathSafety.validateRelativePath(assignment.relativePath)) != nil else { return [] }
+            var keys: [String] = []
+            func add(_ root: String, _ relative: String) {
+                keys.append(
+                    EventStorageLocations.joinedPathKey(rootPath: root, relativePath: relative)
+                        ?? EventStorageLocations.pathKey(root + "/" + relative)
+                )
+            }
+            for policy in [EventStoragePolicy.buffer, .archiveOnly] {
+                for legacy in [false, true] {
+                    let cacheKey = "\(owner.id.uuidString)\u{0}\(assignment.deviceID ?? "")\u{0}\(policy.rawValue)\u{0}\(legacy)"
+                    let rootPath = cardRoots[cacheKey] ?? {
+                        let built = (legacy
+                            ? locations.legacyCardCopyRoot(for: owner, deviceID: assignment.deviceID, policy: policy)
+                            : locations.originalsRoot(for: owner, deviceID: assignment.deviceID, policy: policy)).path
+                        cardRoots[cacheKey] = built
+                        return built
+                    }()
+                    add(rootPath, assignment.relativePath)
+                }
+            }
+            let layoutKey = "\(owner.id.uuidString)\u{0}\(assignment.deviceID ?? "")"
+            let layout = archiveLayouts[layoutKey] ?? {
+                let built = locations.layout(for: owner, deviceID: assignment.deviceID)
+                archiveLayouts[layoutKey] = built
+                return built
+            }()
+            // The NAS mirror copy, and the legacy archive copy an event
+            // archived before the mirror layout still has.
+            if let relative = try? layout.mirrorRelativePath(for: assignment.relativePath) {
+                add(locations.nasRoot.path, relative)
+            }
+            if let relative = try? layout.legacyArchiveRelativePath(for: assignment.relativePath) {
+                add(locations.libraryRoot.path, relative)
+            }
+            return keys
+        }
     }
 
     private func refreshIndexIfNeeded() {
@@ -885,32 +1056,14 @@ final class EventsWorkspace {
         index.reserveCapacity(assignments.count * 2)
         var counts: [UUID: Int] = [:]
         var bytes: [UUID: Int64] = [:]
-        // `pathKey` walks the filesystem: realpath stats every component,
-        // and a NAS path answers in milliseconds. Every root joined below
-        // was already standardized once — the drive/staging roots at
-        // `EventStorageLocations.init` and the source roots here — so for
-        // a clean relative path the resolved key is a string join plus a
-        // lowercase. Only a rare unclean relative path pays for realpath.
-        var sourceRoots: [String: String] = [:]
-        func sourceRoot(_ raw: String) -> String {
-            if let cached = sourceRoots[raw] { return cached }
-            let built = URL(fileURLWithPath: DashboardModel.expandedPath(raw), isDirectory: true)
-                .standardizedFileURL.path
-            sourceRoots[raw] = built
-            return built
-        }
-        func insert(_ key: String?, _ assignment: PhotoEventAssignment) {
-            guard let key, index[key] == nil else { return }
+        var builder = AssignmentKeyBuilder(locations: locations)
+        func insert(_ key: String, _ assignment: PhotoEventAssignment) {
+            guard index[key] == nil else { return }
             index[key] = assignment
         }
         for assignment in assignments {
             autoreleasepool {
-                let rootPath = sourceRoot(assignment.sourceRootPath)
-                if let key = EventStorageLocations.joinedPathKey(rootPath: rootPath, relativePath: assignment.relativePath) {
-                    insert(key, assignment)
-                } else {
-                    insert(EventStorageLocations.pathKey(rootPath + "/" + assignment.relativePath), assignment)
-                }
+                insert(builder.sourceKey(for: assignment), assignment)
                 counts[assignment.eventID, default: 0] += 1
                 bytes[assignment.eventID, default: 0] += assignment.fileSize
             }
@@ -919,67 +1072,97 @@ final class EventsWorkspace {
         // a not-yet-migrated legacy Card Copy, or the NAS), not at the path
         // the file was imported from. Index those too, without letting them
         // steal a source path that already belongs to a different
-        // assignment. One root per event and camera — building it per file
-        // redoes the date formatting 13,000 times.
-        let eventsByID = Dictionary(uniqueKeysWithValues: model.configuration.savedEvents.map { ($0.id, $0) })
-        var cardRoots: [String: String] = [:]
-        var archiveLayouts: [String: OrganizedArchiveLayout] = [:]
+        // assignment.
+        let eventsByID = self.eventsByID
         for assignment in assignments {
             autoreleasepool {
-                guard let owner = eventsByID[assignment.eventID],
-                      (try? PathSafety.validateRelativePath(assignment.relativePath)) != nil else { return }
-                for policy in [EventStoragePolicy.buffer, .archiveOnly] {
-                    for legacy in [false, true] {
-                        let cacheKey = "\(owner.id.uuidString)\u{0}\(assignment.deviceID ?? "")\u{0}\(policy.rawValue)\u{0}\(legacy)"
-                        let rootPath = cardRoots[cacheKey] ?? {
-                            let built = (legacy
-                                ? locations.legacyCardCopyRoot(for: owner, deviceID: assignment.deviceID, policy: policy)
-                                : locations.originalsRoot(for: owner, deviceID: assignment.deviceID, policy: policy)).path
-                            cardRoots[cacheKey] = built
-                            return built
-                        }()
-                        if let key = EventStorageLocations.joinedPathKey(rootPath: rootPath, relativePath: assignment.relativePath) {
-                            insert(key, assignment)
-                        } else {
-                            insert(EventStorageLocations.pathKey(rootPath + "/" + assignment.relativePath), assignment)
-                        }
-                    }
-                }
-                let layoutKey = "\(owner.id.uuidString)\u{0}\(assignment.deviceID ?? "")"
-                let layout = archiveLayouts[layoutKey] ?? {
-                    let built = locations.layout(for: owner, deviceID: assignment.deviceID)
-                    archiveLayouts[layoutKey] = built
-                    return built
-                }()
-                // The NAS mirror copy, and the legacy archive copy an event
-                // archived before the mirror layout still has. `relative` is
-                // assembled from validated components and sanitized folder
-                // names, and both roots are standardized — the archive keys
-                // are string joins too.
-                for (root, relative) in [
-                    (locations.nasRoot.path, try? layout.mirrorRelativePath(for: assignment.relativePath)),
-                    (locations.libraryRoot.path, try? layout.legacyArchiveRelativePath(for: assignment.relativePath)),
-                ] {
-                    guard let relative else { continue }
-                    if let key = EventStorageLocations.joinedPathKey(rootPath: root, relativePath: relative) {
-                        insert(key, assignment)
-                    } else {
-                        insert(EventStorageLocations.pathKey(root + "/" + relative), assignment)
-                    }
+                for key in builder.impliedKeys(for: assignment, owner: eventsByID[assignment.eventID]) {
+                    insert(key, assignment)
                 }
             }
         }
         assignmentsByPathKey = index
         assignmentCounts = counts
         assignmentBytes = bytes
+        assignmentsByEventAndName = [:]
         indexRevision = model.catalogStateRevision
         indexCount = assignments.count
     }
 
+    /// Whether the lookup indexes match the catalog right now — read
+    /// before a catalog change so `patchAssignmentIndex` knows it may patch.
+    private var assignmentIndexIsCurrent: Bool {
+        indexRevision == model.catalogStateRevision && indexCount == model.configuration.photoEventAssignments.count
+    }
+
+    /// Brings the lookup indexes in step with a catalog change that just
+    /// landed, touching only the rows that changed instead of rebuilding
+    /// ~17,000 assignments' worth of keys. `wasCurrent` is whether the
+    /// indexes matched the catalog right before the change; when they did
+    /// not, the next read rebuilds as it always did. A key another
+    /// assignment shadowed comes back on the next full rebuild, not here.
+    private func patchAssignmentIndex(removed: [PhotoEventAssignment], added: [PhotoEventAssignment], wasCurrent: Bool) {
+        guard wasCurrent else { return }
+        var builder = AssignmentKeyBuilder(locations: locations)
+        let eventsByID = self.eventsByID
+        let removedIDs = Set(removed.map(CatalogStore.eventAssetID))
+        for assignment in removed {
+            let keys = [builder.sourceKey(for: assignment)] + builder.impliedKeys(for: assignment, owner: eventsByID[assignment.eventID])
+            for key in keys {
+                if let owner = assignmentsByPathKey[key], removedIDs.contains(CatalogStore.eventAssetID(owner)) {
+                    assignmentsByPathKey[key] = nil
+                }
+            }
+            assignmentCounts[assignment.eventID, default: 0] -= 1
+            assignmentBytes[assignment.eventID, default: 0] -= assignment.fileSize
+            let name = assignment.relativePath.lowercased()
+            if let named = assignmentsByEventAndName[assignment.eventID]?[name],
+               removedIDs.contains(CatalogStore.eventAssetID(named)) {
+                assignmentsByEventAndName[assignment.eventID]?[name] = nil
+            }
+        }
+        for assignment in added {
+            let source = builder.sourceKey(for: assignment)
+            if assignmentsByPathKey[source] == nil { assignmentsByPathKey[source] = assignment }
+            for key in builder.impliedKeys(for: assignment, owner: eventsByID[assignment.eventID]) where assignmentsByPathKey[key] == nil {
+                assignmentsByPathKey[key] = assignment
+            }
+            assignmentCounts[assignment.eventID, default: 0] += 1
+            assignmentBytes[assignment.eventID, default: 0] += assignment.fileSize
+            let name = assignment.relativePath.lowercased()
+            if assignmentsByEventAndName[assignment.eventID] != nil, assignmentsByEventAndName[assignment.eventID]?[name] == nil {
+                assignmentsByEventAndName[assignment.eventID]?[name] = assignment
+            }
+        }
+        indexRevision = model.catalogStateRevision
+        indexCount = model.configuration.photoEventAssignments.count
+    }
+
+    /// One event's assignments by lowercased relative path — what a move
+    /// checks a destination name against. Built the first time an event is
+    /// asked about (one pass) and kept in step by `patchAssignmentIndex`,
+    /// so a move no longer scans every assignment in the library.
+    func assignmentsByName(inEvent eventID: UUID) -> [String: PhotoEventAssignment] {
+        refreshIndexIfNeeded()
+        if let cached = assignmentsByEventAndName[eventID] { return cached }
+        var names: [String: PhotoEventAssignment] = [:]
+        for assignment in model.configuration.photoEventAssignments where assignment.eventID == eventID {
+            let name = assignment.relativePath.lowercased()
+            if names[name] == nil { names[name] = assignment }
+        }
+        assignmentsByEventAndName[eventID] = names
+        return names
+    }
+
     func assignment(for file: OrganizeFile) -> PhotoEventAssignment? {
         refreshIndexIfNeeded()
-        guard let assignment = assignmentsByPathKey[file.pathKey],
+        _ = moveOverlayRevision
+        guard var assignment = assignmentsByPathKey[file.pathKey],
               assignment.fileSize == file.size else { return nil }
+        // A tile that already left for another event while its rename runs
+        // answers as that event's, so its color dot and menus agree with
+        // the board it is drawn on.
+        if let owner = optimisticOwners[file.pathKey] { assignment.eventID = owner }
         return assignment
     }
 
@@ -988,12 +1171,14 @@ final class EventsWorkspace {
     /// parent's files.
     func assignmentCount(for eventID: UUID) -> Int {
         refreshIndexIfNeeded()
-        return scopeIDs(eventID).reduce(0) { $0 + (assignmentCounts[$1] ?? 0) }
+        _ = moveOverlayRevision
+        return scopeIDs(eventID).reduce(0) { $0 + (assignmentCounts[$1] ?? 0) + (optimisticCounts[$1] ?? 0) }
     }
 
     func assignmentBytes(for eventID: UUID) -> Int64 {
         refreshIndexIfNeeded()
-        return scopeIDs(eventID).reduce(Int64(0)) { $0 + (assignmentBytes[$1] ?? 0) }
+        _ = moveOverlayRevision
+        return scopeIDs(eventID).reduce(Int64(0)) { $0 + (assignmentBytes[$1] ?? 0) + (optimisticBytes[$1] ?? 0) }
     }
 
     func assignedEvent(for stack: OrganizeStack) -> (event: SavedCameraEvent?, mixed: Bool) {
@@ -1954,22 +2139,26 @@ final class EventsWorkspace {
         }
     }
 
-    private func applyAssignmentChange(_ change: AssignmentChange, touching eventID: UUID?, addedItems: [OrganizeItem] = []) {
-        let removedIDs = Set(change.removed.map(CatalogStore.eventAssetID))
-        model.updateConfiguration { configuration in
-            if !removedIDs.isEmpty {
-                configuration.photoEventAssignments.removeAll { removedIDs.contains(CatalogStore.eventAssetID($0)) }
-            }
-            if !change.added.isEmpty {
-                let existing = Set(configuration.photoEventAssignments.map(CatalogStore.eventAssetID))
-                configuration.photoEventAssignments.append(
-                    contentsOf: change.added.filter { !existing.contains(CatalogStore.eventAssetID($0)) }
-                )
-            }
-            if let eventID, let index = configuration.savedEvents.firstIndex(where: { $0.id == eventID }) {
-                configuration.savedEvents[index].lastUsedAt = Date()
-            }
+    /// `patchBoards: false` is for a caller that already moved the tiles
+    /// itself (an optimistic Move to Event) and only needs the catalog and
+    /// the lookup indexes brought in step.
+    private func applyAssignmentChange(
+        _ change: AssignmentChange,
+        touching eventID: UUID?,
+        addedItems: [OrganizeItem] = [],
+        patchBoards: Bool = true
+    ) {
+        let wasCurrent = assignmentIndexIsCurrent
+        let revisionBefore = model.configurationRevision
+        let applied = model.replaceAssignments(removing: change.removed, adding: change.added, touching: eventID)
+        // Assignments are not part of what `EventStorageLocations` is built
+        // from (roots, event names, dates, parents), so the resolver stays
+        // valid across this change — no rebuild, no root stats.
+        if let cached = locationsCache, cached.revision == revisionBefore {
+            locationsCache = (model.configurationRevision, cached.locations)
         }
+        patchAssignmentIndex(removed: applied.removed, added: applied.added, wasCurrent: wasCurrent)
+        guard patchBoards else { return }
         // Open boards update in place — no refresh, no sweep, no grid
         // rebuild. Removed files leave every board by file identity, and
         // a board that already displays files gains the items it just
@@ -3008,13 +3197,7 @@ final class EventsWorkspace {
     /// True when another assignment in the same event resolves to the same
     /// event file (same device folder and relative path).
     private func hasOtherAssignment(pointingLike assignment: PhotoEventAssignment) -> Bool {
-        let key = Self.sourceKey(assignment)
-        return model.configuration.photoEventAssignments.contains { other in
-            other.eventID == assignment.eventID
-                && other.deviceID == assignment.deviceID
-                && other.relativePath.lowercased() == assignment.relativePath.lowercased()
-                && Self.sourceKey(other) != key
-        }
+        Self.hasOtherAssignment(pointingLike: assignment, in: model.configuration.photoEventAssignments)
     }
 
     /// The Apply sheet's primary button with the owner's choices for taken
@@ -3185,6 +3368,17 @@ final class EventsWorkspace {
         latestMoveJournalTitle = DriveMoveService.latestUndoableJournal(in: self.journalFolder)?.journal.title
     }
 
+    /// `refreshLatestJournal` with the folder read off the main actor.
+    func refreshLatestJournalInBackground() {
+        let folder = journalFolder
+        Task { @MainActor [weak self] in
+            let title = await Task.detached(priority: .userInitiated) {
+                DriveMoveService.latestUndoableJournal(in: folder)?.journal.title
+            }.value
+            self?.latestMoveJournalTitle = title
+        }
+    }
+
     /// A rename batch landed, straight from the move report: every stack
     /// the boards already show repoints at the destination paths and the
     /// tile loader reroutes decodes off the vacated ones, so an open
@@ -3306,27 +3500,21 @@ final class EventsWorkspace {
     /// the file was drawn at — and `.missing` elsewhere, so a plan never
     /// points a rename at a location the sweep never verified. When the file
     /// is not actually there anymore, the rename's own preflight skips it
-    /// and the completion reports why.
+    /// and the completion reports why. The assignment behind each file comes
+    /// from the path-key index — one lookup per file, never a scan of the
+    /// library.
     private func catalogAssets(for stacks: [OrganizeStack], in event: SavedCameraEvent) -> [MoveCandidate] {
+        refreshIndexIfNeeded()
         let locations = self.locations
+        var paths = EventPathCache(locations: locations)
         let policy = locations.resolvedPolicy(for: event)
         let otherPolicy: EventStoragePolicy = policy == .buffer ? .archiveOnly : .buffer
-        var byPath: [String: PhotoEventAssignment] = [:]
-        for assignment in model.configuration.photoEventAssignments where assignment.eventID == event.id {
-            for url in [
-                locations.sourceURL(for: assignment),
-                locations.driveURL(for: assignment, event: event, policy: policy),
-                locations.driveURL(for: assignment, event: event, policy: otherPolicy),
-                locations.archiveURL(for: assignment, event: event)
-            ] {
-                if let path = url?.path { byPath[path] = assignment }
-            }
-        }
         return stacks.flatMap(\.files).compactMap { file in
-            guard let assignment = byPath[file.path] else { return nil }
+            guard let assignment = assignmentsByPathKey[file.pathKey],
+                  assignment.eventID == event.id, assignment.fileSize == file.size else { return nil }
             let source = locations.sourceURL(for: assignment)?.path
-            let drive = locations.driveURL(for: assignment, event: event, policy: policy)?.path
-            let other = locations.driveURL(for: assignment, event: event, policy: otherPolicy)?.path
+            let drive = paths.driveURL(for: assignment, event: event, policy: policy)?.path
+            let other = paths.driveURL(for: assignment, event: event, policy: otherPolicy)?.path
             let sourceIsDriveCopy = [drive, other].contains { candidate in
                 guard let candidate, let source else { return false }
                 return candidate == source
@@ -3349,9 +3537,20 @@ final class EventsWorkspace {
     /// target's file stays and the extra one goes to the drive's `_Trash` —
     /// and a different photo moves in under a free "(N)" name
     /// (`EventMoveService`). Only a file that cannot be read stays behind.
+    ///
+    /// The click does only the planning, then the tiles change boards in
+    /// memory at once (`beginOptimisticMove`) and the rename runs as a job
+    /// (`startPendingMoves`) — queued, with a line saying behind what, when
+    /// another job holds the gate. The catalog changes when the rename
+    /// lands, not before.
     private func moveLoadedStacks(_ targetStacks: [OrganizeStack], from: SavedCameraEvent, to: SavedCameraEvent) {
         let sourceEventID = from.id
         let targetEventID = to.id
+        let inFlight = pendingMoveStackIDs
+        guard inFlight.isDisjoint(with: targetStacks.map(\.id)) else {
+            model.statusMessage = "Those files are already moving. Give it a moment, then move them again if they are still here."
+            return
+        }
         var assets = targetStacks.flatMap { self.assets(for: $0, in: sourceEventID).map(MoveCandidate.init) }
         if assets.isEmpty {
             assets = catalogAssets(for: targetStacks, in: from)
@@ -3363,18 +3562,15 @@ final class EventsWorkspace {
             return
         }
         let locations = self.locations
+        var paths = EventPathCache(locations: locations)
         let targetPolicy = locations.resolvedPolicy(for: to)
-        let targetOther: EventStoragePolicy = targetPolicy == .buffer ? .archiveOnly : .buffer
-        var targetByName: [String: PhotoEventAssignment] = [:]
-        for assignment in model.configuration.photoEventAssignments where assignment.eventID == targetEventID {
-            let name = assignment.relativePath.lowercased()
-            if targetByName[name] == nil { targetByName[name] = assignment }
-        }
+        let targetByName = assignmentsByName(inEvent: targetEventID)
 
         var items: [EventMoveItem] = []
         // Names this batch already brings in, with where that file is now,
         // so two incoming files with one name are compared with each other.
         var claimed: [String: String] = [:]
+        let targetOther: EventStoragePolicy = targetPolicy == .buffer ? .archiveOnly : .buffer
         for asset in assets {
             // A family board's stacks can already belong to the target —
             // a subevent section on the parent's board dropped back onto
@@ -3386,7 +3582,7 @@ final class EventsWorkspace {
             if asset.sourceIsDriveCopy {
                 if let path = [asset.drive == .present ? asset.drivePath : nil, asset.otherDrive == .present ? asset.otherDrivePath : nil]
                     .compactMap({ $0 }).first {
-                    moved.sourceRootPath = locations.originalsRoot(for: to, deviceID: moved.deviceID, policy: targetPolicy).path
+                    moved.sourceRootPath = paths.originalsRootPath(to, moved.deviceID, targetPolicy)
                     moveSource = path
                 }
             } else if asset.drive == .present {
@@ -3395,7 +3591,7 @@ final class EventsWorkspace {
                 moveSource = asset.otherDrivePath
             }
             let move = moveSource.flatMap { source in
-                locations.driveURL(for: moved, event: to, policy: targetPolicy).map {
+                paths.driveURL(for: moved, event: to, policy: targetPolicy).map {
                     DriveMove(sourcePath: source, destinationPath: $0.path, byteCount: moved.fileSize)
                 }
             }
@@ -3404,8 +3600,8 @@ final class EventsWorkspace {
             var takenBy: [String] = []
             if let existing = targetByName[name] {
                 takenBy = [
-                    locations.driveURL(for: existing, event: to, policy: targetPolicy),
-                    locations.driveURL(for: existing, event: to, policy: targetOther),
+                    paths.driveURL(for: existing, event: to, policy: targetPolicy),
+                    paths.driveURL(for: existing, event: to, policy: targetOther),
                     locations.sourceURL(for: existing)
                 ].compactMap { $0?.path }
             } else if let earlier = claimed[name] {
@@ -3428,75 +3624,224 @@ final class EventsWorkspace {
         noteRecent(targetEventID)
 
         let title = "Move to \(eventTitle(to))"
+        var move = PendingEventMove(from: from, to: to, title: title, items: items, stacks: targetStacks)
+        beginOptimisticMove(&move)
         // Only catalog entries change: no rename and no name to compare.
         guard items.contains(where: { $0.move != nil || !$0.takenBy.isEmpty }) else {
             let change = AssignmentChange(title: title, removed: items.map(\.removed), added: items.map(\.added))
-            // The stacks are already on the source board with real paths
-            // and dates — the target board gains them in place.
-            applyAssignmentChange(
-                change,
-                touching: targetEventID,
-                addedItems: targetStacks.flatMap(\.items)
-            )
+            endOptimisticMove(move)
+            applyAssignmentChange(change, touching: targetEventID, patchBoards: false)
+            stampBoards(of: move)
             pushUndo(change)
             var outcome = EventMoveOutcome()
             outcome.moved = items
             model.statusMessage = EventMoveWording.summary(outcome, from: eventTitle(from), to: eventTitle(to))
             return
         }
+        pendingMoves.append(move)
+        startPendingMoves()
+    }
 
-        // Files other assignments still use are never trashed as a spare
-        // copy — the merge only drops this assignment. Keep Both names
-        // also avoid every path the target's catalog already claims.
-        var protectedKeys: Set<String> = []
-        var takenKeys: Set<String> = []
-        if items.contains(where: { !$0.takenBy.isEmpty }) {
-            let leaving = Set(items.map { CatalogStore.eventAssetID($0.removed) })
-            for assignment in model.configuration.photoEventAssignments where !leaving.contains(CatalogStore.eventAssetID(assignment)) {
-                protectedKeys.insert(Self.sourceKey(assignment))
+    // MARK: - Optimistic Move to Event
+
+    /// The stacks of every move that has been clicked and not yet settled.
+    private var pendingMoveStackIDs: Set<String> {
+        Set(pendingMoves.flatMap { $0.stacks.map(\.id) })
+    }
+
+    /// Moves the tiles between boards in memory, the moment of the click:
+    /// a board whose family holds the source but not the target loses the
+    /// stacks, one holding the target but not the source gains them (in
+    /// capture order, ids intact), and a board holding both — the parent's
+    /// — keeps them. No stacker run, no filesystem, no catalog: O(the
+    /// stacks moved) plus one array copy per board. The counts and the
+    /// color dots follow through the overlay until the rename lands.
+    private func beginOptimisticMove(_ move: inout PendingEventMove) {
+        let ids = Set(move.stacks.map(\.id))
+        for boardID in Array(eventStacks.keys) {
+            guard var stacks = eventStacks[boardID] else { continue }
+            let scope = scopeIDs(boardID)
+            let holdsSource = scope.contains(move.from.id)
+            let holdsTarget = scope.contains(move.to.id)
+            if holdsSource, !holdsTarget {
+                stacks.removeAll { ids.contains($0.id) }
+                move.leftBoards.append(boardID)
+            } else if holdsTarget, !holdsSource {
+                let present = Set(stacks.map(\.id))
+                stacks = Self.inserting(move.stacks.filter { !present.contains($0.id) }, into: stacks)
+                move.joinedBoards.append(boardID)
+            } else {
+                continue
             }
-            for item in items where !item.takenBy.isEmpty && hasOtherAssignment(pointingLike: item.removed) {
-                if let path = item.currentPath { protectedKeys.insert(EventStorageLocations.pathKey(path)) }
+            // A sweep or build still running for this board would publish
+            // the old arrangement over the tiles that just moved. It is
+            // dropped, and the board is re-checked once the move settles.
+            if presenceTasks[boardID] != nil {
+                presenceTasks[boardID]?.cancel()
+                presenceTasks[boardID] = nil
+                refreshGenerations[boardID] = UUID()
+                move.interruptedBoards.append(boardID)
             }
-            for assignment in targetByName.values {
-                if let path = locations.impliedDrivePath(for: assignment, event: to, policy: targetPolicy) {
-                    takenKeys.insert(EventStorageLocations.pathKey(path))
-                }
-            }
+            eventStacks[boardID] = stacks
+            eventGridRevisions[boardID] = model.catalogStateRevision
         }
+        for item in move.items {
+            optimisticCounts[item.removed.eventID, default: 0] -= 1
+            optimisticBytes[item.removed.eventID, default: 0] -= item.removed.fileSize
+            optimisticCounts[move.to.id, default: 0] += 1
+            optimisticBytes[move.to.id, default: 0] += item.removed.fileSize
+        }
+        for file in move.stacks.flatMap(\.files) {
+            optimisticOwners[file.pathKey] = move.to.id
+            move.overlayKeys.append(file.pathKey)
+        }
+        moveOverlayRevision &+= 1
+    }
+
+    /// Drops the overlay of a move that settled — landed or rolled back.
+    private func endOptimisticMove(_ move: PendingEventMove) {
+        for item in move.items {
+            optimisticCounts[item.removed.eventID, default: 0] += 1
+            optimisticBytes[item.removed.eventID, default: 0] += item.removed.fileSize
+            optimisticCounts[move.to.id, default: 0] -= 1
+            optimisticBytes[move.to.id, default: 0] -= item.removed.fileSize
+        }
+        optimisticCounts = optimisticCounts.filter { $0.value != 0 }
+        optimisticBytes = optimisticBytes.filter { $0.value != 0 }
+        for key in move.overlayKeys { optimisticOwners[key] = nil }
+        moveOverlayRevision &+= 1
+    }
+
+    /// The tiles go back where they were: the inverse of
+    /// `beginOptimisticMove`, applied to the boards as they are now (so
+    /// anything else that changed them meanwhile stays changed).
+    private func rollBackOptimisticMove(_ move: PendingEventMove) {
+        let ids = Set(move.stacks.map(\.id))
+        for boardID in move.leftBoards {
+            guard let stacks = eventStacks[boardID] else { continue }
+            let present = Set(stacks.map(\.id))
+            eventStacks[boardID] = Self.inserting(move.stacks.filter { !present.contains($0.id) }, into: stacks)
+            eventGridRevisions[boardID] = model.catalogStateRevision
+        }
+        for boardID in move.joinedBoards {
+            guard var stacks = eventStacks[boardID] else { continue }
+            stacks.removeAll { ids.contains($0.id) }
+            eventStacks[boardID] = stacks
+            eventGridRevisions[boardID] = model.catalogStateRevision
+        }
+        endOptimisticMove(move)
+    }
+
+    /// Boards a move touched are as current as the catalog again.
+    private func stampBoards(of move: PendingEventMove) {
+        for boardID in move.leftBoards + move.joinedBoards where eventStacks[boardID] != nil {
+            eventGridRevisions[boardID] = model.catalogStateRevision
+        }
+    }
+
+    /// `new` merged into `stacks`, which is in capture order — each stack
+    /// lands by binary search where the stacker would have put it.
+    private static func inserting(_ new: [OrganizeStack], into stacks: [OrganizeStack]) -> [OrganizeStack] {
+        var result = stacks
+        func isBefore(_ lhs: OrganizeStack, _ rhs: OrganizeStack) -> Bool {
+            if lhs.captureDate != rhs.captureDate { return lhs.captureDate < rhs.captureDate }
+            return lhs.id < rhs.id
+        }
+        for stack in new.sorted(by: isBefore) {
+            var low = 0
+            var high = result.count
+            while low < high {
+                let middle = (low + high) / 2
+                if isBefore(result[middle], stack) { low = middle + 1 } else { high = middle }
+            }
+            result.insert(stack, at: low)
+        }
+        return result
+    }
+
+    /// Starts the next clicked move when nothing else holds the job gate;
+    /// otherwise says, right away, what it is queued behind. Called at the
+    /// click and every time a job finishes, so a queued move begins in the
+    /// same main-actor turn that frees the gate.
+    func startPendingMoves() {
+        guard let index = pendingMoves.firstIndex(where: { !$0.isRunning }),
+              !pendingMoves.contains(where: \.isRunning) else { return }
+        let move = pendingMoves[index]
+        guard !model.isBusy, !model.isStorageBenchmarkRunning else {
+            let behind = model.activeJob.map { "“\($0.note)”" } ?? "the running job"
+            model.statusMessage = "Move to \(eventTitle(move.to)) queued behind \(behind). The tiles are already on \(eventTitle(move.to))'s board; the files are renamed when that finishes."
+            return
+        }
+        pendingMoves[index].isRunning = true
+        if runMoveJob(move) == nil { pendingMoves[index].isRunning = false }
+    }
+
+    private func runMoveJob(_ move: PendingEventMove) -> UUID? {
+        let sourceEventID = move.from.id
+        let targetEventID = move.to.id
+        let items = move.items
+        let locations = self.locations
+        let targetPolicy = locations.resolvedPolicy(for: move.to)
+        let title = move.title
         var trashEventIDs: [String: UUID] = [:]
         for item in items {
             if let path = item.currentPath { trashEventIDs[EventStorageLocations.pathKey(path)] = sourceEventID }
         }
         let trashContext = TrashContext(
-            locationName: eventTitle(from),
+            locationName: eventTitle(move.from),
             deviceID: nil,
             eventIDsByPathKey: trashEventIDs,
-            eventNamesByID: [sourceEventID: eventTitle(from)],
+            eventNamesByID: [sourceEventID: eventTitle(move.from)],
             personNamesByPathKey: [:],
             captureDatesByPathKey: [:]
         )
         let journalFolder = self.journalFolder
         let boundaries = [locations.bufferRoot, locations.privateStagingRoot]
         let fallbackTrashRoot = locations.removedFilesRoot
-        let fromTitle = eventTitle(from)
-        let toTitle = eventTitle(to)
-        let moveItems = items
-        let protectedPathKeys = protectedKeys
-        let takenPathKeys = takenKeys
-        model.runBackgroundJob(
+        let fromTitle = eventTitle(move.from)
+        let toTitle = eventTitle(move.to)
+        // The name-clash bookkeeping walks every assignment, so it runs
+        // with the job — off the main actor — from a snapshot, and only
+        // when a name is actually taken.
+        let needsClashInputs = items.contains { !$0.takenBy.isEmpty }
+        let assignmentsSnapshot = needsClashInputs ? model.configuration.photoEventAssignments : []
+        let targetAssignments = needsClashInputs ? Array(assignmentsByName(inEvent: targetEventID).values) : []
+        let toEvent = move.to
+        let moveID = move.id
+        return model.runBackgroundJob(
             action: .organize,
             runningNote: "Moving \(ApplyPlanOverview.plural(items.count, "file")) from \(fromTitle) to \(toTitle)",
             logTitle: title,
             logDetail: "Renamed originals between event folders on the same drive. Names already in the event were compared by content: identical copies merged and their extra copy went to _Trash; different photos moved in under a free “(N)” name. Nothing was replaced. NAS copies were not changed.",
+            onSettled: { [weak self] in self?.settleMove(moveID, fromTitle: fromTitle, toTitle: toTitle) },
             operation: { progress in
-                try EventMoveService(trash: MediaTrashService(removedFilesRoot: fallbackTrashRoot)).move(
-                    moveItems,
+                // Files other assignments still use are never trashed as a
+                // spare copy — the merge only drops this assignment. Keep
+                // Both names also avoid every path the target's catalog
+                // already claims.
+                var protectedKeys: Set<String> = []
+                var takenKeys: Set<String> = []
+                if needsClashInputs {
+                    let leaving = Set(items.map { CatalogStore.eventAssetID($0.removed) })
+                    for assignment in assignmentsSnapshot where !leaving.contains(CatalogStore.eventAssetID(assignment)) {
+                        protectedKeys.insert(Self.sourceKey(assignment))
+                    }
+                    for item in items where !item.takenBy.isEmpty && Self.hasOtherAssignment(pointingLike: item.removed, in: assignmentsSnapshot) {
+                        if let path = item.currentPath { protectedKeys.insert(EventStorageLocations.pathKey(path)) }
+                    }
+                    for assignment in targetAssignments {
+                        if let path = locations.impliedDrivePath(for: assignment, event: toEvent, policy: targetPolicy) {
+                            takenKeys.insert(EventStorageLocations.pathKey(path))
+                        }
+                    }
+                }
+                return try EventMoveService(trash: MediaTrashService(removedFilesRoot: fallbackTrashRoot)).move(
+                    items,
                     title: title,
                     journalFolder: journalFolder,
                     pruneBoundaries: boundaries,
-                    protectedPathKeys: protectedPathKeys,
-                    takenPathKeys: takenPathKeys,
+                    protectedPathKeys: protectedKeys,
+                    takenPathKeys: takenKeys,
                     trashContext: trashContext
                 ) { update in
                     progress(DashboardModel.jobUpdate(from: update, notePrefix: "Moving", command: ""))
@@ -3504,29 +3849,201 @@ final class EventsWorkspace {
             },
             completion: { [weak self] outcome in
                 guard let self else { return "" }
-                applyAssignmentChange(
-                    AssignmentChange(title: title, removed: outcome.removedAssignments, added: outcome.addedAssignments),
-                    touching: targetEventID
-                )
-                // No journal means no rename ran, so only catalog entries
-                // moved: those undo from the sort stack instead.
-                if outcome.report.journalPath == nil, !outcome.moved.isEmpty {
-                    pushUndo(AssignmentChange(title: title, removed: outcome.moved.map(\.removed), added: outcome.moved.map(\.added)))
-                }
-                let trashed = (outcome.trashBatch?.entries ?? []).map { EventStorageLocations.pathKey($0.originalAbsolutePath) }
-                removeFilesFromEventBoards(
-                    Set(outcome.report.moved.map { EventStorageLocations.pathKey($0.sourcePath) } + trashed),
-                    events: [sourceEventID]
-                )
-                retargetMovedPaths(outcome.report.moved)
-                refreshLatestJournal()
-                refreshBoth(sourceEventID, targetEventID)
-                if !trashed.isEmpty {
-                    Self.postTrashChanged(rescanUnsorted: false)
-                }
-                return EventMoveWording.summary(outcome, from: fromTitle, to: toTitle)
+                return landMove(moveID, outcome: outcome, fromTitle: fromTitle, toTitle: toTitle)
             }
         )
+    }
+
+    /// The rename finished. The catalog changes now, and the tiles that
+    /// already sit on their new board are pointed at their new paths — in
+    /// place, for just the files that moved. When every file moved under
+    /// its own name that is all there is to do: the boards, counts and
+    /// storage strip are patched from the move report, and nothing is
+    /// swept — least of all the NAS, whose copies a Buffer rename does not
+    /// touch (the moved files simply are not at their new mirror path yet,
+    /// which is what "not on the NAS" already means). A move that merged,
+    /// renamed a clash, or left files behind falls back to re-reading the
+    /// boards it touched.
+    private func landMove(_ moveID: UUID, outcome: EventMoveOutcome, fromTitle: String, toTitle: String) -> String {
+        guard let index = pendingMoves.firstIndex(where: { $0.id == moveID }) else {
+            return EventMoveWording.summary(outcome, from: fromTitle, to: toTitle)
+        }
+        pendingMoves[index].isLanded = true
+        let move = pendingMoves[index]
+        let title = move.title
+        endOptimisticMove(move)
+        applyAssignmentChange(
+            AssignmentChange(title: title, removed: outcome.removedAssignments, added: outcome.addedAssignments),
+            touching: move.to.id,
+            patchBoards: false
+        )
+        // No journal means no rename ran, so only catalog entries
+        // moved: those undo from the sort stack instead.
+        if outcome.report.journalPath == nil, !outcome.moved.isEmpty {
+            pushUndo(AssignmentChange(title: title, removed: outcome.moved.map(\.removed), added: outcome.moved.map(\.added)))
+        }
+        let trashed = (outcome.trashBatch?.entries ?? []).map { EventStorageLocations.pathKey($0.originalAbsolutePath) }
+        let plainMove = outcome.stayed.isEmpty && outcome.keptBoth.isEmpty && outcome.merged.isEmpty && trashed.isEmpty
+        TileImageLoader.shared.retarget(moves: outcome.report.moved)
+        if plainMove {
+            retargetMovedStacks(move.stacks.map(\.id), moves: outcome.report.moved)
+            stampBoards(of: move)
+            // The storage strip follows in its own turn, so the frame that
+            // shows the tiles at their new paths is not also the one that
+            // rewrites the family's presence rows.
+            let moved = outcome.moved
+            Task { @MainActor [weak self] in self?.patchPresence(afterMoving: moved, move: move) }
+            for boardID in move.leftBoards + move.joinedBoards where eventStacks[boardID] != nil {
+                refreshEditTags(for: boardID)
+            }
+            // Only the drive changed: recount what is not on the NAS from
+            // the plan and the records, without listing the NAS again.
+            nasPresence.refresh(.bufferChanged)
+            for boardID in move.interruptedBoards { Task { await refreshEvent(boardID) } }
+        } else {
+            removeFilesFromEventBoards(
+                Set(outcome.report.moved.map { EventStorageLocations.pathKey($0.sourcePath) } + trashed),
+                events: [move.from.id]
+            )
+            retargetMovedPaths(outcome.report.moved)
+            let affected = Set(eventStacks.keys.filter {
+                let scope = scopeIDs($0)
+                return scope.contains(move.from.id) || scope.contains(move.to.id)
+            }).union(move.interruptedBoards).union([move.from.id, move.to.id])
+            Task {
+                for boardID in affected { await refreshEvent(boardID) }
+            }
+            if !trashed.isEmpty {
+                Self.postTrashChanged(rescanUnsorted: false)
+            }
+        }
+        // Reading the journal folder is disk work; the Undo menu learns of
+        // the new journal a moment later instead of holding the main actor.
+        refreshLatestJournalInBackground()
+        return EventMoveWording.summary(outcome, from: fromTitle, to: toTitle)
+    }
+
+    /// Runs after every move job, landed or not. A job that failed or was
+    /// cancelled never reached `landMove`: the tiles go back to their
+    /// boards and the line says so. Then the next queued move may start.
+    private func settleMove(_ moveID: UUID, fromTitle: String, toTitle: String) {
+        guard let index = pendingMoves.firstIndex(where: { $0.id == moveID }) else { return }
+        let move = pendingMoves.remove(at: index)
+        if !move.isLanded {
+            rollBackOptimisticMove(move)
+            let reason = model.statusMessage
+            model.statusMessage = "Move to \(toTitle) did not happen — \(ApplyPlanOverview.plural(move.items.count, "file")) went back to \(fromTitle). Nothing was changed on disk or in the catalog. \(reason)"
+            // A job that died part-way may have renamed some files first:
+            // the boards it touched are re-read from the disk, the truth.
+            let touched = Set(move.leftBoards + move.joinedBoards + move.interruptedBoards)
+            Task {
+                for boardID in touched { await refreshEvent(boardID) }
+            }
+        }
+        startPendingMoves()
+    }
+
+    /// Repoints only the moved stacks at their destination paths. The
+    /// stacks keep their ids, so a selection, focus, or open preview
+    /// follows the files. Every other stack on every board is left alone.
+    private func retargetMovedStacks(_ stackIDs: [String], moves: [DriveMove]) {
+        guard !moves.isEmpty else { return }
+        var destinations: [String: String] = [:]
+        for move in moves {
+            destinations[EventStorageLocations.pathKey(move.sourcePath)] =
+                URL(filePath: move.destinationPath, directoryHint: .notDirectory).standardizedFileURL.path
+        }
+        let ids = Set(stackIDs)
+        for boardID in Array(eventStacks.keys) {
+            guard var stacks = eventStacks[boardID] else { continue }
+            var changed = false
+            for index in stacks.indices where ids.contains(stacks[index].id) {
+                stacks[index] = stacks[index].retargetingPaths(destinations)
+                changed = true
+            }
+            if changed { eventStacks[boardID] = stacks }
+        }
+    }
+
+    /// The storage strip and badge index after a rename, from the move
+    /// report: each moved file's row leaves the boards' families that held
+    /// the source and joins those that hold the target, now on the drive at
+    /// its destination and not (yet) on the NAS at its new mirror path.
+    /// Nothing is stat'ed — the sweep on the next board open confirms it.
+    private func patchPresence(afterMoving moved: [EventMoveItem], move: PendingEventMove) {
+        let renamed = moved.filter { $0.move != nil }
+        guard !renamed.isEmpty else { return }
+        let locations = self.locations
+        var paths = EventPathCache(locations: locations)
+        let targetPolicy = locations.resolvedPolicy(for: move.to)
+        let otherPolicy: EventStoragePolicy = targetPolicy == .buffer ? .archiveOnly : .buffer
+        var replacements: [String: EventAssetPresence] = [:]
+        var oldKeys: [String] = []
+        var newAssets: [(key: String, asset: EventAssetPresence)] = []
+        for item in renamed {
+            guard let drive = item.move else { continue }
+            let oldKey = drive.sourcePath.lowercased()
+            let oldID = CatalogStore.eventAssetID(item.removed)
+            guard let old = eventAssetsByPathKey.values.lazy.compactMap({ $0[oldKey] }).first else { continue }
+            var asset = old
+            asset.id = CatalogStore.eventAssetID(item.added)
+            asset.assignment = item.added
+            asset.drivePath = drive.destinationPath
+            asset.drive = .present
+            asset.driveIsLegacyLayout = false
+            asset.otherDrivePath = paths.driveURL(for: item.added, event: move.to, policy: otherPolicy)?.path
+            asset.otherDrive = .missing
+            asset.otherDriveIsLegacyLayout = false
+            if let source = locations.sourceURL(for: item.added)?.path {
+                asset.sourcePath = source
+                if source.lowercased() == drive.destinationPath.lowercased() {
+                    asset.sourceIsDriveCopy = true
+                    asset.source = .present
+                }
+            }
+            asset.archivePath = paths.archiveURL(for: item.added, event: move.to)?.path
+            if asset.archive != .unavailable { asset.archive = .missing }
+            asset.archiveIsLegacyLayout = false
+            asset.archiveVerifiedAt = nil
+            replacements[oldID] = asset
+            oldKeys.append(oldKey)
+            newAssets.append((drive.destinationPath.lowercased(), asset))
+        }
+        guard !replacements.isEmpty else { return }
+        for boardID in Array(eventAssetsByPathKey.keys) {
+            let scope = scopeIDs(boardID)
+            if scope.contains(move.from.id) { for key in oldKeys { eventAssetsByPathKey[boardID]?[key] = nil } }
+            if scope.contains(move.to.id) { for entry in newAssets { eventAssetsByPathKey[boardID]?[entry.key] = entry.asset } }
+        }
+        for eventID in Array(presence.keys) {
+            guard var summary = presence[eventID] else { continue }
+            let scope = scopeIDs(eventID)
+            let holdsSource = scope.contains(move.from.id)
+            let holdsTarget = scope.contains(move.to.id)
+            if holdsSource, holdsTarget {
+                summary.assets = summary.assets.map { replacements[$0.id] ?? $0 }
+            } else if holdsSource {
+                summary.assets.removeAll { replacements[$0.id] != nil }
+            } else if holdsTarget {
+                summary.assets.append(contentsOf: replacements.values)
+            } else {
+                continue
+            }
+            presence[eventID] = summary
+        }
+    }
+
+    /// Another assignment in the same event resolves to the same file (same
+    /// device folder and relative path) — `hasOtherAssignment` over a
+    /// snapshot, for use off the main actor.
+    nonisolated private static func hasOtherAssignment(pointingLike assignment: PhotoEventAssignment, in assignments: [PhotoEventAssignment]) -> Bool {
+        let key = sourceKey(assignment)
+        return assignments.contains { other in
+            other.eventID == assignment.eventID
+                && other.deviceID == assignment.deviceID
+                && other.relativePath.lowercased() == assignment.relativePath.lowercased()
+                && sourceKey(other) != key
+        }
     }
 
     /// Same rule as `moveStacks`: every click ends in a readable result —
@@ -3649,13 +4166,6 @@ final class EventsWorkspace {
                 return "Returned \(applied.count) file(s) to Unsorted. \(notes)"
             }
         )
-    }
-
-    private func refreshBoth(_ first: UUID, _ second: UUID) {
-        Task {
-            await refreshEvent(first)
-            await refreshEvent(second)
-        }
     }
 
     // MARK: - NAS, drive, and source
@@ -3783,6 +4293,10 @@ final class EventsWorkspace {
     /// from the listing when its family's numbers moved.
     private func nasPresenceChanged(from old: NASPresenceReport?, to new: NASPresenceReport) {
         guard case .event(let eventID) = selection, presence[eventID] != nil else { return }
+        // A recount from the drive alone (a move, an Apply) learned nothing
+        // new about the NAS, and the board was patched or re-read by the
+        // job itself — sweeping it again would stat the NAS for nothing.
+        guard old?.listedAt != new.listedAt else { return }
         let family = scopeIDs(eventID)
         guard old?.totals(for: family) != new.totals(for: family) || old?.listedAt == nil && new.listedAt != nil else { return }
         Task { await refreshEvent(eventID) }
