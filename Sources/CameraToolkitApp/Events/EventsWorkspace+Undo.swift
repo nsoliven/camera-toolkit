@@ -1374,7 +1374,19 @@ extension EventsWorkspace {
                     refuseUndo(entry, direction, "Some of the event's folders are on \(drive), which isn't connected or is missing them, and some are not. Connect it and try again — nothing was changed.")
                     return
                 }
-                guard edit.nasLink != nil else {
+                // A rename always queues its NAS folder rename, so a link says
+                // only that one was queued: what an Undo (or Redo) can act on
+                // is a rename that ran, is still waiting, or was closed by
+                // Undo — not one recorded as absent because the NAS had no
+                // folder to rename.
+                let nasFollowed: Bool = {
+                    guard let link = edit.nasLink else { return false }
+                    let follower = NASMoveFollower(store: nil, queue: NASRenameQueue(journalFolder: self.journalFolder))
+                    return direction == .undo
+                        ? !follower.reversibleTargets(moveJournalID: link).isEmpty
+                        : !follower.redoableTargets(moveJournalID: link).isEmpty
+                }()
+                guard nasFollowed else {
                     refuseUndo(entry, direction, "The event's folders on \(drive) aren't there — the drive isn't connected or was emptied — and no NAS folder was renamed with them, so there is nothing to act on. Connect the drive and try again — nothing was changed.")
                     return
                 }

@@ -89,7 +89,8 @@ final class TileImageLoader: @unchecked Sendable {
     init(
         driveActivityGate: DriveActivityGate = .shared,
         fileExists: @escaping @Sendable (String) -> Bool = { FileManager.default.fileExists(atPath: $0) },
-        willRead: @escaping @Sendable (URL) -> Void = { _ in }
+        willRead: @escaping @Sendable (URL) -> Void = { _ in },
+        purgesOnMemoryPressure: Bool = true
     ) {
         self.driveActivityGate = driveActivityGate
         self.fileExists = fileExists
@@ -104,6 +105,10 @@ final class TileImageLoader: @unchecked Sendable {
         networkQueue.name = "CameraToolkit.TileImageLoader.network"
         networkQueue.maxConcurrentOperationCount = 3
         networkQueue.qualityOfService = .userInitiated
+        // A test that measures the caches turns this off: a busy machine
+        // raises a real memory warning mid-test and the purge would empty
+        // the caches it is looking at.
+        guard purgesOnMemoryPressure else { return }
         let source = DispatchSource.makeMemoryPressureSource(
             eventMask: [.warning, .critical],
             queue: .global(qos: .utility)

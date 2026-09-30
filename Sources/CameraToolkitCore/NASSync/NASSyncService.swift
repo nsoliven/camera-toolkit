@@ -28,6 +28,10 @@ public struct NASSyncReport: Codable, Equatable, Sendable {
     /// fresh open after a short delay. A file that then verified is in
     /// `copied`; one that failed again is also in `failed`.
     public var retried: [NASSyncIssue] = []
+    /// `.<name>.ctsync-<id>` temporaries an earlier dropped sync left on
+    /// the NAS, removed by this one (only files matching that exact
+    /// pattern).
+    public var clearedTemporaries: Int = 0
     /// How the run was configured and where its time went.
     public var timings = NASSyncTimings()
 
@@ -50,6 +54,7 @@ extension NASSyncReport {
         foldersCreated = try container.decodeIfPresent(Int.self, forKey: .foldersCreated) ?? 0
         hashMismatches = try container.decodeIfPresent([NASSyncIssue].self, forKey: .hashMismatches) ?? []
         retried = try container.decodeIfPresent([NASSyncIssue].self, forKey: .retried) ?? []
+        clearedTemporaries = try container.decodeIfPresent(Int.self, forKey: .clearedTemporaries) ?? 0
         timings = try container.decodeIfPresent(NASSyncTimings.self, forKey: .timings) ?? NASSyncTimings()
     }
 }
@@ -321,6 +326,14 @@ public struct NASSyncService {
             let temporary = (folder as NSString).appendingPathComponent(".\(name)\(NASSyncPlanner.temporaryMarker)\(UUID().uuidString.prefix(8))")
             jobs.append(.init(index: index, item: item, destination: destination, kind: .copy(temporary: temporary)))
         }
+        // A temporary a dropped sync left behind is only ever cleared when
+        // the same file name is copied into the same folder again. After
+        // the file moved on, it stayed — and kept its folder alive. So the
+        // synced event folders are searched for them too.
+        let cleared = clearStaleTemporaries(plan: plan, root: root, before: now().timeIntervalSinceReferenceDate, listing: listing(of:)) { folder, name in
+            folderListings[folder]?[name] = nil
+        }
+        run.noteClearedTemporaries(cleared)
         run.endTime(lane: NASSyncRun.checkLane)
         run.addTiming { $0.checkSeconds = clock() - started }
         flushRecords()
@@ -376,6 +389,62 @@ public struct NASSyncService {
             && entry.name.count == prefix.count + 8 {
             unlink((folder as NSString).appendingPathComponent(entry.name))
         }
+    }
+
+    /// True for exactly `.<name>.ctsync-<8 hex digits>`, a regular file last
+    /// written before `time` (this run's own temporaries do not exist yet at
+    /// the check pass, and a second process's are newer than the run).
+    static func isStaleTemporary(_ entry: DirectoryListingEntry, before time: Double) -> Bool {
+        guard entry.kind == .file, entry.name.hasPrefix("."), entry.modifiedAt <= time,
+              let marker = entry.name.range(of: NASSyncPlanner.temporaryMarker, options: .backwards) else { return false }
+        let suffix = entry.name[marker.upperBound...]
+        return marker.lowerBound > entry.name.index(after: entry.name.startIndex)
+            && suffix.count == 8 && suffix.allSatisfy(\.isHexDigit)
+    }
+
+    /// Removes every stale temporary under the synced event folders (the
+    /// plan's, and the top folders its items live in) and the NAS folders
+    /// that leaves empty. Only files matching that exact pattern; nothing
+    /// else is touched. Returns how many were removed.
+    private func clearStaleTemporaries(
+        plan: NASSyncPlan,
+        root: String,
+        before time: Double,
+        listing: (String) -> [String: DirectoryListingEntry]?,
+        forget: (String, String) -> Void
+    ) -> Int {
+        var folders = Set(plan.eventFolders)
+        for item in plan.items {
+            let parts = item.relativePath.split(separator: "/", omittingEmptySubsequences: true)
+            if parts.count > 2 { folders.insert(parts.prefix(2).joined(separator: "/")) }
+        }
+        var removed = 0
+        var emptied = Set<String>()
+        func walk(_ folder: String, depth: Int) {
+            guard depth < 16, let entries = listing(folder) else { return }
+            for entry in entries.values.sorted(by: { $0.name < $1.name }) {
+                let path = folder + "/" + entry.name
+                switch entry.kind {
+                case .directory:
+                    walk(path, depth: depth + 1)
+                case .file where Self.isStaleTemporary(entry, before: time):
+                    if unlink(path) == 0 {
+                        removed += 1
+                        emptied.insert(folder)
+                        forget(folder, entry.name)
+                    }
+                default:
+                    break
+                }
+            }
+        }
+        for relative in folders.sorted() where EventStorageLocations.isLexicallyClean(relative) {
+            walk(root + "/" + relative, depth: 0)
+        }
+        if !emptied.isEmpty {
+            DriveMoveService().pruneEmptyFolders(emptied, boundaries: [URL(fileURLWithPath: root, isDirectory: true)])
+        }
+        return removed
     }
 }
 
@@ -692,6 +761,11 @@ final class NASSyncRun: @unchecked Sendable {
 
     func noteFolderCreated() {
         lock.withLock { report.foldersCreated += 1 }
+    }
+
+    func noteClearedTemporaries(_ count: Int) {
+        guard count > 0 else { return }
+        lock.withLock { report.clearedTemporaries += count }
     }
 
     func addTiming(_ change: (inout NASSyncTimings) -> Void) {

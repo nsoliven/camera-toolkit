@@ -294,7 +294,12 @@ final class StorageBenchmarkModelTests: XCTestCase {
 
         model.removeStaleSpeedTestFiles()
 
-        try await waitForTrue { !FileManager.default.fileExists(atPath: staleBuffer.path) }
+        // The sweep is a detached task that removes the files one after the
+        // other: wait for all of them, not just the first, or a loaded run
+        // asserts between two removals.
+        try await waitForTrue {
+            [staleBuffer, staleTwin, staleLibrary].allSatisfy { !FileManager.default.fileExists(atPath: $0.path) }
+        }
         XCTAssertFalse(FileManager.default.fileExists(atPath: staleTwin.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: staleLibrary.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: keeper.path))

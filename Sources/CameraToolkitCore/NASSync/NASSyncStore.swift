@@ -101,8 +101,15 @@ public final class NASSyncStore: @unchecked Sendable {
         try CatalogDatabase.writer(for: catalogURL)
     }
 
-    /// Case-folded, so a case-insensitive share and drive agree on a key.
-    public static func pathKey(_ relativePath: String) -> String { relativePath.lowercased() }
+    /// Case-folded and NFC-composed, so a case-insensitive share and a drive
+    /// that stores decomposed names (APFS keeps what it was given, and the
+    /// drive listing spells "é" as e plus an accent) agree on one key with
+    /// the event names the app holds (composed). SQLite compares bytes, so
+    /// the key itself must be one spelling. The same rule as
+    /// `NASTreeListing.key`.
+    public static func pathKey(_ relativePath: String) -> String {
+        relativePath.precomposedStringWithCanonicalMapping.lowercased()
+    }
 
     static func standardizedRoot(_ root: String) -> String {
         URL(fileURLWithPath: root, isDirectory: true).standardizedFileURL.path
@@ -317,6 +324,39 @@ public final class NASSyncStore: @unchecked Sendable {
         try records(nasRoot: nasRoot, prefixes: prefixes).compactMapValues { record in
             record.state == .verified ? record.verifiedAt : nil
         }
+    }
+
+    /// What a verified record says about one file: enough for presence to
+    /// refuse a record that is about a different file than the one in front
+    /// of it (another size, or another drive modification time).
+    public struct VerifiedFact: Equatable, Sendable {
+        public var verifiedAt: Date
+        public var byteCount: Int64
+        /// The drive copy's modification time when it was verified
+        /// (`timeIntervalSinceReferenceDate`).
+        public var sourceModifiedAt: Double?
+
+        public init(verifiedAt: Date, byteCount: Int64, sourceModifiedAt: Double?) {
+            self.verifiedAt = verifiedAt
+            self.byteCount = byteCount
+            self.sourceModifiedAt = sourceModifiedAt
+        }
+    }
+
+    /// `verifiedDates` with the size and time each verification was for.
+    public func verifiedFacts(nasRoot: String, prefixes: [String]) throws -> [String: VerifiedFact] {
+        try records(nasRoot: nasRoot, prefixes: prefixes).compactMapValues { record in
+            guard record.state == .verified, let verifiedAt = record.verifiedAt else { return nil }
+            return VerifiedFact(verifiedAt: verifiedAt, byteCount: record.byteCount, sourceModifiedAt: record.sourceModifiedAt)
+        }
+    }
+
+    /// `verifiedFacts` without creating anything, for the presence sweep.
+    public static func verifiedFacts(catalogURL: URL, nasRoot: String, prefixes: [String]) -> [String: VerifiedFact] {
+        guard FileManager.default.fileExists(atPath: catalogURL.path),
+              let writer = try? CatalogDatabase.writer(for: catalogURL),
+              (try? writer.read({ try $0.tableExists(tableName) })) == true else { return [:] }
+        return (try? NASSyncStore(unchecked: catalogURL).verifiedFacts(nasRoot: nasRoot, prefixes: prefixes)) ?? [:]
     }
 
     private static func record(_ row: Row) -> NASSyncRecord {

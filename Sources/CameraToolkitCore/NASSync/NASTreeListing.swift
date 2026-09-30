@@ -47,7 +47,7 @@ public struct NASTreeListing: Codable, Equatable, Sendable {
     /// that stores decomposed names (APFS keeps what it was given) agree on
     /// one key.
     public static func key(_ relativePath: String) -> String {
-        relativePath.precomposedStringWithCanonicalMapping.lowercased()
+        NASSyncStore.pathKey(relativePath)
     }
 
     /// The covered folder `relativePath` sits under, if any — the deepest

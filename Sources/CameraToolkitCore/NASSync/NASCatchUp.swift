@@ -48,6 +48,14 @@ public enum NASCatchUp {
         public var savedBytes: Int64 { candidates.reduce(0) { $0 + $1.item.byteCount } }
     }
 
+    /// Whether the Buffer or the private staging folder is there. Nothing
+    /// can be proven stale without it (the drive is what says which NAS
+    /// paths are owned), so the reconcile switch is off and greyed out
+    /// while it is away.
+    public static func driveIsMounted(_ locations: EventStorageLocations) -> Bool {
+        [locations.bufferRoot, locations.privateStagingRoot].contains { DriveMoveService.exists($0.path) }
+    }
+
     /// The mirror paths (`NASSyncStore.pathKey`) every assignment maps to.
     public static func ownedKeys(assignments: [PhotoEventAssignment], locations: EventStorageLocations) -> Set<String> {
         let events = Dictionary(locations.events.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
@@ -79,7 +87,7 @@ public enum NASCatchUp {
         }
         // Ownership is only provable with the drive present: with it away
         // (the usual case — the Buffer is temporary) nothing is an orphan.
-        let driveMounted = [locations.bufferRoot, locations.privateStagingRoot].contains { DriveMoveService.exists($0.path) }
+        let driveMounted = driveIsMounted(locations)
         var orphans: [NASSyncRecord] = []
         var keepers: [String: NASSyncRecord] = [:]
         for record in records.values.sorted(by: { $0.pathKey < $1.pathKey }) {
@@ -190,13 +198,25 @@ extension NASMoveFollower {
         ownedKeys: Set<String>,
         locations: EventStorageLocations,
         nasRoot: URL,
+        assignments: [PhotoEventAssignment] = [],
         hasher: (String) throws -> String = { try FileScanner.sha256(URL(fileURLWithPath: $0)) },
         progress: Progress? = nil
     ) throws -> NASFollowResult {
         let root = nasRoot.standardizedFileURL.path
         let records = try storeRecords(nasRoot: root)
         let analysis = NASCatchUp.analyze(plan: plan, records: records, ownedKeys: ownedKeys, locations: locations)
-        let renames = NASCatchUp.renames(for: analysis.candidates, nasRoot: nasRoot, hasher: hasher, isCancelled: cancellationCheck)
+        var renames = NASCatchUp.renames(for: analysis.candidates, nasRoot: nasRoot, hasher: hasher, isCancelled: cancellationCheck)
+        // Photos only the NAS has, whose copy is not where the catalog
+        // looks: found from the records and one listing per folder, and
+        // renamed into place when exactly one NAS copy fits.
+        if !assignments.isEmpty, !cancellationCheck() {
+            let taken = Set(renames.map { NASSyncStore.pathKey($0.from) })
+            let repairs = NASCatchUp.repairs(
+                assignments: assignments, plan: plan, records: records, ownedKeys: ownedKeys,
+                locations: locations, nasRoot: root, isCancelled: cancellationCheck
+            ).repairs.filter { !taken.contains($0.orphan.pathKey) }
+            renames += NASCatchUp.renames(for: repairs)
+        }
         guard !renames.isEmpty else { return NASFollowResult() }
         var batch = NASRenameBatch(
             title: "Catch up NAS copies with moved files",
@@ -247,12 +267,13 @@ extension NASMoveFollower {
         nasRoot: URL,
         ownedKeys: Set<String>,
         catchUp: Bool,
+        assignments: [PhotoEventAssignment] = [],
         progress: Progress? = nil
     ) throws -> NASSyncPreparation {
         var follow = try applyPending(nasRoot: nasRoot, progress: progress)
         let plan = NASSyncPlanner.plan(events: events, locations: locations)
         if catchUp, follow.stoppedReason == nil {
-            follow.add(try self.catchUp(plan: plan, ownedKeys: ownedKeys, locations: locations, nasRoot: nasRoot, progress: progress))
+            follow.add(try self.catchUp(plan: plan, ownedKeys: ownedKeys, locations: locations, nasRoot: nasRoot, assignments: assignments, progress: progress))
         }
         return NASSyncPreparation(plan: plan, follow: follow)
     }

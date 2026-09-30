@@ -72,6 +72,11 @@ public enum CatalogStateStartup {
         let owns: Bool
         do {
             try CatalogStore(url: catalogURL).prepareSchema()
+            // NAS sync records keyed by an older spelling of an accented
+            // path move to the current key (backed up and checked first;
+            // a no-op when no path is accented). Best effort: a failure
+            // leaves the old rows, which only hide their files' verification.
+            _ = try? NASSyncKeyMigration.migrateIfNeeded(catalogURL: catalogURL, backups: makeBackups(catalogURL))
             owns = try store.catalogOwnsState()
         } catch {
             return Outcome(
