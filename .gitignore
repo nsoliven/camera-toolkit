@@ -44,3 +44,10 @@ config.json
 # Generated app bundles.
 dist/
 *.app
+
+# Personal helper scripts that hard-code local paths and events.
+scripts/offload-to-library.py
+scripts/icloud-video-to-nas.py
+scripts/purge-verified.py
+scripts/verify-offload.py
+scripts/__pycache__/
