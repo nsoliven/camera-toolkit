@@ -74,6 +74,7 @@ final class ScrollLoaderProbe: @unchecked Sendable {
     private let lock = NSLock()
     private var _mainStats = 0
     private var _backgroundStats = 0
+    private var _reads = 0
     let statDelayMicroseconds: UInt32
     let readDelayMicroseconds: UInt32
     let marker: String
@@ -86,7 +87,10 @@ final class ScrollLoaderProbe: @unchecked Sendable {
 
     var mainStats: Int { lock.withLock { _mainStats } }
     var backgroundStats: Int { lock.withLock { _backgroundStats } }
-    func reset() { lock.withLock { _mainStats = 0; _backgroundStats = 0 } }
+    /// Reads of the NAS stand-in the loader made (thumbnails served from the
+    /// on-disk cache make none).
+    var reads: Int { lock.withLock { _reads } }
+    func reset() { lock.withLock { _mainStats = 0; _backgroundStats = 0; _reads = 0 } }
 
     func stat(_ path: String) -> Bool {
         let onMain = Thread.isMainThread
@@ -96,6 +100,7 @@ final class ScrollLoaderProbe: @unchecked Sendable {
     }
 
     func read(_ url: URL) {
+        lock.withLock { _reads += 1 }
         if url.path.hasPrefix(marker), readDelayMicroseconds > 0 { usleep(readDelayMicroseconds) }
     }
 }
@@ -277,7 +282,7 @@ final class BoardScrollPerfTests: XCTestCase {
             r.mainStats = probe.mainStats
             r.bodies = Dictionary(uniqueKeysWithValues: BoardRenderCounter.Kind.allCases.map { ($0.rawValue, BoardRenderCounter.count($0)) })
             results.append(r)
-            log("\(name): load \(String(format: "%.1f", r.load)) main-thread stats \(r.mainStats) (background \(probe.backgroundStats)) bodies \(r.bodies.sorted { $0.key < $1.key }.map { $0.key + "=" + String($0.value) })")
+            log("\(name): load \(String(format: "%.1f", r.load)) main-thread stats \(r.mainStats) (background \(probe.backgroundStats)), NAS reads \(probe.reads), thumbnail cache \(thumbnailCache?.measuredBytes() ?? 0) bytes, bodies \(r.bodies.sorted { $0.key < $1.key }.map { $0.key + "=" + String($0.value) })")
             log(describe(r))
             try await settle(1)
         }
@@ -531,7 +536,7 @@ struct ScrollLibrary {
     func tearDown() {
         CatalogDatabase.checkpointAndClose(url: root.appendingPathComponent("CameraToolkit/catalog.sqlite"))
         if ProcessInfo.processInfo.environment["CT_LIB_DIR"] == nil {
-            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: root.deletingLastPathComponent())
         }
     }
 
@@ -584,15 +589,20 @@ struct ScrollLibrary {
         let persistent = ProcessInfo.processInfo.environment["CT_LIB_DIR"]
         let base = persistent.map { URL(fileURLWithPath: $0, isDirectory: true) }
             ?? FileManager.default.temporaryDirectory.appendingPathComponent("CTScrollPerf-\(UUID().uuidString)", isDirectory: true)
-        let root = base.resolvingSymlinksInPath()
-        let readyURL = root.appendingPathComponent(onNAS ? "ready-nas" : "ready")
+        // One folder per placement: a library kept between runs holds its
+        // files either in the Buffer or on the NAS stand-in, never both — a
+        // NAS run must not find Buffer copies of what it means to read from
+        // the NAS. The masters are shared.
+        let shared = base.resolvingSymlinksInPath()
+        let root = shared.appendingPathComponent(onNAS ? "library-nas" : "library-buffer", isDirectory: true)
+        let readyURL = root.appendingPathComponent("ready")
         let ready = FileManager.default.fileExists(atPath: readyURL.path)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let support = root.appendingPathComponent("CameraToolkit", isDirectory: true)
         try? FileManager.default.removeItem(at: support)
         try? FileManager.default.removeItem(at: root.appendingPathComponent("Support"))
         try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
-        let masterFolder = root.appendingPathComponent("masters")
+        let masterFolder = shared.appendingPathComponent("masters")
         let masters = FileManager.default.fileExists(atPath: masterFolder.appendingPathComponent("master47.jpg").path)
             ? try existingMasters(in: masterFolder) : try makeMasters(in: masterFolder, count: 48)
         log("masters: \(masters.count), sizes \(masters.prefix(3).map { $0.1 }), files reused \(ready)")
