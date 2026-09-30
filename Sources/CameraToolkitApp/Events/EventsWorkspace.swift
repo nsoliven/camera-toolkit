@@ -3138,7 +3138,11 @@ final class EventsWorkspace {
                 nasRoot: locations.nasRoot, journalFolder: journalFolder
             )
             noteNASRenamesQueued(queued)
-            drainNASRenames()
+            // The batch is on disk now; only running it waits a turn. Started
+            // here, the NAS job would make the next rename — one typed right
+            // behind this one — refuse as "a file job is running" and leave
+            // the NAS folder at this name for good.
+            Task { @MainActor [weak self] in self?.drainNASRenames() }
             if !nasIsConnected {
                 nasNote = " The NAS folder will be renamed when the NAS is connected."
             } else if folderIsThere || queuedBefore {

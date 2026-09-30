@@ -486,9 +486,13 @@ public struct NASMoveFollower {
             for op in closed.ops {
                 switch op.state {
                 case .renamed, .merged, .cancelled:
+                    // A merged copy goes back to the stale place it was set
+                    // aside in (`stalePath` on a pending op is that wish), so
+                    // Redo leaves the NAS exactly as the first run did.
                     ops.append(NASRename(
                         kind: op.kind, from: op.from, to: op.to, byteCount: op.byteCount,
-                        eventID: op.eventID, previousEventID: op.previousEventID
+                        eventID: op.eventID, previousEventID: op.previousEventID,
+                        stalePath: op.state == .merged ? op.stalePath : nil
                     ))
                 default:
                     continue
@@ -827,7 +831,14 @@ public struct NASMoveFollower {
     /// The stale copy goes to the NAS's stale folder; the identical file at
     /// the new path stays. Never deleted.
     private func setAside(_ op: inout NASRename, run: inout Run, fromPath: String) {
-        let stale = run.staleFolder + "/" + op.from
+        // A Redo of a set-aside asks for the place the first run used; it
+        // gets it when that is still a clean, free path inside the stale
+        // folder, and a fresh stamped place otherwise. Nothing is replaced.
+        var stale = run.staleFolder + "/" + op.from
+        if let wanted = op.stalePath, wanted.hasPrefix(Self.staleFolderPath + "/"), Self.isClean(wanted),
+           LayoutMigrationDisk.lstatEntry(run.root + "/" + wanted) == nil {
+            stale = wanted
+        }
         do {
             try renameCreatingFolders(from: fromPath, to: run.root + "/" + stale)
         } catch {

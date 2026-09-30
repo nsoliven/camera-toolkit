@@ -86,14 +86,22 @@ final class TileImageLoaderTests: XCTestCase {
     /// drops both the tile and the preview stores so the app sheds bitmaps
     /// when the system asks.
     func testPurgeForMemoryPressureClearsBothCaches() async throws {
-        let loader = TileImageLoader()
+        // No memory-pressure source of its own: under a loaded full-suite
+        // run the machine raises real warnings, and an NSCache may also shed
+        // entries on its own. Either empties the caches between the decode
+        // and the look, so the fill is retried until both hold.
+        let loader = TileImageLoader(purgesOnMemoryPressure: false)
         let file = try makeJPEG()
         defer { try? FileManager.default.removeItem(at: file) }
 
-        _ = await loader.image(for: file, maximumPixelSize: 384)
-        _ = await loader.image(for: file, maximumPixelSize: 4_800)
-        XCTAssertNotNil(loader.cachedImage(for: file, maximumPixelSize: 384))
-        XCTAssertNotNil(loader.cachedImage(for: file, maximumPixelSize: 4_800))
+        var filled = false
+        for _ in 0..<10 where !filled {
+            _ = await loader.image(for: file, maximumPixelSize: 384)
+            _ = await loader.image(for: file, maximumPixelSize: 4_800)
+            filled = loader.cachedImage(for: file, maximumPixelSize: 384) != nil
+                && loader.cachedImage(for: file, maximumPixelSize: 4_800) != nil
+        }
+        XCTAssertTrue(filled, "both decodes were cached")
 
         loader.purgeForMemoryPressure()
         XCTAssertNil(loader.cachedImage(for: file, maximumPixelSize: 384))
