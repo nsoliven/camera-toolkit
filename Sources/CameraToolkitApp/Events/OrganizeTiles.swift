@@ -1894,7 +1894,7 @@ struct StackPreviewOverlay: View {
                     .buttonBorderShape(.circle)
                     .menuIndicator(.hidden)
                     .fixedSize()
-                    .help("Open \(item.primary.name) in another app (O opens it in \(DJIStudio.isOffered(for: [item.primary.url], resolver: WorkspaceBundleResolver.shared) ? DJIStudio.name : "Photomator"))")
+                    .help("Open \(item.primary.name) in another app (O opens it in \(DJIStudio.isOffered(for: [item.primary.url], resolver: BundleWorkspaceResolver.shared) ? DJIStudio.name : "Photomator"))")
                 }
             }
             .controlSize(.large)
@@ -2021,7 +2021,7 @@ struct StackPreviewOverlay: View {
     private func videoPane(_ item: OrganizeItem) -> some View {
         let dji360 = DJI360PreviewKind(item: item)
         let studioAvailable = dji360 != nil
-            && DJIStudio.isOffered(for: [item.primary.url], resolver: WorkspaceBundleResolver.shared)
+            && DJIStudio.isOffered(for: [item.primary.url], resolver: BundleWorkspaceResolver.shared)
         return ZStack {
             Color.black
             if let image {

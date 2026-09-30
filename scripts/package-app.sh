@@ -24,7 +24,7 @@ mkdir -p "$macos" "$resources"
 cp ".build/release/CameraToolkit" "$macos/CameraToolkit"
 # SwiftPM resource bundles (the face sidecar script lives in the Core one)
 # sit next to the executable in .build. The app finds them in
-# Contents/Resources through ResourceBundleLocator; it must never fall back
+# Contents/Resources through BundledResourceLocator; it must never fall back
 # to the build folder it was compiled in.
 for bundle in .build/release/CameraToolkit_*.bundle; do
   [[ -d "$bundle" ]] && ditto "$bundle" "$resources/$(basename "$bundle")"

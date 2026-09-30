@@ -17,7 +17,7 @@ import Foundation
 ///
 /// Every check is a plain file-exists test, and a miss everywhere returns
 /// `nil` so callers can say "not installed" instead of crashing.
-public struct ResourceBundleLocator: Sendable {
+public struct BundledResourceLocator: Sendable {
     public enum Location: String, Sendable, Equatable {
         case packaged
         case appRoot
@@ -47,7 +47,7 @@ public struct ResourceBundleLocator: Sendable {
     public init(
         resourceURL: URL?,
         bundleURL: URL?,
-        bundleName: String = ResourceBundleLocator.coreBundleName,
+        bundleName: String = BundledResourceLocator.coreBundleName,
         moduleBundle: @escaping @Sendable () -> Bundle?,
         fileExists: @escaping @Sendable (URL) -> Bool = { url in
             var isDirectory: ObjCBool = false
@@ -64,13 +64,13 @@ public struct ResourceBundleLocator: Sendable {
     /// The running process. Inside a `.app` the SwiftPM accessor is never
     /// consulted: its only remaining candidate is the build folder the
     /// binary was compiled in, which a shipped app must not depend on.
-    public static var main: ResourceBundleLocator {
+    public static var main: BundledResourceLocator {
         let main = Bundle.main
         let insideApp = main.bundleURL.pathExtension == "app"
         // A bare executable's `resourceURL` is its own folder, the same as
         // `bundleURL`; leave it out so the log says `appRoot`, not
         // `packaged`, for `swift run`.
-        return ResourceBundleLocator(
+        return BundledResourceLocator(
             resourceURL: insideApp ? main.resourceURL : nil,
             bundleURL: main.bundleURL,
             moduleBundle: { insideApp ? nil : Bundle.module }
@@ -106,15 +106,15 @@ public enum CoreResources {
 
     /// Resolved on first use and logged as `resource.resolve` with the
     /// location only (never the path).
-    public static let faceSidecarScript: ResourceBundleLocator.Resolution =
+    public static let faceSidecarScript: BundledResourceLocator.Resolution =
         resolve(faceSidecarScriptName, with: .main)
 
     /// Every shipped resource, for `--print-resource-paths`.
-    public static var all: [(name: String, resolution: ResourceBundleLocator.Resolution)] {
+    public static var all: [(name: String, resolution: BundledResourceLocator.Resolution)] {
         [(faceSidecarScriptName, faceSidecarScript)]
     }
 
-    static func resolve(_ name: String, with locator: ResourceBundleLocator) -> ResourceBundleLocator.Resolution {
+    static func resolve(_ name: String, with locator: BundledResourceLocator) -> BundledResourceLocator.Resolution {
         let resolution = locator.locate(name)
         DebugLog.shared.log(
             "resource.resolve",
