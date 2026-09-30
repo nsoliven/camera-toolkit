@@ -121,6 +121,38 @@ final class OrganizeMediaTests: XCTestCase {
         XCTAssertTrue(days.allSatisfy { !$0.stacks.isEmpty })
     }
 
+    /// `days(for:)` asks the calendar once per run of stacks on one day. That
+    /// must give what asking for every stack gives — across the days the
+    /// clocks change, and for stacks in no order at all.
+    func testDaysMatchAskingTheCalendarForEveryStack() {
+        for zone in ["America/Los_Angeles", "Europe/Berlin", "Australia/Lord_Howe", "UTC"] {
+            var calendar = Calendar(identifier: .gregorian)
+            calendar.timeZone = TimeZone(identifier: zone)!
+            var generator = SystemRandomNumberGenerator()
+            // Two weeks around a spring and an autumn change, plus scatter.
+            let starts: [Double] = [1_773_000_000, 1_793_000_000]
+            var stacks: [OrganizeStack] = []
+            for start in starts {
+                for index in 0..<400 {
+                    let date = Date(timeIntervalSince1970: start + Double.random(in: 0..<(14 * 86_400), using: &generator))
+                    stacks.append(OrganizeStack(items: [organizeItem("/s/DSC\(index)_\(Int(start)).ARW", date: date)]))
+                }
+            }
+            stacks.shuffle()
+            let days = OrganizeStacker.days(for: stacks, calendar: calendar)
+            var expected: [String: [String]] = [:]
+            for stack in stacks {
+                let c = calendar.dateComponents([.year, .month, .day], from: stack.captureDate)
+                expected[String(format: "%04d-%02d-%02d", c.year ?? 0, c.month ?? 0, c.day ?? 0), default: []].append(stack.id)
+            }
+            XCTAssertEqual(days.map(\.id), expected.keys.sorted(), zone)
+            for day in days {
+                XCTAssertEqual(day.stacks.map(\.id), expected[day.id], "\(zone) \(day.id)")
+                XCTAssertEqual(day.date, calendar.startOfDay(for: day.stacks[0].captureDate), "\(zone) \(day.id)")
+            }
+        }
+    }
+
     /// Every stack on a day counts toward that day's frame and byte
     /// totals — a day holding stacks can never total 0.
     func testDayTotalsIncludeEveryStackOnTheDay() {

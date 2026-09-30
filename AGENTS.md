@@ -52,6 +52,13 @@ Use `scripts/package-app.sh --install` only when the user asks to refresh the in
 - Preserve the existing Finder-style browser and Photomator-opening behavior when changing catalog or thumbnail features.
 - Preserve unrelated dirty or untracked files. Stage and commit only files in the requested scope.
 
+## Board Rendering
+
+- Tiles and rows never touch the filesystem or the network on the main actor: a tile reads the in-memory thumbnail cache while it draws, and stats, redirects and decodes run on `TileImageLoader`'s queues. Thumbnails of NAS photos are also kept in `ThumbnailDiskCache` (under Caches, rebuildable, size-capped) — never write them into the library.
+- Keep the tile board a flat `LazyVStack` of fixed-height rows and give every list element exactly one view. Do not put nested `ForEach`/`Section` content per tile, `ViewThatFits`, or a per-tile `ProgressView` in the scrolling path — each was measured to cost more the deeper the board is scrolled.
+- Read workspace state where it is drawn (a row's or tile's own body, `ScopedBody`), not in the board's body, so a change re-runs the rows on screen and not the board. Long derived answers a header only decorates with (cameras, people) come from the deferred `...ForDisplay` accessors.
+- After changing the board, the bars or thumbnail loading, run `BoardScrollPerfTests` (opt-in, needs an awake display; see the header of that file) and `HostedMoveResponsivenessTests` with `CT_PERF_BUDGETS=1` in a release build, and report the machine's load average with the numbers.
+
 ## Undo History
 
 - Every user-visible action that can be taken back registers one `UndoEntry` in `EventsWorkspace.undoHistory` (`EventsWorkspace+Undo.swift`) when it finishes; ⌘Z always takes the newest, ⌘⇧Z redoes. Do not add a second undo stack.

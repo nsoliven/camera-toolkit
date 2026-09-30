@@ -10,7 +10,7 @@ final class TileImageLoader: @unchecked Sendable {
     /// The app's one loader. A `var` only so a measurement test can install a
     /// loader whose `fileExists` and `willRead` hooks stand in for a slow
     /// network volume; nothing else assigns it.
-    nonisolated(unsafe) static var shared = TileImageLoader()
+    nonisolated(unsafe) static var shared = TileImageLoader(thumbnailCache: .appDefault)
 
     private final class Box {
         let image: CGImage
@@ -31,9 +31,12 @@ final class TileImageLoader: @unchecked Sendable {
         var finished = false
         var result: CGImage?
 
-        init(url: URL, bucket: Int, orientation: Int, priority: Operation.QueuePriority, cacheKey: String, gate: DriveActivityGate, willRead: @escaping @Sendable (URL) -> Void) {
+        init(
+            url: URL, bucket: Int, orientation: Int, priority: Operation.QueuePriority, cacheKey: String,
+            gate: DriveActivityGate, willRead: @escaping @Sendable (URL) -> Void, disk: (cache: ThumbnailDiskCache, key: String)?
+        ) {
             self.cacheKey = cacheKey
-            operation = TileDecodeOperation(url: url, maximumPixelSize: bucket, orientation: orientation, gate: gate, willRead: willRead)
+            operation = TileDecodeOperation(url: url, maximumPixelSize: bucket, orientation: orientation, gate: gate, willRead: willRead, disk: disk)
             operation.queuePriority = priority
             operation.qualityOfService = TileImageLoader.qos(for: priority)
         }
@@ -85,16 +88,25 @@ final class TileImageLoader: @unchecked Sendable {
     /// Nothing in the app sets it; a measurement test delays reads with it
     /// to stand in for a network volume.
     private let willRead: @Sendable (URL) -> Void
+    /// Thumbnails of network-volume photos kept on this Mac; nil keeps none.
+    private let thumbnailCache: ThumbnailDiskCache?
+    /// Overrides the built-in "is this on a network volume" test — a
+    /// measurement test stands a temporary folder in for the NAS.
+    private let networkVolumeCheck: (@Sendable (URL) -> Bool)?
 
     init(
         driveActivityGate: DriveActivityGate = .shared,
         fileExists: @escaping @Sendable (String) -> Bool = { FileManager.default.fileExists(atPath: $0) },
         willRead: @escaping @Sendable (URL) -> Void = { _ in },
-        purgesOnMemoryPressure: Bool = true
+        purgesOnMemoryPressure: Bool = true,
+        thumbnailCache: ThumbnailDiskCache? = nil,
+        networkVolumeCheck: (@Sendable (URL) -> Bool)? = nil
     ) {
         self.driveActivityGate = driveActivityGate
         self.fileExists = fileExists
         self.willRead = willRead
+        self.thumbnailCache = thumbnailCache
+        self.networkVolumeCheck = networkVolumeCheck
         cache.totalCostLimit = 320 * 1_024 * 1_024
         previewCache.totalCostLimit = 192 * 1_024 * 1_024
         queue = OperationQueue()
@@ -180,12 +192,17 @@ final class TileImageLoader: @unchecked Sendable {
     /// Joining an already-queued decode boosts it to the higher priority.
     /// `timeout` bounds the wait; the shared decode operation is not
     /// cancelled — an uninterruptible filesystem read would ignore it anyway.
+    ///
+    /// `fileIdentity` (`ThumbnailDiskCache.fileIdentity`) names the photo
+    /// for the on-disk thumbnail cache: a tile-sized decode of a photo on a
+    /// network volume is kept, and read back without touching the volume.
     func image(
         for url: URL,
         maximumPixelSize: Int,
         orientation: Int = 0,
         priority: Operation.QueuePriority = .normal,
-        timeout: Duration = TileImageLoader.waitTimeout
+        timeout: Duration = TileImageLoader.waitTimeout,
+        fileIdentity: String? = nil
     ) async -> CGImage? {
         let bucket = Self.bucket(for: maximumPixelSize)
         let askedKey = key(url, bucket, orientation)
@@ -201,13 +218,19 @@ final class TileImageLoader: @unchecked Sendable {
             return cached.image
         }
 
+        let onNetwork = isOnNetworkVolume(resolved)
+        var disk: (cache: ThumbnailDiskCache, key: String)?
+        if onNetwork, bucket <= ThumbnailDiskCache.largestBucket, let cache = thumbnailCache, let fileIdentity {
+            disk = (cache, ThumbnailDiskCache.key(fileIdentity: fileIdentity, bucket: bucket, orientation: orientation))
+        }
         let group = joinGroup(
             cacheKey: cacheKey,
             url: resolved,
             bucket: bucket,
             orientation: orientation,
             priority: priority,
-            onNetwork: isOnNetworkVolume(resolved)
+            onNetwork: onNetwork,
+            disk: disk
         )
         let id = UUID()
         let timeoutTask = Task.detached(priority: .utility) { [weak self] in
@@ -233,7 +256,8 @@ final class TileImageLoader: @unchecked Sendable {
         bucket: Int,
         orientation: Int,
         priority: Operation.QueuePriority,
-        onNetwork: Bool = false
+        onNetwork: Bool = false,
+        disk: (cache: ThumbnailDiskCache, key: String)? = nil
     ) -> WaiterGroup {
         lock.lock()
         defer { lock.unlock() }
@@ -242,7 +266,7 @@ final class TileImageLoader: @unchecked Sendable {
             existing.boost(priority)
             return existing
         }
-        let group = WaiterGroup(url: url, bucket: bucket, orientation: orientation, priority: priority, cacheKey: cacheKey, gate: driveActivityGate, willRead: willRead)
+        let group = WaiterGroup(url: url, bucket: bucket, orientation: orientation, priority: priority, cacheKey: cacheKey, gate: driveActivityGate, willRead: willRead, disk: disk)
         group.waiters = 1
         inFlight[cacheKey] = group
         group.operation.completionBlock = { [weak self] in
@@ -256,6 +280,7 @@ final class TileImageLoader: @unchecked Sendable {
     /// volume is not local). Asked once per volume, from the decode's
     /// background path — never from the main actor.
     private func isOnNetworkVolume(_ url: URL) -> Bool {
+        if let networkVolumeCheck { return networkVolumeCheck(url) }
         let parts = url.pathComponents
         guard parts.count > 2, parts[1] == "Volumes" else { return false }
         let root = "/Volumes/\(parts[2])"
@@ -552,9 +577,14 @@ private final class TileDecodeOperation: Operation, @unchecked Sendable {
     let orientation: Int
     let gate: DriveActivityGate
     let willRead: @Sendable (URL) -> Void
+    let disk: (cache: ThumbnailDiskCache, key: String)?
     var result: CGImage?
 
-    init(url: URL, maximumPixelSize: Int, orientation: Int, gate: DriveActivityGate, willRead: @escaping @Sendable (URL) -> Void) {
+    init(
+        url: URL, maximumPixelSize: Int, orientation: Int, gate: DriveActivityGate,
+        willRead: @escaping @Sendable (URL) -> Void, disk: (cache: ThumbnailDiskCache, key: String)?
+    ) {
+        self.disk = disk
         self.url = url
         self.maximumPixelSize = maximumPixelSize
         self.orientation = orientation
@@ -564,6 +594,12 @@ private final class TileDecodeOperation: Operation, @unchecked Sendable {
 
     override func main() {
         guard !isCancelled else { return }
+        // A thumbnail this Mac already made of a photo on a network volume
+        // is a small local read: no volume access, so nothing to wait for.
+        if let disk, let cached = disk.cache.image(forKey: disk.key) {
+            result = cached
+            return
+        }
         // Wait out a speed test measuring this volume rather than reading
         // through it; a cancelled decode returns instead of waiting.
         guard gate.waitIfPaused(for: url, shouldStop: { [self] in isCancelled }) else { return }
@@ -582,6 +618,9 @@ private final class TileDecodeOperation: Operation, @unchecked Sendable {
         let size = DebugLog.fileSize(of: url)
         result = autoreleasepool {
             TileImageLoader.decode(url: url, maximumPixelSize: maximumPixelSize, orientation: orientation)
+        }
+        if let result, !isCancelled, let disk {
+            disk.cache.store(result, forKey: disk.key)
         }
         DebugLog.shared.log(
             "decode.finish",

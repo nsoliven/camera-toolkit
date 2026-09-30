@@ -61,7 +61,7 @@ final class HostedMoveResponsivenessTests: XCTestCase {
         /// Dropped on a sidebar row instead of chosen from the menu.
         var drop = false
         /// The most times the open board's grid may be rebuilt from the click
-        /// until everything is quiet. Before: 7, or 11 with a NAS.
+        /// until everything is quiet. Before: 7, or 11 with a NAS; now 1.
         var gridRenders: Int
         /// Timing budgets in ms, checked only with `CT_PERF_BUDGETS=1`.
         var totalStall: Double
@@ -259,45 +259,50 @@ final class HostedMoveResponsivenessTests: XCTestCase {
 
     // MARK: - The cases
 
-    // Measured in a release build on a quiet machine, before the fix ->
-    // after (stalls >= 16 ms from the click until quiet, total / longest):
-    //   parent board          1,633 / 480 ms -> ~410 / 290
-    //   parent board + NAS    2,512 / 448 ms -> ~520 / 275
-    //   Subevent board + NAS   782 / 140 ms -> ~230 / 120
-    //   list mode             2,028 / 608 ms -> ~430 / 300
-    //   inspector open        1,637 / 465 ms -> ~460 / 330
-    //   sidebar drop            375 / 156 ms -> ~190 / 125
-    // The budgets sit between: well above what the fixed code measures, below
-    // what the old code did. They need a quiet machine — with other builds
-    // running (load average in the tens) every number is inflated ~2x. The grid still redraws for each change to the
-    // app-wide dictionaries it reads (one per move, one when the NAS rename
-    // lands); per-board observable state is what removes those.
+    // Measured in a release build (load average ~10-25), stalls >= 8 ms from
+    // the click until quiet, total / longest, at the start of this work ->
+    // now (`BoardScrollPerfTests` covers scrolling; this covers the move):
+    //   parent board          728 / 398 ms -> ~365 / 120
+    //   parent board + NAS    867 / 417 ms -> ~395 / 205
+    //   Subevent board + NAS  224 / 111 ms -> ~160 / 90
+    //   list mode             767 / 458 ms -> ~380 / 230
+    //   inspector open        728 / 422 ms -> ~430 / 255
+    //   sidebar drop          200 / 124 ms -> ~150 / 105
+    // The grid is rebuilt once per move on a family board (the landing, when
+    // the moved stacks point at their new paths); everything else a move
+    // changes is read by the rows on screen. What is left is SwiftUI's own
+    // update and layout of the window for a landing that changes counts,
+    // strip, tiles, toolbar and status at once (~115 ms of main-thread CPU),
+    // still above the 50 ms goal. The budgets sit between what the code
+    // measures now and what it measured before; they need a quiet machine.
 
     func testMoveFromTheParentBoard() async throws {
-        try await run(Scenario(name: "parent board", gridRenders: 4, totalStall: 900, longestStall: 500))
+        try await run(Scenario(name: "parent board", gridRenders: 2, totalStall: 700, longestStall: 350))
     }
 
     func testMoveFromTheParentBoardWithTheNAS() async throws {
-        try await run(Scenario(name: "parent board + NAS", withNAS: true, gridRenders: 5, totalStall: 1_100, longestStall: 500))
+        try await run(Scenario(name: "parent board + NAS", withNAS: true, gridRenders: 2, totalStall: 800, longestStall: 350))
     }
 
     func testMoveFromTheParentBoardWithTheBufferUnplugged() async throws {
-        try await run(Scenario(name: "parent board, Buffer unplugged", withNAS: true, bufferAway: true, gridRenders: 5, totalStall: 1_100, longestStall: 500))
+        try await run(Scenario(name: "parent board, Buffer unplugged", withNAS: true, bufferAway: true, gridRenders: 2, totalStall: 800, longestStall: 350))
     }
 
     func testMoveFromTheSubeventBoardWithTheNAS() async throws {
-        try await run(Scenario(name: "subevent board + NAS", source: .subevent, withNAS: true, gridRenders: 5, totalStall: 500, longestStall: 250))
+        try await run(Scenario(name: "subevent board + NAS", source: .subevent, withNAS: true, gridRenders: 2, totalStall: 400, longestStall: 200))
     }
 
     func testMoveInListMode() async throws {
-        try await run(Scenario(name: "list mode", list: true, gridRenders: 4, totalStall: 1_000, longestStall: 600))
+        try await run(Scenario(name: "list mode", list: true, gridRenders: 2, totalStall: 700, longestStall: 400))
     }
 
+    // The inspector, unlike the grid, redraws with each of the three
+    // changes a move makes to what it shows (counts, storage rows, people).
     func testMoveWithTheInspectorOpen() async throws {
-        try await run(Scenario(name: "inspector open", inspector: true, gridRenders: 4, totalStall: 1_000, longestStall: 600))
+        try await run(Scenario(name: "inspector open", inspector: true, gridRenders: 3, totalStall: 700, longestStall: 400))
     }
 
     func testDropOnASidebarRow() async throws {
-        try await run(Scenario(name: "sidebar drop", source: .subevent, drop: true, gridRenders: 4, totalStall: 350, longestStall: 250))
+        try await run(Scenario(name: "sidebar drop", source: .subevent, drop: true, gridRenders: 2, totalStall: 300, longestStall: 200))
     }
 }

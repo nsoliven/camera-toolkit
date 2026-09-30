@@ -37,6 +37,9 @@ import XCTest
 //   empty (the usual case: the Buffer is unplugged), main-thread stats are
 //   counted and every stat on it costs `CT_STAT_MS` (default 5), every read
 //   `CT_READ_MS` (default 60), like an SMB round trip.
+// - `CT_THUMB_CACHE=0`: no on-disk thumbnail cache for the NAS stand-in. A
+//   scenario name ending in `purged` (cold1500purged) empties the in-memory
+//   tile cache first.
 // - `CT_SECONDS` (6), `CT_LIB_DIR` (keep the generated JPEGs between runs),
 //   `CT_LIB_SCALE`, `CT_TILE_WIDTH`, `CT_PROFILE` (scenarios to sample).
 // - `CT_PERF_BUDGETS=1`: enforce the pass criteria as assertions (quiet
@@ -186,9 +189,19 @@ final class BoardScrollPerfTests: XCTestCase {
             readMs: onNAS ? (Double(env["CT_READ_MS"] ?? "") ?? 60) : 0
         )
         let originalLoader = TileImageLoader.shared
+        // The on-disk thumbnail cache of NAS photos lives in a scratch folder
+        // (CT_THUMB_CACHE=0 turns it off, for a before/after).
+        let thumbnailFolder = out.appendingPathComponent("thumbnail-cache", isDirectory: true)
+        try? FileManager.default.removeItem(at: thumbnailFolder)
+        let thumbnailCache = env["CT_THUMB_CACHE"] == "0" ? nil : ThumbnailDiskCache(folder: thumbnailFolder, byteLimit: 512 * 1_024 * 1_024)
+        let nasPrefix = lib.workspace.locations.nasRoot.path
+        var networkCheck: (@Sendable (URL) -> Bool)?
+        if onNAS { networkCheck = { url in url.path.hasPrefix(nasPrefix) } }
         TileImageLoader.shared = TileImageLoader(
             fileExists: { probe.stat($0) },
-            willRead: { probe.read($0) }
+            willRead: { probe.read($0) },
+            thumbnailCache: onNAS ? thumbnailCache : nil,
+            networkVolumeCheck: networkCheck
         )
         defer { TileImageLoader.shared = originalLoader }
 
@@ -245,6 +258,10 @@ final class BoardScrollPerfTests: XCTestCase {
                 start = 150_000; range = 1e9
             }
             if name.hasPrefix("cold") { start = warmRange + (velocity > 2_000 ? 40_000 : 2_000); range = 1e9 }
+            // "purged" scenarios start with the in-memory tile cache emptied,
+            // as a memory warning or a long scroll would leave it: what a tile
+            // needs comes from the on-disk cache, or from the NAS again.
+            if name.hasSuffix("purged") { TileImageLoader.shared.purgeForMemoryPressure() }
             let loadName = name.hasPrefix("jobonly") ? "job" + name.dropFirst(7) : name
             let stopLoad = startLoad(for: loadName, lib: lib)
             try await settle(0.5)

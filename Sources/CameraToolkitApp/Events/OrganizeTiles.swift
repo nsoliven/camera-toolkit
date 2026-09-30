@@ -265,6 +265,10 @@ struct TileThumbnail: View {
     /// Part of the task id: a change re-runs a decode that failed while the
     /// file's volume was away.
     var retryToken: Int = 0
+    /// The photo, for the on-disk thumbnail cache of files on the NAS: its
+    /// name, size and time name the thumbnail, so a tile fills in from this
+    /// Mac when the NAS was read once already.
+    var file: OrganizeFile? = nil
 
     @Environment(\.displayScale) private var displayScale
     /// A bitmap that arrived from a decode after the tile was drawn. A
@@ -328,7 +332,12 @@ struct TileThumbnail: View {
             if !Task.isCancelled { showsSpinner = true }
         }
         defer { spinner.cancel() }
-        let loaded = await loader.image(for: url, maximumPixelSize: pixelSize, orientation: orientation)
+        let loaded = await loader.image(
+            for: url,
+            maximumPixelSize: pixelSize,
+            orientation: orientation,
+            fileIdentity: file.map(ThumbnailDiskCache.fileIdentity)
+        )
         guard !Task.isCancelled else { return }
         decoded = loaded
         failed = loaded == nil
@@ -436,7 +445,7 @@ struct StackTileView: View {
         let shape = RoundedRectangle(cornerRadius: BoardMetrics.tileRadius, style: .continuous)
         VStack(alignment: .leading, spacing: 5) {
             ZStack {
-                TileThumbnail(url: stack.coverItem.primary.url, kind: stack.kind, pointSize: width, orientation: orientation, retryToken: retryToken)
+                TileThumbnail(url: stack.coverItem.primary.url, kind: stack.kind, pointSize: width, orientation: orientation, retryToken: retryToken, file: stack.coverItem.primary)
                     .frame(width: width, height: width * 2 / 3)
                     .clipped()
                 VStack {
@@ -711,7 +720,7 @@ struct StackRowView<MoreMenu: View>: View {
     var body: some View {
         let _ = BoardRenderCounter.hit(.stackTile)
         HStack(spacing: 10) {
-            TileThumbnail(url: stack.coverItem.primary.url, kind: stack.kind, pointSize: 88)
+            TileThumbnail(url: stack.coverItem.primary.url, kind: stack.kind, pointSize: 88, file: stack.coverItem.primary)
                 .frame(width: 72, height: 48)
                 .background(.quaternary)
                 .clipped()
@@ -863,7 +872,7 @@ struct BurstExpansionView: View {
             ) {
                 ForEach(Array(stack.items.enumerated()), id: \.element.id) { index, frame in
                     let shape = RoundedRectangle(cornerRadius: BoardMetrics.frameRadius, style: .continuous)
-                    TileThumbnail(url: frame.primary.url, kind: frame.kind, pointSize: frameSize)
+                    TileThumbnail(url: frame.primary.url, kind: frame.kind, pointSize: frameSize, file: frame.primary)
                         .frame(width: frameSize, height: frameSize * 2 / 3)
                         .clipped()
                         .clipShape(shape)
@@ -2086,7 +2095,7 @@ struct StackPreviewOverlay: View {
                         let isCurrent = index == frameIndex
                         let shape = RoundedRectangle(cornerRadius: BoardMetrics.frameRadius, style: .continuous)
                         let highlight = Color(nsColor: .selectedContentBackgroundColor)
-                        TileThumbnail(url: frame.primary.url, kind: frame.kind, pointSize: 96, orientation: orientationForFile(frame.primary))
+                        TileThumbnail(url: frame.primary.url, kind: frame.kind, pointSize: 96, orientation: orientationForFile(frame.primary), file: frame.primary)
                             .frame(width: 96, height: 64)
                             .clipShape(shape)
                             .overlay {
