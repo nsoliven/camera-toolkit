@@ -4,12 +4,12 @@ import XCTest
 
 /// Where the face sidecar script is found. Each test builds a throwaway
 /// `.app` layout in a temp folder; nothing outside it is read.
-final class BundledResourceLocatorTests: XCTestCase {
+final class ResourceBundleLocatorTests: XCTestCase {
     private var root: URL!
 
     override func setUpWithError() throws {
         root = FileManager.default.temporaryDirectory
-            .appendingPathComponent("BundledResourceLocator-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("ResourceBundleLocator-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
     }
 
@@ -19,20 +19,20 @@ final class BundledResourceLocatorTests: XCTestCase {
 
     private var app: URL { root.appendingPathComponent("Fake.app", isDirectory: true) }
     private var resources: URL { app.appendingPathComponent("Contents/Resources", isDirectory: true) }
-    private var moduleDir: URL { root.appendingPathComponent("build/\(BundledResourceLocator.coreBundleName)", isDirectory: true) }
+    private var moduleDir: URL { root.appendingPathComponent("build/\(ResourceBundleLocator.coreBundleName)", isDirectory: true) }
 
     @discardableResult
     private func placeScript(in base: URL) throws -> URL {
-        let bundle = base.lastPathComponent == BundledResourceLocator.coreBundleName
-            ? base : base.appendingPathComponent(BundledResourceLocator.coreBundleName, isDirectory: true)
+        let bundle = base.lastPathComponent == ResourceBundleLocator.coreBundleName
+            ? base : base.appendingPathComponent(ResourceBundleLocator.coreBundleName, isDirectory: true)
         try FileManager.default.createDirectory(at: bundle, withIntermediateDirectories: true)
         let script = bundle.appendingPathComponent(CoreResources.faceSidecarScriptName)
         try Data("print('stub')\n".utf8).write(to: script)
         return script
     }
 
-    private func locator(module: @escaping @Sendable () -> Bundle?) -> BundledResourceLocator {
-        BundledResourceLocator(resourceURL: resources, bundleURL: app, moduleBundle: module)
+    private func locator(module: @escaping @Sendable () -> Bundle?) -> ResourceBundleLocator {
+        ResourceBundleLocator(resourceURL: resources, bundleURL: app, moduleBundle: module)
     }
 
     func testPackagedLocationWinsOverAppRootAndModule() throws {
@@ -69,7 +69,7 @@ final class BundledResourceLocatorTests: XCTestCase {
     func testNothingFoundReturnsNil() throws {
         // An empty resource bundle directory is not the script.
         try FileManager.default.createDirectory(
-            at: resources.appendingPathComponent(BundledResourceLocator.coreBundleName),
+            at: resources.appendingPathComponent(ResourceBundleLocator.coreBundleName),
             withIntermediateDirectories: true
         )
         let empty = root.appendingPathComponent("empty-module", isDirectory: true)
@@ -82,7 +82,7 @@ final class BundledResourceLocatorTests: XCTestCase {
     func testMainLocatorResolvesInThisTestProcess() {
         // SwiftPM test runs are not inside a .app, so the module fallback is
         // allowed and the script must resolve somewhere.
-        XCTAssertNotNil(BundledResourceLocator.main.locate(CoreResources.faceSidecarScriptName).url)
+        XCTAssertNotNil(ResourceBundleLocator.main.locate(CoreResources.faceSidecarScriptName).url)
     }
 
     func testIsInstalledIsFalseWhenScriptIsMissing() throws {

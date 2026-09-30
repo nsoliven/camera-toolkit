@@ -89,7 +89,7 @@ public struct FaceSidecarInstallation: Equatable, Sendable {
 
     /// The bundled sidecar script: `Contents/Resources` of the packaged app
     /// first, never the developer's build folder from inside an app (see
-    /// `BundledResourceLocator`). Nil when the app ships without it.
+    /// `ResourceBundleLocator`). Nil when the app ships without it.
     public static var scriptURL: URL? {
         CoreResources.faceSidecarScript.url
     }

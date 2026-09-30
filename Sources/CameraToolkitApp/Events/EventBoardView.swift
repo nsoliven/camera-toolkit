@@ -395,7 +395,7 @@ struct EventBoardView: View {
         Button("Preview") { openPreview(stack.id) }
         // A 360 clip's own editor leads when it's installed; Photomator
         // stays for everything else.
-        if DJIStudio.isOffered(for: stack.items.map(\.primary.url), resolver: BundleWorkspaceResolver.shared) {
+        if DJIStudio.isOffered(for: stack.items.map(\.primary.url), resolver: WorkspaceBundleResolver.shared) {
             Button("Open in \(DJIStudio.name)") {
                 openInDJIStudio(targets)
             }

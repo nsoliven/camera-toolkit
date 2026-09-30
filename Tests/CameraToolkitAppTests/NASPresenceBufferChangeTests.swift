@@ -7,7 +7,7 @@ import XCTest
 /// recounted from the drive plan and Sync to NAS's records — the NAS is not
 /// listed again for it, because nothing on it changed.
 @MainActor
-final class NASBufferPresenceChangeTests: XCTestCase {
+final class NASPresenceBufferChangeTests: XCTestCase {
     func testABufferChangeRecountsButNeverListsTheNAS() {
         XCTAssertTrue(NASPresenceTrigger.bufferChanged.recountsWithoutListing)
         XCTAssertTrue(NASPresenceTrigger.bufferChanged.isAutomatic)

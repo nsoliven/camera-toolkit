@@ -197,7 +197,7 @@ enum OpenInAppActions {
 struct OpenInAppMenuItems: View {
     let urls: [URL]
     var lookup: any ApplicationLookup = InstalledApplicationLookup.shared
-    var bundleResolver: any BundleApplicationResolving = BundleWorkspaceResolver.shared
+    var bundleResolver: any BundleApplicationResolving = WorkspaceBundleResolver.shared
 
     var body: some View {
         let apps = OpenInApp.installedApps(lookup: lookup)
@@ -238,8 +238,8 @@ protocol BundleApplicationResolving: Sendable {
 /// The real resolver: `NSWorkspace.urlForApplication(withBundleIdentifier:)`,
 /// remembered briefly so a menu re-rendering never re-queries
 /// LaunchServices. A newly installed app appears within `ttl` seconds.
-final class BundleWorkspaceResolver: BundleApplicationResolving, @unchecked Sendable {
-    static let shared = BundleWorkspaceResolver()
+final class WorkspaceBundleResolver: BundleApplicationResolving, @unchecked Sendable {
+    static let shared = WorkspaceBundleResolver()
 
     let ttl: TimeInterval
     private let lock = NSLock()
@@ -294,7 +294,7 @@ enum DJIStudio {
     /// Opens the 360 files among `urls` in DJI Studio, activated. Returns
     /// false — doing nothing — when there are none or the app is gone.
     @discardableResult
-    static func open(_ urls: [URL], resolver: any BundleApplicationResolving = BundleWorkspaceResolver.shared) -> Bool {
+    static func open(_ urls: [URL], resolver: any BundleApplicationResolving = WorkspaceBundleResolver.shared) -> Bool {
         let files = targets(in: urls)
         guard !files.isEmpty, let app = applicationURL(resolver: resolver) else { return false }
         let configuration = NSWorkspace.OpenConfiguration()
@@ -319,7 +319,7 @@ enum PreferredExternalOpen {
         return (studio, urls.filter { !DJI360Media.isDJI360File($0) })
     }
 
-    static func open(_ urls: [URL], resolver: any BundleApplicationResolving = BundleWorkspaceResolver.shared) {
+    static func open(_ urls: [URL], resolver: any BundleApplicationResolving = WorkspaceBundleResolver.shared) {
         let routed = route(urls, resolver: resolver)
         if !routed.djiStudio.isEmpty {
             DJIStudio.open(routed.djiStudio, resolver: resolver)
