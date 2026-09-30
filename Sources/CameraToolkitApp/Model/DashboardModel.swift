@@ -75,6 +75,8 @@ final class DashboardModel {
     /// face scan, or Immich upload the user explicitly asked for.
     private(set) var jobActivityAssertions: [UUID: any NSObjectProtocol] = [:]
     var jobs: [JobSnapshot]
+    /// The progress relay of each running job, closed when it finishes.
+    @ObservationIgnored private var jobProgressRelays: [UUID: JobProgressRelay] = [:]
     var activityLog: [ActivityLogEntry]
     var configuration: AppConfiguration
     var configMessage: String = "Config is saved automatically."
@@ -1521,15 +1523,14 @@ extension DashboardModel {
         jobs.insert(startedJob, at: 0)
         beginJobActivity(id: jobID, reason: "\(logTitle) — a Camera Toolkit file job")
 
-        let progressHandler: @Sendable (BackgroundJobUpdate) -> Void = { [weak self] update in
-            sampledRecorder?.observe(update.historyObservation)
-            Task { @MainActor in
-                guard let self else { return }
-                self.updateJob(id: jobID, update: update)
-                if tracksTransferQueue {
-                    self.updateTransferQueue(update)
-                }
+        let jobProgress = jobProgressHandler(jobID: jobID) { [weak self] update in
+            if tracksTransferQueue {
+                self?.updateTransferQueue(update)
             }
+        }
+        let progressHandler: @Sendable (BackgroundJobUpdate) -> Void = { update in
+            sampledRecorder?.observe(update.historyObservation)
+            jobProgress(update)
         }
 
         let worker = Task.detached(priority: .userInitiated) {
@@ -1602,25 +1603,48 @@ extension DashboardModel {
         ProcessInfo.processInfo.endActivity(token)
     }
 
+    /// The handler a job's worker calls with progress from any thread. Reports
+    /// reach the main actor at most four times a second (`JobProgressRelay`),
+    /// where they update the job's row and then run `alsoOnMain`. The relay is
+    /// closed when the job finishes.
+    func jobProgressHandler(
+        jobID: UUID,
+        alsoOnMain: (@MainActor @Sendable (BackgroundJobUpdate) -> Void)? = nil
+    ) -> @Sendable (BackgroundJobUpdate) -> Void {
+        let relay = JobProgressRelay { [weak self] update in
+            guard let self else { return }
+            self.updateJob(id: jobID, update: update)
+            alsoOnMain?(update)
+        }
+        jobProgressRelays[jobID] = relay
+        return { update in relay.submit(update) }
+    }
+
     func updateJob(id: UUID, update: BackgroundJobUpdate) {
         guard let index = jobs.firstIndex(where: { $0.id == id }) else {
             return
         }
-        jobs[index].progress = min(max(update.progress, 0), 1)
-        jobs[index].note = update.note
-        jobs[index].detail = update.detail.isEmpty ? jobs[index].detail : update.detail
-        jobs[index].command = update.command.isEmpty ? jobs[index].command : update.command
-        jobs[index].sourcePath = update.sourcePath ?? jobs[index].sourcePath
-        jobs[index].destinationPath = update.destinationPath ?? jobs[index].destinationPath
-        jobs[index].currentPath = update.currentPath
-        jobs[index].processedFiles = update.processedFiles
-        jobs[index].totalFiles = update.totalFiles
-        jobs[index].processedBytes = update.processedBytes
-        jobs[index].totalBytes = update.totalBytes
-        jobs[index].bytesPerSecond = update.bytesPerSecond
+        // A report that arrives after the job finished must not rewrite its
+        // final row.
+        guard jobs[index].state == .running || jobs[index].state == .queued else { return }
+        // One write, so observers see one change rather than one per field.
+        var job = jobs[index]
+        job.progress = min(max(update.progress, 0), 1)
+        job.note = update.note
+        job.detail = update.detail.isEmpty ? job.detail : update.detail
+        job.command = update.command.isEmpty ? job.command : update.command
+        job.sourcePath = update.sourcePath ?? job.sourcePath
+        job.destinationPath = update.destinationPath ?? job.destinationPath
+        job.currentPath = update.currentPath
+        job.processedFiles = update.processedFiles
+        job.totalFiles = update.totalFiles
+        job.processedBytes = update.processedBytes
+        job.totalBytes = update.totalBytes
+        job.bytesPerSecond = update.bytesPerSecond
         if let telemetry = update.telemetry {
-            jobs[index].telemetry = telemetry
+            job.telemetry = telemetry
         }
+        jobs[index] = job
 
         let phase = update.phase.lowercased()
         let changesStoredBytes = phase.contains("copying") || phase.contains("removing from camera")
@@ -1639,6 +1663,7 @@ extension DashboardModel {
         logTitle: String,
         logDetail: String
     ) {
+        jobProgressRelays.removeValue(forKey: id)?.close()
         if let index = jobs.firstIndex(where: { $0.id == id }) {
             jobs[index].state = state
             if state == .done {

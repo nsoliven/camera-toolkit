@@ -7,7 +7,10 @@ import ImageIO
 /// queue and a cost-limited cache. RAW files use their embedded JPEG, so a
 /// tile never decodes sensor data.
 final class TileImageLoader: @unchecked Sendable {
-    static let shared = TileImageLoader()
+    /// The app's one loader. A `var` only so a measurement test can install a
+    /// loader whose `fileExists` and `willRead` hooks stand in for a slow
+    /// network volume; nothing else assigns it.
+    nonisolated(unsafe) static var shared = TileImageLoader()
 
     private final class Box {
         let image: CGImage
@@ -28,9 +31,9 @@ final class TileImageLoader: @unchecked Sendable {
         var finished = false
         var result: CGImage?
 
-        init(url: URL, bucket: Int, orientation: Int, priority: Operation.QueuePriority, cacheKey: String, gate: DriveActivityGate) {
+        init(url: URL, bucket: Int, orientation: Int, priority: Operation.QueuePriority, cacheKey: String, gate: DriveActivityGate, willRead: @escaping @Sendable (URL) -> Void) {
             self.cacheKey = cacheKey
-            operation = TileDecodeOperation(url: url, maximumPixelSize: bucket, orientation: orientation, gate: gate)
+            operation = TileDecodeOperation(url: url, maximumPixelSize: bucket, orientation: orientation, gate: gate, willRead: willRead)
             operation.queuePriority = priority
             operation.qualityOfService = TileImageLoader.qos(for: priority)
         }
@@ -78,13 +81,19 @@ final class TileImageLoader: @unchecked Sendable {
     /// `cachedImage`, which the tile calls on the main actor. Injectable so a
     /// test can prove that.
     private let fileExists: @Sendable (String) -> Bool
+    /// Runs on a decode's background thread just before the file is read.
+    /// Nothing in the app sets it; a measurement test delays reads with it
+    /// to stand in for a network volume.
+    private let willRead: @Sendable (URL) -> Void
 
     init(
         driveActivityGate: DriveActivityGate = .shared,
-        fileExists: @escaping @Sendable (String) -> Bool = { FileManager.default.fileExists(atPath: $0) }
+        fileExists: @escaping @Sendable (String) -> Bool = { FileManager.default.fileExists(atPath: $0) },
+        willRead: @escaping @Sendable (URL) -> Void = { _ in }
     ) {
         self.driveActivityGate = driveActivityGate
         self.fileExists = fileExists
+        self.willRead = willRead
         cache.totalCostLimit = 320 * 1_024 * 1_024
         previewCache.totalCostLimit = 192 * 1_024 * 1_024
         queue = OperationQueue()
@@ -228,7 +237,7 @@ final class TileImageLoader: @unchecked Sendable {
             existing.boost(priority)
             return existing
         }
-        let group = WaiterGroup(url: url, bucket: bucket, orientation: orientation, priority: priority, cacheKey: cacheKey, gate: driveActivityGate)
+        let group = WaiterGroup(url: url, bucket: bucket, orientation: orientation, priority: priority, cacheKey: cacheKey, gate: driveActivityGate, willRead: willRead)
         group.waiters = 1
         inFlight[cacheKey] = group
         group.operation.completionBlock = { [weak self] in
@@ -537,13 +546,15 @@ private final class TileDecodeOperation: Operation, @unchecked Sendable {
     let maximumPixelSize: Int
     let orientation: Int
     let gate: DriveActivityGate
+    let willRead: @Sendable (URL) -> Void
     var result: CGImage?
 
-    init(url: URL, maximumPixelSize: Int, orientation: Int, gate: DriveActivityGate) {
+    init(url: URL, maximumPixelSize: Int, orientation: Int, gate: DriveActivityGate, willRead: @escaping @Sendable (URL) -> Void) {
         self.url = url
         self.maximumPixelSize = maximumPixelSize
         self.orientation = orientation
         self.gate = gate
+        self.willRead = willRead
     }
 
     override func main() {
@@ -562,6 +573,7 @@ private final class TileDecodeOperation: Operation, @unchecked Sendable {
             detail: "bucket \(maximumPixelSize)"
         )
         let start = ContinuousClock.now
+        willRead(url)
         let size = DebugLog.fileSize(of: url)
         result = autoreleasepool {
             TileImageLoader.decode(url: url, maximumPixelSize: maximumPixelSize, orientation: orientation)

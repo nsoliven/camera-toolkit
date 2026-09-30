@@ -744,7 +744,13 @@ final class EventsWorkspace {
     @ObservationIgnored private var optimisticBytes: [UUID: Int64] = [:]
     @ObservationIgnored private var assignmentCounts: [UUID: Int] = [:]
     @ObservationIgnored private var assignmentBytes: [UUID: Int64] = [:]
-    @ObservationIgnored private var eventAssetsByPathKey: [UUID: [String: EventAssetPresence]] = [:]
+    @ObservationIgnored private var eventAssetsByPathKey: [UUID: [String: EventAssetPresence]] = [:] {
+        didSet { eventAssetsRevision &+= 1 }
+    }
+    /// Bumped whenever a board's presence rows change. Tiles read it through
+    /// `badge(for:in:)`, so a tile's "not on the drive" badge redraws with
+    /// the rows and only the tiles on screen redraw.
+    private(set) var eventAssetsRevision = 0
     @ObservationIgnored private var refreshGenerations: [UUID: UUID] = [:]
     /// The deferred refresh pipeline running per event — the remaining
     /// files' implied-path build, then the four-place presence sweep. A
@@ -1656,8 +1662,11 @@ final class EventsWorkspace {
         grouping: OrganizeBoardGrouping,
         sort: OrganizeStackSort
     ) -> [OrganizeBoardGroup] {
-        let catalog = model.catalogStateRevision
-        let configuration = model.configurationRevision
+        // Only the Camera sort reads the data cameras are named from; any
+        // other board order is the same across a catalog or configuration
+        // change (a move's landing bumps both), so it is kept.
+        let catalog = sort.key == .camera ? model.catalogStateRevision : 0
+        let configuration = sort.key == .camera ? model.configurationRevision : 0
         if let entry = eventBoardGroupsCache[eventID],
            entry.catalog == catalog, entry.configuration == configuration,
            entry.grouping == grouping, entry.sort == sort, entry.stacks == stacks {
@@ -1842,15 +1851,19 @@ final class EventsWorkspace {
     /// on, like the other filter facts. A frame with no known camera
     /// contributes `OrganizeCamera.unknownID`.
     func cameraIDs(for stack: OrganizeStack) -> Set<String> {
-        let resolver = cameraResolver
+        refreshIndexIfNeeded()
+        return cameraIDs(for: stack, resolver: cameraResolver)
+    }
+
+    /// One stack's cameras, for a caller that has refreshed the assignment
+    /// index and holds the resolver — a board asks this for every stack, and
+    /// each `assignment(for:)` would copy the configuration to check the index.
+    private func cameraIDs(for stack: OrganizeStack, resolver: OrganizeCameraResolver) -> Set<String> {
         var ids = Set<String>()
         for item in stack.items {
-            let camera = resolver.camera(
-                assignmentDeviceID: assignment(for: item.primary)?.deviceID,
-                file: item.primary,
-                metadataCamera: item.metadataCamera
-            )
-            ids.insert(camera?.id ?? OrganizeCamera.unknownID)
+            let file = item.primary
+            let device = assignmentsByPathKey[file.pathKey].flatMap { $0.fileSize == file.size ? $0.deviceID : nil }
+            ids.insert(resolver.cameraID(assignmentDeviceID: device, file: file, metadataCamera: item.metadataCamera))
         }
         return ids
     }
@@ -1880,12 +1893,87 @@ final class EventsWorkspace {
             boardCamerasCache.insert(entry, at: 0)
             return entry.cameras
         }
-        let cameras = Self.boardCameras(stacks) { self.cameraIDs(for: $0) } name: { id in
+        refreshIndexIfNeeded()
+        let resolver = cameraResolver
+        let cameras = Self.boardCameras(stacks) { self.cameraIDs(for: $0, resolver: resolver) } name: { id in
             CameraCatalog.camera(id: id)
         }
         boardCamerasCache.insert((catalog, configuration, stacks, cameras), at: 0)
         if boardCamerasCache.count > 8 { boardCamerasCache.removeLast() }
         return cameras
+    }
+
+    // MARK: Header chips, kept off the render path
+
+    /// Camera and people chips are decoration on the board's header, yet
+    /// recounting them walks every stack (cameras) or every assignment
+    /// (people) — ~20 ms on a 15,000-file family, and a move changes both
+    /// answers twice. So a view draws the answer it already had while the
+    /// new one is worked out on the next turn of the run loop, and redraws
+    /// when it lands. The first answer for a board is computed at once.
+    @ObservationIgnored private var displayedCameras: [UUID: [BoardCamera]] = [:]
+    @ObservationIgnored private var displayedPeople: [UUID: [FacePerson]] = [:]
+    @ObservationIgnored private var staleChipBoards: Set<UUID> = []
+    @ObservationIgnored private var chipRefreshScheduled = false
+    /// Bumped when a deferred chip answer lands; the header reads it.
+    private(set) var boardChipsRevision = 0
+
+    /// `boardCameras(for:)` for the header's chips — see above.
+    func boardCamerasForDisplay(for stacks: [OrganizeStack], eventID: UUID) -> [BoardCamera] {
+        _ = boardChipsRevision
+        let catalog = model.catalogStateRevision
+        let configuration = model.configurationRevision
+        if boardCamerasCache.contains(where: { $0.catalog == catalog && $0.configuration == configuration && $0.stacks == stacks }) {
+            let cameras = boardCameras(for: stacks)
+            displayedCameras[eventID] = cameras
+            return cameras
+        }
+        guard let shown = displayedCameras[eventID] else {
+            let cameras = boardCameras(for: stacks)
+            displayedCameras[eventID] = cameras
+            return cameras
+        }
+        deferChipRefresh(eventID)
+        return shown
+    }
+
+    /// `eventPeople(_:)` for the header's chips and the sidebar's tooltips.
+    func eventPeopleForDisplay(_ eventID: UUID) -> [FacePerson] {
+        _ = boardChipsRevision
+        if let cache = eventPeopleCache, cache.0 == facesRevision, cache.1 == model.catalogStateRevision {
+            let people = cache.2[eventID] ?? []
+            displayedPeople[eventID] = people
+            return people
+        }
+        guard let shown = displayedPeople[eventID] else {
+            let people = eventPeople(eventID)
+            displayedPeople[eventID] = people
+            return people
+        }
+        deferChipRefresh(eventID)
+        return shown
+    }
+
+    private func deferChipRefresh(_ eventID: UUID) {
+        staleChipBoards.insert(eventID)
+        guard !chipRefreshScheduled else { return }
+        chipRefreshScheduled = true
+        Task { @MainActor [weak self] in
+            self?.refreshDeferredChips()
+        }
+    }
+
+    /// Works out the chip answers that went stale and lets the views know.
+    /// Runs on its own turn, so a move's landing does not carry it.
+    func refreshDeferredChips() {
+        chipRefreshScheduled = false
+        let boards = staleChipBoards
+        staleChipBoards = []
+        for eventID in boards {
+            if let stacks = eventStacks[eventID] { displayedCameras[eventID] = boardCameras(for: stacks) }
+            displayedPeople[eventID] = eventPeople(eventID)
+        }
+        boardChipsRevision &+= 1
     }
 
     /// The counting behind `boardCameras(for:)`, pure so it can be tested
@@ -2097,6 +2185,7 @@ final class EventsWorkspace {
     }
 
     func badge(for stack: OrganizeStack, in eventID: UUID) -> TileLocationBadge? {
+        _ = eventAssetsRevision
         guard let event = event(eventID),
               let asset = eventAssetsByPathKey[eventID]?[stack.coverItem.primary.pathKey] else {
             return nil
@@ -6897,9 +6986,19 @@ final class EventsWorkspace {
 
     /// True once `scripts/setup-face-sidecar.sh` has installed the face
     /// engine on this Mac — the gate every scan and the People window show.
+    ///
+    /// The answer comes from files on disk and the sidebar footer asks on
+    /// every redraw — with a job's progress that is several times a second
+    /// — so it is kept for a few seconds before the files are looked at again.
     var faceEngineInstalled: Bool {
-        FaceSidecarInstallation(applicationSupport: DashboardModel.defaultApplicationSupportURL).isInstalled
+        let now = ContinuousClock.now
+        if let known = faceEngineCheck, now - known.at < .seconds(5) { return known.installed }
+        let installed = FaceSidecarInstallation(applicationSupport: DashboardModel.defaultApplicationSupportURL).isInstalled
+        faceEngineCheck = (now, installed)
+        return installed
     }
+
+    @ObservationIgnored private var faceEngineCheck: (at: ContinuousClock.Instant, installed: Bool)?
 
     /// Opens the "Scan for Faces" sheet for a location — quality and the
     /// Fast (pin the Mac) are picked there before any job starts.

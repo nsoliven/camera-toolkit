@@ -12,6 +12,10 @@ enum BoardRenderCounter {
         case grid
         /// One tile or row built by the grid (`OrganizeGrid.tile` / `row`).
         case gridTile
+        /// `StackTileView.body` and `StackRowView.body`: a tile or row drawn.
+        case stackTile
+        /// `TileThumbnail.body`: a thumbnail (or its placeholder) drawn.
+        case thumbnail
         /// `EventBoardView.body`: the board's toolbar and header.
         case board
         /// `EventStorageSummary.body`: the storage strip.

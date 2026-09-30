@@ -21,7 +21,7 @@ struct EventBoardView: View {
     /// notices and chips may grow before they scroll.
     @State private var boardHeight: Double?
     /// The filter popover — owned here, outside the bottom bar's
-    /// `ViewThatFits`, so a candidate swap cannot re-present it mid-layout.
+    /// renderings, so a width change cannot re-present it mid-layout.
     @State private var showFilters = false
     /// Shared with the View menu's Show Inspector item (⌥⌘I); the
     /// inspector itself hangs off the split view in EventsRootView.
@@ -59,9 +59,9 @@ struct EventBoardView: View {
             // One grouping pass per render — the board, the toolbar count,
             // and the bottom bar all share it.
             let groups = boardGroups
-            let ordered = groups
-                .filter { !workspace.collapsedGroupIDs.contains($0.id) }
-                .flatMap(\.stacks)
+            // The stacks in board order, for the preview and Select All — built
+            // when one of them asks, not on every render.
+            let ordered = { groups.filter { !workspace.collapsedGroupIDs.contains($0.id) }.flatMap(\.stacks) }
             let matched = groups.reduce(0) { $0 + $1.stacks.count }
             let title = workspace.eventTitle(event)
             let reachability = workspace.eventReachability[eventID]
@@ -98,26 +98,26 @@ struct EventBoardView: View {
             .scrollEdgeEffectStyle(.hard, for: .bottom)
             .safeAreaBar(edge: .bottom) {
                 BoardBottomBar(model: model, workspace: workspace, loadingNote: loadingNote) {
-                    ViewThatFits(in: .horizontal) {
-                        viewControls(groups: groups, compact: false)
-                        viewControls(groups: groups, compact: true)
-                        viewControls(groups: groups, compact: true, iconOnlyMenus: true)
+                    // Wide, then compact, then icon-only menus: the widest
+                    // that fits, measured once per width change.
+                    AdaptiveBar(id: "event-board", tierCount: 3) { tier in
+                        viewControls(groups: groups, compact: tier > 0, iconOnlyMenus: tier > 1)
+                            .boardFilterPopover(
+                                isPresented: $showFilters,
+                                workspace: workspace,
+                                stacks: stacks ?? [],
+                                eventScope: workspace.scopeIDs(eventID),
+                                search: $workspace.search,
+                                matchedCount: matched
+                            )
                     }
-                    .boardFilterPopover(
-                        isPresented: $showFilters,
-                        workspace: workspace,
-                        stacks: stacks ?? [],
-                        eventScope: workspace.scopeIDs(eventID),
-                        search: $workspace.search,
-                        matchedCount: matched
-                    )
                 }
             }
             .overlay {
                 if previewStackID != nil {
                     StackPreviewOverlay(
                         workspace: workspace,
-                        stacks: ordered,
+                        stacks: ordered(),
                         stackID: $previewStackID,
                         excludedEventID: eventID,
                         assignVerb: "Move to",
@@ -169,7 +169,7 @@ struct EventBoardView: View {
             }
             .onReceive(NotificationCenter.default.publisher(for: BrowserCommand.notification)) { notification in
                 guard let raw = notification.object as? String, let command = BrowserCommand(rawValue: raw) else { return }
-                handle(command, ordered: ordered)
+                handle(command, ordered: ordered())
             }
         } else {
             ContentUnavailableView("Event Not Found", systemImage: "calendar.badge.exclamationmark")
@@ -242,12 +242,12 @@ struct EventBoardView: View {
     /// place), subevent, people and — on a mixed board — camera chips,
     /// and the active filters.
     private func titleAccessory(_ event: SavedCameraEvent) -> some View {
-        let people = workspace.eventPeople(eventID)
+        let people = workspace.eventPeopleForDisplay(eventID)
         let subevents = workspace.subevents(of: eventID)
         let shown = showAllPeople ? people : Array(people.prefix(Self.collapsedPeopleCount))
         // Camera chips only when the board mixes cameras — one camera
         // needs no filter.
-        let cameras = workspace.boardCameras(for: workspace.eventStacks[eventID] ?? [])
+        let cameras = workspace.boardCamerasForDisplay(for: workspace.eventStacks[eventID] ?? [], eventID: eventID)
         return VStack(alignment: .leading, spacing: 8) {
             EventStorageSummary(slots: EventStorageSlots(
                 model: model,
@@ -355,6 +355,9 @@ struct EventBoardView: View {
             onKey: { press, _ in handleKey(press) },
             menu: { stack in LazyContextMenu { contextMenu(stack) } }
         )
+        // Rebuilt only when what it draws changes — not each time the board
+        // around it (strip, status line, counts) re-evaluates.
+        .equatable()
     }
 
     private func openPreview(_ stackID: String, frame: Int = 0) {

@@ -155,6 +155,12 @@ struct OrganizeBoardGroup: Identifiable, Sendable {
         self.totals = Totals(stacks)
     }
 
+    /// Same group, same stacks in the same order — `stacks` compares by
+    /// buffer first, so an unchanged group costs nothing to recognise.
+    func hasSameContent(as other: OrganizeBoardGroup) -> Bool {
+        id == other.id && title == other.title && symbol == other.symbol && stacks == other.stacks
+    }
+
     var frameCount: Int { totals.frames }
     var byteCount: Int64 { totals.bytes }
     var subtitle: String {

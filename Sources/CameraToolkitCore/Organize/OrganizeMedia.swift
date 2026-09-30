@@ -459,12 +459,29 @@ public enum OrganizeStacker {
     public static func days(for stacks: [OrganizeStack], calendar: Calendar = .current) -> [OrganizeDay] {
         var order: [String] = []
         var byDay: [String: (date: Date, stacks: [OrganizeStack])] = [:]
+        // A board's stacks sit in day-long runs, so the calendar is asked
+        // once per day, not once per stack: the day the last stack fell on
+        // answers for every stack inside it (calendar work was most of the
+        // cost of grouping a 4,700-stack board).
+        var runKey: String?
+        var runStart = Date.distantFuture
+        var runEnd = Date.distantPast
         for stack in stacks {
-            let components = calendar.dateComponents([.year, .month, .day], from: stack.captureDate)
-            let key = String(format: "%04d-%02d-%02d", components.year ?? 0, components.month ?? 0, components.day ?? 0)
+            let date = stack.captureDate
+            let key: String
+            if let runKey, date >= runStart, date < runEnd {
+                key = runKey
+            } else {
+                let components = calendar.dateComponents([.year, .month, .day], from: date)
+                key = String(format: "%04d-%02d-%02d", components.year ?? 0, components.month ?? 0, components.day ?? 0)
+                let start = calendar.startOfDay(for: date)
+                runKey = key
+                runStart = start
+                runEnd = calendar.date(byAdding: .day, value: 1, to: start) ?? start
+            }
             if byDay[key] == nil {
                 order.append(key)
-                byDay[key] = (calendar.startOfDay(for: stack.captureDate), [])
+                byDay[key] = (calendar.startOfDay(for: date), [])
             }
             byDay[key]?.stacks.append(stack)
         }

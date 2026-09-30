@@ -326,3 +326,146 @@ private struct BoardStatusLine: View {
         .frame(maxWidth: .infinity, minHeight: 16)
     }
 }
+
+// MARK: - Width-adaptive bars
+
+/// Which rendering of a bar to show, given the width it has. Renderings run
+/// from the widest (tier 0) to the narrowest. `naturals[t]` is the width
+/// tier `t` was last measured at, nil until it has been shown once.
+///
+/// The bar moves one tier at a time and only on what was measured, so a
+/// width the bar fits in never changes anything: it steps down when the
+/// shown tier is wider than the space, and back up when the next wider tier
+/// — as last measured — fits. Both moves use the same numbers, so a width
+/// cannot flip between two tiers.
+enum AdaptiveBarChoice {
+    static func tier(current: Int, tierCount: Int, available: Double, naturals: [Double?]) -> Int {
+        guard tierCount > 1, naturals.indices.contains(current) else { return current }
+        if let natural = naturals[current], natural > available + 0.5, current < tierCount - 1 {
+            return current + 1
+        }
+        if current > 0, let wider = naturals[current - 1], wider <= available {
+            return current - 1
+        }
+        return current
+    }
+}
+
+/// What an `AdaptiveBar` has measured. Reference-typed and unobserved:
+/// layout reports into it, and only a changed choice becomes state.
+@MainActor
+final class AdaptiveBarProbe {
+    var tierCount = 1
+    var available: Double?
+    var naturals: [Double?] = []
+    var tier = 0
+    var apply: (Int) -> Void = { _ in }
+    private var pending = false
+
+    func measured(natural: Double, forTier tier: Int) {
+        guard tier == self.tier else { return }
+        if naturals.count < tierCount { naturals += Array(repeating: nil, count: tierCount - naturals.count) }
+        guard naturals[tier] != natural else { return }
+        naturals[tier] = natural
+        evaluate()
+    }
+
+    func measured(available width: Double) {
+        guard available != width else { return }
+        available = width
+        evaluate()
+    }
+
+    /// Steps toward the tier that fits. Applied on the next turn of the run
+    /// loop, never from inside a layout pass.
+    private func evaluate() {
+        guard let available, !pending else { return }
+        let next = AdaptiveBarChoice.tier(current: tier, tierCount: tierCount, available: available, naturals: naturals)
+        guard next != tier else { return }
+        pending = true
+        DispatchQueue.main.async { [self] in
+            pending = false
+            guard let available = self.available else { return }
+            let target = AdaptiveBarChoice.tier(current: tier, tierCount: tierCount, available: available, naturals: naturals)
+            guard target != tier else { return }
+            tier = target
+            apply(target)
+        }
+    }
+}
+
+/// Reports the natural width of its one child during layout, then lays it
+/// out exactly as the child asks. `ViewThatFits` builds and measures every
+/// candidate again whenever anything around it changes — for a bottom bar
+/// beside a status line that ticks with job progress, that was a full
+/// re-measure of every candidate ten times a second while scrolling. This
+/// measures the one child that is shown.
+private struct NaturalWidthLayout: Layout {
+    let report: (Double) -> Void
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        subviews.first?.sizeThatFits(proposal) ?? .zero
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        guard let subview = subviews.first else { return }
+        report(Double(subview.sizeThatFits(.unspecified).width))
+        subview.place(at: bounds.origin, anchor: .topLeading, proposal: ProposedViewSize(bounds.size))
+    }
+}
+
+/// A bar that shows the widest of its `tierCount` renderings that fits.
+/// Only the shown rendering exists: a width change measures once and
+/// switches once, and nothing re-measures while the bar's width is steady.
+/// Renderings must keep one view structure (they differ in parameters), so
+/// a switch never re-presents a popover or sheet attached to the bar.
+struct AdaptiveBar<Content: View>: View {
+    /// Where the last tier is remembered, so a board opened again starts at
+    /// the tier its width settled on instead of stepping down from the widest.
+    let id: String
+    let tierCount: Int
+    @ViewBuilder let content: (Int) -> Content
+
+    @State private var tier: Int
+    @State private var probe = AdaptiveBarProbe()
+
+    init(id: String, tierCount: Int, @ViewBuilder content: @escaping (Int) -> Content) {
+        self.id = id
+        self.tierCount = tierCount
+        self.content = content
+        _tier = State(initialValue: min(RememberedTiers.shared.tiers[id] ?? 0, tierCount - 1))
+    }
+
+    var body: some View {
+        let _ = configureProbe()
+        NaturalWidthLayout(report: { [probe, tier] width in
+            MainActor.assumeIsolated { probe.measured(natural: width, forTier: tier) }
+        }) {
+            content(tier)
+        }
+        .frame(maxWidth: .infinity)
+        .onGeometryChange(for: Double.self) { Double($0.size.width) } action: { width in
+            probe.measured(available: width)
+        }
+    }
+
+    @MainActor
+    private func configureProbe() -> Bool {
+        probe.tierCount = tierCount
+        probe.tier = tier
+        let id = id
+        let setTier = _tier
+        probe.apply = { next in
+            setTier.wrappedValue = next
+            RememberedTiers.shared.tiers[id] = next
+        }
+        return true
+    }
+}
+
+/// The last tier each bar settled on, for the life of the app.
+@MainActor
+final class RememberedTiers {
+    static let shared = RememberedTiers()
+    var tiers: [String: Int] = [:]
+}

@@ -38,11 +38,10 @@ extension DashboardModel {
         )
         beginJobActivity(id: jobID, reason: "\(logTitle) — a Camera Toolkit file job")
 
-        let progressHandler: @Sendable (BackgroundJobUpdate) -> Void = { [weak self] update in
+        let jobProgress = jobProgressHandler(jobID: jobID)
+        let progressHandler: @Sendable (BackgroundJobUpdate) -> Void = { update in
             recorder?.observe(update.historyObservation)
-            Task { @MainActor in
-                self?.updateJob(id: jobID, update: update)
-            }
+            jobProgress(update)
         }
         let worker = Task.detached(priority: .userInitiated) {
             try await operation(progressHandler)

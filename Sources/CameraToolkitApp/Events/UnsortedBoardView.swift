@@ -17,9 +17,9 @@ struct UnsortedBoardView: View {
     @State private var previewStackID: String?
     @State private var previewFrameIndex = 0
     /// The filter popover — owned here, outside the bottom bar's
-    /// `ViewThatFits`, so a candidate swap cannot re-present it mid-layout.
+    /// renderings, so a width change cannot re-present it mid-layout.
     @State private var showFilters = false
-    /// The Event… picker sheet — outside the `ViewThatFits` for the same
+    /// The Event… picker sheet — outside the renderings for the same
     /// reason as `showFilters`.
     @State private var showEventPicker = false
 
@@ -207,7 +207,7 @@ struct UnsortedBoardView: View {
 
     /// One bottom bar for the sorting workflow: sort-into on the leading
     /// side, view controls in the middle, Undo and Apply trailing. Narrow
-    /// windows first drop the tile slider and shorten Sort/Group to their
+    /// windows (the widest rendering that fits, measured once per width) first drop the tile slider and shorten Sort/Group to their
     /// names, then show them as icons, then shrink the targets to numbered
     /// keycaps, then fall back to a Sort Into menu.
     private func bottomBar(_ result: OrganizeScanResult, groups: [OrganizeBoardGroup], ordered: [OrganizeStack], matched: Int) -> some View {
@@ -222,29 +222,32 @@ struct UnsortedBoardView: View {
             conflicts: collisions.conflicts
         ) ?? "Select items, then press 1–3, drag onto an event, or press N for a new event"
         return BoardBottomBar(model: model, workspace: workspace, hint: hint) {
-            ViewThatFits(in: .horizontal) {
-                bottomBarRow(result, groups: groups, orderedIDs: orderedIDs, matched: matched, targets: targets, sorted: sorted, assignStyle: .glass, compactControls: false)
-                bottomBarRow(result, groups: groups, orderedIDs: orderedIDs, matched: matched, targets: targets, sorted: sorted, assignStyle: .glass, compactControls: true)
-                bottomBarRow(result, groups: groups, orderedIDs: orderedIDs, matched: matched, targets: targets, sorted: sorted, assignStyle: .glass, compactControls: true, iconOnlyMenus: true)
-                bottomBarRow(result, groups: groups, orderedIDs: orderedIDs, matched: matched, targets: targets, sorted: sorted, assignStyle: .glassNumbers, compactControls: true)
-                bottomBarRow(result, groups: groups, orderedIDs: orderedIDs, matched: matched, targets: targets, sorted: sorted, assignStyle: .glassNumbers, compactControls: true, iconOnlyMenus: true)
-                bottomBarRow(result, groups: groups, orderedIDs: orderedIDs, matched: matched, targets: targets, sorted: sorted, assignStyle: .menu, compactControls: true, iconOnlyMenus: true)
+            AdaptiveBar(id: "unsorted-board", tierCount: 6) { tier in
+                let style: (EventAssignControls.Style, Bool, Bool) = switch tier {
+                case 0: (.glass, false, false)
+                case 1: (.glass, true, false)
+                case 2: (.glass, true, true)
+                case 3: (.glassNumbers, true, false)
+                case 4: (.glassNumbers, true, true)
+                default: (.menu, true, true)
+                }
+                bottomBarRow(result, groups: groups, orderedIDs: orderedIDs, matched: matched, targets: targets, sorted: sorted, assignStyle: style.0, compactControls: style.1, iconOnlyMenus: style.2)
+                    .boardFilterPopover(
+                        isPresented: $showFilters,
+                        workspace: workspace,
+                        stacks: result.stacks,
+                        search: $workspace.search,
+                        matchedCount: matched
+                    )
+                    .eventPickerSheet(
+                        isPresented: $showEventPicker,
+                        workspace: workspace,
+                        verb: "Sort into",
+                        canAssign: !targets.isEmpty,
+                        onPick: { workspace.assign(stackIDs: targets, from: location.id, to: $0.id, orderedIDs: orderedIDs) },
+                        onNewEvent: { workspace.requestNewEvent(from: location.id) }
+                    )
             }
-            .boardFilterPopover(
-                isPresented: $showFilters,
-                workspace: workspace,
-                stacks: result.stacks,
-                search: $workspace.search,
-                matchedCount: matched
-            )
-            .eventPickerSheet(
-                isPresented: $showEventPicker,
-                workspace: workspace,
-                verb: "Sort into",
-                canAssign: !targets.isEmpty,
-                onPick: { workspace.assign(stackIDs: targets, from: location.id, to: $0.id, orderedIDs: orderedIDs) },
-                onNewEvent: { workspace.requestNewEvent(from: location.id) }
-            )
         }
     }
 

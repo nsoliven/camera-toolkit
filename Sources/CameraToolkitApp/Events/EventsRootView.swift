@@ -495,7 +495,7 @@ struct EventsSidebar: View {
     private func eventRow(_ event: SavedCameraEvent, depth: Int) -> some View {
         let count = workspace.assignmentCount(for: event.id)
         let summary = workspace.presence[event.id]
-        let names = workspace.eventPeople(event.id).map(\.name).joined(separator: ", ")
+        let names = workspace.eventPeopleForDisplay(event.id).map(\.name).joined(separator: ", ")
         let isPrivate = workspace.resolvedPolicy(for: event) == .archiveOnly
         var details = [
             event.eventDate.formatted(date: .abbreviated, time: .omitted),

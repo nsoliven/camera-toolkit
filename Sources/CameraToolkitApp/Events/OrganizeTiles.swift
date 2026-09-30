@@ -205,7 +205,7 @@ struct PersonChip: View {
     }
 }
 
-enum TileLocationBadge {
+enum TileLocationBadge: Equatable {
     case onSource
     case inBuffer
     case inPrivate
@@ -267,12 +267,26 @@ struct TileThumbnail: View {
     var retryToken: Int = 0
 
     @Environment(\.displayScale) private var displayScale
-    @State private var image: CGImage?
+    /// A bitmap that arrived from a decode after the tile was drawn. A
+    /// bitmap already in the cache is read straight from it while drawing
+    /// and never stored here.
+    @State private var decoded: CGImage?
     @State private var failed = false
+    /// Set once a decode has kept the tile waiting a moment: a tile that
+    /// fills in at once never draws a spinner.
+    @State private var showsSpinner = false
+
+    /// How long a tile waits before it shows a spinner.
+    static let spinnerDelay: Duration = .milliseconds(300)
 
     private var pixelSize: Int { Int(pointSize * displayScale) }
 
     var body: some View {
+        let _ = BoardRenderCounter.hit(.thumbnail)
+        // A memory lookup — no file access — so a cached tile draws its
+        // photo in its first frame. The cache answers before a bitmap this
+        // tile decoded itself, which a rotation may have made stale.
+        let image = TileImageLoader.shared.cachedImage(for: url, maximumPixelSize: pixelSize, orientation: orientation) ?? decoded
         ZStack {
             if let image {
                 Image(decorative: image, scale: 1)
@@ -282,30 +296,43 @@ struct TileThumbnail: View {
                 Image(systemName: symbol)
                     .font(.title)
                     .foregroundStyle(.secondary)
-            } else {
+            } else if showsSpinner {
                 ProgressView()
                     .controlSize(.small)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .task(id: "\(url.path)#\(TileImageLoader.bucket(for: pixelSize))#\(orientation)#\(retryToken)") {
-            if let cached = TileImageLoader.shared.cachedImage(for: url, maximumPixelSize: pixelSize, orientation: orientation) {
-                image = cached
-                failed = false
-                return
-            }
-            image = nil
-            failed = false
-            let loaded = await TileImageLoader.shared.image(for: url, maximumPixelSize: pixelSize, orientation: orientation)
-            guard !Task.isCancelled else { return }
-            image = loaded
-            failed = loaded == nil
+            await load()
         }
         .onDisappear {
-            // Scrolled off: drop the tile's own bitmap — the NSCache keeps a
-            // share for the scroll back, this copy is what ballooned memory.
-            image = nil
+            // Scrolled off: drop the bitmap this tile decoded itself so the
+            // cache alone decides how long it stays in memory.
+            if decoded != nil { decoded = nil }
         }
+    }
+
+    private func load() async {
+        let loader = TileImageLoader.shared
+        if loader.cachedImage(for: url, maximumPixelSize: pixelSize, orientation: orientation) != nil {
+            if decoded != nil { decoded = nil }
+            if failed { failed = false }
+            if showsSpinner { showsSpinner = false }
+            return
+        }
+        if decoded != nil { decoded = nil }
+        if failed { failed = false }
+        if showsSpinner { showsSpinner = false }
+        let spinner = Task { @MainActor in
+            try? await Task.sleep(for: Self.spinnerDelay)
+            if !Task.isCancelled { showsSpinner = true }
+        }
+        defer { spinner.cancel() }
+        let loaded = await loader.image(for: url, maximumPixelSize: pixelSize, orientation: orientation)
+        guard !Task.isCancelled else { return }
+        decoded = loaded
+        failed = loaded == nil
+        showsSpinner = false
     }
 
     private var symbol: String {
@@ -405,6 +432,7 @@ struct StackTileView: View {
     var retryToken: Int = 0
 
     var body: some View {
+        let _ = BoardRenderCounter.hit(.stackTile)
         let shape = RoundedRectangle(cornerRadius: BoardMetrics.tileRadius, style: .continuous)
         VStack(alignment: .leading, spacing: 5) {
             ZStack {
@@ -522,6 +550,30 @@ struct StackTileView: View {
                 .padding(-(gap + lineWidth))
                 .allowsHitTesting(false)
         }
+    }
+}
+
+/// A tile is the same tile when what it shows is the same. Its three
+/// closures only act on the stack by id, so they never change the picture;
+/// with `.equatable()` a row that re-evaluates redraws just the tiles whose
+/// selection, badge, tag or photo actually changed.
+extension StackTileView: @preconcurrency Equatable {
+    static func == (lhs: StackTileView, rhs: StackTileView) -> Bool {
+        lhs.stack == rhs.stack
+            && lhs.width == rhs.width
+            && lhs.isSelected == rhs.isSelected
+            && lhs.isFocused == rhs.isFocused
+            && lhs.isEmphasized == rhs.isEmphasized
+            && lhs.event == rhs.event
+            && lhs.isPrivate == rhs.isPrivate
+            && lhs.tag == rhs.tag
+            && lhs.isMixed == rhs.isMixed
+            && lhs.isDimmed == rhs.isDimmed
+            && lhs.badge == rhs.badge
+            && lhs.editTags == rhs.editTags
+            && lhs.originFolder == rhs.originFolder
+            && lhs.orientation == rhs.orientation
+            && lhs.retryToken == rhs.retryToken
     }
 }
 
@@ -657,9 +709,11 @@ struct StackRowView<MoreMenu: View>: View {
     private var isProminent: Bool { isSelected && isEmphasized }
 
     var body: some View {
+        let _ = BoardRenderCounter.hit(.stackTile)
         HStack(spacing: 10) {
             TileThumbnail(url: stack.coverItem.primary.url, kind: stack.kind, pointSize: 88)
                 .frame(width: 72, height: 48)
+                .background(.quaternary)
                 .clipped()
                 .clipShape(RoundedRectangle(cornerRadius: BoardMetrics.listThumbRadius, style: .continuous))
                 .overlay {
@@ -913,7 +967,11 @@ struct OrganizeGrid<MenuContent: View>: View {
     @ViewBuilder let menu: (OrganizeStack) -> MenuContent
 
     @FocusState private var isFocused: Bool
-    @State private var columns = 1
+    /// The board's measured width. The tile layout — how many columns, how
+    /// wide a cell — is worked out from it and the tile size.
+    @State private var boardWidth: Double = 1_000
+    /// The order stacks are drawn in, for click ranges and arrow keys.
+    @State private var order = BoardOrder()
     /// Restores the board's own scroll position when it is opened again.
     @State private var scrollPosition = ScrollPosition()
     /// The saved offset still to be put back. The grid is lazy, so its
@@ -942,6 +1000,13 @@ struct OrganizeGrid<MenuContent: View>: View {
         OrganizeBoardPlan.sections(for: groups, collapsedIDs: workspace.collapsedGroupIDs)
     }
 
+    private var layout: BoardTileLayout {
+        BoardTileLayout(width: boardWidth, tileWidth: tileWidth)
+    }
+
+    /// Tiles per row on the tile board — what Up and Down step by.
+    private var columns: Int { layout.columns }
+
     /// Reads the board's saved scroll offset once, when the grid first
     /// reports or appears — whichever is first.
     private func beginScrollRestore() {
@@ -958,14 +1023,20 @@ struct OrganizeGrid<MenuContent: View>: View {
 
     var body: some View {
         let _ = BoardRenderCounter.hit(.grid)
+        let sections = self.sections
         let ordered = sections.flatMap(\.visibleStacks)
         let orderedIDs = ordered.map(\.id)
+        let _ = { order.ids = orderedIDs }()
+        // Rows are worked out once per body, not once per row built.
+        let tileSections = mode == .tiles
+            ? BoardTileRows.sections(sections, columns: columns, expanded: workspace.expandedStackIDs)
+            : []
         ScrollViewReader { proxy in
             ScrollView {
                 if mode == .tiles {
-                    tileBoard(orderedIDs: orderedIDs)
+                    tileBoard(tileSections)
                 } else {
-                    listBoard(orderedIDs: orderedIDs)
+                    listBoard(sections)
                 }
             }
             .scrollEdgeEffectStyle(.soft, for: .top)
@@ -995,7 +1066,7 @@ struct OrganizeGrid<MenuContent: View>: View {
             .focused($isFocused)
             .focusEffectDisabled()
             .onKeyPress(phases: .down) { press in
-                handleKey(press, ordered: ordered, orderedIDs: orderedIDs, proxy: proxy)
+                handleKey(press, ordered: ordered, orderedIDs: orderedIDs, tileSections: tileSections, proxy: proxy)
             }
             .onAppear {
                 isFocused = true
@@ -1016,78 +1087,92 @@ struct OrganizeGrid<MenuContent: View>: View {
             .onChange(of: workspace.focusedStackID) { _, id in
                 guard let id else { return }
                 withAnimation(.easeOut(duration: 0.15)) {
-                    proxy.scrollTo(id)
+                    proxy.scrollTo(scrollTarget(for: id, tileSections: tileSections))
                 }
             }
         }
     }
 
-    private func tileBoard(orderedIDs: [String]) -> some View {
-        LazyVGrid(
-            columns: [GridItem(.adaptive(minimum: tileWidth, maximum: tileWidth * 1.3), spacing: 12, alignment: .top)],
-            alignment: .leading,
-            spacing: 14,
-            pinnedViews: [.sectionHeaders]
-        ) {
-            ForEach(sections) { section in
+    /// The id to scroll to for a stack: its row on the tile board (a lazy
+    /// stack only knows the ids of its direct children), the stack itself in
+    /// the list.
+    private func scrollTarget(for stackID: String, tileSections: [BoardTileSection]) -> String {
+        guard mode == .tiles else { return stackID }
+        return BoardTileRows.rowID(containing: stackID, in: tileSections) ?? stackID
+    }
+
+    private func sectionHeader(_ section: OrganizeBoardSection) -> some View {
+        BoardGroupHeader(
+            group: section.group,
+            isCollapsed: section.isCollapsed,
+            onToggleCollapse: {
+                workspace.setGroupCollapsed(section.id, collapsed: !section.isCollapsed)
+            },
+            onSelect: {
+                workspace.selectStacks(section.group.stacks.map(\.id))
+                isFocused = true
+            }
+        )
+    }
+
+    /// Fixed-height rows of tiles in one lazy stack — see `BoardTileLayout`.
+    private func tileBoard(_ tileSections: [BoardTileSection]) -> some View {
+        let layout = self.layout
+        return LazyVStack(alignment: .leading, spacing: BoardTileLayout.rowSpacing, pinnedViews: [.sectionHeaders]) {
+            ForEach(tileSections) { entry in
                 Section {
-                    ForEach(section.visibleStacks) { stack in
-                        if workspace.expandedStackIDs.contains(stack.id), stack.isBurst {
-                            expansion(stack)
-                                .gridCellColumns(max(columns, 1))
-                        } else {
-                            tile(stack, orderedIDs: orderedIDs)
-                        }
+                    ForEach(entry.rows) { row in
+                        tileRow(row, layout: layout)
                     }
                 } header: {
-                    BoardGroupHeader(
-                        group: section.group,
-                        isCollapsed: section.isCollapsed,
-                        onToggleCollapse: {
-                            workspace.setGroupCollapsed(section.id, collapsed: !section.isCollapsed)
-                        },
-                        onSelect: {
-                            workspace.selectStacks(section.group.stacks.map(\.id))
-                            isFocused = true
-                        }
-                    )
+                    sectionHeader(entry.section)
                 }
             }
         }
-        .padding(16)
-        .background {
-            GeometryReader { geometry in
-                Color.clear
-                    .onAppear { updateColumns(geometry.size.width) }
-                    .onChange(of: geometry.size.width) { _, width in updateColumns(width) }
-            }
+        .padding(BoardTileLayout.padding)
+        .onGeometryChange(for: Double.self) { Double($0.size.width) } action: { width in
+            boardWidth = width
         }
     }
 
-    private func listBoard(orderedIDs: [String]) -> some View {
+    @ViewBuilder
+    private func tileRow(_ row: BoardTileRow, layout: BoardTileLayout) -> some View {
+        switch row.content {
+        case .tiles(let stacks):
+            ScopedBody {
+                HStack(alignment: .top, spacing: BoardTileLayout.columnSpacing) {
+                    ForEach(stacks) { stack in
+                        tile(stack)
+                            .frame(width: layout.cellWidth)
+                    }
+                }
+                .frame(height: layout.rowHeight, alignment: .top)
+            }
+        case .expansion(let stack):
+            ScopedBody { expansion(stack) }
+        }
+    }
+
+    /// One view per element — the row, with its burst opened under it when
+    /// it is — so the lazy stack's cost stays flat however deep the list is.
+    private func listBoard(_ sections: [OrganizeBoardSection]) -> some View {
         LazyVStack(spacing: 2, pinnedViews: [.sectionHeaders]) {
             ForEach(sections) { section in
                 Section {
                     ForEach(section.visibleStacks) { stack in
-                        row(stack, orderedIDs: orderedIDs)
-                        if workspace.expandedStackIDs.contains(stack.id), stack.isBurst {
-                            expansion(stack, compact: true)
-                                .padding(.horizontal, 16)
-                                .padding(.vertical, 6)
+                        ScopedBody {
+                            VStack(spacing: 0) {
+                                row(stack)
+                                if workspace.expandedStackIDs.contains(stack.id), stack.isBurst {
+                                    expansion(stack, compact: true)
+                                        .padding(.horizontal, 16)
+                                        .padding(.vertical, 6)
+                                }
+                            }
                         }
                     }
                 } header: {
-                    BoardGroupHeader(
-                        group: section.group,
-                        isCollapsed: section.isCollapsed,
-                        onToggleCollapse: {
-                            workspace.setGroupCollapsed(section.id, collapsed: !section.isCollapsed)
-                        },
-                        onSelect: {
-                            workspace.selectStacks(section.group.stacks.map(\.id))
-                            isFocused = true
-                        }
-                    )
+                    sectionHeader(section)
                 }
             }
         }
@@ -1104,7 +1189,7 @@ struct OrganizeGrid<MenuContent: View>: View {
         .id("\(stack.id)-expansion")
     }
 
-    private func tile(_ stack: OrganizeStack, orderedIDs: [String]) -> some View {
+    private func tile(_ stack: OrganizeStack) -> some View {
         BoardRenderCounter.hit(.gridTile)
         let assigned = eventForStack(stack)
         return StackTileView(
@@ -1130,12 +1215,13 @@ struct OrganizeGrid<MenuContent: View>: View {
             onOpen: { onOpen(stack, 0) },
             retryToken: workspace.connectivityRevision
         )
+        .equatable()
         .id(stack.id)
         .onTapGesture {
-            select(stack, orderedIDs: orderedIDs)
+            select(stack)
         }
         .simultaneousGesture(TapGesture(count: 2).onEnded { onOpen(stack, 0) })
-        .accessibilityAction { select(stack, orderedIDs: orderedIDs) }
+        .accessibilityAction { select(stack) }
         .accessibilityAction(named: "Preview") { onOpen(stack, 0) }
         .onDrag {
             dragProvider(for: stack)
@@ -1145,7 +1231,7 @@ struct OrganizeGrid<MenuContent: View>: View {
         .contextMenu { menu(stack) }
     }
 
-    private func row(_ stack: OrganizeStack, orderedIDs: [String]) -> some View {
+    private func row(_ stack: OrganizeStack) -> some View {
         BoardRenderCounter.hit(.gridTile)
         let assigned = eventForStack(stack)
         let isFocusedRow = workspace.focusedStackID == stack.id
@@ -1178,10 +1264,10 @@ struct OrganizeGrid<MenuContent: View>: View {
         .onHover { hover.set(stack.id, hovering: $0) }
         .id(stack.id)
         .onTapGesture {
-            select(stack, orderedIDs: orderedIDs)
+            select(stack)
         }
         .simultaneousGesture(TapGesture(count: 2).onEnded { onOpen(stack, 0) })
-        .accessibilityAction { select(stack, orderedIDs: orderedIDs) }
+        .accessibilityAction { select(stack) }
         .accessibilityAction(named: "Preview") { onOpen(stack, 0) }
         .onDrag {
             dragProvider(for: stack)
@@ -1199,11 +1285,11 @@ struct OrganizeGrid<MenuContent: View>: View {
         NSItemProvider(object: workspace.dragPayload(for: stack.id, origin: origin, containerID: containerID) as NSString)
     }
 
-    private func select(_ stack: OrganizeStack, orderedIDs: [String]) {
+    private func select(_ stack: OrganizeStack) {
         isFocused = true
         workspace.click(
             stackID: stack.id,
-            orderedIDs: orderedIDs,
+            orderedIDs: order.ids,
             modifiers: NSEvent.modifierFlags,
             clickCount: NSApp.currentEvent?.clickCount ?? 1
         )
@@ -1216,14 +1302,11 @@ struct OrganizeGrid<MenuContent: View>: View {
             .background(.regularMaterial, in: Capsule())
     }
 
-    private func updateColumns(_ width: CGFloat) {
-        columns = max(1, Int((width - 32 + 12) / (tileWidth + 12)))
-    }
-
     private func handleKey(
         _ press: KeyPress,
         ordered: [OrganizeStack],
         orderedIDs: [String],
+        tileSections: [BoardTileSection],
         proxy: ScrollViewProxy
     ) -> KeyPress.Result {
         // Never board keys while a text field owns typing — Delete edits
@@ -1236,7 +1319,7 @@ struct OrganizeGrid<MenuContent: View>: View {
             let id = orderedIDs[target]
             workspace.select(stackID: id, orderedIDs: orderedIDs, extend: press.modifiers.contains(.shift), toggle: false)
             withAnimation(.easeOut(duration: 0.12)) {
-                proxy.scrollTo(id)
+                proxy.scrollTo(scrollTarget(for: id, tileSections: tileSections))
             }
             return .handled
         }
@@ -1277,6 +1360,26 @@ struct OrganizeGrid<MenuContent: View>: View {
             }
             return onKey(press, orderedIDs)
         }
+    }
+}
+
+/// A grid is the same grid when what it draws is the same. The closures a
+/// board hands in read the workspace by id when a tile is built, so they
+/// never decide the picture: wrap the grid in `.equatable()` and a board
+/// that re-evaluates for a reason of its own (the storage strip, the status
+/// line, a count) leaves the tiles alone. What tiles read from the workspace
+/// — selection, badges, edit tags, owners — invalidates the rows that read
+/// it, whether or not the grid was rebuilt.
+extension OrganizeGrid: @preconcurrency Equatable {
+    static func == (lhs: OrganizeGrid<MenuContent>, rhs: OrganizeGrid<MenuContent>) -> Bool {
+        lhs.workspace === rhs.workspace
+            && lhs.mode == rhs.mode
+            && lhs.tileWidth == rhs.tileWidth
+            && lhs.origin == rhs.origin
+            && lhs.containerID == rhs.containerID
+            && lhs.rootPath == rhs.rootPath
+            && lhs.groups.count == rhs.groups.count
+            && zip(lhs.groups, rhs.groups).allSatisfy { $0.hasSameContent(as: $1) }
     }
 }
 

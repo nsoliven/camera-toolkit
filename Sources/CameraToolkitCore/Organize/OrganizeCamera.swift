@@ -65,6 +65,13 @@ public enum CameraCatalog {
         return OrganizeCamera(id: id, name: deviceNames[id] ?? id)
     }
 
+    /// `camera(deviceID:)`'s id without building the camera — for counting
+    /// which cameras a board's frames came from, one call per frame.
+    public static func cameraID(deviceID: String?) -> String? {
+        guard let id = clean(deviceID), id != genericDeviceID else { return nil }
+        return id
+    }
+
     public static func camera(metadata: CameraMetadata?) -> OrganizeCamera? {
         camera(make: metadata?.make, model: metadata?.model)
     }
@@ -137,9 +144,13 @@ public enum CameraCatalog {
     /// becomes nil.
     static func clean(_ value: String?) -> String? {
         guard let value else { return nil }
-        let trimmed = value.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "\0")))
+        let trimmed = value.trimmingCharacters(in: trimmedCharacters)
         return trimmed.isEmpty ? nil : trimmed
     }
+
+    /// Built once: a board resolves the camera of every frame it shows, and
+    /// unioning the two sets on each call was most of that cost.
+    private static let trimmedCharacters = CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "\0"))
 }
 
 /// Resolves which camera shot a file, in precedence order:
@@ -176,6 +187,15 @@ public struct OrganizeCameraResolver: Sendable {
             return Root(prefix: key + "/", camera: camera)
         }
         .sorted { $0.prefix.count > $1.prefix.count }
+    }
+
+    /// The id of `camera(assignmentDeviceID:file:metadataCamera:)`'s answer,
+    /// `unknownID` when no rule knows the file — the same rules, without
+    /// building a camera per frame.
+    public func cameraID(assignmentDeviceID: String?, file: OrganizeFile, metadataCamera: OrganizeCamera?) -> String {
+        if let id = CameraCatalog.cameraID(deviceID: assignmentDeviceID) { return id }
+        if let camera = locationCamera(forPathKey: file.pathKey) { return camera.id }
+        return metadataCamera?.id ?? OrganizeCamera.unknownID
     }
 
     /// The camera of one file, or nil when no rule knows it.
