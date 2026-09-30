@@ -638,7 +638,7 @@ private struct SidebarFooter: View {
             ?? (model.pendingTransferFileCount > 0 ? "\(model.pendingTransferFileCount) waiting" : nil)
         VStack(alignment: .leading, spacing: 6) {
             NASStatusFooterRow(connection: workspace.nasConnection)
-            if !model.configuration.savedEvents.isEmpty {
+            if !model.eventsForDisplay.isEmpty {
                 NASSyncAllFooterRow(workspace: workspace)
             }
             GlassEffectContainer(spacing: 8) {

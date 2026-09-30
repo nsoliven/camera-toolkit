@@ -16,12 +16,26 @@ struct AppShell: View {
                 // main actor.
                 workspace.startNASConnection()
             }
-            .onChange(of: model.configurationRevision) { _, _ in
-                workspace.nasSettingsChanged()
-            }
+            // Watched from a view of its own: the shell would otherwise be
+            // asked to build the whole window again for every settings write.
+            .background { NASSettingsWatcher(model: model, workspace: workspace) }
             .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
                 model.refreshAllIfStale()
                 workspace.refreshConnectivityIfStale()
+            }
+    }
+}
+
+/// Tells the workspace when a setting changed that the NAS connection reads.
+private struct NASSettingsWatcher: View {
+    let model: DashboardModel
+    let workspace: EventsWorkspace
+
+    var body: some View {
+        Color.clear
+            .frame(width: 0, height: 0)
+            .onChange(of: model.configurationRevision) { _, _ in
+                workspace.nasSettingsChanged()
             }
     }
 }

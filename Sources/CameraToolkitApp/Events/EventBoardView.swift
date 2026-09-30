@@ -16,24 +16,16 @@ struct EventBoardView: View {
     @AppStorage(OrganizeBoardSortDefaults.eventAscending) private var sortAscending = OrganizeBoardSortDefaults.legacyAscending()
     @State private var previewStackID: String?
     @State private var previewFrameIndex = 0
-    @State private var showAllPeople = false
     /// The board's measured height, which limits how tall its top bar's
     /// notices and chips may grow before they scroll.
     @State private var boardHeight: Double?
-    /// The filter popover — owned here, outside the bottom bar's
-    /// renderings, so a width change cannot re-present it mid-layout.
-    @State private var showFilters = false
     /// Shared with the View menu's Show Inspector item (⌥⌘I); the
     /// inspector itself hangs off the split view in EventsRootView.
     @AppStorage(EventInfoInspector.visibilityDefaultsKey) private var showInspector = false
 
-    /// People chips kept on the first row. The rest sit behind Show more,
-    /// ordered by how many confirmed faces each person has on this event.
-    private static let collapsedPeopleCount = 4
-
     /// Grouping that makes sense inside one event — every stack belongs to
     /// it, so "by event" would be a single useless section.
-    private static let groupings: [OrganizeBoardGrouping] = [.day, .kind, .ungrouped]
+    fileprivate static let groupings: [OrganizeBoardGrouping] = [.day, .kind, .ungrouped]
 
     private var effectiveGrouping: OrganizeBoardGrouping {
         Self.groupings.contains(grouping) ? grouping : .day
@@ -64,7 +56,6 @@ struct EventBoardView: View {
             let ordered = { groups.filter { !workspace.collapsedGroupIDs.contains($0.id) }.flatMap(\.stacks) }
             let matched = groups.reduce(0) { $0 + $1.stacks.count }
             let title = workspace.eventTitle(event)
-            let reachability = workspace.eventReachability[eventID]
             VStack(spacing: 0) {
                 if workspace.eventBoardShowsPlaceholders(eventID) {
                     // Files this event owns are on their way and a drive
@@ -90,28 +81,26 @@ struct EventBoardView: View {
                         .accessibilityIdentifier("eventBoardLoading")
                 }
             }
+            // The header, the status caption and the toolbar's title each read
+            // their own state (`EventBoardHeader`, `loadingNote`,
+            // `EventBoardToolbarTitle`), so a count, a strip number or a job
+            // that changes redraws that one region — not this whole board.
             .safeAreaBar(edge: .top) {
-                titleAccessory(event)
+                EventBoardHeader(model: model, workspace: workspace, eventID: eventID, boardHeight: boardHeight)
+                    .equatable()
             }
             // A firm edge under the bottom bar keeps its caption legible
             // over tiles scrolling beneath it.
             .scrollEdgeEffectStyle(.hard, for: .bottom)
             .safeAreaBar(edge: .bottom) {
-                BoardBottomBar(model: model, workspace: workspace, loadingNote: loadingNote) {
-                    // Wide, then compact, then icon-only menus: the widest
-                    // that fits, measured once per width change.
-                    AdaptiveBar(id: "event-board", tierCount: 3) { tier in
-                        viewControls(groups: groups, compact: tier > 0, iconOnlyMenus: tier > 1)
-                            .boardFilterPopover(
-                                isPresented: $showFilters,
-                                workspace: workspace,
-                                stacks: stacks ?? [],
-                                eventScope: workspace.scopeIDs(eventID),
-                                search: $workspace.search,
-                                matchedCount: matched
-                            )
-                    }
-                }
+                EventBoardBottomBar(
+                    model: model,
+                    workspace: workspace,
+                    eventID: eventID,
+                    groupIDs: groups.map(\.id),
+                    loadingNote: { loadingNote }
+                )
+                .equatable()
             }
             .overlay {
                 if previewStackID != nil {
@@ -149,10 +138,7 @@ struct EventBoardView: View {
                     model: model,
                     workspace: workspace,
                     event: event,
-                    title: title,
-                    count: countText(total: stacks?.count, matched: matched),
-                    countHelp: countHelp(total: stacks?.count, matched: matched),
-                    help: summaryText(event),
+                    matched: matched,
                     showInspector: $showInspector
                 )
             }
@@ -177,28 +163,6 @@ struct EventBoardView: View {
         }
     }
 
-    /// The capsule: the event's file count, or "N of M" items while a
-    /// search or filter narrows the board.
-    private func countText(total: Int?, matched: Int) -> String {
-        if let total, !workspace.search.isEmpty {
-            return "\(matched.formatted()) of \(total.formatted())"
-        }
-        return workspace.assignmentCount(for: eventID).formatted()
-    }
-
-    private func countHelp(total: Int?, matched: Int) -> String {
-        if let total, !workspace.search.isEmpty {
-            return "\(matched) of \(total) item\(total == 1 ? "" : "s") match the search and filters"
-        }
-        let files = workspace.assignmentCount(for: eventID)
-        return "\(files) file\(files == 1 ? "" : "s")"
-    }
-
-    private func summaryText(_ event: SavedCameraEvent) -> String {
-        let files = workspace.assignmentCount(for: eventID)
-        return "\(event.eventDate.formatted(date: .complete, time: .omitted)) · \(files) file\(files == 1 ? "" : "s") · \(workspace.assignmentBytes(for: eventID).formattedBytes)"
-    }
-
     /// Loading progress for the status caption — the board fills in first
     /// and keeps loading files and capture dates behind it.
     private var loadingNote: String? {
@@ -221,96 +185,6 @@ struct EventBoardView: View {
             return "Reading capture dates… \(pending.formatted()) left."
         }
         return nil
-    }
-
-    private func viewControls(groups: [OrganizeBoardGroup], compact: Bool, iconOnlyMenus: Bool = false) -> some View {
-        BoardViewControls(
-            workspace: workspace,
-            filterPresented: $showFilters,
-            groups: groups,
-            mode: $boardMode,
-            grouping: Binding(get: { effectiveGrouping }, set: { grouping = $0 }),
-            groupings: Self.groupings,
-            sort: Binding(get: { sort }, set: { sortKey = $0.key; sortAscending = $0.ascending }),
-            tileWidth: $tileWidth,
-            compact: compact,
-            iconOnlyMenus: iconOnlyMenus
-        )
-    }
-
-    /// Pinned under the toolbar: where the originals are (one menu per
-    /// place), subevent, people and — on a mixed board — camera chips,
-    /// and the active filters.
-    private func titleAccessory(_ event: SavedCameraEvent) -> some View {
-        let people = workspace.eventPeopleForDisplay(eventID)
-        let subevents = workspace.subevents(of: eventID)
-        let shown = showAllPeople ? people : Array(people.prefix(Self.collapsedPeopleCount))
-        // Camera chips only when the board mixes cameras — one camera
-        // needs no filter.
-        let cameras = workspace.boardCamerasForDisplay(for: workspace.eventStacks[eventID] ?? [], eventID: eventID)
-        return VStack(alignment: .leading, spacing: 8) {
-            EventStorageSummary(slots: EventStorageSlots(
-                model: model,
-                workspace: workspace,
-                event: event,
-                summary: workspace.presence[eventID]
-            ))
-            .guideHighlight(.storageStrip, in: workspace)
-            // The strip stays put; the notices and chips under it scroll
-            // once they would take more than their share of the board.
-            BoardBarScrollRegion(maxHeight: OrganizeChromeSizing.boardAccessoryHeightLimit(boardHeight: boardHeight)) {
-                VStack(alignment: .leading, spacing: 8) {
-                    EventStorageSlots(
-                        model: model,
-                        workspace: workspace,
-                        event: event,
-                        summary: workspace.presence[eventID]
-                    ).misplacedNotice
-                    DuplicateBoardNotice(model: model, workspace: workspace, review: workspace.duplicateReview, eventID: eventID)
-                    FlowLayout(horizontalSpacing: 8, verticalSpacing: 8) {
-                        ForEach(subevents) { subevent in
-                            SubeventChip(
-                                event: subevent,
-                                isFiltering: workspace.search.excludedEventIDs.contains(subevent.id),
-                                onToggle: { workspace.search.toggleEventExclusion(subevent.id) }
-                            )
-                        }
-                        ForEach(shown) { person in
-                            PersonChip(person: person)
-                        }
-                        if people.count > Self.collapsedPeopleCount {
-                            Button(showAllPeople ? "Show Less" : "Show \(people.count - Self.collapsedPeopleCount) More") {
-                                showAllPeople.toggle()
-                            }
-                            .buttonStyle(.borderless)
-                            .controlSize(.small)
-                        }
-                        if cameras.count > 1 {
-                            ForEach(cameras) { entry in
-                                CameraChip(
-                                    camera: entry.camera,
-                                    count: entry.stackCount,
-                                    isOn: workspace.search.isCameraChipOn(entry.id),
-                                    onToggle: { workspace.search.toggleCameraChip(entry.id) }
-                                )
-                            }
-                        }
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    if !workspace.search.rowsWithValues.isEmpty {
-                        OrganizeFilterHotLinks(
-                            workspace: workspace,
-                            stacks: workspace.eventStacks[eventID] ?? [],
-                            search: $workspace.search
-                        )
-                    }
-                }
-            }
-        }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 8)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .onChange(of: eventID) { _, _ in showAllPeople = false }
     }
 
     private func emptyState(_ event: SavedCameraEvent) -> some View {
@@ -514,6 +388,245 @@ struct EventBoardView: View {
     }
 }
 
+/// The board's bottom bar: the view controls in a width-adaptive glass
+/// capsule, and the status caption under it. Its own view, drawn again only
+/// when what it shows changes — the ids of the board's groups — and not each
+/// time a stack under the grid does (a move changes stacks three times). The
+/// controls' settings are read here, from the defaults, and the filter panel
+/// asks for the board's stacks and the count that match when it opens.
+private struct EventBoardBottomBar: View {
+    let model: DashboardModel
+    @Bindable var workspace: EventsWorkspace
+    let eventID: UUID
+    let groupIDs: [String]
+    let loadingNote: () -> String?
+
+    @AppStorage("CameraToolkit.organize.tileWidth") private var tileWidth: Double = 220
+    @AppStorage("CameraToolkit.organize.mode") private var boardMode: OrganizeBoardMode = .tiles
+    @AppStorage("CameraToolkit.eventboard.grouping") private var grouping: OrganizeBoardGrouping = .day
+    @AppStorage(OrganizeBoardSortDefaults.eventKey) private var sortKey: OrganizeSortKey = .captureTime
+    @AppStorage(OrganizeBoardSortDefaults.eventAscending) private var sortAscending = OrganizeBoardSortDefaults.legacyAscending()
+    /// The filter popover — owned here, outside the bar's renderings, so a
+    /// width change cannot re-present it mid-layout.
+    @State private var showFilters = false
+
+    private var effectiveGrouping: OrganizeBoardGrouping {
+        EventBoardView.groupings.contains(grouping) ? grouping : .day
+    }
+
+    private var sort: OrganizeStackSort {
+        OrganizeStackSort(key: sortKey, ascending: sortAscending)
+    }
+
+    var body: some View {
+        BoardBottomBar(model: model, workspace: workspace, loadingNote: loadingNote) {
+            // Wide, then compact, then icon-only menus: the widest that fits,
+            // measured once per width change.
+            AdaptiveBar(id: "event-board", tierCount: 3) { tier in
+                controls(compact: tier > 0, iconOnlyMenus: tier > 1)
+                    .boardFilterPopover(
+                        isPresented: $showFilters,
+                        workspace: workspace,
+                        stacks: workspace.eventStacks[eventID] ?? [],
+                        eventScope: workspace.scopeIDs(eventID),
+                        search: $workspace.search,
+                        matchedCount: workspace.visibleEventStacks(eventID, search: workspace.search).count
+                    )
+            }
+        }
+    }
+
+    private func controls(compact: Bool, iconOnlyMenus: Bool) -> some View {
+        BoardViewControls(
+            workspace: workspace,
+            filterPresented: $showFilters,
+            groupIDs: groupIDs,
+            mode: $boardMode,
+            grouping: Binding(get: { effectiveGrouping }, set: { grouping = $0 }),
+            groupings: EventBoardView.groupings,
+            sort: Binding(get: { sort }, set: { sortKey = $0.key; sortAscending = $0.ascending }),
+            tileWidth: $tileWidth,
+            compact: compact,
+            iconOnlyMenus: iconOnlyMenus
+        )
+    }
+}
+
+extension EventBoardBottomBar: @preconcurrency Equatable {
+    static func == (lhs: EventBoardBottomBar, rhs: EventBoardBottomBar) -> Bool {
+        lhs.model === rhs.model && lhs.workspace === rhs.workspace && lhs.eventID == rhs.eventID
+            && lhs.groupIDs == rhs.groupIDs
+    }
+}
+
+/// Pinned under the toolbar: where the originals are (one menu per place),
+/// subevent, people and — on a mixed board — camera chips, and the active
+/// filters. Its own view with its own reads: a move's counts, a job, or the
+/// status line change without this being asked to draw again, and the board
+/// around it only hands it the event and the height it may grow to.
+private struct EventBoardHeader: View {
+    let model: DashboardModel
+    @Bindable var workspace: EventsWorkspace
+    let eventID: UUID
+    /// The board's measured height, which limits how tall the notices and
+    /// chips may grow before they scroll.
+    let boardHeight: Double?
+    @State private var showAllPeople = false
+
+    /// People chips kept on the first row. The rest sit behind Show more,
+    /// ordered by how many confirmed faces each person has on this event.
+    private static let collapsedPeopleCount = 4
+
+    var body: some View {
+        let people = workspace.shownEventPeople(eventID: eventID)
+        let subevents = workspace.subevents(of: eventID)
+        let shown = showAllPeople ? people : Array(people.prefix(Self.collapsedPeopleCount))
+        // Camera chips only when the board mixes cameras — one camera
+        // needs no filter.
+        let cameras = workspace.shownBoardCameras(eventID: eventID)
+        VStack(alignment: .leading, spacing: 8) {
+            EventStorageStrip(model: model, workspace: workspace, eventID: eventID)
+                .guideHighlight(.storageStrip, in: workspace)
+            // The strip stays put; the notices and chips under it scroll
+            // once they would take more than their share of the board.
+            BoardBarScrollRegion(maxHeight: OrganizeChromeSizing.boardAccessoryHeightLimit(boardHeight: boardHeight)) {
+                VStack(alignment: .leading, spacing: 8) {
+                    EventMisplacedNotice(model: model, workspace: workspace, eventID: eventID)
+                    DuplicateBoardNotice(model: model, workspace: workspace, review: workspace.duplicateReview, eventID: eventID)
+                    FlowLayout(horizontalSpacing: 8, verticalSpacing: 8) {
+                        ForEach(subevents) { subevent in
+                            SubeventChip(
+                                event: subevent,
+                                isFiltering: workspace.search.excludedEventIDs.contains(subevent.id),
+                                onToggle: { workspace.search.toggleEventExclusion(subevent.id) }
+                            )
+                        }
+                        ForEach(shown) { person in
+                            PersonChip(person: person)
+                        }
+                        if people.count > Self.collapsedPeopleCount {
+                            Button(showAllPeople ? "Show Less" : "Show \(people.count - Self.collapsedPeopleCount) More") {
+                                showAllPeople.toggle()
+                            }
+                            .buttonStyle(.borderless)
+                            .controlSize(.small)
+                        }
+                        if cameras.count > 1 {
+                            ForEach(cameras) { entry in
+                                CameraChip(
+                                    camera: entry.camera,
+                                    count: entry.stackCount,
+                                    isOn: workspace.search.isCameraChipOn(entry.id),
+                                    onToggle: { workspace.search.toggleCameraChip(entry.id) }
+                                )
+                            }
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    if !workspace.search.rowsWithValues.isEmpty {
+                        OrganizeFilterHotLinks(
+                            workspace: workspace,
+                            stacks: workspace.eventStacks[eventID] ?? [],
+                            search: $workspace.search
+                        )
+                    }
+                }
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        // Notices when the chips' answers went stale, from a view of its own,
+        // so the header is not drawn again until a recount says something new.
+        .background { EventChipsWatcher(workspace: workspace, eventID: eventID) }
+    }
+}
+
+/// Draws nothing. Reads what the header's chips are counted from, so that a
+/// stale answer is noticed here instead of by redrawing the header.
+private struct EventChipsWatcher: View {
+    let workspace: EventsWorkspace
+    let eventID: UUID
+
+    var body: some View {
+        let _ = workspace.watchChipInputs(eventID)
+        Color.clear.frame(width: 0, height: 0)
+    }
+}
+
+extension EventBoardHeader: @preconcurrency Equatable {
+    static func == (lhs: EventBoardHeader, rhs: EventBoardHeader) -> Bool {
+        lhs.model === rhs.model && lhs.workspace === rhs.workspace
+            && lhs.eventID == rhs.eventID && lhs.boardHeight == rhs.boardHeight
+    }
+}
+
+/// The storage strip: one capsule per place. It reads the event and the
+/// presence *counts* only — not the file rows behind them, which the strip
+/// never draws and which SwiftUI would otherwise compare row by row each
+/// time the strip is asked to redraw.
+private struct EventStorageStrip: View {
+    let model: DashboardModel
+    let workspace: EventsWorkspace
+    let eventID: UUID
+
+    var body: some View {
+        if let event = workspace.event(eventID) {
+            EventStorageSummary(slots: EventStorageSlots(
+                model: model,
+                workspace: workspace,
+                event: event,
+                counts: workspace.presence[eventID]?.counts
+            ))
+        }
+    }
+}
+
+/// The purple notice about copies in the wrong half of the drive.
+private struct EventMisplacedNotice: View {
+    let model: DashboardModel
+    let workspace: EventsWorkspace
+    let eventID: UUID
+
+    var body: some View {
+        if let event = workspace.event(eventID) {
+            EventStorageSlots(
+                model: model,
+                workspace: workspace,
+                event: event,
+                counts: workspace.presence[eventID]?.counts
+            ).misplacedNotice
+        }
+    }
+}
+
+/// The toolbar's centered title with its count capsule. Reads the counts
+/// itself, so a move's optimistic and landed counts redraw this capsule and
+/// nothing else in the toolbar or the board.
+private struct EventBoardToolbarTitle: View {
+    let workspace: EventsWorkspace
+    let eventID: UUID
+    /// Stacks that match the search and filters, worked out once by the board.
+    let matched: Int
+
+    var body: some View {
+        if let event = workspace.event(eventID) {
+            let total = workspace.eventStacks[eventID]?.count
+            let narrowed = total != nil && !workspace.search.isEmpty
+            let files = workspace.assignmentCount(for: eventID)
+            BoardToolbarTitle(
+                title: workspace.eventTitle(event),
+                color: EventPalette.color(for: event.id),
+                count: narrowed ? "\(matched.formatted()) of \((total ?? 0).formatted())" : files.formatted(),
+                countHelp: narrowed
+                    ? "\(matched) of \(total ?? 0) item\((total ?? 0) == 1 ? "" : "s") match the search and filters"
+                    : "\(files) file\(files == 1 ? "" : "s")",
+                help: "\(event.eventDate.formatted(date: .complete, time: .omitted)) · \(files) file\(files == 1 ? "" : "s") · \(workspace.assignmentBytes(for: eventID).formattedBytes)"
+            )
+        }
+    }
+}
+
 /// The event board's toolbar: centered title with its count, then the
 /// window's search field and the event's actions. Its own ToolbarContent
 /// so a board re-render does not rebuild the NSToolbar items it did not
@@ -522,21 +635,12 @@ private struct EventBoardToolbar: ToolbarContent {
     let model: DashboardModel
     let workspace: EventsWorkspace
     let event: SavedCameraEvent
-    let title: String
-    let count: String
-    let countHelp: String
-    let help: String
+    let matched: Int
     @Binding var showInspector: Bool
 
     var body: some ToolbarContent {
         ToolbarItem(placement: .principal) {
-            BoardToolbarTitle(
-                title: title,
-                color: EventPalette.color(for: event.id),
-                count: count,
-                countHelp: countHelp,
-                help: help
-            )
+            EventBoardToolbarTitle(workspace: workspace, eventID: event.id, matched: matched)
         }
         .sharedBackgroundVisibility(.hidden)
         ToolbarItem(placement: .primaryAction) {
@@ -577,7 +681,7 @@ private struct NASSyncToolbarButton: View {
             } label: {
                 Label("Sync to NAS", systemImage: "arrow.up.to.line.circle")
             }
-            .disabled(model.isBusy)
+            .disabledWhileBusy(model)
             .help("Sync to NAS — copy this event and its subevents to the NAS, verifying every copy by re-reading it")
         } else if workspace.nasShareURL != nil {
             Button {
@@ -646,9 +750,9 @@ private struct EventActionsMenu: View {
         }
         Divider()
         Button(workspace.undoMenuTitle ?? "Undo") { workspace.undo() }
-            .disabled(!workspace.canUndo || model.isBusy)
+            .disabledWhileBusy(model, or: !workspace.canUndo)
         Button(workspace.redoMenuTitle ?? "Redo") { workspace.redo() }
-            .disabled(!workspace.canRedo || model.isBusy)
+            .disabledWhileBusy(model, or: !workspace.canRedo)
         Button("Delete Empty Event", role: .destructive) { workspace.deleteEmptyEvent(eventID) }
             .disabled(workspace.assignmentCount(for: eventID) > 0)
     }
@@ -683,11 +787,20 @@ struct EventStorageSlots {
     let model: DashboardModel
     let workspace: EventsWorkspace
     let event: SavedCameraEvent
-    let summary: EventPresenceSummary?
+    /// The presence counts, taken once when the rows were set — a render
+    /// reads these instead of walking ~15,000 rows per slot. Nil while the
+    /// event is still being checked. Only the counts: the rows themselves
+    /// are never handed to a view, which would have to compare them.
+    let presenceCounts: EventPresenceCounts?
 
-    /// The summary's counts, taken once when its rows were set — a render
-    /// reads these instead of walking ~15,000 rows per slot.
-    private var counts: EventPresenceCounts { summary?.counts ?? EventPresenceCounts() }
+    init(model: DashboardModel, workspace: EventsWorkspace, event: SavedCameraEvent, counts: EventPresenceCounts?) {
+        self.model = model
+        self.workspace = workspace
+        self.event = event
+        self.presenceCounts = counts
+    }
+
+    private var counts: EventPresenceCounts { presenceCounts ?? EventPresenceCounts() }
 
     /// Re-checks connections and re-probes where this event's files are. Used
     /// on slots that are showing Offline.
@@ -707,7 +820,7 @@ struct EventStorageSlots {
         let freeable = counts.freeable
         let value: String
         let detail: String
-        if summary == nil {
+        if presenceCounts == nil {
             value = "Checking…"
             detail = "Looking at the card or unsorted folder"
         } else if separate == 0 {
@@ -725,11 +838,11 @@ struct EventStorageSlots {
             tint: .orange,
             value: value,
             detail: detail,
-            state: summary == nil ? .unknown : (onSource == 0 ? .complete : .partial)
+            state: presenceCounts == nil ? .unknown : (onSource == 0 ? .complete : .partial)
         ) {
             if freeable > 0 {
                 Button("Free Up Source…") { workspace.requestRemoveFromSource(event.id) }
-                    .disabled(model.isBusy)
+                    .disabledWhileBusy(model)
                     .help("Re-hash each source file against its drive copy, then remove the source originals")
             }
             if offline > 0 {
@@ -748,7 +861,7 @@ struct EventStorageSlots {
         let removable = counts.removable
         let offline = counts.driveOffline
         let detail: String
-        if summary == nil {
+        if presenceCounts == nil {
             detail = "Checking the drive"
         } else if offline {
             detail = "The drive is not connected"
@@ -765,9 +878,9 @@ struct EventStorageSlots {
             title: policy == .buffer ? "Shared Buffer" : "Private Staging",
             symbol: policy == .buffer ? "externaldrive.fill" : "lock.fill",
             tint: policy == .buffer ? .blue : .purple,
-            value: summary == nil ? "Checking…" : (offline ? "Offline" : "\(onDrive) of \(total)"),
+            value: presenceCounts == nil ? "Checking…" : (offline ? "Offline" : "\(onDrive) of \(total)"),
             detail: detail,
-            state: summary == nil ? .unknown : (offline ? .offline : (total > 0 && onDrive == total && onOther == 0 ? .complete : .partial))
+            state: presenceCounts == nil ? .unknown : (offline ? .offline : (total > 0 && onDrive == total && onOther == 0 ? .complete : .partial))
         ) {
             if needsDrive > 0 {
                 Button(policy == .buffer ? "Put on Buffer…" : "Move to Private…") {
@@ -779,11 +892,11 @@ struct EventStorageSlots {
                         title: policy == .buffer ? "Put \(event.name) on the Buffer" : "Move \(event.name) to Private staging"
                     )
                 }
-                .disabled(model.isBusy)
+                .disabledWhileBusy(model)
             }
             if removable > 0 {
                 Button("Take Off Drive…") { workspace.requestRemoveFromDrive(event.id) }
-                    .disabled(model.isBusy)
+                    .disabledWhileBusy(model)
                     .help("Only files whose NAS copy Sync to NAS verified leave the drive, and each is re-hashed against the NAS first")
             }
             if offline {
@@ -799,7 +912,7 @@ struct EventStorageSlots {
     @ViewBuilder var misplacedNotice: some View {
         let policy = workspace.resolvedPolicy(for: event)
         let misplaced = counts.onOtherDrive
-        if summary != nil, !counts.driveOffline, misplaced > 0 {
+        if presenceCounts != nil, !counts.driveOffline, misplaced > 0 {
             HStack(spacing: 8) {
                 Image(systemName: policy == .archiveOnly ? "lock.open.fill" : "externaldrive.badge.exclamationmark")
                     .foregroundStyle(.purple)
@@ -816,7 +929,7 @@ struct EventStorageSlots {
                     )
                 }
                 .buttonStyle(.glass)
-                .disabled(model.isBusy)
+                .disabledWhileBusy(model)
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 7)
@@ -853,9 +966,9 @@ struct EventStorageSlots {
             title: "NAS",
             symbol: "server.rack",
             tint: .green,
-            value: summary == nil ? "Checking…" : (offline ? "Offline" : "\(onNAS) of \(total)"),
+            value: presenceCounts == nil ? "Checking…" : (offline ? "Offline" : "\(onNAS) of \(total)"),
             detail: detail,
-            state: summary == nil ? .unknown : (offline ? .offline : (total > 0 && onNAS == total ? .complete : .partial))
+            state: presenceCounts == nil ? .unknown : (offline ? .offline : (total > 0 && onNAS == total ? .complete : .partial))
         ) {
             if offline {
                 if workspace.nasShareURL != nil {
@@ -865,7 +978,7 @@ struct EventStorageSlots {
                 checkAgainButton
             } else if onDrive > 0 || verified < onNAS || indexedPending > 0 {
                 Button("Sync to NAS") { workspace.syncToNAS(event.id) }
-                    .disabled(model.isBusy)
+                    .disabledWhileBusy(model)
                     .help("Copy only the files missing on the NAS, each to the same path it has on the drive, and re-read every copy from the NAS to check its SHA-256. Existing files are never overwritten.")
             }
         }
@@ -899,7 +1012,7 @@ struct EventStorageSlots {
                 }
                 .fixedSize()
                 Button("Upload") { workspace.uploadToImmich(event.id) }
-                    .disabled(model.isBusy || summary == nil)
+                    .disabledWhileBusy(model, or: presenceCounts == nil)
                     .help(UndoScopeWording.immichUpload)
             }
         }
@@ -994,9 +1107,11 @@ struct EventInfoInspector: View {
 
     var body: some View {
         let _ = BoardRenderCounter.hit(.inspector)
-        let slots = EventStorageSlots(model: model, workspace: workspace, event: event, summary: workspace.presence[event.id])
+        let slots = EventStorageSlots(model: model, workspace: workspace, event: event, counts: workspace.presence[event.id]?.counts)
         let files = workspace.assignmentCount(for: event.id)
-        let people = workspace.eventPeople(event.id)
+        // The answer the board's header already drew; the recount after a move
+        // lands on its own turn instead of inside this body.
+        let people = workspace.shownEventPeople(eventID: event.id)
         Form {
             Section {
                 LabeledContent("Date", value: event.eventDate.formatted(date: .complete, time: .omitted))
@@ -1128,5 +1243,24 @@ private struct DuplicateBoardNotice: View {
             .padding(.vertical, 7)
             .background(Color.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
         }
+    }
+}
+
+/// Disables a control while a file job runs, reading the job state from a
+/// view of its own. A control that read `model.isBusy` in the body that built
+/// it made that whole body — the storage strip's four menus, the toolbar's
+/// items — draw again every time any job started or ended.
+private struct DisabledWhileBusy: ViewModifier {
+    let model: DashboardModel
+    let otherwise: Bool
+
+    func body(content: Content) -> some View {
+        content.disabled(otherwise || model.isBusy)
+    }
+}
+
+private extension View {
+    func disabledWhileBusy(_ model: DashboardModel, or otherwise: Bool = false) -> some View {
+        modifier(DisabledWhileBusy(model: model, otherwise: otherwise))
     }
 }

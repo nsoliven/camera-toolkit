@@ -78,7 +78,9 @@ final class DashboardModel {
     /// The progress relay of each running job, closed when it finishes.
     @ObservationIgnored private var jobProgressRelays: [UUID: JobProgressRelay] = [:]
     var activityLog: [ActivityLogEntry]
-    var configuration: AppConfiguration
+    var configuration: AppConfiguration {
+        didSet { configurationDidChange() }
+    }
     var configMessage: String = "Config is saved automatically."
     var statusMessage: String = "Ready. Choose folders in Settings to begin."
     var isBusy: Bool = false
@@ -128,7 +130,121 @@ final class DashboardModel {
     /// files live). An event's last-used stamp, its Immich settings, or a
     /// new event with no files leave it alone — rebuilding those lookups
     /// walks every assignment on the main actor.
-    var assignmentIndexRevision: Int = 0
+    var assignmentIndexRevision: Int = 0 {
+        didSet { assignmentIndexStamp = assignmentIndexRevision }
+    }
+    /// `assignmentIndexRevision`, read without depending on it: the tiles
+    /// check the lookup indexes are current on every draw, and are told what
+    /// changed through `EventsWorkspace.fileFacts` instead.
+    @ObservationIgnored private(set) var assignmentIndexStamp = 0
+
+    // MARK: Narrow views of the configuration
+    //
+    // `configuration` is rewritten by every catalog change — a move's
+    // assignments, an event's last-used stamp, a slider in Settings — and a
+    // view that reads any part of it draws again for all of them. A Move to
+    // Event rewrote it three times and every tile, chip, bar and sidebar
+    // row that read the events or the assignments was asked to draw again.
+    //
+    // These are the parts the board and the sidebar read, each with its own
+    // revision: the snapshots are always current and are read without
+    // registering anything (`@ObservationIgnored`); the revision moves only
+    // when what is drawn from that part does — an event's name, date, place,
+    // parent or Immich setting, not its last-used stamp — and a view reads it
+    // through `...ForDisplay`, which depends on the revision alone.
+    private(set) var eventsRevision = 0
+    @ObservationIgnored private(set) var eventsSnapshot: [SavedCameraEvent] = []
+    private(set) var locationsRevision = 0
+    @ObservationIgnored private(set) var locationsSnapshot: [ConfiguredLocation] = []
+    private(set) var orientationsRevision = 0
+    @ObservationIgnored private(set) var orientationsSnapshot: [String: Int] = [:]
+    /// The NAS share's address and its revision: the toolbar's NAS button and
+    /// the sidebar read whether there is one to open, not the rest of the
+    /// settings.
+    private(set) var nasSettingsRevision = 0
+    @ObservationIgnored private(set) var nasSMBURLSnapshot = ""
+    /// Moves when anything `EventStorageLocations` is built from does: the
+    /// drive and library roots, the private staging folder, the NAS layout
+    /// root, the default camera, the configured locations, the events.
+    private(set) var pathsRevision = 0
+    @ObservationIgnored private var pathInputs: [String] = []
+    /// How many assignments the configuration holds right now — read to check
+    /// the lookup indexes without touching the assignments.
+    @ObservationIgnored private(set) var assignmentCountSnapshot = 0
+
+    /// The saved events, current, with a dependency on the events alone.
+    var eventsForDisplay: [SavedCameraEvent] {
+        _ = eventsRevision
+        return eventsSnapshot
+    }
+
+    /// The configured locations, current, with a dependency on them alone.
+    var locationsForDisplay: [ConfiguredLocation] {
+        _ = locationsRevision
+        return locationsSnapshot
+    }
+
+    /// The NAS share's address, current, with a dependency on it alone.
+    var nasSMBURLForDisplay: String {
+        _ = nasSettingsRevision
+        return nasSMBURLSnapshot
+    }
+
+    /// The display orientations, current, with a dependency on them alone.
+    var orientationsForDisplay: [String: Int] {
+        _ = orientationsRevision
+        return orientationsSnapshot
+    }
+
+    private func configurationDidChange() {
+        var pathsMoved = false
+        let events = configuration.savedEvents
+        if !Self.sameEventsForDisplay(events, eventsSnapshot) {
+            eventsRevision &+= 1
+            pathsMoved = true
+        }
+        eventsSnapshot = events
+        let locations = configuration.configuredLocations
+        if locations != locationsSnapshot {
+            locationsSnapshot = locations
+            locationsRevision &+= 1
+            pathsMoved = true
+        }
+        let inputs = [
+            configuration.bufferPath, configuration.privateStagingPath, configuration.cameraLibraryRootPath,
+            configuration.archiveLayoutRootPath, configuration.selectedDeviceID
+        ]
+        if inputs != pathInputs {
+            pathInputs = inputs
+            pathsMoved = true
+        }
+        if pathsMoved { pathsRevision &+= 1 }
+        if configuration.nasSMBURL != nasSMBURLSnapshot {
+            nasSMBURLSnapshot = configuration.nasSMBURL
+            nasSettingsRevision &+= 1
+        }
+        let orientations = configuration.displayOrientations
+        if orientations != orientationsSnapshot {
+            orientationsSnapshot = orientations
+            orientationsRevision &+= 1
+        }
+        assignmentCountSnapshot = configuration.photoEventAssignments.count
+    }
+
+    /// The events are the same as far as anything drawn from them goes: the
+    /// last-used stamp moves with every assignment and is drawn nowhere.
+    nonisolated static func sameEventsForDisplay(_ lhs: [SavedCameraEvent], _ rhs: [SavedCameraEvent]) -> Bool {
+        guard lhs.count == rhs.count else { return false }
+        for (a, b) in zip(lhs, rhs) {
+            guard a.id == b.id else { return false }
+            if a == b { continue }
+            var stamped = a
+            stamped.lastUsedAt = b.lastUsedAt
+            if stamped != b { return false }
+        }
+        return true
+    }
+
     var sourceCleanupMessage: String?
     var sourceCleanupError: String?
     var activeJob: JobSnapshot? {
@@ -192,6 +308,15 @@ final class DashboardModel {
     ) {
         self.jobs = jobs
         self.configuration = configuration
+        self.eventsSnapshot = configuration.savedEvents
+        self.locationsSnapshot = configuration.configuredLocations
+        self.orientationsSnapshot = configuration.displayOrientations
+        self.assignmentCountSnapshot = configuration.photoEventAssignments.count
+        self.nasSMBURLSnapshot = configuration.nasSMBURL
+        self.pathInputs = [
+            configuration.bufferPath, configuration.privateStagingPath, configuration.cameraLibraryRootPath,
+            configuration.archiveLayoutRootPath, configuration.selectedDeviceID
+        ]
         self.configurationStore = configurationStore
         self.configurationFileStamp = configurationStore.fileStamp()
         let resolvedTransferQueueStore = transferQueueStore ?? TransferQueueStore(
@@ -295,7 +420,7 @@ extension DashboardModel {
     }
 
     var savedEvents: [SavedCameraEvent] {
-        configuration.savedEvents.sorted {
+        eventsForDisplay.sorted {
             if $0.eventDate == $1.eventDate { return $0.name < $1.name }
             return $0.eventDate > $1.eventDate
         }
@@ -1490,7 +1615,11 @@ extension DashboardModel {
         /// cannot cover.
         onSettled: (@MainActor @Sendable () -> Void)? = nil,
         operation: @escaping @Sendable (@escaping @Sendable (BackgroundJobUpdate) -> Void) throws -> Result,
-        completion: @escaping (Result) throws -> String
+        /// Runs on the main actor when the operation succeeds and returns
+        /// the job's summary line. It may suspend (`RunLoopTurn.afterCommit`)
+        /// to draw what it has done so far before going on: the job stays
+        /// running — and holds the job gate — until it returns.
+        completion: @escaping (Result) async throws -> String
     ) -> UUID? {
         guard !isBusy, !isStorageBenchmarkRunning else {
             statusMessage = "Another file job is already running. Wait for it to finish, then try again."
@@ -1545,7 +1674,7 @@ extension DashboardModel {
 
             do {
                 let result = try await worker.value
-                let summary = try completion(result)
+                let summary = try await completion(result)
                 statusMessage = summary
                 finishJob(
                     id: jobID,

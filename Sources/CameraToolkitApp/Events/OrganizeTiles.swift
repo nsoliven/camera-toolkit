@@ -562,6 +562,21 @@ struct StackTileView: View {
     }
 }
 
+extension SavedCameraEvent {
+    /// Whether two copies of an event look the same on a tile, chip or row:
+    /// the name, the color (from the id) and the lock. Its last-used stamp
+    /// moves with every file assigned to it and is drawn nowhere — comparing
+    /// it made every tile that wears the event's color dot draw again each
+    /// time a photo joined the event.
+    static func sameAsDrawn(_ lhs: SavedCameraEvent?, _ rhs: SavedCameraEvent?) -> Bool {
+        switch (lhs, rhs) {
+        case (nil, nil): true
+        case let (lhs?, rhs?): lhs.id == rhs.id && lhs.name == rhs.name && lhs.storagePolicy == rhs.storagePolicy
+        default: false
+        }
+    }
+}
+
 /// A tile is the same tile when what it shows is the same. Its three
 /// closures only act on the stack by id, so they never change the picture;
 /// with `.equatable()` a row that re-evaluates redraws just the tiles whose
@@ -573,9 +588,9 @@ extension StackTileView: @preconcurrency Equatable {
             && lhs.isSelected == rhs.isSelected
             && lhs.isFocused == rhs.isFocused
             && lhs.isEmphasized == rhs.isEmphasized
-            && lhs.event == rhs.event
+            && SavedCameraEvent.sameAsDrawn(lhs.event, rhs.event)
             && lhs.isPrivate == rhs.isPrivate
-            && lhs.tag == rhs.tag
+            && SavedCameraEvent.sameAsDrawn(lhs.tag, rhs.tag)
             && lhs.isMixed == rhs.isMixed
             && lhs.isDimmed == rhs.isDimmed
             && lhs.badge == rhs.badge
@@ -583,6 +598,166 @@ extension StackTileView: @preconcurrency Equatable {
             && lhs.originFolder == rhs.originFolder
             && lhs.orientation == rhs.orientation
             && lhs.retryToken == rhs.retryToken
+    }
+}
+
+/// One line of the tile board (`BoardTileRow`): a run of tiles, or a burst
+/// opened in place. Equal when what it draws is equal — its stacks, the
+/// layout, the selection emphasis — so a grid update that changes a few rows
+/// updates a few. What a tile reads from the workspace (owner, badge,
+/// selection) is read while the tile is built, by the key of its own files and
+/// stack (`EventsWorkspace.fileFacts`, `stackFacts`), so a change to those
+/// re-runs the tiles that read it whether or not the grid was rebuilt; the
+/// builders a row is handed only ever act on a stack by id.
+struct BoardTileRowView<Tile: View, Expansion: View>: View {
+    let row: BoardTileRow
+    let layout: BoardTileLayout
+    let isEmphasized: Bool
+    let tile: (OrganizeStack) -> Tile
+    let expansion: (OrganizeStack) -> Expansion
+
+    var body: some View {
+        switch row.content {
+        case .tiles(let stacks):
+            HStack(alignment: .top, spacing: BoardTileLayout.columnSpacing) {
+                ForEach(stacks) { stack in
+                    tile(stack)
+                        .frame(width: layout.cellWidth)
+                }
+            }
+            .frame(height: layout.rowHeight, alignment: .top)
+        case .expansion(let stack):
+            expansion(stack)
+        }
+    }
+}
+
+extension BoardTileRowView: @preconcurrency Equatable {
+    static func == (lhs: BoardTileRowView, rhs: BoardTileRowView) -> Bool {
+        lhs.row == rhs.row && lhs.layout == rhs.layout && lhs.isEmphasized == rhs.isEmphasized
+    }
+}
+
+/// What a tile does when it is clicked, double-clicked, dragged or given a
+/// context menu. One object per board, shared by every tile: the grid
+/// points it at the handlers of its latest render, and a tile calls through
+/// it when the gesture happens, so a tile that was not rebuilt with the
+/// grid still reaches the current ones.
+@MainActor
+final class BoardTileActions {
+    var select: (OrganizeStack) -> Void = { _ in }
+    var open: (OrganizeStack) -> Void = { _ in }
+    var dragProvider: (OrganizeStack) -> NSItemProvider = { _ in NSItemProvider() }
+    var dragPreview: (OrganizeStack) -> AnyView = { _ in AnyView(EmptyView()) }
+    var menu: (OrganizeStack) -> AnyView = { _ in AnyView(EmptyView()) }
+}
+
+/// A tile with its gestures, drag and menu. Equal when the tile is equal:
+/// the handlers never decide the picture (see `BoardTileActions`).
+struct BoardTileCell: View {
+    let tile: StackTileView
+    let actions: BoardTileActions
+
+    var body: some View {
+        let stack = tile.stack
+        tile
+            .onTapGesture {
+                actions.select(stack)
+            }
+            .simultaneousGesture(TapGesture(count: 2).onEnded { actions.open(stack) })
+            .accessibilityAction { actions.select(stack) }
+            .accessibilityAction(named: "Preview") { actions.open(stack) }
+            .onDrag {
+                actions.dragProvider(stack)
+            } preview: {
+                actions.dragPreview(stack)
+            }
+            .contextMenu { actions.menu(stack) }
+    }
+}
+
+extension BoardTileCell: @preconcurrency Equatable {
+    static func == (lhs: BoardTileCell, rhs: BoardTileCell) -> Bool {
+        lhs.tile == rhs.tile && lhs.actions === rhs.actions
+    }
+}
+
+/// A list row with its gestures, drag and menu — the list's `BoardTileCell`.
+struct BoardRowCell<MoreMenu: View>: View {
+    let row: StackRowView<MoreMenu>
+    let hover: BoardHoverState
+    let actions: BoardTileActions
+
+    var body: some View {
+        let stack = row.stack
+        row
+            .onHover { hover.set(stack.id, hovering: $0) }
+            .onTapGesture {
+                actions.select(stack)
+            }
+            .simultaneousGesture(TapGesture(count: 2).onEnded { actions.open(stack) })
+            .accessibilityAction { actions.select(stack) }
+            .accessibilityAction(named: "Preview") { actions.open(stack) }
+            .onDrag {
+                actions.dragProvider(stack)
+            } preview: {
+                actions.dragPreview(stack)
+            }
+            .contextMenu { actions.menu(stack) }
+    }
+}
+
+extension BoardRowCell: @preconcurrency Equatable {
+    static func == (lhs: BoardRowCell, rhs: BoardRowCell) -> Bool {
+        lhs.row == rhs.row && lhs.hover === rhs.hover && lhs.actions === rhs.actions
+    }
+}
+
+/// A row is the same row when what it shows is the same. Its closures only
+/// act on the stack by id, so they never change the picture.
+extension StackRowView: @preconcurrency Equatable {
+    static func == (lhs: StackRowView, rhs: StackRowView) -> Bool {
+        lhs.stack == rhs.stack
+            && lhs.isSelected == rhs.isSelected
+            && lhs.isFocused == rhs.isFocused
+            && lhs.isEmphasized == rhs.isEmphasized
+            && lhs.isExpanded == rhs.isExpanded
+            && SavedCameraEvent.sameAsDrawn(lhs.event, rhs.event)
+            && lhs.isPrivate == rhs.isPrivate
+            && SavedCameraEvent.sameAsDrawn(lhs.tag, rhs.tag)
+            && lhs.isMixed == rhs.isMixed
+            && lhs.isDimmed == rhs.isDimmed
+            && lhs.badge == rhs.badge
+            && lhs.editTags == rhs.editTags
+            && lhs.originFolder == rhs.originFolder
+    }
+}
+
+/// One entry of the list board: the row, with its burst opened under it when
+/// it is. Equal when the stack, whether it is open and the emphasis are — see
+/// `BoardTileRowView`.
+struct BoardListEntryView<Row: View, Expansion: View>: View {
+    let stack: OrganizeStack
+    let isExpanded: Bool
+    let isEmphasized: Bool
+    let row: (OrganizeStack) -> Row
+    let expansion: (OrganizeStack) -> Expansion
+
+    var body: some View {
+        VStack(spacing: 0) {
+            row(stack)
+            if isExpanded, stack.isBurst {
+                expansion(stack)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 6)
+            }
+        }
+    }
+}
+
+extension BoardListEntryView: @preconcurrency Equatable {
+    static func == (lhs: BoardListEntryView, rhs: BoardListEntryView) -> Bool {
+        lhs.stack == rhs.stack && lhs.isExpanded == rhs.isExpanded && lhs.isEmphasized == rhs.isEmphasized
     }
 }
 
@@ -995,6 +1170,9 @@ struct OrganizeGrid<MenuContent: View>: View {
     @Environment(\.appearsActive) private var appearsActive
     /// Which list row shows its `···` menu; only the menu slots observe it.
     @State private var hover = BoardHoverState()
+    /// What a tile does when clicked, dragged or opened, kept where cells
+    /// that did not re-render can still reach the current handlers.
+    @State private var actions = BoardTileActions()
 
     /// Accent selection while the window is active, grey only in the
     /// background — independent of which control has keyboard focus.
@@ -1032,6 +1210,7 @@ struct OrganizeGrid<MenuContent: View>: View {
 
     var body: some View {
         let _ = BoardRenderCounter.hit(.grid)
+        let _ = configureActions()
         let sections = self.sections
         let ordered = sections.flatMap(\.visibleStacks)
         let orderedIDs = ordered.map(\.id)
@@ -1144,22 +1323,19 @@ struct OrganizeGrid<MenuContent: View>: View {
         }
     }
 
-    @ViewBuilder
+    /// One line of tiles, as a value SwiftUI can compare: a grid update that
+    /// leaves this row's stacks, layout and emphasis as they were skips the
+    /// row altogether, instead of asking every row the lazy stack ever built
+    /// to build its tiles again.
     private func tileRow(_ row: BoardTileRow, layout: BoardTileLayout) -> some View {
-        switch row.content {
-        case .tiles(let stacks):
-            ScopedBody {
-                HStack(alignment: .top, spacing: BoardTileLayout.columnSpacing) {
-                    ForEach(stacks) { stack in
-                        tile(stack)
-                            .frame(width: layout.cellWidth)
-                    }
-                }
-                .frame(height: layout.rowHeight, alignment: .top)
-            }
-        case .expansion(let stack):
-            ScopedBody { expansion(stack) }
-        }
+        return BoardTileRowView(
+            row: row,
+            layout: layout,
+            isEmphasized: isEmphasized,
+            tile: { tile($0) },
+            expansion: { expansion($0) }
+        )
+        .equatable()
     }
 
     /// One view per element — the row, with its burst opened under it when
@@ -1169,16 +1345,14 @@ struct OrganizeGrid<MenuContent: View>: View {
             ForEach(sections) { section in
                 Section {
                     ForEach(section.visibleStacks) { stack in
-                        ScopedBody {
-                            VStack(spacing: 0) {
-                                row(stack)
-                                if workspace.expandedStackIDs.contains(stack.id), stack.isBurst {
-                                    expansion(stack, compact: true)
-                                        .padding(.horizontal, 16)
-                                        .padding(.vertical, 6)
-                                }
-                            }
-                        }
+                        BoardListEntryView(
+                            stack: stack,
+                            isExpanded: workspace.expandedStackIDs.contains(stack.id),
+                            isEmphasized: isEmphasized,
+                            row: { row($0) },
+                            expansion: { expansion($0, compact: true) }
+                        )
+                        .equatable()
                     }
                 } header: {
                     sectionHeader(section)
@@ -1201,89 +1375,87 @@ struct OrganizeGrid<MenuContent: View>: View {
     private func tile(_ stack: OrganizeStack) -> some View {
         BoardRenderCounter.hit(.gridTile)
         let assigned = eventForStack(stack)
-        return StackTileView(
-            stack: stack,
-            width: tileWidth,
-            isSelected: workspace.selectedStackIDs.contains(stack.id),
-            isFocused: workspace.focusedStackID == stack.id,
-            isEmphasized: isEmphasized,
-            event: assigned.event,
-            isPrivate: assigned.event.map { workspace.resolvedPolicy(for: $0) == .archiveOnly },
-            tag: tagForStack(stack),
-            isMixed: assigned.mixed,
-            isDimmed: isDimmed(stack),
-            badge: badge(stack),
-            editTags: editTagsForStack(stack),
-            originFolder: OrganizeFolderLabel.subfolder(
-                forFolderPath: stack.coverItem.primary.folderPath,
-                rootPath: rootPath
+        // The tile and everything hung on it (gestures, drag, menu) is one
+        // equatable cell: a row that re-runs for a reason that did not touch
+        // this tile hands SwiftUI an equal cell, which skips the tile's whole
+        // subgraph instead of updating a dozen modifiers per tile.
+        return BoardTileCell(
+            tile: StackTileView(
+                stack: stack,
+                width: tileWidth,
+                isSelected: workspace.isStackSelected(stack.id),
+                isFocused: workspace.isStackFocused(stack.id),
+                isEmphasized: isEmphasized,
+                event: assigned.event,
+                isPrivate: assigned.event.map { workspace.resolvedPolicy(for: $0) == .archiveOnly },
+                tag: tagForStack(stack),
+                isMixed: assigned.mixed,
+                isDimmed: isDimmed(stack),
+                badge: badge(stack),
+                editTags: editTagsForStack(stack),
+                originFolder: OrganizeFolderLabel.subfolder(
+                    forFolderPath: stack.coverItem.primary.folderPath,
+                    rootPath: rootPath
+                ),
+                orientation: orientationForFile(stack.coverItem.primary),
+                onExpand: { workspace.setExpanded(stack.id, expanded: true) },
+                onPlay: { onOpen(stack, 0) },
+                onOpen: { onOpen(stack, 0) },
+                retryToken: workspace.connectivityRevision
             ),
-            orientation: orientationForFile(stack.coverItem.primary),
-            onExpand: { workspace.setExpanded(stack.id, expanded: true) },
-            onPlay: { onOpen(stack, 0) },
-            onOpen: { onOpen(stack, 0) },
-            retryToken: workspace.connectivityRevision
+            actions: actions
         )
         .equatable()
         .id(stack.id)
-        .onTapGesture {
-            select(stack)
-        }
-        .simultaneousGesture(TapGesture(count: 2).onEnded { onOpen(stack, 0) })
-        .accessibilityAction { select(stack) }
-        .accessibilityAction(named: "Preview") { onOpen(stack, 0) }
-        .onDrag {
-            dragProvider(for: stack)
-        } preview: {
-            dragPreview(for: stack)
-        }
-        .contextMenu { menu(stack) }
+    }
+
+    /// Points the shared action object at this render's handlers. Cells that
+    /// skip a re-render keep working: they reach the handlers through it.
+    private func configureActions() -> Bool {
+        actions.select = { select($0) }
+        actions.open = { onOpen($0, 0) }
+        actions.dragProvider = { dragProvider(for: $0) }
+        actions.dragPreview = { AnyView(dragPreview(for: $0)) }
+        actions.menu = { AnyView(menu($0)) }
+        return true
     }
 
     private func row(_ stack: OrganizeStack) -> some View {
         BoardRenderCounter.hit(.gridTile)
         let assigned = eventForStack(stack)
-        let isFocusedRow = workspace.focusedStackID == stack.id
-        return StackRowView(
-            stack: stack,
-            isSelected: workspace.selectedStackIDs.contains(stack.id),
-            isFocused: isFocusedRow,
-            isEmphasized: isEmphasized,
-            isExpanded: workspace.expandedStackIDs.contains(stack.id),
-            event: assigned.event,
-            isPrivate: assigned.event.map { workspace.resolvedPolicy(for: $0) == .archiveOnly },
-            tag: tagForStack(stack),
-            isMixed: assigned.mixed,
-            isDimmed: isDimmed(stack),
-            badge: badge(stack),
-            editTags: editTagsForStack(stack),
-            originFolder: OrganizeFolderLabel.title(
-                forFolderPath: stack.coverItem.primary.folderPath,
-                rootPath: rootPath
-            ),
-            onExpand: { workspace.toggleExpanded(stack.id) },
-            onPlay: { onOpen(stack, 0) },
-            onOpen: { onOpen(stack, 0) },
-            moreMenu: {
-                BoardRowMoreMenu(hover: hover, stackID: stack.id, isFocused: isFocusedRow) {
-                    menu(stack)
+        let isFocusedRow = workspace.isStackFocused(stack.id)
+        return BoardRowCell(
+            row: StackRowView(
+                stack: stack,
+                isSelected: workspace.isStackSelected(stack.id),
+                isFocused: isFocusedRow,
+                isEmphasized: isEmphasized,
+                isExpanded: workspace.expandedStackIDs.contains(stack.id),
+                event: assigned.event,
+                isPrivate: assigned.event.map { workspace.resolvedPolicy(for: $0) == .archiveOnly },
+                tag: tagForStack(stack),
+                isMixed: assigned.mixed,
+                isDimmed: isDimmed(stack),
+                badge: badge(stack),
+                editTags: editTagsForStack(stack),
+                originFolder: OrganizeFolderLabel.title(
+                    forFolderPath: stack.coverItem.primary.folderPath,
+                    rootPath: rootPath
+                ),
+                onExpand: { workspace.toggleExpanded(stack.id) },
+                onPlay: { onOpen(stack, 0) },
+                onOpen: { onOpen(stack, 0) },
+                moreMenu: {
+                    BoardRowMoreMenu(hover: hover, stackID: stack.id, isFocused: isFocusedRow) {
+                        menu(stack)
+                    }
                 }
-            }
+            ),
+            hover: hover,
+            actions: actions
         )
-        .onHover { hover.set(stack.id, hovering: $0) }
+        .equatable()
         .id(stack.id)
-        .onTapGesture {
-            select(stack)
-        }
-        .simultaneousGesture(TapGesture(count: 2).onEnded { onOpen(stack, 0) })
-        .accessibilityAction { select(stack) }
-        .accessibilityAction(named: "Preview") { onOpen(stack, 0) }
-        .onDrag {
-            dragProvider(for: stack)
-        } preview: {
-            dragPreview(for: stack)
-        }
-        .contextMenu { menu(stack) }
     }
 
     /// What a drag of this tile carries, built when a drag starts. The

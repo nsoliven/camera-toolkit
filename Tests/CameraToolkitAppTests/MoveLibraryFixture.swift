@@ -1,4 +1,5 @@
 import CameraToolkitCore
+import Darwin
 import Foundation
 import XCTest
 @testable import CameraToolkitApp
@@ -216,11 +217,15 @@ final class MovePresenceProbe: @unchecked Sendable {
 
 /// Pings the main queue from a background thread and records how long each
 /// ping waited — the time the main actor was blocked and could not draw or
-/// answer input.
+/// answer input — and how much of that the main thread spent running (its own
+/// CPU time), which stays put when the machine is busy and the thread waits
+/// for a core.
 final class MainStallMonitor: @unchecked Sendable {
     struct Stall {
         var startedAt: TimeInterval
         var duration: TimeInterval
+        /// The main thread's user + system CPU time while the ping waited.
+        var cpu: TimeInterval = 0
     }
 
     private let lock = NSLock()
@@ -228,22 +233,28 @@ final class MainStallMonitor: @unchecked Sendable {
     private var origin = ProcessInfo.processInfo.systemUptime
     private var _stalls: [Stall] = []
     private var thread: Thread?
+    private var mainThread: mach_port_t = 0
 
+    /// Call from the main thread.
     func start() {
+        mainThread = mach_thread_self()
         lock.withLock {
             running = true
             origin = ProcessInfo.processInfo.systemUptime
             _stalls = []
         }
+        let mainThread = self.mainThread
         let thread = Thread { [self] in
             while lock.withLock({ running }) {
                 let sent = ProcessInfo.processInfo.systemUptime
+                let cpuBefore = Self.cpuTime(of: mainThread)
                 let done = DispatchSemaphore(value: 0)
                 DispatchQueue.main.async { done.signal() }
                 done.wait()
                 let waited = ProcessInfo.processInfo.systemUptime - sent
                 if waited > 0.008 {
-                    lock.withLock { _stalls.append(Stall(startedAt: sent - origin, duration: waited)) }
+                    let cpu = Self.cpuTime(of: mainThread) - cpuBefore
+                    lock.withLock { _stalls.append(Stall(startedAt: sent - origin, duration: waited, cpu: cpu)) }
                 }
                 usleep(1_000)
             }
@@ -257,5 +268,18 @@ final class MainStallMonitor: @unchecked Sendable {
     func stop() -> [Stall] {
         lock.withLock { running = false }
         return lock.withLock { _stalls }.sorted { $0.duration > $1.duration }
+    }
+
+    private static func cpuTime(of thread: mach_port_t) -> TimeInterval {
+        var info = thread_basic_info()
+        var count = mach_msg_type_number_t(MemoryLayout<thread_basic_info>.size / MemoryLayout<integer_t>.size)
+        let result = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                thread_info(thread, thread_flavor_t(THREAD_BASIC_INFO), $0, &count)
+            }
+        }
+        guard result == KERN_SUCCESS else { return 0 }
+        func seconds(_ time: time_value_t) -> TimeInterval { TimeInterval(time.seconds) + TimeInterval(time.microseconds) / 1_000_000 }
+        return seconds(info.user_time) + seconds(info.system_time)
     }
 }

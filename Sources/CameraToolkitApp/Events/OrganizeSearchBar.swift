@@ -52,10 +52,10 @@ extension View {
     func boardFilterPopover(
         isPresented: Binding<Bool>,
         workspace: EventsWorkspace,
-        stacks: [OrganizeStack],
+        stacks: @autoclosure @escaping () -> [OrganizeStack],
         eventScope: Set<UUID>? = nil,
         search: Binding<OrganizeSearchFilter>,
-        matchedCount: Int? = nil
+        matchedCount: @autoclosure @escaping () -> Int? = nil
     ) -> some View {
         overlayPreferenceValue(BoardFilterAnchorKey.self) { anchor in
             GeometryReader { proxy in
@@ -72,10 +72,10 @@ extension View {
                     ) {
                         OrganizeFilterPanel(
                             workspace: workspace,
-                            stacks: stacks,
+                            stacks: stacks(),
                             eventScope: eventScope,
                             search: search,
-                            matchedCount: matchedCount
+                            matchedCount: matchedCount()
                         )
                     }
             }

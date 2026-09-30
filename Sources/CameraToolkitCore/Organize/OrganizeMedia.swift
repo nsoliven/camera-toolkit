@@ -230,7 +230,19 @@ public struct OrganizeFile: Codable, Hashable, Sendable {
         URL(filePath: path, directoryHint: .notDirectory)
     }
 
-    public var name: String { (path as NSString).lastPathComponent }
+    /// The last path component. Sorting a board, keying a selection and
+    /// titling a tile all ask for it of every file, and going through
+    /// `NSString` for each of them was ~1 µs a call; a path with a plain
+    /// last component is cut at its last slash instead, and anything else
+    /// (a trailing slash, no slash, the root) takes the `NSString` answer.
+    public var name: String {
+        let bytes = path.utf8
+        if let slash = bytes.lastIndex(of: UInt8(ascii: "/")) {
+            let rest = path[bytes.index(after: slash)...]
+            if !rest.isEmpty { return String(rest) }
+        }
+        return (path as NSString).lastPathComponent
+    }
     public var folderPath: String { (path as NSString).deletingLastPathComponent }
     public var fileExtension: String { (name as NSString).pathExtension.lowercased() }
     public var stem: String { (name as NSString).deletingPathExtension.lowercased() }

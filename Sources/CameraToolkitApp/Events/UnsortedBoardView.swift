@@ -297,7 +297,7 @@ struct UnsortedBoardView: View {
             BoardViewControls(
                 workspace: workspace,
                 filterPresented: $showFilters,
-                groups: groups,
+                groupIDs: groups.map(\.id),
                 mode: $boardMode,
                 grouping: $grouping,
                 groupings: OrganizeBoardGrouping.allCases,

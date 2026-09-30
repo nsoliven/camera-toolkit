@@ -142,7 +142,7 @@ extension EventsWorkspace {
             },
             completion: { [weak self] outcome in
                 let (result, remaining) = outcome
-                self?.nasRenamesApplied(result, remaining: remaining)
+                await self?.nasRenamesAppliedInSlices(result, remaining: remaining)
                 guard result.failed.isEmpty else { throw ToolkitError.commandFailed(result.summary) }
                 nasLine.text = result.summary
                 return result.summary
@@ -198,6 +198,21 @@ extension EventsWorkspace {
         // renames of a plain move are patched into the rows they belong to;
         // anything else re-reads the boards.
         if result.changed > 0, !patchPresence(afterNASRenames: result) {
+            for eventID in Array(eventStacks.keys) where presence[eventID] != nil {
+                Task { await refreshEvent(eventID) }
+            }
+        }
+    }
+
+    /// `nasRenamesApplied` for the job that applies the queue, which may
+    /// suspend: the counts, then each piece of the patch, are drawn before the
+    /// next starts, and the job holds the gate until the last one.
+    func nasRenamesAppliedInSlices(_ result: NASFollowResult, remaining: Int) async {
+        pendingNASRenameCount = remaining
+        nasPresence.noteRenamed(result)
+        guard result.changed > 0 else { return }
+        await RunLoopTurn.afterCommit()
+        if !(await patchPresenceInSlices(afterNASRenames: result)) {
             for eventID in Array(eventStacks.keys) where presence[eventID] != nil {
                 Task { await refreshEvent(eventID) }
             }

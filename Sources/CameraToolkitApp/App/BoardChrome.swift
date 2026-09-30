@@ -95,9 +95,10 @@ struct BoardViewControls: View {
     /// Whether the board's filter popover is open — owned by the board,
     /// outside the `ViewThatFits` candidates.
     @Binding var filterPresented: Bool
-    /// The board's groups as computed once for this render — Expand or
-    /// Collapse All reads them instead of re-planning the board.
-    let groups: [OrganizeBoardGroup]
+    /// The ids of the board's groups — what Expand or Collapse All acts on.
+    /// Ids, not the groups: a bar handed the groups drew again every time a
+    /// stack changed, which a move does three times.
+    let groupIDs: [String]
     @Binding var mode: OrganizeBoardMode
     @Binding var grouping: OrganizeBoardGrouping
     let groupings: [OrganizeBoardGrouping]
@@ -137,7 +138,7 @@ struct BoardViewControls: View {
             Menu {
                 BoardGroupMenuContent(
                     workspace: workspace,
-                    groups: groups,
+                    groupIDs: groupIDs,
                     grouping: $grouping,
                     groupings: groupings,
                     tileWidth: compact && mode == .tiles ? $tileWidth : nil
@@ -216,7 +217,7 @@ private struct BoardSortMenuContent: View {
 /// compact bar — Larger/Smaller Tiles in place of the slider.
 private struct BoardGroupMenuContent: View {
     let workspace: EventsWorkspace
-    let groups: [OrganizeBoardGroup]
+    let groupIDs: [String]
     @Binding var grouping: OrganizeBoardGrouping
     let groupings: [OrganizeBoardGrouping]
     /// Set in compact bars, where the slider is not shown.
@@ -230,9 +231,9 @@ private struct BoardGroupMenuContent: View {
         }
         .pickerStyle(.inline)
         Divider()
-        let anyCollapsed = groups.contains { workspace.collapsedGroupIDs.contains($0.id) }
+        let anyCollapsed = groupIDs.contains { workspace.collapsedGroupIDs.contains($0) }
         Button(anyCollapsed ? "Expand All Groups" : "Collapse All Groups") {
-            workspace.setAllGroupsCollapsed(!anyCollapsed, groups: groups)
+            workspace.setAllGroupsCollapsed(!anyCollapsed, groupIDs: groupIDs)
         }
         if let tileWidth {
             Divider()
@@ -266,18 +267,16 @@ struct BoardBottomBar<Controls: View>: View {
     @Bindable var model: DashboardModel
     let workspace: EventsWorkspace
     /// "Reading capture dates… 40 left." while the board is still loading.
-    var loadingNote: String? = nil
+    /// Read while the status line draws, so the bar itself does not depend on
+    /// the loading state it reports.
+    var loadingNote: () -> String? = { nil }
     /// A trailing hint, shown after the status when there is room.
     var hint: String? = nil
     @ViewBuilder let controls: () -> Controls
 
     var body: some View {
         VStack(spacing: 6) {
-            if let running = workspace.runningApply,
-               model.jobs.contains(where: { $0.id == running.jobID && $0.state == .running }) {
-                ApplyProgressBanner(running: running)
-                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-            }
+            ApplyBannerSlot(model: model, workspace: workspace)
             GlassEffectContainer(spacing: 10) {
                 controls()
             }
@@ -289,11 +288,27 @@ struct BoardBottomBar<Controls: View>: View {
     }
 }
 
+/// The running apply's progress banner, when there is one. Its own view: the
+/// job list and the running apply change with every job that starts or ends,
+/// and the bar around the controls has no reason to re-run for them.
+private struct ApplyBannerSlot: View {
+    let model: DashboardModel
+    let workspace: EventsWorkspace
+
+    var body: some View {
+        if let running = workspace.runningApply,
+           model.jobs.contains(where: { $0.id == running.jobID && $0.state == .running }) {
+            ApplyProgressBanner(running: running)
+                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        }
+    }
+}
+
 /// The caption under the bottom bar: a running job with its progress,
 /// board loading progress, or `statusMessage`.
 private struct BoardStatusLine: View {
     @Bindable var model: DashboardModel
-    let loadingNote: String?
+    let loadingNote: () -> String?
     let hint: String?
 
     var body: some View {
@@ -304,7 +319,7 @@ private struct BoardStatusLine: View {
                     .frame(width: 120)
                 Text(job.note)
                     .truncationMode(.middle)
-            } else if let loadingNote {
+            } else if let loadingNote = loadingNote() {
                 ProgressView()
                     .controlSize(.small)
                 Text(loadingNote)

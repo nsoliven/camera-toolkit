@@ -131,18 +131,6 @@ enum BoardTileRows {
     }
 }
 
-/// A view whose body only calls `content`. Views a lazy stack builds from a
-/// closure in the board's own body are evaluated with the board: every
-/// change any tile reads (a selection, an edit tag, a badge) re-ran the
-/// whole board's closures. Built through this, what a row's tiles read is
-/// read while the row's own body runs, so a change re-runs the rows on
-/// screen and nothing else.
-struct ScopedBody<Content: View>: View {
-    @ViewBuilder let content: () -> Content
-
-    var body: some View { content() }
-}
-
 /// The board's stacks in the order they are drawn, kept where clicks can
 /// read the current order without the tiles being rebuilt when it changes.
 @MainActor
