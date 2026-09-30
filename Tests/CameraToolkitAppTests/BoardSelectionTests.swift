@@ -55,8 +55,8 @@ final class BoardSelectionTests: XCTestCase {
     func testOpeningTheViewerNeverChangesTheMultiSelection() async throws {
         try await eachLibrary(.small) { library, mode in
         let workspace = library.workspace
-        await open(library, library.islandID)
-        let chosen = try firstStacks(library, library.islandID, count: 5)
+        await open(library, library.cityID)
+        let chosen = try firstStacks(library, library.cityID, count: 5)
         let ids = Set(chosen.map(\.id))
         workspace.selectStacks(chosen.map(\.id))
 
@@ -66,7 +66,7 @@ final class BoardSelectionTests: XCTestCase {
         XCTAssertEqual(workspace.selectedStackIDs, ids)
         XCTAssertEqual(workspace.focusedStackID, chosen[2].id)
         // Space on a stack that is not part of the selection: still 5.
-        let outsider = try XCTUnwrap(workspace.eventStacks[library.islandID]?.last)
+        let outsider = try XCTUnwrap(workspace.eventStacks[library.cityID]?.last)
         XCTAssertFalse(ids.contains(outsider.id))
         workspace.focus(stackID: outsider.id)
         XCTAssertEqual(workspace.selectedStackIDs, ids)
@@ -77,8 +77,8 @@ final class BoardSelectionTests: XCTestCase {
         try await eachLibrary(.small) { library, mode in
         let workspace = library.workspace
         workspace.selectionCollapseDelay = 0.05
-        await open(library, library.islandID)
-        let chosen = try firstStacks(library, library.islandID, count: 5)
+        await open(library, library.cityID)
+        let chosen = try firstStacks(library, library.cityID, count: 5)
         let ids = Set(chosen.map(\.id))
         workspace.selectStacks(chosen.map(\.id))
         let ordered = chosen.map(\.id)
@@ -99,8 +99,8 @@ final class BoardSelectionTests: XCTestCase {
         try await eachLibrary(.small) { library, mode in
         let workspace = library.workspace
         workspace.selectionCollapseDelay = 0.05
-        await open(library, library.islandID)
-        let chosen = try firstStacks(library, library.islandID, count: 5)
+        await open(library, library.cityID)
+        let chosen = try firstStacks(library, library.cityID, count: 5)
         let ids = Set(chosen.map(\.id))
         workspace.selectStacks(chosen.map(\.id))
 
@@ -116,8 +116,8 @@ final class BoardSelectionTests: XCTestCase {
         try await eachLibrary(.small) { library, mode in
         let workspace = library.workspace
         workspace.selectionCollapseDelay = 0.05
-        await open(library, library.islandID)
-        let chosen = try firstStacks(library, library.islandID, count: 5)
+        await open(library, library.cityID)
+        let chosen = try firstStacks(library, library.cityID, count: 5)
         workspace.selectStacks(chosen.map(\.id))
 
         workspace.click(stackID: chosen[3].id, orderedIDs: chosen.map(\.id), modifiers: [], clickCount: 1)
@@ -130,8 +130,8 @@ final class BoardSelectionTests: XCTestCase {
     func testPlainClickOnAnUnselectedTileReplacesTheSelectionAtOnce() async throws {
         try await eachLibrary(.small) { library, mode in
         let workspace = library.workspace
-        await open(library, library.islandID)
-        let stacks = try firstStacks(library, library.islandID, count: 6)
+        await open(library, library.cityID)
+        let stacks = try firstStacks(library, library.cityID, count: 6)
         workspace.selectStacks(stacks.prefix(5).map(\.id))
 
         workspace.click(stackID: stacks[5].id, orderedIDs: stacks.map(\.id), modifiers: [], clickCount: 1)
@@ -142,8 +142,8 @@ final class BoardSelectionTests: XCTestCase {
     func testCommandAndShiftClicksStillExtendTheSelection() async throws {
         try await eachLibrary(.small) { library, mode in
         let workspace = library.workspace
-        await open(library, library.islandID)
-        let stacks = try firstStacks(library, library.islandID, count: 6)
+        await open(library, library.cityID)
+        let stacks = try firstStacks(library, library.cityID, count: 6)
         let ordered = stacks.map(\.id)
         workspace.click(stackID: stacks[0].id, orderedIDs: ordered, modifiers: [], clickCount: 1)
         workspace.click(stackID: stacks[2].id, orderedIDs: ordered, modifiers: .shift, clickCount: 1)
@@ -189,26 +189,26 @@ final class BoardSelectionTests: XCTestCase {
     func testSelectionSurvivesSwitchingBoardsAndBack() async throws {
         try await eachLibrary(.small) { library, mode in
         let workspace = library.workspace
-        await open(library, library.islandID)
-        await open(library, library.harborID)
-        workspace.selection = .event(library.islandID)
-        let chosen = try firstStacks(library, library.islandID, count: 5)
+        await open(library, library.cityID)
+        await open(library, library.beachID)
+        workspace.selection = .event(library.cityID)
+        let chosen = try firstStacks(library, library.cityID, count: 5)
         workspace.selectStacks(chosen.map(\.id))
         workspace.focus(stackID: chosen[3].id)
 
-        workspace.selection = .event(library.harborID)
+        workspace.selection = .event(library.beachID)
         XCTAssertTrue(workspace.selectedStackIDs.isEmpty, "the other board has its own selection")
-        let harbor = try firstStacks(library, library.harborID, count: 2)
-        workspace.selectStacks(harbor.map(\.id))
+        let beach = try firstStacks(library, library.beachID, count: 2)
+        workspace.selectStacks(beach.map(\.id))
 
-        workspace.selection = .event(library.islandID)
+        workspace.selection = .event(library.cityID)
         XCTAssertEqual(workspace.selectedStackIDs, Set(chosen.map(\.id)))
         XCTAssertEqual(workspace.focusedStackID, chosen[3].id)
-        workspace.selection = .event(library.harborID)
-        XCTAssertEqual(workspace.selectedStackIDs, Set(harbor.map(\.id)))
+        workspace.selection = .event(library.beachID)
+        XCTAssertEqual(workspace.selectedStackIDs, Set(beach.map(\.id)))
         // Through a board with no selection and no board at all.
         workspace.selection = nil
-        workspace.selection = .event(library.islandID)
+        workspace.selection = .event(library.cityID)
         XCTAssertEqual(workspace.selectedStackIDs.count, 5)
         }
     }
@@ -231,7 +231,7 @@ final class BoardSelectionTests: XCTestCase {
         let stacks = try XCTUnwrap(workspace.sources[location.id]?.result?.stacks)
         workspace.selectStacks(stacks.prefix(4).map(\.id))
 
-        await open(library, library.harborID)
+        await open(library, library.beachID)
         XCTAssertTrue(workspace.selectedStackIDs.isEmpty)
         workspace.selection = .unsorted(location.id)
         XCTAssertEqual(workspace.selectedStackIDs, Set(stacks.prefix(4).map(\.id)))
@@ -251,16 +251,16 @@ final class BoardSelectionTests: XCTestCase {
     func testSelectionSurvivesARestackThatChangesEveryStackID() async throws {
         try await eachLibrary(.small) { library, mode in
         let workspace = library.workspace
-        await open(library, library.islandID)
-        let stacks = try XCTUnwrap(workspace.eventStacks[library.islandID])
+        await open(library, library.cityID)
+        let stacks = try XCTUnwrap(workspace.eventStacks[library.cityID])
         let chosen = Array(stacks.prefix(5))
         workspace.selectStacks(chosen.map(\.id))
         workspace.focus(stackID: chosen[2].id)
         let chosenNames = Set(chosen.flatMap(\.files).map(\.name))
 
-        workspace.eventStacks[library.islandID] = relocated(stacks, into: library.root.appendingPathComponent("Library/Elsewhere").path)
+        workspace.eventStacks[library.cityID] = relocated(stacks, into: library.root.appendingPathComponent("Library/Elsewhere").path)
 
-        let rebuilt = try XCTUnwrap(workspace.eventStacks[library.islandID])
+        let rebuilt = try XCTUnwrap(workspace.eventStacks[library.cityID])
         XCTAssertTrue(Set(rebuilt.map(\.id)).isDisjoint(with: stacks.map(\.id)), "every id changed")
         XCTAssertEqual(workspace.selectedStackIDs.count, 5)
         let selectedNames = Set(rebuilt.filter { workspace.selectedStackIDs.contains($0.id) }.flatMap(\.files).map(\.name))
@@ -273,18 +273,18 @@ final class BoardSelectionTests: XCTestCase {
     func testARestackWhileAnotherBoardIsOpenIsRememberedForWhenThisOneReturns() async throws {
         try await eachLibrary(.small) { library, mode in
         let workspace = library.workspace
-        await open(library, library.islandID)
-        await open(library, library.harborID)
-        workspace.selection = .event(library.islandID)
-        let stacks = try XCTUnwrap(workspace.eventStacks[library.islandID])
+        await open(library, library.cityID)
+        await open(library, library.beachID)
+        workspace.selection = .event(library.cityID)
+        let stacks = try XCTUnwrap(workspace.eventStacks[library.cityID])
         workspace.selectStacks(stacks.prefix(5).map(\.id))
-        workspace.selection = .event(library.harborID)
+        workspace.selection = .event(library.beachID)
 
         // A background re-read of the board that is not on screen.
-        workspace.eventStacks[library.islandID] = relocated(stacks, into: library.root.appendingPathComponent("Library/Elsewhere").path)
+        workspace.eventStacks[library.cityID] = relocated(stacks, into: library.root.appendingPathComponent("Library/Elsewhere").path)
         XCTAssertTrue(workspace.selectedStackIDs.isEmpty)
 
-        workspace.selection = .event(library.islandID)
+        workspace.selection = .event(library.cityID)
         XCTAssertEqual(workspace.selectedStackIDs.count, 5)
         }
     }
@@ -292,13 +292,13 @@ final class BoardSelectionTests: XCTestCase {
     func testSelectionRidesThroughABoardThatEmptiesAndRefills() async throws {
         try await eachLibrary(.small) { library, mode in
         let workspace = library.workspace
-        await open(library, library.islandID)
-        let stacks = try XCTUnwrap(workspace.eventStacks[library.islandID])
+        await open(library, library.cityID)
+        let stacks = try XCTUnwrap(workspace.eventStacks[library.cityID])
         workspace.selectStacks(stacks.prefix(5).map(\.id))
 
-        workspace.eventStacks[library.islandID] = []
+        workspace.eventStacks[library.cityID] = []
         XCTAssertTrue(workspace.selectedStackIDs.isEmpty)
-        workspace.eventStacks[library.islandID] = relocated(stacks, into: library.root.appendingPathComponent("Library/Back").path)
+        workspace.eventStacks[library.cityID] = relocated(stacks, into: library.root.appendingPathComponent("Library/Back").path)
         XCTAssertEqual(workspace.selectedStackIDs.count, 5)
         }
     }
@@ -306,17 +306,17 @@ final class BoardSelectionTests: XCTestCase {
     func testRefreshingTheBoardKeepsTheSelection() async throws {
         try await eachLibrary(.small) { library, mode in
         let workspace = library.workspace
-        await open(library, library.islandID)
-        let chosen = try firstStacks(library, library.islandID, count: 5)
+        await open(library, library.cityID)
+        let chosen = try firstStacks(library, library.cityID, count: 5)
         workspace.selectStacks(chosen.map(\.id))
         let names = Set(chosen.flatMap(\.files).map(\.name))
 
-        await workspace.refreshEvent(library.islandID)   // Cmd-R
+        await workspace.refreshEvent(library.cityID)   // Cmd-R
         await workspace.refreshEvent(library.parentID)    // a family board over it
         workspace.refreshConnectivity()
         try await Task.sleep(for: .milliseconds(200))
 
-        let stacks = try XCTUnwrap(workspace.eventStacks[library.islandID])
+        let stacks = try XCTUnwrap(workspace.eventStacks[library.cityID])
         let selectedNames = Set(stacks.filter { workspace.selectedStackIDs.contains($0.id) }.flatMap(\.files).map(\.name))
         XCTAssertEqual(selectedNames, names)
         }
@@ -327,32 +327,32 @@ final class BoardSelectionTests: XCTestCase {
     func testTrashingTwoOfFiveLeavesThree() async throws {
         try await eachLibrary(.small) { library, mode in
         let workspace = library.workspace
-        await open(library, library.islandID)
-        let chosen = try firstStacks(library, library.islandID, count: 5)
+        await open(library, library.cityID)
+        let chosen = try firstStacks(library, library.cityID, count: 5)
         workspace.selectStacks(chosen.map(\.id))
         let trashed = Set(chosen.prefix(2).map(\.id))
         let kept = Set(chosen.suffix(3).map(\.id))
 
-        workspace.requestTrash(stackIDs: trashed, fromEvent: library.islandID)
+        workspace.requestTrash(stackIDs: trashed, fromEvent: library.cityID)
         workspace.confirmTrash(try XCTUnwrap(workspace.pendingTrash))
         if mode != .bufferPlugged {
             // In the temp folder standing in for the NAS there is no volume of
             // its own to hold a Trash folder, and the Buffer's is away: the
             // trash says so, moves nothing, and the selection is untouched.
-            let before = workspace.eventStacks[library.islandID]?.flatMap(\.files).count
+            let before = workspace.eventStacks[library.cityID]?.flatMap(\.files).count
             try await waitUntil { !library.model.isBusy && library.model.statusMessage.contains("Nothing moved to Trash") }
             XCTAssertEqual(workspace.selectedStackIDs, Set(chosen.map(\.id)))
-            XCTAssertEqual(workspace.eventStacks[library.islandID]?.flatMap(\.files).count, before)
+            XCTAssertEqual(workspace.eventStacks[library.cityID]?.flatMap(\.files).count, before)
             return
         }
         try await waitUntil {
-            !library.model.isBusy && (workspace.eventStacks[library.islandID]?.contains { trashed.contains($0.id) } == false)
+            !library.model.isBusy && (workspace.eventStacks[library.cityID]?.contains { trashed.contains($0.id) } == false)
         }
 
         XCTAssertEqual(workspace.selectedStackIDs, kept)
         // And they stay that way across a board switch.
-        workspace.selection = .event(library.harborID)
-        workspace.selection = .event(library.islandID)
+        workspace.selection = .event(library.beachID)
+        workspace.selection = .event(library.cityID)
         XCTAssertEqual(workspace.selectedStackIDs, kept)
         }
     }
@@ -378,17 +378,17 @@ final class BoardSelectionTests: XCTestCase {
         let unsortedStacks = try XCTUnwrap(workspace.sources[location.id]?.result?.stacks)
         XCTAssertEqual(unsortedStacks.count, 4)
 
-        await open(library, library.islandID)
-        let island = try firstStacks(library, library.islandID, count: 5)
-        workspace.selectStacks(island.map(\.id))
+        await open(library, library.cityID)
+        let city = try firstStacks(library, library.cityID, count: 5)
+        workspace.selectStacks(city.map(\.id))
         workspace.selection = .unsorted(location.id)
-        // Two of the four are sorted into Harbor and stay selected on the
+        // Two of the four are sorted into Beach Day and stay selected on the
         // unsorted board; one unmoved file is selected too.
-        workspace.assign(stackIDs: Set(unsortedStacks.prefix(2).map(\.id)), from: location.id, to: library.harborID)
+        workspace.assign(stackIDs: Set(unsortedStacks.prefix(2).map(\.id)), from: location.id, to: library.beachID)
         workspace.selectStacks(unsortedStacks.prefix(3).map(\.id))
 
         let plan = EventsWorkspace.buildApplyPlan(
-            events: [try XCTUnwrap(workspace.event(library.harborID))],
+            events: [try XCTUnwrap(workspace.event(library.beachID))],
             configuration: model.configuration,
             locations: workspace.locations,
             onlyUnder: folder.path,
@@ -400,11 +400,11 @@ final class BoardSelectionTests: XCTestCase {
             // the one action that may say it needs it: nothing moves, and no
             // board's selection is touched by the refusal.
             XCTAssertEqual(plan.moveCount, 0)
-            workspace.prepareApply(eventIDs: [library.harborID], title: "Apply", onlyUnder: folder.path)
+            workspace.prepareApply(eventIDs: [library.beachID], title: "Apply", onlyUnder: folder.path)
             try await Task.sleep(for: .milliseconds(300))
             XCTAssertEqual(workspace.selectedStackIDs.count, 3)
             XCTAssertEqual(workspace.sources[location.id]?.result?.stacks.count, 4)
-            workspace.selection = .event(library.islandID)
+            workspace.selection = .event(library.cityID)
             XCTAssertEqual(workspace.selectedStackIDs.count, 5)
             return
         }
@@ -419,7 +419,7 @@ final class BoardSelectionTests: XCTestCase {
             unsortedStacks[2].files.contains { $0.name == stack.files.first?.name }
         }.map(\.id)))
         // The other board is untouched.
-        workspace.selection = .event(library.islandID)
+        workspace.selection = .event(library.cityID)
         XCTAssertEqual(workspace.selectedStackIDs.count, 5)
         }
     }
@@ -427,13 +427,13 @@ final class BoardSelectionTests: XCTestCase {
     func testEscapeAndSelectAllStillWork() async throws {
         try await eachLibrary(.small) { library, mode in
         let workspace = library.workspace
-        await open(library, library.islandID)
-        let stacks = try XCTUnwrap(workspace.eventStacks[library.islandID])
+        await open(library, library.cityID)
+        let stacks = try XCTUnwrap(workspace.eventStacks[library.cityID])
         workspace.selectStacks(stacks.map(\.id))
         XCTAssertEqual(workspace.selectedStackIDs.count, stacks.count)
         workspace.selectedStackIDs.removeAll()
-        workspace.selection = .event(library.harborID)
-        workspace.selection = .event(library.islandID)
+        workspace.selection = .event(library.beachID)
+        workspace.selection = .event(library.cityID)
         XCTAssertTrue(workspace.selectedStackIDs.isEmpty, "Escape's clear is remembered too")
         }
     }

@@ -145,8 +145,8 @@ final class StorageLinkInspectorTests: XCTestCase {
 
     func testUSBContextUsesTheNegotiatedLinkSpeed() {
         let volume = MountedVolumeInfo(
-            url: URL(fileURLWithPath: "/Volumes/Buffer", isDirectory: true),
-            name: "Buffer",
+            url: URL(fileURLWithPath: "/Volumes/Buffer Drive", isDirectory: true),
+            name: "Buffer Drive",
             fileSystemType: "exfat",
             mountSource: "/dev/disk8s2",
             isRemovable: true,

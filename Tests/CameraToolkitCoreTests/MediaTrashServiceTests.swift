@@ -358,7 +358,7 @@ final class MediaTrashServiceTests: XCTestCase {
                     locationName: "Unsorted",
                     eventIDsByPathKey: [key: eventID],
                     eventNamesByID: [eventID: "Nina's Birthday"],
-                    personNamesByPathKey: [key: ["Sam", "Nina"]],
+                    personNamesByPathKey: [key: ["Alex", "Nina"]],
                     captureDatesByPathKey: [key: captured]
                 )
             )
@@ -367,13 +367,13 @@ final class MediaTrashServiceTests: XCTestCase {
             let entry = try XCTUnwrap(manifest.entries.first)
             XCTAssertEqual(entry.eventID, eventID)
             XCTAssertEqual(entry.eventName, "Nina's Birthday")
-            XCTAssertEqual(entry.personNames, ["Sam", "Nina"])
+            XCTAssertEqual(entry.personNames, ["Alex", "Nina"])
             XCTAssertEqual(entry.capturedAt, captured)
 
             let item = try XCTUnwrap(service(removedFilesRoot: trash).listItems(under: [trash]).first)
             XCTAssertEqual(item.fileName, "DSC00001.ARW")
             XCTAssertEqual(item.eventName, "Nina's Birthday")
-            XCTAssertEqual(item.personNames, ["Sam", "Nina"])
+            XCTAssertEqual(item.personNames, ["Alex", "Nina"])
             XCTAssertEqual(item.capturedAt, captured)
             XCTAssertEqual(item.sortDate, captured)
             XCTAssertEqual(item.originalAbsolutePath, photo.standardizedFileURL.path)
@@ -396,13 +396,13 @@ final class MediaTrashServiceTests: XCTestCase {
                 context: TrashContext(
                     eventIDsByPathKey: [key: eventID],
                     eventNamesByID: [eventID: "Nina's Birthday"],
-                    personNamesByPathKey: [key: ["Sam"]]
+                    personNamesByPathKey: [key: ["Alex"]]
                 )
             )
 
             let items = svc.listItems(under: [trash])
             XCTAssertEqual(items.count, 2)
-            XCTAssertEqual(items.filter { MediaTrashQuery(text: "sam").matches($0) }.map(\.fileName), ["DSC00001.ARW"])
+            XCTAssertEqual(items.filter { MediaTrashQuery(text: "alex").matches($0) }.map(\.fileName), ["DSC00001.ARW"])
             XCTAssertEqual(items.filter { MediaTrashQuery(text: "c0001").matches($0) }.map(\.fileName), ["C0001.MP4"])
             XCTAssertEqual(items.filter { MediaTrashQuery(text: "birthday").matches($0) }.map(\.fileName), ["DSC00001.ARW"])
             XCTAssertTrue(items.filter { MediaTrashQuery(text: "nobody").matches($0) }.isEmpty)

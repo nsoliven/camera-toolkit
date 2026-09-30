@@ -15,8 +15,8 @@ struct MoveLibrary {
     struct Shape {
         /// Files sitting directly in the parent event.
         var parentOwn = 9_846
-        var harbor = 1_931
-        var island = 3_673
+        var beach = 1_931
+        var city = 3_673
         var road = 160
         /// A second family the moves never touch.
         var elsewhere = 1_390
@@ -27,9 +27,9 @@ struct MoveLibrary {
 
         static let realistic = Shape()
         /// The same structure at a size where the unit tests stay quick.
-        static let small = Shape(parentOwn: 80, harbor: 30, island: 60, road: 6, elsewhere: 20, catalogBacked: false)
+        static let small = Shape(parentOwn: 80, beach: 30, city: 60, road: 6, elsewhere: 20, catalogBacked: false)
 
-        var family: Int { parentOwn + harbor + island + road }
+        var family: Int { parentOwn + beach + city + road }
         var total: Int { family + elsewhere }
     }
 
@@ -38,16 +38,16 @@ struct MoveLibrary {
     let workspace: EventsWorkspace
     let shape: Shape
     let parentID: UUID
-    let harborID: UUID
-    let islandID: UUID
+    let beachID: UUID
+    let cityID: UUID
     let roadID: UUID
     let elsewhereID: UUID
     /// The next event to move things into — a sibling in the same family.
-    var targetID: UUID { harborID }
+    var targetID: UUID { beachID }
     /// The subevent a move leaves and the sibling it joins, by neutral names
     /// for tests that describe the move rather than the fixture's events.
-    var sourceSubeventID: UUID { islandID }
-    var targetSubeventID: UUID { harborID }
+    var sourceSubeventID: UUID { cityID }
+    var targetSubeventID: UUID { beachID }
 
     var catalogURL: URL { root.appendingPathComponent("CameraToolkit/catalog.sqlite") }
 
@@ -75,11 +75,11 @@ struct MoveLibrary {
         )
         let day = Calendar.current.startOfDay(for: Date(timeIntervalSince1970: 1_772_000_000))
         let parent = SavedCameraEvent(name: "Trip 2026", eventDate: day, storagePolicy: .buffer)
-        let harbor = SavedCameraEvent(name: "Harbor", eventDate: day, storagePolicy: .buffer, parentEventID: parent.id)
-        let island = SavedCameraEvent(name: "Island", eventDate: day.addingTimeInterval(4 * 86_400), storagePolicy: .buffer, parentEventID: parent.id)
-        let road = SavedCameraEvent(name: "Road", eventDate: day.addingTimeInterval(9 * 86_400), storagePolicy: .buffer, parentEventID: parent.id)
+        let beach = SavedCameraEvent(name: "Beach Day", eventDate: day, storagePolicy: .buffer, parentEventID: parent.id)
+        let city = SavedCameraEvent(name: "City Weekend", eventDate: day.addingTimeInterval(4 * 86_400), storagePolicy: .buffer, parentEventID: parent.id)
+        let road = SavedCameraEvent(name: "Road Trip", eventDate: day.addingTimeInterval(9 * 86_400), storagePolicy: .buffer, parentEventID: parent.id)
         let elsewhere = SavedCameraEvent(name: "Elsewhere", eventDate: day.addingTimeInterval(30 * 86_400), storagePolicy: .buffer)
-        configuration.savedEvents = [parent, harbor, island, road, elsewhere]
+        configuration.savedEvents = [parent, beach, city, road, elsewhere]
 
         let locations = EventStorageLocations(configuration: configuration)
         let unsorted = root.appendingPathComponent("Drive/Unsorted A7V", isDirectory: true)
@@ -89,7 +89,7 @@ struct MoveLibrary {
         var burst = 0
         let fileManager = FileManager.default
         for (event, count) in [
-            (parent, shape.parentOwn), (harbor, shape.harbor), (island, shape.island),
+            (parent, shape.parentOwn), (beach, shape.beach), (city, shape.city),
             (road, shape.road), (elsewhere, shape.elsewhere)
         ] {
             let folder = locations.originalsRoot(for: event, deviceID: "sony-a7v", policy: .buffer)
@@ -164,8 +164,8 @@ struct MoveLibrary {
             workspace: workspace,
             shape: shape,
             parentID: parent.id,
-            harborID: harbor.id,
-            islandID: island.id,
+            beachID: beach.id,
+            cityID: city.id,
             roadID: road.id,
             elsewhereID: elsewhere.id
         )

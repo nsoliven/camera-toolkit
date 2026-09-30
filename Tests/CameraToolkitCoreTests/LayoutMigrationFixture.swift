@@ -10,7 +10,7 @@ import XCTest
 ///   Sony A7V/Card Copy/            DSC00001.ARW (+ .ARW.xmp, ._ twin), DSC00002.ARW + .JPG
 ///                                  (+ ._ twin and its own ._._ twin),
 ///                                  DSC00003.ARW.photo-edit, notes.txt (unknown), .DS_Store,
-///                                  Transfer 4 (Ridge)/DSC00010.ARW (+ ._ folder twin)
+///                                  Transfer 4 (Lakeside)/DSC00010.ARW (+ ._ folder twin)
 ///   Sony A7V/readme.txt            beside Card Copy → left in place
 ///   DJI Osmo 360/Card Copy/        CAM_0001.OSV + .LRF
 ///   osmo-360/Card Copy/            a *different* CAM_0001.OSV + .LRF + ._ twin → "(2)"
@@ -103,8 +103,8 @@ struct LayoutMigrationFixture {
         try put(sony.appendingPathComponent("DSC00003.ARW.photo-edit"), "edit-three")
         try put(sony.appendingPathComponent("notes.txt"), "unknown to the catalog")
         try put(sony.appendingPathComponent(".DS_Store"), "finder")
-        try put(sony.appendingPathComponent("Transfer 4 (Ridge)/DSC00010.ARW"), "raw-ten")
-        try put(sony.appendingPathComponent("._Transfer 4 (Ridge)"), "folder twin")
+        try put(sony.appendingPathComponent("Transfer 4 (Lakeside)/DSC00010.ARW"), "raw-ten")
+        try put(sony.appendingPathComponent("._Transfer 4 (Lakeside)"), "folder twin")
         try put(parentFolder.appendingPathComponent("Sony A7V/readme.txt"), "beside card copy")
         try put(osmo.appendingPathComponent("CAM_0001.OSV"), "osv-a")
         try put(osmo.appendingPathComponent("CAM_0001.LRF"), "lrf-a")
@@ -132,7 +132,7 @@ struct LayoutMigrationFixture {
         let unsorted = root.appendingPathComponent("Unsorted", isDirectory: true)
         let adoptedSony = assignment(sony, "DSC00001.ARW", parent, "sony-a7v", size: 7)
         let appliedRenamed = assignment(unsorted.appendingPathComponent("Transfer 2"), "DSC00002.ARW", parent, "sony-a7v", size: 7)
-        let appliedNested = assignment(unsorted, "Transfer 4 (Ridge)/DSC00010.ARW", parent, "sony-a7v", size: 7)
+        let appliedNested = assignment(unsorted, "Transfer 4 (Lakeside)/DSC00010.ARW", parent, "sony-a7v", size: 7)
         let appliedPrivate = assignment(unsorted.appendingPathComponent("Private"), "DSC00100.ARW", child, "sony-a7v", size: 11)
         let adoptedOsmo = assignment(osmo, "CAM_0001.OSV", parent, "osmo-360", size: 5)
         let adoptedOsmoAlt = assignment(osmoAlt, "CAM_0001.OSV", parent, "osmo-360", size: 15)
@@ -173,7 +173,7 @@ struct LayoutMigrationFixture {
             try db.execute(sql: "INSERT INTO event_asset_locations(event_asset_id, location, state, checked_at) VALUES (?, 'buffer', 1, ?)", arguments: [adoptedID, now])
             try db.execute(sql: "INSERT INTO immich_assets(event_asset_id, status, checked_at) VALUES (?, 'uploaded', ?)", arguments: [adoptedID, now])
             try db.execute(sql: "INSERT INTO immich_assets(event_asset_id, status, checked_at) VALUES (?, 'uploaded', ?)", arguments: [CatalogStore.eventAssetID(appliedRenamed), now])
-            try db.execute(sql: "INSERT INTO people(id, name, is_roster, face_count, created_at, updated_at) VALUES ('P1', 'Riley', 1, 3, ?, ?)", arguments: [now, now])
+            try db.execute(sql: "INSERT INTO people(id, name, is_roster, face_count, created_at, updated_at) VALUES ('P1', 'Jordan', 1, 3, ?, ?)", arguments: [now, now])
             let modified = ISO8601DateFormatter.fractional.string(from: fixedDate)
             func photo(_ path: String, _ name: String, _ size: Int) throws -> String {
                 let key = EventStorageLocations.pathKey(path)

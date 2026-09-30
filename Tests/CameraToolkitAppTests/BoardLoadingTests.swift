@@ -28,7 +28,7 @@ final class BoardLoadingTests: XCTestCase {
     // MARK: - First tiles never wait for the NAS
 
     func testFirstTilesDoNotWaitForAHungNASRoot() async throws {
-        try await eachLibrary(MoveLibrary.Shape(parentOwn: 200, harbor: 0, island: 0, road: 0, elsewhere: 0, catalogBacked: false)) { library, mode in
+        try await eachLibrary(MoveLibrary.Shape(parentOwn: 200, beach: 0, city: 0, road: 0, elsewhere: 0, catalogBacked: false)) { library, mode in
         let workspace = library.workspace
         // The NAS root does not answer for 10 s and the check would wait
         // 8 s for it — before, the board stayed empty for all of that.
@@ -52,7 +52,7 @@ final class BoardLoadingTests: XCTestCase {
 
     func testTheWholeGridOfALargeEventDoesNotWaitForAHungNASRoot() async throws {
         try await eachLibrary(
-            MoveLibrary.Shape(parentOwn: 3_000, harbor: 0, island: 0, road: 0, elsewhere: 0, catalogBacked: false),
+            MoveLibrary.Shape(parentOwn: 3_000, beach: 0, city: 0, road: 0, elsewhere: 0, catalogBacked: false),
             populateNAS: false
         ) { library, mode in
         let workspace = library.workspace
@@ -75,7 +75,7 @@ final class BoardLoadingTests: XCTestCase {
     /// its first screen, and the board turned that into "Drives Not
     /// Connected". Its first screen is now the family's earliest files.
     func testFamilyWithNoFilesOfItsOwnPublishesTilesAndNeverAnEmptyGrid() async throws {
-        try await eachLibrary(MoveLibrary.Shape(parentOwn: 0, harbor: 400, island: 400, road: 400, elsewhere: 0, catalogBacked: false)) { library, mode in
+        try await eachLibrary(MoveLibrary.Shape(parentOwn: 0, beach: 400, city: 400, road: 400, elsewhere: 0, catalogBacked: false)) { library, mode in
         let workspace = library.workspace
         // Some place is offline, so the board is armed to say "not connected".
         workspace.placeResponseTimeout = 0.3
@@ -104,7 +104,7 @@ final class BoardLoadingTests: XCTestCase {
     }
 
     func testPlaceholdersStandInWhileFilesAreOnTheirWayAndNeverOnceTheLoadFinished() async throws {
-        try await eachLibrary(MoveLibrary.Shape(parentOwn: 0, harbor: 60, island: 60, road: 0, elsewhere: 0, catalogBacked: false)) { library, mode in
+        try await eachLibrary(MoveLibrary.Shape(parentOwn: 0, beach: 60, city: 60, road: 0, elsewhere: 0, catalogBacked: false)) { library, mode in
         let workspace = library.workspace
         // Nothing resolves to a path, so no tile can be drawn yet; the NAS
         // check parks the pipeline behind it.
@@ -123,7 +123,7 @@ final class BoardLoadingTests: XCTestCase {
     }
 
     func testNoPlaceholdersWithoutAnyLoadOrWithoutCatalogFiles() async throws {
-        try await eachLibrary(MoveLibrary.Shape(parentOwn: 0, harbor: 20, island: 0, road: 0, elsewhere: 0, catalogBacked: false)) { library, mode in
+        try await eachLibrary(MoveLibrary.Shape(parentOwn: 0, beach: 20, city: 0, road: 0, elsewhere: 0, catalogBacked: false)) { library, mode in
         let workspace = library.workspace
         // Nothing is loading: a board with no tiles is a finished answer.
         XCTAssertFalse(workspace.eventBoardShowsPlaceholders(library.parentID))
@@ -150,7 +150,7 @@ final class BoardLoadingTests: XCTestCase {
     /// run behind it.
     func testBufferOfflineOpensTheWholeGridFromTheNASMirrorWithoutAnyNASStat() async throws {
         try await eachLibrary(
-            MoveLibrary.Shape(parentOwn: 0, harbor: 1_856, island: 0, road: 0, elsewhere: 0, catalogBacked: false),
+            MoveLibrary.Shape(parentOwn: 0, beach: 1_856, city: 0, road: 0, elsewhere: 0, catalogBacked: false),
             modes: [.nasOnly]
         ) { library, mode in
         let workspace = library.workspace
@@ -159,7 +159,7 @@ final class BoardLoadingTests: XCTestCase {
         // NAS stand-in holds every file at its mirror path.
         let locations = workspace.locations
         XCTAssertFalse(VolumeInfo.isAvailable(locations.bufferRoot), "the test's Buffer must be unmounted")
-        XCTAssertEqual(model.configuration.photoEventAssignments.filter { $0.eventID == library.harborID }.count, 1_856)
+        XCTAssertEqual(model.configuration.photoEventAssignments.filter { $0.eventID == library.beachID }.count, 1_856)
         // Every NAS stat costs 20 ms, and the NAS check itself is slow enough
         // to hold the presence sweep back while the grid is inspected.
         let stats = MovePresenceProbe(nasRoot: locations.nasRoot.path, nasDelayMicroseconds: 20_000)
@@ -172,25 +172,25 @@ final class BoardLoadingTests: XCTestCase {
             return FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) && isDirectory.boolValue
         }
 
-        workspace.selection = .event(library.harborID)
+        workspace.selection = .event(library.beachID)
         let start = ProcessInfo.processInfo.systemUptime
-        let refresh = Task { await workspace.refreshEvent(library.harborID) }
-        try await waitUntil { workspace.eventStacks[library.harborID]?.isEmpty == false }
+        let refresh = Task { await workspace.refreshEvent(library.beachID) }
+        try await waitUntil { workspace.eventStacks[library.beachID]?.isEmpty == false }
         let elapsed = ProcessInfo.processInfo.systemUptime - start
         print("TIMING|Buffer unplugged, 1,856 files on the NAS: whole grid after \(elapsed * 1_000) ms, NAS stats so far \(stats.nasStats)")
 
-        let stacks = try XCTUnwrap(workspace.eventStacks[library.harborID])
+        let stacks = try XCTUnwrap(workspace.eventStacks[library.beachID])
         // ~0.1 s on an idle machine; the budget leaves room for a loaded one and
         // is still far under the seconds the NAS check and sweep used to cost.
         XCTAssertLessThan(elapsed, 0.75, "the grid waited")
         XCTAssertEqual(stacks.flatMap(\.files).count, 1_856, "the first grid is the whole board")
-        XCTAssertNil(workspace.eventBuildRemainders[library.harborID], "nothing is still to come")
+        XCTAssertNil(workspace.eventBuildRemainders[library.beachID], "nothing is still to come")
         XCTAssertEqual(stats.nasStats, 0, "a NAS stat sat on the path to the first paint")
         XCTAssertTrue(stacks.flatMap(\.files).allSatisfy { $0.path.hasPrefix(nas + "/") }, "tiles point at the NAS mirror")
-        XCTAssertFalse(workspace.eventBoardShowsPlaceholders(library.harborID), "no spinner over a grid that is up")
-        XCTAssertNil(workspace.presence[library.harborID], "presence has not landed yet")
+        XCTAssertFalse(workspace.eventBoardShowsPlaceholders(library.beachID), "no spinner over a grid that is up")
+        XCTAssertNil(workspace.presence[library.beachID], "presence has not landed yet")
         // Grouping (scrolling) and selection work before presence finishes.
-        let groups = workspace.eventBoardGroups(library.harborID, stacks: stacks, grouping: .day, sort: OrganizeStackSort(key: .captureTime, ascending: true))
+        let groups = workspace.eventBoardGroups(library.beachID, stacks: stacks, grouping: .day, sort: OrganizeStackSort(key: .captureTime, ascending: true))
         XCTAssertEqual(groups.flatMap(\.stacks).count, stacks.count)
         workspace.selectStacks(stacks.prefix(5).map(\.id))
         XCTAssertEqual(workspace.selectedStackIDs.count, 5)
@@ -198,14 +198,14 @@ final class BoardLoadingTests: XCTestCase {
         // Let the NAS answer and presence run (fast stats now).
         stats.nasDelayMicroseconds = 0
         await refresh.value
-        XCTAssertEqual(workspace.presence[library.harborID]?.onArchive, 1_856, "the strip fills in behind the grid")
+        XCTAssertEqual(workspace.presence[library.beachID]?.onArchive, 1_856, "the strip fills in behind the grid")
         XCTAssertEqual(
-            workspace.eventStacks[library.harborID]?.flatMap(\.files).map(\.path).sorted(),
+            workspace.eventStacks[library.beachID]?.flatMap(\.files).map(\.path).sorted(),
             stacks.flatMap(\.files).map(\.path).sorted(),
             "the grid was not re-laid out"
         )
         XCTAssertEqual(workspace.selectedStackIDs.count, 5, "selection survived the presence result")
-        XCTAssertEqual(workspace.eventReachability[library.harborID]?.isOffline, false)
+        XCTAssertEqual(workspace.eventReachability[library.beachID]?.isOffline, false)
         }
     }
 
@@ -214,7 +214,7 @@ final class BoardLoadingTests: XCTestCase {
     /// blank tiles — no "not connected" screen, no spinner, no wait.
     func testNothingMountedStillDrawsTheWholeCatalogGrid() async throws {
         try await eachLibrary(
-            MoveLibrary.Shape(parentOwn: 0, harbor: 700, island: 500, road: 0, elsewhere: 0, catalogBacked: false),
+            MoveLibrary.Shape(parentOwn: 0, beach: 700, city: 500, road: 0, elsewhere: 0, catalogBacked: false),
             modes: [.nothingMounted]
         ) { library, mode in
         let workspace = library.workspace
@@ -244,7 +244,7 @@ final class BoardLoadingTests: XCTestCase {
     /// The first screen paints from the mount table and the capture-date
     /// cache only: no header read, and no rewrite of the whole cache file.
     func testFirstPaintReadsNoHeadersAndNeverRewritesTheCaptureDateCache() async throws {
-        try await eachLibrary(MoveLibrary.Shape(parentOwn: 300, harbor: 0, island: 0, road: 0, elsewhere: 0, catalogBacked: false)) { library, mode in
+        try await eachLibrary(MoveLibrary.Shape(parentOwn: 300, beach: 0, city: 0, road: 0, elsewhere: 0, catalogBacked: false)) { library, mode in
         let workspace = library.workspace
         let reads = ReadCounter()
         workspace.captureDateReadProbe = { url in reads.note(url); return nil }
@@ -355,29 +355,29 @@ final class BoardLoadingTests: XCTestCase {
         let workspace = library.workspace
         let sweeps = SweepCounter()
         workspace.presenceProbe = sweeps.probe
-        await workspace.refreshEvent(library.islandID)
-        XCTAssertTrue(workspace.isBoardFresh(library.islandID))
+        await workspace.refreshEvent(library.cityID)
+        XCTAssertTrue(workspace.isBoardFresh(library.cityID))
         let statsAfterLoad = sweeps.count
         XCTAssertGreaterThan(statsAfterLoad, 0)
 
         // What an appearing board runs: nothing, because nothing changed.
-        let stacks = workspace.eventStacks[library.islandID]
-        await workspace.refreshEventIfStale(library.islandID)
+        let stacks = workspace.eventStacks[library.cityID]
+        await workspace.refreshEventIfStale(library.cityID)
         XCTAssertEqual(sweeps.count, statsAfterLoad)
-        XCTAssertEqual(workspace.eventStacks[library.islandID], stacks)
+        XCTAssertEqual(workspace.eventStacks[library.cityID], stacks)
 
         // Data that actually changed does re-check it.
         workspace.refreshConnectivity()
-        XCTAssertFalse(workspace.isBoardFresh(library.islandID))
-        await workspace.refreshEventIfStale(library.islandID)
+        XCTAssertFalse(workspace.isBoardFresh(library.cityID))
+        await workspace.refreshEventIfStale(library.cityID)
         // (`refreshConnectivity` also re-reads every open board in the
         // background; wait for whichever refresh lands last.)
-        try await waitUntil { workspace.isBoardFresh(library.islandID) }
+        try await waitUntil { workspace.isBoardFresh(library.cityID) }
         XCTAssertGreaterThan(sweeps.count, statsAfterLoad)
 
         // And an old proof is re-checked in the background.
         workspace.boardFreshnessInterval = 0
-        XCTAssertFalse(workspace.isBoardFresh(library.islandID))
+        XCTAssertFalse(workspace.isBoardFresh(library.cityID))
         }
     }
 
@@ -386,19 +386,19 @@ final class BoardLoadingTests: XCTestCase {
     func testBoardGroupsAreReusedUntilTheirInputsChange() async throws {
         try await eachLibrary(.small) { library, mode in
         let workspace = library.workspace
-        await workspace.refreshEvent(library.islandID)
-        let stacks = try XCTUnwrap(workspace.eventStacks[library.islandID])
+        await workspace.refreshEvent(library.cityID)
+        let stacks = try XCTUnwrap(workspace.eventStacks[library.cityID])
         let sort = OrganizeStackSort(key: .captureTime, ascending: true)
-        let first = workspace.eventBoardGroups(library.islandID, stacks: stacks, grouping: .day, sort: sort)
-        let again = workspace.eventBoardGroups(library.islandID, stacks: stacks, grouping: .day, sort: sort)
+        let first = workspace.eventBoardGroups(library.cityID, stacks: stacks, grouping: .day, sort: sort)
+        let again = workspace.eventBoardGroups(library.cityID, stacks: stacks, grouping: .day, sort: sort)
         XCTAssertEqual(first.map(\.id), again.map(\.id))
         XCTAssertEqual(first.flatMap(\.stacks).count, stacks.count)
         // A different grouping is a different answer.
-        let byKind = workspace.eventBoardGroups(library.islandID, stacks: stacks, grouping: .kind, sort: sort)
+        let byKind = workspace.eventBoardGroups(library.cityID, stacks: stacks, grouping: .kind, sort: sort)
         XCTAssertEqual(byKind.flatMap(\.stacks).count, stacks.count)
         // And a changed board is never served a stale grouping.
         let fewer = Array(stacks.dropFirst(5))
-        let changed = workspace.eventBoardGroups(library.islandID, stacks: fewer, grouping: .day, sort: sort)
+        let changed = workspace.eventBoardGroups(library.cityID, stacks: fewer, grouping: .day, sort: sort)
         XCTAssertEqual(changed.flatMap(\.stacks).count, fewer.count)
         }
     }

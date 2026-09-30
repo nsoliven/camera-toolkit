@@ -37,15 +37,15 @@ final class NASFollowMovesTests: XCTestCase {
         defer { library.tearDown() }
         let workspace = library.workspace
         let model = library.model
-        for id in [library.parentID, library.islandID, library.harborID] { await workspace.refreshEvent(id) }
-        let selection = library.bursts(in: library.islandID, count: 2)
+        for id in [library.parentID, library.cityID, library.beachID] { await workspace.refreshEvent(id) }
+        let selection = library.bursts(in: library.cityID, count: 2)
         let files = selection.flatMap(\.files)
         XCTAssertFalse(files.isEmpty)
         let oldNAS = try files.map { try nasPath(library, drivePath: $0.path) }
 
         // The NAS is not mounted: the move runs, the renames are journaled.
         XCTAssertFalse(exists(workspace.locations.nasRoot.path))
-        workspace.moveStacks(Set(selection.map(\.id)), fromEvent: library.islandID, toEvent: library.harborID)
+        workspace.moveStacks(Set(selection.map(\.id)), fromEvent: library.cityID, toEvent: library.beachID)
         try await waitUntil { !model.isBusy && workspace.latestMoveJournalTitle != nil }
         XCTAssertTrue(model.statusMessage.contains("will be renamed when the NAS is connected"), model.statusMessage)
         XCTAssertEqual(workspace.pendingNASRenameCount, files.count)
@@ -65,7 +65,7 @@ final class NASFollowMovesTests: XCTestCase {
         XCTAssertTrue(model.statusMessage.contains("Renamed \(files.count) copies on the NAS"), model.statusMessage)
         XCTAssertTrue(oldNAS.allSatisfy { !exists($0) })
         for file in files {
-            XCTAssertTrue(exists(try nasPath(library, drivePath: workspace.locations.originalsRoot(for: workspace.event(library.harborID)!, deviceID: "sony-a7v", policy: .buffer).appendingPathComponent(file.name).path)))
+            XCTAssertTrue(exists(try nasPath(library, drivePath: workspace.locations.originalsRoot(for: workspace.event(library.beachID)!, deviceID: "sony-a7v", policy: .buffer).appendingPathComponent(file.name).path)))
         }
         XCTAssertTrue(workspace.nasRenameQueue.pending().isEmpty)
 

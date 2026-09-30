@@ -44,7 +44,7 @@ final class ApplyPlanOverviewTests: XCTestCase {
     }
 
     func testDriveNameFromPath() {
-        XCTAssertEqual(ApplyPathLabel.driveName(for: "/Volumes/Buffer/Camera Buffer"), "Buffer")
+        XCTAssertEqual(ApplyPathLabel.driveName(for: "/Volumes/Buffer Drive/Camera Buffer"), "Buffer Drive")
         XCTAssertEqual(ApplyPathLabel.driveName(for: "/Drive/Camera Buffer"), "this Mac")
     }
 
@@ -79,11 +79,11 @@ final class ApplyPlanOverviewTests: XCTestCase {
     func testMoveOnlySentenceSaysNothingIsCopied() {
         let sentence = ApplyPlanOverview.sentence(
             moveCount: 40, copyCount: 0, sourceNames: ["Unsorted A7V"],
-            eventCount: 2, destinationDrives: ["Buffer"]
+            eventCount: 2, destinationDrives: ["Buffer Drive"]
         )
         XCTAssertEqual(
             sentence,
-            "40 files move from “Unsorted A7V” into 2 events on Buffer. They are renamed on the same drive, so no files are copied or deleted."
+            "40 files move from “Unsorted A7V” into 2 events on Buffer Drive. They are renamed on the same drive, so no files are copied or deleted."
         )
     }
 

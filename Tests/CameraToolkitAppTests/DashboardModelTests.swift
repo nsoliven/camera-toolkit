@@ -34,7 +34,7 @@ final class DashboardModelTests: XCTestCase {
             DashboardModel.inferredDeviceID(for: ConfiguredLocation(
                 role: .importSource,
                 name: "DJI NANO",
-                path: "/Volumes/Buffer/Work Trip Utah /DJI NANO"
+                path: "/Volumes/Buffer Drive/Road Trip 2026 /DJI NANO"
             )),
             "dji-nano"
         )

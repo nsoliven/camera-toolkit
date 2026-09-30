@@ -64,7 +64,7 @@ final class BoardLoadTimingTests: XCTestCase {
     }
 
     func testFirstTilesSmallEventNASAnswering() async throws {
-        let library = try MoveLibrary.make(MoveLibrary.Shape(parentOwn: 200, harbor: 0, island: 0, road: 0, elsewhere: 0, catalogBacked: false))
+        let library = try MoveLibrary.make(MoveLibrary.Shape(parentOwn: 200, beach: 0, city: 0, road: 0, elsewhere: 0, catalogBacked: false))
         defer { library.tearDown() }
         try library.model.configurationStore.save(library.model.configuration)
         let (cold, warm) = try await coldAndWarm(library, library.parentID)
@@ -73,7 +73,7 @@ final class BoardLoadTimingTests: XCTestCase {
     }
 
     func testFirstTilesSmallEventNASHung() async throws {
-        let library = try MoveLibrary.make(MoveLibrary.Shape(parentOwn: 200, harbor: 0, island: 0, road: 0, elsewhere: 0, catalogBacked: false))
+        let library = try MoveLibrary.make(MoveLibrary.Shape(parentOwn: 200, beach: 0, city: 0, road: 0, elsewhere: 0, catalogBacked: false))
         defer { library.tearDown() }
         try library.model.configurationStore.save(library.model.configuration)
         hangNASRoot(library)
@@ -82,7 +82,7 @@ final class BoardLoadTimingTests: XCTestCase {
     }
 
     func testFirstTilesFifteenThousandOneEvent() async throws {
-        let library = try MoveLibrary.make(MoveLibrary.Shape(parentOwn: 15_000, harbor: 0, island: 0, road: 0, elsewhere: 0, catalogBacked: false))
+        let library = try MoveLibrary.make(MoveLibrary.Shape(parentOwn: 15_000, beach: 0, city: 0, road: 0, elsewhere: 0, catalogBacked: false))
         defer { library.tearDown() }
         try library.model.configurationStore.save(library.model.configuration)
         let (cold, warm) = try await coldAndWarm(library, library.parentID)
@@ -93,7 +93,7 @@ final class BoardLoadTimingTests: XCTestCase {
     }
 
     func testFirstTilesFamilyWithNoFilesOfItsOwn() async throws {
-        let library = try MoveLibrary.make(MoveLibrary.Shape(parentOwn: 0, harbor: 5_000, island: 5_000, road: 5_000, elsewhere: 0, catalogBacked: false))
+        let library = try MoveLibrary.make(MoveLibrary.Shape(parentOwn: 0, beach: 5_000, city: 5_000, road: 5_000, elsewhere: 0, catalogBacked: false))
         defer { library.tearDown() }
         try library.model.configurationStore.save(library.model.configuration)
         let (cold, warm) = try await coldAndWarm(library, library.parentID)
@@ -103,7 +103,7 @@ final class BoardLoadTimingTests: XCTestCase {
     /// Where a switch spends its main-actor time: the selection write, the
     /// SwiftUI update it triggers, and the run-loop turns after it.
     func testSwitchBreakdown() async throws {
-        let library = try MoveLibrary.make(MoveLibrary.Shape(parentOwn: 9_000, harbor: 3_000, island: 3_000, road: 160, elsewhere: 300, catalogBacked: false))
+        let library = try MoveLibrary.make(MoveLibrary.Shape(parentOwn: 9_000, beach: 3_000, city: 3_000, road: 160, elsewhere: 300, catalogBacked: false))
         defer { library.tearDown() }
         try library.model.configurationStore.save(library.model.configuration)
         let workspace = library.workspace
@@ -140,7 +140,7 @@ final class BoardLoadTimingTests: XCTestCase {
     /// was blocked between the click and the new board settling, and the
     /// main-actor time the whole switch took.
     func testSwitchTimingsInTheMainWindow() async throws {
-        let library = try MoveLibrary.make(MoveLibrary.Shape(parentOwn: 9_000, harbor: 3_000, island: 3_000, road: 160, elsewhere: 300, catalogBacked: false))
+        let library = try MoveLibrary.make(MoveLibrary.Shape(parentOwn: 9_000, beach: 3_000, city: 3_000, road: 160, elsewhere: 300, catalogBacked: false))
         defer { library.tearDown() }
         try library.model.configurationStore.save(library.model.configuration)
         let workspace = library.workspace

@@ -7,7 +7,7 @@ import XCTest
 final class StorageBottleneckAnalysisTests: XCTestCase {
     func testWiFiBeatsEveryOtherLinkAsTheBottleneck() {
         let card = makeTarget(id: "card", name: "LEXAR", roles: ["Camera Source"])
-        let buffer = makeTarget(id: "buffer", name: "Buffer", roles: ["Buffer"], access: .readWrite)
+        let buffer = makeTarget(id: "buffer", name: "Buffer Drive", roles: ["Buffer"], access: .readWrite)
         let nas = makeTarget(id: "nas", name: "nas_share", roles: ["Photo Library"], access: .readWrite)
         let results = [
             "card": result(read: 400e6),
@@ -35,7 +35,7 @@ final class StorageBottleneckAnalysisTests: XCTestCase {
     }
 
     func testWiredNetworkIsTheBottleneckWhenDisksAreFaster() {
-        let buffer = makeTarget(id: "buffer", name: "Buffer", roles: ["Buffer"], access: .readWrite)
+        let buffer = makeTarget(id: "buffer", name: "Buffer Drive", roles: ["Buffer"], access: .readWrite)
         let nas = makeTarget(id: "nas", name: "nas_share", roles: ["Photo Library"], access: .readWrite)
         let results = [
             "buffer": result(read: 700e6, write: 640e6),
@@ -58,7 +58,7 @@ final class StorageBottleneckAnalysisTests: XCTestCase {
     }
 
     func testSlowNASUnderItsNetworkCeilingBlamesTheDisksNotTheWire() {
-        let buffer = makeTarget(id: "buffer", name: "Buffer", roles: ["Buffer"], access: .readWrite)
+        let buffer = makeTarget(id: "buffer", name: "Buffer Drive", roles: ["Buffer"], access: .readWrite)
         let nas = makeTarget(id: "nas", name: "nas_share", roles: ["Photo Library"], access: .readWrite)
         let results = [
             "buffer": result(read: 700e6, write: 640e6),
@@ -83,7 +83,7 @@ final class StorageBottleneckAnalysisTests: XCTestCase {
 
     func testNegotiatedUSBLinkCanBeTheSlowestLink() {
         let card = makeTarget(id: "card", name: "Osmo360", roles: ["Camera Source"])
-        let buffer = makeTarget(id: "buffer", name: "Buffer", roles: ["Buffer"], access: .readWrite)
+        let buffer = makeTarget(id: "buffer", name: "Buffer Drive", roles: ["Buffer"], access: .readWrite)
         let results = [
             "card": result(read: 800e6),
             "buffer": result(read: 900e6, write: 850e6)
@@ -116,7 +116,7 @@ final class StorageBottleneckAnalysisTests: XCTestCase {
 
     func testUnmeasuredTargetsFallBackToTypicalFigures() {
         let card = makeTarget(id: "card", name: "LEXAR", roles: ["Camera Source"])
-        let buffer = makeTarget(id: "buffer", name: "Buffer", roles: ["Buffer"], access: .readWrite)
+        let buffer = makeTarget(id: "buffer", name: "Buffer Drive", roles: ["Buffer"], access: .readWrite)
 
         let verdicts = StorageBottleneckAnalysis.verdicts(
             targets: [card, buffer],

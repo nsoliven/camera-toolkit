@@ -168,7 +168,7 @@ public struct OrganizedArchiveLayout: Sendable {
     /// same `<year>/<event>/Originals/<Camera>/<subpath>` it has under the
     /// drive root. `sourcePath` is the path under `Originals/<Camera>` —
     /// its subfolders are kept, so two files with one name never collide.
-    /// A component SMB cannot store (`w: Sam`, a trailing dot) is
+    /// A component SMB cannot store (`w: Alex`, a trailing dot) is
     /// rewritten by `PortablePath`, the same rule Sync to NAS applies.
     public func mirrorRelativePath(for sourcePath: String) throws -> String {
         try PathSafety.validateRelativePath(sourcePath)
