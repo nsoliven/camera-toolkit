@@ -32,12 +32,12 @@ final class EventMoveBenchmarkTests: XCTestCase {
         // Open the boards a user would have visited: the parent (whole
         // family), the subevent the bursts leave, and the one they join.
         var clock = ContinuousClock.now
-        for id in [library.parentID, library.islandID, library.harborID] {
+        for id in [library.parentID, library.cityID, library.beachID] {
             await workspace.refreshEvent(id)
         }
-        print("BENCH open three boards (refresh + sweeps): \(ms(seconds(clock))) · stacks parent \(workspace.eventStacks[library.parentID]?.count ?? -1), island \(workspace.eventStacks[library.islandID]?.count ?? -1), harbor \(workspace.eventStacks[library.harborID]?.count ?? -1) · NAS stats so far \(probe.nasStats)")
+        print("BENCH open three boards (refresh + sweeps): \(ms(seconds(clock))) · stacks parent \(workspace.eventStacks[library.parentID]?.count ?? -1), city \(workspace.eventStacks[library.cityID]?.count ?? -1), beach \(workspace.eventStacks[library.beachID]?.count ?? -1) · NAS stats so far \(probe.nasStats)")
 
-        let selection = library.bursts(in: library.islandID, count: 15)
+        let selection = library.bursts(in: library.cityID, count: 15)
         XCTAssertEqual(selection.count, 15)
         let fileCount = selection.flatMap(\.files).count
         let statsBefore = probe.nasStats
@@ -49,11 +49,11 @@ final class EventMoveBenchmarkTests: XCTestCase {
         // returns runs on the main actor.
         clock = ContinuousClock.now
         let clicked = clock
-        workspace.moveStacks(Set(selection.map(\.id)), fromEvent: library.islandID, toEvent: library.harborID)
+        workspace.moveStacks(Set(selection.map(\.id)), fromEvent: library.cityID, toEvent: library.beachID)
         let click = seconds(clicked)
         let jobStarted = model.isBusy
         print("BENCH click -> moveStacks returned (main actor): \(ms(click)) · job started: \(jobStarted) · \(selection.count) bursts, \(fileCount) files · status: \(model.statusMessage)")
-        let paintedOnClick = workspace.eventStacks[library.islandID]?.count
+        let paintedOnClick = workspace.eventStacks[library.cityID]?.count
 
         // Stage 2: the rename job, its completion, the catalog write.
         clock = ContinuousClock.now
@@ -66,7 +66,7 @@ final class EventMoveBenchmarkTests: XCTestCase {
         var quietSince = ContinuousClock.now
         while seconds(quietSince) < 0.5 {
             try await Task.sleep(for: .milliseconds(25))
-            let busy = [library.parentID, library.islandID, library.harborID].contains { workspace.isCheckingFiles(for: $0) }
+            let busy = [library.parentID, library.cityID, library.beachID].contains { workspace.isCheckingFiles(for: $0) }
             if probe.total != lastCalls || busy {
                 lastCalls = probe.total
                 quietSince = ContinuousClock.now
@@ -76,7 +76,7 @@ final class EventMoveBenchmarkTests: XCTestCase {
         let stalls = monitor.stop()
         print("BENCH job done -> refreshes settled: \(ms(settle)) · NAS stats during move: \(probe.nasStats - statsBefore)")
         print("BENCH main-actor stalls >= 8 ms: \(stalls.count) · longest \(stalls.prefix(5).map { ms($0.duration) + " @" + String(format: "%.2fs", $0.startedAt) }.joined(separator: ", ")) · total \(ms(stalls.reduce(0) { $0 + $1.duration }))")
-        print("BENCH island stacks: before click \(paintedOnClick ?? -1) (was \(library.shape.island)-file board), final \(workspace.eventStacks[library.islandID]?.count ?? -1); harbor final \(workspace.eventStacks[library.harborID]?.count ?? -1); parent final \(workspace.eventStacks[library.parentID]?.count ?? -1)")
+        print("BENCH city stacks: before click \(paintedOnClick ?? -1) (was \(library.shape.city)-file board), final \(workspace.eventStacks[library.cityID]?.count ?? -1); beach final \(workspace.eventStacks[library.beachID]?.count ?? -1); parent final \(workspace.eventStacks[library.parentID]?.count ?? -1)")
         XCTAssertTrue(jobStarted)
     }
 

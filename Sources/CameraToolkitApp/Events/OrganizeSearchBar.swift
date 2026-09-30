@@ -768,7 +768,7 @@ struct OrganizeFilterHotLinks: View {
         }
     }
 
-    /// The People row's picks as "Sam, Person 1" — roster members and
+    /// The People row's picks as "Alex, Person 1" — roster members and
     /// unnamed groups in the picker's order, then stale picks the board
     /// no longer offers.
     private func peopleLabel(for row: OrganizeFilterRow) -> String {

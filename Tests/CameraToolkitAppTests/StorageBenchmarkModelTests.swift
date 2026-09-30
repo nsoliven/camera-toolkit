@@ -66,7 +66,7 @@ final class StorageBenchmarkModelTests: XCTestCase {
 
         let volume = MountedVolumeInfo(
             url: root,
-            name: "Buffer",
+            name: "Buffer Drive",
             fileSystemType: "exfat",
             mountSource: "/dev/disk8s2",
             isRemovable: true,

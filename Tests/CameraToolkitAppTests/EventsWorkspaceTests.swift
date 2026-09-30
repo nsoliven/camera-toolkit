@@ -1112,7 +1112,7 @@ final class EventsWorkspaceTests: XCTestCase {
 
             let parent = try XCTUnwrap(workspace.createEvent(name: "TRIP2026", date: organizerDay("2026-08-21"), policy: .buffer))
             let child = try XCTUnwrap(workspace.createEvent(name: "Matcha", date: organizerDay("2026-08-23"), policy: nil, parentEventID: parent))
-            let other = try XCTUnwrap(workspace.createEvent(name: "Other Trip", date: organizerDay("2026-08-21"), policy: .buffer))
+            let other = try XCTUnwrap(workspace.createEvent(name: "Other Event", date: organizerDay("2026-08-21"), policy: .buffer))
 
             // Sidebar events: a parent-name hit reveals the subevent row too;
             // a child-name hit keeps only the matching child.
@@ -1549,10 +1549,10 @@ final class EventsWorkspaceTests: XCTestCase {
             workspace.scan(location)
             try await waitUntil { workspace.sources[location.id]?.result != nil }
             let result = try XCTUnwrap(workspace.sources[location.id]?.result)
-            let samStack = try XCTUnwrap(result.stacks.first { $0.coverItem.primary.name == "DSC00001.ARW" })
+            let alexStack = try XCTUnwrap(result.stacks.first { $0.coverItem.primary.name == "DSC00001.ARW" })
             let groupStack = try XCTUnwrap(result.stacks.first { $0.coverItem.primary.name == "DSC00002.ARW" })
 
-            // Seed the face index as if a scan ran: Sam confirmed on the
+            // Seed the face index as if a scan ran: Alex confirmed on the
             // first photo, an Inbox cluster on the second.
             let catalog = root.appendingPathComponent("catalog.sqlite")
             _ = try CatalogStore(url: catalog).bootstrap(
@@ -1561,11 +1561,11 @@ final class EventsWorkspaceTests: XCTestCase {
                 createLibraryFolders: false
             )
             let store = workspace.faceStore
-            let sam = try store.createPerson(name: "Sam", isRoster: true)
+            let alex = try store.createPerson(name: "Alex", isRoster: true)
             let group = try store.createPerson(name: "Person 1", isRoster: false)
             let box = NormalizedFaceBox(x: 0.1, y: 0.1, width: 0.2, height: 0.2)
             for (stack, person, state) in [
-                (samStack, sam, FaceState.confirmed),
+                (alexStack, alex, FaceState.confirmed),
                 (groupStack, group, FaceState.other),
             ] {
                 let file = stack.coverItem.primary
@@ -1586,13 +1586,13 @@ final class EventsWorkspaceTests: XCTestCase {
             // carry that person's confirmed face — the catalog join needs
             // no filesystem reads. An Inbox face names no stack: a needle
             // matching its row's name still doesn't surface it.
-            XCTAssertEqual(workspace.visibleDays(result, hideSorted: false, matching: "sam").flatMap(\.stacks).map(\.id), [samStack.id])
+            XCTAssertEqual(workspace.visibleDays(result, hideSorted: false, matching: "alex").flatMap(\.stacks).map(\.id), [alexStack.id])
             XCTAssertEqual(workspace.visibleDays(result, hideSorted: false, matching: "person 1").flatMap(\.stacks).map(\.id), [])
-            XCTAssertEqual(Set(workspace.visibleDays(result, hideSorted: false, matching: "").flatMap(\.stacks).map(\.id)), [samStack.id, groupStack.id])
+            XCTAssertEqual(Set(workspace.visibleDays(result, hideSorted: false, matching: "").flatMap(\.stacks).map(\.id)), [alexStack.id, groupStack.id])
             XCTAssertTrue(workspace.visibleDays(result, hideSorted: false, matching: "zzz").isEmpty)
 
             // File-name matching still works alongside person names.
-            XCTAssertEqual(workspace.visibleDays(result, hideSorted: false, matching: "dsc00001").flatMap(\.stacks).map(\.id), [samStack.id])
+            XCTAssertEqual(workspace.visibleDays(result, hideSorted: false, matching: "dsc00001").flatMap(\.stacks).map(\.id), [alexStack.id])
         }
     }
 

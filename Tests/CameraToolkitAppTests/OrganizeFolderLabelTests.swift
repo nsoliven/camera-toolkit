@@ -66,10 +66,10 @@ final class OrganizeFolderLabelTests: XCTestCase {
     func testTitleIsRootNamePlusSubfolder() {
         XCTAssertEqual(
             OrganizeFolderLabel.title(
-                forFolderPath: "/Volumes/Transfer 3 (Riley Tessie BDay)/100MSDCF",
-                rootPath: "/Volumes/Transfer 3 (Riley Tessie BDay)"
+                forFolderPath: "/Volumes/Transfer 3 (Jordan Sam BDay)/100MSDCF",
+                rootPath: "/Volumes/Transfer 3 (Jordan Sam BDay)"
             ),
-            "Transfer 3 (Riley Tessie BDay)/100MSDCF"
+            "Transfer 3 (Jordan Sam BDay)/100MSDCF"
         )
     }
 

@@ -63,9 +63,9 @@ final class LayoutMigrationPlannerTests: XCTestCase {
             // A twin, and the twin of that twin, chain onto the new name.
             XCTAssertEqual(dest(sony + "/._DSC00002.JPG"), originals + "/Sony A7V/._DSC00002 (2).JPG")
             XCTAssertEqual(dest(sony + "/._._DSC00002.JPG"), originals + "/Sony A7V/._._DSC00002 (2).JPG")
-            XCTAssertEqual(dest(sony + "/Transfer 4 (Ridge)/DSC00010.ARW"), originals + "/Sony A7V/Transfer 4 (Ridge)/DSC00010.ARW")
-            XCTAssertEqual(dest(sony + "/._Transfer 4 (Ridge)"), originals + "/Sony A7V/._Transfer 4 (Ridge)")
-            XCTAssertEqual(moves[sony + "/._Transfer 4 (Ridge)"]?.kind, .folderAppleDouble)
+            XCTAssertEqual(dest(sony + "/Transfer 4 (Lakeside)/DSC00010.ARW"), originals + "/Sony A7V/Transfer 4 (Lakeside)/DSC00010.ARW")
+            XCTAssertEqual(dest(sony + "/._Transfer 4 (Lakeside)"), originals + "/Sony A7V/._Transfer 4 (Lakeside)")
+            XCTAssertEqual(moves[sony + "/._Transfer 4 (Lakeside)"]?.kind, .folderAppleDouble)
             // Unknown files inside Card Copy move along.
             XCTAssertEqual(dest(sony + "/notes.txt"), originals + "/Sony A7V/notes.txt")
             XCTAssertEqual(moves[sony + "/notes.txt"]?.catalogKnown, false)

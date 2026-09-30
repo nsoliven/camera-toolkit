@@ -29,8 +29,8 @@ import Foundation
 ///   `<event>/Originals/<Camera>/<relative path>` (same-name sidecars
 ///   follow), so presence finds the files where the app looks;
 /// - an assigned file whose relative path has a component SMB cannot store
-///   (`w: Sam`) goes to the `PortablePath` form the app computes
-///   (`with Sam`), and its assignment's relative path is rewritten to
+///   (`w: Alex`) goes to the `PortablePath` form the app computes
+///   (`with Alex`), and its assignment's relative path is rewritten to
 ///   that form in the catalog transaction (a new id; presence and Immich
 ///   rows follow, faces are keyed by path and untouched).
 extension NASLayoutMigrationPlanner {

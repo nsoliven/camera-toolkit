@@ -48,7 +48,7 @@ public struct EventStoragePlace: Hashable, Sendable {
     /// `/Volumes/<name>` when the place lives on an external or network volume.
     public var volumeRoot: URL? { VolumeInfo.volumeRoot(for: root) }
 
-    /// "Buffer (Buffer)" — the volume name the owner sees in Finder,
+    /// "Buffer Drive (Buffer)" — the volume name the owner sees in Finder,
     /// plus which role it plays for this event.
     public var displayName: String {
         let name = volumeRoot?.lastPathComponent ?? root.lastPathComponent
@@ -105,7 +105,7 @@ public struct EventReachabilityReport: Sendable, Equatable {
     /// spinner.
     public var isOffline: Bool { !anyReachable && !offlinePlaces.isEmpty }
 
-    /// "Buffer (Buffer), Photos (NAS)".
+    /// "Buffer Drive (Buffer), Photos (NAS)".
     public var offlineList: String {
         offlinePlaces.map(\.displayName).formatted(.list(type: .and))
     }

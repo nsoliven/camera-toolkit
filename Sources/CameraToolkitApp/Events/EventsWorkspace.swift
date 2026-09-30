@@ -7397,7 +7397,7 @@ final class EventsWorkspace {
     /// Approved-person names detected on the stack's files, joined through
     /// the catalog's confirmed face rows by file key (name|bytes|mtime —
     /// it survives the file moving between folders). Board search matches
-    /// these, so "Sam" keeps every burst she appears in — while an
+    /// these, so "Alex" keeps every burst they appear in — while an
     /// Inbox face never names a stack.
     func personNames(on stack: OrganizeStack) -> Set<String> {
         let names = faceNamesByFileKey()

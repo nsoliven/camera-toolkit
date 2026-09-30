@@ -3,8 +3,8 @@ import Foundation
 /// Folder and file names SMB (and exFAT) can store as themselves.
 ///
 /// A macOS path may hold characters an SMB share cannot store portably —
-/// most often `:`, which is how POSIX spells a Finder `/` ("w/ Sam" is
-/// `w: Sam` on disk). The NAS mirror path of such a file is computed
+/// most often `:`, which is how POSIX spells a Finder `/` ("w/ Alex" is
+/// `w: Alex` on disk). The NAS mirror path of such a file is computed
 /// with each unsafe component rewritten by one stable rule, so presence,
 /// Sync to NAS and the NAS layout migration all agree on where it lives:
 ///

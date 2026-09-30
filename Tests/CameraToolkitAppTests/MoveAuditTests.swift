@@ -353,31 +353,31 @@ final class MoveAuditTests: XCTestCase {
         let library = try AuditLibrary.make()
         defer { library.tearDown() }
         library.addEvent("trip", name: "Trip 2026")
-        library.addEvent("harbor", name: "Harbor", date: AuditLibrary.day, policy: nil, parent: "trip")
-        library.addEvent("island", name: "Island", date: AuditLibrary.day.addingTimeInterval(86_400), policy: nil, parent: "trip")
+        library.addEvent("beach", name: "Beach Day", date: AuditLibrary.day, policy: nil, parent: "trip")
+        library.addEvent("city", name: "City Weekend", date: AuditLibrary.day.addingTimeInterval(86_400), policy: nil, parent: "trip")
         library.addEvent("nano", name: "Nano", date: AuditLibrary.day.addingTimeInterval(2 * 86_400), policy: nil, parent: "trip")
         let stamp = AuditLibrary.day.addingTimeInterval(100)
-        let one = try library.place("harbor", name: "B0007_DSC00001.ARW", content: photo("1"), modifiedAt: stamp)
-        let two = try library.place("harbor", name: "B0007_DSC00002.ARW", content: photo("2"), modifiedAt: stamp.addingTimeInterval(1))
-        let three = try library.place("island", name: "B0007_DSC00003.ARW", content: photo("3"), modifiedAt: stamp.addingTimeInterval(2))
-        await library.open("trip", "harbor", "island", "nano")
+        let one = try library.place("beach", name: "B0007_DSC00001.ARW", content: photo("1"), modifiedAt: stamp)
+        let two = try library.place("beach", name: "B0007_DSC00002.ARW", content: photo("2"), modifiedAt: stamp.addingTimeInterval(1))
+        let three = try library.place("city", name: "B0007_DSC00003.ARW", content: photo("3"), modifiedAt: stamp.addingTimeInterval(2))
+        await library.open("trip", "beach", "city", "nano")
         // Frames of one burst number, cut into stacks by the event folder they sit in.
-        let harborBurst = try XCTUnwrap(library.stack(at: one.url.path, on: "trip"))
-        let islandFrame = try XCTUnwrap(library.stack(at: three.url.path, on: "trip"))
-        XCTAssertEqual(harborBurst.files.count + islandFrame.files.count, 3)
+        let beachBurst = try XCTUnwrap(library.stack(at: one.url.path, on: "trip"))
+        let cityFrame = try XCTUnwrap(library.stack(at: three.url.path, on: "trip"))
+        XCTAssertEqual(beachBurst.files.count + cityFrame.files.count, 3)
         let census = library.contentCensus()
 
-        library.workspace.moveStacks([harborBurst.id, islandFrame.id], fromEvent: library.id("trip"), toEvent: library.id("nano"))
+        library.workspace.moveStacks([beachBurst.id, cityFrame.id], fromEvent: library.id("trip"), toEvent: library.id("nano"))
         try await library.settle()
         XCTAssertEqual(library.assignments("nano").count, 3)
-        XCTAssertTrue(library.assignments("harbor").isEmpty)
-        XCTAssertTrue(library.assignments("island").isEmpty)
+        XCTAssertTrue(library.assignments("beach").isEmpty)
+        XCTAssertTrue(library.assignments("city").isEmpty)
         for placed in [one, two, three] {
             XCTAssertFalse(library.exists(placed.url.path))
             XCTAssertTrue(library.exists(library.folder("nano").appendingPathComponent(placed.assignment.relativePath).path))
         }
         XCTAssertEqual(library.contentCensus(), census)
-        for key in ["trip", "harbor", "island", "nano"] {
+        for key in ["trip", "beach", "city", "nano"] {
             let before = library.boardFiles(library.id(key))
             await library.workspace.refreshEvent(library.id(key))
             XCTAssertEqual(library.boardFiles(library.id(key)), before, "\(key)'s board is what a fresh read finds")
@@ -385,8 +385,8 @@ final class MoveAuditTests: XCTestCase {
         // Undo puts every frame back in its own event.
         library.workspace.undoLastMove()
         try await library.settle()
-        XCTAssertEqual(library.assignments("harbor").count, 2)
-        XCTAssertEqual(library.assignments("island").count, 1)
+        XCTAssertEqual(library.assignments("beach").count, 2)
+        XCTAssertEqual(library.assignments("city").count, 1)
         XCTAssertTrue(library.exists(three.url.path))
     }
 
@@ -396,24 +396,24 @@ final class MoveAuditTests: XCTestCase {
         let library = try AuditLibrary.make()
         defer { library.tearDown() }
         library.addEvent("trip", name: "Trip 2026")
-        library.addEvent("harbor", name: "Harbor", date: AuditLibrary.day, policy: nil, parent: "trip")
+        library.addEvent("beach", name: "Beach Day", date: AuditLibrary.day, policy: nil, parent: "trip")
         let unsorted = library.drive.appendingPathComponent("Unsorted A7V")
         try FileManager.default.createDirectory(at: unsorted, withIntermediateDirectories: true)
-        let file = try library.place("harbor", name: "DSC00001.ARW", content: photo("1"), sourceRoot: unsorted.path)
-        await library.open("trip", "harbor")
+        let file = try library.place("beach", name: "DSC00001.ARW", content: photo("1"), sourceRoot: unsorted.path)
+        await library.open("trip", "beach")
         let tile = try XCTUnwrap(library.stack(at: file.url.path, on: "trip"))
 
         library.workspace.returnToUnsorted([tile.id], eventID: library.id("trip"))
         try await library.settle()
         XCTAssertEqual(library.data(unsorted.appendingPathComponent("DSC00001.ARW")), Data(photo("1").utf8))
         XCTAssertFalse(library.exists(file.url.path))
-        XCTAssertTrue(library.assignments("harbor").isEmpty)
-        XCTAssertNil(library.stack(at: file.url.path, on: "harbor"))
+        XCTAssertTrue(library.assignments("beach").isEmpty)
+        XCTAssertNil(library.stack(at: file.url.path, on: "beach"))
 
         library.workspace.undoLastMove()
         try await library.settle()
         XCTAssertTrue(library.exists(file.url.path))
-        XCTAssertEqual(library.assignments("harbor"), [file.assignment])
+        XCTAssertEqual(library.assignments("beach"), [file.assignment])
     }
 
     // MARK: - Size
@@ -633,14 +633,14 @@ final class MoveAuditTests: XCTestCase {
         let library = try AuditLibrary.make()
         defer { library.tearDown() }
         library.addEvent("trip", name: "Trip 2026")
-        library.addEvent("harbor", name: "Harbor", date: AuditLibrary.day.addingTimeInterval(86_400), policy: nil, parent: "trip")
-        let file = try library.place("harbor", name: "DSC00001.ARW", content: photo("1"))
-        await library.open("trip", "harbor")
+        library.addEvent("beach", name: "Beach Day", date: AuditLibrary.day.addingTimeInterval(86_400), policy: nil, parent: "trip")
+        let file = try library.place("beach", name: "DSC00001.ARW", content: photo("1"))
+        await library.open("trip", "beach")
         XCTAssertNotNil(library.stack(at: file.url.path, on: "trip"))
 
-        library.workspace.renameEvent(library.id("harbor"), name: "Harbor City", date: AuditLibrary.day.addingTimeInterval(86_400), policy: nil, parentEventID: library.id("trip"))
+        library.workspace.renameEvent(library.id("beach"), name: "Beach Day Two", date: AuditLibrary.day.addingTimeInterval(86_400), policy: nil, parentEventID: library.id("trip"))
         try await library.settle()
-        let landed = library.folder("harbor").appendingPathComponent("DSC00001.ARW")
+        let landed = library.folder("beach").appendingPathComponent("DSC00001.ARW")
         XCTAssertTrue(library.exists(landed.path))
         XCTAssertNotNil(library.stack(at: landed.path, on: "trip"), "the parent's board follows the renamed folder")
         XCTAssertNil(library.stack(at: file.url.path, on: "trip"))
@@ -674,25 +674,25 @@ final class MoveAuditTests: XCTestCase {
         let library = try AuditLibrary.make()
         defer { library.tearDown() }
         library.addEvent("trip", name: "Trip 2026")
-        library.addEvent("harbor", name: "Harbor", date: AuditLibrary.day.addingTimeInterval(86_400))
-        let file = try library.place("harbor", name: "DSC00001.ARW", content: photo("1"))
-        await library.open("trip", "harbor")
+        library.addEvent("beach", name: "Beach Day", date: AuditLibrary.day.addingTimeInterval(86_400))
+        let file = try library.place("beach", name: "DSC00001.ARW", content: photo("1"))
+        await library.open("trip", "beach")
         XCTAssertNil(library.stack(at: file.url.path, on: "trip"))
 
-        library.workspace.renameEvent(library.id("harbor"), name: "Harbor", date: AuditLibrary.day.addingTimeInterval(86_400), policy: .buffer, parentEventID: library.id("trip"))
+        library.workspace.renameEvent(library.id("beach"), name: "Beach Day", date: AuditLibrary.day.addingTimeInterval(86_400), policy: .buffer, parentEventID: library.id("trip"))
         try await library.settle()
-        XCTAssertEqual(library.event("harbor").parentEventID, library.id("trip"))
-        let landed = library.folder("harbor").appendingPathComponent("DSC00001.ARW")
+        XCTAssertEqual(library.event("beach").parentEventID, library.id("trip"))
+        let landed = library.folder("beach").appendingPathComponent("DSC00001.ARW")
         XCTAssertTrue(library.exists(landed.path))
         XCTAssertFalse(library.exists(file.url.path))
         XCTAssertNotNil(library.stack(at: landed.path, on: "trip"), "the new parent's board draws it")
-        XCTAssertNotNil(library.stack(at: landed.path, on: "harbor"))
+        XCTAssertNotNil(library.stack(at: landed.path, on: "beach"))
         XCTAssertEqual(library.workspace.assignmentCount(for: library.id("trip")), 1)
 
-        library.workspace.renameEvent(library.id("harbor"), name: "Harbor", date: AuditLibrary.day.addingTimeInterval(86_400), policy: .buffer, parentEventID: nil)
+        library.workspace.renameEvent(library.id("beach"), name: "Beach Day", date: AuditLibrary.day.addingTimeInterval(86_400), policy: .buffer, parentEventID: nil)
         try await library.settle()
         XCTAssertNil(library.stack(at: landed.path, on: "trip"))
-        XCTAssertNotNil(library.stack(at: file.url.path, on: "harbor"))
+        XCTAssertNotNil(library.stack(at: file.url.path, on: "beach"))
         XCTAssertEqual(library.workspace.assignmentCount(for: library.id("trip")), 0)
     }
 
@@ -904,23 +904,23 @@ final class MoveAuditTests: XCTestCase {
         let library = try AuditLibrary.make()
         defer { library.tearDown() }
         library.addEvent("trip", name: "Trip 2026")
-        library.addEvent("harbor", name: "Harbor", date: AuditLibrary.day, policy: nil, parent: "trip")
+        library.addEvent("beach", name: "Beach Day", date: AuditLibrary.day, policy: nil, parent: "trip")
         let card = try library.place("trip", name: "CARD_1.ARW", content: photo("c"), onDrive: false)
-        await library.open("trip", "harbor")
+        await library.open("trip", "beach")
         let tile = try XCTUnwrap(library.stack(at: card.url.path, on: "trip"))
 
-        library.workspace.moveStacks([tile.id], fromEvent: library.id("trip"), toEvent: library.id("harbor"))
+        library.workspace.moveStacks([tile.id], fromEvent: library.id("trip"), toEvent: library.id("beach"))
         try await library.settle()
-        XCTAssertEqual(library.assignments("harbor").count, 1)
+        XCTAssertEqual(library.assignments("beach").count, 1)
         XCTAssertNotNil(library.stack(at: card.url.path, on: "trip"))
-        XCTAssertNotNil(library.stack(at: card.url.path, on: "harbor"))
+        XCTAssertNotNil(library.stack(at: card.url.path, on: "beach"))
         XCTAssertTrue(library.exists(card.url.path), "the card file is not touched")
 
         library.workspace.undoLastSort()
         try await library.settle()
         XCTAssertEqual(library.assignments("trip"), [card.assignment])
         XCTAssertNotNil(library.stack(at: card.url.path, on: "trip"), "the family board still draws it")
-        XCTAssertNil(library.stack(at: card.url.path, on: "harbor"))
+        XCTAssertNil(library.stack(at: card.url.path, on: "beach"))
     }
 
     /// A card's photo moves from a top-level event down into a subevent three
@@ -930,16 +930,16 @@ final class MoveAuditTests: XCTestCase {
         defer { library.tearDown() }
         library.addEvent("solo", name: "Solo Day")
         library.addEvent("trip", name: "Trip", date: AuditLibrary.day.addingTimeInterval(86_400), policy: nil, parent: "solo")
-        library.addEvent("island", name: "Island", date: AuditLibrary.day.addingTimeInterval(2 * 86_400), policy: nil, parent: "trip")
-        library.addEvent("harbor", name: "Harbor", date: AuditLibrary.day.addingTimeInterval(3 * 86_400), policy: nil, parent: "island")
+        library.addEvent("city", name: "City Weekend", date: AuditLibrary.day.addingTimeInterval(2 * 86_400), policy: nil, parent: "trip")
+        library.addEvent("beach", name: "Beach Day", date: AuditLibrary.day.addingTimeInterval(3 * 86_400), policy: nil, parent: "city")
         let one = try library.place("solo", name: "CARD_0.ARW", content: photo("c0"), onDrive: false)
         let two = try library.place("solo", name: "CARD_2.ARW", content: photo("c2"), onDrive: false)
-        await library.open("solo", "trip", "island", "harbor")
+        await library.open("solo", "trip", "city", "beach")
 
-        try click(library, [one.url.path, two.url.path], from: "solo", to: "harbor")
+        try click(library, [one.url.path, two.url.path], from: "solo", to: "beach")
         try await library.settle()
-        XCTAssertEqual(library.assignments("harbor").count, 2)
-        for key in ["solo", "trip", "island", "harbor"] {
+        XCTAssertEqual(library.assignments("beach").count, 2)
+        for key in ["solo", "trip", "city", "beach"] {
             XCTAssertNotNil(library.stack(at: one.url.path, on: key), "\(key) draws CARD_0")
             XCTAssertNotNil(library.stack(at: two.url.path, on: key), "\(key) draws CARD_2")
             let before = library.boardFiles(library.id(key))
@@ -956,21 +956,21 @@ final class MoveAuditTests: XCTestCase {
         defer { library.tearDown() }
         library.addEvent("solo", name: "Solo Day")
         library.addEvent("trip", name: "Trip", date: AuditLibrary.day.addingTimeInterval(86_400), policy: nil, parent: "solo")
-        library.addEvent("island", name: "Island", date: AuditLibrary.day.addingTimeInterval(2 * 86_400), policy: nil, parent: "trip")
-        library.addEvent("harbor", name: "Harbor", date: AuditLibrary.day.addingTimeInterval(3 * 86_400), policy: nil, parent: "trip")
+        library.addEvent("city", name: "City Weekend", date: AuditLibrary.day.addingTimeInterval(2 * 86_400), policy: nil, parent: "trip")
+        library.addEvent("beach", name: "Beach Day", date: AuditLibrary.day.addingTimeInterval(3 * 86_400), policy: nil, parent: "trip")
         let outside = try library.place("solo", name: "DSC00001.ARW", content: photo("o"))
-        let inside = try library.place("island", name: "DSC00002.ARW", content: photo("i"))
-        await library.open("solo", "trip", "island", "harbor")
+        let inside = try library.place("city", name: "DSC00002.ARW", content: photo("i"))
+        await library.open("solo", "trip", "city", "beach")
         XCTAssertNil(library.stack(at: outside.url.path, on: "trip"))
 
-        try click(library, [outside.url.path, inside.url.path], from: "solo", to: "harbor")
-        // At once, on the click: the middle board has both, island lost its own.
+        try click(library, [outside.url.path, inside.url.path], from: "solo", to: "beach")
+        // At once, on the click: the middle board has both, city lost its own.
         XCTAssertNotNil(library.stack(at: outside.url.path, on: "trip"), "the family board gains the top-level event's photo")
         XCTAssertNotNil(library.stack(at: inside.url.path, on: "trip"), "and keeps the subevent's until it lands")
-        XCTAssertNil(library.stack(at: inside.url.path, on: "island"))
+        XCTAssertNil(library.stack(at: inside.url.path, on: "city"))
         try await library.settle()
-        XCTAssertEqual(library.assignments("harbor").count, 2)
-        for key in ["solo", "trip", "island", "harbor"] {
+        XCTAssertEqual(library.assignments("beach").count, 2)
+        for key in ["solo", "trip", "city", "beach"] {
             let before = library.boardFiles(library.id(key))
             await library.workspace.refreshEvent(library.id(key))
             XCTAssertEqual(library.boardFiles(library.id(key)), before, key)

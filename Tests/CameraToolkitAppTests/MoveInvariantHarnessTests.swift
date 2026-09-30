@@ -54,7 +54,7 @@ final class MoveInvariantHarnessTests: XCTestCase {
         continueAfterFailure = false
     }
 
-    private let eventKeys = ["trip", "harbor", "island", "secret", "vault", "solo"]
+    private let eventKeys = ["trip", "beach", "city", "secret", "vault", "solo"]
     private let namePool = (1...9).map { String(format: "DSC%05d.ARW", $0) } + ["B0003_DSC00040.ARW", "B0003_DSC00041.ARW", "C0100.MP4"]
 
     // MARK: - Library
@@ -63,9 +63,9 @@ final class MoveInvariantHarnessTests: XCTestCase {
         let library = try AuditLibrary.make()
         let day = AuditLibrary.day
         library.addEvent("trip", name: "Trip 2026", date: day)
-        library.addEvent("harbor", name: "Harbor", date: day.addingTimeInterval(86_400), policy: nil, parent: "trip")
-        library.addEvent("island", name: "Sam&Alex Hangout", date: day.addingTimeInterval(3 * 86_400), policy: nil, parent: "trip")
-        library.addEvent("secret", name: "Riley's 90th Birthday", date: day.addingTimeInterval(2 * 86_400), policy: .archiveOnly, parent: "trip")
+        library.addEvent("beach", name: "Beach Day", date: day.addingTimeInterval(86_400), policy: nil, parent: "trip")
+        library.addEvent("city", name: "Alex&Sam Private Hangout", date: day.addingTimeInterval(3 * 86_400), policy: nil, parent: "trip")
+        library.addEvent("secret", name: "Jordan's 90th Birthday", date: day.addingTimeInterval(2 * 86_400), policy: .archiveOnly, parent: "trip")
         library.addEvent("vault", name: "Private Trip", date: day.addingTimeInterval(10 * 86_400), policy: .archiveOnly)
         library.addEvent("solo", name: "Solo Day", date: day.addingTimeInterval(20 * 86_400))
         let unsorted = library.drive.appendingPathComponent("Unsorted A7V")
@@ -333,7 +333,7 @@ final class MoveInvariantHarnessTests: XCTestCase {
         func context(_ step: Int) -> String { "seed \(seed) step \(step): " + (log.last ?? "start") }
         func exactnessHolds() -> Bool { !exactnessLost && laggingIDs.isEmpty && unplugged == nil }
 
-        for key in ["trip", "harbor"] {
+        for key in ["trip", "beach"] {
             await library.open(key)
             opened.insert(key)
         }

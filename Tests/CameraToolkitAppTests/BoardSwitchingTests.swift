@@ -58,63 +58,63 @@ final class BoardSwitchingTests: XCTestCase {
     func testEachBoardKeepsItsOwnExpandedBurstsCollapsedGroupsAndFilters() async throws {
         try await eachLibrary(.small) { library, mode in
         let workspace = library.workspace
-        await open(library, library.islandID, library.harborID)
+        await open(library, library.cityID, library.beachID)
 
-        workspace.selection = .event(library.islandID)
-        let island = try XCTUnwrap(workspace.eventStacks[library.islandID])
-        let burst = try XCTUnwrap(island.first { $0.isBurst })
+        workspace.selection = .event(library.cityID)
+        let city = try XCTUnwrap(workspace.eventStacks[library.cityID])
+        let burst = try XCTUnwrap(city.first { $0.isBurst })
         workspace.setExpanded(burst.id, expanded: true)
         workspace.setGroupCollapsed("2026-03-01", collapsed: true)
         workspace.search.text = "DSC"
-        workspace.search.excludedEventIDs = [library.harborID]
-        let islandSearch = workspace.search
+        workspace.search.excludedEventIDs = [library.beachID]
+        let citySearch = workspace.search
 
-        workspace.selection = .event(library.harborID)
+        workspace.selection = .event(library.beachID)
         XCTAssertTrue(workspace.expandedStackIDs.isEmpty, "the other board starts with nothing expanded")
         XCTAssertTrue(workspace.collapsedGroupIDs.isEmpty)
         XCTAssertTrue(workspace.search.isUntouched, "the other board starts with no filters")
         workspace.search.text = "B00"
-        let harborSearch = workspace.search
+        let beachSearch = workspace.search
 
-        workspace.selection = .event(library.islandID)
+        workspace.selection = .event(library.cityID)
         XCTAssertEqual(workspace.expandedStackIDs, [burst.id])
         XCTAssertEqual(workspace.collapsedGroupIDs, ["2026-03-01"])
-        XCTAssertEqual(workspace.search, islandSearch)
+        XCTAssertEqual(workspace.search, citySearch)
 
-        workspace.selection = .event(library.harborID)
-        XCTAssertEqual(workspace.search, harborSearch)
+        workspace.selection = .event(library.beachID)
+        XCTAssertEqual(workspace.search, beachSearch)
         XCTAssertTrue(workspace.expandedStackIDs.isEmpty)
         // Through the welcome screen and back.
         workspace.selection = nil
-        workspace.selection = .event(library.islandID)
+        workspace.selection = .event(library.cityID)
         XCTAssertEqual(workspace.expandedStackIDs, [burst.id])
-        XCTAssertEqual(workspace.search, islandSearch)
+        XCTAssertEqual(workspace.search, citySearch)
         }
     }
 
     func testScrollPositionsAreRememberedPerBoard() async throws {
         try await eachLibrary(.small) { library, mode in
         let workspace = library.workspace
-        workspace.noteScrollOffset(1_234, board: .event(library.islandID))
-        workspace.noteScrollOffset(56, board: .event(library.harborID))
-        workspace.selection = .event(library.islandID)
-        workspace.selection = .event(library.harborID)
-        XCTAssertEqual(workspace.savedScrollOffset(for: .event(library.islandID)), 1_234)
-        XCTAssertEqual(workspace.savedScrollOffset(for: .event(library.harborID)), 56)
+        workspace.noteScrollOffset(1_234, board: .event(library.cityID))
+        workspace.noteScrollOffset(56, board: .event(library.beachID))
+        workspace.selection = .event(library.cityID)
+        workspace.selection = .event(library.beachID)
+        XCTAssertEqual(workspace.savedScrollOffset(for: .event(library.cityID)), 1_234)
+        XCTAssertEqual(workspace.savedScrollOffset(for: .event(library.beachID)), 56)
         XCTAssertEqual(workspace.savedScrollOffset(for: .event(library.roadID)), 0)
         }
     }
 
     /// The real window: scroll a long board, go to another and come back.
     func testTheWindowRestoresTheScrollPositionOfTheBoardYouLeft() async throws {
-        try await eachLibrary(MoveLibrary.Shape(parentOwn: 0, harbor: 60, island: 2_400, road: 0, elsewhere: 0, catalogBacked: false)) { library, mode in
+        try await eachLibrary(MoveLibrary.Shape(parentOwn: 0, beach: 60, city: 2_400, road: 0, elsewhere: 0, catalogBacked: false)) { library, mode in
         let workspace = library.workspace
-        await open(library, library.islandID, library.harborID)
+        await open(library, library.cityID, library.beachID)
         let window = SnapshotWindows.main(model: library.model, workspace: workspace)
         defer { window.orderOut(nil); window.close() }
         window.setContentSize(NSSize(width: 1320, height: 840))
 
-        workspace.selection = .event(library.islandID)
+        workspace.selection = .event(library.cityID)
         await pump(0.6, window)
         let scroll = try XCTUnwrap(boardScrollView(in: window))
         let origin = scroll.contentView.bounds.origin.y
@@ -123,11 +123,11 @@ final class BoardSwitchingTests: XCTestCase {
         await pump(0.4, window)
         let scrolledTo = scroll.contentView.bounds.origin.y
         XCTAssertGreaterThan(scrolledTo, origin + 1_000, "the board did not scroll in the harness")
-        XCTAssertGreaterThan(workspace.savedScrollOffset(for: .event(library.islandID)), 1_000)
+        XCTAssertGreaterThan(workspace.savedScrollOffset(for: .event(library.cityID)), 1_000)
 
-        workspace.selection = .event(library.harborID)
+        workspace.selection = .event(library.beachID)
         await pump(0.6, window)
-        workspace.selection = .event(library.islandID)
+        workspace.selection = .event(library.cityID)
         await pump(0.8, window)
         let back = try XCTUnwrap(boardScrollView(in: window))
         XCTAssertEqual(back.contentView.bounds.origin.y, scrolledTo, accuracy: 60, "the board came back at another place")
@@ -137,16 +137,16 @@ final class BoardSwitchingTests: XCTestCase {
     // MARK: - Loaded boards switch without a wait
 
     func testSelectingALoadedBoardShowsItsGridInTheSameFrame() async throws {
-        try await eachLibrary(MoveLibrary.Shape(parentOwn: 0, harbor: 200, island: 600, road: 0, elsewhere: 0, catalogBacked: false)) { library, mode in
+        try await eachLibrary(MoveLibrary.Shape(parentOwn: 0, beach: 200, city: 600, road: 0, elsewhere: 0, catalogBacked: false)) { library, mode in
         let workspace = library.workspace
-        await open(library, library.islandID, library.harborID)
+        await open(library, library.cityID, library.beachID)
         let window = SnapshotWindows.main(model: library.model, workspace: workspace)
         defer { window.orderOut(nil); window.close() }
         window.setContentSize(NSSize(width: 1320, height: 840))
-        workspace.selection = .event(library.islandID)
+        workspace.selection = .event(library.cityID)
         await pump(0.6, window)
 
-        for id in [library.harborID, library.islandID, library.harborID] {
+        for id in [library.beachID, library.cityID, library.beachID] {
             workspace.selection = .event(id)
             // No run-loop turn between the click and the first layout.
             window.contentView?.layoutSubtreeIfNeeded()
@@ -166,7 +166,7 @@ final class BoardSwitchingTests: XCTestCase {
         let workspace = library.workspace
         let sweeps = SweepCounter()
         workspace.presenceProbe = sweeps.probe
-        await open(library, library.islandID, library.harborID)
+        await open(library, library.cityID, library.beachID)
         let window = SnapshotWindows.main(model: library.model, workspace: workspace)
         defer { window.orderOut(nil); window.close() }
         // Opening the window re-checks connectivity, which (rightly) has each
@@ -175,24 +175,24 @@ final class BoardSwitchingTests: XCTestCase {
         // board opened in that moment is verified against the old revision:
         // open each twice, the second time against the settled one.)
         for _ in 0..<2 {
-            for id in [library.islandID, library.harborID] {
+            for id in [library.cityID, library.beachID] {
                 workspace.selection = .event(id)
                 await pump(0.7, window)
             }
         }
-        for id in [library.islandID, library.harborID] {
+        for id in [library.cityID, library.beachID] {
             try await waitUntil { workspace.isBoardFresh(id) }
         }
         let statsAfterLoad = sweeps.count
-        let island = workspace.eventStacks[library.islandID]
+        let city = workspace.eventStacks[library.cityID]
         for _ in 0..<3 {
-            workspace.selection = .event(library.islandID)
+            workspace.selection = .event(library.cityID)
             await pump(0.3, window)
-            workspace.selection = .event(library.harborID)
+            workspace.selection = .event(library.beachID)
             await pump(0.3, window)
         }
         XCTAssertEqual(sweeps.count, statsAfterLoad, "selecting a loaded board swept it again")
-        XCTAssertEqual(workspace.eventStacks[library.islandID], island)
+        XCTAssertEqual(workspace.eventStacks[library.cityID], city)
         }
     }
 
@@ -200,7 +200,7 @@ final class BoardSwitchingTests: XCTestCase {
     /// board that is already loaded — a small one and a family of ~15k files.
     func testSwitchStallsStayInsideTheFrameBudget() async throws {
         try await eachLibrary(
-            MoveLibrary.Shape(parentOwn: 9_000, harbor: 3_000, island: 3_000, road: 160, elsewhere: 300, catalogBacked: false),
+            MoveLibrary.Shape(parentOwn: 9_000, beach: 3_000, city: 3_000, road: 160, elsewhere: 300, catalogBacked: false),
             populateNAS: false
         ) { library, mode in
         let workspace = library.workspace
@@ -246,14 +246,14 @@ final class BoardSwitchingTests: XCTestCase {
     /// screen or a spinner.
     func testNothingMountedNeverShowsABlockingScreenWhileSwitching() async throws {
         try await eachLibrary(
-            MoveLibrary.Shape(parentOwn: 0, harbor: 200, island: 400, road: 30, elsewhere: 0, catalogBacked: false),
+            MoveLibrary.Shape(parentOwn: 0, beach: 200, city: 400, road: 30, elsewhere: 0, catalogBacked: false),
             modes: [.nothingMounted]
         ) { library, mode in
         let workspace = library.workspace
         let window = SnapshotWindows.main(model: library.model, workspace: workspace)
         defer { window.orderOut(nil); window.close() }
         window.setContentSize(NSSize(width: 1320, height: 840))
-        for id in [library.islandID, library.harborID, library.roadID, library.parentID, library.islandID] {
+        for id in [library.cityID, library.beachID, library.roadID, library.parentID, library.cityID] {
             workspace.selection = .event(id)
             // The first frames of a board that has never been opened.
             for _ in 0..<40 {
@@ -274,8 +274,8 @@ final class BoardSwitchingTests: XCTestCase {
     func testClickingThroughBoardsFastNeverCrossesSelectionsOrMixesTiles() async throws {
         try await eachLibrary(.small) { library, mode in
         let workspace = library.workspace
-        let ids = [library.parentID, library.harborID, library.islandID, library.roadID, library.elsewhereID]
-        await open(library, library.harborID, library.islandID, library.roadID, library.elsewhereID)
+        let ids = [library.parentID, library.beachID, library.cityID, library.roadID, library.elsewhereID]
+        await open(library, library.beachID, library.cityID, library.roadID, library.elsewhereID)
         var chosen: [UUID: Set<String>] = [:]
         for (index, id) in ids.dropFirst().enumerated() {
             workspace.selection = .event(id)
@@ -315,7 +315,7 @@ final class BoardSwitchingTests: XCTestCase {
 
     func testABoardLeftWhileItIsStillLoadingStopsLoading() async throws {
         try await eachLibrary(
-            MoveLibrary.Shape(parentOwn: 0, harbor: 800, island: 800, road: 0, elsewhere: 0, catalogBacked: false),
+            MoveLibrary.Shape(parentOwn: 0, beach: 800, city: 800, road: 0, elsewhere: 0, catalogBacked: false),
             populateNAS: false
         ) { library, mode in
         let workspace = library.workspace
@@ -326,56 +326,56 @@ final class BoardSwitchingTests: XCTestCase {
         let gate = DispatchSemaphore(value: 0)
         defer { for _ in 0..<8 { gate.signal() } }
         let firstScreen = Set(library.model.configuration.photoEventAssignments
-            .filter { $0.eventID == library.islandID }
+            .filter { $0.eventID == library.cityID }
             .sorted { ($0.modifiedAt, $0.relativePath) < ($1.modifiedAt, $1.relativePath) }
             .prefix(EventsWorkspace.firstScreenFileLimit)
             .map(\.relativePath))
         let locations = workspace.locations
-        let island = try XCTUnwrap(workspace.event(library.islandID))
-        let layout = locations.layout(for: island, deviceID: "sony-a7v")
+        let city = try XCTUnwrap(workspace.event(library.cityID))
+        let layout = locations.layout(for: city, deviceID: "sony-a7v")
         let released = ThreadRecorder()
         let bufferPlugged = mode == .bufferPlugged
         workspace.eventPathResolver = { assignment in
             if !firstScreen.contains(assignment.relativePath), released.total == 0 {
                 _ = gate.wait(timeout: .now() + 20)
             }
-            if bufferPlugged { return locations.impliedDrivePath(for: assignment, event: island, policy: .buffer) }
+            if bufferPlugged { return locations.impliedDrivePath(for: assignment, event: city, policy: .buffer) }
             return (try? layout.mirrorRelativePath(for: assignment.relativePath)).map { locations.nasRoot.appendingPathComponent($0).path }
         }
-        workspace.selection = .event(library.islandID)
-        let refresh = Task { await workspace.refreshEvent(library.islandID) }
-        try await waitUntil { workspace.eventStacks[library.islandID]?.isEmpty == false }
-        XCTAssertNotNil(workspace.eventBuildRemainders[library.islandID], "only the first screen is up")
-        let firstCount = try XCTUnwrap(workspace.eventStacks[library.islandID]).count
+        workspace.selection = .event(library.cityID)
+        let refresh = Task { await workspace.refreshEvent(library.cityID) }
+        try await waitUntil { workspace.eventStacks[library.cityID]?.isEmpty == false }
+        XCTAssertNotNil(workspace.eventBuildRemainders[library.cityID], "only the first screen is up")
+        let firstCount = try XCTUnwrap(workspace.eventStacks[library.cityID]).count
 
         // Click another board while this one is still finding its files.
-        workspace.selection = .event(library.harborID)
-        XCTAssertFalse(workspace.eventsLoading.contains(library.islandID), "the superseded load is still marked loading")
+        workspace.selection = .event(library.beachID)
+        XCTAssertFalse(workspace.eventsLoading.contains(library.cityID), "the superseded load is still marked loading")
         // The held resolve is released; the cancelled build must not publish.
         released.note()
         for _ in 0..<8 { gate.signal() }
         await refresh.value
         try await Task.sleep(for: .milliseconds(400))
-        XCTAssertEqual(workspace.eventStacks[library.islandID]?.count, firstCount, "the superseded load kept building")
-        XCTAssertNotNil(workspace.eventBuildRemainders[library.islandID])
+        XCTAssertEqual(workspace.eventStacks[library.cityID]?.count, firstCount, "the superseded load kept building")
+        XCTAssertNotNil(workspace.eventBuildRemainders[library.cityID])
 
         // Coming back starts it over and finishes.
-        workspace.selection = .event(library.islandID)
-        await workspace.refreshEventIfStale(library.islandID)
-        XCTAssertEqual(workspace.eventStacks[library.islandID]?.flatMap(\.files).count, 800)
-        XCTAssertNil(workspace.eventBuildRemainders[library.islandID])
+        workspace.selection = .event(library.cityID)
+        await workspace.refreshEventIfStale(library.cityID)
+        XCTAssertEqual(workspace.eventStacks[library.cityID]?.flatMap(\.files).count, 800)
+        XCTAssertNil(workspace.eventBuildRemainders[library.cityID])
         }
     }
 
     func testALoadedBoardIsNotCancelledWhenYouLeaveIt() async throws {
         try await eachLibrary(.small) { library, mode in
         let workspace = library.workspace
-        workspace.selection = .event(library.islandID)
-        await workspace.refreshEvent(library.islandID)
-        let stacks = workspace.eventStacks[library.islandID]
-        workspace.selection = .event(library.harborID)
-        XCTAssertEqual(workspace.eventStacks[library.islandID], stacks)
-        XCTAssertTrue(workspace.isBoardFresh(library.islandID))
+        workspace.selection = .event(library.cityID)
+        await workspace.refreshEvent(library.cityID)
+        let stacks = workspace.eventStacks[library.cityID]
+        workspace.selection = .event(library.beachID)
+        XCTAssertEqual(workspace.eventStacks[library.cityID], stacks)
+        XCTAssertTrue(workspace.isBoardFresh(library.cityID))
         }
     }
 }

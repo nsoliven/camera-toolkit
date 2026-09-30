@@ -46,28 +46,28 @@ final class EventMoveLatencyTests: XCTestCase {
         // Every NAS stat would cost an SMB round trip; none may happen.
         let probe = MovePresenceProbe(nasRoot: workspace.locations.nasRoot.path)
         workspace.presenceProbe = probe.probe
-        await open(library, library.parentID, library.islandID, library.harborID)
+        await open(library, library.parentID, library.cityID, library.beachID)
         probe.nasDelayMicroseconds = 2_000
 
-        let selection = library.bursts(in: library.islandID, count: 15)
+        let selection = library.bursts(in: library.cityID, count: 15)
         XCTAssertEqual(selection.count, 15)
         let files = selection.flatMap(\.files)
         let parentBefore = try XCTUnwrap(workspace.eventStacks[library.parentID]).count
-        let islandBefore = try XCTUnwrap(workspace.eventStacks[library.islandID]).count
-        let harborBefore = try XCTUnwrap(workspace.eventStacks[library.harborID]).count
+        let cityBefore = try XCTUnwrap(workspace.eventStacks[library.cityID]).count
+        let beachBefore = try XCTUnwrap(workspace.eventStacks[library.beachID]).count
         let nasStatsBefore = probe.nasStats
 
         let monitor = MainStallMonitor()
         monitor.start()
         try await Task.sleep(for: .milliseconds(50))
         let clicked = ContinuousClock.now
-        workspace.moveStacks(Set(selection.map(\.id)), fromEvent: library.islandID, toEvent: library.harborID)
+        workspace.moveStacks(Set(selection.map(\.id)), fromEvent: library.cityID, toEvent: library.beachID)
         let click = seconds(since: clicked)
 
         // The click's own answer: tiles already on their new board.
         XCTAssertTrue(model.isBusy)
-        XCTAssertEqual(workspace.eventStacks[library.islandID]?.count, islandBefore - 15)
-        XCTAssertEqual(workspace.eventStacks[library.harborID]?.count, harborBefore + 15)
+        XCTAssertEqual(workspace.eventStacks[library.cityID]?.count, cityBefore - 15)
+        XCTAssertEqual(workspace.eventStacks[library.beachID]?.count, beachBefore + 15)
         XCTAssertEqual(workspace.eventStacks[library.parentID]?.count, parentBefore, "the parent's board holds both subevents")
 
         try await waitUntil { !model.isBusy && workspace.latestMoveJournalTitle != nil }
@@ -82,24 +82,24 @@ final class EventMoveLatencyTests: XCTestCase {
         XCTAssertEqual(probe.nasStats, nasStatsBefore, "a Buffer rename must not stat a single NAS file")
 
         // The result is right on disk, in the catalog, and on the boards.
-        let harborAssignments = assignments(library, in: library.harborID)
-        XCTAssertEqual(harborAssignments.count, library.shape.harbor + files.count)
-        XCTAssertEqual(assignments(library, in: library.islandID).count, library.shape.island - files.count)
+        let beachAssignments = assignments(library, in: library.beachID)
+        XCTAssertEqual(beachAssignments.count, library.shape.beach + files.count)
+        XCTAssertEqual(assignments(library, in: library.cityID).count, library.shape.city - files.count)
         XCTAssertEqual(model.configuration.photoEventAssignments.count, library.shape.total)
-        XCTAssertEqual(workspace.eventStacks[library.islandID]?.count, islandBefore - 15)
-        XCTAssertEqual(workspace.eventStacks[library.harborID]?.count, harborBefore + 15)
+        XCTAssertEqual(workspace.eventStacks[library.cityID]?.count, cityBefore - 15)
+        XCTAssertEqual(workspace.eventStacks[library.beachID]?.count, beachBefore + 15)
         XCTAssertEqual(workspace.eventStacks[library.parentID]?.count, parentBefore)
         XCTAssertEqual(workspace.assignmentCount(for: library.parentID), library.shape.family)
-        XCTAssertEqual(workspace.assignmentCount(for: library.harborID), library.shape.harbor + files.count)
-        let harbor = try XCTUnwrap(workspace.event(library.harborID))
-        let harborFolder = workspace.locations.originalsRoot(for: harbor, deviceID: "sony-a7v", policy: .buffer)
+        XCTAssertEqual(workspace.assignmentCount(for: library.beachID), library.shape.beach + files.count)
+        let beach = try XCTUnwrap(workspace.event(library.beachID))
+        let beachFolder = workspace.locations.originalsRoot(for: beach, deviceID: "sony-a7v", policy: .buffer)
         for file in files {
             XCTAssertFalse(exists(file.path), "\(file.name) left its old folder")
-            XCTAssertTrue(exists(harborFolder.appendingPathComponent(file.name).path), "\(file.name) is in Harbor's folder")
+            XCTAssertTrue(exists(beachFolder.appendingPathComponent(file.name).path), "\(file.name) is in Beach Day's folder")
         }
         // The tiles on every board now read the files where they are.
-        for stack in try XCTUnwrap(workspace.eventStacks[library.harborID]) where selection.contains(where: { $0.id == stack.id }) {
-            XCTAssertTrue(stack.files.allSatisfy { exists($0.path) && $0.path.hasPrefix(harborFolder.path) })
+        for stack in try XCTUnwrap(workspace.eventStacks[library.beachID]) where selection.contains(where: { $0.id == stack.id }) {
+            XCTAssertTrue(stack.files.allSatisfy { exists($0.path) && $0.path.hasPrefix(beachFolder.path) })
         }
     }
 
@@ -110,35 +110,35 @@ final class EventMoveLatencyTests: XCTestCase {
         defer { library.tearDown() }
         let workspace = library.workspace
         let model = library.model
-        await open(library, library.parentID, library.islandID, library.harborID)
-        let selection = library.bursts(in: library.islandID, count: 3)
+        await open(library, library.parentID, library.cityID, library.beachID)
+        let selection = library.bursts(in: library.cityID, count: 3)
         let fileCount = selection.flatMap(\.files).count
-        let islandCount = workspace.assignmentCount(for: library.islandID)
-        let harborCount = workspace.assignmentCount(for: library.harborID)
-        let islandStacks = try XCTUnwrap(workspace.eventStacks[library.islandID]).count
-        let harborStacks = try XCTUnwrap(workspace.eventStacks[library.harborID]).count
+        let cityCount = workspace.assignmentCount(for: library.cityID)
+        let beachCount = workspace.assignmentCount(for: library.beachID)
+        let cityStacks = try XCTUnwrap(workspace.eventStacks[library.cityID]).count
+        let beachStacks = try XCTUnwrap(workspace.eventStacks[library.beachID]).count
 
-        workspace.moveStacks(Set(selection.map(\.id)), fromEvent: library.islandID, toEvent: library.harborID)
+        workspace.moveStacks(Set(selection.map(\.id)), fromEvent: library.cityID, toEvent: library.beachID)
 
-        XCTAssertEqual(workspace.eventStacks[library.islandID]?.count, islandStacks - 3)
-        XCTAssertEqual(workspace.eventStacks[library.harborID]?.count, harborStacks + 3)
-        XCTAssertEqual(workspace.assignmentCount(for: library.islandID), islandCount - fileCount)
-        XCTAssertEqual(workspace.assignmentCount(for: library.harborID), harborCount + fileCount)
+        XCTAssertEqual(workspace.eventStacks[library.cityID]?.count, cityStacks - 3)
+        XCTAssertEqual(workspace.eventStacks[library.beachID]?.count, beachStacks + 3)
+        XCTAssertEqual(workspace.assignmentCount(for: library.cityID), cityCount - fileCount)
+        XCTAssertEqual(workspace.assignmentCount(for: library.beachID), beachCount + fileCount)
         // The catalog is untouched until the rename lands — a crash now
         // must not leave an assignment pointing at a folder the file is not in.
-        XCTAssertEqual(assignments(library, in: library.islandID).count, library.shape.island)
+        XCTAssertEqual(assignments(library, in: library.cityID).count, library.shape.city)
         XCTAssertTrue(selection.flatMap(\.files).allSatisfy { exists($0.path) })
         // The color dot on the parent's board already names the new home.
         let onParent = try XCTUnwrap(workspace.eventStacks[library.parentID]?.first { $0.id == selection[0].id })
-        XCTAssertEqual(workspace.assignedEvent(for: onParent).event?.id, library.harborID)
+        XCTAssertEqual(workspace.assignedEvent(for: onParent).event?.id, library.beachID)
         XCTAssertTrue(model.statusMessage.hasPrefix("Moving"), model.statusMessage)
 
         try await waitUntil { !model.isBusy && workspace.latestMoveJournalTitle != nil }
-        XCTAssertEqual(assignments(library, in: library.islandID).count, library.shape.island - fileCount)
-        XCTAssertEqual(assignments(library, in: library.harborID).count, library.shape.harbor + fileCount)
-        XCTAssertEqual(workspace.assignmentCount(for: library.islandID), islandCount - fileCount)
-        XCTAssertEqual(workspace.assignmentCount(for: library.harborID), harborCount + fileCount)
-        XCTAssertEqual(workspace.assignedEvent(for: try XCTUnwrap(workspace.eventStacks[library.parentID]?.first { $0.id == selection[0].id })).event?.id, library.harborID)
+        XCTAssertEqual(assignments(library, in: library.cityID).count, library.shape.city - fileCount)
+        XCTAssertEqual(assignments(library, in: library.beachID).count, library.shape.beach + fileCount)
+        XCTAssertEqual(workspace.assignmentCount(for: library.cityID), cityCount - fileCount)
+        XCTAssertEqual(workspace.assignmentCount(for: library.beachID), beachCount + fileCount)
+        XCTAssertEqual(workspace.assignedEvent(for: try XCTUnwrap(workspace.eventStacks[library.parentID]?.first { $0.id == selection[0].id })).event?.id, library.beachID)
         XCTAssertEqual(model.statusMessage.hasPrefix("Moved"), true, model.statusMessage)
     }
 
@@ -147,33 +147,33 @@ final class EventMoveLatencyTests: XCTestCase {
         defer { library.tearDown() }
         let workspace = library.workspace
         let model = library.model
-        await open(library, library.parentID, library.islandID, library.harborID)
+        await open(library, library.parentID, library.cityID, library.beachID)
         // The journal is written before any rename; a file where its folder
         // should be makes the whole job fail before a file is touched.
         let support = workspace.journalFolder.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
         try Data("not a folder".utf8).write(to: workspace.journalFolder)
 
-        let selection = library.bursts(in: library.islandID, count: 2)
+        let selection = library.bursts(in: library.cityID, count: 2)
         let fileCount = selection.flatMap(\.files).count
-        let islandCount = workspace.assignmentCount(for: library.islandID)
-        let islandStacks = try XCTUnwrap(workspace.eventStacks[library.islandID]).map(\.id)
-        let harborStacks = try XCTUnwrap(workspace.eventStacks[library.harborID]).map(\.id)
+        let cityCount = workspace.assignmentCount(for: library.cityID)
+        let cityStacks = try XCTUnwrap(workspace.eventStacks[library.cityID]).map(\.id)
+        let beachStacks = try XCTUnwrap(workspace.eventStacks[library.beachID]).map(\.id)
         let parentBefore = try XCTUnwrap(workspace.eventStacks[library.parentID]).count
 
-        workspace.moveStacks(Set(selection.map(\.id)), fromEvent: library.islandID, toEvent: library.harborID)
-        XCTAssertEqual(workspace.eventStacks[library.islandID]?.count, islandStacks.count - 2, "optimistic first")
+        workspace.moveStacks(Set(selection.map(\.id)), fromEvent: library.cityID, toEvent: library.beachID)
+        XCTAssertEqual(workspace.eventStacks[library.cityID]?.count, cityStacks.count - 2, "optimistic first")
 
         try await waitUntil { !model.isBusy && model.statusMessage.contains("did not happen") }
-        XCTAssertTrue(model.statusMessage.contains("went back to Trip 2026 / Island"), model.statusMessage)
+        XCTAssertTrue(model.statusMessage.contains("went back to Trip 2026 / City Weekend"), model.statusMessage)
         XCTAssertTrue(model.statusMessage.contains("The catalog was not changed"), model.statusMessage)
         // Back on the source board, gone from the target, counts restored.
-        XCTAssertEqual(Set(try XCTUnwrap(workspace.eventStacks[library.islandID]).map(\.id)), Set(islandStacks))
-        XCTAssertEqual(Set(try XCTUnwrap(workspace.eventStacks[library.harborID]).map(\.id)), Set(harborStacks))
+        XCTAssertEqual(Set(try XCTUnwrap(workspace.eventStacks[library.cityID]).map(\.id)), Set(cityStacks))
+        XCTAssertEqual(Set(try XCTUnwrap(workspace.eventStacks[library.beachID]).map(\.id)), Set(beachStacks))
         XCTAssertEqual(workspace.eventStacks[library.parentID]?.count, parentBefore)
-        XCTAssertEqual(workspace.assignmentCount(for: library.islandID), islandCount)
-        XCTAssertEqual(assignments(library, in: library.islandID).count, library.shape.island)
-        XCTAssertEqual(workspace.assignedEvent(for: try XCTUnwrap(workspace.eventStacks[library.parentID]?.first { $0.id == selection[0].id })).event?.id, library.islandID)
+        XCTAssertEqual(workspace.assignmentCount(for: library.cityID), cityCount)
+        XCTAssertEqual(assignments(library, in: library.cityID).count, library.shape.city)
+        XCTAssertEqual(workspace.assignedEvent(for: try XCTUnwrap(workspace.eventStacks[library.parentID]?.first { $0.id == selection[0].id })).event?.id, library.cityID)
         XCTAssertTrue(selection.flatMap(\.files).allSatisfy { exists($0.path) })
         XCTAssertEqual(fileCount, selection.flatMap(\.files).count)
         XCTAssertNil(workspace.latestMoveJournalTitle)
@@ -186,7 +186,7 @@ final class EventMoveLatencyTests: XCTestCase {
         defer { library.tearDown() }
         let workspace = library.workspace
         let model = library.model
-        await open(library, library.parentID, library.islandID, library.harborID)
+        await open(library, library.parentID, library.cityID, library.beachID)
         let gate = DispatchSemaphore(value: 0)
         model.runBackgroundJob(
             action: .verifyManifest,
@@ -201,24 +201,24 @@ final class EventMoveLatencyTests: XCTestCase {
         )
         XCTAssertTrue(model.isBusy)
 
-        let selection = library.bursts(in: library.islandID, count: 2)
+        let selection = library.bursts(in: library.cityID, count: 2)
         let ids = Set(selection.map(\.id))
-        let islandStacks = try XCTUnwrap(workspace.eventStacks[library.islandID]).count
-        workspace.moveStacks(ids, fromEvent: library.islandID, toEvent: library.harborID)
+        let cityStacks = try XCTUnwrap(workspace.eventStacks[library.cityID]).count
+        workspace.moveStacks(ids, fromEvent: library.cityID, toEvent: library.beachID)
 
         // Said right away: what it waits behind — and the tiles are already there.
         XCTAssertTrue(model.statusMessage.contains("queued behind “Verifying the manifest”"), model.statusMessage)
-        XCTAssertEqual(workspace.eventStacks[library.islandID]?.count, islandStacks - 2)
+        XCTAssertEqual(workspace.eventStacks[library.cityID]?.count, cityStacks - 2)
         XCTAssertTrue(selection.flatMap(\.files).allSatisfy { exists($0.path) }, "nothing is renamed while the other job holds the gate")
-        XCTAssertEqual(assignments(library, in: library.islandID).count, library.shape.island)
+        XCTAssertEqual(assignments(library, in: library.cityID).count, library.shape.city)
         // The same tiles, still on the parent's board, cannot be moved twice.
         workspace.moveStacks(ids, fromEvent: library.parentID, toEvent: library.roadID)
         XCTAssertTrue(model.statusMessage.contains("already moving"), model.statusMessage)
 
         gate.signal()
-        try await waitUntil { !model.isBusy && workspace.latestMoveJournalTitle == "Move to Trip 2026 / Harbor" }
+        try await waitUntil { !model.isBusy && workspace.latestMoveJournalTitle == "Move to Trip 2026 / Beach Day" }
         XCTAssertFalse(selection.flatMap(\.files).contains { exists($0.path) })
-        XCTAssertEqual(assignments(library, in: library.harborID).count, library.shape.harbor + selection.flatMap(\.files).count)
+        XCTAssertEqual(assignments(library, in: library.beachID).count, library.shape.beach + selection.flatMap(\.files).count)
         XCTAssertTrue(model.statusMessage.hasPrefix("Moved"), model.statusMessage)
     }
 
@@ -231,39 +231,39 @@ final class EventMoveLatencyTests: XCTestCase {
         let model = library.model
         let probe = MovePresenceProbe(nasRoot: workspace.locations.nasRoot.path, nasDelayMicroseconds: 1_000)
         workspace.presenceProbe = probe.probe
-        await open(library, library.parentID, library.islandID, library.harborID, library.roadID)
+        await open(library, library.parentID, library.cityID, library.beachID, library.roadID)
         XCTAssertGreaterThan(probe.nasStats, 0, "opening a board sweeps the NAS place")
         let statsAfterOpening = probe.total
 
-        let selection = library.bursts(in: library.islandID, count: 3)
+        let selection = library.bursts(in: library.cityID, count: 3)
         let moved = selection.flatMap(\.files).count
         let before = (
-            island: try XCTUnwrap(workspace.presence[library.islandID]).total,
-            harbor: try XCTUnwrap(workspace.presence[library.harborID]).total,
+            city: try XCTUnwrap(workspace.presence[library.cityID]).total,
+            beach: try XCTUnwrap(workspace.presence[library.beachID]).total,
             parent: try XCTUnwrap(workspace.presence[library.parentID]).total,
             road: try XCTUnwrap(workspace.presence[library.roadID]).total
         )
-        workspace.moveStacks(Set(selection.map(\.id)), fromEvent: library.islandID, toEvent: library.harborID)
+        workspace.moveStacks(Set(selection.map(\.id)), fromEvent: library.cityID, toEvent: library.beachID)
         try await waitUntil { !model.isBusy && workspace.latestMoveJournalTitle != nil }
         try await Task.sleep(for: .milliseconds(200))
 
         XCTAssertEqual(probe.total, statsAfterOpening, "no file of any place was stat'ed after the rename")
-        XCTAssertEqual(workspace.presence[library.islandID]?.total, before.island - moved)
-        XCTAssertEqual(workspace.presence[library.harborID]?.total, before.harbor + moved)
+        XCTAssertEqual(workspace.presence[library.cityID]?.total, before.city - moved)
+        XCTAssertEqual(workspace.presence[library.beachID]?.total, before.beach + moved)
         XCTAssertEqual(workspace.presence[library.parentID]?.total, before.parent)
         XCTAssertEqual(workspace.presence[library.roadID]?.total, before.road)
-        let harborSummary = try XCTUnwrap(workspace.presence[library.harborID])
-        let movedAssets = harborSummary.assets.filter { asset in selection.flatMap(\.files).contains { $0.name == (asset.assignment.relativePath as NSString).lastPathComponent } }
+        let beachSummary = try XCTUnwrap(workspace.presence[library.beachID])
+        let movedAssets = beachSummary.assets.filter { asset in selection.flatMap(\.files).contains { $0.name == (asset.assignment.relativePath as NSString).lastPathComponent } }
         XCTAssertEqual(movedAssets.count, moved)
         // On the drive at the new place; not on the NAS at the new mirror path.
         XCTAssertTrue(movedAssets.allSatisfy { $0.drive == .present && $0.archive == .missing && $0.archiveVerifiedAt == nil })
-        XCTAssertTrue(movedAssets.allSatisfy { $0.assignment.eventID == library.harborID })
+        XCTAssertTrue(movedAssets.allSatisfy { $0.assignment.eventID == library.beachID })
 
         // The patch says what a fresh sweep says.
-        let patched = Dictionary(uniqueKeysWithValues: harborSummary.assets.map { ($0.id, [$0.drivePath, $0.archivePath, "\($0.drive)", "\($0.archive)", "\($0.source)"]) })
-        await workspace.refreshEvent(library.harborID)
-        let swept = try XCTUnwrap(workspace.presence[library.harborID])
-        XCTAssertEqual(swept.total, harborSummary.total)
+        let patched = Dictionary(uniqueKeysWithValues: beachSummary.assets.map { ($0.id, [$0.drivePath, $0.archivePath, "\($0.drive)", "\($0.archive)", "\($0.source)"]) })
+        await workspace.refreshEvent(library.beachID)
+        let swept = try XCTUnwrap(workspace.presence[library.beachID])
+        XCTAssertEqual(swept.total, beachSummary.total)
         XCTAssertEqual(
             Dictionary(uniqueKeysWithValues: swept.assets.map { ($0.id, [$0.drivePath, $0.archivePath, "\($0.drive)", "\($0.archive)", "\($0.source)"]) }),
             patched
@@ -276,13 +276,13 @@ final class EventMoveLatencyTests: XCTestCase {
         defer { library.tearDown() }
         let workspace = library.workspace
         let model = library.model
-        await open(library, library.parentID, library.islandID, library.harborID)
-        let selection = library.bursts(in: library.islandID, count: 3)
-        workspace.moveStacks(Set(selection.map(\.id)), fromEvent: library.islandID, toEvent: library.harborID)
+        await open(library, library.parentID, library.cityID, library.beachID)
+        let selection = library.bursts(in: library.cityID, count: 3)
+        workspace.moveStacks(Set(selection.map(\.id)), fromEvent: library.cityID, toEvent: library.beachID)
         try await waitUntil { !model.isBusy && workspace.latestMoveJournalTitle != nil }
 
         let fresh = EventsWorkspace(model: model, supportFolder: library.root.appendingPathComponent("Fresh"), driveActivityGate: DriveActivityGate())
-        for boardID in [library.parentID, library.islandID, library.harborID] {
+        for boardID in [library.parentID, library.cityID, library.beachID] {
             for stack in try XCTUnwrap(workspace.eventStacks[boardID]) {
                 for file in stack.files {
                     XCTAssertEqual(workspace.assignment(for: file), fresh.assignment(for: file), file.path)
@@ -305,27 +305,27 @@ final class EventMoveLatencyTests: XCTestCase {
         defer { library.tearDown() }
         let workspace = library.workspace
         let model = library.model
-        await open(library, library.parentID, library.islandID, library.harborID)
-        let selection = library.bursts(in: library.islandID, count: 3)
+        await open(library, library.parentID, library.cityID, library.beachID)
+        let selection = library.bursts(in: library.cityID, count: 3)
         let originalPaths = selection.flatMap(\.files).map(\.path)
-        let islandStacks = try XCTUnwrap(workspace.eventStacks[library.islandID]).count
-        let harborStacks = try XCTUnwrap(workspace.eventStacks[library.harborID]).count
+        let cityStacks = try XCTUnwrap(workspace.eventStacks[library.cityID]).count
+        let beachStacks = try XCTUnwrap(workspace.eventStacks[library.beachID]).count
         let originalAssignments = Set(model.configuration.photoEventAssignments)
 
-        workspace.moveStacks(Set(selection.map(\.id)), fromEvent: library.islandID, toEvent: library.harborID)
-        try await waitUntil { !model.isBusy && workspace.latestMoveJournalTitle == "Move to Trip 2026 / Harbor" }
+        workspace.moveStacks(Set(selection.map(\.id)), fromEvent: library.cityID, toEvent: library.beachID)
+        try await waitUntil { !model.isBusy && workspace.latestMoveJournalTitle == "Move to Trip 2026 / Beach Day" }
         XCTAssertFalse(originalPaths.contains { exists($0) })
 
         workspace.undoLastMove()
         try await waitUntil { !model.isBusy && workspace.latestMoveJournalTitle == nil }
-        await open(library, library.islandID, library.harborID)
+        await open(library, library.cityID, library.beachID)
 
         XCTAssertTrue(originalPaths.allSatisfy { exists($0) }, "every file is back where it was")
         XCTAssertEqual(Set(model.configuration.photoEventAssignments), originalAssignments)
-        XCTAssertEqual(workspace.eventStacks[library.islandID]?.count, islandStacks)
-        XCTAssertEqual(workspace.eventStacks[library.harborID]?.count, harborStacks)
-        XCTAssertEqual(workspace.assignmentCount(for: library.islandID), library.shape.island)
-        XCTAssertEqual(workspace.assignmentCount(for: library.harborID), library.shape.harbor)
+        XCTAssertEqual(workspace.eventStacks[library.cityID]?.count, cityStacks)
+        XCTAssertEqual(workspace.eventStacks[library.beachID]?.count, beachStacks)
+        XCTAssertEqual(workspace.assignmentCount(for: library.cityID), library.shape.city)
+        XCTAssertEqual(workspace.assignmentCount(for: library.beachID), library.shape.beach)
     }
 
     // MARK: - Board counts for the family
@@ -335,31 +335,31 @@ final class EventMoveLatencyTests: XCTestCase {
         defer { library.tearDown() }
         let workspace = library.workspace
         let model = library.model
-        await open(library, library.parentID, library.islandID, library.harborID, library.roadID)
+        await open(library, library.parentID, library.cityID, library.beachID, library.roadID)
         let counts = { (id: UUID) in workspace.assignmentCount(for: id) }
         XCTAssertEqual(counts(library.parentID), library.shape.family)
 
-        let selection = library.bursts(in: library.islandID, count: 2)
+        let selection = library.bursts(in: library.cityID, count: 2)
         let moved = selection.flatMap(\.files).count
-        // Island → Harbor, then a burst from Harbor on to the parent itself.
-        workspace.moveStacks(Set(selection.map(\.id)), fromEvent: library.islandID, toEvent: library.harborID)
+        // City Weekend → Beach Day, then a burst from Beach Day on to the parent itself.
+        workspace.moveStacks(Set(selection.map(\.id)), fromEvent: library.cityID, toEvent: library.beachID)
         try await waitUntil { !model.isBusy }
-        XCTAssertEqual(counts(library.islandID), library.shape.island - moved)
-        XCTAssertEqual(counts(library.harborID), library.shape.harbor + moved)
+        XCTAssertEqual(counts(library.cityID), library.shape.city - moved)
+        XCTAssertEqual(counts(library.beachID), library.shape.beach + moved)
         XCTAssertEqual(counts(library.roadID), library.shape.road)
         XCTAssertEqual(counts(library.parentID), library.shape.family)
 
-        let again = Array(try XCTUnwrap(workspace.eventStacks[library.harborID]).filter { stack in selection.contains { $0.id == stack.id } }.prefix(1))
+        let again = Array(try XCTUnwrap(workspace.eventStacks[library.beachID]).filter { stack in selection.contains { $0.id == stack.id } }.prefix(1))
         let movedAgain = again.flatMap(\.files).count
-        workspace.moveStacks(Set(again.map(\.id)), fromEvent: library.harborID, toEvent: library.parentID)
+        workspace.moveStacks(Set(again.map(\.id)), fromEvent: library.beachID, toEvent: library.parentID)
         try await waitUntil { !model.isBusy && workspace.latestMoveJournalTitle != nil }
-        XCTAssertEqual(counts(library.harborID), library.shape.harbor + moved - movedAgain)
+        XCTAssertEqual(counts(library.beachID), library.shape.beach + moved - movedAgain)
         XCTAssertEqual(counts(library.parentID), library.shape.family)
         // The parent's own board keeps every stack; a subevent's board never
         // shows the sibling's.
         let parentStacks = try XCTUnwrap(workspace.eventStacks[library.parentID])
         XCTAssertTrue(parentStacks.contains { $0.id == again[0].id })
-        XCTAssertFalse(try XCTUnwrap(workspace.eventStacks[library.harborID]).contains { $0.id == again[0].id })
+        XCTAssertFalse(try XCTUnwrap(workspace.eventStacks[library.beachID]).contains { $0.id == again[0].id })
         XCTAssertEqual(workspace.assignedEvent(for: try XCTUnwrap(parentStacks.first { $0.id == again[0].id })).event?.id, library.parentID)
         XCTAssertEqual(
             model.configuration.photoEventAssignments.count,

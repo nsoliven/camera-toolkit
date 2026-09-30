@@ -63,7 +63,7 @@ check_pattern "Likely GitHub token" 'gh[pousr]_[A-Za-z0-9]{30,}'
 check_pattern "Likely AWS access key" 'AKIA[0-9A-Z]{16}'
 check_pattern "Likely Supabase token" 'sbp_[0-9a-f]{20,}'
 check_pattern "Private network address" '(^|[^0-9.])(10\.[0-9]{1,3}|192\.168|172\.(1[6-9]|2[0-9]|3[01]))\.[0-9]{1,3}\.[0-9]{1,3}([^0-9]|$)'
-check_pattern "Email address" '[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+\.(com|net|org|io|dev|me|app|co)\b' 'i' '@example\.(com|org|net)'
+check_pattern "Email address" '[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+\.(com|net|org|io|dev|me|app|co)\b' 'i' '@example\.(com|org|net)|noreply@anthropic\.com'
 
 private_terms="${CAMERA_TOOLKIT_PRIVATE_TERMS:-$HOME/.config/camera-toolkit/private-terms.txt}"
 if [[ -f "$private_terms" ]]; then

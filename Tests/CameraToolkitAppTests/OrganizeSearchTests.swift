@@ -104,10 +104,10 @@ final class OrganizeSearchTests: XCTestCase {
         let stack = OrganizeStack(items: [item("/Card/DSC00001.ARW")])
         XCTAssertTrue(OrganizeSearch.matches(
             stack: stack,
-            needle: "sam",
+            needle: "alex",
             rootPath: "/Card",
             eventTitle: nil,
-            personNames: ["Sam", "Person 1"]
+            personNames: ["Alex", "Person 1"]
         ))
         // Unnamed group labels hit too — "person" finds the Person 1 burst.
         XCTAssertTrue(OrganizeSearch.matches(
@@ -115,18 +115,18 @@ final class OrganizeSearchTests: XCTestCase {
             needle: "person",
             rootPath: "/Card",
             eventTitle: nil,
-            personNames: ["Sam", "Person 1"]
+            personNames: ["Alex", "Person 1"]
         ))
         XCTAssertFalse(OrganizeSearch.matches(
             stack: stack,
             needle: "dad",
             rootPath: "/Card",
             eventTitle: nil,
-            personNames: ["Sam", "Person 1"]
+            personNames: ["Alex", "Person 1"]
         ))
         XCTAssertFalse(OrganizeSearch.matches(
             stack: stack,
-            needle: "sam",
+            needle: "alex",
             rootPath: "/Card",
             eventTitle: nil,
             personNames: []
@@ -448,15 +448,15 @@ final class OrganizeSearchTests: XCTestCase {
 
     func testRowsInAGroupAndTogether() {
         let stack = OrganizeStack(items: [item("/Card/DCIM/DSC00001.ARW", kind: .raw)])
-        let sam = UUID()
-        let search = filter([[.people([sam]), .media([.raw])]])
+        let alex = UUID()
+        let search = filter([[.people([alex]), .media([.raw])]])
 
-        // The "Sam, stills only" shape: both rows must hold.
-        XCTAssertTrue(matches(stack, search: search, facts: OrganizeStackFacts(personIDs: [sam])))
+        // The "Alex, stills only" shape: both rows must hold.
+        XCTAssertTrue(matches(stack, search: search, facts: OrganizeStackFacts(personIDs: [alex])))
         XCTAssertFalse(matches(stack, search: search, facts: OrganizeStackFacts()))
 
         let video = OrganizeStack(items: [item("/Card/DCIM/C0001.MP4", kind: .video)])
-        XCTAssertFalse(matches(video, search: search, facts: OrganizeStackFacts(personIDs: [sam])))
+        XCTAssertFalse(matches(video, search: search, facts: OrganizeStackFacts(personIDs: [alex])))
     }
 
     func testGroupsOrTogether() {
@@ -464,24 +464,24 @@ final class OrganizeSearchTests: XCTestCase {
         func day(_ month: Int, _ day: Int) -> Date {
             calendar.date(from: DateComponents(year: 2026, month: month, day: day))!
         }
-        let sam = UUID()
-        // "(Sam and stills) or (a date range)".
+        let alex = UUID()
+        // "(Alex and stills) or (a date range)".
         let search = filter([
-            [.people([sam]), .media([.photo])],
+            [.people([alex]), .media([.photo])],
             [.days(from: day(8, 26), to: day(8, 27))],
         ])
 
-        let samStill = OrganizeStack(items: [item("/Card/DSC00001.HEIC", kind: .photo, capturedAt: day(9, 1))])
+        let alexStill = OrganizeStack(items: [item("/Card/DSC00001.HEIC", kind: .photo, capturedAt: day(9, 1))])
         let inRange = OrganizeStack(items: [item("/Card/DSC00002.ARW", kind: .raw, capturedAt: day(8, 26))])
-        let samVideo = OrganizeStack(items: [item("/Card/C0001.MP4", kind: .video, capturedAt: day(9, 2))])
+        let alexVideo = OrganizeStack(items: [item("/Card/C0001.MP4", kind: .video, capturedAt: day(9, 2))])
         let outsider = OrganizeStack(items: [item("/Card/DSC00003.ARW", kind: .raw, capturedAt: day(9, 3))])
 
-        XCTAssertTrue(matches(samStill, search: search, facts: OrganizeStackFacts(personIDs: [sam])))
+        XCTAssertTrue(matches(alexStill, search: search, facts: OrganizeStackFacts(personIDs: [alex])))
         XCTAssertTrue(matches(inRange, search: search))                          // group 2 alone
-        // Sam on a video stack fails group 1's media row and lands
+        // Alex on a video stack fails group 1's media row and lands
         // outside group 2's range — neither group keeps it.
-        XCTAssertFalse(matches(samVideo, search: search, facts: OrganizeStackFacts(personIDs: [sam])))
-        XCTAssertFalse(matches(outsider, search: search, facts: OrganizeStackFacts(personIDs: [sam])))
+        XCTAssertFalse(matches(alexVideo, search: search, facts: OrganizeStackFacts(personIDs: [alex])))
+        XCTAssertFalse(matches(outsider, search: search, facts: OrganizeStackFacts(personIDs: [alex])))
     }
 
     func testRowsWithNoValuesDoNotFilter() {
@@ -558,26 +558,26 @@ final class OrganizeSearchTests: XCTestCase {
     }
 
     func testPausedRowLeavesItsSiblingsFiltering() {
-        let sam = UUID()
+        let alex = UUID()
         let raw = OrganizeStack(items: [item("/Card/DSC00001.ARW", kind: .raw)])
         let video = OrganizeStack(items: [item("/Card/C0001.MP4", kind: .video)])
 
         // AND inside a group: pausing the media row leaves the people
         // row deciding on its own.
-        var search = filter([[.people([sam]), .media([.video])]])
+        var search = filter([[.people([alex]), .media([.video])]])
         search.toggleRow(search.groups[0].rows[1].id)
-        XCTAssertTrue(matches(raw, search: search, facts: OrganizeStackFacts(personIDs: [sam])))
+        XCTAssertTrue(matches(raw, search: search, facts: OrganizeStackFacts(personIDs: [alex])))
         XCTAssertFalse(matches(raw, search: search, facts: OrganizeStackFacts()))
         XCTAssertFalse(matches(video, search: search, facts: OrganizeStackFacts()))
         XCTAssertTrue(search.hasActiveConditions)
 
         // OR across groups: a group whose only row is paused drops out of
         // the OR instead of widening the match.
-        search = filter([[.media([.video])], [.people([sam])]])
+        search = filter([[.media([.video])], [.people([alex])]])
         search.toggleRow(search.groups[1].rows[0].id)
         XCTAssertEqual(search.groups.count, 2)
         XCTAssertTrue(matches(video, search: search))
-        XCTAssertFalse(matches(raw, search: search, facts: OrganizeStackFacts(personIDs: [sam])))
+        XCTAssertFalse(matches(raw, search: search, facts: OrganizeStackFacts(personIDs: [alex])))
     }
 
     // MARK: - Family scoping

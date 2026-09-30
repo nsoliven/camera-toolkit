@@ -360,24 +360,24 @@ final class UndoHistoryWorkspaceTests: XCTestCase {
         let library = try AuditLibrary.make()
         defer { library.tearDown() }
         library.addEvent("trip", name: "Trip 2026")
-        library.addEvent("harbor", name: "Lakeside", date: AuditLibrary.day.addingTimeInterval(86_400), policy: nil)
+        library.addEvent("beach", name: "Lakeside", date: AuditLibrary.day.addingTimeInterval(86_400), policy: nil)
         library.addEvent("solo", name: "Solo Day", date: AuditLibrary.day.addingTimeInterval(9 * 86_400))
         let workspace = library.workspace
-        let file = try library.place("harbor", name: "DSC00001.ARW", content: photo("1"))
-        await library.open("trip", "harbor", "solo")
-        try click(library, [file.url.path], from: "harbor", to: "solo")
+        let file = try library.place("beach", name: "DSC00001.ARW", content: photo("1"))
+        await library.open("trip", "beach", "solo")
+        try click(library, [file.url.path], from: "beach", to: "solo")
         try await settle(library)
         let afterMove = snapshot(library)
 
-        let harbor = library.event("harbor")
-        workspace.renameEvent(harbor.id, name: harbor.name, date: harbor.eventDate, policy: harbor.storagePolicy, parentEventID: library.id("trip"))
+        let beach = library.event("beach")
+        workspace.renameEvent(beach.id, name: beach.name, date: beach.eventDate, policy: beach.storagePolicy, parentEventID: library.id("trip"))
         try await settle(library)
-        XCTAssertEqual(library.event("harbor").parentEventID, library.id("trip"))
+        XCTAssertEqual(library.event("beach").parentEventID, library.id("trip"))
         XCTAssertEqual(workspace.undoMenuTitle, "Undo Move Lakeside")
 
         workspace.undo()
         try await settle(library)
-        XCTAssertNil(library.event("harbor").parentEventID)
+        XCTAssertNil(library.event("beach").parentEventID)
         XCTAssertEqual(snapshot(library), afterMove)
         XCTAssertEqual(workspace.undoMenuTitle, "Undo Move to Solo Day (1 file)", "the move before it was not abandoned")
     }

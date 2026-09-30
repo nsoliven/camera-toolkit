@@ -1597,7 +1597,7 @@ final class FaceIndexTests: XCTestCase {
     /// members are different identities.
     func testRematchLeavesUserNamedGroupsIntact() throws {
         try withFaceStore { store, catalog in
-            let named = try store.createPerson(name: "Sam", isRoster: false)
+            let named = try store.createPerson(name: "Alex", isRoster: false)
             let photo = photoRecord("RB2.JPG")
             let m1 = faceRecord(photo, detScore: 0.95, embedding: testEmbedding(seed: 21))
             let m2 = faceRecord(
@@ -1773,9 +1773,9 @@ final class FaceIndexTests: XCTestCase {
     /// face, grouped or lookalike, never does.
     func testPersonNamesByFileKeyCoversConfirmedApprovedPeople() throws {
         try withFaceStore { store, _ in
-            let sam = try store.createPerson(name: "Sam", isRoster: true)
+            let alex = try store.createPerson(name: "Alex", isRoster: true)
             let group = try store.createPerson(name: "Person 1", isRoster: false)
-            let pile = try store.createPerson(name: "Sam", isRoster: false, suggestedPersonID: sam.id)
+            let pile = try store.createPerson(name: "Alex", isRoster: false, suggestedPersonID: alex.id)
 
             let modified = Date(timeIntervalSince1970: 1_752_000_000)
             let photoA = photoRecord("DSC00001.ARW", size: 4_096, modified: modified)
@@ -1784,7 +1784,7 @@ final class FaceIndexTests: XCTestCase {
             let photoD = photoRecord("DSC00004.ARW", size: 1_024, modified: modified)
 
             try store.replaceFaces(photo: photoA, faces: [
-                faceRecord(photoA, embedding: testEmbedding(seed: 81), state: .confirmed, personID: sam.id),
+                faceRecord(photoA, embedding: testEmbedding(seed: 81), state: .confirmed, personID: alex.id),
             ])
             try store.replaceFaces(photo: photoB, faces: [
                 faceRecord(photoB, embedding: testEmbedding(seed: 83), state: .other, personID: group.id),
@@ -1793,7 +1793,7 @@ final class FaceIndexTests: XCTestCase {
             try store.replaceFaces(photo: photoC, faces: [
                 faceRecord(photoC, embedding: testEmbedding(seed: 84)),
             ])
-            // Nor does a proposed face in the "Looks like Sam" pile.
+            // Nor does a proposed face in the "Looks like Alex" pile.
             try store.replaceFaces(photo: photoD, faces: [
                 faceRecord(photoD, embedding: testEmbedding(seed: 85), state: .proposed, personID: pile.id),
             ])
@@ -1804,9 +1804,9 @@ final class FaceIndexTests: XCTestCase {
             let keyC = FaceIndexStore.fileKey(fileName: "DSC00003.ARW", byteCount: 2_048, modifiedAt: modified)
             let keyD = FaceIndexStore.fileKey(fileName: "DSC00004.ARW", byteCount: 1_024, modifiedAt: modified)
 
-            // Sam's confirmed face names her photo; the Inbox kinds —
+            // Alex's confirmed face names their photo; the Inbox kinds —
             // cluster member and lookalike — name nothing.
-            XCTAssertEqual(names[keyA], ["Sam"])
+            XCTAssertEqual(names[keyA], ["Alex"])
             XCTAssertNil(names[keyB])
             XCTAssertNil(names[keyC])
             XCTAssertNil(names[keyD])
