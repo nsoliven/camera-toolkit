@@ -58,7 +58,7 @@ public struct DiscoveredNASEvent: Identifiable, Hashable, Sendable {
 }
 
 /// Something discovery or adoption left alone, and why.
-public struct NASDiscoveryProblem: Hashable, Sendable {
+public struct NASDiscoveryProblem: Codable, Hashable, Sendable {
     /// Relative to the NAS root.
     public var path: String
     public var reason: String

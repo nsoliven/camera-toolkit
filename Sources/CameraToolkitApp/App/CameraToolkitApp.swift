@@ -39,6 +39,18 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate, NSMenuIte
             DebugLog.shared.flush()
             exit(status)
         }
+        // Found on the NAS → Add to Events from a script: catalog rows only,
+        // from a reviewed plan; same support folder and app-running rules.
+        if CommandLine.arguments.contains(NASAdoptCommand.flag) {
+            let status = NASAdoptCommand.run(
+                arguments: CommandLine.arguments,
+                defaultSupportFolder: DashboardModel.defaultApplicationSupportURL
+                    .appendingPathComponent("CameraToolkit", isDirectory: true),
+                isAppRunning: { anotherAppInstanceIsRunning() }
+            )
+            DebugLog.shared.flush()
+            exit(status)
+        }
         CrashReporting.start()
         UserDefaults.standard.set(false, forKey: "NSQuitAlwaysKeepsWindows")
         let application = NSApplication.shared
