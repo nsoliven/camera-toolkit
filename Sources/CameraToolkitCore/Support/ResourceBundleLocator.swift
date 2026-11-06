@@ -12,6 +12,8 @@ import Foundation
 /// The locator checks, in order:
 /// 1. `resourceURL/<bundle>/<file>` — `Contents/Resources` of a packaged app;
 /// 2. `bundleURL/<bundle>/<file>` — next to a bare executable (`swift run`);
+///    in both, `<bundle>/Contents/Resources/<file>` is accepted too, the
+///    layout newer SwiftPM toolchains give the bundle;
 /// 3. `moduleBundle()` — SwiftPM's accessor, touched only when both of the
 ///    app's own locations miss.
 ///
@@ -83,8 +85,14 @@ public struct ResourceBundleLocator: Sendable {
         let candidates: [(URL?, Location)] = [(resourceURL, .packaged), (bundleURL, .appRoot)]
         for (base, location) in candidates {
             guard let base else { continue }
-            let url = base.appendingPathComponent(bundleName, isDirectory: true).appendingPathComponent(fileName)
-            if fileExists(url) { return Resolution(url: url, location: location) }
+            let bundle = base.appendingPathComponent(bundleName, isDirectory: true)
+            // Older SwiftPM emits a flat bundle; newer toolchains use the
+            // macOS layout with the files under Contents/Resources.
+            for url in [bundle.appendingPathComponent(fileName),
+                        bundle.appendingPathComponent("Contents/Resources", isDirectory: true).appendingPathComponent(fileName)]
+                where fileExists(url) {
+                return Resolution(url: url, location: location)
+            }
         }
         if let bundle = moduleBundle() {
             let name = fileName as NSString

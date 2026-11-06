@@ -29,9 +29,11 @@ cp ".build/release/CameraToolkit" "$macos/CameraToolkit"
 for bundle in .build/release/CameraToolkit_*.bundle; do
   [[ -d "$bundle" ]] && ditto "$bundle" "$resources/$(basename "$bundle")"
 done
-core_script="$resources/CameraToolkit_CameraToolkitCore.bundle/face_sidecar.py"
-if [[ ! -f "$core_script" ]]; then
-  echo "error: $core_script is missing; the face engine would not work" >&2
+# Newer SwiftPM toolchains emit the bundle in macOS layout (Contents/Resources);
+# older ones keep it flat. --print-resource-paths below proves which one the app resolves.
+core_bundle="$resources/CameraToolkit_CameraToolkitCore.bundle"
+if [[ ! -f "$core_bundle/face_sidecar.py" && ! -f "$core_bundle/Contents/Resources/face_sidecar.py" ]]; then
+  echo "error: face_sidecar.py is missing from $core_bundle; the face engine would not work" >&2
   exit 1
 fi
 "$repo_root/scripts/make-app-icon.swift" "$repo_root/Assets/AppIcon.png" "$resources/AppIcon.icns"
