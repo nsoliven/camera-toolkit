@@ -143,6 +143,8 @@ extension EventsWorkspace {
             completion: { [weak self] outcome in
                 let (result, remaining) = outcome
                 await self?.nasRenamesAppliedInSlices(result, remaining: remaining)
+                // NAS discovery waits for queued renames (see `discoverNASEvents`).
+                self?.discoverNASEvents()
                 guard result.failed.isEmpty else { throw ToolkitError.commandFailed(result.summary) }
                 nasLine.text = result.summary
                 return result.summary

@@ -683,6 +683,12 @@ final class EventsWorkspace {
     var eventReachability: [UUID: EventReachabilityReport] = [:]
     var eventImmichStatuses: [UUID: [String: ImmichCatalogStatus]] = [:]
     var discoveredDriveEvents: [DiscoveredDriveEvent] = []
+    /// Event folders in the NAS mirror whose files no assignment covers
+    /// (`NASEventDiscovery`) — "Found on the NAS" in the sidebar.
+    var discoveredNASEvents: [DiscoveredNASEvent] = []
+    /// What the last NAS discovery left alone, and why.
+    var nasDiscoveryProblems: [NASDiscoveryProblem] = []
+    @ObservationIgnored var nasDiscoveryTask: Task<Void, Never>?
     /// Per event board: which of its originals have edits under the
     /// family's `Edited/<Tag>` folders (`EditTagLinker`). Loaded off the
     /// main actor after the board's stacks land.
@@ -1157,6 +1163,14 @@ final class EventsWorkspace {
                 || OrganizeSearch.matches(location.path, needle: needle)
                 || OrganizeSearch.matches(DashboardModel.expandedPath(location.path), needle: needle)
         }
+    }
+
+    /// Discovered NAS folders matching the search query, for the "Found
+    /// on the NAS" banner.
+    func discoveredNASEvents(matching query: String) -> [DiscoveredNASEvent] {
+        let needle = OrganizeSearch.needle(query)
+        guard !needle.isEmpty else { return discoveredNASEvents }
+        return discoveredNASEvents.filter { OrganizeSearch.matches($0.displayName, needle: needle) }
     }
 
     /// Discovered drive events matching the search query on name, for the
@@ -3453,6 +3467,7 @@ final class EventsWorkspace {
             self?.discoveredDriveEvents = found.0
             self?.legacyLayoutFolders = found.1
         }
+        discoverNASEvents()
     }
 
     func adoptDiscoveredDriveEvents() {
@@ -3463,6 +3478,9 @@ final class EventsWorkspace {
             summary = DriveEventDiscovery.adopt(found, into: &configuration)
         }
         discoveredDriveEvents = []
+        // The NAS list may name the same files; it is read again against
+        // the new assignments.
+        discoverNASEvents()
         model.statusMessage = "Added \(summary.createdEvents) event(s) and \(summary.addedAssignments) file(s) already organized on the drive. No files moved."
     }
 
