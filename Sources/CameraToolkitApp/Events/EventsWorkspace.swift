@@ -934,6 +934,10 @@ final class EventsWorkspace {
     /// already holds that file (`refreshAppliedSources`). What the unsorted
     /// board hides and what the waiting-for-Apply count leaves out.
     private(set) var appliedSourceEvents: [String: [String: UUID]] = [:]
+    /// Scanned source root → what Clear from Card may offer there.
+    private(set) var cardClearSummaries: [String: CardClearSummary] = [:]
+    /// The open Clear from Card confirmation.
+    var pendingCardClear: CardClearRequest?
     @ObservationIgnored private var appliedRefreshGenerations: [UUID: UUID] = [:]
     /// Test seam: whether a source file and an event's drive root share a
     /// volume (a card never does). Nil uses `VolumeInfo.isSameVolume`.
@@ -1810,37 +1814,182 @@ final class EventsWorkspace {
         guard let result = sources[locationID]?.result else { return }
         let generation = UUID()
         appliedRefreshGenerations[locationID] = generation
-        refreshIndexIfNeeded(tracking: false)
-        var rows: [PhotoEventAssignment] = []
-        var eventIDs = Set<UUID>()
-        for item in result.items {
-            for file in item.files {
-                guard let assignment = currentAssignment(for: file) else { continue }
-                rows.append(assignment)
-                eventIDs.insert(assignment.eventID)
-            }
-        }
-        let events = Dictionary(uniqueKeysWithValues: eventIDs.compactMap { event($0) }.map { ($0.id, $0) })
-        let locations = self.locations
-        let gate = driveActivityGate
-        let sameVolume = appliedSameVolumeCheck
-        let mounted = mountedVolumesProvider?()
-        let applied = await Task.detached(priority: .utility) {
-            AppliedSourceCheck.appliedSources(
-                assignments: rows,
-                events: events,
-                locations: locations,
-                mountedVolumes: mounted,
-                pauseGate: gate,
-                sameVolume: sameVolume,
-                isCancelled: { Task.isCancelled }
-            )
-        }.value
+        let plan = await cardClearPlan(for: locationID, result: result)
         guard appliedRefreshGenerations[locationID] == generation,
               sources[locationID]?.result?.rootPath == result.rootPath else { return }
-        if appliedSourceEvents[result.rootPath] != applied {
-            appliedSourceEvents[result.rootPath] = applied
+        if appliedSourceEvents[result.rootPath] != plan.applied {
+            appliedSourceEvents[result.rootPath] = plan.applied
         }
+        let summary = CardClearSummary(plan)
+        if cardClearSummaries[result.rootPath] != summary {
+            cardClearSummaries[result.rootPath] = summary
+        }
+    }
+
+    /// A fresh `CardClearPlanner` pass for one scanned source, off the main
+    /// actor: the applied answer for every sorted file, and which items are
+    /// safe on the drive and verified on the NAS. Reads the catalog, the
+    /// card and the drive; never the NAS share.
+    func cardClearPlan(for locationID: UUID, result: OrganizeScanResult) async -> CardClearPlan {
+        let job = cardClearJobInputs(result: result)
+        return await Task.detached(priority: .utility) {
+            job.plan(isCancelled: { Task.isCancelled })
+        }.value
+    }
+
+    /// Everything a planner pass needs, captured on the main actor.
+    private func cardClearJobInputs(result: OrganizeScanResult) -> CardClearJobInputs {
+        refreshIndexIfNeeded(tracking: false)
+        var inputs: [CardClearInput] = []
+        var eventIDs = Set<UUID>()
+        for item in result.items {
+            let entries = item.files.map { file -> CardClearInput.Entry in
+                let assignment = currentAssignment(for: file)
+                if let assignment { eventIDs.insert(assignment.eventID) }
+                return CardClearInput.Entry(path: file.path, assignment: assignment)
+            }
+            guard entries.contains(where: { $0.assignment != nil }) else { continue }
+            inputs.append(CardClearInput(id: item.primary.pathKey, entries: entries))
+        }
+        return CardClearJobInputs(
+            inputs: inputs,
+            sourceRoot: result.rootPath,
+            events: Dictionary(uniqueKeysWithValues: eventIDs.compactMap { event($0) }.map { ($0.id, $0) }),
+            locations: locations,
+            catalogURL: URL(fileURLWithPath: DashboardModel.expandedPath(model.configuration.catalogDatabasePath)),
+            mountedVolumes: mountedVolumesProvider?(),
+            pauseGate: driveActivityGate,
+            sameVolume: appliedSameVolumeCheck
+        )
+    }
+
+    // MARK: - Clear from Card
+
+    /// "Clear from Card…": plans afresh, then opens the confirmation with
+    /// what is eligible per event and what stays and why. Nothing is deleted
+    /// here.
+    func requestClearFromCard(_ locationID: UUID) async {
+        guard let location = location(locationID), let result = sources[locationID]?.result else { return }
+        let plan = await cardClearPlan(for: locationID, result: result)
+        guard sources[locationID]?.result?.rootPath == result.rootPath else { return }
+        guard !plan.clearable.isEmpty else {
+            model.statusMessage = plan.waitingForNAS.isEmpty
+                ? "Nothing here is safe to clear yet. Apply, then Sync to NAS first."
+                : "\(plan.waitingFiles) file(s) are in their events but not verified on the NAS yet. Sync to NAS first — nothing was removed."
+            return
+        }
+        let byEvent = Dictionary(grouping: plan.clearable, by: \.eventID)
+            .map { eventID, items in
+                CardClearRequest.EventLine(
+                    name: event(eventID).map { eventTitle($0) } ?? "An event",
+                    fileCount: items.reduce(0) { $0 + $1.files.count },
+                    byteCount: items.reduce(0) { $0 + $1.byteCount }
+                )
+            }
+            .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        pendingCardClear = CardClearRequest(
+            locationID: locationID,
+            locationName: location.name,
+            itemIDs: Set(plan.clearable.map(\.id)),
+            fileCount: plan.clearableFiles,
+            byteCount: plan.clearableBytes,
+            events: byEvent,
+            waitingForNASFiles: plan.waitingFiles,
+            driveName: plan.driveName,
+            nasReachable: VolumeInfo.isAvailable(locations.nasRoot, mountedVolumes: mountedVolumesProvider?() ?? VolumeInfo.mountedVolumePaths())
+        )
+    }
+
+    /// Runs the confirmed Clear from Card as a tracked job. The typed token
+    /// is checked here and again by the service; the job plans afresh and
+    /// clears only items the sheet listed that still qualify, each after its
+    /// own final hash checks (`CardClearService`). Outside Undo — the sheet
+    /// says so.
+    func confirmCardClear(_ request: CardClearRequest, confirmation: String) {
+        pendingCardClear = nil
+        guard confirmation == FreeUpService.confirmationToken else {
+            model.statusMessage = "Nothing was removed — type \(FreeUpService.confirmationToken) to clear files from the card."
+            return
+        }
+        // Like Take Off Drive: re-read NAS copies over Ethernet if it can.
+        // Then it waits in the job queue behind whatever is running.
+        nasConnection.prepareForNASJob { [weak self] in
+            guard let self else { return }
+            model.enqueueFileJob(
+                action: .freeUp,
+                queuedNote: "Clear \(request.fileCount) file(s) from \(request.locationName).",
+                detail: "Waits for the running job. Then Verify re-hashes each card file, its drive copy and the NAS copy against the hash Sync to NAS verified, and Remove deletes only the card files that passed.",
+                skippedNote: "Did not start: \(request.locationName) or its scan is gone. Nothing was removed."
+            ) { [weak self] jobID in
+                self?.runCardClear(request, confirmation: confirmation, jobID: jobID)
+            }
+        }
+    }
+
+    private func runCardClear(_ request: CardClearRequest, confirmation: String, jobID: UUID) {
+        guard let location = location(request.locationID), let result = sources[request.locationID]?.result else { return }
+        // Planned again from the catalog and disk as they are now.
+        let job = cardClearJobInputs(result: result)
+        let itemIDs = request.itemIDs
+        let nasRoot = locations.nasRoot
+        let mountedProvider = mountedVolumesProvider
+        let title = "Cleared files from \(location.name)"
+        let recorder = model.makeHistoryRecorder(action: .freeUp, title: title, id: jobID)
+        let cardRoot = result.rootPath
+        model.runBackgroundJob(
+            action: .freeUp,
+            runningNote: "Verify: rechecking \(request.fileCount) file(s) on \(location.name) against the drive and the NAS",
+            logTitle: title,
+            logDetail: "Planned again, then Verify re-hashed each card file, its drive copy (against the SHA-256 Sync to NAS verified) and the NAS copy when reachable; Remove permanently deleted only card files that passed, through the existing source cleanup, which re-hashes once more. Drive and NAS copies were only read.",
+            history: recorder,
+            jobID: jobID,
+            operation: { progress in
+                let plan = job.plan(isCancelled: { false })
+                let items = plan.clearable.filter { itemIDs.contains($0.id) }
+                let nasReachable = VolumeInfo.isAvailable(nasRoot, mountedVolumes: mountedProvider?() ?? VolumeInfo.mountedVolumePaths())
+                recorder?.setTotals(files: items.reduce(0) { $0 + $1.files.count }, bytes: items.reduce(0) { $0 + $1.byteCount })
+                let report = items.isEmpty
+                    ? CardClearReport()
+                    : try CardClearService().clear(
+                        items: items,
+                        nasReachable: nasReachable,
+                        confirmation: confirmation,
+                        progress: { update in
+                            recorder?.observe(update)
+                            progress(DashboardModel.jobUpdate(from: update, notePrefix: "Clear from Card", command: ""))
+                        },
+                        fileSettled: { file in
+                            let relative = file.sourcePath.hasPrefix(cardRoot + "/")
+                                ? String(file.sourcePath.dropFirst(cardRoot.count + 1))
+                                : file.relativePath
+                            // `job_items` only knows the sync outcomes (its
+                            // CHECK constraint is left as it is): a removed
+                            // file is `matched` — every copy matched — and a
+                            // file that stayed is `failed`, its phase and
+                            // reason in `error`.
+                            recorder?.fileSettled(JobHistoryItem(
+                                relativePath: relative,
+                                byteCount: file.byteCount,
+                                start: nil,
+                                end: recorder?.elapsed() ?? 0,
+                                outcome: file.removed ? .matched : .failed,
+                                verifyMethod: nasReachable ? "NAS re-read" : "recorded NAS hash",
+                                error: file.removed
+                                    ? nil
+                                    : "Skipped in \(file.phase): \(file.reason ?? "it did not pass every check.") The card file stays."
+                            ))
+                        }
+                    )
+                recorder?.notePhases(report.phases)
+                let dropped = itemIDs.subtracting(Set(items.map(\.id))).count
+                return CardClearOutcome(report: report, noLongerEligible: dropped)
+            },
+            completion: { [weak self] outcome in
+                guard let self else { return "" }
+                scan(location, force: true)
+                return CardClearWording.summary(outcome, locationName: location.name)
+            }
+        )
     }
 
     /// Takes stacks the board no longer shows out of the selection, focus and
@@ -6694,13 +6843,27 @@ final class EventsWorkspace {
         case .drive:
             // Take Off Drive re-reads every NAS copy: over Ethernet if it can.
             nasConnection.prepareForNASJob { [weak self] in
-                self?.removeFromDrive(request.eventID, confirmation: confirmation)
+                guard let self else { return }
+                model.enqueueFileJob(
+                    action: .freeUp,
+                    queuedNote: "Take \(request.fileCount) file(s) off the drive.",
+                    detail: "Waits for the running job, then re-hashes every drive copy against its NAS copy before moving it into the drive's _Trash folder."
+                ) { [weak self] jobID in
+                    self?.removeFromDrive(request.eventID, confirmation: confirmation, jobID: jobID)
+                }
             }
-        case .source: removeFromSource(request.eventID, confirmation: confirmation)
+        case .source:
+            model.enqueueFileJob(
+                action: .freeUp,
+                queuedNote: "Free up \(request.fileCount) source file(s).",
+                detail: "Waits for the running job, then re-hashes every source file against its drive copy before permanently removing only matching originals."
+            ) { [weak self] jobID in
+                self?.removeFromSource(request.eventID, confirmation: confirmation, jobID: jobID)
+            }
         }
     }
 
-    private func removeFromDrive(_ eventID: UUID, confirmation: String) {
+    private func removeFromDrive(_ eventID: UUID, confirmation: String, jobID: UUID? = nil) {
         guard let event = event(eventID), let summary = presence[eventID] else { return }
         let locations = self.locations
         var pairs: [VerifiedRemovalPair] = []
@@ -6737,6 +6900,7 @@ final class EventsWorkspace {
             runningNote: "Rechecking \(pairs.count) drive copies of \(eventTitle(event)) against the NAS",
             logTitle: "Took \(eventTitle(event)) off the drive",
             logDetail: "Re-hashed every drive copy against its NAS copy, then moved the drive copies into the drive's hidden _Trash folder. Nothing was deleted.",
+            jobID: jobID,
             operation: { progress in
                 try VerifiedRemovalService().moveVerifiedCopiesAside(
                     pairs: plannedPairs,
@@ -6765,7 +6929,7 @@ final class EventsWorkspace {
         )
     }
 
-    private func removeFromSource(_ eventID: UUID, confirmation: String) {
+    private func removeFromSource(_ eventID: UUID, confirmation: String, jobID: UUID? = nil) {
         guard let event = event(eventID), let summary = presence[eventID] else { return }
         let locations = self.locations
         var groups: [String: SourceCleanupGroup] = [:]
@@ -6791,6 +6955,7 @@ final class EventsWorkspace {
             runningNote: "Rechecking \(total) source files of \(eventTitle(event)) against the drive",
             logTitle: "Freed source space for \(eventTitle(event))",
             logDetail: "Re-hashed each source file against its drive copy before permanently removing only matching source originals.",
+            jobID: jobID,
             operation: { progress in
                 var removed = 0
                 var bytes: Int64 = 0

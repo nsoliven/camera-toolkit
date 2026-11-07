@@ -682,32 +682,75 @@ private struct UnsortedApplyBanner: View {
 
     var body: some View {
         let waiting = workspace.sortedFiles(in: result)
-        if waiting.files > 0 {
-            HStack(spacing: 10) {
-                Image(systemName: "tray.and.arrow.down.fill")
-                    .foregroundStyle(.tint)
-                Text(UnsortedApplyBannerText.text(files: waiting.files, bytes: waiting.bytes))
-                    .font(.callout)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                    .layoutPriority(-1)
-                Spacer(minLength: 8)
-                Button("Apply…") {
-                    workspace.prepareApply(sourceLocationID: location.id)
+        let clear = workspace.cardClearSummaries[result.rootPath]
+        if waiting.files > 0 || clear?.isEmpty == false {
+            VStack(spacing: 4) {
+                if waiting.files > 0 {
+                    line(
+                        symbol: "tray.and.arrow.down.fill",
+                        text: UnsortedApplyBannerText.text(files: waiting.files, bytes: waiting.bytes),
+                        button: "Apply…",
+                        help: "Review the plan — nothing moves until you confirm it.",
+                        prominent: true
+                    ) {
+                        workspace.prepareApply(sourceLocationID: location.id)
+                    }
                 }
-                .buttonStyle(.glassProminent)
-                .controlSize(.small)
-                .disabled(model.isBusy)
-                .help("Review the plan — nothing moves until you confirm it.")
-                .fixedSize()
+                if let clear, !clear.isEmpty {
+                    // A second, quieter line: the files that are safe on
+                    // the drive and the NAS can come off the card.
+                    line(
+                        symbol: "checkmark.shield",
+                        text: CardClearWording.bannerLine(clear),
+                        button: clear.clearableFiles > 0 ? "Clear from Card…" : nil,
+                        help: "Re-checks every copy first, then permanently deletes only matching files from the card. Asks you to confirm.",
+                        prominent: false
+                    ) {
+                        Task { await workspace.requestClearFromCard(location.id) }
+                    }
+                }
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
-            .glassEffect(.regular, in: .capsule)
             .padding(.horizontal, 16)
             .padding(.top, 4)
-            .accessibilityElement(children: .combine)
         }
+    }
+
+    private func line(
+        symbol: String,
+        text: String,
+        button: String?,
+        help: String,
+        prominent: Bool,
+        action: @escaping () -> Void
+    ) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: symbol)
+                .foregroundStyle(prominent ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
+            Text(text)
+                .font(.callout)
+                .foregroundStyle(prominent ? .primary : .secondary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .layoutPriority(-1)
+            Spacer(minLength: 8)
+            if let button {
+                Group {
+                    if prominent {
+                        Button(button, action: action).buttonStyle(.glassProminent)
+                    } else {
+                        Button(button, action: action).buttonStyle(.glass)
+                    }
+                }
+                .controlSize(.small)
+                .disabled(model.isBusy)
+                .help(help)
+                .fixedSize()
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .glassEffect(.regular, in: .capsule)
+        .accessibilityElement(children: .combine)
     }
 }
 
