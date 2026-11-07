@@ -44,6 +44,24 @@ struct NewEventRequest: Identifiable {
     /// Set when the stacks live on an event board: completing the request
     /// moves them into the new event instead of assigning from a source.
     var moveFromEventID: UUID?
+    /// The board's display order when the request was made, so sorting into
+    /// the new event advances focus the way the 1–3 keys do.
+    var orderedIDs: [String] = []
+}
+
+/// Pending "Sort Into…" picker for an unsorted board. The stacks are the
+/// ones targeted when the picker opened, kept with the source they came
+/// from; completing re-checks them against that source's current scan, so
+/// a rescan or a changed selection never sorts something else.
+struct SortIntoRequest: Identifiable {
+    let id = UUID()
+    var sourceLocationID: UUID
+    var stackIDs: Set<String>
+    /// The board's display order at open time, for the focus advance.
+    var orderedIDs: [String] = []
+    /// Counts at open time, for the picker's header.
+    var itemCount: Int
+    var fileCount: Int
 }
 
 struct RenameEventRequest: Identifiable {
@@ -703,6 +721,12 @@ final class EventsWorkspace {
     /// `<device>/Card Copy` layout — offered for the layout migration.
     var legacyLayoutFolders: [DriveCameraFolder] = []
     var newEventRequest: NewEventRequest?
+    /// The unsorted board's "Sort Into…" picker sheet.
+    var sortIntoRequest: SortIntoRequest?
+    /// "New Event…" chosen inside the Sort Into picker waits here until the
+    /// picker has finished closing (`sortIntoSheetDidDismiss`), so the New
+    /// Event sheet never presents over a sheet that is still on screen.
+    var newEventAfterSortInto: NewEventRequest?
     var renameRequest: RenameEventRequest?
     var faceScanRequest: FaceScanRequest?
     var pendingApplyPlan: OrganizeApplyPlan?
@@ -2375,8 +2399,23 @@ final class EventsWorkspace {
         return OrganizeStackMenuState(
             targetIDs: targets,
             stacks: stacks(matching: targets, inLocation: locationID),
-            eventTargets: menuTargets(excluding: nil)
+            eventTargets: sortIntoTargets()
         )
+    }
+
+    /// The events an unsorted board may sort into — the same rows the
+    /// right-click menu's `eventTargets` lists, so the Sort Into picker
+    /// never offers an event the menu would not.
+    func sortIntoTargets() -> [EventMenuTarget] {
+        menuTargets(excluding: nil)
+    }
+
+    /// The ids among `stackIDs` that are still on `locationID`'s current
+    /// scan — never ids from another source, and none while the board has
+    /// no scan result (mid-rescan).
+    func liveStackIDs(_ stackIDs: Set<String>, inLocation locationID: UUID) -> Set<String> {
+        guard let byID = sources[locationID]?.stacksByID, sources[locationID]?.result != nil else { return [] }
+        return stackIDs.filter { byID[$0] != nil }
     }
 
     func badge(for stack: OrganizeStack, in eventID: UUID) -> TileLocationBadge? {
@@ -3117,7 +3156,73 @@ final class EventsWorkspace {
 
     // MARK: - Events
 
-    func requestNewEvent(from locationID: UUID?, parentEventID: UUID? = nil) {
+    // MARK: - Sort Into picker
+
+    /// Opens the Sort Into picker for `stackIDs` on an unsorted board. The
+    /// stacks are captured now; an empty set still opens it so "New Event…"
+    /// stays reachable, with the event rows inactive.
+    func requestSortInto(stackIDs: Set<String>, from locationID: UUID, orderedIDs: [String] = []) {
+        let live = liveStackIDs(stackIDs, inLocation: locationID)
+        let stacks = stacks(matching: live, inLocation: locationID)
+        sortIntoRequest = SortIntoRequest(
+            sourceLocationID: locationID,
+            stackIDs: live,
+            orderedIDs: orderedIDs,
+            itemCount: stacks.count,
+            fileCount: stacks.reduce(0) { $0 + $1.files.count }
+        )
+    }
+
+    /// The picker's header line: what will be sorted, and from where.
+    func sortIntoSummary(_ request: SortIntoRequest) -> String {
+        let source = location(request.sourceLocationID)?.name ?? "this folder"
+        guard request.itemCount > 0 else {
+            return "Nothing is selected in \(source). Select photos first, or make a new event."
+        }
+        return "\(ApplyPlanOverview.plural(request.itemCount, "item")) (\(ApplyPlanOverview.plural(request.fileCount, "file"))) from \(source). Nothing moves until you press Apply."
+    }
+
+    /// The picker's choice: sorts the captured stacks that are still on
+    /// their source into `eventID` through `assign` — the same path as the
+    /// 1–3 keys, so undo, the status line and the focus advance match.
+    func completeSortInto(_ request: SortIntoRequest, eventID: UUID) {
+        sortIntoRequest = nil
+        guard sortIntoTargets().contains(where: { $0.id == eventID }), event(eventID) != nil else {
+            model.statusMessage = "That event is no longer available. Nothing was sorted."
+            return
+        }
+        let live = liveStackIDs(request.stackIDs, inLocation: request.sourceLocationID)
+        guard !live.isEmpty else {
+            model.statusMessage = request.stackIDs.isEmpty
+                ? "Select photos first, then choose Sort Into…."
+                : "Those items are no longer on the board (it was rescanned). Nothing was sorted — select them again."
+            return
+        }
+        assign(stackIDs: live, from: request.sourceLocationID, to: eventID, orderedIDs: request.orderedIDs)
+    }
+
+    /// "New Event…" inside the picker: closes it and queues the New Event
+    /// sheet for the same stacks; `sortIntoSheetDidDismiss` presents it.
+    func newEventFromSortInto(_ request: SortIntoRequest) {
+        let live = liveStackIDs(request.stackIDs, inLocation: request.sourceLocationID)
+        let stacks = stacks(matching: live, inLocation: request.sourceLocationID)
+        newEventAfterSortInto = NewEventRequest(
+            suggestedDate: stacks.map(\.captureDate).min() ?? Date(),
+            sourceLocationID: request.sourceLocationID,
+            stackIDs: live,
+            orderedIDs: request.orderedIDs
+        )
+        sortIntoRequest = nil
+    }
+
+    /// The picker sheet finished closing: present a queued New Event sheet.
+    func sortIntoSheetDidDismiss() {
+        guard let pending = newEventAfterSortInto else { return }
+        newEventAfterSortInto = nil
+        newEventRequest = pending
+    }
+
+    func requestNewEvent(from locationID: UUID?, parentEventID: UUID? = nil, orderedIDs: [String] = []) {
         // New Subevent under an event already at the cap refuses here —
         // the picker never offered it, but the menu shortcut can reach it.
         if let parentEventID, let refusal = subeventRefusal(for: parentEventID) {
@@ -3131,7 +3236,8 @@ final class EventsWorkspace {
             suggestedDate: stacks.map(\.captureDate).min() ?? Date(),
             sourceLocationID: locationID,
             stackIDs: Set(stacks.map(\.id)),
-            parentEventID: validParentEventID(parentEventID, for: nil)
+            parentEventID: validParentEventID(parentEventID, for: nil),
+            orderedIDs: orderedIDs
         )
     }
 
@@ -3199,9 +3305,24 @@ final class EventsWorkspace {
     func completeNewEvent(_ request: NewEventRequest, name: String, date: Date, policy: EventStoragePolicy?, parentEventID: UUID?) {
         guard let eventID = createEvent(name: name, date: date, policy: policy, parentEventID: parentEventID) else { return }
         newEventRequest = nil
-        // Creating an event never sorts or moves photos. Assign is a separate
-        // click on the board; Apply is the later move. Auto-assign made every
-        // selected burst go gray the moment the sheet confirmed.
+        // New Event from a selection on an unsorted board sorts that
+        // selection into the event, through the same `assign` the 1–3 keys
+        // use — catalog only, one undo entry, Apply enabled. Nothing moves
+        // on disk until Apply. Only stacks still on that source's current
+        // scan are sorted. An event-board request (`moveFromEventID`)
+        // still only creates the event: that path would move real files.
+        if let locationID = request.sourceLocationID, request.moveFromEventID == nil {
+            guard !request.stackIDs.isEmpty else { return }
+            let live = liveStackIDs(request.stackIDs, inLocation: locationID)
+            guard !live.isEmpty else {
+                if let event = event(eventID) {
+                    model.statusMessage = "Created \(eventTitle(event)). The selected items are no longer on the board (it was rescanned), so nothing was sorted into it."
+                }
+                return
+            }
+            assign(stackIDs: live, from: locationID, to: eventID, orderedIDs: request.orderedIDs)
+            return
+        }
         if request.sourceLocationID == nil, request.moveFromEventID == nil {
             selection = .event(eventID)
         }

@@ -2765,11 +2765,11 @@ final class EventsWorkspaceTests: XCTestCase {
         }
     }
 
-    func testNewEventRequestDoesNotAssignOnCreate() async throws {
+    func testNewEventRequestFromUnsortedSourceSortsTheStacksIntoIt() async throws {
         try await withOrganizerSandbox { root, model, workspace in
             let unsorted = root.appendingPathComponent("Drive/Unsorted A7V", isDirectory: true)
-            try writeOrganizerARW(unsorted.appendingPathComponent("B0009_DSC00001.ARW"), "2026:08:26 10:00:00", "000")
-            try writeOrganizerARW(unsorted.appendingPathComponent("B0009_DSC00002.ARW"), "2026:08:26 10:00:00", "200")
+            let first = try writeOrganizerARW(unsorted.appendingPathComponent("B0009_DSC00001.ARW"), "2026:08:26 10:00:00", "000")
+            let second = try writeOrganizerARW(unsorted.appendingPathComponent("B0009_DSC00002.ARW"), "2026:08:26 10:00:00", "200")
             let location = addUnsorted(unsorted, to: model)
             workspace.scan(location)
             try await waitUntil { workspace.sources[location.id]?.result != nil }
@@ -2786,10 +2786,199 @@ final class EventsWorkspaceTests: XCTestCase {
             workspace.completeNewEvent(request, name: "New Gig", date: organizerDay("2026-08-26"), policy: .buffer, parentEventID: nil)
             XCTAssertNil(workspace.newEventRequest)
 
+            // Creating from a selection sorts it — catalog only, like 1–3.
             let created = try XCTUnwrap(model.configuration.savedEvents.first { $0.name == "New Gig" })
-            XCTAssertNil(workspace.assignedEvent(for: burst).event)
-            XCTAssertFalse(workspace.isSorted(burst))
+            XCTAssertEqual(workspace.assignedEvent(for: burst).event?.id, created.id)
+            XCTAssertTrue(workspace.isSorted(burst))
+            XCTAssertEqual(
+                model.configuration.photoEventAssignments.filter { $0.eventID == created.id }.map(\.relativePath).sorted(),
+                ["B0009_DSC00001.ARW", "B0009_DSC00002.ARW"]
+            )
+            XCTAssertEqual(workspace.sortedFiles(in: try XCTUnwrap(workspace.sources[location.id]?.result)).files, 2)
             XCTAssertTrue(workspace.recentEvents.contains { $0.id == created.id })
+            XCTAssertTrue(workspace.undoMenuTitle?.hasPrefix("Undo Sort into New Gig") == true, workspace.undoMenuTitle ?? "nil")
+            // Nothing on disk moved: both files are where the card had them.
+            XCTAssertTrue(FileManager.default.fileExists(atPath: first.path))
+            XCTAssertTrue(FileManager.default.fileExists(atPath: second.path))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("Drive/Camera Buffer/2026/2026-08-26 New Gig").path))
+
+            // ⌘Z takes the sort back first, then the event itself.
+            workspace.undo()
+            XCTAssertFalse(workspace.isSorted(burst))
+            XCTAssertTrue(model.configuration.photoEventAssignments.isEmpty)
+            XCTAssertNotNil(workspace.event(created.id))
+            workspace.undo()
+            XCTAssertNil(workspace.event(created.id))
+            XCTAssertTrue(FileManager.default.fileExists(atPath: first.path))
+            XCTAssertTrue(FileManager.default.fileExists(atPath: second.path))
+        }
+    }
+
+    func testNewEventFromBoardSelectionSortsOnlyStacksStillOnTheSource() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let unsorted = root.appendingPathComponent("Drive/Unsorted A7V", isDirectory: true)
+            try writeOrganizerARW(unsorted.appendingPathComponent("DSC00001.ARW"), "2026:08:26 10:00:00", "000")
+            try writeOrganizerARW(unsorted.appendingPathComponent("DSC00002.ARW"), "2026:08:26 11:00:00", "000")
+            let location = addUnsorted(unsorted, to: model)
+            workspace.scan(location)
+            try await waitUntil { workspace.sources[location.id]?.result != nil }
+            let stacks = try XCTUnwrap(workspace.sources[location.id]?.result?.stacks)
+            XCTAssertEqual(stacks.count, 2)
+            let picked = stacks[0]
+            let other = stacks[1]
+
+            // N / "New Event from Selection…": the board's selection.
+            workspace.selectStacks([picked.id])
+            workspace.requestNewEvent(from: location.id, orderedIDs: stacks.map(\.id))
+            var request = try XCTUnwrap(workspace.newEventRequest)
+            XCTAssertEqual(request.stackIDs, [picked.id])
+            XCTAssertEqual(request.orderedIDs, stacks.map(\.id))
+            // A changed selection while the sheet is open does not matter.
+            workspace.selectStacks([other.id])
+            workspace.completeNewEvent(request, name: "Beach Day", date: organizerDay("2026-08-26"), policy: .buffer, parentEventID: nil)
+            let beach = try XCTUnwrap(model.configuration.savedEvents.first { $0.name == "Beach Day" })
+            XCTAssertEqual(workspace.assignedEvent(for: picked).event?.id, beach.id)
+            XCTAssertNil(workspace.assignedEvent(for: other).event)
+            // The focus advanced past the sorted stack, as 1–3 do.
+            XCTAssertEqual(workspace.selectedStackIDs, [other.id])
+
+            // A request whose stacks are no longer on the scan sorts nothing.
+            request = NewEventRequest(suggestedDate: Date(), sourceLocationID: location.id, stackIDs: ["not-on-the-board"])
+            workspace.newEventRequest = request
+            workspace.completeNewEvent(request, name: "Family Party", date: organizerDay("2026-08-26"), policy: .buffer, parentEventID: nil)
+            let party = try XCTUnwrap(model.configuration.savedEvents.first { $0.name == "Family Party" })
+            XCTAssertTrue(model.configuration.photoEventAssignments.filter { $0.eventID == party.id }.isEmpty)
+            XCTAssertTrue(model.statusMessage.contains("nothing was sorted"), model.statusMessage)
+            XCTAssertNil(workspace.assignedEvent(for: other).event)
+        }
+    }
+
+    func testSortIntoPickerSortsTheStacksCapturedWhenItOpened() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let unsorted = root.appendingPathComponent("Drive/Unsorted A7V", isDirectory: true)
+            let burstFile = try writeOrganizerARW(unsorted.appendingPathComponent("B0001_DSC00001.ARW"), "2026:08:26 10:00:00", "100")
+            try writeOrganizerARW(unsorted.appendingPathComponent("B0001_DSC00002.ARW"), "2026:08:26 10:00:00", "400")
+            try writeOrganizerARW(unsorted.appendingPathComponent("DSC00003.ARW"), "2026:08:26 12:00:00", "000")
+            let location = addUnsorted(unsorted, to: model)
+            workspace.scan(location)
+            try await waitUntil { workspace.sources[location.id]?.result != nil }
+            let result = try XCTUnwrap(workspace.sources[location.id]?.result)
+            let burst = try XCTUnwrap(result.stacks.first { $0.isBurst })
+            let single = try XCTUnwrap(result.stacks.first { !$0.isBurst })
+            let beach = try XCTUnwrap(workspace.createEvent(name: "Beach Day", date: organizerDay("2026-08-26"), policy: .buffer))
+
+            workspace.selectStacks([burst.id])
+            workspace.requestSortInto(stackIDs: workspace.targetStackIDs(), from: location.id, orderedIDs: result.stacks.map(\.id))
+            let request = try XCTUnwrap(workspace.sortIntoRequest)
+            XCTAssertEqual(request.stackIDs, [burst.id])
+            XCTAssertEqual(request.itemCount, 1)
+            XCTAssertEqual(request.fileCount, 2)
+            XCTAssertTrue(workspace.sortIntoSummary(request).contains("1 item (2 files) from Unsorted A7V"), workspace.sortIntoSummary(request))
+            // The picker offers exactly the right-click menu's targets.
+            XCTAssertEqual(
+                workspace.sortIntoTargets().map(\.id),
+                workspace.stackMenuState(forStackID: burst.id, inLocation: location.id).eventTargets.map(\.id)
+            )
+
+            // The selection changes while the sheet is open: the captured
+            // stacks are still the ones sorted.
+            workspace.selectStacks([single.id])
+            workspace.completeSortInto(request, eventID: beach)
+            XCTAssertNil(workspace.sortIntoRequest)
+            XCTAssertEqual(workspace.assignedEvent(for: burst).event?.id, beach)
+            XCTAssertNil(workspace.assignedEvent(for: single).event)
+            XCTAssertTrue(workspace.undoMenuTitle?.hasPrefix("Undo Sort into Beach Day") == true, workspace.undoMenuTitle ?? "nil")
+            XCTAssertTrue(FileManager.default.fileExists(atPath: burstFile.path))
+
+            workspace.undo()
+            XCTAssertNil(workspace.assignedEvent(for: burst).event)
+            XCTAssertTrue(model.configuration.photoEventAssignments.isEmpty)
+        }
+    }
+
+    func testSortIntoPickerNeverSortsStacksThatLeftTheSourceOrBelongToAnother() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let cardA = root.appendingPathComponent("Drive/Unsorted A", isDirectory: true)
+            let cardB = root.appendingPathComponent("Drive/Unsorted B", isDirectory: true)
+            try writeOrganizerARW(cardA.appendingPathComponent("DSC00001.ARW"), "2026:08:26 10:00:00", "000")
+            try writeOrganizerARW(cardB.appendingPathComponent("DSC00101.ARW"), "2026:08:26 10:00:00", "000")
+            let locationA = addUnsorted(cardA, to: model)
+            let locationB = addUnsorted(cardB, to: model)
+            workspace.scan(locationA)
+            workspace.scan(locationB)
+            try await waitUntil { workspace.sources[locationA.id]?.result != nil && workspace.sources[locationB.id]?.result != nil }
+            let stackA = try XCTUnwrap(workspace.sources[locationA.id]?.result?.stacks.first)
+            let stackB = try XCTUnwrap(workspace.sources[locationB.id]?.result?.stacks.first)
+            let beach = try XCTUnwrap(workspace.createEvent(name: "Beach Day", date: organizerDay("2026-08-26"), policy: .buffer))
+
+            // Another source's stack is never captured for this source.
+            XCTAssertEqual(workspace.liveStackIDs([stackA.id, stackB.id], inLocation: locationA.id), [stackA.id])
+            workspace.requestSortInto(stackIDs: [stackA.id, stackB.id, "gone"], from: locationA.id)
+            let request = try XCTUnwrap(workspace.sortIntoRequest)
+            XCTAssertEqual(request.stackIDs, [stackA.id])
+
+            // A request naming only stacks that are no longer on the scan
+            // (a rescan replaced them) changes nothing and says so.
+            let stale = SortIntoRequest(sourceLocationID: locationA.id, stackIDs: ["gone", stackB.id], itemCount: 2, fileCount: 2)
+            workspace.completeSortInto(stale, eventID: beach)
+            XCTAssertTrue(model.configuration.photoEventAssignments.isEmpty)
+            XCTAssertTrue(model.statusMessage.contains("Nothing was sorted"), model.statusMessage)
+            XCTAssertNil(workspace.assignedEvent(for: stackB).event)
+
+            // An event that is gone is refused the same way.
+            workspace.completeSortInto(request, eventID: UUID())
+            XCTAssertTrue(model.configuration.photoEventAssignments.isEmpty)
+            XCTAssertTrue(model.statusMessage.contains("Nothing was sorted"), model.statusMessage)
+
+            // With nothing selected the picker still opens (New Event… stays
+            // reachable) but its choice sorts nothing.
+            workspace.selectStacks([])
+            workspace.requestSortInto(stackIDs: workspace.targetStackIDs(), from: locationA.id)
+            let empty = try XCTUnwrap(workspace.sortIntoRequest)
+            XCTAssertTrue(empty.stackIDs.isEmpty)
+            workspace.completeSortInto(empty, eventID: beach)
+            XCTAssertTrue(model.configuration.photoEventAssignments.isEmpty)
+
+            // Cancelling changes nothing.
+            workspace.requestSortInto(stackIDs: [stackA.id], from: locationA.id)
+            workspace.sortIntoRequest = nil
+            workspace.sortIntoSheetDidDismiss()
+            XCTAssertNil(workspace.newEventRequest)
+            XCTAssertTrue(model.configuration.photoEventAssignments.isEmpty)
+            XCTAssertEqual(model.configuration.savedEvents.map(\.id), [beach])
+        }
+    }
+
+    func testSortIntoPickerNewEventOpensAfterThePickerClosesAndSortsIntoIt() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let unsorted = root.appendingPathComponent("Drive/Unsorted A7V", isDirectory: true)
+            try writeOrganizerARW(unsorted.appendingPathComponent("DSC00001.ARW"), "2026:08:27 09:00:00", "000")
+            let location = addUnsorted(unsorted, to: model)
+            workspace.scan(location)
+            try await waitUntil { workspace.sources[location.id]?.result != nil }
+            let stack = try XCTUnwrap(workspace.sources[location.id]?.result?.stacks.first)
+
+            workspace.requestSortInto(stackIDs: [stack.id], from: location.id)
+            let picker = try XCTUnwrap(workspace.sortIntoRequest)
+            workspace.newEventFromSortInto(picker)
+            // The New Event sheet waits until the picker has closed.
+            XCTAssertNil(workspace.sortIntoRequest)
+            XCTAssertNil(workspace.newEventRequest)
+            workspace.sortIntoSheetDidDismiss()
+            let request = try XCTUnwrap(workspace.newEventRequest)
+            XCTAssertNil(workspace.newEventAfterSortInto)
+            XCTAssertEqual(request.sourceLocationID, location.id)
+            XCTAssertEqual(request.stackIDs, [stack.id])
+            XCTAssertNil(request.moveFromEventID)
+
+            workspace.completeNewEvent(request, name: "City Walk", date: organizerDay("2026-08-27"), policy: .buffer, parentEventID: nil)
+            let created = try XCTUnwrap(model.configuration.savedEvents.first { $0.name == "City Walk" })
+            XCTAssertEqual(workspace.assignedEvent(for: stack).event?.id, created.id)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: stack.coverItem.primary.path))
+
+            workspace.undo()
+            XCTAssertNil(workspace.assignedEvent(for: stack).event)
+            XCTAssertNotNil(workspace.event(created.id))
         }
     }
 

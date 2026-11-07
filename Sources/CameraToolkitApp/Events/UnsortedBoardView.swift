@@ -19,9 +19,6 @@ struct UnsortedBoardView: View {
     /// The filter popover — owned here, outside the bottom bar's
     /// renderings, so a width change cannot re-present it mid-layout.
     @State private var showFilters = false
-    /// The Event… picker sheet — outside the renderings for the same
-    /// reason as `showFilters`.
-    @State private var showEventPicker = false
 
     private var state: UnsortedSourceState {
         workspace.sources[location.id] ?? UnsortedSourceState()
@@ -220,7 +217,7 @@ struct UnsortedBoardView: View {
             sortedBytes: sorted.bytes,
             duplicates: collisions.duplicates,
             conflicts: collisions.conflicts
-        ) ?? "Select items, then press 1–3, drag onto an event, or press N for a new event"
+        ) ?? "Select items, then press 1–3 or E, drag onto an event, or press N for a new event"
         return BoardBottomBar(model: model, workspace: workspace, hint: hint) {
             AdaptiveBar(id: "unsorted-board", tierCount: 6) { tier in
                 let style: (EventAssignControls.Style, Bool, Bool) = switch tier {
@@ -238,14 +235,6 @@ struct UnsortedBoardView: View {
                         stacks: result.stacks,
                         search: $workspace.search,
                         matchedCount: matched
-                    )
-                    .eventPickerSheet(
-                        isPresented: $showEventPicker,
-                        workspace: workspace,
-                        verb: "Sort into",
-                        canAssign: !targets.isEmpty,
-                        onPick: { workspace.assign(stackIDs: targets, from: location.id, to: $0.id, orderedIDs: orderedIDs) },
-                        onNewEvent: { workspace.requestNewEvent(from: location.id) }
                     )
             }
         }
@@ -271,15 +260,19 @@ struct UnsortedBoardView: View {
                     .foregroundStyle(targets.isEmpty ? .secondary : .primary)
                     .lineLimit(1)
                     .fixedSize()
-                    .help(targets.isEmpty ? "Select items, then press 1–3, drag onto an event, or press N for a new event." : "")
+                    .help(targets.isEmpty ? "Select items, then press 1–3 or E, drag onto an event, or press N for a new event." : "")
                 EventAssignControls(
                     workspace: workspace,
                     verb: "Sort into",
                     canAssign: !targets.isEmpty,
                     style: assignStyle,
-                    pickerPresented: $showEventPicker,
+                    // The Sort Into sheet lives at the window root, so a width
+                    // change here can never drop or re-present it.
+                    onChooseEvent: {
+                        workspace.requestSortInto(stackIDs: workspace.targetStackIDs(), from: location.id, orderedIDs: orderedIDs)
+                    },
                     onAssign: { workspace.assign(stackIDs: targets, from: location.id, to: $0.id, orderedIDs: orderedIDs) },
-                    onNewEvent: { workspace.requestNewEvent(from: location.id) }
+                    onNewEvent: { workspace.requestNewEvent(from: location.id, orderedIDs: orderedIDs) }
                 )
                 Button {
                     workspace.unassign(stackIDs: targets, from: location.id)
@@ -355,7 +348,7 @@ struct UnsortedBoardView: View {
                 previewStackID = stack.id
             },
             onKey: { press, orderedIDs in handleKey(press, orderedIDs: orderedIDs) },
-            menu: { stack in LazyContextMenu { contextMenu(stack) } }
+            menu: { stack in LazyContextMenu { contextMenu(stack, groups: groups) } }
         )
     }
 
@@ -368,21 +361,20 @@ struct UnsortedBoardView: View {
     /// workspace answers every row from its stack-id index, so the menu
     /// opens instantly even mid-scan.
     @ViewBuilder
-    private func contextMenu(_ stack: OrganizeStack) -> some View {
+    private func contextMenu(_ stack: OrganizeStack, groups: [OrganizeBoardGroup]) -> some View {
         let menu = workspace.stackMenuState(forStackID: stack.id, inLocation: location.id)
         let targets = menu.targetIDs
-        Menu("Sort Into") {
-            ForEach(menu.eventTargets) { target in
-                Button(target.title) {
-                    workspace.assign(stackIDs: targets, from: location.id, to: target.id)
-                }
-            }
+        // One entry: the picker sheet searches every event, which a nested
+        // submenu of dozens of events could not.
+        Button("Sort Into…") {
+            workspace.requestSortInto(stackIDs: targets, from: location.id, orderedIDs: orderedStacks(in: groups).map(\.id))
         }
+        .help("Pick an event for the selection (E). Nothing moves until Apply.")
         Button("New Event from Selection…") {
             if !workspace.selectedStackIDs.contains(stack.id) {
                 workspace.selectStacks([stack.id])
             }
-            workspace.requestNewEvent(from: location.id)
+            workspace.requestNewEvent(from: location.id, orderedIDs: orderedStacks(in: groups).map(\.id))
         }
         Button("Unsort") {
             workspace.unassign(stackIDs: targets, from: location.id)
@@ -502,7 +494,11 @@ struct UnsortedBoardView: View {
             break
         }
         if press.characters.lowercased() == "n" {
-            workspace.requestNewEvent(from: location.id)
+            workspace.requestNewEvent(from: location.id, orderedIDs: orderedIDs)
+            return .handled
+        }
+        if press.characters.lowercased() == "e" {
+            workspace.requestSortInto(stackIDs: targets, from: location.id, orderedIDs: orderedIDs)
             return .handled
         }
         if let digit = press.characters.first?.wholeNumberValue, (1...3).contains(digit) {
