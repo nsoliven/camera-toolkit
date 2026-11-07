@@ -4444,3 +4444,217 @@ extension EventsWorkspaceTests {
         return url
     }
 }
+
+// MARK: - Clear from Card
+
+extension EventsWorkspaceTests {
+    /// Clear from Card deletes a card file only when it is sorted, in its
+    /// event on the drive, verified on the NAS by Sync to NAS, and every hash
+    /// still matches at click time. Everything else — and every drive and
+    /// NAS copy — stays exactly as it was.
+    func testClearFromCardRemovesOnlyFilesSafeOnTheDriveAndTheNAS() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            // Stands in for a card: never the drive's volume.
+            workspace.appliedSameVolumeCheck = { _, _, _ in false }
+            let card = root.appendingPathComponent("Card A7V", isDirectory: true)
+            let dcim = card.appendingPathComponent("DCIM/100MSDCF", isDirectory: true)
+            let safe = try writeOrganizerARW(dcim.appendingPathComponent("DSC00001.ARW"), "2026:08:26 10:00:00", "000")
+            let changed = try writeOrganizerARW(dcim.appendingPathComponent("DSC00002.ARW"), "2026:08:26 10:05:00", "000")
+            let driveOnly = try writeOrganizerARW(dcim.appendingPathComponent("DSC00003.ARW"), "2026:08:26 10:10:00", "000")
+            let notApplied = try writeOrganizerARW(dcim.appendingPathComponent("DSC00004.ARW"), "2026:08:26 10:15:00", "000")
+            let unsorted = try writeOrganizerARW(dcim.appendingPathComponent("DSC00005.ARW"), "2026:08:26 10:20:00", "000")
+            let clip = try organizerWrite(card.appendingPathComponent("M4ROOT/CLIP/C0001.MP4"), String(repeating: "clip", count: 64))
+            let clipXML = try organizerWrite(card.appendingPathComponent("M4ROOT/CLIP/C0001M01.XML"), "<NonRealTimeMeta/>")
+            let preview = try organizerWrite(card.appendingPathComponent("M4ROOT/THMBNL/C0001T01.JPG"), "preview")
+            let index = try organizerWrite(card.appendingPathComponent("M4ROOT/MEDIAPRO.XML"), "<MediaProfile/>")
+            let location = addUnsorted(card, to: model)
+            workspace.scan(location)
+            try await waitUntil { workspace.sources[location.id]?.result != nil }
+            let result = try XCTUnwrap(workspace.sources[location.id]?.result)
+            func stack(_ url: URL) throws -> OrganizeStack {
+                try XCTUnwrap(result.stacks.first { $0.files.contains { $0.path == url.standardizedFileURL.path } })
+            }
+
+            let beach = try XCTUnwrap(workspace.createEvent(name: "Beach Day", date: organizerDay("2026-08-26"), policy: .buffer))
+            let hotel = try XCTUnwrap(workspace.createEvent(name: "Hotel Night", date: organizerDay("2026-08-26"), policy: .buffer))
+            workspace.assign(stackIDs: Set(try [safe, changed, notApplied, clip].map { try stack($0).id }), from: location.id, to: beach)
+            workspace.assign(stackIDs: [try stack(driveOnly).id], from: location.id, to: hotel)
+
+            // A card Apply copies into the event and leaves the original.
+            var driveCopies: [URL: URL] = [:]
+            for url in [safe, changed, driveOnly, clip, clipXML] {
+                let file = try XCTUnwrap(result.items.flatMap(\.files).first { $0.path == url.standardizedFileURL.path })
+                let row = try XCTUnwrap(workspace.assignment(for: file))
+                let event = try XCTUnwrap(workspace.event(row.eventID))
+                let copy = try XCTUnwrap(workspace.locations.driveURL(for: row, event: event, policy: workspace.locations.resolvedPolicy(for: event)))
+                try FileManager.default.createDirectory(at: copy.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try FileManager.default.copyItem(at: url, to: copy)
+                driveCopies[url] = copy
+            }
+            // Sync to NAS verifies Beach Day only; Hotel Night stays drive-only.
+            let nas = root.appendingPathComponent("Library", isDirectory: true)
+            try FileManager.default.createDirectory(at: nas, withIntermediateDirectories: true)
+            workspace.syncToNAS(beach)
+            try await waitUntil { !model.isBusy }
+            XCTAssertEqual(model.jobs.first?.state, .done, model.jobs.first?.note ?? "")
+            // After that verification, the second photo's drive copy changes
+            // (same size and time, so only a fresh hash can tell).
+            let changedCopy = try XCTUnwrap(driveCopies[changed])
+            let stamp = try XCTUnwrap(FileManager.default.attributesOfItem(atPath: changedCopy.path)[.modificationDate] as? Date)
+            let size = try XCTUnwrap(FileManager.default.attributesOfItem(atPath: changedCopy.path)[.size] as? NSNumber).intValue
+            try Data(repeating: 0x5A, count: size).write(to: changedCopy)
+            try FileManager.default.setAttributes([.modificationDate: stamp], ofItemAtPath: changedCopy.path)
+
+            await workspace.refreshAppliedSources(for: location.id)
+            let summary = try XCTUnwrap(workspace.cardClearSummaries[result.rootPath])
+            XCTAssertEqual(summary.clearableFiles, 4)   // safe, changed, clip + XML
+            XCTAssertEqual(summary.waitingForNASFiles, 1)
+            XCTAssertTrue(CardClearWording.bannerLine(summary).contains("4 files here are safe on"))
+            XCTAssertTrue(CardClearWording.bannerLine(summary).contains("1 waiting for Sync to NAS"))
+
+            let buffer = root.appendingPathComponent("Drive/Camera Buffer", isDirectory: true)
+            func tree(_ folder: URL) throws -> [String: Data] {
+                var all: [String: Data] = [:]
+                let walker = FileManager.default.enumerator(at: folder, includingPropertiesForKeys: [.isRegularFileKey])
+                while let url = walker?.nextObject() as? URL {
+                    guard (try url.resourceValues(forKeys: [.isRegularFileKey])).isRegularFile == true else { continue }
+                    all[url.path] = try Data(contentsOf: url)
+                }
+                return all
+            }
+            let bufferBefore = try tree(buffer)
+            let nasBefore = try tree(nas)
+            XCTAssertFalse(nasBefore.isEmpty)
+
+            // The sheet: counts per event, what stays, the NAS answer.
+            await workspace.requestClearFromCard(location.id)
+            let request = try XCTUnwrap(workspace.pendingCardClear)
+            XCTAssertEqual(request.fileCount, 4)
+            XCTAssertEqual(request.events.map(\.name).count, 1)
+            XCTAssertEqual(request.waitingForNASFiles, 1)
+            XCTAssertTrue(request.nasReachable)
+            XCTAssertNotNil(CardClearWording.skippedNote(request))
+            XCTAssertTrue(CardClearConfirmSheet.isConfirmed("DELETE"))
+            XCTAssertFalse(CardClearConfirmSheet.isConfirmed("delete"))
+
+            // Cancel and a wrong token remove nothing and start nothing.
+            workspace.pendingCardClear = nil
+            workspace.confirmCardClear(request, confirmation: "delete")
+            XCTAssertFalse(model.isBusy)
+            for url in [safe, changed, clip, clipXML] {
+                XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
+            }
+
+            // Confirmed while another job holds the gate: it waits in Jobs
+            // as queued, below the running job, and nothing is deleted yet.
+            model.jobHistoryEnabled = true
+            let release = BlockerRelease()
+            model.runBackgroundJob(
+                action: .organize,
+                runningNote: "Another job",
+                logTitle: "Another job",
+                logDetail: "",
+                operation: { _ in
+                    while !release.isSet { Thread.sleep(forTimeInterval: 0.01) }
+                    return 0
+                },
+                completion: { _ in "Done." }
+            )
+            workspace.confirmCardClear(request, confirmation: FreeUpService.confirmationToken)
+            let queued = try XCTUnwrap(model.jobs.first { $0.action == .freeUp && $0.state == .queued })
+            XCTAssertEqual(model.activeJob?.action, .organize)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: safe.path))
+            release.set()
+            try await waitUntil { model.jobs.first(where: { $0.id == queued.id })?.state == .done }
+            try await waitUntil { !model.isBusy && workspace.sources[location.id]?.isScanning == false }
+            let finished = try XCTUnwrap(model.jobs.first { $0.id == queued.id })
+            XCTAssertTrue(finished.note.contains("Cleared 3 files"), finished.note)
+
+            // The job record carries the phases and one row per file, with
+            // the reason for the one that stayed.
+            model.flushJobHistory()
+            let historyURL = JobHistoryStore.defaultURL(catalogURL: URL(fileURLWithPath: DashboardModel.expandedPath(model.configuration.catalogDatabasePath)))
+            let store = try XCTUnwrap(JobHistoryStore.shared(at: historyURL))
+            try await waitUntil { ((try? store.items(jobID: queued.id)) ?? []).count == 4 }
+            let record = try XCTUnwrap(try store.job(id: queued.id))
+            XCTAssertEqual(record.kind, JobAction.freeUp.rawValue)
+            XCTAssertEqual(record.summary?.phases.map(\.label), ["Verify", "Remove"])
+            let rows = try store.items(jobID: queued.id)
+            XCTAssertEqual(rows.filter { $0.outcome == .matched }.map(\.fileName).sorted(), ["C0001.MP4", "C0001M01.XML", "DSC00001.ARW"])
+            let stayed = try XCTUnwrap(rows.first { $0.outcome == .failed })
+            XCTAssertEqual(stayed.fileName, "DSC00002.ARW")
+            XCTAssertTrue(stayed.error?.hasPrefix("Skipped in Verify: ") == true, stayed.error ?? "")
+            XCTAssertEqual(record.matchedExisting, 3)
+            XCTAssertEqual(record.failed, 1)
+            XCTAssertEqual(record.outcome, .succeeded)
+            XCTAssertEqual(stayed.verifyMethod, "NAS re-read")
+
+            // Gone: exactly the verified photo and the clip with its XML.
+            for url in [safe, clip, clipXML] {
+                XCTAssertFalse(FileManager.default.fileExists(atPath: url.path), url.lastPathComponent)
+            }
+            // Stayed: the changed copy's original, the drive-only file, the
+            // sorted-not-applied and unsorted files, and the camera's own files.
+            for url in [changed, driveOnly, notApplied, unsorted, preview, index] {
+                XCTAssertTrue(FileManager.default.fileExists(atPath: url.path), url.lastPathComponent)
+            }
+            // Drive and NAS copies are byte-for-byte as they were.
+            XCTAssertEqual(try tree(buffer), bufferBefore)
+            XCTAssertEqual(try tree(nas), nasBefore)
+
+            // The rescanned board no longer lists what left the card.
+            let rescanned = try XCTUnwrap(workspace.sources[location.id]?.result)
+            let names = Set(rescanned.items.flatMap(\.files).map(\.name))
+            XCTAssertEqual(names, ["DSC00002.ARW", "DSC00003.ARW", "DSC00004.ARW", "DSC00005.ARW"])
+        }
+    }
+}
+
+extension EventsWorkspaceTests {
+    /// File jobs wait in Jobs as queued behind the running job, start in
+    /// order when it settles, and a job that finds nothing to do when its
+    /// turn comes closes its row without running.
+    func testFileJobsQueueBehindTheRunningJob() async throws {
+        try await withOrganizerSandbox { _, model, _ in
+            let release = BlockerRelease()
+            model.runBackgroundJob(
+                action: .organize, runningNote: "Another job", logTitle: "Another job", logDetail: "",
+                operation: { _ in
+                    while !release.isSet { Thread.sleep(forTimeInterval: 0.01) }
+                    return 0
+                },
+                completion: { _ in "Done." }
+            )
+            let ran = BlockerRelease()
+            let first = model.enqueueFileJob(action: .freeUp, queuedNote: "First.", detail: "") { id in
+                model.runBackgroundJob(
+                    action: .freeUp, runningNote: "First", logTitle: "First", logDetail: "", jobID: id,
+                    operation: { _ in ran.set(); return 1 },
+                    completion: { _ in "First done." }
+                )
+            }
+            let second = model.enqueueFileJob(action: .freeUp, queuedNote: "Second.", detail: "", skippedNote: "Nothing to do.") { _ in }
+            XCTAssertEqual(model.jobs.first { $0.id == first }?.state, .queued)
+            XCTAssertEqual(model.jobs.first { $0.id == second }?.state, .queued)
+            XCTAssertEqual(model.activeJob?.action, .organize)
+            XCTAssertFalse(ran.isSet)
+
+            release.set()
+            try await waitUntil { model.jobs.first { $0.id == second }?.state == .cancelled }
+            XCTAssertTrue(ran.isSet)
+            XCTAssertEqual(model.jobs.first { $0.id == first }?.state, .done)
+            XCTAssertEqual(model.jobs.first { $0.id == first }?.note, "First done.")
+            XCTAssertEqual(model.jobs.first { $0.id == second }?.note, "Nothing to do.")
+            XCTAssertEqual(model.jobs.filter { $0.id == first }.count, 1, "the queued row turns running in place")
+            XCTAssertFalse(model.isBusy)
+        }
+    }
+}
+
+/// Lets a test hold a background job open until it says so.
+final class BlockerRelease: @unchecked Sendable {
+    private let lock = NSLock()
+    private var released = false
+    var isSet: Bool { lock.withLock { released } }
+    func set() { lock.withLock { released = true } }
+}
