@@ -28,6 +28,9 @@ struct JobActivityDetail: View {
     var fixedNow: Date?
     /// Opens the Files list on its Issues filter; nil when there is no list.
     var showIssues: (() -> Void)?
+    /// Opens a file's two copies side by side; nil where there is nothing
+    /// to compare (not a Sync to NAS job).
+    var compare: ((JobHistoryItem, CompareRequest.Mode) -> Void)?
 
     var isLive: Bool {
         guard let live else { return false }
@@ -218,7 +221,7 @@ struct JobActivityDetail: View {
             }
             debugLines
             if let job = detail?.job, !isLive {
-                JobIssueSection(job: job, items: detail?.items ?? [], showIssues: showIssues)
+                JobIssueSection(job: job, items: detail?.items ?? [], showIssues: showIssues, compare: compare)
             }
         }
         .padding(.horizontal, 4)
@@ -599,6 +602,7 @@ private struct JobIssueSection: View {
     let job: JobHistoryJob
     let items: [JobHistoryItem]
     let showIssues: (() -> Void)?
+    let compare: ((JobHistoryItem, CompareRequest.Mode) -> Void)?
     @State private var expanded = true
 
     /// Files listed here before the rest wait in the Files list.
@@ -684,6 +688,11 @@ private struct JobIssueSection: View {
                 Text(item.fileName)
                     .font(.callout.monospaced())
                     .help(item.relativePath)
+                if item.outcome == .conflict, let compare {
+                    Button("Compare…") { compare(item, .conflict) }
+                        .controlSize(.small)
+                        .help("See both versions side by side and choose which to keep")
+                }
             }
             if let error = item.error, !error.isEmpty {
                 Text(error)

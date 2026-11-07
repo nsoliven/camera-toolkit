@@ -1672,6 +1672,37 @@ extension EventsWorkspace {
         model.statusMessage = "\(direction.past) “\(entry.title)”."
     }
 
+    /// A conflict resolved in the Jobs window. Undo runs as a job that moves
+    /// what the resolution put in place aside (NAS `_Stale Copies`, drive
+    /// `_Trash`) and returns the originals; Redo resolves again the same
+    /// way, refusing if either copy changed. In memory only: the on-disk
+    /// journal under the catalog's "Conflict Resolutions" keeps the record.
+    func recordConflictUndo(_ resolution: ConflictResolution, title: String) {
+        final class Box { var current: ConflictResolution; init(_ value: ConflictResolution) { current = value } }
+        let box = Box(resolution)
+        let name = (resolution.pair.relativePath as NSString).lastPathComponent
+        recordSessionUndo(
+            title,
+            detail: "Undo moves the version put in place aside and brings the original back. Nothing is deleted.",
+            undo: { [weak self] in
+                self?.model.undoConflictResolution(box.current) { undone in
+                    if let undone { box.current = undone }
+                }
+            },
+            redo: { [weak self] in
+                guard let self else { return }
+                let original = box.current
+                model.resolveConflict(
+                    original.pair, choice: original.choice,
+                    expectedDrive: original.driveSHA256, expectedNAS: original.nasSHA256,
+                    fileName: name
+                ) { redone in
+                    if let redone { box.current = redone }
+                }
+            }
+        )
+    }
+
     /// A duplicate resolution: the copies that went to Trash, the entries
     /// that were dropped (also those whose file stayed), and the NAS copies
     /// that were set aside.

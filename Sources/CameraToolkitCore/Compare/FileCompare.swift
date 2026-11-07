@@ -33,7 +33,9 @@ public struct FileComparison: Equatable, Sendable {
 
     /// Which side was saved later, when both dates are known.
     public var newer: Side? {
-        guard let left = drive.modified, let right = nas.modified, left != right else { return nil }
+        // Identical copies have no newer side, and a second's difference is
+        // a filesystem's rounding, not a later save.
+        guard !identical, let left = drive.modified, let right = nas.modified, abs(left.timeIntervalSince(right)) >= 1 else { return nil }
         return left > right ? .drive : .nas
     }
 

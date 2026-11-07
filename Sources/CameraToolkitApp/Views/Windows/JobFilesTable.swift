@@ -262,6 +262,8 @@ struct JobHistoryFileTable: View {
     @Binding var filter: JobHistoryFileFilter
     /// The job's kind, for how its files' outcomes read.
     var kind = ""
+    /// Opens a row's two copies; nil where there is nothing to compare.
+    var compare: ((JobHistoryItem, CompareRequest.Mode) -> Void)?
     @State private var selection: JobHistoryFileRow.ID?
     @State private var sortOrder = [KeyPathComparator(\JobHistoryFileRow.start)]
 
@@ -338,6 +340,19 @@ struct JobHistoryFileTable: View {
                     .width(min: 90, ideal: 130)
                 }
                 .font(.caption)
+                .contextMenu(forSelectionType: JobHistoryFileRow.ID.self) { ids in
+                    if let compare, ids.count == 1, let id = ids.first, items.indices.contains(id) {
+                        let item = items[id]
+                        switch item.outcome {
+                        case .conflict:
+                            Button("Compare…") { compare(item, .conflict) }
+                        case .copied, .matched, .alreadyVerified:
+                            Button("View Both Copies") { compare(item, .viewOnly) }
+                        case .failed:
+                            EmptyView()
+                        }
+                    }
+                }
                 .onChange(of: selection) { _, id in
                     guard let id, items.indices.contains(id), let start = items[id].start else { return }
                     zoom.show(start...items[id].end, padding: 0.6)

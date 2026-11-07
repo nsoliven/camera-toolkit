@@ -89,7 +89,7 @@ public enum ConflictResolveError: Error, Equatable, LocalizedError {
 /// SHA-256 matches. Both copies are re-hashed first and must still be the
 /// ones the owner compared. Afterwards `nas_sync_files` records the pair
 /// as verified, so the next Sync to NAS reports no conflict.
-public struct ConflictResolver {
+public struct ConflictResolver: Sendable {
     public static let staleFolderPath = NASMoveFollower.staleFolderPath
     public static let temporaryMarker = ".ctresolve-"
 
