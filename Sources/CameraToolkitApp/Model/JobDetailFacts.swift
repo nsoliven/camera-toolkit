@@ -124,10 +124,10 @@ enum JobDetailFacts {
     /// What the job did to its files: for Sync to NAS, bytes copied against
     /// files already there and what was verified; for other jobs, files
     /// and bytes processed. Problems are always last.
-    static func tally(job: JobHistoryJob?, live: JobSnapshot?) -> [JobTallyItem] {
-        var items: [JobTallyItem] = []
+    static func tally(job: JobHistoryJob?, live: JobSnapshot?, items: [JobHistoryItem] = []) -> [JobTallyItem] {
+        var result: [JobTallyItem] = []
         if let job, job.kind == JobAction.syncBuffer.rawValue {
-            items.append(JobTallyItem(
+            result.append(JobTallyItem(
                 label: "Copied",
                 value: job.bytesDone > 0 ? "\(job.bytesDone.formattedBytes) · \(job.copied.formatted()) file\(job.copied == 1 ? "" : "s")" : (job.outcome == .running ? "Nothing yet" : "Nothing"),
                 help: "\(job.bytesDone.formatted()) bytes written to the NAS"
@@ -136,27 +136,41 @@ enum JobDetailFacts {
                 ?? live?.telemetry?.phases.filter { $0.label == "Verify" || $0.label == "Remote verify (NAS)" }.reduce(Int64(0)) { $0 + $1.bytes }
             if let verifiedBytes, verifiedBytes > 0 {
                 let method = job.summary?.verifyMethod.map { $0 == "ssh" ? " on the NAS" : " over SMB" } ?? ""
-                items.append(JobTallyItem(label: "Verified", value: "\(verifiedBytes.formattedBytes)\(method)", help: "Bytes checked against the drive's SHA-256 after copying"))
+                result.append(JobTallyItem(label: "Verified", value: "\(verifiedBytes.formattedBytes)\(method)", help: "Bytes checked against the drive's SHA-256 after copying"))
             }
             let already = job.matchedExisting + job.alreadyVerified
             if already > 0 {
-                items.append(JobTallyItem(label: "Already there", value: "\(already.formatted()) file\(already == 1 ? "" : "s")", help: "Files the NAS already held — checked, not copied"))
+                result.append(JobTallyItem(label: "Already there", value: "\(already.formatted()) file\(already == 1 ? "" : "s")", help: "Files the NAS already held — checked, not copied"))
             }
+        } else if let job, JobHistoryItemOutcome.removes(job.kind), job.matchedExisting + job.failed > 0 {
+            let removedBytes = items.filter { $0.outcome == .matched }.reduce(Int64(0)) { $0 + $1.byteCount }
+            do {
+                var value = "\(job.matchedExisting.formatted()) file\(job.matchedExisting == 1 ? "" : "s")"
+                if removedBytes > 0 { value += " · \(removedBytes.formattedBytes)" }
+                result.append(JobTallyItem(label: "Removed", value: value, help: "Files whose every copy matched, then removed"))
+            }
+            if job.failed > 0 {
+                result.append(JobTallyItem(
+                    label: "Skipped", value: "\(job.failed.formatted()) kept", tone: .warning,
+                    help: "Files that did not pass a check; they were left where they were"
+                ))
+            }
+            return result
         } else if let job {
             let files = job.totalFiles > 0 ? job.totalFiles : (live?.processedFiles ?? 0)
             if files > 0 {
                 let done = live.map(\.processedFiles) ?? files
-                items.append(JobTallyItem(label: "Files", value: live?.state == .running ? "\(done.formatted()) of \(files.formatted())" : files.formatted()))
+                result.append(JobTallyItem(label: "Files", value: live?.state == .running ? "\(done.formatted()) of \(files.formatted())" : files.formatted()))
             }
             if job.bytesDone > 0 {
-                items.append(JobTallyItem(label: "Data", value: job.bytesDone.formattedBytes, help: "\(job.bytesDone.formatted()) bytes"))
+                result.append(JobTallyItem(label: "Data", value: job.bytesDone.formattedBytes, help: "\(job.bytesDone.formatted()) bytes"))
             }
         } else if let live {
             if live.totalFiles > 0 || live.processedFiles > 0 {
-                items.append(JobTallyItem(label: "Files", value: live.totalFiles > 0 ? "\(live.processedFiles.formatted()) of \(live.totalFiles.formatted())" : live.processedFiles.formatted()))
+                result.append(JobTallyItem(label: "Files", value: live.totalFiles > 0 ? "\(live.processedFiles.formatted()) of \(live.totalFiles.formatted())" : live.processedFiles.formatted()))
             }
             if live.processedBytes > 0 {
-                items.append(JobTallyItem(label: "Data", value: live.processedBytes.formattedBytes))
+                result.append(JobTallyItem(label: "Data", value: live.processedBytes.formattedBytes))
             }
         }
         if let job {
@@ -164,13 +178,13 @@ enum JobDetailFacts {
             if job.conflicts > 0 { problems.append("\(job.conflicts.formatted()) conflict\(job.conflicts == 1 ? "" : "s")") }
             if job.failed > 0 { problems.append("\(job.failed.formatted()) failed") }
             if !problems.isEmpty {
-                items.append(JobTallyItem(
+                result.append(JobTallyItem(
                     label: "Issues", value: problems.joined(separator: " · "), tone: job.failed > 0 ? .failure : .warning,
                     help: "Conflicts are left untouched; the Files list's Issues filter shows each one"
                 ))
             }
         }
-        return items
+        return result
     }
 
     /// "4 transfers in parallel · SSH verify · NAS SHA-256 (…) · 2 NAS batches"
@@ -292,6 +306,9 @@ extension JobDetailFacts {
     }
 
     static func outcomeDisplay(_ outcome: JobHistoryOutcome, job: JobHistoryJob?) -> JobOutcomeDisplay {
+        if let job, JobHistoryItemOutcome.removes(job.kind), outcome == .succeeded, job.failed > 0 {
+            return JobOutcomeDisplay(label: "Done · \(job.failed.formatted()) skipped", symbol: "exclamationmark.triangle.fill", tone: .warning)
+        }
         if let job, endedWithOnlyConflicts(job) {
             return JobOutcomeDisplay(
                 label: "Done · \(job.conflicts.formatted()) conflict\(job.conflicts == 1 ? "" : "s")",
@@ -322,7 +339,8 @@ extension JobDetailFacts {
             text = String(text[..<range.lowerBound])
         }
         // "Sync to NAS for all events: …" — the job's title already says it.
-        if let colon = text.range(of: ": "), text.distance(from: text.startIndex, to: colon.lowerBound) < 80 {
+        if let colon = text.range(of: ": "), text.distance(from: text.startIndex, to: colon.lowerBound) < 80,
+           !text[..<colon.lowerBound].contains(".") {
             text = String(text[colon.upperBound...])
         }
         var clauses: [String] = []
@@ -373,6 +391,9 @@ extension JobDetailFacts {
 
     /// The issue section's one-line answer to "why did it end this way?".
     static func issueHeadline(_ job: JobHistoryJob) -> String {
+        if JobHistoryItemOutcome.removes(job.kind), job.failed > 0, job.summary?.stoppedReason == nil {
+            return "\(job.failed.formatted()) file\(job.failed == 1 ? "" : "s") skipped and kept — not every check passed, so nothing was removed for \(job.failed == 1 ? "it" : "them")"
+        }
         if endedWithOnlyConflicts(job) {
             return "Finished — \(job.conflicts.formatted()) file\(job.conflicts == 1 ? "" : "s") left untouched because the NAS holds a different version"
         }
@@ -388,8 +409,13 @@ extension JobDetailFacts {
     }
 
     /// What a file's problem means and what the owner can do about it.
-    static func advice(for item: JobHistoryItem) -> String {
-        switch item.outcome {
+    static func advice(for item: JobHistoryItem, kind: String = "") -> String {
+        if JobHistoryItemOutcome.removes(kind) {
+            return item.outcome == .failed || item.outcome == .conflict
+                ? "Left where it was. Sync it again (or bring its copies back), then run the job again."
+                : ""
+        }
+        return switch item.outcome {
         case .conflict:
             "The NAS already has a different file at this path. Neither copy was changed; keep the one you want and sync again."
         case .failed:

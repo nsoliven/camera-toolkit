@@ -184,7 +184,7 @@ struct JobActivityDetail: View {
 
     @ViewBuilder
     private var tally: some View {
-        let items = JobDetailFacts.tally(job: detail?.job, live: live)
+        let items = JobDetailFacts.tally(job: detail?.job, live: live, items: detail?.items ?? [])
         if !items.isEmpty {
             WrappingRowLayout(spacing: 26, rowSpacing: 8) {
                 ForEach(Array(items.enumerated()), id: \.offset) { _, item in
@@ -656,6 +656,7 @@ private struct JobIssueSection: View {
                     .controlSize(.small)
                 }
                 .padding(.top, 6)
+                .frame(maxWidth: .infinity, alignment: .leading)
                 .textSelection(.enabled)
             } label: {
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
@@ -677,9 +678,9 @@ private struct JobIssueSection: View {
     private func issueRow(_ item: JobHistoryItem) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack(alignment: .firstTextBaseline, spacing: 6) {
-                Text(item.outcome.label)
+                Text(item.outcome.label(kind: job.kind))
                     .font(.caption.weight(.bold))
-                    .foregroundStyle(item.outcome.tint)
+                    .foregroundStyle(item.outcome.tint(kind: job.kind))
                 Text(item.fileName)
                     .font(.callout.monospaced())
                     .help(item.relativePath)
@@ -689,7 +690,7 @@ private struct JobIssueSection: View {
                     .font(.caption)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            Text(JobDetailFacts.advice(for: item))
+            Text(JobDetailFacts.advice(for: item, kind: job.kind))
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -906,6 +907,8 @@ struct PhaseBreakdown: View {
         case "Remote verify (NAS)": .mint
         case "Hash": .teal
         case "Rename": .purple
+        case "Remove": .orange
+        case "Check": .gray
         default: .gray
         }
     }

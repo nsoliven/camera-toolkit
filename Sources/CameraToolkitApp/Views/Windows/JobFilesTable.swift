@@ -70,6 +70,28 @@ extension JobHistoryOutcome {
 }
 
 extension JobHistoryItemOutcome {
+    /// Jobs that remove files (Clear from Card and the other free-space
+    /// jobs, kind `freeUp`) record their files with the sync outcomes the
+    /// table allows: `matched` — every copy matched — is a file removed,
+    /// `failed` a file skipped and kept, its phase and reason in the row.
+    static func removes(_ kind: String) -> Bool { kind == JobAction.freeUp.rawValue }
+
+    func label(kind: String) -> String {
+        guard Self.removes(kind) else { return label }
+        return switch self {
+        case .matched, .copied, .alreadyVerified: "Removed"
+        case .failed, .conflict: "Skipped"
+        }
+    }
+
+    func tint(kind: String) -> Color {
+        guard Self.removes(kind) else { return tint }
+        return switch self {
+        case .matched, .copied, .alreadyVerified: .green
+        case .failed, .conflict: .orange
+        }
+    }
+
     var label: String {
         switch self {
         case .copied: "Copied"
@@ -121,8 +143,8 @@ enum JobHistoryText {
     }
 
     /// A file's exact stats, for its row's tooltip.
-    static func item(_ item: JobHistoryItem) -> String {
-        var lines = ["\(item.relativePath)", "\(item.byteCount.formattedBytes) (\(item.byteCount.formatted()) bytes) · \(item.outcome.label)"]
+    static func item(_ item: JobHistoryItem, kind: String = "") -> String {
+        var lines = ["\(item.relativePath)", "\(item.byteCount.formattedBytes) (\(item.byteCount.formatted()) bytes) · \(item.outcome.label(kind: kind))"]
         if let start = item.start {
             lines.append("In flight \(JobActivityDetail.durationText(start)) → \(JobActivityDetail.durationText(item.end)) · \(seconds(item.end - start))")
         } else {
@@ -131,11 +153,14 @@ enum JobHistoryText {
         var timing: [String] = []
         if let copy = item.copySeconds { timing.append("copy \(seconds(copy))") }
         if let verify = item.verifySeconds {
-            timing.append("verify \(seconds(verify))\(item.verifyMethod.map { $0 == "ssh" ? " on the NAS (SSH)" : " over SMB" } ?? "")")
+            timing.append("verify \(seconds(verify))\(item.verifyMethod.map { $0 == "ssh" ? " on the NAS (SSH)" : $0 == "smb" ? " over SMB" : " (\($0))" } ?? "")")
         }
         if !timing.isEmpty { lines.append(timing.joined(separator: " · ")) }
         if let speed = item.averageMegabytesPerSecond { lines.append("\(JobThroughputFormat.rate(speed)) MB/s over its time in flight") }
         if let slot = item.slot { lines.append("Transfer \(slot + 1)") }
+        if item.verifySeconds == nil, let method = item.verifyMethod, method != "ssh", method != "smb" {
+            lines.append("Checked against the \(method)")
+        }
         if let error = item.error { lines.append(error) }
         return lines.joined(separator: "\n")
     }
@@ -166,13 +191,14 @@ final class JobHistoryHover {
 struct JobHistoryFileRow: Identifiable, Hashable {
     let id: Int
     let item: JobHistoryItem
+    var kind = ""
 
     var name: String { item.fileName }
     var size: Int64 { item.byteCount }
     var start: Double { item.start ?? item.end }
     var duration: Double { item.duration ?? 0 }
     var speed: Double { item.averageMegabytesPerSecond ?? 0 }
-    var outcome: String { item.outcome.label }
+    var outcome: String { item.outcome.label(kind: kind) }
 }
 
 enum JobHistoryFileFilter: String, CaseIterable, Identifiable {
@@ -182,6 +208,32 @@ enum JobHistoryFileFilter: String, CaseIterable, Identifiable {
     case issues = "Issues"
 
     var id: String { rawValue }
+
+    /// The filters a job of `kind` offers: a removing job has no "already
+    /// there", and its two outcomes are Removed and Skipped.
+    static func available(kind: String) -> [JobHistoryFileFilter] {
+        JobHistoryItemOutcome.removes(kind) ? [.all, .transferred, .issues] : allCases
+    }
+
+    func title(kind: String) -> String {
+        guard JobHistoryItemOutcome.removes(kind) else { return rawValue }
+        return switch self {
+        case .all: "All"
+        case .transferred: "Removed"
+        case .skipped: "Already There"
+        case .issues: "Skipped"
+        }
+    }
+
+    func includes(_ outcome: JobHistoryItemOutcome, kind: String) -> Bool {
+        guard JobHistoryItemOutcome.removes(kind) else { return includes(outcome) }
+        return switch self {
+        case .all: true
+        case .transferred: outcome != .failed && outcome != .conflict
+        case .skipped: false
+        case .issues: outcome == .failed || outcome == .conflict
+        }
+    }
 
     func includes(_ outcome: JobHistoryItemOutcome) -> Bool {
         switch self {
@@ -193,8 +245,8 @@ enum JobHistoryFileFilter: String, CaseIterable, Identifiable {
     }
 
     /// Rows of `items` this filter keeps, sorted.
-    static func rows(_ items: [JobHistoryItem], filter: JobHistoryFileFilter, sortedBy order: [KeyPathComparator<JobHistoryFileRow>]) -> [JobHistoryFileRow] {
-        items.indices.compactMap { filter.includes(items[$0].outcome) ? JobHistoryFileRow(id: $0, item: items[$0]) : nil }
+    static func rows(_ items: [JobHistoryItem], filter: JobHistoryFileFilter, kind: String = "", sortedBy order: [KeyPathComparator<JobHistoryFileRow>]) -> [JobHistoryFileRow] {
+        items.indices.compactMap { filter.includes(items[$0].outcome, kind: kind) ? JobHistoryFileRow(id: $0, item: items[$0], kind: kind) : nil }
             .sorted(using: order)
     }
 }
@@ -208,11 +260,13 @@ struct JobHistoryFileTable: View {
     let hover: JobHistoryHover
     /// Shared with the issue section, which can jump here to Issues.
     @Binding var filter: JobHistoryFileFilter
+    /// The job's kind, for how its files' outcomes read.
+    var kind = ""
     @State private var selection: JobHistoryFileRow.ID?
     @State private var sortOrder = [KeyPathComparator(\JobHistoryFileRow.start)]
 
     var body: some View {
-        let rows = JobHistoryFileFilter.rows(items, filter: filter, sortedBy: sortOrder)
+        let rows = JobHistoryFileFilter.rows(items, filter: filter, kind: kind, sortedBy: sortOrder)
         VStack(spacing: 0) {
             HStack(spacing: 8) {
                 Text("Files")
@@ -222,7 +276,7 @@ struct JobHistoryFileTable: View {
                     .foregroundStyle(.secondary)
                 Spacer(minLength: 8)
                 Picker("Show", selection: $filter) {
-                    ForEach(JobHistoryFileFilter.allCases) { Text($0.rawValue).tag($0) }
+                    ForEach(JobHistoryFileFilter.available(kind: kind)) { Text($0.title(kind: kind)).tag($0) }
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
@@ -242,7 +296,7 @@ struct JobHistoryFileTable: View {
                         JobHistoryCell(row: row, hover: hover) {
                             HStack(spacing: 6) {
                                 Circle()
-                                    .fill(row.item.outcome.tint)
+                                    .fill(row.item.outcome.tint(kind: kind))
                                     .frame(width: 7, height: 7)
                                 Text(row.name)
                                     .lineLimit(1)
@@ -277,8 +331,8 @@ struct JobHistoryFileTable: View {
                     .width(min: 70, ideal: 86)
                     TableColumn("Outcome", value: \.outcome) { row in
                         JobHistoryCell(row: row, hover: hover) {
-                            let method = row.item.verifyMethod.map { $0 == "ssh" ? " · SSH" : " · SMB" } ?? ""
-                            Text("\(Text(row.outcome).foregroundStyle(row.item.outcome.tint))\(Text(method).foregroundStyle(.secondary))")
+                            let method = row.item.verifyMethod.map { $0 == "ssh" ? " · SSH" : $0 == "smb" ? " · SMB" : "" } ?? ""
+                            Text("\(Text(row.outcome).foregroundStyle(row.item.outcome.tint(kind: kind)))\(Text(method).foregroundStyle(.secondary))")
                         }
                     }
                     .width(min: 90, ideal: 130)
@@ -314,6 +368,6 @@ private struct JobHistoryCell<Content: View>: View {
                     hover.row = nil
                 }
             }
-            .help(JobHistoryText.item(row.item))
+            .help(JobHistoryText.item(row.item, kind: row.kind))
     }
 }

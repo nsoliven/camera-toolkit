@@ -63,7 +63,7 @@ struct TransferQueueView: View {
         let recording = model.jobs.compactMap { job in
             recorded.contains(job.id) ? nil : model.jobHistoryRecorders[job.id]?.currentJob()
         }
-        return JobsList.sections(session: model.jobs, history: history.jobs + recording)
+        return JobsList.sections(session: model.jobs, history: history.jobs + recording, queueOrder: model.queuedFileJobs.map(\.id))
     }
 
     var body: some View {
@@ -135,6 +135,13 @@ struct TransferQueueView: View {
     private func detailPane(_ id: UUID?, sections: JobsList.Sections) -> some View {
         if let id, let index = model.pendingTransferBatches.firstIndex(where: { $0.id == id }) {
             QueuedBatchDetail(model: model, batch: model.pendingTransferBatches[index], position: index + 1)
+        } else if let id, let job = model.jobs.first(where: { $0.id == id && $0.state == .queued }) {
+            QueuedFileJobDetail(
+                model: model,
+                job: job,
+                position: (sections.queued.firstIndex { $0.id == id } ?? 0) + 1,
+                runningTitle: sections.running.first?.title
+            )
         } else if let id, let entry = sections.all.first(where: { $0.id == id }) {
             let transfer = model.transferQueue.flatMap { queue in
                 JobsList.transferJobID(for: queue, in: sections.all) == id ? queue : nil
@@ -255,7 +262,7 @@ private struct JobDetailContainer: View {
             } else if let detail, !detail.items.isEmpty {
                 VSplitView {
                     pane.frame(minHeight: 280, idealHeight: 470, maxHeight: .infinity)
-                    JobHistoryFileTable(items: detail.items, zoom: $zoom, hover: hover, filter: $fileFilter)
+                    JobHistoryFileTable(items: detail.items, zoom: $zoom, hover: hover, filter: $fileFilter, kind: detail.job.kind)
                         .frame(minHeight: 140, idealHeight: 240, maxHeight: .infinity)
                 }
             } else {
@@ -545,6 +552,109 @@ private struct QueuedBatchDetail: View {
                 .textSelection(.enabled)
                 .fixedSize(horizontal: false, vertical: true)
         }
+    }
+}
+
+/// A deleting or space-freeing job waiting for the job gate (Clear from
+/// Card, Take Off Drive, Free Up Source, Free Up Camera): what it will do,
+/// its phases, where it stands in the queue, and Cancel — safe, since
+/// nothing has run. Its typed confirmation already happened; starting it
+/// stays with the queue.
+private struct QueuedFileJobDetail: View {
+    @Bindable var model: DashboardModel
+    let job: JobSnapshot
+    let position: Int
+    let runningTitle: String?
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                HStack(alignment: .center, spacing: 12) {
+                    Image(systemName: "clock")
+                        .font(.title)
+                        .foregroundStyle(.blue)
+                        .frame(width: 34)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(JobDetailFacts.plural(job.note.isEmpty ? job.action.displayName : job.note))
+                            .font(.title3.weight(.semibold))
+                            .fixedSize(horizontal: false, vertical: true)
+                        Text(queueLine)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer(minLength: 8)
+                    JobHistoryOutcomeBadge(display: JobOutcomeDisplay(label: "Queued", symbol: "clock", tone: .running))
+                }
+                if !job.detail.isEmpty {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("WHAT IT WILL DO")
+                            .font(.caption2.weight(.bold))
+                            .foregroundStyle(.secondary)
+                        Text(job.detail)
+                            .font(.callout)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .textSelection(.enabled)
+                    }
+                }
+                let phases = Self.phases(job.detail)
+                if !phases.isEmpty {
+                    HStack(spacing: 6) {
+                        ForEach(Array(phases.enumerated()), id: \.offset) { index, phase in
+                            if index > 0 {
+                                Image(systemName: "arrow.right")
+                                    .font(.caption)
+                                    .foregroundStyle(.tertiary)
+                            }
+                            Label(phase, systemImage: "circle.fill")
+                                .labelStyle(PhaseChipLabelStyle(color: PhaseBreakdown.color(phase)))
+                        }
+                    }
+                }
+                Button("Cancel Job", systemImage: "xmark.circle", role: .destructive) {
+                    model.cancelQueuedFileJob(id: job.id)
+                }
+                .help("Take this job off the queue. It has not started, so nothing changes.")
+            }
+            .padding(16)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private var queueLine: String {
+        let place = position == 1 ? "Next in the queue" : "Number \(position) in the queue"
+        guard let runningTitle else { return "\(place) — starts in a moment" }
+        return "\(place) — starts when “\(runningTitle)” finishes"
+    }
+
+    /// The phases the queued job's description names, in the order it
+    /// runs them ("re-hashes … then removing" → Verify → Remove).
+    static func phases(_ detail: String) -> [String] {
+        let text = detail.lowercased()
+        var found: [(Int, String)] = []
+        for (needle, phase) in [("verify", "Verify"), ("re-hash", "Verify"), ("remov", "Remove"), ("delet", "Remove"), ("moving it into", "Move to Trash")] {
+            if let range = text.range(of: needle) {
+                let offset = text.distance(from: text.startIndex, to: range.lowerBound)
+                if !found.contains(where: { $0.1 == phase }) { found.append((offset, phase)) }
+            }
+        }
+        return found.sorted { $0.0 < $1.0 }.map(\.1)
+    }
+}
+
+private struct PhaseChipLabelStyle: LabelStyle {
+    let color: Color
+
+    func makeBody(configuration: Configuration) -> some View {
+        HStack(spacing: 5) {
+            configuration.icon
+                .font(.system(size: 7))
+                .foregroundStyle(color)
+            configuration.title
+                .font(.callout)
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 4)
+        .background(color.opacity(0.1), in: Capsule())
     }
 }
 

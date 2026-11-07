@@ -206,4 +206,42 @@ final class JobsWindowModelTests: XCTestCase {
         XCTAssertEqual(sections.queued.map(\.id), [first.id, second.id])
         XCTAssertEqual(sections.active.map(\.id), [running.id, first.id, second.id])
     }
+
+    // MARK: Removing jobs and the file-job queue
+
+    /// Clear from Card records removed files as `matched` and skipped ones
+    /// as `failed` (the table's CHECK only knows sync outcomes); the window
+    /// reads them as Removed and Skipped.
+    func testAClearFromCardJobReadsRemovedAndSkipped() {
+        let items = [
+            JobHistoryItem(relativePath: "DCIM/100MSDCF/DSC00001.ARW", byteCount: 40_000_000, start: nil, end: 3, outcome: .matched, verifyMethod: "NAS re-read"),
+            JobHistoryItem(relativePath: "DCIM/100MSDCF/DSC00001.JPG", byteCount: 10_000_000, start: nil, end: 3, outcome: .matched, verifyMethod: "NAS re-read"),
+            JobHistoryItem(relativePath: "DCIM/100MSDCF/DSC00002.ARW", byteCount: 40_000_000, start: nil, end: 4, outcome: .failed, verifyMethod: "NAS re-read", error: "Skipped in Verify: the drive copy changed. The card file stays."),
+        ]
+        let job = JobHistoryJob(kind: "freeUp", title: "Cleared files from CARD", startedAt: now.addingTimeInterval(-20), endedAt: now, outcome: .succeeded, matchedExisting: 2, failed: 1)
+        XCTAssertEqual(items.map { $0.outcome.label(kind: job.kind) }, ["Removed", "Removed", "Skipped"])
+        XCTAssertEqual(JobHistoryFileFilter.available(kind: job.kind).map { $0.title(kind: job.kind) }, ["All", "Removed", "Skipped"])
+        XCTAssertEqual(JobHistoryFileFilter.rows(items, filter: .issues, kind: job.kind, sortedBy: []).map(\.name), ["DSC00002.ARW"])
+        XCTAssertEqual(JobHistoryFileFilter.rows(items, filter: .transferred, kind: job.kind, sortedBy: []).count, 2)
+        XCTAssertEqual(JobDetailFacts.tally(job: job, live: nil, items: items).map(\.label), ["Removed", "Skipped"])
+        XCTAssertEqual(JobDetailFacts.tally(job: job, live: nil, items: items).first?.value, "2 files · \(Int64(50_000_000).formattedBytes)")
+        XCTAssertEqual(JobsList.rowDetail(job, now: now), "2 removed · 1 skipped")
+        XCTAssertEqual(JobDetailFacts.outcomeDisplay(.succeeded, job: job), JobOutcomeDisplay(label: "Done · 1 skipped", symbol: "exclamationmark.triangle.fill", tone: .warning))
+        XCTAssertEqual(
+            JobDetailFacts.noteParts("Cleared 2 file(s) from CARD (50 MB). 1 file(s) stayed: its drive copy changed.").clauses,
+            ["Cleared 2 files from CARD (50 MB)", "1 file stayed: its drive copy changed"]
+        )
+        XCTAssertTrue(JobDetailFacts.issueHeadline(job).hasPrefix("1 file skipped and kept"))
+        XCTAssertTrue(JobHistoryText.item(items[2], kind: job.kind).contains("Skipped in Verify"))
+        XCTAssertTrue(JobHistoryText.item(items[0], kind: job.kind).contains("Checked against the NAS re-read"))
+        // A sync keeps its own words.
+        XCTAssertEqual(JobHistoryItemOutcome.matched.label(kind: "syncBuffer"), "Already on NAS")
+    }
+
+    func testQueuedJobsFollowTheQueuesOwnOrder() {
+        let a = JobSnapshot(action: .freeUp, state: .queued, createdAt: now.addingTimeInterval(-30))
+        let b = JobSnapshot(action: .freeUp, state: .queued, createdAt: now.addingTimeInterval(-20))
+        let sections = JobsList.sections(session: [a, b], history: [], queueOrder: [b.id, a.id], now: now, calendar: calendar)
+        XCTAssertEqual(sections.queued.map(\.id), [b.id, a.id])
+    }
 }

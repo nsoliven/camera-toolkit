@@ -66,6 +66,7 @@ enum JobsList {
     static func sections(
         session: [JobSnapshot],
         history: [JobHistoryJob],
+        queueOrder: [UUID] = [],
         now: Date = Date(),
         calendar: Calendar = .current
     ) -> Sections {
@@ -81,7 +82,11 @@ enum JobsList {
         }
         // Running newest first, then queued in the order they will start.
         let running = entries.filter { if case .running = $0.status { true } else { false } }.sorted { $0.startedAt > $1.startedAt }
-        let queued = entries.filter { $0.status == .queued }.sorted { $0.startedAt < $1.startedAt }
+        // The queue's own order when it is known, else when each was queued.
+        let rank = Dictionary(queueOrder.enumerated().map { ($1, $0) }, uniquingKeysWith: { first, _ in first })
+        let queued = entries.filter { $0.status == .queued }.sorted {
+            (rank[$0.id] ?? Int.max, $0.startedAt) < (rank[$1.id] ?? Int.max, $1.startedAt)
+        }
         let active = running + queued
         let past = entries.filter { !$0.isActive }.sorted { $0.startedAt > $1.startedAt }
         return Sections(active: active, days: days(past, now: now, calendar: calendar))
@@ -130,6 +135,11 @@ enum JobsList {
 
     /// "2.2 GB · 98 MB/s", or the files when nothing moved: "16,141 checked".
     static func rowDetail(_ job: JobHistoryJob, now: Date) -> String? {
+        if JobHistoryItemOutcome.removes(job.kind), job.matchedExisting + job.failed > 0 {
+            var parts = ["\(job.matchedExisting.formatted()) removed"]
+            if job.failed > 0 { parts.append("\(job.failed.formatted()) skipped") }
+            return parts.joined(separator: " · ")
+        }
         let moved = job.transferBytes ?? job.bytesDone
         if moved > 0 {
             var parts = [job.bytesDone > 0 ? job.bytesDone.formattedBytes : moved.formattedBytes]

@@ -55,6 +55,22 @@ final class JobHistorySnapshotTests: XCTestCase {
             JobHistorySample(t: 3, combined: 151, doneBytes: 450_000_000, doneFiles: 14),
         ], items: [], jobID: card.id)
 
+        // A Clear from Card run: two files removed, one skipped in Verify.
+        let clear = JobHistoryJob(
+            kind: JobAction.freeUp.rawValue, title: "Cleared files from CARD",
+            startedAt: sync.startedAt.addingTimeInterval(8_000), endedAt: sync.startedAt.addingTimeInterval(8_012), outcome: .succeeded,
+            totalFiles: 3, totalBytes: 90_000_000, matchedExisting: 2, failed: 1,
+            summary: JobHistorySummary(
+                phases: [JobPhaseTotal(label: "Verify", seconds: 9, activeSeconds: 9), JobPhaseTotal(label: "Remove", seconds: 2, activeSeconds: 2)],
+                note: "Cleared 2 file(s) from CARD (50 MB). 1 file(s) stayed: its drive copy changed since Sync to NAS verified it."
+            )
+        )
+        try store.write(job: clear, samples: [], items: [
+            JobHistoryItem(relativePath: "DCIM/100MSDCF/DSC00001.ARW", byteCount: 40_000_000, start: nil, end: 10, outcome: .matched, verifyMethod: "NAS re-read"),
+            JobHistoryItem(relativePath: "DCIM/100MSDCF/DSC00001.JPG", byteCount: 10_000_000, start: nil, end: 10, outcome: .matched, verifyMethod: "NAS re-read"),
+            JobHistoryItem(relativePath: "DCIM/100MSDCF/DSC00002.ARW", byteCount: 40_000_000, start: nil, end: 9, outcome: .failed, verifyMethod: "NAS re-read", error: "Skipped in Verify: the drive copy changed since Sync to NAS verified it. The card file stays."),
+        ], jobID: clear.id)
+
         let browser = JobHistoryBrowser(model: model)
         await browser.reload()
         await browser.open(sync.id)
@@ -63,6 +79,8 @@ final class JobHistorySnapshotTests: XCTestCase {
         let checkDetail = try XCTUnwrap(browser.detail)
         await browser.open(card.id)
         let cardDetail = try XCTUnwrap(browser.detail)
+        await browser.open(clear.id)
+        let clearDetail = try XCTUnwrap(browser.detail)
         // The window opens on the sync.
         await browser.open(sync.id)
         let monitor = JobActivityMonitor(ceilingResolver: nil)
@@ -84,10 +102,26 @@ final class JobHistorySnapshotTests: XCTestCase {
             .background(.background))
         }
 
+        // A Clear from Card waiting behind the running sync.
+        let running = JobSnapshot(action: .syncBuffer, state: .running, progress: 0.4, note: "Sync to NAS: Copying to NAS", createdAt: Date().addingTimeInterval(-90))
+        let queuedClear = JobSnapshot(
+            action: .freeUp, state: .queued, note: "Clear 12 file(s) from CARD.",
+            detail: "Waits for the running job. Then Verify re-hashes each card file, its drive copy and the NAS copy against the hash Sync to NAS verified, and Remove deletes only the card files that passed."
+        )
+        let queueModel = DashboardModel(
+            jobs: [running, queuedClear],
+            configuration: AppConfiguration.defaults(applicationSupport: root),
+            configurationStore: ConfigurationStore(url: root.appendingPathComponent("config-queue.json"))
+        )
+
         for appearance in [NSAppearance.Name.aqua, .darkAqua] {
             let suffix = appearance == .aqua ? "light" : "dark"
             try render(AnyView(TransferQueueView(model: model, selection: sync.id, history: browser).background(.background)), size: NSSize(width: 1_280, height: 820), appearance: appearance,
                        to: folder.appendingPathComponent("jobs-window-\(suffix).png"))
+            try render(AnyView(TransferQueueView(model: queueModel, selection: queuedClear.id).background(.background)), size: NSSize(width: 1_100, height: 560), appearance: appearance,
+                       to: folder.appendingPathComponent("jobs-queued-\(suffix).png"))
+            try render(pane(clearDetail, zoom: JobHistoryZoom(full: 0...clearDetail.graph.duration), hover: JobHistoryHover()), size: NSSize(width: 860, height: 560), appearance: appearance,
+                       to: folder.appendingPathComponent("jobs-clear-card-\(suffix).png"))
             try render(pane(detail, zoom: full, hover: hover), size: NSSize(width: 860, height: 640), appearance: appearance,
                        to: folder.appendingPathComponent("jobs-sync-hover-\(suffix).png"))
             try render(pane(detail, zoom: zoom, hover: zoomedHover), size: NSSize(width: 860, height: 640), appearance: appearance,
