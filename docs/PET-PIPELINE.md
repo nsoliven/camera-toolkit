@@ -78,11 +78,11 @@ Change a default only with a new measurement, as FACE-PIPELINE.md says for faces
 **Set (2026-11-07).** Everything ran read-only on small JPEG renders in a scratch folder; no original, catalog or app state was touched.
 
 - **A real library:** 1,550 photos.
-  - 150 from events built around the household's dogs.
-  - 1,400 sampled across a year of other events: people, travel, landscapes, indoor parties, graduation plush toys, zoo and farm animals.
+  - 150 from events where the main test dog appears.
+  - 1,400 sampled across a year of other events: people, travel, landscapes, indoor parties, plush toys, zoo and farm animals.
 - **Ground truth, labelled by hand:** 173 findable dogs.
   - The main dog is a small white long-haired breed, in 116 detections (108 clean enough to group).
-  - A second household dog is a tan terrier, in 48.
+  - A second recurring dog appears in 48.
   - A few strangers' dogs.
   - Hard cases are included: back of the head, side profile, low light, motion blur, a dog held against a person, two dogs overlapping, and dogs partly out of frame. So are things that must not count: plush toys, a framed dog photo, a dog figurine, monkeys and goats.
 - **Look-alikes:** 322 public photos of other dogs.
@@ -121,7 +121,7 @@ False dogs: 3 boxes on monkeys (COCO has no monkey class), 1 goat, and 2 dog fig
 | …so her photos named or suggested | 59 of 108 (55%) | **99 of 108 (92%)** |
 | Wrong dogs suggested as her (look-alikes, second dog, false dogs) | 0 | **0** |
 | Closest look-alike to her (cosine) | 0.58 | 0.56 |
-| Second household dog | 1 group, 7 wrong dogs in it | 1 group (43 of 45), 1 wrong |
+| Second recurring dog | 1 group, 7 wrong dogs in it | 1 group (43 of 45), 1 wrong |
 
 **What each change bought** (pairwise AUC, main dog vs every other dog):
 - Padding the box instead of the margin crop was the big step: 0.946 → 0.967 on base.
@@ -133,7 +133,7 @@ False dogs: 3 boxes on monkeys (COCO has no monkey class), 1 goat, and 2 dog fig
 - **Strangers of the same breed group together.** Of 338 look-alike detections, 292 landed in 26 "Dog N" groups that mix different dogs of one breed. They never touch a named pet: approve, ignore or junk them.
 - **The white fluffy breeds sometimes read as "teddy bear"** and are missed. Treating teddy-bear boxes as dogs would bring in every plush toy, so it is not done.
 - **Animals with no COCO class (monkeys) and figurines can come back as dogs.** They rarely resemble a named pet, so they land in "Dog N" groups or nowhere.
-- These numbers come from one library with two household dogs. A home with two near-identical dogs of the same breed will split and mix more.
+- These numbers come from one personal library with two recurring dogs. A home with two near-identical dogs of the same breed will split and mix more.
 
 ## Verifying
 
