@@ -29,7 +29,7 @@ public struct FaceIndexService: Sendable {
         self.options = options
     }
 
-    init(store: FaceIndexStore, options: FaceScanOptions = FaceScanOptions()) {
+    public init(store: FaceIndexStore, options: FaceScanOptions = FaceScanOptions()) {
         self.store = store
         self.options = options
     }
@@ -121,7 +121,7 @@ public struct FaceIndexService: Sendable {
         for item in targets {
             let file = item.primary
             if let known = existing[file.pathKey],
-               known.covers(options.mode),
+               known.covers(options.mode, engine: store.engine),
                known.describes(path: file.path, size: file.size, modifiedAt: file.modifiedAt) {
                 report.photosSkipped += 1
             } else {
@@ -188,7 +188,7 @@ public struct FaceIndexService: Sendable {
         for item in eligible {
             let file = item.primary
             if let known = existing[file.pathKey],
-               known.covers(options.mode),
+               known.covers(options.mode, engine: store.engine),
                known.describes(path: file.path, size: file.size, modifiedAt: file.modifiedAt) {
                 report.photosSkipped += 1
             } else if burstMemberIDs.contains(item.id), !sampledIDs.contains(item.id) {
@@ -332,12 +332,12 @@ public struct FaceIndexService: Sendable {
                 modifiedAt: file.modifiedAt,
                 takenAt: item.captureDate,
                 scanGrade: grade,
-                engine: FaceEngine.identifier
+                engine: store.engine
             ))
             report.photosBurstCovered += 1
         }
 
-        report.detectorSummary = "\(FaceEngine.identifier) scales \(options.detectorScales.map(String.init).joined(separator: "/"))"
+        report.detectorSummary = "\(store.engine) scales \(options.detectorScales.map(String.init).joined(separator: "/"))"
 
         // XHIGH rebuilds the gallery first so the match below runs against
         // the sharpened templates; the rebuild reads confirmed faces only.
@@ -503,6 +503,7 @@ public struct FaceIndexService: Sendable {
         token: Int,
         options: FaceScanOptions,
         analyzer: FaceAnalyzing,
+        engine: String,
         telemetry: FaceScanTelemetry?
     ) throws -> [FaceRecord] {
         telemetry?.step(token, .detect)
@@ -522,6 +523,7 @@ public struct FaceIndexService: Sendable {
                 facePixels: face.facePixels,
                 embedding: face.embedding,
                 crop: face.crop,
+                model: engine,
                 state: .cached,
                 scanGrade: grade,
                 photoPath: file.path
@@ -554,6 +556,7 @@ public struct FaceIndexService: Sendable {
             token: token,
             options: options,
             analyzer: analyzer,
+            engine: store.engine,
             telemetry: telemetry
         ) else {
             telemetry?.finish(token, faces: 0, videoFramesRead: 0, failed: true)
@@ -570,7 +573,7 @@ public struct FaceIndexService: Sendable {
             takenAt: item.captureDate,
             scanGrade: executedGrade(for: options.mode),
             faceCount: faces.count,
-            engine: FaceEngine.identifier
+            engine: store.engine
         )
         guard (try? store.replaceFaces(photo: photo, faces: faces)) != nil else {
             telemetry?.finish(token, faces: 0, videoFramesRead: 0, failed: true)
@@ -639,6 +642,7 @@ public struct FaceIndexService: Sendable {
                 token: token,
                 options: options,
                 analyzer: analyzer,
+                engine: store.engine,
                 telemetry: telemetry
             ) else {
                 telemetry?.finish(token, faces: 0, videoFramesRead: framesRead, failed: true)
@@ -668,7 +672,7 @@ public struct FaceIndexService: Sendable {
             takenAt: item.captureDate,
             scanGrade: executedGrade(for: options.mode),
             faceCount: faces.count,
-            engine: FaceEngine.identifier
+            engine: store.engine
         )
         guard (try? store.replaceFaces(photo: photo, faces: faces)) != nil else {
             telemetry?.finish(token, faces: 0, videoFramesRead: framesRead, failed: true)
@@ -693,7 +697,7 @@ public struct FaceIndexService: Sendable {
         try store.inWriteTransaction { database in
             for person in try store.rosterPeople(database: database) {
                 let confirmed = try store.faces(personID: person.id, database: database)
-                    .filter { $0.state == .confirmed && $0.embedding != nil && $0.model == FaceEngine.identifier }
+                    .filter { $0.state == .confirmed && $0.embedding != nil && $0.model == store.engine }
                 var perPhoto: [String: FaceRecord] = [:]
                 for face in confirmed {
                     // `faces(personID:)` arrives detScore-sorted, so the first
@@ -794,7 +798,7 @@ public struct FaceIndexService: Sendable {
             // a recycled row would carry a stale suggestion.
             let autoGroups = rebundleGroups
                 ? try store.otherGroups(database: database)
-                    .filter { Self.isAutoGroupName($0.name) && $0.suggestedPersonID == nil }
+                    .filter { Self.isAutoGroupName($0.name, prefix: store.groupNamePrefix) && $0.suggestedPersonID == nil }
                 : []
             let dissolvingIDs = Set(autoGroups.map(\.id))
             let templates = try store.rosterTemplates(database: database)
@@ -1141,7 +1145,8 @@ public struct FaceIndexService: Sendable {
     /// the clusters a re-match may dissolve and rebuild. Anything else
     /// counts as user-named (a demoted roster person keeps its name) and
     /// is left intact.
-    static func isAutoGroupName(_ name: String) -> Bool {
-        name.hasPrefix("Person ") && Int(name.dropFirst("Person ".count)) != nil
+    static func isAutoGroupName(_ name: String, prefix: String = "Person") -> Bool {
+        let lead = "\(prefix) "
+        return name.hasPrefix(lead) && Int(name.dropFirst(lead.count)) != nil
     }
 }

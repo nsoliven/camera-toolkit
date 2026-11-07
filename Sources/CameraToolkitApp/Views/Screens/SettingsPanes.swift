@@ -349,6 +349,9 @@ struct OrganizingSettingsPane: View {
     @AppStorage(BurstGroupingConfiguration.visualRecoveryDefaultsKey) private var burstVisualRecovery = true
     @AppStorage(BurstGroupingConfiguration.maximumGapDefaultsKey) private var burstMaximumGap = 2.0
     @AppStorage(BurstGroupingConfiguration.maximumVisionDistanceDefaultsKey) private var burstVisionDistance = 0.48
+    @AppStorage(PetGallery.scanEnabledDefaultsKey) private var petsEnabled = true
+    /// Read when the pane appears — the check looks at files on disk.
+    @State private var petEngineInstalled = false
 
     var body: some View {
         Form {
@@ -386,6 +389,25 @@ struct OrganizingSettingsPane: View {
                 Text("Consecutive frames up to a second apart always chain into a burst. With recovery on, consecutive frames up to the gap limit are compared with Apple Vision and merged when they look alike. Lower distance limits are stricter. These sliders apply on the next regroup — press Regroup Bursts on an Unsorted board to re-run grouping without re-reading files.")
             }
 
+            Section {
+                Toggle("Look for dogs during face scans", isOn: $petsEnabled)
+                    .disabled(!petEngineInstalled)
+                LabeledContent("Pet engine") {
+                    if petEngineInstalled {
+                        Label("Installed", systemImage: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
+                    } else {
+                        Text("Run \(PetSidecarInstallation.setupCommand) once on this Mac")
+                            .textSelection(.enabled)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            } header: {
+                Text("Pets")
+            } footer: {
+                Text("Scan for Faces then also finds dogs and groups each dog's photos, the way it groups people. Name them under People › Pets. Dogs live in their own index beside the catalog — the people and face data are never changed, and photos are only read.")
+            }
+
             Section("Import Defaults") {
                 Picker(
                     "Camera",
@@ -410,6 +432,11 @@ struct OrganizingSettingsPane: View {
                     )
                 )
             }
+        }
+        .onAppear {
+            petEngineInstalled = PetSidecarInstallation(
+                applicationSupport: DashboardModel.defaultApplicationSupportURL
+            ).isInstalled
         }
     }
 }

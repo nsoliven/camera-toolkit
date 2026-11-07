@@ -25,6 +25,7 @@ Sources/
     ├── Catalog/        # GRDB schema, sync, inspection, and activity history
     ├── Configuration/  # persisted settings, event policy, and event-name policy
     ├── Faces/          # on-device face detection, embeddings, match/group index
+    ├── Pets/           # dog engine (pet sidecar) and the pets.sqlite index the face code runs on
     ├── Import/         # scanning, planning, copy, and archive organization
     ├── Integrations/   # external service clients
     ├── Media/          # media parsing and streaming file hashes

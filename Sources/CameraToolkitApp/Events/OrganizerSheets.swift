@@ -583,6 +583,8 @@ struct FaceScanSheet: View {
     /// MED and above need the converted detector package; without it the
     /// scan button stays off and the fix is spelled out inline.
     let engineInstalled: Bool
+    /// The same pass also looks for dogs (Settings › Organizing › Pets).
+    var alsoDogs = false
     let onCancel: () -> Void
     let onScan: (FaceScanOptions) -> Void
 
@@ -603,7 +605,7 @@ struct FaceScanSheet: View {
                     Toggle("Fast — pin the Mac", isOn: $fast)
                         .help("Uses every core it can and will run hot. Turn off to keep the machine quiet; same quality, longer wait.")
                 } footer: {
-                    Text(modeHelp)
+                    Text(alsoDogs ? modeHelp + " Dogs are looked for on the same photos." : modeHelp)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
