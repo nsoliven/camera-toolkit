@@ -113,6 +113,16 @@ struct BoardViewControls: View {
 
     static let tileWidthRange = 88.0...460.0
 
+    static func sortedToggleTitle(hidden: Bool) -> String {
+        hidden ? "Show Sorted" : "Hide Sorted"
+    }
+
+    static func sortedToggleHelp(hidden: Bool) -> String {
+        hidden
+            ? "Show Sorted: bring back items already sorted into an event, to review them. Nothing moves."
+            : "Hide Sorted: show only what still needs sorting. Nothing moves."
+    }
+
     var body: some View {
         HStack(spacing: 6) {
             OrganizeFilterButton(isPresented: $filterPresented, search: workspace.search)
@@ -167,11 +177,16 @@ struct BoardViewControls: View {
                 .help("Tile size — smaller fits more bursts on screen")
             }
             if let hideSorted {
-                Toggle(isOn: hideSorted) {
-                    Label("Hide Sorted", systemImage: "eye.slash")
+                // Named for what a click does: while sorted items are hidden
+                // it offers Show Sorted, while they show it offers Hide Sorted.
+                let hidden = hideSorted.wrappedValue
+                Button {
+                    hideSorted.wrappedValue.toggle()
+                } label: {
+                    Label(Self.sortedToggleTitle(hidden: hidden), systemImage: hidden ? "eye" : "eye.slash")
                 }
-                .toggleStyle(.button)
-                .help(hideSorted.wrappedValue ? "Show sorted items again" : "Hide items already sorted into an event")
+                .help(Self.sortedToggleHelp(hidden: hidden))
+                .accessibilityLabel(Self.sortedToggleTitle(hidden: hidden))
             }
         }
         .labelStyle(.iconOnly)

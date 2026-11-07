@@ -488,6 +488,160 @@ final class OrganizeMediaTests: XCTestCase {
     }
 }
 
+// MARK: - Camera support files
+
+extension OrganizeMediaTests {
+    func testCameraSupportFilesMatchOnlySonyPreviewsAndLUTs() {
+        XCTAssertTrue(CameraSupportFiles.isCameraGenerated("M4ROOT/THMBNL/C0002T01.JPG"))
+        XCTAssertTrue(CameraSupportFiles.isCameraGenerated("/card/M4ROOT/THMBNL/C0003T01.JPG"))
+        XCTAssertTrue(CameraSupportFiles.isCameraGenerated("/card/m4root/thmbnl/c0001t01.jpg"))
+        XCTAssertTrue(CameraSupportFiles.isCameraGenerated("M4ROOT/GENERAL/LUT/LOOK1.cube"))
+        XCTAssertTrue(CameraSupportFiles.isCameraGenerated("M4ROOT/GENERAL/LOOK2.CUBE"))
+        XCTAssertFalse(CameraSupportFiles.isCameraGenerated("M4ROOT/CLIP/C0001.MP4"))
+        XCTAssertFalse(CameraSupportFiles.isCameraGenerated("M4ROOT/CLIP/C0001M01.XML"))
+        XCTAssertFalse(CameraSupportFiles.isCameraGenerated("M4ROOT/GENERAL/MEDIAPRO.XML"))
+        XCTAssertFalse(CameraSupportFiles.isCameraGenerated("DCIM/100MSDCF/DSC00001.JPG"))
+        XCTAssertFalse(CameraSupportFiles.isCameraGenerated("DCIM/100MSDCF/DSC00001.ARW"))
+        XCTAssertFalse(CameraSupportFiles.isCameraGenerated("DCIM/100MSDCF/DSC00001.photo-edit"))
+        XCTAssertFalse(CameraSupportFiles.isCameraGenerated("DCIM/100MSDCF/DSC00001-export.tif"))
+        XCTAssertFalse(CameraSupportFiles.isCameraGenerated("Grading/LOOK1.cube"))
+        XCTAssertFalse(CameraSupportFiles.isCameraGenerated("THMBNL/C0001T01.JPG"))
+        XCTAssertFalse(CameraSupportFiles.isCameraGenerated("M4ROOT/THMBNL"))
+        XCTAssertTrue(CameraSupportFiles.isThumbnailFolder("/card/M4ROOT/THMBNL"))
+        XCTAssertFalse(CameraSupportFiles.isThumbnailFolder("/card/M4ROOT/CLIP"))
+    }
+
+    func testScannerIgnoresSonyPreviewsAndLUTsButKeepsClipsAndPhotos() throws {
+        try withTemporaryDirectory { root in
+            let card = root.appendingPathComponent("Card", isDirectory: true)
+            let dcim = card.appendingPathComponent("DCIM/100MSDCF", isDirectory: true)
+            try writeFakeARW(dcim.appendingPathComponent("DSC00001.ARW"), captureTime: "2026:08:27 05:27:53")
+            try writeFile(dcim.appendingPathComponent("DSC00001.JPG"), Data(repeating: 3, count: 64))
+            try writeFile(dcim.appendingPathComponent("DSC00002.JPG"), Data(repeating: 4, count: 64))
+            try writeFile(dcim.appendingPathComponent("DSC00001.photo-edit"), "edit")
+            try writeFile(dcim.appendingPathComponent("DSC00002-export.tif"), Data(repeating: 5, count: 64))
+            try writeFile(card.appendingPathComponent("M4ROOT/CLIP/C0001.MP4"), Data(repeating: 1, count: 64))
+            try writeFile(card.appendingPathComponent("M4ROOT/CLIP/C0001M01.XML"), "<xml/>")
+            let preview = try writeFile(card.appendingPathComponent("M4ROOT/THMBNL/C0001T01.JPG"), Data(repeating: 6, count: 64))
+            let lut = try writeFile(card.appendingPathComponent("M4ROOT/GENERAL/LUT/LOOK1.cube"), "LUT_3D_SIZE 2")
+            let before = try treeBytes(card)
+
+            let cache = CaptureDateCache(url: root.appendingPathComponent("cache.json"))
+            for scanRoot in [card, card.appendingPathComponent("M4ROOT", isDirectory: true)] {
+                let result = try OrganizeScanner(concurrency: 2).scan(root: scanRoot, cache: cache)
+                let names = Set(result.items.flatMap(\.files).map(\.name))
+                XCTAssertFalse(names.contains("C0001T01.JPG"))
+                XCTAssertFalse(names.contains("LOOK1.cube"))
+                XCTAssertTrue(names.contains("C0001.MP4"))
+                let clip = try XCTUnwrap(result.items.first { $0.primary.name == "C0001.MP4" })
+                XCTAssertEqual(clip.companions.map(\.name), ["C0001M01.XML"])
+                XCTAssertEqual(clip.kind, .video)
+                if scanRoot == card {
+                    XCTAssertEqual(names, [
+                        "DSC00001.ARW", "DSC00001.JPG", "DSC00002.JPG", "DSC00001.photo-edit",
+                        "DSC00002-export.tif", "C0001.MP4", "C0001M01.XML",
+                    ])
+                }
+            }
+            // Ignored means untouched: every file is still there, byte for byte.
+            XCTAssertEqual(try treeBytes(card), before)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: preview.path))
+            XCTAssertTrue(FileManager.default.fileExists(atPath: lut.path))
+            // Ingest's own exclusions are unchanged: the card copy keeps them.
+            XCTAssertFalse(ExclusionMatcher.isExcluded("M4ROOT/THMBNL/C0001T01.JPG"))
+            XCTAssertFalse(ExclusionMatcher.isExcluded("M4ROOT/GENERAL/LUT/LOOK1.cube"))
+        }
+    }
+}
+
+// MARK: - Event boards stack like the card board
+
+extension OrganizeMediaTests {
+    /// The same frames, scanned on the card and drawn from their Buffer
+    /// copies (same names, sizes and times), make the same bursts: the Vision
+    /// verdicts and the manual splits follow frame identity, not the path.
+    func testBufferCopiesStackIntoTheSameBurstsAsTheCardScan() throws {
+        try withTemporaryDirectory { root in
+            let cardFolder = root.appendingPathComponent("Card/DCIM/100MSDCF", isDirectory: true)
+            let bufferFolder = root.appendingPathComponent("Buffer/2026/2026-08-26 Beach Day/Originals/Sony A7V", isDirectory: true)
+            let scenes: [(String, CGImage)] = [
+                ("DSC00001.JPG", SyntheticImage.scene(seed: 42)),
+                ("DSC00002.JPG", SyntheticImage.scene(seed: 42, extraMark: true)),
+                ("DSC00003.JPG", SyntheticImage.solidBlack()),
+                ("DSC00004.JPG", SyntheticImage.solidBlack()),
+                ("DSC00009.JPG", SyntheticImage.scene(seed: 7)),
+            ]
+            let modified = Date(timeIntervalSince1970: 1_790_000_000)
+            for (name, image) in scenes {
+                for folder in [cardFolder, bufferFolder] {
+                    let url = try SyntheticImage.writeJPEG(image, to: folder.appendingPathComponent(name))
+                    try FileManager.default.setAttributes([.modificationDate: modified], ofItemAtPath: url.path)
+                }
+            }
+            // 1.4 s (Vision band), 1.4 s to a different scene, 0.5 s
+            // (automatic), then a lone frame half an hour later.
+            let t0 = Date(timeIntervalSince1970: 1_800_000_000)
+            let offsets: [TimeInterval] = [0, 1.4, 2.8, 3.3, 1_800]
+            func items(in folder: URL) throws -> [OrganizeItem] {
+                try zip(scenes, offsets).map { scene, offset in
+                    let url = folder.appendingPathComponent(scene.0)
+                    let size = try XCTUnwrap(FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber).int64Value
+                    return OrganizeItem(
+                        primary: OrganizeFile(literalPath: url.path, size: size, modifiedAt: modified),
+                        kind: .photo,
+                        captureDate: t0.addingTimeInterval(offset),
+                        hasCameraDate: true
+                    )
+                }
+            }
+            let cardItems = try items(in: cardFolder)
+            let bufferItems = try items(in: bufferFolder)
+            func names(_ stacks: [OrganizeStack]) -> [[String]] { stacks.map { $0.items.map(\.primary.name) } }
+            let expected = [["DSC00001.JPG", "DSC00002.JPG"], ["DSC00003.JPG", "DSC00004.JPG"], ["DSC00009.JPG"]]
+
+            // The card board: Vision links its recovery pair.
+            let configuration = BurstGroupingConfiguration()
+            let cardLinks = BurstVisualLinker.links(for: cardItems, configuration: configuration, concurrency: 2)
+            XCTAssertEqual(names(OrganizeStacker.stacks(for: cardItems, configuration: configuration, visualLinks: cardLinks)), expected)
+            // Stacked without those links (the old event board) the pair fell apart.
+            XCTAssertEqual(names(OrganizeStacker.stacks(for: bufferItems)), [["DSC00001.JPG"], ["DSC00002.JPG"], ["DSC00003.JPG", "DSC00004.JPG"], ["DSC00009.JPG"]])
+
+            // Learned from the card scan, answered for the Buffer copies
+            // without reading them.
+            let learned = BurstLinkMemory()
+            learned.record(items: cardItems, links: cardLinks, configuration: configuration)
+            XCTAssertEqual(learned.count, 2)
+            let fromCard = BurstStackingContext(configuration: configuration, linkMemory: learned)
+            XCTAssertEqual(names(fromCard.stacks(for: bufferItems)), expected)
+            XCTAssertEqual(names(fromCard.stacks(for: cardItems)), expected)
+
+            // With nothing learned (a relaunch), a pass that may read the
+            // Buffer copies reaches the same verdicts and remembers them.
+            let fresh = BurstLinkMemory()
+            let fromBuffer = BurstStackingContext(configuration: configuration, linkMemory: fresh)
+            XCTAssertEqual(names(fromBuffer.stacks(for: bufferItems)), names(OrganizeStacker.stacks(for: bufferItems)))
+            XCTAssertEqual(names(fromBuffer.stacks(for: bufferItems, computeMissingLinks: true)), expected)
+            XCTAssertEqual(fresh.count, 2)
+            XCTAssertEqual(names(fromBuffer.stacks(for: cardItems)), expected)
+
+            // A verdict reached at another Vision threshold is not reused.
+            var stricter = configuration
+            stricter.maximumVisionDistance = 0.01
+            XCTAssertEqual(names(BurstStackingContext(configuration: stricter, linkMemory: learned).stacks(for: bufferItems)).count, 4)
+
+            // A split made on the card (card path keys) holds on the copies.
+            let split = BurstSplit(memberPathKeys: [cardItems[1].primary.pathKey])
+            let identities = [cardItems[1].primary.pathKey: BurstFrameIdentity.key(for: cardItems[1].primary)]
+            let withSplit = BurstStackingContext(configuration: configuration, splits: [split], memberIdentities: identities, linkMemory: learned)
+            let splitExpected = [["DSC00001.JPG"], ["DSC00002.JPG"], ["DSC00003.JPG", "DSC00004.JPG"], ["DSC00009.JPG"]]
+            XCTAssertEqual(names(OrganizeStacker.stacks(for: cardItems, configuration: configuration, visualLinks: cardLinks, splits: [split])), splitExpected)
+            XCTAssertEqual(names(withSplit.stacks(for: bufferItems)), splitExpected)
+            // Without the member's identity the board cannot match it.
+            XCTAssertEqual(names(BurstStackingContext(configuration: configuration, splits: [split], linkMemory: learned).stacks(for: bufferItems)), expected)
+        }
+    }
+}
+
 /// Deterministic synthetic scenes for Vision feature prints. A seeded
 /// gradient-and-blobs scene gives near-zero distance to a re-render of itself
 /// and a ~1.0 distance to a solid frame, so both sides of the 0.48 threshold

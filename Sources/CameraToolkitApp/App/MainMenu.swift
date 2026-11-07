@@ -43,9 +43,23 @@ enum MainMenu {
     /// keys through `@AppStorage`, so a menu change redraws the open board.
     enum DefaultsKey {
         static let boardMode = "CameraToolkit.organize.mode"
-        static let hideSorted = "CameraToolkit.organize.hideSorted"
+        /// `.v2`: hiding sorted items became the default, and installs that
+        /// stored the old default (`false`) under the first key would never
+        /// see it.
+        static let hideSorted = "CameraToolkit.organize.hideSorted.v2"
         static let tileWidth = "CameraToolkit.organize.tileWidth"
         static let showInspector = "CameraToolkit.organize.showInspector"
+    }
+
+    /// Unsorted boards show only what still needs sorting unless the owner
+    /// asks to see sorted items again.
+    static let hideSortedByDefault = true
+
+    /// The View menu's Hide Sorted Items state: the stored choice, or the
+    /// default when none was made — the same answer the boards' `@AppStorage`
+    /// gives.
+    static func hidesSorted(_ defaults: UserDefaults = .standard) -> Bool {
+        defaults.object(forKey: DefaultsKey.hideSorted) as? Bool ?? hideSortedByDefault
     }
 
     static let tileWidthRange: ClosedRange<Double> = 88...460

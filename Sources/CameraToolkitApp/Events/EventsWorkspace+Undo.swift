@@ -1597,9 +1597,10 @@ extension EventsWorkspace {
                 sources[id]?.result = result.restacked(withSplits: splits)
             }
         }
+        let stacking = eventStacking()
         for id in Array(eventStacks.keys) {
             if let stacks = eventStacks[id] {
-                eventStacks[id] = OrganizeStacker.stacks(for: stacks.flatMap(\.items), splits: splits)
+                eventStacks[id] = stacking.stacks(for: stacks.flatMap(\.items))
                     .carryingIDs(from: stacks)
             }
         }

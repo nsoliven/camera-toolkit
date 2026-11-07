@@ -2,6 +2,7 @@ import AppKit
 import CameraToolkitCore
 import CoreGraphics
 import Foundation
+import ImageIO
 import SwiftUI
 @testable import CameraToolkitApp
 import XCTest
@@ -4124,5 +4125,255 @@ private struct StubFaceAnalyzer: FaceAnalyzing {
 
     func analyze(_ image: CGImage, options: FaceScanOptions) throws -> [AnalyzedFace] {
         []
+    }
+}
+
+// MARK: - Unsorted shows only what still needs sorting
+
+extension EventsWorkspaceTests {
+    /// Hiding sorted items is the default under a key no earlier build wrote,
+    /// so an install that stored the old `false` default still gets it.
+    func testUnsortedBoardsHideSortedByDefaultUnderANewKey() throws {
+        let suite = "CameraToolkitTests.hideSorted.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set(false, forKey: "CameraToolkit.organize.hideSorted")
+        XCTAssertNotEqual(MainMenu.DefaultsKey.hideSorted, "CameraToolkit.organize.hideSorted")
+        XCTAssertTrue(MainMenu.hidesSorted(defaults))
+        defaults.set(false, forKey: MainMenu.DefaultsKey.hideSorted)
+        XCTAssertFalse(MainMenu.hidesSorted(defaults))
+        XCTAssertEqual(BoardViewControls.sortedToggleTitle(hidden: true), "Show Sorted")
+        XCTAssertEqual(BoardViewControls.sortedToggleTitle(hidden: false), "Hide Sorted")
+    }
+
+    /// Sorted stacks leave the board, but Apply still counts every sorted
+    /// file and hidden stacks never stay selected, so no key or menu acts on
+    /// a stack the owner cannot see. Nothing in the catalog changes.
+    func testHiddenSortedStacksLeaveTheSelectionButApplyStillCountsThem() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let unsorted = root.appendingPathComponent("Drive/Unsorted A7V", isDirectory: true)
+            try writeOrganizerARW(unsorted.appendingPathComponent("DCIM/100MSDCF/DSC00001.ARW"), "2026:08:26 10:00:00", "000")
+            try writeOrganizerARW(unsorted.appendingPathComponent("DCIM/100MSDCF/DSC00010.ARW"), "2026:08:26 10:05:00", "000")
+            try writeOrganizerARW(unsorted.appendingPathComponent("DCIM/100MSDCF/DSC00020.ARW"), "2026:08:26 10:10:00", "000")
+            let location = addUnsorted(unsorted, to: model)
+            workspace.scan(location)
+            try await waitUntil { workspace.sources[location.id]?.result != nil }
+            let result = try XCTUnwrap(workspace.sources[location.id]?.result)
+            XCTAssertEqual(result.stacks.count, 3)
+            let eventID = try XCTUnwrap(workspace.createEvent(name: "Beach Day", date: organizerDay("2026-08-26"), policy: .buffer))
+            let ordered = result.stacks.map(\.id)
+            let first = ordered[0], second = ordered[1], third = ordered[2]
+
+            // Sorting the last stack leaves focus on it (nothing comes after).
+            workspace.selectStacks([third])
+            workspace.assign(stackIDs: workspace.targetStackIDs(), from: location.id, to: eventID, orderedIDs: ordered)
+            XCTAssertEqual(workspace.focusedStackID, third)
+            let hidden = workspace.hiddenSortedStackIDs(result, hideSorted: true)
+            XCTAssertEqual(hidden, [third])
+            XCTAssertEqual(workspace.hiddenSortedStackIDs(result, hideSorted: false), [])
+            XCTAssertEqual(workspace.visibleStacks(result, hideSorted: true).map(\.id), [first, second])
+            XCTAssertEqual(workspace.visibleStacks(result, hideSorted: false).map(\.id), ordered)
+
+            // What the board does when the stack disappears.
+            workspace.deselectHiddenStacks(hidden)
+            XCTAssertTrue(workspace.targetStackIDs().isEmpty)
+            XCTAssertNil(workspace.focusedStackID)
+
+            // Nothing is targeted, so selection actions do nothing.
+            let before = model.configuration.photoEventAssignments
+            workspace.unassign(stackIDs: workspace.targetStackIDs(), from: location.id)
+            workspace.assign(stackIDs: workspace.targetStackIDs(), from: location.id, to: eventID, orderedIDs: ordered)
+            workspace.trash(stackIDs: workspace.targetStackIDs(), from: location.id)
+            XCTAssertEqual(model.configuration.photoEventAssignments, before)
+            XCTAssertEqual(before.count, 1)
+
+            // A selection spanning a hidden stack keeps only what is shown.
+            workspace.selectStacks([first, third])
+            workspace.deselectHiddenStacks(workspace.hiddenSortedStackIDs(result, hideSorted: true))
+            XCTAssertEqual(workspace.targetStackIDs(), [first])
+
+            // Sort everything: the board is empty, Apply still sees all of it.
+            workspace.assign(stackIDs: [first, second], from: location.id, to: eventID, orderedIDs: ordered)
+            XCTAssertTrue(workspace.visibleStacks(result, hideSorted: true).isEmpty)
+            XCTAssertEqual(workspace.sortedFiles(in: result).files, 3)
+            let hiddenAll = workspace.hiddenSortedStackIDs(result, hideSorted: true)
+            XCTAssertEqual(hiddenAll, Set(ordered))
+            workspace.deselectHiddenStacks(hiddenAll)
+            XCTAssertTrue(workspace.targetStackIDs().isEmpty)
+            XCTAssertEqual(workspace.sortedFiles(in: result).files, 3)
+
+            // Hiding is view-only: undo still brings the sort back.
+            workspace.undo()
+            XCTAssertEqual(model.configuration.photoEventAssignments.count, 1)
+            XCTAssertEqual(workspace.visibleStacks(result, hideSorted: true).map(\.id), [first, second])
+        }
+    }
+
+    /// A Sony card's per-clip preview JPEGs and stored LUTs never reach the
+    /// board; the clips, their XML and the DCIM photos do. A catalog row an
+    /// older build made for a preview is not shown, not counted, and not
+    /// planned by Apply — and the preview is never touched.
+    func testCameraPreviewsAndLUTsStayOffTheBoardAndOutOfApply() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let card = root.appendingPathComponent("Drive/Unsorted A7V", isDirectory: true)
+            let photo = try writeOrganizerARW(card.appendingPathComponent("DCIM/100MSDCF/DSC00001.ARW"), "2026:08:26 10:00:00", "000")
+            let jpeg = try writeOrganizerJPEG(card.appendingPathComponent("DCIM/100MSDCF/DSC00002.JPG"))
+            let clip = try organizerWrite(card.appendingPathComponent("M4ROOT/CLIP/C0001.MP4"), "clip")
+            let clipXML = try organizerWrite(card.appendingPathComponent("M4ROOT/CLIP/C0001M01.XML"), "<xml/>")
+            let preview = try writeOrganizerJPEG(card.appendingPathComponent("M4ROOT/THMBNL/C0001T01.JPG"))
+            let lut = try organizerWrite(card.appendingPathComponent("M4ROOT/GENERAL/LUT/LOOK1.cube"), "LUT_3D_SIZE 2")
+            let location = addUnsorted(card, to: model)
+            workspace.scan(location)
+            try await waitUntil { workspace.sources[location.id]?.result != nil }
+            let result = try XCTUnwrap(workspace.sources[location.id]?.result)
+            let listed = Set(result.items.flatMap(\.files).map(\.name))
+            XCTAssertEqual(listed, ["DSC00001.ARW", "DSC00002.JPG", "C0001.MP4", "C0001M01.XML"])
+            let clipItem = try XCTUnwrap(result.items.first { $0.primary.name == "C0001.MP4" })
+            XCTAssertEqual(clipItem.companions.map(\.name), ["C0001M01.XML"])
+
+            let eventID = try XCTUnwrap(workspace.createEvent(name: "Beach Day", date: organizerDay("2026-08-26"), policy: .buffer))
+            workspace.assign(stackIDs: Set(result.stacks.map(\.id)), from: location.id, to: eventID)
+            // An older build offered the preview, and it was sorted then.
+            let attributes = try FileManager.default.attributesOfItem(atPath: preview.path)
+            let legacy = PhotoEventAssignment(
+                sourceRootPath: preview.deletingLastPathComponent().path,
+                relativePath: preview.lastPathComponent,
+                fileSize: (attributes[.size] as? NSNumber)?.int64Value ?? 0,
+                modifiedAt: attributes[.modificationDate] as? Date ?? Date(),
+                eventID: eventID,
+                deviceID: "sony-a7v"
+            )
+            workspace.applyAssignmentChange(AssignmentChange(title: "Sort", removed: [], added: [legacy]), touching: eventID)
+            XCTAssertEqual(model.configuration.photoEventAssignments.count, 5)
+            XCTAssertEqual(workspace.sortedFiles(in: result).files, 4)
+            XCTAssertTrue(workspace.visibleStacks(result, hideSorted: true).isEmpty)
+
+            let plan = EventsWorkspace.buildApplyPlan(
+                events: [try XCTUnwrap(workspace.event(eventID))],
+                configuration: model.configuration,
+                locations: workspace.locations,
+                onlyUnder: card.path,
+                title: "Apply",
+                unsortedRoots: [card]
+            )
+            let planned = plan.groups.flatMap { $0.moves.map { ($0.sourcePath as NSString).lastPathComponent } }
+                + plan.groups.flatMap { $0.copies.flatMap { $0.files.map { ($0.path as NSString).lastPathComponent } } }
+            XCTAssertEqual(Set(planned), ["DSC00001.ARW", "DSC00002.JPG", "C0001.MP4", "C0001M01.XML"])
+
+            // Planning and scanning touched nothing.
+            for url in [photo, jpeg, clip, clipXML, preview, lut] {
+                XCTAssertTrue(FileManager.default.fileExists(atPath: url.path), url.lastPathComponent)
+            }
+        }
+    }
+}
+
+// MARK: - Event boards group bursts like the card did
+
+extension EventsWorkspaceTests {
+    /// Frames the card board grouped through the Vision check (a 1–2 s gap)
+    /// stay one burst on the event board after Apply put them in the Buffer.
+    func testEventBoardGroupsTheSameBurstsAsTheCardAfterApply() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let card = root.appendingPathComponent("Drive/Unsorted A7V", isDirectory: true)
+            let folder = card.appendingPathComponent("DCIM/100MSDCF", isDirectory: true)
+            // Two similar frames 1.4 s apart (Vision band), a different scene,
+            // then a frame 0.5 s after it (automatic band), then a lone frame.
+            let frames: [(String, Int, String, String)] = [
+                ("DSC00001.JPG", 42, "2026:08:26 10:00:00", "000"),
+                ("DSC00002.JPG", 42, "2026:08:26 10:00:01", "400"),
+                ("DSC00003.JPG", 0, "2026:08:26 10:00:02", "800"),
+                ("DSC00004.JPG", 0, "2026:08:26 10:00:03", "300"),
+                ("DSC00009.JPG", 7, "2026:08:26 10:30:00", "000"),
+            ]
+            for (name, seed, time, subseconds) in frames {
+                try writeBurstSceneJPEG(folder.appendingPathComponent(name), seed: seed, mark: name == "DSC00002.JPG", captureTime: time, subseconds: subseconds)
+            }
+            let location = addUnsorted(card, to: model)
+            workspace.scan(location)
+            try await waitUntil { workspace.sources[location.id]?.result != nil }
+            let result = try XCTUnwrap(workspace.sources[location.id]?.result)
+            let cardGroups = result.stacks.map { $0.items.map(\.primary.name) }
+            XCTAssertEqual(cardGroups, [["DSC00001.JPG", "DSC00002.JPG"], ["DSC00003.JPG", "DSC00004.JPG"], ["DSC00009.JPG"]])
+
+            let eventID = try XCTUnwrap(workspace.createEvent(name: "Beach Day", date: organizerDay("2026-08-26"), policy: .buffer))
+            workspace.assign(stackIDs: Set(result.stacks.map(\.id)), from: location.id, to: eventID)
+            let plan = EventsWorkspace.buildApplyPlan(
+                events: [try XCTUnwrap(workspace.event(eventID))],
+                configuration: model.configuration,
+                locations: workspace.locations,
+                onlyUnder: card.path,
+                title: "Apply",
+                unsortedRoots: [card]
+            )
+            XCTAssertEqual(plan.moveCount, 5)
+            workspace.performApply(plan)
+            try await waitUntil { !model.isBusy && workspace.latestMoveJournalTitle != nil }
+
+            await workspace.refreshEvent(eventID)
+            let stacks = try XCTUnwrap(workspace.eventStacks[eventID])
+            let bufferEvent = root.appendingPathComponent("Drive/Camera Buffer/2026/2026-08-26 Beach Day/Originals/Sony A7V").path
+            XCTAssertTrue(stacks.flatMap(\.items).allSatisfy { $0.primary.path.hasPrefix(bufferEvent) })
+            XCTAssertEqual(stacks.map { $0.items.map(\.primary.name) }, cardGroups)
+
+            // A split made on the card board holds on the event board too.
+            let cardSecond = try XCTUnwrap(result.items.first { $0.primary.name == "DSC00002.JPG" })
+            model.updateConfiguration { $0.burstSplits.append(BurstSplit(memberPathKeys: [cardSecond.primary.pathKey])) }
+            let restacked = workspace.eventStacking().stacks(for: stacks.flatMap(\.items))
+            XCTAssertEqual(
+                restacked.map { $0.items.map(\.primary.name) },
+                [["DSC00001.JPG"], ["DSC00002.JPG"], ["DSC00003.JPG", "DSC00004.JPG"], ["DSC00009.JPG"]]
+            )
+        }
+    }
+
+    /// A JPEG with a camera capture time and a synthetic scene: the same seed
+    /// draws the same scene (Vision distance near 0), `mark` adds a dot.
+    @discardableResult
+    private func writeBurstSceneJPEG(_ url: URL, seed: Int, mark: Bool, captureTime: String, subseconds: String) throws -> URL {
+        let width = 640, height = 480
+        let context = try XCTUnwrap(CGContext(
+            data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
+        ))
+        if seed == 0 {
+            context.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 1))
+            context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        } else {
+            var rng = UInt64(seed)
+            func next() -> UInt64 {
+                rng = rng &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+                return rng >> 33
+            }
+            for y in 0..<height {
+                let t = Double(y) / Double(height)
+                context.setFillColor(CGColor(red: t, green: 0.4, blue: 1 - t, alpha: 1))
+                context.fill(CGRect(x: 0, y: y, width: width, height: 1))
+            }
+            for _ in 0..<40 {
+                context.setFillColor(CGColor(
+                    red: Double(next() % 255) / 255, green: Double(next() % 255) / 255,
+                    blue: Double(next() % 255) / 255, alpha: 0.8))
+                context.fillEllipse(in: CGRect(
+                    x: Double(next() % UInt64(width)), y: Double(next() % UInt64(height)),
+                    width: 20 + Double(next() % 80), height: 20 + Double(next() % 80)))
+            }
+        }
+        if mark {
+            context.setFillColor(CGColor(red: 1, green: 0, blue: 0, alpha: 1))
+            context.fillEllipse(in: CGRect(x: 300, y: 200, width: 12, height: 12))
+        }
+        let image = try XCTUnwrap(context.makeImage())
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let destination = try XCTUnwrap(CGImageDestinationCreateWithURL(url as CFURL, "public.jpeg" as CFString, 1, nil))
+        let properties: [CFString: Any] = [
+            kCGImagePropertyExifDictionary: [
+                kCGImagePropertyExifDateTimeOriginal: captureTime,
+                kCGImagePropertyExifSubsecTimeOriginal: subseconds,
+            ] as [CFString: Any],
+        ]
+        CGImageDestinationAddImage(destination, image, properties as CFDictionary)
+        XCTAssertTrue(CGImageDestinationFinalize(destination))
+        return url
     }
 }

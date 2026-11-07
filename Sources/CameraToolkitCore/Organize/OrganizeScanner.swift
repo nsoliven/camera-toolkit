@@ -298,7 +298,8 @@ public struct OrganizeScanner: Sendable {
         guard let values = try? url.resourceValues(forKeys: Set(listedKeys)) else { return }
         let name = url.lastPathComponent
         if values.isDirectory == true {
-            if skippedDirectoryNames.contains(name.lowercased()) {
+            // A Sony card's per-clip preview folder holds no media.
+            if skippedDirectoryNames.contains(name.lowercased()) || CameraSupportFiles.isThumbnailFolder(url.path) {
                 enumerator.skipDescendants()
             }
             return
@@ -306,8 +307,13 @@ public struct OrganizeScanner: Sendable {
         guard values.isRegularFile == true, values.isPackage != true else { return }
         let relative = FileScanner.relativePath(for: url, under: root)
         guard !ExclusionMatcher.isExcluded(relative) else { return }
+        let path = url.standardizedFileURL.path
+        // Camera previews and LUTs are ignored — never offered as items.
+        // Checked on the absolute path so a root inside `M4ROOT` still
+        // recognizes them.
+        guard !CameraSupportFiles.isCameraGenerated(path) else { return }
         files.append(OrganizeFile(
-            path: url.standardizedFileURL.path,
+            path: path,
             size: Int64(values.fileSize ?? 0),
             modifiedAt: values.contentModificationDate ?? .distantPast
         ))

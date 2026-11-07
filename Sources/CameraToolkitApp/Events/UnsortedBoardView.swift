@@ -9,7 +9,10 @@ struct UnsortedBoardView: View {
     let location: ConfiguredLocation
 
     @AppStorage("CameraToolkit.organize.tileWidth") private var tileWidth: Double = 220
-    @AppStorage("CameraToolkit.organize.hideSorted") private var hideSorted = false
+    /// Sorted items leave the board as soon as they are sorted; the bar's
+    /// Show Sorted brings them back for review. View-only — assignments
+    /// are untouched. Same key and default as `MainMenu.hidesSorted`.
+    @AppStorage("CameraToolkit.organize.hideSorted.v2") private var hideSorted = MainMenu.hideSortedByDefault
     @AppStorage("CameraToolkit.organize.mode") private var boardMode: OrganizeBoardMode = .tiles
     @AppStorage("CameraToolkit.organize.grouping") private var grouping: OrganizeBoardGrouping = .day
     @AppStorage(OrganizeBoardSortDefaults.unsortedKey) private var sortKey: OrganizeSortKey = .captureTime
@@ -58,6 +61,8 @@ struct UnsortedBoardView: View {
         let ordered = orderedStacks(in: groups)
         let searching = !workspace.search.isEmpty
         let matched = groups.reduce(0) { $0 + $1.stacks.count }
+        // Sorted stacks that just left the board leave the selection too.
+        let hiddenSorted = result.map { workspace.hiddenSortedStackIDs($0, hideSorted: hideSorted) } ?? []
 
         VStack(spacing: 0) {
             if result != nil {
@@ -166,6 +171,9 @@ struct UnsortedBoardView: View {
         }
         .task(id: location.id) {
             workspace.scan(location)
+        }
+        .onChange(of: hiddenSorted, initial: true) { _, hidden in
+            workspace.deselectHiddenStacks(hidden)
         }
         .onReceive(NotificationCenter.default.publisher(for: BrowserCommand.notification)) { notification in
             guard let raw = notification.object as? String, let command = BrowserCommand(rawValue: raw) else { return }
