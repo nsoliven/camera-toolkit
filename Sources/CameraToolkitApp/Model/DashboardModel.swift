@@ -296,6 +296,9 @@ final class DashboardModel {
     /// changed) — the NAS presence check pauses for jobs and recounts
     /// after them.
     @ObservationIgnored var onJobStarted: (@MainActor (JobAction) -> Void)?
+    /// A conflict was resolved (the Jobs window's Compare): the workspace
+    /// registers its Undo.
+    @ObservationIgnored var onConflictResolved: (@MainActor (ConflictResolution, String) -> Void)?
     @ObservationIgnored var onJobFinished: (@MainActor (JobAction) -> Void)?
     /// Heard when a speed test releases the job gate (see
     /// `isStorageBenchmarkRunning`).

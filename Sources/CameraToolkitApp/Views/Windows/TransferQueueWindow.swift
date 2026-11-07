@@ -244,6 +244,20 @@ private struct JobDetailContainer: View {
     @State private var zoom = JobHistoryZoom(full: 0...1)
     @State private var hover = JobHistoryHover()
     @State private var fileFilter = JobHistoryFileFilter.all
+    @State private var compareRequest: CompareRequest?
+    @State private var compareProblem: String?
+
+    /// Comparing works on Sync to NAS rows: their paths are NAS mirror paths.
+    private var compare: ((JobHistoryItem, CompareRequest.Mode) -> Void)? {
+        guard detail?.job.kind == JobAction.syncBuffer.rawValue else { return nil }
+        return { item, mode in
+            if let pair = model.comparePair(for: item) {
+                compareRequest = CompareRequest(pair: pair, mode: mode, fileName: item.fileName)
+            } else {
+                compareProblem = "The drive copy of \(item.fileName) was not found. Connect the drive it was synced from, then try again."
+            }
+        }
+    }
 
     private var duration: Double { detail?.graph.duration ?? 1 }
 
@@ -262,7 +276,7 @@ private struct JobDetailContainer: View {
             } else if let detail, !detail.items.isEmpty {
                 VSplitView {
                     pane.frame(minHeight: 280, idealHeight: 470, maxHeight: .infinity)
-                    JobHistoryFileTable(items: detail.items, zoom: $zoom, hover: hover, filter: $fileFilter, kind: detail.job.kind)
+                    JobHistoryFileTable(items: detail.items, zoom: $zoom, hover: hover, filter: $fileFilter, kind: detail.job.kind, compare: compare)
                         .frame(minHeight: 140, idealHeight: 240, maxHeight: .infinity)
                 }
             } else {
@@ -272,13 +286,22 @@ private struct JobDetailContainer: View {
         .onChange(of: duration, initial: true) { _, duration in
             zoom.setFull(0...max(duration, 1))
         }
+        .sheet(item: $compareRequest) { request in
+            FileCompareSheet(model: model, request: request)
+        }
+        .alert("Can't Compare", isPresented: Binding(get: { compareProblem != nil }, set: { if !$0 { compareProblem = nil } })) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(compareProblem ?? "")
+        }
     }
 
     private var pane: some View {
         ScrollView {
             JobActivityDetail(
                 live: live, detail: detail, monitor: monitor, zoom: $zoom, hover: hover,
-                showIssues: transfer == nil && !(detail?.items.isEmpty ?? true) ? { fileFilter = .issues } : nil
+                showIssues: transfer == nil && !(detail?.items.isEmpty ?? true) ? { fileFilter = .issues } : nil,
+                compare: compare
             )
         }
     }
@@ -998,6 +1021,7 @@ extension JobAction {
         case .immichUpload: "Immich Upload"
         case .faceScan: "Face Scan"
         case .nasRename: "NAS Rename"
+        case .resolveConflict: "Resolve Conflict"
         }
     }
 }

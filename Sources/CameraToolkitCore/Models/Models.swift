@@ -171,6 +171,8 @@ public enum JobAction: String, Codable, CaseIterable, Sendable {
     case faceScan
     /// NAS copies renamed to follow files moved on the drive.
     case nasRename
+    /// One Sync to NAS conflict resolved (or its resolution undone).
+    case resolveConflict
 }
 
 public struct JobSnapshot: Identifiable, Codable, Hashable, Sendable {

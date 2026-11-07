@@ -1013,6 +1013,9 @@ final class EventsWorkspace {
         nasPresence.onReportChanged = { [weak self] old, new in self?.nasPresenceChanged(from: old, to: new) }
         // A job that only renames files on the drives never writes the
         // NAS, so it neither pauses a NAS listing nor triggers a new one.
+        model.onConflictResolved = { [weak self] resolution, title in
+            self?.recordConflictUndo(resolution, title: title)
+        }
         model.onJobStarted = { [weak self] action in
             guard action != .organize else { return }
             self?.nasPresence.pauseForJob()
