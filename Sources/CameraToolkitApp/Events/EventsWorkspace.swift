@@ -930,6 +930,14 @@ final class EventsWorkspace {
     /// files, so an event board groups the same bursts as the card board
     /// whichever copy it draws (`eventStacking()`).
     @ObservationIgnored let burstLinkMemory = BurstLinkMemory()
+    /// Scanned source root → source path key → the event whose drive folder
+    /// already holds that file (`refreshAppliedSources`). What the unsorted
+    /// board hides and what the waiting-for-Apply count leaves out.
+    private(set) var appliedSourceEvents: [String: [String: UUID]] = [:]
+    @ObservationIgnored private var appliedRefreshGenerations: [UUID: UUID] = [:]
+    /// Test seam: whether a source file and an event's drive root share a
+    /// volume (a card never does). Nil uses `VolumeInfo.isSameVolume`.
+    @ObservationIgnored var appliedSameVolumeCheck: AppliedSourceCheck.SameVolume?
     /// `OrganizeStack.id` → stack per event board — rebuilt when the board
     /// writes `eventStacks`, so a context menu or key press resolves its
     /// targets by lookup instead of scanning every stack in the event.
@@ -1739,16 +1747,22 @@ final class EventsWorkspace {
     /// needle — file name, burst label, origin subfolder, assigned event
     /// title, or the name of a person or group whose face sits on one of
     /// the stack's files — and the builder's OR-of-AND condition groups.
+    ///
+    /// `hideApplied` (the unsorted board's default) drops only stacks whose
+    /// every file is already in its event (`isApplied`): a sorted stack that
+    /// still needs Apply stays, so its sort can be checked and changed.
     func visibleStacks(
         _ result: OrganizeScanResult,
         hideSorted: Bool,
+        hideApplied: Bool = false,
         search: OrganizeSearchFilter = OrganizeSearchFilter()
     ) -> [OrganizeStack] {
-        guard hideSorted || !search.isEmpty else { return result.stacks }
+        guard hideSorted || hideApplied || !search.isEmpty else { return result.stacks }
         let people: BoardPeople = search.needsPeople ? boardPeople(for: result.stacks) : ([], [:], [])
         let cameras = search.needsCameras
         return result.stacks.filter { stack in
             if hideSorted, isSorted(stack) { return false }
+            if hideApplied, isApplied(stack, in: result) { return false }
             guard !search.isEmpty else { return true }
             return OrganizeSearch.matches(
                 stack: stack,
@@ -1759,11 +1773,74 @@ final class EventsWorkspace {
         }
     }
 
-    /// The stacks `hideSorted` takes off a board — fully sorted ones — so the
-    /// board can drop them from the selection (`deselectHiddenStacks`).
-    func hiddenSortedStackIDs(_ result: OrganizeScanResult, hideSorted: Bool) -> Set<String> {
-        guard hideSorted else { return [] }
-        return Set(result.stacks.lazy.filter { self.isSorted($0) }.map(\.id))
+    /// The stacks `hideApplied` takes off a board — every file already in
+    /// its event — so the board can drop them from the selection
+    /// (`deselectHiddenStacks`). Sorted stacks still waiting for Apply stay.
+    func hiddenAppliedStackIDs(_ result: OrganizeScanResult, hideApplied: Bool) -> Set<String> {
+        guard hideApplied, appliedSourceEvents[result.rootPath]?.isEmpty == false || !applyDuplicateSourceKeys.isEmpty else { return [] }
+        return Set(result.stacks.lazy.filter { self.isApplied($0, in: result) }.map(\.id))
+    }
+
+    /// True when every file of the stack is sorted and already in its event
+    /// on the drive — what an Apply would count as "already there" (see
+    /// `AppliedSourceCheck`), or a byte-identical copy the last Apply plan
+    /// found (`applyDuplicateSourceKeys`). Such a stack needs nothing more.
+    func isApplied(_ stack: OrganizeStack, in result: OrganizeScanResult) -> Bool {
+        let applied = appliedSourceEvents[result.rootPath] ?? [:]
+        guard !applied.isEmpty || !applyDuplicateSourceKeys.isEmpty else { return false }
+        return stack.items.allSatisfy { item in
+            item.files.allSatisfy { isApplied($0, applied: applied) }
+        }
+    }
+
+    /// One file: sorted, and its event (the current one — a re-sort into
+    /// another event makes it pending again) already holds its copy.
+    private func isApplied(_ file: OrganizeFile, applied: [String: UUID]) -> Bool {
+        guard let assignment = assignment(for: file) else { return false }
+        if applyDuplicateSourceKeys[assignment.eventID]?.contains(file.pathKey) == true { return true }
+        return applied[file.pathKey] == assignment.eventID
+    }
+
+    /// Re-learns which sorted files of a scanned source are already in their
+    /// event (`AppliedSourceCheck`, off the main actor; it stats the source
+    /// and drive copies only, never the NAS). The board calls it after a
+    /// scan, a sort, an Apply or a copy finishing, and a mount change. A
+    /// newer call supersedes an older one still running.
+    func refreshAppliedSources(for locationID: UUID) async {
+        guard let result = sources[locationID]?.result else { return }
+        let generation = UUID()
+        appliedRefreshGenerations[locationID] = generation
+        refreshIndexIfNeeded(tracking: false)
+        var rows: [PhotoEventAssignment] = []
+        var eventIDs = Set<UUID>()
+        for item in result.items {
+            for file in item.files {
+                guard let assignment = currentAssignment(for: file) else { continue }
+                rows.append(assignment)
+                eventIDs.insert(assignment.eventID)
+            }
+        }
+        let events = Dictionary(uniqueKeysWithValues: eventIDs.compactMap { event($0) }.map { ($0.id, $0) })
+        let locations = self.locations
+        let gate = driveActivityGate
+        let sameVolume = appliedSameVolumeCheck
+        let mounted = mountedVolumesProvider?()
+        let applied = await Task.detached(priority: .utility) {
+            AppliedSourceCheck.appliedSources(
+                assignments: rows,
+                events: events,
+                locations: locations,
+                mountedVolumes: mounted,
+                pauseGate: gate,
+                sameVolume: sameVolume,
+                isCancelled: { Task.isCancelled }
+            )
+        }.value
+        guard appliedRefreshGenerations[locationID] == generation,
+              sources[locationID]?.result?.rootPath == result.rootPath else { return }
+        if appliedSourceEvents[result.rootPath] != applied {
+            appliedSourceEvents[result.rootPath] = applied
+        }
     }
 
     /// Takes stacks the board no longer shows out of the selection, focus and
@@ -2323,12 +2400,19 @@ final class EventsWorkspace {
     /// Sorted files still waiting for Apply. A file the last Apply plan
     /// found already in its event as an identical copy is not waiting —
     /// it is counted by `applyCollisions(in:)` instead.
+    ///
+    /// A file already in its event (a card file Apply copied, which stays on
+    /// the card) is not waiting either (`isApplied`), so this is exactly what
+    /// Apply still has to do.
     func sortedFiles(in result: OrganizeScanResult) -> (files: Int, bytes: Int64) {
         let duplicates = applyDuplicateSourceKeys.values.reduce(into: Set<String>()) { $0.formUnion($1) }
+        let applied = appliedSourceEvents[result.rootPath] ?? [:]
         var files = 0
         var bytes: Int64 = 0
         for item in result.items {
-            for file in item.files where assignment(for: file) != nil && !duplicates.contains(file.pathKey) {
+            for file in item.files {
+                guard let assignment = assignment(for: file), !duplicates.contains(file.pathKey),
+                      applied[file.pathKey] != assignment.eventID else { continue }
                 files += 1
                 bytes += file.size
             }

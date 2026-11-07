@@ -43,23 +43,23 @@ enum MainMenu {
     /// keys through `@AppStorage`, so a menu change redraws the open board.
     enum DefaultsKey {
         static let boardMode = "CameraToolkit.organize.mode"
-        /// `.v2`: hiding sorted items became the default, and installs that
-        /// stored the old default (`false`) under the first key would never
-        /// see it.
-        static let hideSorted = "CameraToolkit.organize.hideSorted.v2"
+        /// Hide applied items on unsorted boards. `.v2`: hiding became the
+        /// default, and installs that stored the old default (`false`) under
+        /// the first key would never see it. (The key keeps its first name.)
+        static let hideApplied = "CameraToolkit.organize.hideSorted.v2"
         static let tileWidth = "CameraToolkit.organize.tileWidth"
         static let showInspector = "CameraToolkit.organize.showInspector"
     }
 
-    /// Unsorted boards show only what still needs sorting unless the owner
-    /// asks to see sorted items again.
-    static let hideSortedByDefault = true
+    /// Unsorted boards hide items already in their events unless the owner
+    /// asks to see them; sorted items waiting for Apply always show.
+    static let hideAppliedByDefault = true
 
-    /// The View menu's Hide Sorted Items state: the stored choice, or the
+    /// The View menu's Hide Applied Items state: the stored choice, or the
     /// default when none was made — the same answer the boards' `@AppStorage`
     /// gives.
-    static func hidesSorted(_ defaults: UserDefaults = .standard) -> Bool {
-        defaults.object(forKey: DefaultsKey.hideSorted) as? Bool ?? hideSortedByDefault
+    static func hidesApplied(_ defaults: UserDefaults = .standard) -> Bool {
+        defaults.object(forKey: DefaultsKey.hideApplied) as? Bool ?? hideAppliedByDefault
     }
 
     static let tileWidthRange: ClosedRange<Double> = 88...460
@@ -167,7 +167,7 @@ enum MainMenu {
         menu.addItem(.separator())
         menu.addItem(item("as Tiles", #selector(MainMenuActions.showTiles(_:)), to: target))
         menu.addItem(item("as List", #selector(MainMenuActions.showList(_:)), to: target))
-        menu.addItem(item("Hide Sorted Items", #selector(MainMenuActions.toggleHideSorted(_:)), to: target))
+        menu.addItem(item("Hide Applied Items", #selector(MainMenuActions.toggleHideSorted(_:)), to: target))
         menu.addItem(.separator())
         menu.addItem(item("Bigger Tiles", #selector(MainMenuActions.zoomTilesIn(_:)), "+", to: target))
         menu.addItem(item("Smaller Tiles", #selector(MainMenuActions.zoomTilesOut(_:)), "-", to: target))

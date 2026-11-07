@@ -105,7 +105,7 @@ struct BoardViewControls: View {
     @Binding var sort: OrganizeStackSort
     @Binding var tileWidth: Double
     /// Unsorted boards only.
-    var hideSorted: Binding<Bool>? = nil
+    var hideApplied: Binding<Bool>? = nil
     var compact = false
     /// The narrowest bars: Sort and Group as bare icons (their current
     /// choice stays in the help and VoiceOver label).
@@ -113,14 +113,14 @@ struct BoardViewControls: View {
 
     static let tileWidthRange = 88.0...460.0
 
-    static func sortedToggleTitle(hidden: Bool) -> String {
-        hidden ? "Show Sorted" : "Hide Sorted"
+    static func appliedToggleTitle(hidden: Bool) -> String {
+        hidden ? "Show Applied" : "Hide Applied"
     }
 
-    static func sortedToggleHelp(hidden: Bool) -> String {
+    static func appliedToggleHelp(hidden: Bool) -> String {
         hidden
-            ? "Show Sorted: bring back items already sorted into an event, to review them. Nothing moves."
-            : "Hide Sorted: show only what still needs sorting. Nothing moves."
+            ? "Show Applied: also show items already copied into their events. Sorted items waiting for Apply always show. Nothing moves."
+            : "Hide Applied: hide items already copied into their events. Sorted items waiting for Apply stay. Nothing moves."
     }
 
     var body: some View {
@@ -176,17 +176,17 @@ struct BoardViewControls: View {
                 .frame(width: 130)
                 .help("Tile size — smaller fits more bursts on screen")
             }
-            if let hideSorted {
-                // Named for what a click does: while sorted items are hidden
-                // it offers Show Sorted, while they show it offers Hide Sorted.
-                let hidden = hideSorted.wrappedValue
+            if let hideApplied {
+                // Named for what a click does: while applied items are hidden
+                // it offers Show Applied, while they show it offers Hide Applied.
+                let hidden = hideApplied.wrappedValue
                 Button {
-                    hideSorted.wrappedValue.toggle()
+                    hideApplied.wrappedValue.toggle()
                 } label: {
-                    Label(Self.sortedToggleTitle(hidden: hidden), systemImage: hidden ? "eye" : "eye.slash")
+                    Label(Self.appliedToggleTitle(hidden: hidden), systemImage: hidden ? "eye" : "eye.slash")
                 }
-                .help(Self.sortedToggleHelp(hidden: hidden))
-                .accessibilityLabel(Self.sortedToggleTitle(hidden: hidden))
+                .help(Self.appliedToggleHelp(hidden: hidden))
+                .accessibilityLabel(Self.appliedToggleTitle(hidden: hidden))
             }
         }
         .labelStyle(.iconOnly)
@@ -473,7 +473,11 @@ struct AdaptiveBar<Content: View>: View {
         }) {
             content(tier)
         }
-        .frame(maxWidth: .infinity)
+        // `minWidth: 0` makes the bar exactly as wide as it is offered. With
+        // `maxWidth` alone a rendering wider than the window widened the bar
+        // to fit it, so the measured room grew with the overflow, no narrower
+        // tier was ever chosen, and the trailing Apply button ran off-screen.
+        .frame(minWidth: 0, maxWidth: .infinity)
         .onGeometryChange(for: Double.self) { Double($0.size.width) } action: { width in
             probe.measured(available: width)
         }

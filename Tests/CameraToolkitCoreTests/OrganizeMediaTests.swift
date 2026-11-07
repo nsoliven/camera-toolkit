@@ -511,6 +511,43 @@ extension OrganizeMediaTests {
         XCTAssertFalse(CameraSupportFiles.isThumbnailFolder("/card/M4ROOT/CLIP"))
     }
 
+    func testCameraSupportFilesMatchSonyCardManagementFiles() {
+        // The clip index and status file directly in M4ROOT, wherever M4ROOT is.
+        XCTAssertTrue(CameraSupportFiles.isCameraGenerated("M4ROOT/MEDIAPRO.XML"))
+        XCTAssertTrue(CameraSupportFiles.isCameraGenerated("/card/M4ROOT/STATUS.BIN"))
+        XCTAssertTrue(CameraSupportFiles.isCameraGenerated("/card/PRIVATE/M4ROOT/MEDIAPRO.XML"))
+        XCTAssertTrue(CameraSupportFiles.isCameraGenerated("/card/PRIVATE/M4ROOT/THMBNL/C0001T01.JPG"))
+        // The still-image database.
+        XCTAssertTrue(CameraSupportFiles.isCameraGenerated("/card/AVF_INFO/AVIN0001.INT"))
+        XCTAssertTrue(CameraSupportFiles.isCameraGenerated("AVF_INFO/AVIN0001.INP"))
+        XCTAssertTrue(CameraSupportFiles.isCameraGenerated("AVF_INFO/AVIN0001.BNP"))
+        // The camera database and card files under PRIVATE.
+        XCTAssertTrue(CameraSupportFiles.isCameraGenerated("/card/PRIVATE/DATABASE/DATABASE.BIN"))
+        XCTAssertTrue(CameraSupportFiles.isCameraGenerated("PRIVATE/SONY/DATABASE/DATABASE.BIN"))
+        XCTAssertTrue(CameraSupportFiles.isCameraGenerated("PRIVATE/DATABASE.BIN"))
+        XCTAssertTrue(CameraSupportFiles.isCameraGenerated("PRIVATE/SONY/SONYCARD.IND"))
+        // Media stays: clips and their XML (also under PRIVATE/M4ROOT), and
+        // other PRIVATE media such as AVCHD streams.
+        XCTAssertFalse(CameraSupportFiles.isCameraGenerated("M4ROOT/CLIP/C0001.MP4"))
+        XCTAssertFalse(CameraSupportFiles.isCameraGenerated("M4ROOT/CLIP/C0001M01.XML"))
+        XCTAssertFalse(CameraSupportFiles.isCameraGenerated("/card/PRIVATE/M4ROOT/CLIP/C0001.MP4"))
+        XCTAssertFalse(CameraSupportFiles.isCameraGenerated("/card/PRIVATE/M4ROOT/CLIP/C0001M01.XML"))
+        XCTAssertFalse(CameraSupportFiles.isCameraGenerated("PRIVATE/AVCHD/BDMV/STREAM/00000.MTS"))
+        XCTAssertFalse(CameraSupportFiles.isCameraGenerated("DCIM/100MSDCF/DATABASE.JPG"))
+        XCTAssertFalse(CameraSupportFiles.isCameraGenerated("Exports/MEDIAPRO.XML"))
+        XCTAssertFalse(CameraSupportFiles.isCameraGenerated("DATABASE.BIN"))
+        // Folders a scan skips whole.
+        XCTAssertTrue(CameraSupportFiles.isSupportFolder("/card/AVF_INFO"))
+        XCTAssertTrue(CameraSupportFiles.isSupportFolder("/card/PRIVATE/DATABASE"))
+        XCTAssertTrue(CameraSupportFiles.isSupportFolder("/card/PRIVATE/SONY"))
+        XCTAssertTrue(CameraSupportFiles.isSupportFolder("/card/M4ROOT/THMBNL"))
+        XCTAssertFalse(CameraSupportFiles.isSupportFolder("/card/PRIVATE"))
+        XCTAssertFalse(CameraSupportFiles.isSupportFolder("/card/PRIVATE/M4ROOT"))
+        XCTAssertFalse(CameraSupportFiles.isSupportFolder("/card/PRIVATE/M4ROOT/CLIP"))
+        XCTAssertFalse(CameraSupportFiles.isSupportFolder("/card/M4ROOT"))
+        XCTAssertFalse(CameraSupportFiles.isSupportFolder("/card/DCIM/100MSDCF"))
+    }
+
     func testScannerIgnoresSonyPreviewsAndLUTsButKeepsClipsAndPhotos() throws {
         try withTemporaryDirectory { root in
             let card = root.appendingPathComponent("Card", isDirectory: true)
@@ -524,6 +561,16 @@ extension OrganizeMediaTests {
             try writeFile(card.appendingPathComponent("M4ROOT/CLIP/C0001M01.XML"), "<xml/>")
             let preview = try writeFile(card.appendingPathComponent("M4ROOT/THMBNL/C0001T01.JPG"), Data(repeating: 6, count: 64))
             let lut = try writeFile(card.appendingPathComponent("M4ROOT/GENERAL/LUT/LOOK1.cube"), "LUT_3D_SIZE 2")
+            try writeFile(card.appendingPathComponent("M4ROOT/MEDIAPRO.XML"), "<MediaProfile/>")
+            try writeFile(card.appendingPathComponent("M4ROOT/STATUS.BIN"), Data(repeating: 7, count: 16))
+            try writeFile(card.appendingPathComponent("AVF_INFO/AVIN0001.INT"), Data(repeating: 8, count: 16))
+            try writeFile(card.appendingPathComponent("AVF_INFO/AVIN0001.INP"), Data(repeating: 8, count: 16))
+            try writeFile(card.appendingPathComponent("AVF_INFO/AVIN0001.BNP"), Data(repeating: 8, count: 16))
+            try writeFile(card.appendingPathComponent("PRIVATE/DATABASE/DATABASE.BIN"), Data(repeating: 9, count: 16))
+            try writeFile(card.appendingPathComponent("PRIVATE/SONY/SONYCARD.IND"), Data(repeating: 9, count: 16))
+            try writeFile(card.appendingPathComponent("PRIVATE/M4ROOT/CLIP/C0002.MP4"), Data(repeating: 2, count: 64))
+            try writeFile(card.appendingPathComponent("PRIVATE/M4ROOT/CLIP/C0002M01.XML"), "<xml/>")
+            try writeFile(card.appendingPathComponent("PRIVATE/M4ROOT/MEDIAPRO.XML"), "<MediaProfile/>")
             let before = try treeBytes(card)
 
             let cache = CaptureDateCache(url: root.appendingPathComponent("cache.json"))
@@ -539,8 +586,10 @@ extension OrganizeMediaTests {
                 if scanRoot == card {
                     XCTAssertEqual(names, [
                         "DSC00001.ARW", "DSC00001.JPG", "DSC00002.JPG", "DSC00001.photo-edit",
-                        "DSC00002-export.tif", "C0001.MP4", "C0001M01.XML",
+                        "DSC00002-export.tif", "C0001.MP4", "C0001M01.XML", "C0002.MP4", "C0002M01.XML",
                     ])
+                    let privateClip = try XCTUnwrap(result.items.first { $0.primary.name == "C0002.MP4" })
+                    XCTAssertEqual(privateClip.companions.map(\.name), ["C0002M01.XML"])
                 }
             }
             // Ignored means untouched: every file is still there, byte for byte.

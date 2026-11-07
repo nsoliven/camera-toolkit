@@ -65,35 +65,51 @@ public enum PathSafety {
     }
 }
 
-/// Files a Sony camera writes for its own use beside the media: one small
-/// preview JPEG per clip under `M4ROOT/THMBNL`, and the colour LUTs it keeps
-/// under `M4ROOT/GENERAL`. They are not photos and never belong on a board.
+/// Files a Sony camera writes for its own use beside the media. They are not
+/// photos or clips and never belong on a board:
+/// - `M4ROOT/THMBNL/…` — one small preview JPEG per clip.
+/// - `M4ROOT/GENERAL/….cube` — the colour LUTs the camera keeps.
+/// - `M4ROOT/MEDIAPRO.XML`, `M4ROOT/STATUS.BIN` — the clip index and status.
+/// - `AVF_INFO/…` — the still-image database (`AVIN0001.INT/.INP/.BNP`).
+/// - Under `PRIVATE/`: the camera database (`…/DATABASE/…`, `DATABASE.BIN`)
+///   and `PRIVATE/SONY/…` card management files.
+///
+/// `M4ROOT` is matched wherever it sits (some bodies write it under
+/// `PRIVATE/`), and its `CLIP` folder — the clips and their `M01.XML`
+/// sidecars — stays listed, as do DCIM photos, Photomator edits, exports and
+/// any other file under `PRIVATE/` (AVCHD streams, for one).
 ///
 /// This only keeps them off the sorting boards (`OrganizeScanner`) and out of
-/// Apply plans. It is deliberately narrow and path-based: the clips in
-/// `M4ROOT/CLIP` and their XML sidecars, DCIM photos, Photomator edits and
-/// any other JPEG stay listed. It is not part of `DefaultExcludes`, so card
-/// ingest, manifests and Free Up are unchanged — nothing here moves, copies
-/// or deletes a file.
+/// Apply plans. It is not part of `DefaultExcludes`, so card ingest,
+/// manifests and Free Up are unchanged — nothing here moves, copies or
+/// deletes a file.
 public enum CameraSupportFiles {
-    /// True for a file under `M4ROOT/THMBNL/` or a `.cube` file under
-    /// `M4ROOT/GENERAL/`. `path` may be absolute or relative to a scan root;
-    /// folder names compare case-insensitively.
+    /// True for a camera support file. `path` may be absolute or relative to a
+    /// scan root; names compare case-insensitively.
     public static func isCameraGenerated(_ path: String) -> Bool {
-        let components = path.replacingOccurrences(of: "\\", with: "/")
-            .split(separator: "/", omittingEmptySubsequences: true)
-            .map { $0.uppercased() }
-        // The file itself is the last component; its folders come before.
-        guard components.count >= 3 else { return false }
+        let components = upperComponents(path)
+        guard let name = components.last, components.count >= 2 else { return false }
         let folders = components.dropLast()
-        for index in folders.indices where folders[index] == "M4ROOT" {
+        if folders.contains("AVF_INFO") { return true }
+        for index in folders.indices {
             let next = folders.index(after: index)
-            guard next < folders.endIndex else { continue }
-            switch folders[next] {
-            case "THMBNL":
-                return true
-            case "GENERAL":
-                if components.last?.hasSuffix(".CUBE") == true { return true }
+            switch folders[index] {
+            case "M4ROOT":
+                // Directly inside M4ROOT: the clip index and status file.
+                if next == folders.endIndex, name == "MEDIAPRO.XML" || name == "STATUS.BIN" { return true }
+                guard next < folders.endIndex else { continue }
+                switch folders[next] {
+                case "THMBNL":
+                    return true
+                case "GENERAL":
+                    if name.hasSuffix(".CUBE") { return true }
+                default:
+                    break
+                }
+            case "PRIVATE":
+                let below = folders[next...]
+                if below.contains("M4ROOT") { continue }
+                if name == "DATABASE.BIN" || below.contains("DATABASE") || below.first == "SONY" { return true }
             default:
                 break
             }
@@ -101,13 +117,32 @@ public enum CameraSupportFiles {
         return false
     }
 
-    /// True for the `M4ROOT/THMBNL` folder itself (relative or absolute), so a
+    /// True for a folder that holds nothing but support files — `M4ROOT/THMBNL`,
+    /// `AVF_INFO`, a `DATABASE` folder or `SONY` folder under `PRIVATE` — so a
     /// scan can skip it without listing its files.
+    public static func isSupportFolder(_ path: String) -> Bool {
+        let components = upperComponents(path)
+        guard let last = components.last else { return false }
+        if last == "AVF_INFO" { return true }
+        let parents = components.dropLast()
+        if last == "THMBNL", parents.last == "M4ROOT" { return true }
+        if let privateIndex = parents.lastIndex(of: "PRIVATE"), !components[privateIndex...].contains("M4ROOT") {
+            if last == "DATABASE" { return true }
+            if last == "SONY", parents.last == "PRIVATE" { return true }
+        }
+        return false
+    }
+
+    /// The `M4ROOT/THMBNL` folder itself (relative or absolute).
     public static func isThumbnailFolder(_ path: String) -> Bool {
-        let components = path.replacingOccurrences(of: "\\", with: "/")
-            .split(separator: "/", omittingEmptySubsequences: true)
-            .map { $0.uppercased() }
+        let components = upperComponents(path)
         guard components.count >= 2 else { return false }
         return components[components.count - 1] == "THMBNL" && components[components.count - 2] == "M4ROOT"
+    }
+
+    private static func upperComponents(_ path: String) -> [String] {
+        path.replacingOccurrences(of: "\\", with: "/")
+            .split(separator: "/", omittingEmptySubsequences: true)
+            .map { $0.uppercased() }
     }
 }

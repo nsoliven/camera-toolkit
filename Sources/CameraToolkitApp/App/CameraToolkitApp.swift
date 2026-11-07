@@ -178,7 +178,7 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate, NSMenuIte
             menuItem.state = boardMode == .list ? .on : .off
             return true
         case #selector(toggleHideSorted(_:)):
-            menuItem.state = MainMenu.hidesSorted(defaults) ? .on : .off
+            menuItem.state = MainMenu.hidesApplied(defaults) ? .on : .off
             return true
         case #selector(zoomTilesIn(_:)), #selector(zoomTilesOut(_:)):
             return !typing && boardMode == .tiles
@@ -236,7 +236,7 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate, NSMenuIte
 
     @objc func toggleHideSorted(_ sender: Any?) {
         let defaults = UserDefaults.standard
-        defaults.set(!MainMenu.hidesSorted(defaults), forKey: MainMenu.DefaultsKey.hideSorted)
+        defaults.set(!MainMenu.hidesApplied(defaults), forKey: MainMenu.DefaultsKey.hideApplied)
     }
 
     @objc func zoomTilesIn(_ sender: Any?) {

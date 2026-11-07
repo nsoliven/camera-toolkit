@@ -124,7 +124,7 @@ final class MainMenuTests: XCTestCase {
             .compactMap { try? String(contentsOf: Self.sourceRoot.appendingPathComponent($0), encoding: .utf8) }
             .joined()
         XCTAssertFalse(sources.isEmpty)
-        for key in [MainMenu.DefaultsKey.boardMode, MainMenu.DefaultsKey.hideSorted, MainMenu.DefaultsKey.tileWidth] {
+        for key in [MainMenu.DefaultsKey.boardMode, MainMenu.DefaultsKey.hideApplied, MainMenu.DefaultsKey.tileWidth] {
             XCTAssertTrue(sources.contains("\"\(key)\""), "\(key) is not read by any board")
         }
     }

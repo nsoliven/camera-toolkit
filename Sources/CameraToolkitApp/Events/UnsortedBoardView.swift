@@ -9,10 +9,12 @@ struct UnsortedBoardView: View {
     let location: ConfiguredLocation
 
     @AppStorage("CameraToolkit.organize.tileWidth") private var tileWidth: Double = 220
-    /// Sorted items leave the board as soon as they are sorted; the bar's
-    /// Show Sorted brings them back for review. View-only — assignments
-    /// are untouched. Same key and default as `MainMenu.hidesSorted`.
-    @AppStorage("CameraToolkit.organize.hideSorted.v2") private var hideSorted = MainMenu.hideSortedByDefault
+    /// Applied items — every file already in its event — leave the board;
+    /// sorted items still waiting for Apply stay, dimmed with their event,
+    /// so a sort can be checked and changed first. The bar's Show Applied
+    /// brings applied items back. View-only — assignments are untouched.
+    /// Same key and default as `MainMenu.hidesApplied`.
+    @AppStorage("CameraToolkit.organize.hideSorted.v2") private var hideApplied = MainMenu.hideAppliedByDefault
     @AppStorage("CameraToolkit.organize.mode") private var boardMode: OrganizeBoardMode = .tiles
     @AppStorage("CameraToolkit.organize.grouping") private var grouping: OrganizeBoardGrouping = .day
     @AppStorage(OrganizeBoardSortDefaults.unsortedKey) private var sortKey: OrganizeSortKey = .captureTime
@@ -30,7 +32,7 @@ struct UnsortedBoardView: View {
     private var groups: [OrganizeBoardGroup] {
         guard let result = state.result else { return [] }
         return OrganizeBoardPlan.groups(
-            for: workspace.visibleStacks(result, hideSorted: hideSorted, search: workspace.search),
+            for: workspace.visibleStacks(result, hideSorted: false, hideApplied: hideApplied, search: workspace.search),
             grouping: grouping,
             sort: sort,
             rootPath: result.rootPath,
@@ -61,21 +63,21 @@ struct UnsortedBoardView: View {
         let ordered = orderedStacks(in: groups)
         let searching = !workspace.search.isEmpty
         let matched = groups.reduce(0) { $0 + $1.stacks.count }
-        // Sorted stacks that just left the board leave the selection too.
-        let hiddenSorted = result.map { workspace.hiddenSortedStackIDs($0, hideSorted: hideSorted) } ?? []
+        // Applied stacks that just left the board leave the selection too.
+        let hiddenApplied = result.map { workspace.hiddenAppliedStackIDs($0, hideApplied: hideApplied) } ?? []
 
         VStack(spacing: 0) {
             if result != nil {
                 if groups.isEmpty {
                     if searching {
                         NoMatchesView(workspace: workspace, boardName: location.name)
-                    } else if hideSorted {
+                    } else if hideApplied {
                         ContentUnavailableView {
-                            Label("Everything Here Is Sorted", systemImage: "checkmark.circle")
+                            Label("Everything Here Is in Its Event", systemImage: "checkmark.circle")
                         } description: {
-                            Text("Show sorted items to review them, or Apply to move the files into their events.")
+                            Text("Every file here already has its copy in its event. Show applied items to review them.")
                         } actions: {
-                            Button("Show Sorted") { hideSorted = false }
+                            Button("Show Applied") { hideApplied = false }
                             if let result, workspace.sortedFiles(in: result).files > 0 {
                                 Button("Apply…") { workspace.prepareApply(sourceLocationID: location.id) }
                                     .buttonStyle(.borderedProminent)
@@ -119,6 +121,13 @@ struct UnsortedBoardView: View {
         // A firm edge under the bottom bar keeps its caption legible over
         // tiles scrolling beneath it.
         .scrollEdgeEffectStyle(.hard, for: .bottom)
+        // What still needs Apply, said once at the top — the bottom bar's
+        // Apply button can be the last thing a narrow window has room for.
+        .safeAreaBar(edge: .top) {
+            if let result {
+                UnsortedApplyBanner(model: model, workspace: workspace, location: location, result: result)
+            }
+        }
         .safeAreaBar(edge: .bottom) {
             if let result {
                 bottomBar(result, groups: groups, ordered: ordered, matched: matched)
@@ -172,7 +181,10 @@ struct UnsortedBoardView: View {
         .task(id: location.id) {
             workspace.scan(location)
         }
-        .onChange(of: hiddenSorted, initial: true) { _, hidden in
+        .background {
+            AppliedSourcesWatcher(model: model, workspace: workspace, locationID: location.id, scannedAt: result?.scannedAt)
+        }
+        .onChange(of: hiddenApplied, initial: true) { _, hidden in
             workspace.deselectHiddenStacks(hidden)
         }
         .onReceive(NotificationCenter.default.publisher(for: BrowserCommand.notification)) { notification in
@@ -304,11 +316,16 @@ struct UnsortedBoardView: View {
                 groupings: OrganizeBoardGrouping.allCases,
                 sort: Binding(get: { sort }, set: { sortKey = $0.key; sortAscending = $0.ascending }),
                 tileWidth: $tileWidth,
-                hideSorted: $hideSorted,
+                hideApplied: $hideApplied,
                 compact: compactControls,
                 iconOnlyMenus: iconOnlyMenus
             )
             .fixedSize()
+            // Past the narrowest tier the view controls give way (clipped),
+            // never Undo and Apply.
+            .frame(minWidth: 0)
+            .clipped()
+            .layoutPriority(-1)
             Spacer(minLength: 0)
             // Trailing: undo, and the one commit step.
             HStack(spacing: 6) {
@@ -334,6 +351,7 @@ struct UnsortedBoardView: View {
                 .guideHighlight(.applyButton, in: workspace)
             }
             .fixedSize()
+            .layoutPriority(1)
         }
     }
 
@@ -347,7 +365,9 @@ struct UnsortedBoardView: View {
             containerID: location.id,
             rootPath: state.result?.rootPath,
             eventForStack: { workspace.assignedEvent(for: $0) },
-            isDimmed: { !hideSorted && workspace.isSorted($0) && !workspace.selectedStackIDs.contains($0.id) },
+            // Sorted stacks stay on the board until applied, dimmed with their
+            // event tag; a selected one is drawn at full strength.
+            isDimmed: { workspace.isSorted($0) && !workspace.selectedStackIDs.contains($0.id) },
             badge: { _ in nil },
             orientationForFile: { workspace.displayTurns(for: $0) },
             onOpen: { stack, frame in
@@ -647,5 +667,83 @@ private struct UnsortedActionsMenu: View {
             workspace.removeUnsortedFolder(location.id)
         }
         .help("Stop listing this folder here — no files change")
+    }
+}
+
+/// "12 sorted files aren't in their events yet" with its own Apply…, above
+/// the board while anything sorted still waits for Apply. Its own view, so
+/// the count is read where it is drawn. Apply… only opens the plan sheet;
+/// nothing moves until the plan is confirmed there.
+private struct UnsortedApplyBanner: View {
+    let model: DashboardModel
+    let workspace: EventsWorkspace
+    let location: ConfiguredLocation
+    let result: OrganizeScanResult
+
+    var body: some View {
+        let waiting = workspace.sortedFiles(in: result)
+        if waiting.files > 0 {
+            HStack(spacing: 10) {
+                Image(systemName: "tray.and.arrow.down.fill")
+                    .foregroundStyle(.tint)
+                Text(UnsortedApplyBannerText.text(files: waiting.files, bytes: waiting.bytes))
+                    .font(.callout)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .layoutPriority(-1)
+                Spacer(minLength: 8)
+                Button("Apply…") {
+                    workspace.prepareApply(sourceLocationID: location.id)
+                }
+                .buttonStyle(.glassProminent)
+                .controlSize(.small)
+                .disabled(model.isBusy)
+                .help("Review the plan — nothing moves until you confirm it.")
+                .fixedSize()
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .glassEffect(.regular, in: .capsule)
+            .padding(.horizontal, 16)
+            .padding(.top, 4)
+            .accessibilityElement(children: .combine)
+        }
+    }
+}
+
+/// The banner's one line: how many sorted files still need Apply.
+enum UnsortedApplyBannerText {
+    static func text(files: Int, bytes: Int64) -> String {
+        let noun = files == 1 ? "sorted file isn’t" : "sorted files aren’t"
+        return "\(files.formatted()) \(noun) in \(files == 1 ? "its event" : "their events") yet (\(bytes.formattedBytes)) — they’re only here until you Apply."
+    }
+}
+
+/// Keeps the board's "already in its event" answers current: after the scan,
+/// a sort (the catalog revision), a job or copy finishing, and a mount
+/// change. A short pause folds a run of key presses into one check, which
+/// runs off the main actor and only stats the source and drive copies.
+private struct AppliedSourcesWatcher: View {
+    let model: DashboardModel
+    let workspace: EventsWorkspace
+    let locationID: UUID
+    let scannedAt: Date?
+
+    var body: some View {
+        let key = [
+            locationID.uuidString,
+            scannedAt.map { "\($0.timeIntervalSinceReferenceDate)" } ?? "-",
+            "\(model.catalogStateRevision)",
+            "\(model.isBusy)",
+            model.transferQueue.map { "\($0.id)-\(String(describing: $0.state))" } ?? "-",
+            "\(workspace.connectivityRevision)",
+        ].joined(separator: "|")
+        Color.clear
+            .task(id: key) {
+                guard scannedAt != nil else { return }
+                try? await Task.sleep(for: .milliseconds(300))
+                guard !Task.isCancelled else { return }
+                await workspace.refreshAppliedSources(for: locationID)
+            }
     }
 }
