@@ -18,7 +18,7 @@ final class TransferQueueWindowController: NSObject, NSWindowDelegate {
             .transferQueue,
             identifier: "CameraToolkitTransferQueueWindow",
             title: "Jobs",
-            initialContentSize: NSSize(width: 840, height: 500),
+            initialContentSize: NSSize(width: 1_080, height: 720),
             rootView: TransferQueueView(model: model)
         )
         window.delegate = self
@@ -27,40 +27,66 @@ final class TransferQueueWindowController: NSObject, NSWindowDelegate {
     }
 }
 
+/// The Jobs window: one screen. Every job — running ones pinned on top,
+/// then everything recorded, by day — in the list on the left; the one
+/// selected opened on the right in the same live layout whether it is
+/// running or ended (`JobActivityDetail`), with its files below. A card
+/// transfer also shows its route and per-file progress there.
 struct TransferQueueView: View {
     @Bindable var model: DashboardModel
     @State private var showingSpeedGuide = false
-    @State private var showingSourceCleanup = false
-    /// A row the owner tapped wins over the default — otherwise the
-    /// currently running job expands itself.
-    @State private var inspectedJobID: UUID?
-    /// Live jobs the owner deliberately collapsed stay collapsed until the
-    /// next job starts.
-    @State private var dismissedLiveJobIDs: Set<UUID> = []
     @State private var monitor = JobActivityMonitor()
-    /// The window shows past jobs instead of this session's.
-    @State private var showingHistory = false
     @State private var history: JobHistoryBrowser
+    @State private var selection: UUID?
 
-    init(model: DashboardModel) {
+    /// `history` is a seam for the snapshot harness, which hands in a
+    /// reader it already loaded.
+    init(model: DashboardModel, selection: UUID? = nil, history: JobHistoryBrowser? = nil) {
         self.model = model
-        _history = State(initialValue: JobHistoryBrowser(model: model))
+        _history = State(initialValue: history ?? JobHistoryBrowser(model: model))
+        _selection = State(initialValue: selection)
+    }
+
+    /// Re-reads on selection and whenever a recorded job ends.
+    private struct LoadKey: Equatable {
+        var selection: UUID?
+        var revision: Int
+    }
+
+    /// How often a running job's graph and counts are reread.
+    static let livePollInterval: Duration = .seconds(2)
+
+    private var sections: JobsList.Sections {
+        // A job this session records is listed under its recorded title
+        // even before the history list rereads it.
+        let recorded = Set(history.jobs.map(\.id))
+        let recording = model.jobs.compactMap { job in
+            recorded.contains(job.id) ? nil : model.jobHistoryRecorders[job.id]?.currentJob()
+        }
+        return JobsList.sections(session: model.jobs, history: history.jobs + recording)
     }
 
     var body: some View {
+        let sections = sections
+        let shown = selection ?? Self.defaultSelection(sections)
         Group {
-            if showingHistory {
-                JobHistoryView(model: model, browser: history)
-            } else if let queue = model.transferQueue {
-                queueContent(queue)
-            } else if !model.pendingTransferBatches.isEmpty || !model.jobs.isEmpty {
-                idleContent
-            } else {
+            if sections.isEmpty, model.pendingTransferBatches.isEmpty, model.transferQueue == nil, !history.hasLoaded {
+                // The first read of the history is still on its way.
+                ProgressView()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if sections.isEmpty, model.pendingTransferBatches.isEmpty, model.transferQueue == nil {
                 ContentUnavailableView(
                     "No Jobs Yet",
                     systemImage: "list.bullet.clipboard",
-                    description: Text("Transfers, burst regrouping, face scans, and other background work appear here while they run.")
+                    description: Text("Card copies, syncs to the NAS, face scans, and other background work appear here — while they run, and afterwards with their speed and files.")
                 )
+            } else {
+                HSplitView {
+                    JobsSidebar(model: model, sections: sections, selection: $selection, message: history.message)
+                        .frame(minWidth: 220, idealWidth: 280, maxWidth: 380, maxHeight: .infinity)
+                    detailPane(shown, sections: sections)
+                        .frame(minWidth: 480, maxWidth: .infinity, maxHeight: .infinity)
+                }
             }
         }
         .frame(
@@ -72,55 +98,83 @@ struct TransferQueueView: View {
         .navigationTitle("Jobs")
         .navigationSubtitle(windowSubtitle)
         .toolbar { toolbar }
-        .onChange(of: firstLiveJobID) { _, newID in
-            // Follow the job that is actually running; a finished job's
-            // pane collapses and stays reachable by tapping its row.
-            inspectedJobID = nil
-            if let newID {
-                dismissedLiveJobIDs.remove(newID)
+        .task(id: model.jobHistoryRevision) {
+            await history.reload()
+        }
+        .task(id: LoadKey(selection: shown, revision: model.jobHistoryRevision)) {
+            await history.open(shown)
+            // A running job keeps growing: reread its samples (from the
+            // recorder in memory) every poll, its files every third.
+            var polls = 0
+            while !Task.isCancelled, let id = shown, isRunning(id) {
+                try? await Task.sleep(for: Self.livePollInterval)
+                guard !Task.isCancelled else { return }
+                polls += 1
+                await history.open(id, reloadItems: polls % 3 == 0)
             }
+        }
+        .onChange(of: firstLiveJobID) { _, newID in
+            // A job that starts is the one to watch.
+            if let newID { selection = newID }
+        }
+    }
+
+    static func defaultSelection(_ sections: JobsList.Sections) -> UUID? {
+        sections.active.first?.id ?? sections.all.first?.id
+    }
+
+    private var firstLiveJobID: UUID? {
+        model.jobs.first { $0.state == .running || $0.state == .queued }?.id
+    }
+
+    private func isRunning(_ id: UUID) -> Bool {
+        model.jobs.contains { $0.id == id && ($0.state == .running || $0.state == .queued) }
+    }
+
+    @ViewBuilder
+    private func detailPane(_ id: UUID?, sections: JobsList.Sections) -> some View {
+        if let id, let index = model.pendingTransferBatches.firstIndex(where: { $0.id == id }) {
+            QueuedBatchDetail(model: model, batch: model.pendingTransferBatches[index], position: index + 1)
+        } else if let id, let entry = sections.all.first(where: { $0.id == id }) {
+            let transfer = model.transferQueue.flatMap { queue in
+                JobsList.transferJobID(for: queue, in: sections.all) == id ? queue : nil
+            }
+            JobDetailContainer(
+                model: model,
+                live: model.jobs.first { $0.id == id },
+                detail: history.detail?.job.id == id ? history.detail : nil,
+                monitor: monitor,
+                transfer: transfer
+            )
+            .id(entry.id)
+        } else {
+            ContentUnavailableView(
+                "Select a Job",
+                systemImage: "chart.xyaxis.line",
+                description: Text("Pick a job to see its speed over the whole run and its files.")
+            )
         }
     }
 
     // MARK: - Title and toolbar
 
-    /// The transfer's phase and counts while one exists, else what the
+    /// The card transfer's phase and counts while one runs, else what the
     /// window is waiting on.
     private var windowSubtitle: String {
-        if showingHistory {
-            return "History"
-        }
-        if let queue = model.transferQueue {
-            return "\(queue.phase) · \(queueSummary(queue))"
-        }
-        if !model.pendingTransferBatches.isEmpty {
-            return "Transfers waiting — the list is saved. Start it when the camera and Buffer are connected."
+        if let queue = model.transferQueue, queue.state == .running {
+            return "\(queue.phase) · \(CardTransferSection.queueSummary(queue))"
         }
         if let job = model.jobs.first(where: { $0.state == .running || $0.state == .queued }) {
             return job.note
+        }
+        if !model.pendingTransferBatches.isEmpty {
+            return "Transfers waiting — the list is saved. Start it when the camera and Buffer are connected."
         }
         return ""
     }
 
     @ToolbarContentBuilder
     private var toolbar: some ToolbarContent {
-        if model.jobHistoryURL != nil {
-            ToolbarItem(placement: .navigation) {
-                Picker("View", selection: $showingHistory) {
-                    Text("Now").tag(false)
-                    Text("History").tag(true)
-                }
-                .pickerStyle(.segmented)
-                .help("This session's jobs, or every recorded job with its whole speed chart and files")
-            }
-        }
-        if !showingHistory {
-            liveToolbar
-        }
-    }
-
-    @ToolbarContentBuilder
-    private var liveToolbar: some ToolbarContent {
         if let queue = model.transferQueue {
             ToolbarItem {
                 Button("Speed Guide", systemImage: "gauge.with.dots.needle.50percent") {
@@ -134,20 +188,20 @@ struct TransferQueueView: View {
             ToolbarItem {
                 Menu("Show in Finder", systemImage: "folder") {
                     Button("Show Camera") {
-                        revealFolder(queue.sourcePath)
+                        CardTransferSection.revealFolder(queue.sourcePath)
                     }
                     Button("Show Buffer") {
-                        revealFolder(queue.destinationPath)
+                        CardTransferSection.revealFolder(queue.destinationPath)
                     }
                 }
-                .help("Open the camera or Buffer folder of this transfer in Finder")
+                .help("Open the camera or Buffer folder of the card transfer in Finder")
             }
             if queue.state != .running {
                 ToolbarItem {
                     Button("Clear", systemImage: "xmark.circle") {
                         model.dismissTransferQueue()
                     }
-                    .help("Clear this finished transfer from the queue")
+                    .help("Clear the finished card transfer's file list. Its job stays in the list.")
                 }
             }
         }
@@ -168,31 +222,347 @@ struct TransferQueueView: View {
             }
         }
     }
+}
 
-    // MARK: - Layout
+/// The selected job: its detail pane on top (scrolling when tall), its
+/// files — or, for a card transfer, the per-file queue — underneath. Owns
+/// the graph's zoom and the pointer state the graph and the file list
+/// share, so both reset when another job is picked.
+private struct JobDetailContainer: View {
+    @Bindable var model: DashboardModel
+    let live: JobSnapshot?
+    let detail: JobHistoryDetail?
+    let monitor: JobActivityMonitor
+    let transfer: TransferQueueSnapshot?
+    @State private var zoom = JobHistoryZoom(full: 0...1)
+    @State private var hover = JobHistoryHover()
+    @State private var fileFilter = JobHistoryFileFilter.all
 
-    private func queueContent(_ queue: TransferQueueSnapshot) -> some View {
+    private var duration: Double { detail?.graph.duration ?? 1 }
+
+    var body: some View {
+        Group {
+            if live == nil, detail == nil {
+                // Only the history knows this job, and it is still being read.
+                ProgressView("Reading the job…")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if let transfer {
+                VSplitView {
+                    pane.frame(minHeight: 280, idealHeight: 470, maxHeight: .infinity)
+                    CardTransferSection(model: model, queue: transfer)
+                        .frame(minHeight: 160, idealHeight: 260, maxHeight: .infinity)
+                }
+            } else if let detail, !detail.items.isEmpty {
+                VSplitView {
+                    pane.frame(minHeight: 280, idealHeight: 470, maxHeight: .infinity)
+                    JobHistoryFileTable(items: detail.items, zoom: $zoom, hover: hover, filter: $fileFilter)
+                        .frame(minHeight: 140, idealHeight: 240, maxHeight: .infinity)
+                }
+            } else {
+                pane
+            }
+        }
+        .onChange(of: duration, initial: true) { _, duration in
+            zoom.setFull(0...max(duration, 1))
+        }
+    }
+
+    private var pane: some View {
+        ScrollView {
+            JobActivityDetail(
+                live: live, detail: detail, monitor: monitor, zoom: $zoom, hover: hover,
+                showIssues: transfer == nil && !(detail?.items.isEmpty ?? true) ? { fileFilter = .issues } : nil
+            )
+        }
+    }
+}
+
+/// The job list: waiting card batches, running jobs, then every past job
+/// by day.
+private struct JobsSidebar: View {
+    @Bindable var model: DashboardModel
+    let sections: JobsList.Sections
+    @Binding var selection: UUID?
+    let message: String?
+
+    var body: some View {
+        List(selection: $selection) {
+            if !sections.running.isEmpty {
+                Section("Running") {
+                    ForEach(sections.running) { entry in
+                        JobListRow(entry: entry, live: model.jobs.first { $0.id == entry.id })
+                            .tag(entry.id)
+                    }
+                }
+            }
+            // Waiting their turn, in the order they will start: card copies
+            // saved for later, then any job the gate holds.
+            if !model.pendingTransferBatches.isEmpty || !sections.queued.isEmpty {
+                Section {
+                    ForEach(Array(model.pendingTransferBatches.enumerated()), id: \.element.id) { index, batch in
+                        pendingBatchRow(batch, position: index + 1)
+                            .tag(batch.id)
+                    }
+                    ForEach(sections.queued) { entry in
+                        JobListRow(entry: entry, live: model.jobs.first { $0.id == entry.id })
+                            .tag(entry.id)
+                    }
+                } header: {
+                    Text(model.isBusy ? "Queued · starts after the current job" : "Queued")
+                }
+            }
+            ForEach(sections.days) { day in
+                Section(day.title) {
+                    ForEach(day.entries) { entry in
+                        JobListRow(entry: entry, live: nil)
+                            .tag(entry.id)
+                    }
+                }
+            }
+            if let message {
+                Section {
+                    Label(message, systemImage: "info.circle")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .listStyle(.sidebar)
+    }
+
+    private func pendingBatchRow(_ batch: PendingTransferBatch, position: Int) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: position <= 50 ? "\(position).circle.fill" : "circle.fill")
+                .symbolRenderingMode(.hierarchical)
+                .foregroundStyle(.blue)
+                .accessibilityLabel("Position \(position)")
+            VStack(alignment: .leading, spacing: 2) {
+                Text(batch.eventName.isEmpty ? "Queued Transfer" : batch.eventName)
+                    .lineLimit(1)
+                Text("\(batch.files.count) file\(batch.files.count == 1 ? "" : "s") · \(batch.totalBytes.formattedBytes)")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            .help("\(batch.sourcePath) → \(batch.destinationPath)")
+            Spacer(minLength: 4)
+            Button("Remove Batch", systemImage: "xmark.circle") {
+                model.removePendingTransferBatch(batch.id)
+            }
+            .labelStyle(.iconOnly)
+            .buttonStyle(.borderless)
+            .help("Remove this waiting batch. No files will be changed.")
+        }
+    }
+}
+
+/// One job in the list: what it was, and either its live progress or
+/// when it ran, how long, and what it moved.
+struct JobListRow: View {
+    let entry: JobListEntry
+    /// The session's job, for a running row's progress and current step.
+    let live: JobSnapshot?
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: symbol)
+                .symbolRenderingMode(.hierarchical)
+                .foregroundStyle(tint)
+                .frame(width: 18)
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text(entry.title)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer(minLength: 4)
+                    Text(entry.startedAt, style: .time)
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+                switch entry.status {
+                case .running(let progress):
+                    ProgressView(value: progress)
+                        .controlSize(.small)
+                    Text(liveLine(progress))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                case .queued:
+                    Text("Waiting to start")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                case .ended(let outcome):
+                    HStack(spacing: 4) {
+                        if outcome != .succeeded, let display = entry.display {
+                            Text(display.label.replacingOccurrences(of: "Done · ", with: ""))
+                                .foregroundStyle(display.tone.color)
+                                .fontWeight(.semibold)
+                        }
+                        Text(endedLine)
+                            .foregroundStyle(.secondary)
+                    }
+                    .font(.caption.monospacedDigit())
+                    .lineLimit(1)
+                }
+            }
+        }
+        .padding(.vertical, 2)
+    }
+
+    private var symbol: String {
+        switch entry.status {
+        case .queued: "clock"
+        case .running: entry.action.map(Self.runningSymbol) ?? "arrow.trianglehead.2.clockwise.rotate.90"
+        case .ended(let outcome): entry.display?.symbol ?? outcome.symbol
+        }
+    }
+
+    private var tint: Color {
+        switch entry.status {
+        case .queued, .running: .blue
+        case .ended(let outcome): entry.display?.tone.color ?? outcome.tint
+        }
+    }
+
+    /// "61% · Copying to NAS · DSC00001.ARW"
+    private func liveLine(_ progress: Double) -> String {
+        var parts = [progress.formatted(.percent.precision(.fractionLength(0)))]
+        if let item = live?.telemetry?.activeItems.first {
+            parts.append("\(item.step) · \(item.name)")
+        } else if let note = live?.note, !note.isEmpty {
+            parts.append(note)
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    /// "3:12 · 2.2 GB · 98 MB/s"
+    private var endedLine: String {
+        var parts: [String] = []
+        if let end = entry.endedAt {
+            parts.append(JobActivityDetail.durationText(end.timeIntervalSince(entry.startedAt)))
+        }
+        if let detail = entry.detail { parts.append(detail) }
+        return parts.joined(separator: " · ")
+    }
+
+    static func runningSymbol(_ action: JobAction) -> String {
+        switch action {
+        case .faceScan: "person.crop.rectangle.stack"
+        case .organize: "rectangle.3.group"
+        case .nasRename: "arrow.left.arrow.right"
+        case .ingestCard: "arrow.down.circle"
+        case .freeUp: "trash"
+        case .immichScan, .immichUpload: "square.and.arrow.up"
+        case .verifyManifest: "checkmark.shield"
+        case .diskSpeed, .networkSpeed: "gauge.with.dots.needle.33percent"
+        default: "arrow.trianglehead.2.clockwise.rotate.90"
+        }
+    }
+}
+
+/// A card copy waiting its turn: what it will copy, from where to where,
+/// and the controls the queue already has — start it now when nothing
+/// else runs, or take it off the queue (no files change).
+private struct QueuedBatchDetail: View {
+    @Bindable var model: DashboardModel
+    let batch: PendingTransferBatch
+    let position: Int
+
+    var body: some View {
+        let photos = batch.files.count { kind($0.path) == .photo || kind($0.path) == .raw }
+        let videos = batch.files.count { kind($0.path) == .video }
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                HStack(alignment: .center, spacing: 12) {
+                    Image(systemName: "clock")
+                        .font(.title)
+                        .foregroundStyle(.blue)
+                        .frame(width: 34)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(batch.eventName.isEmpty ? "Queued Transfer" : batch.eventName)
+                            .font(.title3.weight(.semibold))
+                        Text(position == 1
+                            ? (model.isBusy ? "Next — starts automatically after the current job" : "Next — waiting for the camera and Buffer")
+                            : "Number \(position) in the queue")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer(minLength: 8)
+                    JobHistoryOutcomeBadge(display: JobOutcomeDisplay(label: "Queued", symbol: "clock", tone: .running))
+                }
+                WrappingRowLayout(spacing: 26, rowSpacing: 8) {
+                    fact("Files", "\(batch.files.count.formatted())")
+                    fact("Size", batch.totalBytes.formattedBytes)
+                    if photos > 0 { fact("Photos", photos.formatted()) }
+                    if videos > 0 { fact("Videos", videos.formatted()) }
+                }
+                VStack(alignment: .leading, spacing: 6) {
+                    route("From", batch.sourcePath, symbol: "sdcard")
+                    route("To", batch.destinationPath, symbol: "externaldrive")
+                }
+                Text("Copies each file to the Buffer, then re-reads both and compares SHA-256 before it counts as copied. Nothing is removed from the card.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 8) {
+                    if position == 1 {
+                        Button("Start Now", systemImage: "play.fill") { model.resumePendingTransfers() }
+                            .disabled(model.isBusy || model.isStorageBenchmarkRunning)
+                    }
+                    Button("Remove from Queue", systemImage: "xmark.circle") { model.removePendingTransferBatch(batch.id) }
+                        .help("Take this batch off the queue. No files will be changed.")
+                }
+            }
+            .padding(16)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private func kind(_ path: String) -> OrganizeMediaKind {
+        OrganizeFileClassifier.kind(forExtension: (path as NSString).pathExtension)
+    }
+
+    private func fact(_ label: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label.uppercased())
+                .font(.caption2.weight(.bold))
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.callout.monospacedDigit())
+        }
+    }
+
+    private func route(_ label: String, _ path: String, symbol: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Image(systemName: symbol)
+                .foregroundStyle(.secondary)
+                .frame(width: 18)
+            Text(label)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 36, alignment: .leading)
+            Text(path)
+                .font(.caption.monospaced())
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
+/// A card transfer's own view under its job: camera → Buffer, its message,
+/// every file with its progress, and Free Up Camera once all of them are
+/// verified.
+struct CardTransferSection: View {
+    @Bindable var model: DashboardModel
+    let queue: TransferQueueSnapshot
+    @State private var showingSourceCleanup = false
+
+    var body: some View {
         VStack(spacing: 0) {
-            summary(queue)
-
-            Divider()
             routeDiagram(queue)
-
             if let message = queue.message {
                 Divider()
                 messageBanner(message, queue: queue)
             }
-
-            if !model.pendingTransferBatches.isEmpty {
-                Divider()
-                pendingBatchesSection
-            }
-
-            if !model.jobs.isEmpty {
-                Divider()
-                jobsSection
-            }
-
             Divider()
             queueTable(queue)
         }
@@ -206,296 +576,6 @@ struct TransferQueueView: View {
         .sheet(isPresented: $showingSourceCleanup) {
             SourceCleanupSheet(model: model, queue: queue)
         }
-    }
-
-    /// No transfer in flight: waiting batches on top, the shared job list
-    /// filling the rest — this is the window's whole story when a face scan
-    /// or regroup runs without a copy queued. Start Next Transfer lives in
-    /// the toolbar.
-    private var idleContent: some View {
-        VStack(spacing: 0) {
-            if !model.pendingTransferBatches.isEmpty {
-                pendingBatchesSection
-                Divider()
-            }
-            jobsSection
-        }
-    }
-
-    private func sectionHeader(_ title: String, detail: String? = nil) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Text(title)
-                .font(.headline)
-            if let detail {
-                Text(detail)
-                    .font(.callout.monospacedDigit())
-                    .foregroundStyle(.secondary)
-            }
-            Spacer(minLength: 0)
-        }
-        .padding(.horizontal, 16)
-        .padding(.top, 10)
-        .padding(.bottom, 4)
-    }
-
-    // MARK: - Jobs
-
-    /// Every background job this session — transfers, organize work, burst
-    /// regrouping, face scans — newest first. The single-job gate keeps at
-    /// most one running; that job's row opens into the activity pane on
-    /// its own, and any row can be opened for its final counters.
-    private var jobsSection: some View {
-        let jobs = Array(model.jobs.prefix(30))
-        let anyExpanded = jobs.contains(where: isExpanded)
-        return VStack(alignment: .leading, spacing: 0) {
-            sectionHeader("Jobs", detail: jobs.first(where: isExpanded)?.telemetry?.step)
-            List {
-                ForEach(jobs) { job in
-                    DisclosureGroup(isExpanded: expansionBinding(job)) {
-                        JobActivityDetail(job: job, monitor: monitor, wholeJobSamples: wholeJobSamples(job))
-                    } label: {
-                        jobRow(job)
-                    }
-                }
-            }
-            .listStyle(.inset)
-            .frame(maxHeight: model.transferQueue == nil ? .infinity : (anyExpanded ? 340 : 150))
-        }
-    }
-
-    /// The job's recorded samples, while this session still holds its
-    /// recorder — the source of the chart's "Whole job" range, so the full
-    /// run survives closing and reopening the window.
-    private func wholeJobSamples(_ job: JobSnapshot) -> (() -> [JobHistorySample])? {
-        guard let recorder = model.jobHistoryRecorders[job.id] else { return nil }
-        return { recorder.samples() }
-    }
-
-    private var firstLiveJobID: UUID? {
-        model.jobs.first { $0.state == .running || $0.state == .queued }?.id
-    }
-
-    private func isExpanded(_ job: JobSnapshot) -> Bool {
-        if let inspectedJobID {
-            return inspectedJobID == job.id
-        }
-        return job.id == firstLiveJobID && !dismissedLiveJobIDs.contains(job.id)
-    }
-
-    private func toggleJob(_ job: JobSnapshot) {
-        if isExpanded(job) {
-            inspectedJobID = nil
-            dismissedLiveJobIDs.insert(job.id)
-        } else {
-            inspectedJobID = job.id
-            dismissedLiveJobIDs.remove(job.id)
-        }
-    }
-
-    /// One open job at a time: opening a row inspects it, closing it
-    /// dismisses the live default — the same rules the chevron row used.
-    private func expansionBinding(_ job: JobSnapshot) -> Binding<Bool> {
-        Binding(
-            get: { isExpanded(job) },
-            set: { open in
-                if open != isExpanded(job) {
-                    toggleJob(job)
-                }
-            }
-        )
-    }
-
-    private func jobRow(_ job: JobSnapshot) -> some View {
-        HStack(spacing: 12) {
-            Image(systemName: jobSymbol(job))
-                .font(.title3)
-                .symbolRenderingMode(.hierarchical)
-                .foregroundStyle(job.state.tint)
-                .frame(width: 24, height: 24)
-
-            VStack(alignment: .leading, spacing: 3) {
-                Text(job.action.displayName)
-                    .font(.subheadline.weight(.medium))
-                    .lineLimit(1)
-                Text(jobSubtitle(job))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-
-            VStack(alignment: .trailing, spacing: 4) {
-                if job.state == .running || job.state == .queued {
-                    ProgressView(value: job.progress)
-                        .frame(width: 110)
-                    Text(job.progress.formatted(.percent.precision(.fractionLength(0))))
-                        .font(.caption2.monospacedDigit())
-                        .foregroundStyle(.secondary)
-                } else {
-                    Text(job.state.displayName)
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(job.state.tint)
-                    Text(job.finishedAt ?? job.createdAt, style: .time)
-                        .font(.caption2.monospacedDigit())
-                        .foregroundStyle(.secondary)
-                }
-            }
-            .frame(width: 130, alignment: .trailing)
-        }
-        .padding(.vertical, 3)
-        .contentShape(Rectangle())
-        .help(job.detail.isEmpty ? job.note : job.detail)
-    }
-
-    /// The compact second line: the live pipeline step and file when the
-    /// job reports them, else the coarse progress note (which already
-    /// names the stage for jobs without per-file detail).
-    private func jobSubtitle(_ job: JobSnapshot) -> String {
-        if let items = job.telemetry?.activeItems, let first = items.first {
-            let extra = items.count > 1 ? " · +\(items.count - 1) workers" : ""
-            return "\(first.step) · \(first.name)\(extra)"
-        }
-        return job.note
-    }
-
-    private func jobSymbol(_ job: JobSnapshot) -> String {
-        switch job.state {
-        case .done: return "checkmark.circle.fill"
-        case .failed: return "exclamationmark.circle.fill"
-        case .cancelled: return "xmark.circle.fill"
-        case .queued: return "clock"
-        case .running:
-            switch job.action {
-            case .faceScan: return "person.crop.rectangle.stack"
-            case .organize: return "rectangle.3.group"
-            case .nasRename: return "arrow.left.arrow.right"
-            case .ingestCard: return "arrow.down.circle"
-            case .freeUp: return "trash"
-            case .immichScan, .immichUpload: return "square.and.arrow.up"
-            case .verifyManifest: return "checkmark.shield"
-            case .diskSpeed, .networkSpeed: return "gauge.with.dots.needle.33percent"
-            default: return "arrow.trianglehead.2.clockwise.rotate.90"
-            }
-        }
-    }
-
-    // MARK: - Up Next
-
-    private var pendingBatchesSection: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack(alignment: .firstTextBaseline) {
-                sectionHeader(
-                    "Up Next",
-                    detail: "\(model.pendingTransferFileCount) file\(model.pendingTransferFileCount == 1 ? "" : "s") · \(model.pendingTransferByteCount.formattedBytes)"
-                )
-                if model.isBusy {
-                    Text("Starts automatically after the current job")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .padding(.trailing, 16)
-                }
-            }
-
-            List {
-                ForEach(Array(model.pendingTransferBatches.enumerated()), id: \.element.id) { index, batch in
-                    pendingBatchRow(batch, position: index + 1)
-                }
-            }
-            .listStyle(.inset)
-            .frame(maxHeight: model.transferQueue == nil && model.jobs.isEmpty ? .infinity : 116)
-        }
-    }
-
-    private func pendingBatchRow(_ batch: PendingTransferBatch, position: Int) -> some View {
-        HStack(spacing: 12) {
-            Group {
-                if position <= 50 {
-                    Image(systemName: "\(position).circle.fill")
-                        .symbolRenderingMode(.hierarchical)
-                } else {
-                    Text("\(position)")
-                        .font(.caption.weight(.semibold).monospacedDigit())
-                }
-            }
-            .font(.title3)
-            .foregroundStyle(.blue)
-            .frame(width: 24, height: 24)
-            .accessibilityLabel("Position \(position)")
-
-            VStack(alignment: .leading, spacing: 3) {
-                Text(batch.eventName.isEmpty ? "Queued Transfer" : batch.eventName)
-                    .font(.subheadline.weight(.medium))
-                    .lineLimit(1)
-                HStack(spacing: 4) {
-                    Text(OrganizeRouteLabel.breadcrumb(for: batch.sourcePath))
-                        .truncationMode(.middle)
-                    Image(systemName: "arrow.right")
-                    Text(OrganizeRouteLabel.breadcrumb(for: batch.destinationPath))
-                        .truncationMode(.middle)
-                }
-                .font(.caption.monospaced())
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-
-            Text("\(batch.files.count) file\(batch.files.count == 1 ? "" : "s") · \(batch.totalBytes.formattedBytes)")
-                .font(.caption.monospacedDigit())
-                .foregroundStyle(.secondary)
-
-            Button("Remove Batch", systemImage: "xmark.circle") {
-                model.removePendingTransferBatch(batch.id)
-            }
-            .labelStyle(.iconOnly)
-            .buttonStyle(.borderless)
-            .help("Remove this waiting batch. No files will be changed.")
-        }
-        .padding(.vertical, 4)
-    }
-
-    // MARK: - Transfer summary
-
-    /// The transfer's progress. Its phase and file counts are the window
-    /// subtitle, so this strip carries only the numbers and the bar.
-    private func summary(_ queue: TransferQueueSnapshot) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(alignment: .firstTextBaseline, spacing: 10) {
-                Image(systemName: queueSymbol(queue.state))
-                    .font(.title2)
-                    .symbolRenderingMode(.hierarchical)
-                    .foregroundStyle(queueColor(queue.state))
-                    .accessibilityHidden(true)
-                Text(phaseProgressLabel(queue))
-                    .font(.headline)
-                Spacer(minLength: 16)
-                Text(phaseByteSummary(queue))
-                    .font(.subheadline.weight(.semibold).monospacedDigit())
-                    .lineLimit(1)
-                Group {
-                    if queue.state == .running, queue.bytesPerSecond > 0 {
-                        Text("\(Int64(queue.bytesPerSecond).formattedBytes)/s avg")
-                            .monospacedDigit()
-                            .help("Average for this copy or verification job. Verification alternates between camera and Buffer reads, so this is not an instantaneous camera-link measurement.")
-                    } else {
-                        Text(queueStateNote(queue.state))
-                    }
-                }
-                .font(.callout)
-                .foregroundStyle(.secondary)
-            }
-
-            HStack(spacing: 10) {
-                ProgressView(value: queue.progress)
-                    .tint(queueColor(queue.state))
-                    .progressViewStyle(.linear)
-                Text(queue.progress.formatted(.percent.precision(.fractionLength(0))))
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
-                    .frame(minWidth: 34, alignment: .trailing)
-            }
-        }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 12)
     }
 
     /// "This source folder → this destination" — the same readable route the
@@ -687,7 +767,7 @@ struct TransferQueueView: View {
         .padding(.vertical, 10)
     }
 
-    private func revealFolder(_ path: String) {
+    static func revealFolder(_ path: String) {
         let url = URL(fileURLWithPath: DashboardModel.expandedPath(path), isDirectory: true)
         guard FileManager.default.fileExists(atPath: url.path) else { return }
         NSWorkspace.shared.open(url)
@@ -719,7 +799,7 @@ struct TransferQueueView: View {
         item.size > 0 && (item.state == .copying || (item.state == .failed && item.copiedBytes > 0))
     }
 
-    private func queueSummary(_ queue: TransferQueueSnapshot) -> String {
+    static func queueSummary(_ queue: TransferQueueSnapshot) -> String {
         if queue.state == .running,
            !queue.items.isEmpty,
            queue.items.allSatisfy({ $0.state == .waiting }) {
@@ -740,29 +820,6 @@ struct TransferQueueView: View {
         return "\(completed) copied · \(queue.verifiedCount) of \(queue.items.count) verified"
     }
 
-    private func phaseByteSummary(_ queue: TransferQueueSnapshot) -> String {
-        let processed = queue.phaseProcessedBytes ?? queue.processedBytes
-        let total = queue.phaseTotalBytes ?? queue.totalBytes
-        return "\(processed.formattedBytes) / \(total.formattedBytes)"
-    }
-
-    private func phaseProgressLabel(_ queue: TransferQueueSnapshot) -> String {
-        let phase = queue.phase.lowercased()
-        if phase.contains("verif") || phase.contains("check") { return "Verification progress" }
-        if queue.state == .failed { return "Progress when stopped" }
-        if queue.state == .completed { return "Transfer complete" }
-        return "Copy progress"
-    }
-
-    private func queueStateNote(_ state: TransferQueueState) -> String {
-        switch state {
-        case .running: ""
-        case .completed: "Checksum verified"
-        case .failed: "Stopped safely"
-        case .cancelled: "Cancelled"
-        }
-    }
-
     private func shortParentPath(_ path: String) -> String {
         let components = URL(fileURLWithPath: path)
             .deletingLastPathComponent()
@@ -777,15 +834,6 @@ struct TransferQueueView: View {
             .filter { $0 != "/" }
             .suffix(2)
             .joined(separator: " / ")
-    }
-
-    private func queueSymbol(_ state: TransferQueueState) -> String {
-        switch state {
-        case .running: "arrow.down.circle.fill"
-        case .completed: "checkmark.circle.fill"
-        case .failed: "exclamationmark.circle.fill"
-        case .cancelled: "xmark.circle.fill"
-        }
     }
 
     private func queueColor(_ state: TransferQueueState) -> Color {

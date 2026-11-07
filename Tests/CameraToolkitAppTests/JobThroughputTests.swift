@@ -295,7 +295,7 @@ final class JobThroughputTests: XCTestCase {
             JobPhaseTotal(label: "Rename", seconds: 5),
         ])
         XCTAssertEqual(PhaseBreakdown.summary(shares), "Copy 30% · Flush 40% · Verify 25% · Rename 5%")
-        XCTAssertEqual(ThroughputChart.axisNumber(2.5), "2.5")
-        XCTAssertEqual(ThroughputChart.axisNumber(50), "50")
+        XCTAssertEqual(JobSpeedGraphView.axisNumber(2.5), "2.5")
+        XCTAssertEqual(JobSpeedGraphView.axisNumber(50), "50")
     }
 }
