@@ -316,6 +316,17 @@ public final class JobHistoryRecorder: @unchecked Sendable {
         }
     }
 
+    /// Where the job's time went, per phase ("Verify", "Remove"), for jobs
+    /// that measure it themselves; kept in the job's summary.
+    public func notePhases(_ phases: [JobPhaseTotal]) {
+        lock.withLock {
+            var summary = job.summary ?? JobHistorySummary()
+            summary.phases = phases
+            job.summary = summary
+            jobChanged = true
+        }
+    }
+
     /// The job ended. `totals` are the job's final counters for jobs that
     /// did not pin their own. Everything buffered is written.
     public func finish(outcome: JobHistoryOutcome, note: String?, totals: Observation? = nil, endedAt: Date = Date()) {

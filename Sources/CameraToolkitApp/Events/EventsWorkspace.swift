@@ -44,6 +44,24 @@ struct NewEventRequest: Identifiable {
     /// Set when the stacks live on an event board: completing the request
     /// moves them into the new event instead of assigning from a source.
     var moveFromEventID: UUID?
+    /// The board's display order when the request was made, so sorting into
+    /// the new event advances focus the way the 1–3 keys do.
+    var orderedIDs: [String] = []
+}
+
+/// Pending "Sort Into…" picker for an unsorted board. The stacks are the
+/// ones targeted when the picker opened, kept with the source they came
+/// from; completing re-checks them against that source's current scan, so
+/// a rescan or a changed selection never sorts something else.
+struct SortIntoRequest: Identifiable {
+    let id = UUID()
+    var sourceLocationID: UUID
+    var stackIDs: Set<String>
+    /// The board's display order at open time, for the focus advance.
+    var orderedIDs: [String] = []
+    /// Counts at open time, for the picker's header.
+    var itemCount: Int
+    var fileCount: Int
 }
 
 struct RenameEventRequest: Identifiable {
@@ -703,6 +721,12 @@ final class EventsWorkspace {
     /// `<device>/Card Copy` layout — offered for the layout migration.
     var legacyLayoutFolders: [DriveCameraFolder] = []
     var newEventRequest: NewEventRequest?
+    /// The unsorted board's "Sort Into…" picker sheet.
+    var sortIntoRequest: SortIntoRequest?
+    /// "New Event…" chosen inside the Sort Into picker waits here until the
+    /// picker has finished closing (`sortIntoSheetDidDismiss`), so the New
+    /// Event sheet never presents over a sheet that is still on screen.
+    var newEventAfterSortInto: NewEventRequest?
     var renameRequest: RenameEventRequest?
     var faceScanRequest: FaceScanRequest?
     var pendingApplyPlan: OrganizeApplyPlan?
@@ -901,6 +925,23 @@ final class EventsWorkspace {
     /// Storage-location resolver reused within one configuration revision so
     /// event hierarchy lookups share its index.
     @ObservationIgnored private var locationsCache: (revision: Int, locations: EventStorageLocations)?
+    /// Vision verdicts on burst pairs by frame identity: learned by every
+    /// unsorted scan and regroup, and by event boards that may read their
+    /// files, so an event board groups the same bursts as the card board
+    /// whichever copy it draws (`eventStacking()`).
+    @ObservationIgnored let burstLinkMemory = BurstLinkMemory()
+    /// Scanned source root → source path key → the event whose drive folder
+    /// already holds that file (`refreshAppliedSources`). What the unsorted
+    /// board hides and what the waiting-for-Apply count leaves out.
+    private(set) var appliedSourceEvents: [String: [String: UUID]] = [:]
+    /// Scanned source root → what Clear from Card may offer there.
+    private(set) var cardClearSummaries: [String: CardClearSummary] = [:]
+    /// The open Clear from Card confirmation.
+    var pendingCardClear: CardClearRequest?
+    @ObservationIgnored private var appliedRefreshGenerations: [UUID: UUID] = [:]
+    /// Test seam: whether a source file and an event's drive root share a
+    /// volume (a card never does). Nil uses `VolumeInfo.isSameVolume`.
+    @ObservationIgnored var appliedSameVolumeCheck: AppliedSourceCheck.SameVolume?
     /// `OrganizeStack.id` → stack per event board — rebuilt when the board
     /// writes `eventStacks`, so a context menu or key press resolves its
     /// targets by lookup instead of scanning every stack in the event.
@@ -1710,16 +1751,22 @@ final class EventsWorkspace {
     /// needle — file name, burst label, origin subfolder, assigned event
     /// title, or the name of a person or group whose face sits on one of
     /// the stack's files — and the builder's OR-of-AND condition groups.
+    ///
+    /// `hideApplied` (the unsorted board's default) drops only stacks whose
+    /// every file is already in its event (`isApplied`): a sorted stack that
+    /// still needs Apply stays, so its sort can be checked and changed.
     func visibleStacks(
         _ result: OrganizeScanResult,
         hideSorted: Bool,
+        hideApplied: Bool = false,
         search: OrganizeSearchFilter = OrganizeSearchFilter()
     ) -> [OrganizeStack] {
-        guard hideSorted || !search.isEmpty else { return result.stacks }
+        guard hideSorted || hideApplied || !search.isEmpty else { return result.stacks }
         let people: BoardPeople = search.needsPeople ? boardPeople(for: result.stacks) : ([], [:], [])
         let cameras = search.needsCameras
         return result.stacks.filter { stack in
             if hideSorted, isSorted(stack) { return false }
+            if hideApplied, isApplied(stack, in: result) { return false }
             guard !search.isEmpty else { return true }
             return OrganizeSearch.matches(
                 stack: stack,
@@ -1727,6 +1774,238 @@ final class EventsWorkspace {
                 rootPath: result.rootPath,
                 facts: stackFacts(stack, people: people, cameras: cameras)
             )
+        }
+    }
+
+    /// The stacks `hideApplied` takes off a board — every file already in
+    /// its event — so the board can drop them from the selection
+    /// (`deselectHiddenStacks`). Sorted stacks still waiting for Apply stay.
+    func hiddenAppliedStackIDs(_ result: OrganizeScanResult, hideApplied: Bool) -> Set<String> {
+        guard hideApplied, appliedSourceEvents[result.rootPath]?.isEmpty == false || !applyDuplicateSourceKeys.isEmpty else { return [] }
+        return Set(result.stacks.lazy.filter { self.isApplied($0, in: result) }.map(\.id))
+    }
+
+    /// True when every file of the stack is sorted and already in its event
+    /// on the drive — what an Apply would count as "already there" (see
+    /// `AppliedSourceCheck`), or a byte-identical copy the last Apply plan
+    /// found (`applyDuplicateSourceKeys`). Such a stack needs nothing more.
+    func isApplied(_ stack: OrganizeStack, in result: OrganizeScanResult) -> Bool {
+        let applied = appliedSourceEvents[result.rootPath] ?? [:]
+        guard !applied.isEmpty || !applyDuplicateSourceKeys.isEmpty else { return false }
+        return stack.items.allSatisfy { item in
+            item.files.allSatisfy { isApplied($0, applied: applied) }
+        }
+    }
+
+    /// One file: sorted, and its event (the current one — a re-sort into
+    /// another event makes it pending again) already holds its copy.
+    private func isApplied(_ file: OrganizeFile, applied: [String: UUID]) -> Bool {
+        guard let assignment = assignment(for: file) else { return false }
+        if applyDuplicateSourceKeys[assignment.eventID]?.contains(file.pathKey) == true { return true }
+        return applied[file.pathKey] == assignment.eventID
+    }
+
+    /// Re-learns which sorted files of a scanned source are already in their
+    /// event (`AppliedSourceCheck`, off the main actor; it stats the source
+    /// and drive copies only, never the NAS). The board calls it after a
+    /// scan, a sort, an Apply or a copy finishing, and a mount change. A
+    /// newer call supersedes an older one still running.
+    func refreshAppliedSources(for locationID: UUID) async {
+        guard let result = sources[locationID]?.result else { return }
+        let generation = UUID()
+        appliedRefreshGenerations[locationID] = generation
+        let plan = await cardClearPlan(for: locationID, result: result)
+        guard appliedRefreshGenerations[locationID] == generation,
+              sources[locationID]?.result?.rootPath == result.rootPath else { return }
+        if appliedSourceEvents[result.rootPath] != plan.applied {
+            appliedSourceEvents[result.rootPath] = plan.applied
+        }
+        let summary = CardClearSummary(plan)
+        if cardClearSummaries[result.rootPath] != summary {
+            cardClearSummaries[result.rootPath] = summary
+        }
+    }
+
+    /// A fresh `CardClearPlanner` pass for one scanned source, off the main
+    /// actor: the applied answer for every sorted file, and which items are
+    /// safe on the drive and verified on the NAS. Reads the catalog, the
+    /// card and the drive; never the NAS share.
+    func cardClearPlan(for locationID: UUID, result: OrganizeScanResult) async -> CardClearPlan {
+        let job = cardClearJobInputs(result: result)
+        return await Task.detached(priority: .utility) {
+            job.plan(isCancelled: { Task.isCancelled })
+        }.value
+    }
+
+    /// Everything a planner pass needs, captured on the main actor.
+    private func cardClearJobInputs(result: OrganizeScanResult) -> CardClearJobInputs {
+        refreshIndexIfNeeded(tracking: false)
+        var inputs: [CardClearInput] = []
+        var eventIDs = Set<UUID>()
+        for item in result.items {
+            let entries = item.files.map { file -> CardClearInput.Entry in
+                let assignment = currentAssignment(for: file)
+                if let assignment { eventIDs.insert(assignment.eventID) }
+                return CardClearInput.Entry(path: file.path, assignment: assignment)
+            }
+            guard entries.contains(where: { $0.assignment != nil }) else { continue }
+            inputs.append(CardClearInput(id: item.primary.pathKey, entries: entries))
+        }
+        return CardClearJobInputs(
+            inputs: inputs,
+            sourceRoot: result.rootPath,
+            events: Dictionary(uniqueKeysWithValues: eventIDs.compactMap { event($0) }.map { ($0.id, $0) }),
+            locations: locations,
+            catalogURL: URL(fileURLWithPath: DashboardModel.expandedPath(model.configuration.catalogDatabasePath)),
+            mountedVolumes: mountedVolumesProvider?(),
+            pauseGate: driveActivityGate,
+            sameVolume: appliedSameVolumeCheck
+        )
+    }
+
+    // MARK: - Clear from Card
+
+    /// "Clear from Card…": plans afresh, then opens the confirmation with
+    /// what is eligible per event and what stays and why. Nothing is deleted
+    /// here.
+    func requestClearFromCard(_ locationID: UUID) async {
+        guard let location = location(locationID), let result = sources[locationID]?.result else { return }
+        let plan = await cardClearPlan(for: locationID, result: result)
+        guard sources[locationID]?.result?.rootPath == result.rootPath else { return }
+        guard !plan.clearable.isEmpty else {
+            model.statusMessage = plan.waitingForNAS.isEmpty
+                ? "Nothing here is safe to clear yet. Apply, then Sync to NAS first."
+                : "\(plan.waitingFiles) file(s) are in their events but not verified on the NAS yet. Sync to NAS first — nothing was removed."
+            return
+        }
+        let byEvent = Dictionary(grouping: plan.clearable, by: \.eventID)
+            .map { eventID, items in
+                CardClearRequest.EventLine(
+                    name: event(eventID).map { eventTitle($0) } ?? "An event",
+                    fileCount: items.reduce(0) { $0 + $1.files.count },
+                    byteCount: items.reduce(0) { $0 + $1.byteCount }
+                )
+            }
+            .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        pendingCardClear = CardClearRequest(
+            locationID: locationID,
+            locationName: location.name,
+            itemIDs: Set(plan.clearable.map(\.id)),
+            fileCount: plan.clearableFiles,
+            byteCount: plan.clearableBytes,
+            events: byEvent,
+            waitingForNASFiles: plan.waitingFiles,
+            driveName: plan.driveName,
+            nasReachable: VolumeInfo.isAvailable(locations.nasRoot, mountedVolumes: mountedVolumesProvider?() ?? VolumeInfo.mountedVolumePaths())
+        )
+    }
+
+    /// Runs the confirmed Clear from Card as a tracked job. The typed token
+    /// is checked here and again by the service; the job plans afresh and
+    /// clears only items the sheet listed that still qualify, each after its
+    /// own final hash checks (`CardClearService`). Outside Undo — the sheet
+    /// says so.
+    func confirmCardClear(_ request: CardClearRequest, confirmation: String) {
+        pendingCardClear = nil
+        guard confirmation == FreeUpService.confirmationToken else {
+            model.statusMessage = "Nothing was removed — type \(FreeUpService.confirmationToken) to clear files from the card."
+            return
+        }
+        // Like Take Off Drive: re-read NAS copies over Ethernet if it can.
+        // Then it waits in the job queue behind whatever is running.
+        nasConnection.prepareForNASJob { [weak self] in
+            guard let self else { return }
+            model.enqueueFileJob(
+                action: .freeUp,
+                queuedNote: "Clear \(request.fileCount) file(s) from \(request.locationName).",
+                detail: "Waits for the running job. Then Verify re-hashes each card file, its drive copy and the NAS copy against the hash Sync to NAS verified, and Remove deletes only the card files that passed.",
+                skippedNote: "Did not start: \(request.locationName) or its scan is gone. Nothing was removed."
+            ) { [weak self] jobID in
+                self?.runCardClear(request, confirmation: confirmation, jobID: jobID)
+            }
+        }
+    }
+
+    private func runCardClear(_ request: CardClearRequest, confirmation: String, jobID: UUID) {
+        guard let location = location(request.locationID), let result = sources[request.locationID]?.result else { return }
+        // Planned again from the catalog and disk as they are now.
+        let job = cardClearJobInputs(result: result)
+        let itemIDs = request.itemIDs
+        let nasRoot = locations.nasRoot
+        let mountedProvider = mountedVolumesProvider
+        let title = "Cleared files from \(location.name)"
+        let recorder = model.makeHistoryRecorder(action: .freeUp, title: title, id: jobID)
+        let cardRoot = result.rootPath
+        model.runBackgroundJob(
+            action: .freeUp,
+            runningNote: "Verify: rechecking \(request.fileCount) file(s) on \(location.name) against the drive and the NAS",
+            logTitle: title,
+            logDetail: "Planned again, then Verify re-hashed each card file, its drive copy (against the SHA-256 Sync to NAS verified) and the NAS copy when reachable; Remove permanently deleted only card files that passed, through the existing source cleanup, which re-hashes once more. Drive and NAS copies were only read.",
+            history: recorder,
+            jobID: jobID,
+            operation: { progress in
+                let plan = job.plan(isCancelled: { false })
+                let items = plan.clearable.filter { itemIDs.contains($0.id) }
+                let nasReachable = VolumeInfo.isAvailable(nasRoot, mountedVolumes: mountedProvider?() ?? VolumeInfo.mountedVolumePaths())
+                recorder?.setTotals(files: items.reduce(0) { $0 + $1.files.count }, bytes: items.reduce(0) { $0 + $1.byteCount })
+                let report = items.isEmpty
+                    ? CardClearReport()
+                    : try CardClearService().clear(
+                        items: items,
+                        nasReachable: nasReachable,
+                        confirmation: confirmation,
+                        progress: { update in
+                            recorder?.observe(update)
+                            progress(DashboardModel.jobUpdate(from: update, notePrefix: "Clear from Card", command: ""))
+                        },
+                        fileSettled: { file in
+                            let relative = file.sourcePath.hasPrefix(cardRoot + "/")
+                                ? String(file.sourcePath.dropFirst(cardRoot.count + 1))
+                                : file.relativePath
+                            // `job_items` only knows the sync outcomes (its
+                            // CHECK constraint is left as it is): a removed
+                            // file is `matched` — every copy matched — and a
+                            // file that stayed is `failed`, its phase and
+                            // reason in `error`.
+                            recorder?.fileSettled(JobHistoryItem(
+                                relativePath: relative,
+                                byteCount: file.byteCount,
+                                start: nil,
+                                end: recorder?.elapsed() ?? 0,
+                                outcome: file.removed ? .matched : .failed,
+                                verifyMethod: nasReachable ? "NAS re-read" : "recorded NAS hash",
+                                error: file.removed
+                                    ? nil
+                                    : "Skipped in \(file.phase): \(file.reason ?? "it did not pass every check.") The card file stays."
+                            ))
+                        }
+                    )
+                recorder?.notePhases(report.phases)
+                let dropped = itemIDs.subtracting(Set(items.map(\.id))).count
+                return CardClearOutcome(report: report, noLongerEligible: dropped)
+            },
+            completion: { [weak self] outcome in
+                guard let self else { return "" }
+                scan(location, force: true)
+                return CardClearWording.summary(outcome, locationName: location.name)
+            }
+        )
+    }
+
+    /// Takes stacks the board no longer shows out of the selection, focus and
+    /// range anchor, so a key (1–3, E, N, Delete) or Move to Trash can never
+    /// act on a stack the owner cannot see. Selection only — nothing in the
+    /// catalog changes.
+    func deselectHiddenStacks(_ hidden: Set<String>) {
+        guard !hidden.isEmpty else { return }
+        if !selectedStackIDs.isDisjoint(with: hidden) {
+            selectedStackIDs.subtract(hidden)
+        }
+        if let focusedStackID, hidden.contains(focusedStackID) {
+            self.focusedStackID = nil
+        }
+        if let selectionAnchorID, hidden.contains(selectionAnchorID) {
+            self.selectionAnchorID = nil
         }
     }
 
@@ -2270,12 +2549,19 @@ final class EventsWorkspace {
     /// Sorted files still waiting for Apply. A file the last Apply plan
     /// found already in its event as an identical copy is not waiting —
     /// it is counted by `applyCollisions(in:)` instead.
+    ///
+    /// A file already in its event (a card file Apply copied, which stays on
+    /// the card) is not waiting either (`isApplied`), so this is exactly what
+    /// Apply still has to do.
     func sortedFiles(in result: OrganizeScanResult) -> (files: Int, bytes: Int64) {
         let duplicates = applyDuplicateSourceKeys.values.reduce(into: Set<String>()) { $0.formUnion($1) }
+        let applied = appliedSourceEvents[result.rootPath] ?? [:]
         var files = 0
         var bytes: Int64 = 0
         for item in result.items {
-            for file in item.files where assignment(for: file) != nil && !duplicates.contains(file.pathKey) {
+            for file in item.files {
+                guard let assignment = assignment(for: file), !duplicates.contains(file.pathKey),
+                      applied[file.pathKey] != assignment.eventID else { continue }
                 files += 1
                 bytes += file.size
             }
@@ -2375,8 +2661,23 @@ final class EventsWorkspace {
         return OrganizeStackMenuState(
             targetIDs: targets,
             stacks: stacks(matching: targets, inLocation: locationID),
-            eventTargets: menuTargets(excluding: nil)
+            eventTargets: sortIntoTargets()
         )
+    }
+
+    /// The events an unsorted board may sort into — the same rows the
+    /// right-click menu's `eventTargets` lists, so the Sort Into picker
+    /// never offers an event the menu would not.
+    func sortIntoTargets() -> [EventMenuTarget] {
+        menuTargets(excluding: nil)
+    }
+
+    /// The ids among `stackIDs` that are still on `locationID`'s current
+    /// scan — never ids from another source, and none while the board has
+    /// no scan result (mid-rescan).
+    func liveStackIDs(_ stackIDs: Set<String>, inLocation locationID: UUID) -> Set<String> {
+        guard let byID = sources[locationID]?.stacksByID, sources[locationID]?.result != nil else { return [] }
+        return stackIDs.filter { byID[$0] != nil }
     }
 
     func badge(for stack: OrganizeStack, in eventID: UUID) -> TileLocationBadge? {
@@ -2770,10 +3071,15 @@ final class EventsWorkspace {
         }
 
         let gate = driveActivityGate
+        let linkMemory = burstLinkMemory
         Task { @MainActor [weak self] in
             let outcome: Result<OrganizeScanResult, any Error> = await Task.detached(priority: .userInitiated) {
                 Result {
-                    try OrganizeScanner().scan(root: root, cache: cache, burstGrouping: BurstGroupingConfiguration.resolved(), burstSplits: burstSplits, pauseGate: gate, progress: reportProgress)
+                    let result = try OrganizeScanner().scan(root: root, cache: cache, burstGrouping: BurstGroupingConfiguration.resolved(), burstSplits: burstSplits, pauseGate: gate, progress: reportProgress)
+                    // What the Vision check decided here holds for every
+                    // copy of these frames, so event boards group alike.
+                    linkMemory.record(result)
+                    return result
                 }
             }.value
             guard let self else { return }
@@ -3058,6 +3364,7 @@ final class EventsWorkspace {
         // always did.
         removeAssignmentsFromEventBoards(change.removed)
         let covered = Set(addedItems.flatMap(\.files).map(Self.fileKey))
+        var stacking: BurstStackingContext?
         for (targetID, added) in Dictionary(grouping: change.added, by: \.eventID) {
             let wanted = Set(added.map(Self.fileKey))
             // The event's own board and the open family boards above it draw
@@ -3070,9 +3377,10 @@ final class EventsWorkspace {
                 }
                 let present = Set(stacks.flatMap(\.files).map(\.pathKey))
                 let fresh = addedItems.filter { !present.contains($0.primary.pathKey) }
-                eventStacks[boardID] = OrganizeStacker.stacks(
-                    for: stacks.flatMap(\.items) + fresh,
-                    splits: model.configuration.burstSplits
+                let context = stacking ?? eventStacking()
+                stacking = context
+                eventStacks[boardID] = context.stacks(
+                    for: stacks.flatMap(\.items) + fresh
                 ).carryingIDs(from: stacks)
                 eventGridRevisions[boardID] = model.catalogStateRevision
             }
@@ -3095,13 +3403,48 @@ final class EventsWorkspace {
         FaceIndexStore.fileKey(fileName: file.name, byteCount: file.size, modifiedAt: file.modifiedAt)
     }
 
+    /// How event boards cut their frames into stacks — the unsorted scan's
+    /// grouping options, the Vision verdicts it reached (by frame identity)
+    /// and the manual splits, matched to whichever copy a board draws. A
+    /// split made on a card names card paths; each member's identity comes
+    /// from its catalog row or from a board that draws it. View-only: it
+    /// decides tiles, never which file an action touches.
+    func eventStacking() -> BurstStackingContext {
+        let splits = model.configuration.burstSplits
+        var identities: [String: String] = [:]
+        if !splits.isEmpty {
+            refreshIndexIfNeeded(tracking: false)
+            var unresolved = Set<String>()
+            for key in splits.lazy.flatMap(\.memberPathKeys) where identities[key] == nil {
+                if let assignment = assignmentsByPathKey[key] {
+                    identities[key] = Self.fileKey(assignment)
+                } else {
+                    unresolved.insert(key)
+                }
+            }
+            if !unresolved.isEmpty {
+                for stacks in eventStacks.values {
+                    for item in stacks.lazy.flatMap(\.items) where unresolved.contains(item.primary.pathKey) {
+                        identities[item.primary.pathKey] = BurstFrameIdentity.key(for: item.primary)
+                    }
+                }
+            }
+        }
+        return BurstStackingContext(
+            configuration: BurstGroupingConfiguration.resolved(),
+            splits: splits,
+            memberIdentities: identities,
+            linkMemory: burstLinkMemory
+        )
+    }
+
     /// Drop removed assignments' files from every open board, matching by
     /// file identity so a stack loses the file whichever copy its tiles
     /// were pointing at. Boards without a match are left untouched.
     private func removeAssignmentsFromEventBoards(_ removed: [PhotoEventAssignment]) {
         guard !removed.isEmpty else { return }
         let fileKeys = Set(removed.map(Self.fileKey))
-        let splits = model.configuration.burstSplits
+        let stacking = eventStacking()
         for boardID in Array(eventStacks.keys) {
             guard let stacks = eventStacks[boardID] else { continue }
             let items = stacks.flatMap(\.items)
@@ -3109,7 +3452,7 @@ final class EventsWorkspace {
                 !item.files.contains { fileKeys.contains(Self.fileKey($0)) }
             }
             guard remaining.count != items.count else { continue }
-            eventStacks[boardID] = OrganizeStacker.stacks(for: remaining, splits: splits)
+            eventStacks[boardID] = stacking.stacks(for: remaining)
                 .carryingIDs(from: stacks)
             eventGridRevisions[boardID] = model.catalogStateRevision
         }
@@ -3117,7 +3460,73 @@ final class EventsWorkspace {
 
     // MARK: - Events
 
-    func requestNewEvent(from locationID: UUID?, parentEventID: UUID? = nil) {
+    // MARK: - Sort Into picker
+
+    /// Opens the Sort Into picker for `stackIDs` on an unsorted board. The
+    /// stacks are captured now; an empty set still opens it so "New Event…"
+    /// stays reachable, with the event rows inactive.
+    func requestSortInto(stackIDs: Set<String>, from locationID: UUID, orderedIDs: [String] = []) {
+        let live = liveStackIDs(stackIDs, inLocation: locationID)
+        let stacks = stacks(matching: live, inLocation: locationID)
+        sortIntoRequest = SortIntoRequest(
+            sourceLocationID: locationID,
+            stackIDs: live,
+            orderedIDs: orderedIDs,
+            itemCount: stacks.count,
+            fileCount: stacks.reduce(0) { $0 + $1.files.count }
+        )
+    }
+
+    /// The picker's header line: what will be sorted, and from where.
+    func sortIntoSummary(_ request: SortIntoRequest) -> String {
+        let source = location(request.sourceLocationID)?.name ?? "this folder"
+        guard request.itemCount > 0 else {
+            return "Nothing is selected in \(source). Select photos first, or make a new event."
+        }
+        return "\(ApplyPlanOverview.plural(request.itemCount, "item")) (\(ApplyPlanOverview.plural(request.fileCount, "file"))) from \(source). Nothing moves until you press Apply."
+    }
+
+    /// The picker's choice: sorts the captured stacks that are still on
+    /// their source into `eventID` through `assign` — the same path as the
+    /// 1–3 keys, so undo, the status line and the focus advance match.
+    func completeSortInto(_ request: SortIntoRequest, eventID: UUID) {
+        sortIntoRequest = nil
+        guard sortIntoTargets().contains(where: { $0.id == eventID }), event(eventID) != nil else {
+            model.statusMessage = "That event is no longer available. Nothing was sorted."
+            return
+        }
+        let live = liveStackIDs(request.stackIDs, inLocation: request.sourceLocationID)
+        guard !live.isEmpty else {
+            model.statusMessage = request.stackIDs.isEmpty
+                ? "Select photos first, then choose Sort Into…."
+                : "Those items are no longer on the board (it was rescanned). Nothing was sorted — select them again."
+            return
+        }
+        assign(stackIDs: live, from: request.sourceLocationID, to: eventID, orderedIDs: request.orderedIDs)
+    }
+
+    /// "New Event…" inside the picker: closes it and queues the New Event
+    /// sheet for the same stacks; `sortIntoSheetDidDismiss` presents it.
+    func newEventFromSortInto(_ request: SortIntoRequest) {
+        let live = liveStackIDs(request.stackIDs, inLocation: request.sourceLocationID)
+        let stacks = stacks(matching: live, inLocation: request.sourceLocationID)
+        newEventAfterSortInto = NewEventRequest(
+            suggestedDate: stacks.map(\.captureDate).min() ?? Date(),
+            sourceLocationID: request.sourceLocationID,
+            stackIDs: live,
+            orderedIDs: request.orderedIDs
+        )
+        sortIntoRequest = nil
+    }
+
+    /// The picker sheet finished closing: present a queued New Event sheet.
+    func sortIntoSheetDidDismiss() {
+        guard let pending = newEventAfterSortInto else { return }
+        newEventAfterSortInto = nil
+        newEventRequest = pending
+    }
+
+    func requestNewEvent(from locationID: UUID?, parentEventID: UUID? = nil, orderedIDs: [String] = []) {
         // New Subevent under an event already at the cap refuses here —
         // the picker never offered it, but the menu shortcut can reach it.
         if let parentEventID, let refusal = subeventRefusal(for: parentEventID) {
@@ -3131,7 +3540,8 @@ final class EventsWorkspace {
             suggestedDate: stacks.map(\.captureDate).min() ?? Date(),
             sourceLocationID: locationID,
             stackIDs: Set(stacks.map(\.id)),
-            parentEventID: validParentEventID(parentEventID, for: nil)
+            parentEventID: validParentEventID(parentEventID, for: nil),
+            orderedIDs: orderedIDs
         )
     }
 
@@ -3199,9 +3609,24 @@ final class EventsWorkspace {
     func completeNewEvent(_ request: NewEventRequest, name: String, date: Date, policy: EventStoragePolicy?, parentEventID: UUID?) {
         guard let eventID = createEvent(name: name, date: date, policy: policy, parentEventID: parentEventID) else { return }
         newEventRequest = nil
-        // Creating an event never sorts or moves photos. Assign is a separate
-        // click on the board; Apply is the later move. Auto-assign made every
-        // selected burst go gray the moment the sheet confirmed.
+        // New Event from a selection on an unsorted board sorts that
+        // selection into the event, through the same `assign` the 1–3 keys
+        // use — catalog only, one undo entry, Apply enabled. Nothing moves
+        // on disk until Apply. Only stacks still on that source's current
+        // scan are sorted. An event-board request (`moveFromEventID`)
+        // still only creates the event: that path would move real files.
+        if let locationID = request.sourceLocationID, request.moveFromEventID == nil {
+            guard !request.stackIDs.isEmpty else { return }
+            let live = liveStackIDs(request.stackIDs, inLocation: locationID)
+            guard !live.isEmpty else {
+                if let event = event(eventID) {
+                    model.statusMessage = "Created \(eventTitle(event)). The selected items are no longer on the board (it was rescanned), so nothing was sorted into it."
+                }
+                return
+            }
+            assign(stackIDs: live, from: locationID, to: eventID, orderedIDs: request.orderedIDs)
+            return
+        }
         if request.sourceLocationID == nil, request.moveFromEventID == nil {
             selection = .event(eventID)
         }
@@ -3539,7 +3964,7 @@ final class EventsWorkspace {
         let locations = self.locations
         let policy = locations.resolvedPolicy(for: event)
         let cacheLoader = captureDateCacheLoader
-        let burstSplits = model.configuration.burstSplits
+        let stacking = eventStacking()
         let catalogURL = URL(fileURLWithPath: DashboardModel.expandedPath(model.configuration.catalogDatabasePath))
         let probe = presenceProbe
         let dateReadProbe = captureDateReadProbe
@@ -3646,7 +4071,7 @@ final class EventsWorkspace {
                 // header read, so nothing on this pass can wait on a drive.
                 let items = OrganizeScanner.items(for: files, cache: cacheLoader.cache(), readMissingCaptureDates: false, pauseGate: gate).items
                 return (
-                    EventImpliedGrid(files: files, stacks: OrganizeStacker.stacks(for: items, splits: burstSplits)),
+                    EventImpliedGrid(files: files, stacks: stacking.stacks(for: items)),
                     family.count
                 )
             }.value
@@ -3678,6 +4103,7 @@ final class EventsWorkspace {
         // honest.
         let pipeline = Task.detached(priority: .userInitiated) { [self] in
             var built: EventImpliedGrid?
+            var datedItems: [OrganizeItem]?
             var canReadHeaders = true
             // What the board shows, as far as this pipeline has put it there.
             var published = existingStacks
@@ -3698,7 +4124,7 @@ final class EventsWorkspace {
                     // reads rides the apply so the board can say dates are
                     // still coming without saying files are.
                     let undated = OrganizeScanner.items(for: files, cache: cache, readMissingCaptureDates: false, pauseGate: gate)
-                    let provisional = OrganizeStacker.stacks(for: undated.items, splits: burstSplits)
+                    let provisional = stacking.stacks(for: undated.items)
                     // A refresh that rebuilds the very grid the board already
                     // shows publishes nothing: the comparison runs here, off
                     // the main actor, instead of a 15,000-stack restack there.
@@ -3747,10 +4173,8 @@ final class EventsWorkspace {
                     cache.timestampProbe = dateReadProbe
                     let dated = OrganizeScanner.items(for: files, cache: cache, readMissingCaptureDates: canReadHeaders, pauseGate: gate)
                     cache.timestampProbe = previousProbe
-                    built = EventImpliedGrid(
-                        files: files,
-                        stacks: OrganizeStacker.stacks(for: dated.items, splits: burstSplits)
-                    )
+                    datedItems = dated.items
+                    built = EventImpliedGrid(files: files, stacks: stacking.stacks(for: dated.items))
                 }
                 await applyEventBuild(
                     eventID: eventID,
@@ -3761,6 +4185,27 @@ final class EventsWorkspace {
                     connectivity: connectivityRevisionAtStart,
                     unchanged: built.map { $0.stacks == published } ?? false
                 )
+                // Burst pairs no scan compared yet (the card is gone, or this
+                // is a relaunch) get the Vision check here, from the same
+                // places the dates came from — after the dated board is up,
+                // so fingerprinting never holds it back. Only a change in
+                // grouping publishes again.
+                if canReadHeaders, !Task.isCancelled, let items = datedItems, let shown = built,
+                   stacking.needsVisualCheck(for: items) {
+                    let linked = stacking.stacks(for: items, computeMissingLinks: true, pauseGate: gate)
+                    if !Task.isCancelled, linked != shown.stacks {
+                        let regrouped = EventImpliedGrid(files: shown.files, stacks: linked)
+                        await applyEventBuild(
+                            eventID: eventID,
+                            generation: generation,
+                            revision: revisionAtStart,
+                            build: regrouped,
+                            datesRead: true,
+                            connectivity: connectivityRevisionAtStart
+                        )
+                        built = regrouped
+                    }
+                }
             }
 
             // The sweep. Its own utility task, joined through a continuation
@@ -4043,13 +4488,17 @@ final class EventsWorkspace {
         // restack onto the real ones. Continuation, not `task.value`, so
         // the rebuild keeps its utility priority.
         let cache = captureDateCache
-        let splits = model.configuration.burstSplits
+        let stacking = eventStacking()
+        let gate = driveActivityGate
         let files = output.files
         let rebuilt = await withCheckedContinuation { (cc: CheckedContinuation<[OrganizeStack], Never>) in
             Task.detached(priority: .utility) {
-                cc.resume(returning: OrganizeStacker.stacks(
-                    for: OrganizeScanner.items(for: files, cache: cache, pauseGate: self.driveActivityGate).items,
-                    splits: splits
+                // These are the copies the sweep found on disk, so the
+                // Vision check may read them for pairs nobody compared yet.
+                cc.resume(returning: stacking.stacks(
+                    for: OrganizeScanner.items(for: files, cache: cache, pauseGate: gate).items,
+                    computeMissingLinks: true,
+                    pauseGate: gate
                 ))
             }
         }
@@ -4202,6 +4651,11 @@ final class EventsWorkspace {
                 }
                 guard let drivePath = asset.drivePath else { continue }
                 let size = asset.assignment.fileSize
+                // A camera's own clip preview or LUT (`CameraSupportFiles`)
+                // is never copied or moved off the card, even when an older
+                // catalog row still names it — the board no longer offers it.
+                let sourceIsCameraSupport = !asset.sourceIsDriveCopy
+                    && (asset.sourcePath.map(CameraSupportFiles.isCameraGenerated) ?? false)
                 switch asset.drive {
                 case .present:
                     // A same-size file is already in the event. If the
@@ -4210,7 +4664,7 @@ final class EventsWorkspace {
                     // different photo with the same name — the collision
                     // check below decides. Card sources on another drive
                     // keep their originals by design and stay "in place".
-                    if asset.source == .present, !asset.sourceIsDriveCopy,
+                    if !sourceIsCameraSupport, asset.source == .present, !asset.sourceIsDriveCopy,
                        let sourcePath = asset.sourcePath, isSameVolume(sourcePath) {
                         candidates.append(ApplyMoveCandidate(
                             move: DriveMove(sourcePath: sourcePath, destinationPath: drivePath, byteCount: size),
@@ -4233,6 +4687,7 @@ final class EventsWorkspace {
                     ))
                     continue
                 }
+                if sourceIsCameraSupport { continue }
                 guard asset.source == .present, !asset.sourceIsDriveCopy, let sourcePath = asset.sourcePath else {
                     if asset.source == .unavailable { unavailable += 1 }
                     continue
@@ -6388,13 +6843,27 @@ final class EventsWorkspace {
         case .drive:
             // Take Off Drive re-reads every NAS copy: over Ethernet if it can.
             nasConnection.prepareForNASJob { [weak self] in
-                self?.removeFromDrive(request.eventID, confirmation: confirmation)
+                guard let self else { return }
+                model.enqueueFileJob(
+                    action: .freeUp,
+                    queuedNote: "Take \(request.fileCount) file(s) off the drive.",
+                    detail: "Waits for the running job, then re-hashes every drive copy against its NAS copy before moving it into the drive's _Trash folder."
+                ) { [weak self] jobID in
+                    self?.removeFromDrive(request.eventID, confirmation: confirmation, jobID: jobID)
+                }
             }
-        case .source: removeFromSource(request.eventID, confirmation: confirmation)
+        case .source:
+            model.enqueueFileJob(
+                action: .freeUp,
+                queuedNote: "Free up \(request.fileCount) source file(s).",
+                detail: "Waits for the running job, then re-hashes every source file against its drive copy before permanently removing only matching originals."
+            ) { [weak self] jobID in
+                self?.removeFromSource(request.eventID, confirmation: confirmation, jobID: jobID)
+            }
         }
     }
 
-    private func removeFromDrive(_ eventID: UUID, confirmation: String) {
+    private func removeFromDrive(_ eventID: UUID, confirmation: String, jobID: UUID? = nil) {
         guard let event = event(eventID), let summary = presence[eventID] else { return }
         let locations = self.locations
         var pairs: [VerifiedRemovalPair] = []
@@ -6431,6 +6900,7 @@ final class EventsWorkspace {
             runningNote: "Rechecking \(pairs.count) drive copies of \(eventTitle(event)) against the NAS",
             logTitle: "Took \(eventTitle(event)) off the drive",
             logDetail: "Re-hashed every drive copy against its NAS copy, then moved the drive copies into the drive's hidden _Trash folder. Nothing was deleted.",
+            jobID: jobID,
             operation: { progress in
                 try VerifiedRemovalService().moveVerifiedCopiesAside(
                     pairs: plannedPairs,
@@ -6459,7 +6929,7 @@ final class EventsWorkspace {
         )
     }
 
-    private func removeFromSource(_ eventID: UUID, confirmation: String) {
+    private func removeFromSource(_ eventID: UUID, confirmation: String, jobID: UUID? = nil) {
         guard let event = event(eventID), let summary = presence[eventID] else { return }
         let locations = self.locations
         var groups: [String: SourceCleanupGroup] = [:]
@@ -6485,6 +6955,7 @@ final class EventsWorkspace {
             runningNote: "Rechecking \(total) source files of \(eventTitle(event)) against the drive",
             logTitle: "Freed source space for \(eventTitle(event))",
             logDetail: "Re-hashed each source file against its drive copy before permanently removing only matching source originals.",
+            jobID: jobID,
             operation: { progress in
                 var removed = 0
                 var bytes: Int64 = 0
@@ -6752,7 +7223,7 @@ final class EventsWorkspace {
                     let remaining = stacks.flatMap(\.items).filter { item in
                         !item.files.contains { movedKeys.contains($0.pathKey) }
                     }
-                    eventStacks[eventID] = OrganizeStacker.stacks(for: remaining, splits: model.configuration.burstSplits)
+                    eventStacks[eventID] = eventStacking().stacks(for: remaining)
                         .carryingIDs(from: stacks)
                     eventGridRevisions[eventID] = model.catalogStateRevision
                 }
@@ -6946,7 +7417,7 @@ final class EventsWorkspace {
     func removeFilesFromEventBoards(_ pathKeys: Set<String>, events: Set<UUID>) {
         guard !pathKeys.isEmpty else { return }
         let ids = events.isEmpty ? Set(eventStacks.keys) : events
-        let splits = model.configuration.burstSplits
+        let stacking = eventStacking()
         for eventID in ids {
             guard let stacks = eventStacks[eventID] else { continue }
             let items = stacks.flatMap(\.items)
@@ -6954,7 +7425,7 @@ final class EventsWorkspace {
                 !item.files.contains { pathKeys.contains($0.pathKey) }
             }
             guard remaining.count != items.count else { continue }
-            eventStacks[eventID] = OrganizeStacker.stacks(for: remaining, splits: splits)
+            eventStacks[eventID] = stacking.stacks(for: remaining)
                 .carryingIDs(from: stacks)
             eventGridRevisions[eventID] = model.catalogStateRevision
         }
@@ -6989,9 +7460,10 @@ final class EventsWorkspace {
                 sources[id]?.result = result.restacked(withSplits: splits)
             }
         }
+        let stacking = eventStacking()
         for id in Array(eventStacks.keys) {
             if let stacks = eventStacks[id] {
-                eventStacks[id] = OrganizeStacker.stacks(for: stacks.flatMap(\.items), splits: splits)
+                eventStacks[id] = stacking.stacks(for: stacks.flatMap(\.items))
                     .carryingIDs(from: stacks)
                 eventGridRevisions[id] = model.catalogStateRevision
             }
@@ -7419,6 +7891,7 @@ final class EventsWorkspace {
         }
         let items = result.items
         let grouping = BurstGroupingConfiguration.resolved()
+        let linkMemory = burstLinkMemory
         var state = sources[id] ?? UnsortedSourceState()
         state.isScanning = true
         state.error = nil
@@ -7454,6 +7927,7 @@ final class EventsWorkspace {
                     ))
                 }
                 reportProgress(OrganizeScanProgress(phase: "Grouping bursts", processed: 0, total: 0))
+                linkMemory.record(items: items, links: links, configuration: grouping)
                 return BurstRegroupOutcome(
                     stacks: OrganizeStacker.stacks(for: items, configuration: grouping, visualLinks: links),
                     links: links,

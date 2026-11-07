@@ -162,6 +162,27 @@ public enum BurstVisualLinker {
     ) -> Set<BurstVisualLink> {
         let pairs = recoveryPairs(for: items, configuration: configuration)
         guard !pairs.isEmpty else { return [] }
+        let answers = verdicts(forPairs: pairs, configuration: configuration, concurrency: concurrency, progress: progress)
+        var links = Set<BurstVisualLink>()
+        for (pair, answer) in zip(pairs, answers) where answer == true {
+            links.insert(BurstVisualLink(previous: pair.previous, next: pair.next))
+        }
+        return links
+    }
+
+    /// One answer per pair, in order: true when the two previews are within
+    /// `maximumVisionDistance`, false when they are not, nil when either
+    /// preview could not be read (the pair never links, but nothing was
+    /// learned about it). Each file is fingerprinted once; `pauseGate` parks
+    /// a worker before it reads a file whose volume a speed test owns.
+    public static func verdicts(
+        forPairs pairs: [(previous: OrganizeItem, next: OrganizeItem)],
+        configuration: BurstGroupingConfiguration = BurstGroupingConfiguration(),
+        concurrency: Int = 8,
+        pauseGate: DriveActivityGate? = nil,
+        progress: (@Sendable (OrganizeScanProgress) -> Void)? = nil
+    ) -> [Bool?] {
+        guard !pairs.isEmpty else { return [] }
 
         // Fingerprint each file once even when it appears in several pairs.
         var orderedPaths: [String] = []
@@ -185,7 +206,8 @@ public enum BurstVisualLinker {
             },
             transform: { index in
                 autoreleasepool {
-                    FeaturePrintBox(print: try? featurePrint(forPath: paths[index]))
+                    pauseGate?.waitIfPaused(for: URL(fileURLWithPath: paths[index]))
+                    return FeaturePrintBox(print: try? featurePrint(forPath: paths[index]))
                 }
             }
         )
@@ -195,17 +217,13 @@ public enum BurstVisualLinker {
             if let print = result.print { prints[path] = print }
         }
 
-        var links = Set<BurstVisualLink>()
-        for pair in pairs {
+        return pairs.map { pair -> Bool? in
             guard let first = prints[pair.previous.primary.path],
-                  let second = prints[pair.next.primary.path] else { continue }
+                  let second = prints[pair.next.primary.path] else { return nil }
             var distance: Float = 0
-            guard (try? first.computeDistance(&distance, to: second)) != nil else { continue }
-            if distance <= configuration.maximumVisionDistance {
-                links.insert(BurstVisualLink(previous: pair.previous, next: pair.next))
-            }
+            guard (try? first.computeDistance(&distance, to: second)) != nil else { return nil }
+            return distance <= configuration.maximumVisionDistance
         }
-        return links
     }
 
     /// Feature-print distance between two files' previews. Small values mean

@@ -83,14 +83,24 @@ final class DashboardModel {
     }
     var configMessage: String = "Config is saved automatically."
     var statusMessage: String = "Ready. Choose folders in Settings to begin."
-    var isBusy: Bool = false
+    var isBusy: Bool = false {
+        // A queued file job (Clear from Card, Take Off Drive, Free Up…)
+        // starts once the gate is free — after the settling job's own
+        // follow-ups, which run first on this turn.
+        didSet {
+            if oldValue, !isBusy { scheduleQueuedFileJobs() }
+        }
+    }
     var isStorageBenchmarkRunning: Bool = false {
         // A speed test holds the job gate without being a job, so nothing
         // calls `onJobFinished` when it lets go — work that queued behind
         // it (a clicked Move to Event, NAS renames) hears it here instead
         // of waiting for some other job to end.
         didSet {
-            if oldValue, !isStorageBenchmarkRunning { onGateReleased?() }
+            if oldValue, !isStorageBenchmarkRunning {
+                onGateReleased?()
+                scheduleQueuedFileJobs()
+            }
         }
     }
     var immichAPIKeyDraft: String = ""
@@ -293,6 +303,9 @@ final class DashboardModel {
     /// This session's job recorders by job id: the running job's, and the
     /// last few finished ones so their whole-run chart stays drawable.
     @ObservationIgnored var jobHistoryRecorders: [UUID: JobHistoryRecorder] = [:]
+    /// File jobs waiting for the job gate, oldest first; each is shown in
+    /// `jobs` as queued until it starts (`enqueueFileJob`).
+    @ObservationIgnored var queuedFileJobs: [QueuedFileJob] = []
     @ObservationIgnored var jobHistoryFinishedOrder: [UUID] = []
     /// Increments when a recorded job ends, so the History list reloads.
     var jobHistoryRevision: Int = 0
@@ -1083,11 +1096,38 @@ extension DashboardModel {
         sourceCleanupError = nil
     }
 
+    /// Free Up Camera: checked now for a quick answer, then queued in Jobs
+    /// behind whatever is running; the job checks everything again when it
+    /// starts (`startRemovingVerifiedSourceFiles`).
     func removeVerifiedSourceFiles(queueID: UUID, confirmation: String) {
-        guard !isBusy, !isSourceCleanupRunning, !isStorageBenchmarkRunning else {
-            sourceCleanupError = "Another file job is already running. Wait for it to finish, then try again."
+        guard !isSourceCleanupRunning else {
+            sourceCleanupError = "Freeing camera space is already queued or running."
             return
         }
+        guard let queue = transferQueue,
+              queue.id == queueID,
+              queue.state == .completed,
+              queue.verifiedCount == queue.items.count else {
+            sourceCleanupError = "Every selected file must be checksum verified in the Buffer first."
+            return
+        }
+        guard queue.items.contains(where: { $0.state == .verified || $0.state == .alreadyPresent }) else {
+            sourceCleanupError = "These source files have already been removed from the camera."
+            return
+        }
+        sourceCleanupMessage = nil
+        sourceCleanupError = nil
+        enqueueFileJob(
+            action: .freeUp,
+            queuedNote: "Free up camera space.",
+            detail: "Waits for the running job, then re-hashes every camera file against its Buffer copy before permanently removing only matching originals.",
+            skippedNote: "Did not start: the transfer it belonged to changed. Nothing was removed."
+        ) { [weak self] jobID in
+            self?.startRemovingVerifiedSourceFiles(queueID: queueID, confirmation: confirmation, jobID: jobID)
+        }
+    }
+
+    private func startRemovingVerifiedSourceFiles(queueID: UUID, confirmation: String, jobID: UUID) {
         guard let queue = transferQueue,
               queue.id == queueID,
               queue.state == .completed,
@@ -1126,6 +1166,7 @@ extension DashboardModel {
             command: command,
             sourcePath: sourcePath,
             destinationPath: bufferPath,
+            jobID: jobID,
             operation: { jobProgress in
                 try SourceCleanupService().removeVerifiedFiles(
                     sourceRoot: source,
@@ -1614,6 +1655,9 @@ extension DashboardModel {
         /// callers can clear bookkeeping the success-only `completion`
         /// cannot cover.
         onSettled: (@MainActor @Sendable () -> Void)? = nil,
+        /// The id of the queued row this job starts (`enqueueFileJob`): the
+        /// row turns running in place and the history record keeps the id.
+        jobID queuedID: UUID? = nil,
         operation: @escaping @Sendable (@escaping @Sendable (BackgroundJobUpdate) -> Void) throws -> Result,
         /// Runs on the main actor when the operation succeeds and returns
         /// the job's summary line. It may suspend (`RunLoopTurn.afterCommit`)
@@ -1630,8 +1674,8 @@ extension DashboardModel {
         statusMessage = runningNote
         onJobStarted?(action)
 
-        let recorder = history ?? makeHistoryRecorder(action: action, title: logTitle)
-        let jobID = recorder?.jobID ?? UUID()
+        let recorder = history ?? makeHistoryRecorder(action: action, title: logTitle, id: queuedID ?? UUID())
+        let jobID = recorder?.jobID ?? queuedID ?? UUID()
         if let recorder {
             jobHistoryRecorders[jobID] = recorder
             recorder.start()
@@ -1649,7 +1693,11 @@ extension DashboardModel {
             sourcePath: sourcePath,
             destinationPath: destinationPath
         )
-        jobs.insert(startedJob, at: 0)
+        if let index = jobs.firstIndex(where: { $0.id == jobID && $0.state == .queued }) {
+            jobs[index] = startedJob
+        } else {
+            jobs.insert(startedJob, at: 0)
+        }
         beginJobActivity(id: jobID, reason: "\(logTitle) — a Camera Toolkit file job")
 
         let jobProgress = jobProgressHandler(jobID: jobID) { [weak self] update in

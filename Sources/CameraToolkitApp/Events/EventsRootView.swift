@@ -192,6 +192,21 @@ struct EventsRootView: View {
                 }
             )
         }
+        // The unsorted board's Sort Into picker. Picking sorts (catalog
+        // only) through `assign`; "New Event…" queues the New Event sheet,
+        // presented once this one has finished closing.
+        .sheet(item: $workspace.sortIntoRequest, onDismiss: { workspace.sortIntoSheetDidDismiss() }) { request in
+            EventPickerSheet(
+                workspace: workspace,
+                verb: "Sort into",
+                summary: workspace.sortIntoSummary(request),
+                allowedEventIDs: Set(workspace.sortIntoTargets().map(\.id)),
+                canAssign: !request.stackIDs.isEmpty,
+                onPick: { workspace.completeSortInto(request, eventID: $0.id) },
+                onNewEvent: { workspace.newEventFromSortInto(request) },
+                onCancel: { workspace.sortIntoRequest = nil }
+            )
+        }
         .sheet(item: $workspace.renameRequest) { request in
             if let event = workspace.event(request.eventID) {
                 EventDetailsSheet(
@@ -221,6 +236,13 @@ struct EventsRootView: View {
                 request: request,
                 onCancel: { workspace.pendingTrash = nil },
                 onConfirm: { workspace.confirmTrash(request) }
+            )
+        }
+        .sheet(item: $workspace.pendingCardClear) { request in
+            CardClearConfirmSheet(
+                request: request,
+                onCancel: { workspace.pendingCardClear = nil },
+                onConfirm: { workspace.confirmCardClear(request, confirmation: $0) }
             )
         }
         .sheet(item: $workspace.pendingRemoval) { request in
