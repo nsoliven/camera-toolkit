@@ -51,3 +51,4 @@ scripts/icloud-video-to-nas.py
 scripts/purge-verified.py
 scripts/verify-offload.py
 scripts/__pycache__/
+__pycache__/

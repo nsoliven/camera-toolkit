@@ -100,6 +100,8 @@ Open **Camera Toolkit → Settings** and choose:
 
 To use **Scan for Faces…**, run `scripts/setup-face-sidecar.sh` once. It builds a private Python environment under the app's support folder with the reference InsightFace models (see `docs/FACE-PIPELINE.md`); face scans are refused until it exists.
 
+To have face scans also find and group dogs, run `scripts/setup-pet-sidecar.sh` once (about 1.2 GB: PyTorch, an RT-DETRv2 dog detector and DINOv2) and leave **Settings › Organizing › Pets** on. Dogs appear under **People › Pets** and live in their own `pets.sqlite` beside the catalog (see `docs/PET-PIPELINE.md`).
+
 Then add cards and unsorted folders from the Events sidebar with **Add Folder or Card…**. No removable-drive, network-share, username, or home-directory path is compiled into the app. API keys are stored in macOS Keychain; paths and event preferences stay in the app's local configuration.
 
 ## Event workflow

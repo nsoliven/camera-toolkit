@@ -20,11 +20,52 @@ final class PeopleWindowController: NSObject, NSWindowDelegate {
             identifier: "CameraToolkitPeopleWindow",
             title: "People",
             initialContentSize: NSSize(width: 880, height: 620),
-            rootView: PeopleView(model: model, workspace: workspace)
+            rootView: PeopleWindowRoot(model: model, workspace: workspace)
         )
         window.delegate = self
         self.window = window
         CameraToolkitWindowFactory.present(window)
+    }
+}
+
+/// The People window's content: people from the catalog, and — once the
+/// pet engine is set up and Settings asks for dogs — a People | Pets
+/// switch that shows the pet index with the same rows and actions.
+private struct PeopleWindowRoot: View {
+    @Bindable var model: DashboardModel
+    @Bindable var workspace: EventsWorkspace
+    @AppStorage(PetGallery.scanEnabledDefaultsKey) private var petsEnabled = true
+    @State private var subject: FaceGallerySubject = .people
+
+    private var showsPets: Bool {
+        petsEnabled && (workspace.petGallery.faceEngineInstalled
+            || FileManager.default.fileExists(atPath: workspace.petGallery.databaseURL.path))
+    }
+
+    var body: some View {
+        Group {
+            if showsPets && subject == .pets {
+                PeopleView(model: model, gallery: workspace.petGallery)
+                    .id(FaceGallerySubject.pets)
+            } else {
+                PeopleView(model: model, gallery: workspace)
+                    .id(FaceGallerySubject.people)
+            }
+        }
+        .toolbar {
+            if showsPets {
+                ToolbarItem(placement: .principal) {
+                    Picker("Show", selection: $subject) {
+                        ForEach(FaceGallerySubject.allCases) { subject in
+                            Text(subject.title).tag(subject)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .help("People from face scans, or dogs from pet scans")
+                }
+            }
+        }
     }
 }
 
@@ -35,7 +76,9 @@ final class PeopleWindowController: NSObject, NSWindowDelegate {
 /// data — no photo is ever written to.
 private struct PeopleView: View {
     @Bindable var model: DashboardModel
-    @Bindable var workspace: EventsWorkspace
+    let gallery: any FaceReviewGallery
+
+    private var subject: FaceGallerySubject { gallery.gallerySubject }
 
     @State private var approved: [FacePerson] = []
     @State private var inbox: [FacePerson] = []
@@ -70,7 +113,7 @@ private struct PeopleView: View {
         Group {
             if let detail {
                 PersonFacesGrid(
-                    workspace: workspace,
+                    gallery: gallery,
                     person: detail,
                     needle: OrganizeSearch.needle(gridSearchText),
                     onBack: { self.detail = nil },
@@ -84,9 +127,9 @@ private struct PeopleView: View {
         .safeAreaInset(edge: .bottom, spacing: 0) {
             VStack(spacing: 0) {
                 Divider()
-                if !workspace.faceEngineInstalled {
+                if !gallery.faceEngineInstalled {
                     Label {
-                        Text("Face engine not installed — run \(FaceSidecarInstallation.setupCommand) once on this Mac.")
+                        Text("\(subject.engineName) not installed — run \(subject.setupCommand) once on this Mac.")
                             .textSelection(.enabled)
                     } icon: {
                         Image(systemName: "exclamationmark.triangle.fill")
@@ -108,23 +151,24 @@ private struct PeopleView: View {
                 }
             }
         }
-        .navigationTitle(detail.map(displayName) ?? "People")
+        .navigationTitle(detail.map(displayName) ?? subject.title)
         .navigationSubtitle(windowSubtitle)
         .searchable(
             text: Binding(get: { activeQuery }, set: { activeQuery = $0 }),
             placement: .toolbar,
-            prompt: detail == nil ? "Search people" : "Search photos"
+            prompt: detail == nil ? subject.searchPrompt : "Search photos"
         )
         .toolbar { toolbar }
         .onAppear(perform: reload)
-        .onChange(of: workspace.facesRevision) { reload() }
+        .onChange(of: gallery.facesRevision) { reload() }
         .sheet(isPresented: $clearingFaceIndex) {
             ClearFaceScanSheet(
-                counts: workspace.faceIndexCounts(),
+                subject: subject,
+                counts: gallery.faceIndexCounts(),
                 onCancel: { clearingFaceIndex = false },
                 onClear: {
                     clearingFaceIndex = false
-                    workspace.clearFaceIndex()
+                    gallery.clearFaceIndex()
                 }
             )
         }
@@ -132,13 +176,14 @@ private struct PeopleView: View {
             NamePersonSheet(
                 title: request.title,
                 initialName: request.initialName,
+                prompt: subject.namePrompt,
                 onCancel: { naming = nil },
                 onSave: { name in
                     naming = nil
                     if request.isApproval {
-                        workspace.nameGroup(request.person.id, name: name)
+                        gallery.nameGroup(request.person.id, name: name)
                     } else {
-                        workspace.renamePerson(request.person.id, name: name)
+                        gallery.renamePerson(request.person.id, name: name)
                     }
                 }
             )
@@ -148,7 +193,7 @@ private struct PeopleView: View {
             isPresented: Binding(get: { junkTarget != nil }, set: { if !$0 { junkTarget = nil } })
         ) {
             Button("Remove", role: .destructive) {
-                if let junkTarget { workspace.junkGroup(junkTarget.id) }
+                if let junkTarget { gallery.junkGroup(junkTarget.id) }
                 junkTarget = nil
             }
             Button("Cancel", role: .cancel) { junkTarget = nil }
@@ -160,13 +205,13 @@ private struct PeopleView: View {
     /// The list's one-line explanation, or the setup command when the face
     /// engine is missing. Inside a person's grid the grid says what it shows.
     private var windowSubtitle: String {
-        guard workspace.faceEngineInstalled else {
-            return "Face engine not installed"
+        guard gallery.faceEngineInstalled else {
+            return "\(subject.engineName) not installed"
         }
         if detail != nil {
             return "Double-click opens the photo · right-click for actions"
         }
-        return "A scan never adds faces to Approved — its clusters and lookalikes wait in the Inbox."
+        return "A scan never adds \(subject.detectionNoun)s to Approved — its groups and lookalikes wait in the Inbox."
     }
 
     @ToolbarContentBuilder
@@ -177,27 +222,27 @@ private struct PeopleView: View {
                     detail = nil
                 }
                 .keyboardShortcut("[", modifiers: .command)
-                .help("Back to People (⌘[)")
+                .help("Back to \(subject.title) (⌘[)")
             }
         }
         ToolbarItem {
             Button {
-                workspace.rematchFaces()
+                gallery.rematchFaces()
             } label: {
                 Label("Re-match", systemImage: "arrow.trianglehead.2.clockwise.rotate.90")
             }
             .disabled(model.isBusy || (approved.isEmpty && inbox.isEmpty))
-            .help("Re-file stored faces into the Inbox — lookalikes beside the approved people they resemble, strangers into fresh clusters. Reads the catalog's stored vectors only: no rescan, and no files or events move.")
+            .help("Re-file stored \(subject.detectionNoun)s into the Inbox — lookalikes beside the approved \(subject.nounPlural) they resemble, strangers into fresh groups. Reads stored vectors only: no rescan, and no files or events move.")
         }
         ToolbarItem {
             // The catalog wipe sits one menu deeper than Re-match, so it is
             // never a single stray click away.
             Menu {
-                Button("Clear Face Scan…", systemImage: "trash", role: .destructive) {
+                Button("\(subject.clearTitle)…", systemImage: "trash", role: .destructive) {
                     clearingFaceIndex = true
                 }
                 .disabled(model.isBusy)
-                .help("Throw away the face index so a scan can start over. Catalog rows only — no file is touched.")
+                .help("Throw away the \(subject == .pets ? "pet" : "face") index so a scan can start over. Index rows only — no file is touched.")
             } label: {
                 Label("More", systemImage: "ellipsis")
             }
@@ -236,7 +281,7 @@ private struct PeopleView: View {
     private func personMatches(_ person: FacePerson) -> Bool {
         OrganizeSearch.matches(person.name, needle: needle)
             || OrganizeSearch.matches(person.suggestedPersonName ?? "", needle: needle)
-            || workspace.faces(for: person.id).contains {
+            || gallery.faces(for: person.id).contains {
                 OrganizeSearch.matches(facePhotoName($0), needle: needle)
             }
     }
@@ -257,16 +302,16 @@ private struct PeopleView: View {
     private var reviewList: some View {
         if approved.isEmpty && inbox.isEmpty {
             ContentUnavailableView(
-                "No People Yet",
-                systemImage: "person.crop.rectangle.stack",
-                description: Text("Run a face scan on an Unsorted folder — the clusters and lookalikes it finds land in the Inbox.")
+                subject.emptyTitle,
+                systemImage: subject.emptySymbol,
+                description: Text(subject.emptyDescription)
             )
             .frame(maxHeight: .infinity)
         } else if filteredApproved.isEmpty && filteredInbox.isEmpty {
             ContentUnavailableView(
                 "No Matches",
                 systemImage: "magnifyingglass",
-                description: Text("No people or photo names match “\(searchText)”.")
+                description: Text("No \(subject.nounPlural) or photo names match “\(searchText)”.")
             )
             .frame(maxHeight: .infinity)
         } else {
@@ -322,7 +367,7 @@ private struct PeopleView: View {
             memberStrip(person)
         } label: {
             HStack(spacing: 10) {
-                PersonCover(workspace: workspace, personID: person.id)
+                PersonCover(gallery: gallery, personID: person.id)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(displayName(person))
                         .font(.headline)
@@ -359,7 +404,7 @@ private struct PeopleView: View {
     private func inboxPrimaryAction(_ person: FacePerson) -> some View {
         if let targetID = person.suggestedPersonID, let target = person.suggestedPersonName {
             Button("Merge into \(target)") {
-                workspace.mergePerson(person.id, into: targetID)
+                gallery.mergePerson(person.id, into: targetID)
             }
             .buttonStyle(.bordered)
             .help("Confirms every face here onto \(target) — the faces move because you said so")
@@ -380,7 +425,7 @@ private struct PeopleView: View {
             onShowGrid: { detail = person },
             onToggleMembers: { toggleExpanded(person.id) },
             membersShown: expanded.contains(person.id),
-            onMerge: { target in workspace.mergePerson(person.id, into: target) },
+            onMerge: { target in gallery.mergePerson(person.id, into: target) },
             onRename: {
                 naming = NamingRequest(
                     person: person,
@@ -389,7 +434,7 @@ private struct PeopleView: View {
                     isApproval: false
                 )
             },
-            onMoveToInbox: { workspace.demotePerson(person.id) },
+            onMoveToInbox: { gallery.demotePerson(person.id) },
             onApprove: { approve(person) },
             onJunk: { junkTarget = person }
         )
@@ -435,7 +480,7 @@ private struct PeopleView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
             Spacer()
-            Text("\(FaceScanSummaryText.quality(scanGrades)) · faces only read photos; nothing is written to media")
+            Text("\(FaceScanSummaryText.quality(scanGrades, subject: subject)) · \(subject.readOnlyNote)")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -448,7 +493,7 @@ private struct PeopleView: View {
     /// stored match score, strongest first, weak ones last — because the
     /// user opened the row specifically to see the doubtful faces.
     private func memberStrip(_ person: FacePerson) -> some View {
-        let all = person.isRoster ? workspace.faces(for: person.id) : workspace.inboxFaces(for: person.id)
+        let all = person.isRoster ? gallery.faces(for: person.id) : gallery.inboxFaces(for: person.id)
         let members = person.isRoster ? Array(all.prefix(12)) : all
         return ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 6) {
@@ -478,7 +523,7 @@ private struct PeopleView: View {
                         .accessibilityAddTraits(.isButton)
                         .accessibilityAction(named: "Open Photo") { previewFace = face }
                         .contextMenu {
-                            FaceContextMenu(workspace: workspace, face: face, person: person, onOpenPhoto: { previewFace = $0 })
+                            FaceContextMenu(gallery: gallery, face: face, person: person, onOpenPhoto: { previewFace = $0 })
                         }
                         .help("\(facePhotoName(face))\(face.matchScore.map { " · match \(Int($0 * 100))%" } ?? "") · double-click opens the photo")
                 }
@@ -524,10 +569,10 @@ private struct PeopleView: View {
     }
 
     private func reload() {
-        let snapshot = workspace.faceSnapshot()
+        let snapshot = gallery.faceSnapshot()
         approved = snapshot.approved
         inbox = snapshot.inbox
-        scanGrades = workspace.storedFaceScanGrades()
+        scanGrades = gallery.storedFaceScanGrades()
     }
 }
 
@@ -538,9 +583,9 @@ private struct PeopleView: View {
 enum FaceScanSummaryText {
     /// "Medium quality" for one grade, "Low, Medium quality" when the
     /// index mixes passes, "No face scan stored" when it holds nothing.
-    static func quality(_ grades: [FaceScanGrade]) -> String {
+    static func quality(_ grades: [FaceScanGrade], subject: FaceGallerySubject = .people) -> String {
         let names = grades.compactMap(\.displayName)
-        guard !names.isEmpty else { return "No face scan stored" }
+        guard !names.isEmpty else { return subject == .pets ? "No pet scan stored" : "No face scan stored" }
         return "\(names.joined(separator: ", ")) quality"
     }
 }
@@ -603,30 +648,33 @@ private struct PersonActionsMenu: View {
 /// face tables' catalog rows go — nothing on disk is touched. A sheet,
 /// not a typed-token gate: this is not media trash.
 private struct ClearFaceScanSheet: View {
+    let subject: FaceGallerySubject
     let counts: FaceIndexCounts
     let onCancel: () -> Void
     let onClear: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text("Clear Face Scan")
+            Text(subject.clearTitle)
                 .font(.title3.bold())
             VStack(alignment: .leading, spacing: 5) {
-                Text("This removes the face index stored in the local catalog:")
+                Text("This removes the \(subject == .pets ? "pet" : "face") index stored in \(subject.indexLocation):")
                 VStack(alignment: .leading, spacing: 2) {
                     Text("· \(counts.scannedPhotos) scanned photo\(counts.scannedPhotos == 1 ? "" : "s")")
-                    Text("· \(counts.faces) detected face\(counts.faces == 1 ? "" : "s")")
-                    Text("· \(counts.namedPeople) named \(counts.namedPeople == 1 ? "person" : "people")")
+                    Text("· \(counts.faces) detected \(subject.detectionNoun)\(counts.faces == 1 ? "" : "s")")
+                    Text("· \(counts.namedPeople) named \(counts.namedPeople == 1 ? subject.nounSingular : subject.nounPlural)")
                     Text("· \(counts.unnamedGroups) unnamed group\(counts.unnamedGroups == 1 ? "" : "s")")
                 }
                 .font(.callout.weight(.semibold))
                 .padding(.leading, 8)
             }
-            Text("Only catalog rows are deleted — face_photos, faces, people, face_templates, and face_rejections. Photos, RAW, video, XMP sidecars, event assignments, events, and .Camera Toolkit/_Trash are not touched. Nothing is moved or deleted on disk.")
+            Text(subject == .pets
+                ? "Only pet index rows are deleted. The catalog — people, faces, events, assignments — and every photo, RAW, video, XMP sidecar, and .Camera Toolkit/_Trash are not touched. Nothing is moved or deleted on disk."
+                : "Only catalog rows are deleted — face_photos, faces, people, face_templates, and face_rejections. Photos, RAW, video, XMP sidecars, event assignments, events, and .Camera Toolkit/_Trash are not touched. Nothing is moved or deleted on disk.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-            Text("Afterward the next face scan will not skip those files.")
+            Text("Afterward the next \(subject == .pets ? "pet" : "face") scan will not skip those files.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -635,7 +683,7 @@ private struct ClearFaceScanSheet: View {
                 Button("Cancel", action: onCancel)
                     .keyboardShortcut(.cancelAction)
                 // A catalog wipe is never the Return key's default.
-                Button("Clear Face Scan", role: .destructive, action: onClear)
+                Button(subject.clearTitle, role: .destructive, action: onClear)
             }
         }
         .padding(20)
@@ -646,14 +694,22 @@ private struct ClearFaceScanSheet: View {
 /// Small name prompt shared by Rename and Name-group.
 private struct NamePersonSheet: View {
     let title: String
+    let prompt: String
     let onCancel: () -> Void
     let onSave: (String) -> Void
 
     @State private var name: String
     @FocusState private var focused: Bool
 
-    init(title: String, initialName: String, onCancel: @escaping () -> Void, onSave: @escaping (String) -> Void) {
+    init(
+        title: String,
+        initialName: String,
+        prompt: String = "Who is this?",
+        onCancel: @escaping () -> Void,
+        onSave: @escaping (String) -> Void
+    ) {
         self.title = title
+        self.prompt = prompt
         self.onCancel = onCancel
         self.onSave = onSave
         _name = State(initialValue: initialName)
@@ -663,7 +719,7 @@ private struct NamePersonSheet: View {
         VStack(alignment: .leading, spacing: 14) {
             Text(title)
                 .font(.title3.bold())
-            TextField("Name", text: $name, prompt: Text("Who is this?"))
+            TextField("Name", text: $name, prompt: Text(prompt))
                 .textFieldStyle(.roundedBorder)
                 .focused($focused)
             HStack {
@@ -692,7 +748,7 @@ private struct NamePersonSheet: View {
 /// A person's cover crop, loaded lazily so the list does not deserialize
 /// every member embedding up front.
 private struct PersonCover: View {
-    let workspace: EventsWorkspace
+    let gallery: any FaceReviewGallery
     let personID: UUID
     @State private var face: FaceRecord?
 
@@ -701,7 +757,7 @@ private struct PersonCover: View {
             if let face {
                 FaceCropView(face: face)
             } else {
-                Image(systemName: "person.crop.square")
+                Image(systemName: gallery.gallerySubject.placeholderSymbol)
                     .resizable()
                     .scaledToFit()
                     .padding(8)
@@ -712,11 +768,11 @@ private struct PersonCover: View {
         .background(Color(nsColor: .controlColor), in: RoundedRectangle(cornerRadius: 6))
         .clipShape(RoundedRectangle(cornerRadius: 6))
         .onAppear(perform: load)
-        .onChange(of: workspace.facesRevision) { load() }
+        .onChange(of: gallery.facesRevision) { load() }
     }
 
     private func load() {
-        face = (try? workspace.faceStore.coverFace(personID: personID)) ?? nil
+        face = gallery.coverFace(personID: personID)
     }
 }
 
@@ -742,7 +798,7 @@ private struct FaceCropView: View {
 /// The face context menu shared by the member strip and the detail grid —
 /// photo navigation plus review actions. All writes hit the catalog only.
 private struct FaceContextMenu: View {
-    let workspace: EventsWorkspace
+    let gallery: any FaceReviewGallery
     let face: FaceRecord
     let person: FacePerson
     let onOpenPhoto: (FaceRecord) -> Void
@@ -758,31 +814,31 @@ private struct FaceContextMenu: View {
         if face.id == person.coverFaceID {
             Text("Cover Photo")
         } else {
-            Button("Set as Cover") { workspace.setCoverFace(face.id, for: person.id) }
+            Button("Set as Cover") { gallery.setCoverFace(face.id, for: person.id) }
         }
         if person.isRoster {
             Button("Pin as Match Reference") {
-                workspace.pinTemplate(face.id, for: person.id)
+                gallery.pinTemplate(face.id, for: person.id)
             }
             Button("Not \(person.name)") {
-                workspace.rejectFace(face.id)
+                gallery.rejectFace(face.id)
             }
         } else {
             if let target = person.suggestedPersonName {
                 Button("Confirm \(target)") {
-                    workspace.confirmFace(face.id)
+                    gallery.confirmFace(face.id)
                 }
                 Button("Not \(target)") {
-                    workspace.rejectFace(face.id)
+                    gallery.rejectFace(face.id)
                 }
             } else {
                 Button("Not This Group") {
-                    workspace.rejectFace(face.id)
+                    gallery.rejectFace(face.id)
                 }
             }
             if face.state != .confirmed {
                 Button("Junk Face", role: .destructive) {
-                    workspace.junkFace(face.id)
+                    gallery.junkFace(face.id)
                 }
             }
         }
@@ -795,7 +851,7 @@ private struct FaceContextMenu: View {
 /// weak matches at the bottom. Single-click selects, double-click opens
 /// the source photo, right-click offers cover and review actions.
 private struct PersonFacesGrid: View {
-    let workspace: EventsWorkspace
+    let gallery: any FaceReviewGallery
     /// Normalized query narrowing the grid by photo file name; empty shows
     /// every detection.
     let needle: String
@@ -807,13 +863,13 @@ private struct PersonFacesGrid: View {
     @State private var selectedID: UUID?
 
     init(
-        workspace: EventsWorkspace,
+        gallery: any FaceReviewGallery,
         person: FacePerson,
         needle: String,
         onBack: @escaping () -> Void,
         onOpenPhoto: @escaping (FaceRecord) -> Void
     ) {
-        self.workspace = workspace
+        self.gallery = gallery
         self.needle = needle
         self.onBack = onBack
         self.onOpenPhoto = onOpenPhoto
@@ -866,14 +922,14 @@ private struct PersonFacesGrid: View {
             }
         }
         .onAppear(perform: reload)
-        .onChange(of: workspace.facesRevision) { reload() }
+        .onChange(of: gallery.facesRevision) { reload() }
     }
 
     private var gridHeader: some View {
         // The person's name is the window title and Back lives in the
         // toolbar; this strip only says what the grid holds.
         HStack(spacing: 10) {
-            PersonCover(workspace: workspace, personID: person.id)
+            PersonCover(gallery: gallery, personID: person.id)
             Text(needle.isEmpty
                 ? "\(faces.count) detection\(faces.count == 1 ? "" : "s") in \(photoCount) photo\(photoCount == 1 ? "" : "s")\(person.isRoster ? "" : " · weakest matches last")"
                 : "\(visibleFaces.count) of \(faces.count) detections")
@@ -926,7 +982,7 @@ private struct PersonFacesGrid: View {
             .accessibilityAction { selectedID = face.id }
             .accessibilityAction(named: "Open Photo") { onOpenPhoto(face) }
             .contextMenu {
-                FaceContextMenu(workspace: workspace, face: face, person: person, onOpenPhoto: onOpenPhoto)
+                FaceContextMenu(gallery: gallery, face: face, person: person, onOpenPhoto: onOpenPhoto)
             }
             .help("\(photoName(face))\(face.matchScore.map { " · match \(Int($0 * 100))%" } ?? "")")
     }
@@ -936,7 +992,7 @@ private struct PersonFacesGrid: View {
     }
 
     private func reload() {
-        guard let fresh = workspace.person(person.id) else {
+        guard let fresh = gallery.person(person.id) else {
             // The person was merged or junked while open — return to the list.
             onBack()
             return
@@ -945,8 +1001,8 @@ private struct PersonFacesGrid: View {
         // Approved people keep their portrait order; an Inbox row reviews
         // weakest-last by stored match score — the strip's order exactly.
         faces = person.isRoster
-            ? workspace.faces(for: person.id)
-            : workspace.inboxFaces(for: person.id)
+            ? gallery.faces(for: person.id)
+            : gallery.inboxFaces(for: person.id)
         if let selectedID, !faces.contains(where: { $0.id == selectedID }) {
             self.selectedID = nil
         }

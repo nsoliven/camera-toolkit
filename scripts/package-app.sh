@@ -32,10 +32,12 @@ done
 # Newer SwiftPM toolchains emit the bundle in macOS layout (Contents/Resources);
 # older ones keep it flat. --print-resource-paths below proves which one the app resolves.
 core_bundle="$resources/CameraToolkit_CameraToolkitCore.bundle"
-if [[ ! -f "$core_bundle/face_sidecar.py" && ! -f "$core_bundle/Contents/Resources/face_sidecar.py" ]]; then
-  echo "error: face_sidecar.py is missing from $core_bundle; the face engine would not work" >&2
-  exit 1
-fi
+for script in face_sidecar.py pet_sidecar.py; do
+  if [[ ! -f "$core_bundle/$script" && ! -f "$core_bundle/Contents/Resources/$script" ]]; then
+    echo "error: $script is missing from $core_bundle; its engine would not work" >&2
+    exit 1
+  fi
+done
 "$repo_root/scripts/make-app-icon.swift" "$repo_root/Assets/AppIcon.png" "$resources/AppIcon.icns"
 
 cat > "$contents/Info.plist" <<'PLIST'
@@ -85,11 +87,13 @@ if ! resource_paths="$("$macos/CameraToolkit" --print-resource-paths)"; then
   echo "$resource_paths" >&2
   exit 1
 fi
-if ! grep -q '^face_sidecar.py packaged ' <<< "$resource_paths"; then
-  echo "error: face_sidecar.py does not resolve from Contents/Resources:" >&2
-  echo "$resource_paths" >&2
-  exit 1
-fi
+for script in face_sidecar.py pet_sidecar.py; do
+  if ! grep -q "^$script packaged " <<< "$resource_paths"; then
+    echo "error: $script does not resolve from Contents/Resources:" >&2
+    echo "$resource_paths" >&2
+    exit 1
+  fi
+done
 echo "Built $app"
 
 if $install; then

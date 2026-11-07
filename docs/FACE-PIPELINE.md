@@ -85,3 +85,4 @@ A confirmed label is trusted; its measurement is not. When a re-scan produces a 
 - Do not touch pixels between decode and the sidecar besides bounding the size and applying orientation.
 - Do not copy formulas out of `insightface` into Swift "for speed". If something must move, move it into the sidecar and keep calling the library.
 - Do not change a threshold, the pack, or the pins without recording the measurement here.
+- Do not put pets into the catalog's face tables or this engine's space. Dogs are a separate engine with their own index file — see `docs/PET-PIPELINE.md`.

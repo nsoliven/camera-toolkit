@@ -22,7 +22,8 @@ let package = Package(
                 .product(name: "GRDB", package: "GRDB.swift")
             ],
             resources: [
-                .copy("Resources/face_sidecar.py")
+                .copy("Resources/face_sidecar.py"),
+                .copy("Resources/pet_sidecar.py")
             ],
             linkerSettings: [
                 .linkedLibrary("sqlite3")
