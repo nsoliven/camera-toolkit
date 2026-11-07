@@ -8,8 +8,8 @@ authors' own image processors; this file only moves bytes in and out and
 cuts the crop each embedding is computed from.
 
   detector  RT-DETRv2 R50 (`PekingU/rtdetr_v2_r50vd`, COCO, Apache-2.0)
-  identity  DINOv2 base (`facebook/dinov2-base`, Apache-2.0), CLS token,
-            L2-normalized, 768-d
+  identity  DINOv2 large (`facebook/dinov2-large`, Apache-2.0), CLS token
+            of the detector's box padded to a square, L2-normalized, 1024-d
 
 Protocol — the face sidecar's: one JSON object per line on stdin, one per
 line on stdout; stderr is free-form logging.
@@ -21,10 +21,10 @@ line on stdout; stderr is free-form logging.
                  {"box": [x1, y1, x2, y2],          # image pixels, top-left origin
                   "det_score": 0.93,
                   "species": "dog",
-                  "embedding": [768 floats],        # L2-normalized
+                  "embedding": [1024 floats],       # L2-normalized
                   "norm": 41.2,                     # pre-normalization norm
                   "crop_b64": "<jpeg of the square crop>"}]}
-  request   ← {"id": …, "op": "embed_crop", "image_b64": "<png>"}
+  request   ← {"id": …, "op": "embed_crop", "image_b64": "<png of one dog's box>"}
   response  → {"id": …, "embedding": [...], "norm": ...}
   request   ← {"id": …, "op": "ping"}      → {"id": …, "ok": true}
   failure   → {"id": …, "error": "message"}
@@ -44,16 +44,21 @@ import traceback
 
 DETECTOR = "PekingU/rtdetr_v2_r50vd"
 DETECTOR_REVISION = "282494075698cab9faa1096ae26856890030c817"
-EMBEDDER = "facebook/dinov2-base"
-EMBEDDER_REVISION = "f9e44c814b77203eaa57a6bdbbd535f21ede1415"
+EMBEDDER = "facebook/dinov2-large"
+EMBEDDER_REVISION = "47b73eefe95e8d44ec3623f8890bd894b6ea2d6c"
 # Matches `PetFaceEngine.identifier` in Swift. Any change to a model, a
 # revision, the crop rule, or the vector means a new identifier.
-ENGINE = "pets/rtdetr_v2_r50vd+dinov2-base"
+ENGINE = "pets/rtdetr_v2_r50vd+dinov2-large-boxpad"
 SPECIES = ("dog",)
-# The crop grows the detector's box by this fraction on every side, then
-# squares it, so ears and tail stay in and the processor's center crop
-# never cuts the dog.
+# The crop shown in the app grows the detector's box by this fraction on
+# every side, then squares it, so ears and tail stay in.
 CROP_MARGIN = 0.10
+# The identity vector is computed from the detector's box alone, padded
+# to a square with the embedder's mean color (it normalizes to zero).
+# Measured on a hand-labelled library: the margin crop let the background
+# and a second dog in the frame dominate the vector (pairwise same-vs-
+# different separation 0.87); the padded box lifted it to 0.95.
+PAD_COLOR = (124, 116, 104)
 CROP_JPEG_EDGE = 224
 
 
@@ -82,6 +87,28 @@ def square_crop_box(box, width, height, margin=CROP_MARGIN):
     left = min(max(left, 0.0), max(width - side, 0.0)) if side <= width else (width - side) / 2
     top = min(max(top, 0.0), max(height - side, 0.0)) if side <= height else (height - side) / 2
     return (left, top, left + side, top + side)
+
+
+def padded_box(image, box):
+    """The detector's box, cut out and centered on a square of PAD_COLOR.
+
+    Nothing outside the box enters the identity vector, and the dog keeps
+    its aspect ratio instead of being stretched by the processor.
+    """
+    left, top, right, bottom = (round(v) for v in box)
+    left, top = max(left, 0), max(top, 0)
+    right, bottom = min(right, image.width), min(bottom, image.height)
+    cut = image.crop((left, top, max(right, left + 1), max(bottom, top + 1)))
+    return pad_to_square(cut)
+
+
+def pad_to_square(cut):
+    from PIL import Image
+
+    side = max(cut.width, cut.height)
+    canvas = Image.new("RGB", (side, side), PAD_COLOR)
+    canvas.paste(cut, ((side - cut.width) // 2, (side - cut.height) // 2))
+    return canvas
 
 
 def main():
@@ -181,7 +208,8 @@ def main():
             # PIL pads outside the image with black, which only happens
             # when the square is larger than the photo's short side.
             crops.append(image.crop((round(left), round(top), round(right), round(bottom))))
-        vectors, norms = embed(crops, bool(request.get("flip_tta", False)))
+        boxes = [padded_box(image, box) for _, _, box in found]
+        vectors, norms = embed(boxes, bool(request.get("flip_tta", False)))
         faces = []
         for (score, species, box), crop, vector, norm in zip(found, crops, vectors, norms):
             faces.append({
@@ -195,7 +223,7 @@ def main():
         return {"width": width, "height": height, "faces": faces}
 
     def embed_crop(request):
-        crop = decode_image(request["image_b64"])
+        crop = pad_to_square(decode_image(request["image_b64"]))
         vectors, norms = embed([crop], bool(request.get("flip_tta", False)))
         return {"embedding": [round(float(v), 7) for v in vectors[0]], "norm": float(norms[0])}
 

@@ -19,8 +19,10 @@ Camera Toolkit groups a person's photos with the face pipeline (`docs/FACE-PIPEL
 | | YOLOX ONNX | Apache-2.0 | Release assets are stale and need hand-written pre/post-processing. Not used. |
 | | Ultralytics YOLO | AGPL-3.0 | Not used: incompatible with an MIT repo |
 | | dlib dog-face detector | CC0 | 2016 model, C++ example only, would need hand-written alignment. Not used. |
-| Tell dogs apart | **DINOv2 base (`facebook/dinov2-base`)** | **Apache-2.0** | **Chosen.** General-purpose features that work zero-shot for retrieving individual animals; 768-d CLS token |
-| | MegaDescriptor (BVRA) | CC-BY-NC-4.0 | Built for wildlife re-ID, but non-commercial, and the original training set probably had no dogs. A possible opt-in upgrade. |
+| Tell dogs apart | **DINOv2 large (`facebook/dinov2-large`)** | **Apache-2.0** | **Chosen.** General-purpose features that work zero-shot for retrieving individual animals; 1024-d CLS token. Measured best of everything below (see "Quality evaluation") |
+| | DINOv2 base / small / with registers (large) | Apache-2.0 | Measured: base is close behind large, small and the registers variant are clearly worse |
+| | SigLIP 2 so400m, CLIP ViT-L/14 | Apache-2.0 / MIT | Measured: they describe "a small white dog", not which one — far worse at telling individuals apart |
+| | MegaDescriptor-L-384 (BVRA) | CC-BY-NC-4.0 | Built for wildlife re-ID, but non-commercial. Measured as a reference only: worse than DINOv2 large on real household dogs, so it is not an upgrade |
 | | MiewID (msv2/msv3) | No license published | Includes dogs, but with no license it counts as all rights reserved. Not used. |
 | | AvitoTech SigLIP/CLIP animal-ID | Card says Apache-2.0, but trained on PetFace (non-commercial) | Best dog numbers published, but the provenance is unclear. Not used. |
 | | DogFaceNet, PetFace | MIT code, but no maintained weights / non-commercial | Need aligned dog faces and landmarks. Not used. |
@@ -35,13 +37,14 @@ The rule from FACE-PIPELINE.md stands: **the reference implementation runs in a 
 | Role | Implementation |
 |---|---|
 | Detector | RT-DETRv2 R50, COCO, label `dog`, revision pinned in `pet_sidecar.py` |
-| Crop | detector box + 10% margin per side, squared on the longer side, kept inside the photo (`square_crop_box`) |
-| Identity | DINOv2 base `pooler_output` (layer-normed CLS), L2-normalized, 768-d. XHIGH averages it with the mirrored crop (`flip_tta`) |
+| Crop shown in the app | detector box + 10% margin per side, squared on the longer side, kept inside the photo (`square_crop_box`) |
+| Crop the vector is computed from | the detector box alone, centered on a square of the embedder's mean color (`padded_box`), so neither background nor a second dog in the frame enters the vector |
+| Identity | DINOv2 large `pooler_output` (layer-normed CLS) of the padded box, L2-normalized, 1024-d. No mirror averaging on any grade (it measured no better) |
 | Runtime | PyTorch on the Metal (MPS) device with CPU fallback; one process (`PetSidecarPool`) |
 | Protocol | the face sidecar's JSON-lines protocol (`analyze`, `embed_crop`, `ping`), so `FaceSidecarProcess` launches both and `FaceSidecarPool.faces(from:)` does the one box conversion for both |
-| Identifier | `pets/rtdetr_v2_r50vd+dinov2-base` (`PetFaceEngine.identifier`), stamped on every pet row. The sidecar refuses to start if its `ENGINE` differs |
+| Identifier | `pets/rtdetr_v2_r50vd+dinov2-large-boxpad` (`PetFaceEngine.identifier`), stamped on every pet row. The sidecar refuses to start if its `ENGINE` differs |
 
-Install once per Mac with `scripts/setup-pet-sidecar.sh`. It needs `uv`, takes about 1.2 GB under `~/Library/Application Support/CameraToolkit/pet-sidecar`, pins torch 2.15.0 and transformers 5.22.2, and pins the model revisions. Models download once (`--prefetch`). Serving runs with `HF_HUB_OFFLINE=1`, so a scan never touches the network. `ready.json` is written last, so a half-finished install never looks installed. `--check` reports status. The face sidecar is separate and unchanged.
+Install once per Mac with `scripts/setup-pet-sidecar.sh`. It needs `uv`, takes about 2.3 GB under `~/Library/Application Support/CameraToolkit/pet-sidecar`, pins torch 2.15.0 and transformers 5.22.2, and pins the model revisions. Models download once (`--prefetch`). Serving runs with `HF_HUB_OFFLINE=1`, so a scan never touches the network. `ready.json` is written last, so a half-finished install never looks installed. `--check` reports status. The face sidecar is separate and unchanged.
 
 ## Where pet data lives
 
@@ -58,34 +61,85 @@ The two code changes the face pipeline needed are both no-ops for people. `FaceI
 
 | Setting | Pet default | Face default | Source |
 |---|---|---|---|
-| `detScoreThreshold` | 0.5 | 0.6 | RT-DETR scores; 0.5 kept every real dog in the sample below |
+| `detScoreThreshold` | 0.5 | 0.6 | detector sweep below: 0.45–0.5 is the knee; 0.6 loses real dogs, 0.4 adds false dogs and duplicate boxes |
 | `groupingMinDetScore` | 0.7 | 0.7 | same gate as faces |
 | `groupingMinFacePixels` | 96 px | 48 px | dogs are larger than faces; tiny dogs are background |
 | `minimumFacePixels` | 128 / 96 / 64 px by grade | 64 / 40 / 30 | product decision |
-| `clusterThreshold` | **0.60** | 0.40 | measured, see below |
-| `matchThreshold` | **0.68** | 0.45 | above the largest different-dog cosine seen at p90 (0.60); suggestions only |
+| `clusterThreshold` | **0.50** | 0.40 | measured: fewest splits of one dog with no look-alike joining her groups |
+| `matchThreshold` | **0.60** | 0.45 | measured: the closest of 322 look-alike dogs reached 0.56 against the household dog; suggestions only |
+| `flipTTA` | off on every grade | XHIGH | measured no better for dogs |
 | `minimumGroupFaces` | 3 | 3 | same |
-| `videoDuplicateCosine` | 0.95 | 0.92 | DINOv2 vectors of consecutive frames sit closer |
+| `videoDuplicateCosine` | 0.95 | 0.92 | not re-measured for the large model |
 
-**Measurement (2026-11-07):** 50 public-domain photos from Wikimedia Commons of two dogs of the same breed and the same black coat. This is the hard case: no breed or colour cue.
+Change a default only with a new measurement, as FACE-PIPELINE.md says for faces.
 
-- The sidecar processed a 1280-px photo in a median 0.07 s on an Apple Silicon GPU.
-- 40 photos had one dog. The 9 with none were a costumed person, a sculpture, and dogs too small to matter; all correct rejections.
-- Pairwise cosine: same dog median 0.53, p90 0.69. Different dog median 0.52, p90 0.60, max 0.76. Single pairs overlap, so pairwise thresholds alone are not enough.
-- Average-linkage grouping (the `assignToGroups` rule):
-  - At 0.55–0.62, every group of 3+ held one dog. One dog was split into 2–3 groups, which the user merges.
-  - At 0.65, one wrong dog joined a group.
-  - At 0.70, under half the photos were grouped.
-  - 0.60 is the default.
-- Through the Swift path (`PetSidecarTests.testScanningASampleFolderFindsAndGroupsDogs`), the same folder gave 35 dogs and 3 groups with no failures.
+## Quality evaluation
 
-These numbers come from two dogs. Change a default only with a measurement on the owner's confirmed pets, as FACE-PIPELINE.md says for faces.
+**Set (2026-11-07).** Everything ran read-only on small JPEG renders in a scratch folder; no original, catalog or app state was touched.
+
+- **A real library:** 1,550 photos.
+  - 150 from events built around the household's dogs.
+  - 1,400 sampled across a year of other events: people, travel, landscapes, indoor parties, graduation plush toys, zoo and farm animals.
+- **Ground truth, labelled by hand:** 173 findable dogs.
+  - The main dog is a small white long-haired breed, in 116 detections (108 clean enough to group).
+  - A second household dog is a tan terrier, in 48.
+  - A few strangers' dogs.
+  - Hard cases are included: back of the head, side profile, low light, motion blur, a dog held against a person, two dogs overlapping, and dogs partly out of frame. So are things that must not count: plush toys, a framed dog photo, a dog figurine, monkeys and goats.
+- **Look-alikes:** 322 public photos of other dogs.
+  - Small white or fluffy breeds: Bichon Frisé, West Highland White Terrier, Havanese, Pomeranian, Japanese Chin, Samoyed, Great Pyrenees and wheaten terrier, from Wikimedia Commons and the Oxford-IIIT Pet set.
+  - Yorkshire terriers.
+  - Each is a different dog, so none may ever be grouped with or suggested as a household dog.
+- **Simulation:** grouping replays `FaceIndexService.assignToGroups` (average linkage, detection-confidence order, 3-dog minimum). "After approval" approves the largest group of the main dog, keeps 8 farthest-first templates like `rebuildRosterTemplates`, and matches every other dog against them.
+
+**Detector (unchanged RT-DETRv2), on the real library at score 0.5:**
+
+| Measure | Result |
+|---|---|
+| Dogs found (recall) | 165 of 173 (95%) |
+| Detections that were really dogs (precision) | 97% |
+| Look-alike photos with their dog found | 322 of 322 |
+| Plush toys called "dog" | 0 of 40+ photos with plush toys (the detector calls them "teddy bear") |
+
+What it missed:
+- 3 shots where it called the white dog a teddy bear;
+- 1 dim indoor shot;
+- 1 frame where two dogs touching came out as one box;
+- 2 dogs mostly hidden behind a person.
+
+False dogs: 3 boxes on monkeys (COCO has no monkey class), 1 goat, and 2 dog figurines.
+
+**Telling dogs apart, before → after:**
+
+| Measure | Before (DINOv2 base, margin crop, 0.60 / 0.68) | After (DINOv2 large, padded box, 0.50 / 0.60) |
+|---|---|---|
+| Separation of the main dog from every other dog (pairwise ROC AUC) | 0.946 | **0.982** |
+| Groups the main dog is split into | 6 | **4** |
+| Main dog in her largest group | 46 of 108 | **70 of 108** |
+| Main dog filed in another dog's group | 7 | **1** |
+| Other dogs in the main dog's groups | 0 | 1 (a box that also held the second dog) |
+| After approving her largest group: her other photos suggested as "Looks like" | 13 of 70 | **29 of 46** |
+| …so her photos named or suggested | 59 of 108 (55%) | **99 of 108 (92%)** |
+| Wrong dogs suggested as her (look-alikes, second dog, false dogs) | 0 | **0** |
+| Closest look-alike to her (cosine) | 0.58 | 0.56 |
+| Second household dog | 1 group, 7 wrong dogs in it | 1 group (43 of 45), 1 wrong |
+
+**What each change bought** (pairwise AUC, main dog vs every other dog):
+- Padding the box instead of the margin crop was the big step: 0.946 → 0.967 on base.
+- Large instead of base on top of it: 0.982.
+- Mirror averaging, a 448-px input, mean-patch pooling and a second merge pass over whole groups all measured equal or worse, so none ships.
+
+**Still weak:**
+- **One dog still splits into a few groups.** Merging 3 small groups into the first one takes three clicks. The 9 photos neither grouped nor suggested are dim, blurred or back-of-head shots.
+- **Strangers of the same breed group together.** Of 338 look-alike detections, 292 landed in 26 "Dog N" groups that mix different dogs of one breed. They never touch a named pet: approve, ignore or junk them.
+- **The white fluffy breeds sometimes read as "teddy bear"** and are missed. Treating teddy-bear boxes as dogs would bring in every plush toy, so it is not done.
+- **Animals with no COCO class (monkeys) and figurines can come back as dogs.** They rarely resemble a named pet, so they land in "Dog N" groups or nowhere.
+- These numbers come from one library with two household dogs. A home with two near-identical dogs of the same breed will split and mix more.
 
 ## Verifying
 
 - `swift test --filter PetIndexTests` covers the schema matching the catalog, migrate and backup, the scan writing only the pet index, Clear, the engine stamps, "Dog N", options, and the install contract.
 - `swift test --filter PetGalleryTests` covers the Pets side of the window: browsing creates no file, and review actions write only the pet index.
-- `CT_PET_SIDECAR_ROOT=<install> swift test --filter PetSidecarTests` runs the real sidecar: protocol, a blank image with no dog, and a stable 768-d unit vector. Add `CT_PET_SAMPLE_DIR=<folder of dog JPEGs>` to scan that folder read-only into a throwaway index and print the groups. Without an install these tests skip.
+- `CT_PET_SIDECAR_ROOT=<install> swift test --filter PetSidecarTests` runs the real sidecar: protocol, a blank image with no dog, and a stable 1024-d unit vector. Add `CT_PET_SAMPLE_DIR=<folder of dog JPEGs>` to scan that folder read-only into a throwaway index and print the groups. Without an install these tests skip.
 
 ## Not done yet
 

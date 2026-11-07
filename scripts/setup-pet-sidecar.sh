@@ -10,7 +10,7 @@
 #
 # Requires `uv` (brew install uv). It fetches an isolated Python 3.12 if the
 # Mac has none, so the system or Homebrew Python is never touched. About
-# 1.5 GB on disk once the models are downloaded.
+# 2.3 GB on disk once the models are downloaded.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"

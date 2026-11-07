@@ -213,7 +213,10 @@ final class PetIndexTests: XCTestCase {
         XCTAssertEqual(pets.videoFrameStride, faces.videoFrameStride)
         XCTAssertEqual(pets.maximumVideoFrames, faces.maximumVideoFrames)
         XCTAssertEqual(pets.detectPixels, faces.detectPixels)
-        XCTAssertEqual(FaceScanOptions.pets(mode: .xhigh).flipTTA, true)
+        // Mirror averaging measured no better for dogs, so even XHIGH skips
+        // it; faces keep it.
+        XCTAssertFalse(FaceScanOptions.pets(mode: .xhigh).flipTTA)
+        XCTAssertTrue(FaceScanOptions(mode: .xhigh).flipTTA)
     }
 
     // MARK: - Install contract

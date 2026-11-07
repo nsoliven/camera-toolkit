@@ -44,7 +44,7 @@ final class PetSidecarTests: XCTestCase {
         })
         let first = try pool.embedCrop(pattern)
         let second = try pool.embedCrop(pattern)
-        XCTAssertEqual(first.embedding.count, 768)
+        XCTAssertEqual(first.embedding.count, 1024)
         XCTAssertEqual(Double(FaceEmbeddingMath.cosine(first.embedding, first.embedding)), 1, accuracy: 1e-3)
         XCTAssertGreaterThan(FaceEmbeddingMath.cosine(first.embedding, second.embedding), 0.999)
         XCTAssertGreaterThan(first.quality, 0)
@@ -84,7 +84,7 @@ final class PetSidecarTests: XCTestCase {
             let faces = try groups.flatMap { try store.faces(personID: $0.id) }
             for face in faces {
                 XCTAssertEqual(face.model, PetFaceEngine.identifier)
-                XCTAssertEqual(face.embedding?.count, 768)
+                XCTAssertEqual(face.embedding?.count, 1024)
                 XCTAssertNotNil(face.crop)
                 XCTAssertTrue((0...1).contains(face.box.x) && face.box.x + face.box.width <= 1.0001)
             }

@@ -11,8 +11,8 @@ public enum PetFaceEngine {
     /// `ENGINE` in `pet_sidecar.py`. Changing a model, a revision, or the
     /// crop rule means changing it, so old vectors are re-read rather than
     /// mixed with new ones.
-    public static let identifier = "pets/rtdetr_v2_r50vd+dinov2-base"
-    public static let displayName = "Pets: RT-DETRv2 R50 (dogs) + DINOv2 base"
+    public static let identifier = "pets/rtdetr_v2_r50vd+dinov2-large-boxpad"
+    public static let displayName = "Pets: RT-DETRv2 R50 (dogs) + DINOv2 large"
 }
 
 /// Where the pet sidecar lives on this Mac and whether it is ready.
@@ -143,10 +143,10 @@ public final class PetSidecarPool: FaceAnalyzing, @unchecked Sendable {
 extension FaceScanOptions {
     /// A pet pass at `mode`: the face pass's burst sampling, video
     /// sampling, and decode bound, with pet floors and thresholds. The
-    /// thresholds are for DINOv2-base cosine on whole-dog crops and are a
-    /// starting point measured on public same-breed photos — see
-    /// docs/PET-PIPELINE.md — to be re-measured on the owner's confirmed
-    /// pets before changing.
+    /// thresholds are for DINOv2-large cosine on the padded dog box and
+    /// were measured on a hand-labelled library plus public look-alike
+    /// breeds — see docs/PET-PIPELINE.md. Mirror averaging stays off on
+    /// every grade: it measured no better for dogs.
     public static func pets(mode: FaceScanGrade = .med, fast: Bool = true) -> FaceScanOptions {
         FaceScanOptions(
             mode: mode,
@@ -158,7 +158,8 @@ extension FaceScanOptions {
             groupingMinDetScore: PetScanDefaults.groupingMinDetScore,
             groupingMinFacePixels: PetScanDefaults.groupingMinDogPixels,
             minimumGroupFaces: 3,
-            videoDuplicateCosine: PetScanDefaults.videoDuplicateCosine
+            videoDuplicateCosine: PetScanDefaults.videoDuplicateCosine,
+            flipTTA: false
         )
     }
 }
@@ -170,9 +171,9 @@ public enum PetScanDefaults {
     /// Below this a dog is stored but never seeds or joins a group.
     public static let groupingMinDetScore: Float = 0.7
     /// Mean cosine to a group's members to join it (average linkage).
-    public static let clusterThreshold: Float = 0.60
+    public static let clusterThreshold: Float = 0.50
     /// Best template cosine to file a dog on a named pet's "looks like" row.
-    public static let matchThreshold: Float = 0.68
+    public static let matchThreshold: Float = 0.60
     /// Two video-frame detections this alike are one appearance.
     public static let videoDuplicateCosine: Float = 0.95
     /// Smallest dog (shorter box side, decoded pixels) that may be grouped.
