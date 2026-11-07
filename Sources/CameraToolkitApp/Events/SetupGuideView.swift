@@ -369,7 +369,7 @@ struct SetupGuidePanel: View {
             Text("After that, sorting is fast")
                 .font(.headline)
                 .padding(.top, 4)
-            GuideBullet(symbol: "number", text: "Press 1–3 to send the selected photos to the numbered event in the bar above the photos. Event… searches the rest.")
+            GuideBullet(symbol: "number", text: "Press 1–3 to send the selected photos to the numbered event in the bar above the photos. Press E, or click Event…, to search every event.")
             GuideBullet(symbol: "hand.draw", text: "Or drag tiles onto an event in the sidebar.")
             GuideBullet(symbol: "n.square", text: "Press N to make a new event from what’s selected.")
             GuideBullet(symbol: "arrow.uturn.left", text: "Command-Z takes back the newest action and Shift-Command-Z puts it back. Sorting never moves files by itself.")

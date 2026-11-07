@@ -39,6 +39,18 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate, NSMenuIte
             DebugLog.shared.flush()
             exit(status)
         }
+        // Found on the NAS → Add to Events from a script: catalog rows only,
+        // from a reviewed plan; same support folder and app-running rules.
+        if CommandLine.arguments.contains(NASAdoptCommand.flag) {
+            let status = NASAdoptCommand.run(
+                arguments: CommandLine.arguments,
+                defaultSupportFolder: DashboardModel.defaultApplicationSupportURL
+                    .appendingPathComponent("CameraToolkit", isDirectory: true),
+                isAppRunning: { anotherAppInstanceIsRunning() }
+            )
+            DebugLog.shared.flush()
+            exit(status)
+        }
         CrashReporting.start()
         UserDefaults.standard.set(false, forKey: "NSQuitAlwaysKeepsWindows")
         let application = NSApplication.shared
@@ -166,7 +178,7 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate, NSMenuIte
             menuItem.state = boardMode == .list ? .on : .off
             return true
         case #selector(toggleHideSorted(_:)):
-            menuItem.state = defaults.bool(forKey: MainMenu.DefaultsKey.hideSorted) ? .on : .off
+            menuItem.state = MainMenu.hidesApplied(defaults) ? .on : .off
             return true
         case #selector(zoomTilesIn(_:)), #selector(zoomTilesOut(_:)):
             return !typing && boardMode == .tiles
@@ -224,7 +236,7 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate, NSMenuIte
 
     @objc func toggleHideSorted(_ sender: Any?) {
         let defaults = UserDefaults.standard
-        defaults.set(!defaults.bool(forKey: MainMenu.DefaultsKey.hideSorted), forKey: MainMenu.DefaultsKey.hideSorted)
+        defaults.set(!MainMenu.hidesApplied(defaults), forKey: MainMenu.DefaultsKey.hideApplied)
     }
 
     @objc func zoomTilesIn(_ sender: Any?) {

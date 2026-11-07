@@ -63,6 +63,7 @@ enum CameraToolkitShortcutCatalog {
                 .init(action: "Select all", keys: "⌘A", detail: "Selects every stack on the current board."),
                 .init(action: "Search the board", keys: "⌘F", detail: "Focuses the board's search field; the popover filters by people, date, event, and media kind."),
                 .init(action: "Sort into a recent event", keys: "1  2  3", detail: "Assigns selected stacks to one of the three most recently used events."),
+                .init(action: "Sort into any event", keys: "E", detail: "Opens the event picker for the selected stacks on an unsorted board: type to search, ↑ ↓ to choose, Return to sort. Nothing moves until Apply."),
                 .init(action: "New event", keys: "N", detail: "Creates an event and assigns the selected stacks to it."),
                 .init(action: "Rotate selected frames", keys: "[  ]", detail: "Rotates the selection 90° left or right; R and ⇧R also work."),
                 .init(action: "Undo", keys: "⌘Z", detail: "Takes back the newest action — a sort, a move, an Apply, a Trash, a merge, an event rename, a face change. Edit ▸ Undo names it. Files that moved are renamed back and nothing is ever replaced."),

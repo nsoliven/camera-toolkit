@@ -47,6 +47,21 @@ final class ResourceBundleLocatorTests: XCTestCase {
         XCTAssertEqual(asked.value, 0, "Bundle.module must not be touched when the app has its own copy")
     }
 
+    /// Newer SwiftPM toolchains build the resource bundle in macOS layout,
+    /// with its files under `Contents/Resources`; a packaged app must still
+    /// find the script there instead of reporting it missing.
+    func testPackagedBundleInMacOSLayoutIsFound() throws {
+        let inner = resources.appendingPathComponent("\(ResourceBundleLocator.coreBundleName)/Contents/Resources", isDirectory: true)
+        try FileManager.default.createDirectory(at: inner, withIntermediateDirectories: true)
+        let script = inner.appendingPathComponent(CoreResources.faceSidecarScriptName)
+        try Data("print('stub')\n".utf8).write(to: script)
+        let asked = Counter()
+        let result = locator { asked.bump(); return nil }.locate(CoreResources.faceSidecarScriptName)
+        XCTAssertEqual(result.location, .packaged)
+        XCTAssertEqual(result.url?.standardizedFileURL, script.standardizedFileURL)
+        XCTAssertEqual(asked.value, 0)
+    }
+
     func testFallsBackToBundleURL() throws {
         let appRoot = try placeScript(in: app)
         let asked = Counter()

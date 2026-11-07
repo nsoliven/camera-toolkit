@@ -28,11 +28,12 @@ extension DashboardModel {
 
     /// A recorder for a job about to start; nil while recording is off.
     /// Nothing is written until the job starts (`JobHistoryRecorder.start`).
-    func makeHistoryRecorder(action: JobAction, title: String) -> JobHistoryRecorder? {
+    func makeHistoryRecorder(action: JobAction, title: String, id: UUID = UUID()) -> JobHistoryRecorder? {
         guard let url = jobHistoryURL else { return nil }
         let sampler = JobHistoryLoadSampler()
         return JobHistoryRecorder(
             storeURL: url,
+            id: id,
             kind: action.rawValue,
             title: title,
             loadProbe: { sampler.sample() }

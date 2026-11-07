@@ -192,6 +192,21 @@ struct EventsRootView: View {
                 }
             )
         }
+        // The unsorted board's Sort Into picker. Picking sorts (catalog
+        // only) through `assign`; "New Event…" queues the New Event sheet,
+        // presented once this one has finished closing.
+        .sheet(item: $workspace.sortIntoRequest, onDismiss: { workspace.sortIntoSheetDidDismiss() }) { request in
+            EventPickerSheet(
+                workspace: workspace,
+                verb: "Sort into",
+                summary: workspace.sortIntoSummary(request),
+                allowedEventIDs: Set(workspace.sortIntoTargets().map(\.id)),
+                canAssign: !request.stackIDs.isEmpty,
+                onPick: { workspace.completeSortInto(request, eventID: $0.id) },
+                onNewEvent: { workspace.newEventFromSortInto(request) },
+                onCancel: { workspace.sortIntoRequest = nil }
+            )
+        }
         .sheet(item: $workspace.renameRequest) { request in
             if let event = workspace.event(request.eventID) {
                 EventDetailsSheet(
@@ -221,6 +236,13 @@ struct EventsRootView: View {
                 request: request,
                 onCancel: { workspace.pendingTrash = nil },
                 onConfirm: { workspace.confirmTrash(request) }
+            )
+        }
+        .sheet(item: $workspace.pendingCardClear) { request in
+            CardClearConfirmSheet(
+                request: request,
+                onCancel: { workspace.pendingCardClear = nil },
+                onConfirm: { workspace.confirmCardClear(request, confirmation: $0) }
             )
         }
         .sheet(item: $workspace.pendingRemoval) { request in
@@ -343,6 +365,12 @@ struct EventsSidebar: View {
                     if !legacyFolders.isEmpty {
                         legacyLayoutBanner(legacyFolders)
                     }
+                }
+            }
+            let nasFound = workspace.discoveredNASEvents(matching: query)
+            if !nasFound.isEmpty {
+                Section("Found on the NAS") {
+                    nasDiscoveryBanner(nasFound, skipped: workspace.nasDiscoveryProblems)
                 }
             }
 
@@ -475,6 +503,38 @@ struct EventsSidebar: View {
             Button("Add to Events") { workspace.adoptDiscoveredDriveEvents() }
                 .controlSize(.small)
                 .help("Lists these folders as events. No files move.")
+        }
+        .padding(.vertical, 4)
+    }
+
+    /// Event folders only the NAS holds files for. Adding them records
+    /// assignments only; the files show on their events as "NAS only".
+    private func nasDiscoveryBanner(_ found: [DiscoveredNASEvent], skipped: [NASDiscoveryProblem]) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("\(found.count) event folder\(found.count == 1 ? " has" : "s have") files on the NAS that are not in your events.")
+                .font(.callout.weight(.semibold))
+                .fixedSize(horizontal: false, vertical: true)
+            ForEach(found.prefix(3)) { folder in
+                Text("\(folder.displayName) · \(folder.fileCount.formatted()) files\(folder.matchingEventID == nil ? " · new event" : "")")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .help(folder.relativeFolderPath)
+            }
+            if found.count > 3 {
+                Text("and \(found.count - 3) more")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            if !skipped.isEmpty {
+                Text("\(skipped.count) item\(skipped.count == 1 ? "" : "s") left out")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .help(skipped.prefix(8).map { "\($0.path): \($0.reason)" }.joined(separator: "\n"))
+            }
+            Button("Add to Events") { workspace.adoptDiscoveredNASEvents() }
+                .controlSize(.small)
+                .help("Backs up the photo list, then lists these files on their events as NAS only. Nothing on the NAS moves or changes.")
         }
         .padding(.vertical, 4)
     }

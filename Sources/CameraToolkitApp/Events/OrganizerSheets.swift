@@ -387,6 +387,86 @@ struct RemovalConfirmSheet: View {
     }
 }
 
+/// "Clear from Card" confirmation: what will be deleted per event, what
+/// stays and why, and the typed `DELETE` that alone unlocks the button. The
+/// same shape and rules as `RemovalConfirmSheet`: Return never runs it, and
+/// the service checks the token again.
+struct CardClearConfirmSheet: View {
+    let request: CardClearRequest
+    let onCancel: () -> Void
+    let onConfirm: (String) -> Void
+
+    @State private var confirmation = ""
+
+    static func isConfirmed(_ typed: String) -> Bool {
+        typed == FreeUpService.confirmationToken
+    }
+
+    var body: some View {
+        SheetScaffold(
+            title: "Clear \(request.fileCount) file\(request.fileCount == 1 ? "" : "s") from \(request.locationName)?",
+            subtitle: "\(request.byteCount.formattedBytes) · permanently deleted from the card",
+            systemImage: "sdcard",
+            iconTint: .red
+        ) {
+            Text(CardClearWording.sheetExplanation(request))
+                .fixedSize(horizontal: false, vertical: true)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(Array(request.events.enumerated()), id: \.offset) { _, line in
+                    HStack {
+                        Text(line.name)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Spacer()
+                        Text("\(line.fileCount) file\(line.fileCount == 1 ? "" : "s") · \(line.byteCount.formattedBytes)")
+                            .monospacedDigit()
+                            .foregroundStyle(.secondary)
+                    }
+                    .font(.callout)
+                    }
+                }
+            }
+            .frame(maxHeight: 160)
+            if let note = CardClearWording.nasNote(request) {
+                Text(note)
+                    .font(.callout)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if let note = CardClearWording.skippedNote(request) {
+                Text(note)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Text(UndoScopeWording.removeFromSource)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            LabeledContent("Type \(FreeUpService.confirmationToken) to continue") {
+                TextField(
+                    "Type \(FreeUpService.confirmationToken) to continue",
+                    text: $confirmation,
+                    prompt: Text(FreeUpService.confirmationToken)
+                )
+                .textFieldStyle(.roundedBorder)
+                .labelsHidden()
+                .autocorrectionDisabled()
+                .frame(width: 180)
+            }
+        } actions: {
+            Button("Cancel", action: onCancel)
+                .keyboardShortcut(.cancelAction)
+            // Deliberately not the default button: Return must never delete.
+            Button("Verify and Clear from Card", role: .destructive) {
+                onConfirm(confirmation)
+            }
+            .disabled(!Self.isConfirmed(confirmation))
+        }
+    }
+}
+
 /// Organizer Trash confirmation. Count and source sit in the header, each
 /// volume's `_Trash` folder gets its own row in a tinted group box — the
 /// line the owner must not miss — and a note keeps it distinct from Finder
