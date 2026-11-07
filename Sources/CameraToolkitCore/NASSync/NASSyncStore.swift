@@ -359,6 +359,15 @@ public final class NASSyncStore: @unchecked Sendable {
         return (try? NASSyncStore(unchecked: catalogURL).verifiedFacts(nasRoot: nasRoot, prefixes: prefixes)) ?? [:]
     }
 
+    /// `records(nasRoot:pathKeys:)` read-only: a missing catalog or table is
+    /// "no records", and the schema is never created or changed.
+    public static func records(catalogURL: URL, nasRoot: String, pathKeys: some Collection<String>) -> [String: NASSyncRecord] {
+        guard FileManager.default.fileExists(atPath: catalogURL.path),
+              let writer = try? CatalogDatabase.writer(for: catalogURL),
+              (try? writer.read({ try $0.tableExists(tableName) })) == true else { return [:] }
+        return (try? NASSyncStore(unchecked: catalogURL).records(nasRoot: nasRoot, pathKeys: pathKeys)) ?? [:]
+    }
+
     private static func record(_ row: Row) -> NASSyncRecord {
         let eventID: String? = row["event_id"]
         let checked: String = row["checked_at"]

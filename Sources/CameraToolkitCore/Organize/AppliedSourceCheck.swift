@@ -30,6 +30,29 @@ public enum AppliedSourceCheck {
         sameVolume: SameVolume? = nil,
         isCancelled: @Sendable () -> Bool = { false }
     ) -> [String: UUID] {
+        appliedAssets(
+            assignments: assignments,
+            events: events,
+            locations: locations,
+            mountedVolumes: mountedVolumes,
+            pauseGate: pauseGate,
+            sameVolume: sameVolume,
+            isCancelled: isCancelled
+        ).mapValues(\.assignment.eventID)
+    }
+
+    /// The same answer with the presence each one was decided on — source
+    /// path key → that file's `EventAssetPresence` (drive copy path and root,
+    /// NAS mirror path). The NAS place in it was not probed.
+    public static func appliedAssets(
+        assignments: [PhotoEventAssignment],
+        events: [UUID: SavedCameraEvent],
+        locations: EventStorageLocations,
+        mountedVolumes: Set<String>? = nil,
+        pauseGate: DriveActivityGate? = nil,
+        sameVolume: SameVolume? = nil,
+        isCancelled: @Sendable () -> Bool = { false }
+    ) -> [String: EventAssetPresence] {
         guard !assignments.isEmpty else { return [:] }
         let mounted = mountedVolumes ?? VolumeInfo.mountedVolumePaths()
         let sameVolume = sameVolume ?? { source, root, mounted in
@@ -47,7 +70,7 @@ public enum AppliedSourceCheck {
             return EventPresenceScanner.state(url, size: size, mounted: mounted)
         }
 
-        var applied: [String: UUID] = [:]
+        var applied: [String: EventAssetPresence] = [:]
         for (eventID, rows) in Dictionary(grouping: assignments, by: \.eventID) {
             guard !isCancelled(), let event = events[eventID] else { continue }
             let driveRoot = locations.driveRoot(for: locations.resolvedPolicy(for: event))
@@ -64,7 +87,7 @@ public enum AppliedSourceCheck {
                       let source = asset.sourcePath, asset.drivePath != nil else { continue }
                 let sourceURL = URL(fileURLWithPath: source)
                 guard !sameVolume(sourceURL, driveRoot, mounted) else { continue }
-                applied[EventStorageLocations.pathKey(source)] = asset.assignment.eventID
+                applied[EventStorageLocations.pathKey(source)] = asset
             }
         }
         return applied
