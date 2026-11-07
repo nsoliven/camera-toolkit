@@ -2,25 +2,36 @@ import CameraToolkitCore
 import Foundation
 import Observation
 
-/// One recorded job opened in History: its row, samples, files, and the
-/// structures the chart and table draw from — built off the main actor.
+/// One recorded job opened in the Jobs window: its row, samples, files,
+/// and the speed graph and flight index drawn from them — built off the
+/// main actor.
 struct JobHistoryDetail: Sendable {
     var job: JobHistoryJob
     var samples: [JobHistorySample]
     var items: [JobHistoryItem]
     var flights: JobHistoryFlightIndex
-    var chart: JobHistoryChartData
+    var graph: JobSpeedGraph
 
     init(job: JobHistoryJob, samples: [JobHistorySample], items: [JobHistoryItem], now: Date = Date()) {
         self.job = job
         self.samples = samples
         self.items = items
         flights = JobHistoryFlightIndex(items)
-        chart = JobHistoryChartData(samples: samples, duration: max(job.duration(now: now), items.map(\.end).max() ?? 0))
+        var graph = JobSpeedGraph.build(
+            samples: samples,
+            kind: job.kind,
+            duration: max(job.duration(now: now), items.map(\.end).max() ?? 0),
+            movedBytes: job.transferBytes ?? job.bytesDone
+        )
+        // The dashed average is the same number as the AVERAGE readout.
+        if graph.metric == .megabytesPerSecond, let rate = job.averageBytesPerSecond(now: now) {
+            graph.average = rate / 1_000_000
+        }
+        self.graph = graph
     }
 }
 
-/// What the Jobs window's History reads: the recorded jobs, newest first,
+/// What the Jobs window reads from `job-history.sqlite`: the recorded jobs, newest first,
 /// and the detail of the one opened. Reads only — every write goes through
 /// the job recorders in Core. Reads run detached; a store that cannot be
 /// opened shows as a message, never an error dialog.
@@ -67,8 +78,10 @@ final class JobHistoryBrowser {
     }
 
     /// Opens `id`'s detail. A job still running is reread on every call,
-    /// so polling it keeps the chart growing.
-    func open(_ id: UUID?) async {
+    /// so polling it keeps the graph growing; `reloadItems: false` keeps
+    /// the file rows already read (samples come from the recorder in
+    /// memory, so a poll stays cheap).
+    func open(_ id: UUID?, reloadItems: Bool = true) async {
         guard let id else {
             detail = nil
             return
@@ -78,13 +91,14 @@ final class JobHistoryBrowser {
         let live = model.jobHistoryRecorders[id]
         let liveJob = live?.currentJob()
         let liveSamples = live?.samples()
+        let knownItems = !reloadItems && detail?.job.id == id ? detail?.items : nil
         let loaded = await Task.detached(priority: .userInitiated) { () -> JobHistoryDetail? in
             guard let store = JobHistoryStore.shared(at: url),
                   let job = liveJob ?? (try? store.job(id: id)) else { return nil }
             // A recorder in memory has every sample, including those not
             // written yet; the file rows come from the store.
             let samples = liveSamples ?? ((try? store.samples(jobID: id)) ?? [])
-            let items = (try? store.items(jobID: id)) ?? []
+            let items = knownItems ?? ((try? store.items(jobID: id)) ?? [])
             return JobHistoryDetail(job: job, samples: samples, items: items)
         }.value
         isLoadingDetail = false

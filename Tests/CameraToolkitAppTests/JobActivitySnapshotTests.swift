@@ -28,7 +28,7 @@ final class JobActivitySnapshotTests: XCTestCase {
         for (name, job, monitor, now) in cases {
             for appearance in [NSAppearance.Name.aqua, .darkAqua] {
                 let suffix = appearance == .aqua ? "light" : "dark"
-                let view = JobActivityDetail(job: job, monitor: monitor, sampling: false, fixedUptime: now)
+                let view = JobActivityDetail(live: job, detail: nil, monitor: monitor, zoom: .constant(JobHistoryZoom(full: 0...max(now, 1))), hover: JobHistoryHover(), sampling: false, fixedUptime: now)
                     .padding(.vertical, 12)
                     .padding(.trailing, 12)
                     .frame(width: 900, alignment: .top)

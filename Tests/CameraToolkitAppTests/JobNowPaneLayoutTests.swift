@@ -4,29 +4,27 @@ import SwiftUI
 @testable import CameraToolkitApp
 import XCTest
 
-/// The Jobs window's live "Now" pane must fit the window it is hosted in:
-/// readouts and labels stay on one line, the chart stays inside its slot
-/// in both ranges, and nothing pushes the pane wider than the window —
-/// when the pane did, the window grew past its minimum (or the running
-/// app's content clipped at the right edge), "CPU" folded to one letter
-/// per line, and the rate column read "18.5 MB/:".
+/// The Jobs window — job list on the left, the selected job's pane on the
+/// right — must fit the window it is hosted in: readouts and labels stay on
+/// one line, the speed graph stays inside its slot, and nothing pushes the
+/// pane wider than the window — when the old pane did, the window grew
+/// past its minimum (or the running app's content clipped at the right
+/// edge), "CPU" folded to one letter per line, and the rate column read
+/// "18.5 MB/:".
 ///
 /// These host the real `TransferQueueView` in a `CameraToolkitWindowFactory`
 /// window off-screen (like `MainWindowLayoutTests` does the main window)
 /// with a running Sync to NAS — four transfers plus a NAS verify row,
 /// telemetry, and a recorder fed ~26 s of samples — and check, at the
-/// minimum and a large size, in both chart ranges and across the toggle,
-/// that:
+/// minimum and a large size, that:
 /// - the content's fitting width stays within the window,
-/// - every scroll view and every expanded job row lies inside the window,
-/// - the jobs table is never wider than its scroll view.
+/// - every scroll view and table lies inside the window,
+/// - the selected job's pane is there, tall enough to hold the graph.
 ///
-/// The chart's legend and axes live in the hosting view's layer tree, not
-/// in `NSView` frames, and the AX tree stays empty without a window server;
-/// the chart slot is instead pinned by `.clipped()` and a fixed frame, and
-/// with `CT_SNAPSHOT_OUT` set every checked state is also written as a PNG
-/// (`cacheDisplay`, like `MainWindowLayoutTests`; `CT_SNAPSHOT_PREFIX`
-/// prefixes the file names) so the marks can be reviewed inside it.
+/// The chart's marks live in the hosting view's layer tree, not in
+/// `NSView` frames; with `CT_SNAPSHOT_OUT` set every checked state is also
+/// written as a PNG (`cacheDisplay`; `CT_SNAPSHOT_PREFIX` prefixes the file
+/// names) so the marks can be reviewed.
 @MainActor
 final class JobNowPaneLayoutTests: XCTestCase {
     private var root: URL!
@@ -35,7 +33,7 @@ final class JobNowPaneLayoutTests: XCTestCase {
     /// The window sizes checked: the factory minimum and a big desktop
     /// window like the reporter's.
     private static let sizes = [
-        NSSize(width: 720, height: 440),
+        CameraToolkitPopOutWindow.transferQueue.minimumContentSize,
         NSSize(width: 1_680, height: 1_450),
     ]
 
@@ -47,7 +45,6 @@ final class JobNowPaneLayoutTests: XCTestCase {
     }
 
     override func tearDown() async throws {
-        UserDefaults.standard.removeObject(forKey: JobActivityDetail.chartRangeDefaultsKey)
         window?.orderOut(nil)
         window?.close()
         window = nil
@@ -58,12 +55,15 @@ final class JobNowPaneLayoutTests: XCTestCase {
 
     // MARK: - Layout
 
-    func testNowPaneFitsTheWindowInBothRanges() throws {
+    func testJobsWindowFitsAtItsMinimumAndLarge() throws {
         let (job, _, recorder) = makeRunningSyncJob()
         let model = DashboardModel(
             jobs: [job],
+            configuration: AppConfiguration.defaults(applicationSupport: root),
             configurationStore: ConfigurationStore(url: root.appendingPathComponent("config.json"))
         )
+        model.jobHistoryEnabled = true
+        defer { model.jobHistoryURL.map { CatalogDatabase.checkpointAndClose(url: $0) } }
         model.transferQueue = TransferQueueSnapshot(
             state: .running,
             sourcePath: "/Sample/Camera",
@@ -79,7 +79,7 @@ final class JobNowPaneLayoutTests: XCTestCase {
             .transferQueue,
             identifier: "CameraToolkitJobsLayout-\(UUID().uuidString)",
             title: "Jobs",
-            initialContentSize: NSSize(width: 840, height: 500),
+            initialContentSize: NSSize(width: 1_080, height: 720),
             rootView: TransferQueueView(model: model)
         )
         SnapshotWindows.hide(window)
@@ -88,92 +88,36 @@ final class JobNowPaneLayoutTests: XCTestCase {
 
         for size in Self.sizes {
             window.setContentSize(size)
-            RunLoop.main.run(until: Date().addingTimeInterval(1.0))
-
-            for range in [ThroughputChartRange.recent, .wholeJob] {
-                setChartRange(range)
-                try assertLayout(window, size: size, name: "\(range.rawValue)-\(Int(size.width))x\(Int(size.height))")
-            }
-
-            // The reported sequence: the chart's slot off-screen below the
-            // fold, toggle to the whole job, then scroll down to look.
-            scrollJobsList(in: window, toTop: true)
-            setChartRange(.wholeJob)
-            scrollJobsList(in: window, toTop: false)
-            try assertLayout(window, size: size, name: "toggled-scrolled-\(Int(size.width))x\(Int(size.height))")
-
-            // Rapid toggles mid-scroll settle to a contained chart too.
-            setChartRange(.recent)
-            setChartRange(.wholeJob)
-            try assertLayout(window, size: size, name: "toggled-again-\(Int(size.width))x\(Int(size.height))")
+            RunLoop.main.run(until: Date().addingTimeInterval(1.5))
+            try assertLayout(window, size: size, name: "\(Int(size.width))x\(Int(size.height))")
         }
     }
 
-    /// The pane on its own must fit the minimum window's inner column
-    /// when that width is proposed — a minimum above it is what forced
-    /// the pane past the right edge (measured: the row wanted 867 pt in a
-    /// ~700 pt column).
+    /// The pane on its own must fit the detail column of the minimum
+    /// window when that width is proposed — a minimum above it is what
+    /// forced the old pane past the right edge.
     func testDetailFittingWidthStaysInsideTheMinimumWindow() throws {
         let (job, monitor, recorder) = makeRunningSyncJob()
-        for range in [ThroughputChartRange.recent, .wholeJob] {
-            setChartRange(range)
+        let detail = JobHistoryDetail(job: recorder.currentJob(), samples: recorder.samples(), items: [])
+        let column = CameraToolkitPopOutWindow.transferQueue.minimumContentSize.width - 230
+        for live in [job, nil] {
             let probe = NSHostingController(rootView: AnyView(
                 JobActivityDetail(
-                    job: job, monitor: monitor, sampling: false, fixedUptime: 26,
-                    wholeJobSamples: { recorder.samples() }
+                    live: live, detail: detail, monitor: monitor,
+                    zoom: .constant(JobHistoryZoom(full: 0...detail.graph.duration)), hover: JobHistoryHover(),
+                    sampling: false, fixedUptime: 26
                 )
                 .background(.background)
             ))
             probe.view.layoutSubtreeIfNeeded()
             RunLoop.main.run(until: Date().addingTimeInterval(0.4))
-            let fitted = probe.sizeThatFits(in: NSSize(width: 700, height: CGFloat.infinity))
-            XCTAssertLessThanOrEqual(
-                fitted.width, 700.5,
-                "\(range): the pane wants \(fitted.width) inside a 700-wide column"
-            )
-            probe.view.frame = NSRect(origin: .zero, size: NSSize(width: 700, height: fitted.height))
+            let fitted = probe.sizeThatFits(in: NSSize(width: column, height: CGFloat.infinity))
+            let name = live == nil ? "recorded" : "running"
+            XCTAssertLessThanOrEqual(fitted.width, column + 0.5, "\(name): the pane wants \(fitted.width) inside a \(column)-wide column")
+            probe.view.frame = NSRect(origin: .zero, size: NSSize(width: column, height: fitted.height))
             probe.view.layoutSubtreeIfNeeded()
-            try writePNG(probe.view, name: "detail-700-\(range.rawValue)")
+            try writePNG(probe.view, name: "detail-\(Int(column))-\(name)")
         }
-    }
-
-    // MARK: - Whole-job readout
-
-    /// In the whole-job range the FILES readout is the job average —
-    /// files done over the job's wall time — like the byte "average" next
-    /// to it, not the smoothed live rate (a resumed sync settling already-
-    /// verified files holds a meaningless rate otherwise).
-    func testWholeJobFilesRateIsTheJobAverage() throws {
-        var live = JobThroughputReadout(unit: .megabytesPerSecond, current: 12.4, average: 8.1, filesPerSecond: 19_589)
-        live.series = ["Overall"]
-
-        var samples: [JobHistorySample] = []
-        for second in 0...26 {
-            let doneFiles: Int = second < 2 ? second * 1_900 : 3_800 + (second - 2) * 16
-            let doneBytes: Int64 = Int64(second) * 1_600_000_000
-            samples.append(JobHistorySample(
-                t: Double(second), combined: 104, copy: 108, verify: 96,
-                doneBytes: doneBytes, doneFiles: doneFiles
-            ))
-        }
-        let readout = live.wholeJob(samples: samples, elapsed: 26)
-
-        XCTAssertEqual(readout.filesPerSecond ?? 0, 4_184 / 26, accuracy: 0.01)
-        XCTAssertTrue(readout.wholeJobRate)
-        XCTAssertEqual(live.wholeJobRate, false)
-        XCTAssertFalse(readout.points.isEmpty)
-        XCTAssertEqual(readout.xDomain, 0...60)
-    }
-
-    /// No settled files yet (or a job that just started) shows no rate
-    /// rather than a huge or divided-by-zero one.
-    func testWholeJobFilesRateNeedsAFileAndASecond() throws {
-        var live = JobThroughputReadout(unit: .megabytesPerSecond, filesPerSecond: 9_999)
-        let sample = JobHistorySample(t: 0, combined: 0, doneBytes: 0, doneFiles: 0)
-        XCTAssertNil(live.wholeJob(samples: [sample], elapsed: 0.5).filesPerSecond)
-        XCTAssertTrue(live.wholeJob(samples: [sample], elapsed: 0.5).wholeJobRate)
-        live = JobThroughputReadout(unit: .megabytesPerSecond, filesPerSecond: 9_999)
-        XCTAssertNil(live.wholeJob(samples: [sample], elapsed: 30).filesPerSecond)
     }
 
     // MARK: - Checks
@@ -202,41 +146,21 @@ final class JobNowPaneLayoutTests: XCTestCase {
             }
         }
 
-        // Every realized row stays inside its table, and the running
-        // job's detail row — a tall one, ~500 pt with the chart — is
-        // present somewhere in the window's tables.
-        var expanded = false
+        // Every realized row stays inside its table.
         for (_, table) in tables {
             for rowIndex in 0..<table.numberOfRows {
                 guard let row = table.rowView(atRow: rowIndex, makeIfNecessary: false) else { continue }
                 let rect = row.convert(row.bounds, to: table)
                 XCTAssertLessThanOrEqual(rect.maxX, table.bounds.width + 0.5,
                     "\(name): row \(rowIndex) \(rect) of \(type(of: table)) runs past its table's width")
-                expanded = expanded || rect.height > 100
             }
         }
-        XCTAssertTrue(expanded, "\(name): the running job's detail row is not expanded")
+        // The running job is selected and its pane — header, transfers,
+        // readouts, graph — is laid out in a scroll view of its own.
+        let panes = scrollViews(in: content).filter { !($0.documentView is NSTableView) && ($0.documentView?.frame.height ?? 0) > 300 }
+        XCTAssertFalse(panes.isEmpty, "\(name): the running job's pane is missing")
 
         try writeSnapshot(window, name: name)
-    }
-
-    private func setChartRange(_ range: ThroughputChartRange) {
-        UserDefaults.standard.set(range.rawValue, forKey: JobActivityDetail.chartRangeDefaultsKey)
-        window?.contentView?.layoutSubtreeIfNeeded()
-    }
-
-    /// The jobs list's scroll view is the one inside the Jobs section —
-    /// the window's smallest table scroll view.
-    private func scrollJobsList(in window: NSWindow, toTop: Bool) {
-        guard let content = window.contentView else { return }
-        guard let scroll = scrollViews(in: content)
-            .filter({ $0.documentView is NSTableView })
-            .min(by: { $0.frame.height < $1.frame.height }),
-            let document = scroll.documentView else { return }
-        let clip = scroll.contentView
-        document.scroll(NSPoint(x: 0, y: toTop ? 0 : max(document.bounds.height - clip.bounds.height, 0)))
-        scroll.reflectScrolledClipView(clip)
-        RunLoop.main.run(until: Date().addingTimeInterval(0.4))
     }
 
     private func scrollViews(in view: NSView) -> [NSScrollView] {
@@ -273,7 +197,7 @@ final class JobNowPaneLayoutTests: XCTestCase {
 
     /// A running Sync to NAS, ~26 s in: four transfers plus a NAS verify
     /// row like the reporter's job, and a recorder fed the same seconds so
-    /// "Whole job" appears.
+    /// the graph has its whole run.
     private func makeRunningSyncJob() -> (JobSnapshot, JobActivityMonitor, JobHistoryRecorder) {
         let monitor = JobActivityMonitor(ceilingResolver: nil)
         let elapsed: TimeInterval = 26

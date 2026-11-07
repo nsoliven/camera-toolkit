@@ -15,7 +15,7 @@ enum CameraToolkitPopOutWindow: CaseIterable {
     var minimumContentSize: NSSize {
         switch self {
         case .settings: NSSize(width: 660, height: 520)
-        case .transferQueue: NSSize(width: 720, height: 440)
+        case .transferQueue: NSSize(width: 820, height: 520)
         case .storageSpeedTests: NSSize(width: 720, height: 520)
         case .eventLibrary: NSSize(width: 940, height: 600)
         case .photoDatabase: NSSize(width: 820, height: 540)

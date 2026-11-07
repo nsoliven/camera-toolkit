@@ -59,54 +59,6 @@ final class JobHistoryViewTests: XCTestCase {
         XCTAssertEqual(JobHistoryChartMath.timeStride(180), 30)
         XCTAssertEqual(JobHistoryChartMath.timeStride(3_600), 600)
         XCTAssertEqual(JobHistoryChartMath.timeStride(10 * 3_600), 7_200)
-        // The live chart's rolling window keeps its 15 s / 30 s ticks.
-        XCTAssertEqual(ThroughputChart.xStride(0...60), 15)
-        XCTAssertEqual(ThroughputChart.xStride(20...200), 30)
-        XCTAssertEqual(ThroughputChart.xStride(0...36_000), 7_200)
-    }
-
-    // MARK: Series
-
-    func testChartSeriesFollowWhatTheJobRecorded() {
-        let sync = JobHistoryChartData(samples: [
-            JobHistorySample(t: 1, combined: 100, copy: 60, verify: nil),
-            JobHistorySample(t: 2, combined: 110, copy: 55, verify: 58),
-        ])
-        XCTAssertEqual(sync.series, ["Overall", "Copy (write)", "Verify (re-read)"])
-        XCTAssertEqual(sync.points["Verify (re-read)"]?.count, 1, "a second without a rate is left out")
-        XCTAssertEqual(sync.yUpper, 200)
-        XCTAssertEqual(sync.unit, .megabytesPerSecond)
-
-        let copy = JobHistoryChartData(samples: [JobHistorySample(t: 1, combined: 30), JobHistorySample(t: 2, combined: 31)])
-        XCTAssertEqual(copy.series, ["Throughput"])
-
-        let scan = JobHistoryChartData(samples: [JobHistorySample(t: 1, combined: 0, filesPerSecond: 2.5)])
-        XCTAssertEqual(scan.series, ["Files"])
-        XCTAssertEqual(scan.unit, .filesPerSecond)
-    }
-
-    func testTheLiveChartsWholeJobRangeDrawsEveryRecordedSecond() {
-        // Two hours of 1 Hz samples.
-        let samples = (0..<7_200).map { JobHistorySample(t: Double($0), combined: 100 + Double($0 % 13), copy: 60, verify: 50) }
-        let live = JobThroughputReadout(
-            unit: .megabytesPerSecond,
-            current: 105,
-            average: 101,
-            points: [ThroughputPoint(elapsed: 7_190, series: "Overall", value: 104)],
-            series: ["Overall", "Copy (write)", "Verify (re-read)"],
-            yUpper: 150,
-            xDomain: 7_020...7_200,
-            ceiling: JobLinkCeiling(label: "1 GbE", megabytesPerSecond: 115)
-        )
-        let whole = live.wholeJob(samples: samples, elapsed: 7_200, buckets: 300)
-        XCTAssertEqual(whole.xDomain, 0...7_200)
-        XCTAssertEqual(whole.series, live.series)
-        XCTAssertEqual(whole.current, 105, "the readouts stay live")
-        XCTAssertEqual(whole.ceiling, live.ceiling)
-        XCTAssertLessThanOrEqual(whole.points.filter { $0.series == "Overall" }.count, 604)
-        XCTAssertEqual(whole.points.filter { $0.series == "Overall" }.map(\.value).max(), 112, "a column's peak survives")
-        XCTAssertEqual(whole.points.first?.elapsed, 0)
-        XCTAssertGreaterThanOrEqual(whole.yUpper, 115 * 1.1, "the link ceiling stays on the chart")
     }
 
     // MARK: Files and text
@@ -198,12 +150,5 @@ final class JobHistoryViewTests: XCTestCase {
         XCTAssertEqual(job.bytesDone, 3_000)
         XCTAssertEqual(job.summary?.note, "Copied 3 files.")
         XCTAssertNotNil(job.endedAt)
-    }
-
-    func testARecordedEstimateReadsAgainstTheRealEnd() {
-        XCTAssertEqual(JobHistoryEstimateText.line(remaining: 600, error: nil), "Said ~\(JobActivityDetail.durationText(600)) left")
-        XCTAssertTrue(JobHistoryEstimateText.line(remaining: 600, error: 20).hasSuffix("on time"))
-        XCTAssertTrue(JobHistoryEstimateText.line(remaining: 600, error: -600).hasSuffix("finished \(JobActivityDetail.durationText(600)) later"))
-        XCTAssertTrue(JobHistoryEstimateText.line(remaining: 3_600, error: 900).hasSuffix("finished \(JobActivityDetail.durationText(900)) sooner"))
     }
 }
