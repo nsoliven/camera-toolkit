@@ -7210,6 +7210,12 @@ final class EventsWorkspace {
     }
 
     @ObservationIgnored private var faceStoreInstance: FaceIndexStore?
+    /// The pets side of the People window and of a face scan — its own
+    /// index beside the catalog (`PetIndexDatabase`).
+    @ObservationIgnored lazy var petGallery = PetGallery(model: model)
+    /// Test seam: supplies the pet engine so a pet pass can run without
+    /// the pet sidecar installed. Nil in production.
+    @ObservationIgnored var petAnalyzerProvider: (@Sendable () async throws -> FaceAnalyzing?)?
     /// (facesRevision, catalogStateRevision, people by event) — rebuilt
     /// lazily so sidebar rows share one catalog pass.
     @ObservationIgnored private var eventPeopleCache: (Int, Int, [UUID: [FacePerson]])?
@@ -7532,52 +7538,137 @@ final class EventsWorkspace {
         let catalogURL = catalogDatabaseURL
         let configuration = model.configuration
         let burstScope = options.mode < .high ? "a sample of each burst" : "every burst frame"
+        // Dogs ride along when Settings asks for them and the pet engine
+        // is there; they go to the pet index, never the catalog.
+        let petProvider = petAnalyzerProvider
+        let includePets = PetGallery.scanEnabled()
+            && (petGallery.faceEngineInstalled || petProvider != nil)
+        let petsURL = petGallery.databaseURL
+        let petOptions = FaceScanOptions.pets(mode: options.mode, fast: options.fast)
+        let faceUpperBound = includePets ? 0.6 : 0.98
+        let petsNote = includePets ? " Then looked for dogs on the same files with the pet engine and filed them into the pet index's Inbox." : ""
         model.runAsyncJob(
             action: .faceScan,
-            runningNote: "Scanning \(title) for faces",
+            runningNote: includePets ? "Scanning \(title) for faces and dogs" : "Scanning \(title) for faces",
             logTitle: "Face scan: \(title)",
-            logDetail: "Quality \(options.mode.rawValue). Detected faces on \(burstScope), single stills, and — at MED and above — video frames with the on-device face engine; matched faces against the approved people and grouped the rest — every classification lands in the Inbox, unapproved until the user says so. Files were only read — nothing was written or moved.",
+            logDetail: "Quality \(options.mode.rawValue). Detected faces on \(burstScope), single stills, and — at MED and above — video frames with the on-device face engine; matched faces against the approved people and grouped the rest — every classification lands in the Inbox, unapproved until the user says so.\(petsNote) Files were only read — nothing was written or moved.",
             operation: { progress in
-                // Bootstrap is idempotent: it guarantees the face tables
-                // exist even if no catalog sync has run since the upgrade.
-                _ = try CatalogStore(url: catalogURL).bootstrap(
-                    configuration: configuration,
-                    createBackup: false,
-                    createLibraryFolders: false
-                )
-                let analyzer: FaceAnalyzing
-                if let analyzerProvider, let provided = try await analyzerProvider() {
-                    analyzer = provided
-                } else {
-                    // Sidecar processes live for this job only.
-                    analyzer = try FaceSidecarPool.open(applicationSupport: support, options: options)
-                }
-                defer { (analyzer as? FaceSidecarPool)?.shutdown() }
-                // The board's burst stacks drive sampling — a burst decodes
-                // its first/middle/last stills instead of every frame (all
-                // stills at HIGH and above).
-                return try FaceIndexService(catalogURL: catalogURL, options: options).scan(
+                let faces = try await Self.runFaceScanPass(
                     stacks: stacks,
-                    analyzer: analyzer
-                ) { update in
-                    progress(DashboardModel.jobUpdate(
-                        from: update,
-                        lowerBound: 0.02,
-                        upperBound: 0.98,
-                        notePrefix: "Face scan",
-                        command: ""
-                    ))
+                    options: options,
+                    catalogURL: catalogURL,
+                    configuration: configuration,
+                    support: support,
+                    analyzerProvider: analyzerProvider,
+                    upperBound: faceUpperBound,
+                    progress: progress
+                )
+                guard includePets else { return FaceAndPetScanReport(faces: faces) }
+                // A pet failure never undoes the face pass, which is
+                // already stored; it is reported beside it.
+                do {
+                    let pets = try await Self.runPetScanPass(
+                        stacks: stacks,
+                        options: petOptions,
+                        petsURL: petsURL,
+                        support: support,
+                        analyzerProvider: petProvider,
+                        lowerBound: faceUpperBound,
+                        progress: progress
+                    )
+                    return FaceAndPetScanReport(faces: faces, pets: pets)
+                } catch {
+                    return FaceAndPetScanReport(faces: faces, petError: error.localizedDescription)
                 }
             },
-            completion: { [weak self] report in
+            completion: { [weak self] result in
                 self?.facesRevision &+= 1
+                if includePets { self?.petGallery.noteScanFinished() }
+                let report = result.faces
                 let video = report.videoFramesRead > 0 ? "; \(report.videoFramesRead) video frames read" : ""
                 let burst = report.photosBurstCovered > 0 ? "; \(report.photosBurstCovered) burst frames covered by sampled siblings" : ""
                 // The Jobs log may name packages — the scan sheet cannot.
                 let packages = report.detectorSummary.map { " Engine: \($0)." } ?? ""
-                return "Face scan done — \(report.facesDetected) face\(report.facesDetected == 1 ? "" : "s") on \(report.photosProcessed) sampled photo(s); \(report.photosSkipped) already scanned\(burst); \(report.facesProposed) filed in the Inbox as lookalikes, \(report.facesGrouped) grouped\(video).\(packages)"
+                return "Face scan done — \(report.facesDetected) face\(report.facesDetected == 1 ? "" : "s") on \(report.photosProcessed) sampled photo(s); \(report.photosSkipped) already scanned\(burst); \(report.facesProposed) filed in the Inbox as lookalikes, \(report.facesGrouped) grouped\(video).\(packages)\(result.petSummary)"
             }
         )
+    }
+
+    /// The face half of a scan job: bootstrap, open the engine, scan.
+    nonisolated private static func runFaceScanPass(
+        stacks: [OrganizeStack],
+        options: FaceScanOptions,
+        catalogURL: URL,
+        configuration: AppConfiguration,
+        support: URL,
+        analyzerProvider: (@Sendable () async throws -> FaceAnalyzing?)?,
+        upperBound: Double,
+        progress: @escaping @Sendable (BackgroundJobUpdate) -> Void
+    ) async throws -> FaceScanReport {
+        // Bootstrap is idempotent: it guarantees the face tables exist
+        // even if no catalog sync has run since the upgrade.
+        _ = try CatalogStore(url: catalogURL).bootstrap(
+            configuration: configuration,
+            createBackup: false,
+            createLibraryFolders: false
+        )
+        let analyzer: FaceAnalyzing
+        if let analyzerProvider, let provided = try await analyzerProvider() {
+            analyzer = provided
+        } else {
+            // Sidecar processes live for this job only.
+            analyzer = try FaceSidecarPool.open(applicationSupport: support, options: options)
+        }
+        defer { (analyzer as? FaceSidecarPool)?.shutdown() }
+        // The board's burst stacks drive sampling — a burst decodes its
+        // first/middle/last stills instead of every frame (all stills at
+        // HIGH and above).
+        return try FaceIndexService(catalogURL: catalogURL, options: options).scan(
+            stacks: stacks,
+            analyzer: analyzer
+        ) { update in
+            progress(DashboardModel.jobUpdate(
+                from: update,
+                lowerBound: 0.02,
+                upperBound: upperBound,
+                notePrefix: "Face scan",
+                command: ""
+            ))
+        }
+    }
+
+    /// The dog half of a scan job: the same stacks and burst sampling, the
+    /// pet engine, and the pet index — opened (backed up first when a
+    /// migration is pending) beside the catalog. The catalog is not opened.
+    nonisolated private static func runPetScanPass(
+        stacks: [OrganizeStack],
+        options: FaceScanOptions,
+        petsURL: URL,
+        support: URL,
+        analyzerProvider: (@Sendable () async throws -> FaceAnalyzing?)?,
+        lowerBound: Double,
+        progress: @escaping @Sendable (BackgroundJobUpdate) -> Void
+    ) async throws -> FaceScanReport {
+        let store = try PetIndexDatabase.open(url: petsURL)
+        let analyzer: FaceAnalyzing
+        if let analyzerProvider, let provided = try await analyzerProvider() {
+            analyzer = provided
+        } else {
+            analyzer = try PetSidecarPool.open(applicationSupport: support)
+        }
+        defer { (analyzer as? PetSidecarPool)?.shutdown() }
+        return try FaceIndexService(store: store, options: options).scan(
+            stacks: stacks,
+            analyzer: analyzer
+        ) { update in
+            progress(DashboardModel.jobUpdate(
+                from: update,
+                lowerBound: lowerBound,
+                upperBound: 0.98,
+                notePrefix: "Pet scan",
+                command: ""
+            ))
+        }
     }
 
     /// Approved people detected on this event's photos — the "event.people"

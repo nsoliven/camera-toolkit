@@ -110,6 +110,10 @@ final class FaceSidecarProcess: @unchecked Sendable {
     }
 
     private(set) var ready: ReadyInfo
+    /// The ready line's full object — engines report different fields.
+    private(set) var readyObject: [String: Any] = [:]
+    /// "face sidecar" or "pet sidecar" — how errors name this process.
+    let name: String
     private let process: Process
     private let input: FileHandle
     private let output: FileHandle
@@ -122,20 +126,40 @@ final class FaceSidecarProcess: @unchecked Sendable {
 
     /// `startupTimeout` covers a cold CoreML compile; the cached second
     /// start takes well under a second.
-    init(installation: FaceSidecarInstallation, startupTimeout: TimeInterval = 240) throws {
+    convenience init(installation: FaceSidecarInstallation, startupTimeout: TimeInterval = 240) throws {
         guard let script = FaceSidecarInstallation.scriptURL else {
             throw FaceIndexError.engineFailed("The face sidecar script is missing from the app bundle.")
         }
         guard installation.isInstalled else {
             throw FaceIndexError.engineNotInstalled(FaceSidecarInstallation.notInstalledMessage)
         }
+        try self.init(
+            pythonURL: installation.pythonURL,
+            scriptURL: script,
+            root: installation.root,
+            name: "face sidecar",
+            startupTimeout: startupTimeout
+        )
+    }
+
+    /// Launches `python -u script --root root` and waits for its ready
+    /// line. Every sidecar speaks the same line protocol; this is the one
+    /// launcher for all of them.
+    init(
+        pythonURL: URL,
+        scriptURL script: URL,
+        root: URL,
+        name: String,
+        startupTimeout: TimeInterval = 240
+    ) throws {
+        self.name = name
         // A sidecar that died mid-write must surface as an error, not a
         // SIGPIPE that kills the app.
         signal(SIGPIPE, SIG_IGN)
 
         let process = Process()
-        process.executableURL = installation.pythonURL
-        process.arguments = ["-u", script.path, "--root", installation.root.path]
+        process.executableURL = pythonURL
+        process.arguments = ["-u", script.path, "--root", root.path]
         var environment = ProcessInfo.processInfo.environment
         environment["PYTHONUNBUFFERED"] = "1"
         process.environment = environment
@@ -168,15 +192,16 @@ final class FaceSidecarProcess: @unchecked Sendable {
         do {
             try process.run()
         } catch {
-            throw FaceIndexError.engineFailed("Could not start the face sidecar: \(error.localizedDescription)")
+            throw FaceIndexError.engineFailed("Could not start the \(name): \(error.localizedDescription)")
         }
 
         let line = try readLine(timeout: startupTimeout)
         guard let object = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any],
               object["event"] as? String == "ready" else {
             terminate()
-            throw FaceIndexError.engineFailed("The face sidecar did not report ready. \(stderrTail())")
+            throw FaceIndexError.engineFailed("The \(name) did not report ready. \(stderrTail())")
         }
+        readyObject = object
         ready = ReadyInfo(
             pack: object["pack"] as? String ?? "",
             insightface: object["insightface"] as? String ?? "",
@@ -201,7 +226,7 @@ final class FaceSidecarProcess: @unchecked Sendable {
     /// sidecar error, a dead process, or a timeout.
     func request(_ body: [String: Any], timeout: TimeInterval = 120) throws -> [String: Any] {
         guard process.isRunning else {
-            throw FaceIndexError.engineFailed("The face sidecar exited. \(stderrTail())")
+            throw FaceIndexError.engineFailed("The \(name) exited. \(stderrTail())")
         }
         nextID += 1
         var payload = body
@@ -211,14 +236,14 @@ final class FaceSidecarProcess: @unchecked Sendable {
         do {
             try input.write(contentsOf: data)
         } catch {
-            throw FaceIndexError.engineFailed("Could not write to the face sidecar: \(error.localizedDescription) \(stderrTail())")
+            throw FaceIndexError.engineFailed("Could not write to the \(name): \(error.localizedDescription) \(stderrTail())")
         }
         let line = try readLine(timeout: timeout)
         guard let object = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any] else {
-            throw FaceIndexError.engineFailed("The face sidecar returned an unreadable line.")
+            throw FaceIndexError.engineFailed("The \(name) returned an unreadable line.")
         }
         if let message = object["error"] as? String {
-            throw FaceIndexError.engineFailed("Face sidecar: \(message)")
+            throw FaceIndexError.engineFailed("\(name.prefix(1).uppercased() + name.dropFirst()): \(message)")
         }
         return object
     }
@@ -233,18 +258,18 @@ final class FaceSidecarProcess: @unchecked Sendable {
             }
             let remaining = deadline.timeIntervalSinceNow
             guard remaining > 0 else {
-                throw FaceIndexError.engineFailed("Timed out waiting for the face sidecar. \(stderrTail())")
+                throw FaceIndexError.engineFailed("Timed out waiting for the \(name). \(stderrTail())")
             }
             var descriptor = pollfd(fd: output.fileDescriptor, events: Int16(POLLIN), revents: 0)
             let ready = poll(&descriptor, 1, Int32(min(remaining, 1) * 1000))
             if ready > 0 {
                 let chunk = output.availableData
                 if chunk.isEmpty {
-                    throw FaceIndexError.engineFailed("The face sidecar closed its output. \(stderrTail())")
+                    throw FaceIndexError.engineFailed("The \(name) closed its output. \(stderrTail())")
                 }
                 buffer.append(contentsOf: chunk)
             } else if ready < 0, errno != EINTR {
-                throw FaceIndexError.engineFailed("Could not read from the face sidecar (errno \(errno)).")
+                throw FaceIndexError.engineFailed("Could not read from the \(name) (errno \(errno)).")
             }
         }
     }
@@ -396,7 +421,7 @@ public final class FaceSidecarPool: FaceAnalyzing, @unchecked Sendable {
         }
     }
 
-    private static func floats(_ value: Any?) -> [Float] {
+    static func floats(_ value: Any?) -> [Float] {
         (value as? [Any])?.compactMap { ($0 as? NSNumber)?.floatValue } ?? []
     }
 }

@@ -117,9 +117,15 @@ public enum CoreResources {
     public static let faceSidecarScript: ResourceBundleLocator.Resolution =
         resolve(faceSidecarScriptName, with: .main)
 
+    public static let petSidecarScriptName = "pet_sidecar.py"
+
+    /// The pet sidecar (`PetSidecarInstallation`), resolved the same way.
+    public static let petSidecarScript: ResourceBundleLocator.Resolution =
+        resolve(petSidecarScriptName, with: .main)
+
     /// Every shipped resource, for `--print-resource-paths`.
     public static var all: [(name: String, resolution: ResourceBundleLocator.Resolution)] {
-        [(faceSidecarScriptName, faceSidecarScript)]
+        [(faceSidecarScriptName, faceSidecarScript), (petSidecarScriptName, petSidecarScript)]
     }
 
     static func resolve(_ name: String, with locator: ResourceBundleLocator) -> ResourceBundleLocator.Resolution {

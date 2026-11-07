@@ -1650,6 +1650,44 @@ final class EventsWorkspaceTests: XCTestCase {
         }
     }
 
+    /// With pets on, the same job looks for dogs after faces: dogs land in
+    /// pets.sqlite beside the catalog, and the catalog gets no pet row.
+    func testFaceScanAlsoFindsDogsIntoThePetIndexOnly() async throws {
+        let defaults = UserDefaults.standard
+        let previous = defaults.object(forKey: PetGallery.scanEnabledDefaultsKey)
+        defaults.set(true, forKey: PetGallery.scanEnabledDefaultsKey)
+        defer { defaults.set(previous, forKey: PetGallery.scanEnabledDefaultsKey) }
+        try await withOrganizerSandbox { root, model, workspace in
+            let unsorted = root.appendingPathComponent("Card", isDirectory: true)
+            // Decodable stills — the stub engines decide what is in them.
+            for index in 1...3 {
+                try writeDecodableJPEG(unsorted.appendingPathComponent("DSC0000\(index).JPG"), shade: Double(index) / 4)
+            }
+            let location = addUnsorted(unsorted, to: model)
+            workspace.scan(location)
+            try await waitUntil {
+                workspace.sources[location.id]?.result != nil
+                    && workspace.sources[location.id]?.isScanning == false
+            }
+
+            workspace.faceAnalyzerProvider = { StubFaceAnalyzer() }
+            workspace.petAnalyzerProvider = { StubDogAnalyzer() }
+            workspace.faceScan(location)
+            try await waitUntil { !model.isBusy }
+
+            let job = try XCTUnwrap(model.jobs.first { $0.action == .faceScan })
+            XCTAssertEqual(job.state, .done)
+            XCTAssertTrue(model.statusMessage.contains("Dogs: 3 dogs"), model.statusMessage)
+
+            let pets = root.appendingPathComponent(PetIndexDatabase.fileName)
+            XCTAssertEqual(workspace.petGallery.databaseURL.path, pets.path)
+            XCTAssertEqual(workspace.petGallery.faceSnapshot().inbox.map(\.name), ["Dog 1"])
+            XCTAssertEqual(workspace.petGallery.faceIndexCounts().faces, 3)
+            XCTAssertEqual(workspace.faceIndexCounts().faces, 0, "no dog reached the catalog")
+            XCTAssertTrue(workspace.faceSnapshot().inbox.isEmpty)
+        }
+    }
+
     func testEventFaceScanBlockerRequiresAssignedReachableFiles() async throws {
         try await withOrganizerSandbox { root, model, workspace in
             // An event with nothing sorted into it has nothing to scan.
@@ -3936,4 +3974,35 @@ private struct StubFaceAnalyzer: FaceAnalyzing {
     func analyze(_ image: CGImage, options: FaceScanOptions) throws -> [AnalyzedFace] {
         []
     }
+}
+
+/// One large, confident dog in every image, with the same identity.
+private struct StubDogAnalyzer: FaceAnalyzing {
+    var displayName: String { "StubDogAnalyzer" }
+
+    func analyze(_ image: CGImage, options: FaceScanOptions) throws -> [AnalyzedFace] {
+        [AnalyzedFace(
+            box: NormalizedFaceBox(x: 0.1, y: 0.1, width: 0.6, height: 0.6),
+            detScore: 0.95,
+            embedding: FaceEmbeddingMath.l2Normalized((0..<768).map { Float($0 % 5) + 1 }),
+            quality: 40,
+            facePixels: 400
+        )]
+    }
+}
+
+/// A 640-px flat JPEG the face decoder can read.
+private func writeDecodableJPEG(_ url: URL, shade: Double) throws {
+    try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    let size = 640
+    let context = try XCTUnwrap(CGContext(
+        data: nil, width: size, height: size, bitsPerComponent: 8, bytesPerRow: size * 4,
+        space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+    ))
+    context.setFillColor(CGColor(red: shade, green: 0.5, blue: 1 - shade, alpha: 1))
+    context.fill(CGRect(x: 0, y: 0, width: size, height: size))
+    let image = try XCTUnwrap(context.makeImage())
+    let destination = try XCTUnwrap(CGImageDestinationCreateWithURL(url as CFURL, "public.jpeg" as CFString, 1, nil))
+    CGImageDestinationAddImage(destination, image, nil)
+    XCTAssertTrue(CGImageDestinationFinalize(destination))
 }

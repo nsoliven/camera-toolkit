@@ -11,18 +11,25 @@ import GRDB
 /// people drop their template links and free their faces.
 public final class FaceIndexStore: @unchecked Sendable {
     public let url: URL
+    /// The engine whose rows this store matches, groups, and templates
+    /// with — `FaceEngine.identifier` for people in the catalog,
+    /// `PetFaceEngine.identifier` for the pet index (`PetIndexDatabase`).
+    /// Rows stamped with any other engine are invisible to those passes.
+    public let engine: String
     private let injectedWriter: (any DatabaseWriter)?
 
-    public init(url: URL) {
+    public init(url: URL, engine: String = FaceEngine.identifier) {
         self.url = url
+        self.engine = engine
         self.injectedWriter = nil
     }
 
     /// A store over a prebuilt queue — the test seam for a trace hook
     /// counting BEGINs or a busy handler that refuses the first attempts,
     /// instead of the shared catalog connection.
-    init(url: URL, queue: DatabaseQueue) {
+    init(url: URL, queue: DatabaseQueue, engine: String = FaceEngine.identifier) {
         self.url = url
+        self.engine = engine
         self.injectedWriter = queue
     }
 
@@ -665,7 +672,7 @@ public final class FaceIndexStore: @unchecked Sendable {
             JOIN people p ON p.id = t.person_id
             WHERE p.is_roster = 1 AND f.embedding IS NOT NULL AND f.model = ?
             """,
-            arguments: [FaceEngine.identifier]
+            arguments: [engine]
         )
         return rows.compactMap { row in
             guard let personID = UUID(uuidString: row["person_id"] as String? ?? ""),
@@ -691,7 +698,7 @@ public final class FaceIndexStore: @unchecked Sendable {
               AND f.model = ?
             ORDER BY f.det_score DESC
             """,
-            arguments: [FaceEngine.identifier]
+            arguments: [engine]
         ).map { Self.faceRecord($0) }
     }
 
@@ -718,7 +725,7 @@ public final class FaceIndexStore: @unchecked Sendable {
             WHERE p.is_roster = 0 AND p.suggested_person_id IS NULL
               AND f.embedding IS NOT NULL AND f.model = ?
             """,
-            arguments: [FaceEngine.identifier]
+            arguments: [engine]
         )
         var groups: [UUID: [(faceID: UUID, embedding: [Float])]] = [:]
         for row in rows {
@@ -804,18 +811,30 @@ public final class FaceIndexStore: @unchecked Sendable {
     }
 
     func nextGroupName(database: Database) throws -> String {
+        let prefix = "\(groupNamePrefix) "
         let rows = try Row.fetchAll(
             database,
-            sql: "SELECT name FROM people WHERE is_roster = 0 AND name LIKE 'Person %'"
+            sql: "SELECT name FROM people WHERE is_roster = 0 AND name LIKE ?",
+            arguments: ["\(prefix)%"]
         )
         var highest = 0
         for row in rows {
             if let name: String = row["name"],
-               let number = Int(name.dropFirst("Person ".count)) {
+               let number = Int(name.dropFirst(prefix.count)) {
                 highest = max(highest, number)
             }
         }
-        return "Person \(highest + 1)"
+        return "\(prefix)\(highest + 1)"
+    }
+
+    /// The word automatic clusters are named with: "Person N" in the
+    /// catalog's face index, "Dog N" in the pet index.
+    public var groupNamePrefix: String {
+        Self.groupNamePrefix(engine: engine)
+    }
+
+    public static func groupNamePrefix(engine: String) -> String {
+        engine == PetFaceEngine.identifier ? "Dog" : "Person"
     }
 
     /// Renames a person. Inbox suggestion rows pointing at them take the

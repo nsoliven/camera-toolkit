@@ -158,8 +158,8 @@ public struct FacePhotoRecord: Equatable, Sendable {
 
     /// True when this row was produced by the current engine at a grade
     /// that covers `mode` — the whole skip rule besides file identity.
-    public func covers(_ mode: FaceScanGrade) -> Bool {
-        engine == FaceEngine.identifier && scanGrade.covers(mode)
+    public func covers(_ mode: FaceScanGrade, engine expected: String = FaceEngine.identifier) -> Bool {
+        engine == expected && scanGrade.covers(mode)
     }
 
     /// True when this row describes the same file bytes — same size and

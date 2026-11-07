@@ -248,6 +248,7 @@ struct EventsRootView: View {
                     FaceScanSheet(
                         name: location.name,
                         engineInstalled: workspace.faceEngineInstalled,
+                        alsoDogs: PetGallery.scanEnabled() && workspace.petGallery.faceEngineInstalled,
                         onCancel: { workspace.faceScanRequest = nil },
                         onScan: { options in
                             workspace.faceScanRequest = nil
@@ -260,6 +261,7 @@ struct EventsRootView: View {
                     FaceScanSheet(
                         name: workspace.eventTitle(event),
                         engineInstalled: workspace.faceEngineInstalled,
+                        alsoDogs: PetGallery.scanEnabled() && workspace.petGallery.faceEngineInstalled,
                         onCancel: { workspace.faceScanRequest = nil },
                         onScan: { options in
                             workspace.faceScanRequest = nil
