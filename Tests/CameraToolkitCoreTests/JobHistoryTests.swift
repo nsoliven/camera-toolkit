@@ -369,31 +369,6 @@ final class JobHistoryTests: XCTestCase {
 
     // MARK: Analysis
 
-    func testDownsamplingKeepsEachColumnsExtremesAndStaysSmall() {
-        // 10 hours at 1 Hz: a steady 100 MB/s with one spike and one stall.
-        var points = (0..<36_000).map { JobHistoryAnalysis.Point(t: Double($0), value: 100 + Double($0 % 7)) }
-        points[12_345].value = 900
-        points[30_001].value = 0
-        let drawn = JobHistoryAnalysis.downsample(points, in: 0...35_999, buckets: 400)
-        XCTAssertLessThanOrEqual(drawn.count, 804)
-        XCTAssertTrue(drawn.contains(points[12_345]), "the spike survives")
-        XCTAssertTrue(drawn.contains(points[30_001]), "the stall survives")
-        XCTAssertEqual(drawn.map(\.t), drawn.map(\.t).sorted(), "still in time order")
-        XCTAssertEqual(drawn.first?.t, 0)
-        XCTAssertEqual(drawn.last?.t, 35_999)
-    }
-
-    func testDownsamplingAZoomedRangeKeepsItsNeighboursAndSmallRangesUntouched() {
-        let points = (0..<1_000).map { JobHistoryAnalysis.Point(t: Double($0), value: Double($0)) }
-        let zoomed = JobHistoryAnalysis.downsample(points, in: 100.5...110.5, buckets: 400)
-        XCTAssertEqual(zoomed.map(\.t), Array(100...111).map(Double.init), "every point in range plus one beyond each edge")
-        let wide = JobHistoryAnalysis.downsample(points, in: 200.5...899.5, buckets: 50)
-        XCTAssertEqual(wide.first?.t, 200, "the neighbour before the range")
-        XCTAssertEqual(wide.last?.t, 900, "the neighbour after it")
-        XCTAssertLessThanOrEqual(wide.count, 104)
-        XCTAssertTrue(JobHistoryAnalysis.downsample([], in: 0...1, buckets: 10).isEmpty)
-    }
-
     func testTheFlightIndexAnswersWhichFilesWereInFlight() {
         let items = [
             JobHistoryItem(relativePath: "a", byteCount: 1, start: 0, end: 10, outcome: .copied),
