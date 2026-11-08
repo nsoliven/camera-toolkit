@@ -32,14 +32,18 @@ public struct NASConnectionSettings: Sendable, Equatable {
     public var nasRoot: URL
     /// The configured `smb://` share, nil when none is set.
     public var shareURL: URL?
-    /// "Connect to the NAS automatically" — auto-connect at launch and
-    /// automatic Wi-Fi → Ethernet reconnects.
+    /// "Connect to the NAS automatically" — auto-connect at launch.
     public var automatic: Bool
+    /// "Switch the NAS share to the faster link automatically" — reconnect
+    /// the share when the route to the NAS moved to a faster link (Ethernet
+    /// plugged in) and no job uses the NAS.
+    public var autoSwitchLink: Bool
 
-    public init(nasRoot: URL, shareURL: URL?, automatic: Bool) {
+    public init(nasRoot: URL, shareURL: URL?, automatic: Bool, autoSwitchLink: Bool = true) {
         self.nasRoot = nasRoot
         self.shareURL = shareURL
         self.automatic = automatic
+        self.autoSwitchLink = autoSwitchLink
     }
 
     /// `/Volumes/<share>` holding the NAS root; nil for a local folder.
@@ -76,11 +80,36 @@ public struct NASConnectionStatus: Sendable, Equatable {
     public var banner: NASGuardBannerReason?
     /// Waiting for NAS jobs to finish before reconnecting (banner button).
     public var isWaitingToReconnect = false
+    /// The automatic switch is wanted and waits only for a running job to
+    /// end (or for the job queue's next boundary).
+    public var linkSwitchPending = false
+    /// The last switch attempt failed (the share kept or fell back to its
+    /// old link); the banner offers to try again.
+    public var lastSwitchFailed = false
     /// The last connect/reconnect note ("Moved the NAS connection to Ethernet.").
     public var message: String?
     public var hasShareURL = false
 
     public init() {}
+
+    /// The route to the NAS against the session's link.
+    public var linkAssessment: NASLinkAssessment {
+        snapshot?.linkAssessment ?? NASLinkAssessment(route: nil, sessionInterfaces: [])
+    }
+
+    /// True when the route to the NAS uses a faster link than the share's
+    /// SMB session — a reconnect would move the share onto it.
+    public var fasterLinkAvailable: Bool {
+        phase == .connected && linkAssessment.state == .fasterLinkAvailable
+    }
+
+    /// The link a switch would move the share to ("Ethernet").
+    public var fasterLinkName: String {
+        let assessment = linkAssessment
+        guard let route = assessment.route else { return "Ethernet" }
+        guard let session = assessment.session else { return route.kind.displayName }
+        return NASLinkAssessment.name(route, against: session)
+    }
 
     /// "Ethernet 1 GbE", "Wi-Fi ⚠︎", "Thunderbolt", "Connected".
     public var linkLabel: String {
@@ -106,9 +135,15 @@ public struct NASConnectionStatus: Sendable, Equatable {
         case .notConfigured: return "NAS · Not Set Up"
         case .offline: return "NAS · Offline"
         case .connecting: return "NAS · Connecting…"
-        case .reconnecting: return "NAS · Reconnecting…"
+        case .reconnecting:
+            return linkAssessment.state == .fasterLinkAvailable ? "NAS · Switching to \(fasterLinkName)…" : "NAS · Reconnecting…"
         case .notSMB: return "NAS · Local Volume"
         case .connected:
+            // Said plainly when the route and the share disagree: the
+            // cable is in, but the share still rides the old link.
+            if let summary = linkAssessment.summary {
+                return "NAS · \(summary)"
+            }
             var parts = ["NAS", linkLabel]
             if isTestingSpeed {
                 parts.append("Testing…")
@@ -119,17 +154,31 @@ public struct NASConnectionStatus: Sendable, Equatable {
         }
     }
 
-    public var isOnSlowWiFi: Bool {
-        phase == .connected && snapshot?.sessionKind == .wifi && snapshot?.hasWiredRoute == true
+    /// Shown where the link is: SMB multichannel on the NAS lets one
+    /// session use every link at once, so plugging in a cable needs no
+    /// reconnect. Only a hint — the app never changes NAS settings.
+    public static let multichannelHint = "Tip: turning on SMB multichannel on the NAS lets the share use Wi-Fi and Ethernet together, without reconnecting."
+
+    /// Whether the multichannel hint applies: the session is single-channel
+    /// and the Mac has a wired link to the NAS (or the route and session
+    /// disagree).
+    public var showsMultichannelHint: Bool {
+        guard phase == .connected || phase == .reconnecting, let snapshot, !snapshot.multichannel else { return false }
+        return snapshot.hasWiredRoute || linkAssessment.state == .fasterLinkAvailable || linkAssessment.state == .sessionOnFasterLink
     }
 
     /// The tooltip: interface, route, and the speed test with its age.
     public func detail(now: Date) -> String {
         var lines: [String] = []
         if let snapshot, snapshot.isMounted {
+            if let route = snapshot.routeInterface {
+                lines.append("Route to the NAS: \(Self.describe(route))")
+            }
             if let interface = snapshot.primarySessionInterface {
-                let name = interface.displayName.map { "\($0) (\(interface.bsdName))" } ?? interface.bsdName
-                lines.append("Session over \(name)")
+                var line = "SMB session: \(Self.describe(interface))"
+                if let local = snapshot.session?.localAddresses.first { line += " from \(local)" }
+                if snapshot.multichannel { line += " (multichannel)" }
+                lines.append(line)
                 if snapshot.session?.confidence == .measuredBySpeedTest {
                     lines.append("Link measured by the speed test (macOS does not show Camera Toolkit its network connections)")
                 }
@@ -138,8 +187,19 @@ public struct NASConnectionStatus: Sendable, Equatable {
             } else {
                 lines.append("Could not tell which interface the SMB session uses")
             }
-            if let wired = snapshot.wiredRoutes.first, snapshot.sessionKind == .wifi {
-                lines.append("A wired route is up on \(wired.displayName ?? wired.bsdName) (\(wired.bsdName))")
+            switch snapshot.linkAssessment.state {
+            case .fasterLinkAvailable:
+                if linkSwitchPending {
+                    lines.append("The share moves to \(fasterLinkName) when no job is using the NAS (a running job is never interrupted).")
+                } else {
+                    lines.append("The share moves to \(fasterLinkName) only when it reconnects.")
+                }
+            case .sessionOnFasterLink:
+                lines.append("The faster link went away; macOS reconnects the share on its own.")
+            case .matched, .unknown:
+                if let wired = snapshot.wiredRoutes.first, snapshot.sessionKind == .wifi, snapshot.routeInterface?.kind == .wifi {
+                    lines.append("\(Self.describe(wired)) reaches the NAS, but macOS routes it over Wi-Fi (check the service order in Network settings).")
+                }
             }
         } else if phase == .offline {
             lines.append(hasShareURL ? "The NAS share is not mounted. Click Connect." : "The NAS share is not mounted. Set its smb:// address in Settings → Locations.")
@@ -153,12 +213,24 @@ public struct NASConnectionStatus: Sendable, Equatable {
         }
         if let speedTestError { lines.append(speedTestError) }
         if let message { lines.append(message) }
+        if showsMultichannelHint { lines.append(Self.multichannelHint) }
         return lines.joined(separator: "\n")
+    }
+
+    /// "Ethernet 1 GbE — USB LAN (en7)".
+    static func describe(_ interface: NASNetworkInterface) -> String {
+        var kind = interface.kind == .other ? "Network" : interface.kind.displayName
+        if interface.kind.isWired, let speed = interface.linkSpeedMbps, speed > 0 {
+            kind += " \(NASInterfaceClassifier.linkSpeedLabel(mbps: speed))"
+        }
+        let name = interface.displayName.map { "\($0) (\(interface.bsdName))" } ?? interface.bsdName
+        return "\(kind) — \(name)"
     }
 }
 
-/// Connects the NAS share, watches which link its SMB session uses, moves
-/// it off Wi-Fi when a wired link is up, and runs the quick speed test.
+/// Connects the NAS share, watches which link its SMB session uses against
+/// the link the route to the NAS takes, moves the share onto the faster one
+/// when no job uses the NAS, and runs the quick speed test.
 /// An actor: every check and file operation runs off the main actor; the
 /// app observes `onChange`.
 public actor NASConnectionController {
@@ -188,6 +260,10 @@ public actor NASConnectionController {
     /// session it ran against (see `NASTrafficAttribution`).
     private var measured: (mountKey: String, interface: String)?
     private var waitTask: Task<Void, Never>?
+    /// The last switch stopped at a refused unmount (files open elsewhere).
+    private var unmountRefused = false
+    /// Before the one retry of a remount that found no answer.
+    private let remountRetryDelay: Duration
 
     public init(
         inspector: NASConnectionInspector = NASConnectionInspector(),
@@ -195,9 +271,11 @@ public actor NASConnectionController {
         speedTester: any NASSpeedTesting = NASSpeedTester(),
         limiter: NASReconnectRateLimiter = NASReconnectRateLimiter(),
         now: @escaping @Sendable () -> Date = Date.init,
+        remountRetryDelay: Duration = .seconds(3),
         isNASInUse: @escaping @Sendable () async -> Bool,
         onChange: @escaping @Sendable (NASConnectionStatus) -> Void
     ) {
+        self.remountRetryDelay = remountRetryDelay
         self.inspector = inspector
         self.mounter = mounter
         self.speedTester = speedTester
@@ -333,6 +411,34 @@ public actor NASConnectionController {
         }
     }
 
+    /// A safe point — nothing uses the NAS, or the job queue is between two
+    /// jobs and holds the next one: switch now when the policy says so. A
+    /// waiting "Switch now" request counts as the user's own.
+    public func switchAtSafePoint() async {
+        let userAsked = waitTask != nil
+        if userAsked {
+            waitTask?.cancel()
+            waitTask = nil
+            status.isWaitingToReconnect = false
+        }
+        // A reconnect or speed test already owns the share: return only once
+        // it is done, so whoever holds the job queue for this switch does
+        // not let the next job start on a share being remounted.
+        var waited: Duration = .zero
+        while isBusy, waited < Self.busyWait {
+            try? await Task.sleep(for: .milliseconds(250))
+            waited += .milliseconds(250)
+        }
+        guard !isBusy else { publish(); return }
+        await inspectNow()
+        guard !isBusy else { return }
+        if await evaluateGuard(userRequested: userAsked) == .reconnect {
+            await reconnect(userRequested: userAsked)
+        } else {
+            publish()
+        }
+    }
+
     public func cancelWaitingToReconnect() {
         waitTask?.cancel()
         waitTask = nil
@@ -403,29 +509,46 @@ public actor NASConnectionController {
     public func evaluateGuard(userRequested: Bool) async -> NASGuardDecision {
         let snapshot = status.snapshot
         guard let snapshot, snapshot.isMounted else {
-            if status.banner != nil { status.banner = nil; publish() }
+            if status.banner != nil || status.linkSwitchPending {
+                status.banner = nil
+                status.linkSwitchPending = false
+                publish()
+            }
             return .nothing
         }
-        let input = NASWiFiGuard.Input(
-            sessionKind: snapshot.sessionKind,
-            hasWiredRoute: snapshot.hasWiredRoute,
+        let input = NASLinkSwitchPolicy.Input(
+            link: snapshot.linkAssessment.state,
             nasInUse: await isNASInUse(),
-            automaticEnabled: settings?.automatic ?? false,
+            automaticEnabled: settings?.autoSwitchLink ?? false,
             hasShareAddress: canRemount(snapshot),
             userRequested: userRequested,
             limiter: limiter.verdict(now: now(), userRequested: userRequested)
         )
-        let decision = NASWiFiGuard.decide(input)
-        let banner: NASGuardBannerReason? = if case .banner(let reason) = decision { reason } else { nil }
-        if banner != status.banner {
+        let decision = NASLinkSwitchPolicy.decide(input)
+        var banner: NASGuardBannerReason? = if case .banner(let reason) = decision { reason } else { nil }
+        // The give-up and the pause after a refused unmount have one cause
+        // worth naming: another app holds files open on the share.
+        if unmountRefused, banner == .gaveUp || banner == .rateLimited { banner = .shareBusyElsewhere }
+        let pending = NASLinkSwitchPolicy.waitsOnlyForJobs(input)
+        if snapshot.linkAssessment.state != .fasterLinkAvailable {
+            // Nothing to move any more (the cable was pulled, or the share
+            // reconnected by itself): forget the last failure.
+            status.lastSwitchFailed = false
+            unmountRefused = false
+        }
+        if banner != status.banner || pending != status.linkSwitchPending {
             status.banner = banner
+            status.linkSwitchPending = pending
             publish()
         }
         return decision
     }
 
-    /// Unmount, remount, and verify the new session is wired. Counts as a
-    /// failure when any step fails or the session is still on Wi-Fi.
+    /// Unmount, remount, and verify the new session rides the link the
+    /// route uses. Counts as a failure when any step fails or the session
+    /// is still on the slower link. The unmount is a normal one: when any
+    /// app has a file open on the share, macOS refuses and the share stays
+    /// exactly as it was.
     @discardableResult
     public func reconnect(userRequested: Bool) async -> Bool {
         guard let settings, let url = settings.shareURL, let mountPoint = settings.mountPoint,
@@ -447,29 +570,42 @@ public actor NASConnectionController {
             publish()
             return false
         }
+        let target = status.fasterLinkName
         limiter.recordAttempt(at: now(), userRequested: userRequested)
         status.phase = .reconnecting
         status.message = nil
+        status.linkSwitchPending = false
         publish()
 
         do {
             try await mounter.unmount(mountPoint: mountPoint)
         } catch {
             limiter.recordFailure()
+            unmountRefused = true
+            status.lastSwitchFailed = true
             await inspectNow()
-            status.message = "Could not disconnect the NAS to reconnect it over Ethernet (a file on it may be open): \(error.localizedDescription)"
-            _ = await evaluateGuardBanner()
+            status.message = "The share stays on its current link: macOS would not disconnect it because another app (Finder, Time Machine, …) has files open on it. \(error.localizedDescription)"
+            status.banner = .shareBusyElsewhere
             publish()
             return false
         }
-        let (outcome, _) = await mounter.mountWithoutUI(url)
+        unmountRefused = false
+        var (outcome, _) = await mounter.mountWithoutUI(url)
         if case .needsUserInteraction = outcome {
             _ = await mounter.openInFinder(url)
         }
         await inspectNow()
+        if !status.snapshotIsMounted, outcome == .unreachable || outcome == .cancelled {
+            // The new link may still be settling (DHCP, routes): one more
+            // try a moment later, over whatever link the route takes then.
+            try? await Task.sleep(for: remountRetryDelay)
+            (outcome, _) = await mounter.mountWithoutUI(url)
+            await inspectNow()
+        }
         guard status.snapshotIsMounted else {
             limiter.recordFailure()
-            status.message = "The NAS was disconnected but did not mount again\(outcome == .unreachable ? " (it did not answer)" : ""). Use Connect to NAS…"
+            status.lastSwitchFailed = true
+            status.message = "The share was disconnected to move it to \(target) but did not mount again\(outcome == .unreachable ? " (the NAS did not answer)" : ""). Click Connect to mount it again."
             publish()
             return false
         }
@@ -479,26 +615,30 @@ public actor NASConnectionController {
         // Right after each reconnect; it also tells the link apart when the
         // socket list is hidden.
         if !(await isNASInUse()) { await runSpeedTest(onDemand: false, heldByCaller: true) }
-        guard let kind = status.snapshot?.sessionKind else {
+        let assessment = status.linkAssessment
+        switch assessment.state {
+        case .matched, .sessionOnFasterLink:
+            limiter.recordSuccess()
+            status.lastSwitchFailed = false
+            status.banner = nil
+            status.message = "Reconnected the NAS over \(status.linkLabel)."
+            publish()
+            return true
+        case .unknown:
             // Mounted again, link not verifiable (the test was skipped or
             // inconclusive): neither a success nor a failure.
             status.message = "Reconnected the NAS; could not confirm which link it uses."
             status.banner = nil
             publish()
             return false
-        }
-        if kind.isWired {
-            limiter.recordSuccess()
-            status.banner = nil
-            status.message = "Reconnected the NAS over \(status.linkLabel)."
+        case .fasterLinkAvailable:
+            limiter.recordFailure()
+            status.lastSwitchFailed = true
+            status.message = "Reconnected, but the share is still on \(assessment.session.map { $0.kind.displayName } ?? "the slower link")."
+            _ = await evaluateGuardBanner()
             publish()
-            return true
+            return false
         }
-        limiter.recordFailure()
-        status.message = "Reconnected, but the NAS session is still not on the wired link."
-        _ = await evaluateGuardBanner()
-        publish()
-        return false
     }
 
     // MARK: - Internals

@@ -7,6 +7,8 @@ public enum NASGuardTrigger: String, Sendable, Equatable {
     case networkChange
     case mounted
     case jobStart
+    /// No job uses the NAS any more, or the job queue is between jobs.
+    case jobBoundary
     case userRequested
 }
 
@@ -14,15 +16,19 @@ public enum NASGuardTrigger: String, Sendable, Equatable {
 public enum NASGuardBannerReason: String, Sendable, Equatable {
     /// A job is using the NAS, or the app has NAS files open.
     case nasInUse
-    /// Two reconnects in a row did not move the session to a wired link.
+    /// Two reconnects in a row did not move the session to the faster link.
     case gaveUp
     /// A reconnect ran moments ago; the next automatic one waits.
     case rateLimited
-    /// "Connect to the NAS automatically" is off.
+    /// "Switch the NAS share to the faster link automatically" is off.
     case automaticOff
     /// No SMB address is configured, so an unmounted share could not be
     /// mounted again.
     case noShareAddress
+    /// macOS refused the (normal, never forced) unmount: Finder, Time
+    /// Machine or another app has files open on the share. It stays where
+    /// it is until they let go.
+    case shareBusyElsewhere
 }
 
 public enum NASGuardDecision: Sendable, Equatable {
@@ -30,7 +36,7 @@ public enum NASGuardDecision: Sendable, Equatable {
     case nothing
     /// Unmount and remount now.
     case reconnect
-    /// Show "NAS is connected over Wi-Fi (slow). Reconnect over Ethernet".
+    /// Show "Ethernet available · share still on Wi-Fi" with its reason.
     case banner(NASGuardBannerReason)
 }
 
@@ -77,29 +83,30 @@ public struct NASReconnectRateLimiter: Sendable, Equatable {
     }
 }
 
-public enum NASWiFiGuard {
+/// Should the share be reconnected now to move its SMB session onto the
+/// faster link the route to the NAS already uses? The whole decision, with
+/// every input passed in.
+public enum NASLinkSwitchPolicy {
     public struct Input: Sendable, Equatable {
-        /// The session's link, nil when not mounted or not pinned down.
-        public var sessionKind: NASInterfaceKind?
-        public var hasWiredRoute: Bool
-        /// A NAS job is running or the app has NAS files open.
+        /// The route to the NAS against the session's link.
+        public var link: NASLinkAssessment.State
+        /// A NAS job is running (mid-file) — never interrupted.
         public var nasInUse: Bool
+        /// "Switch the NAS share to the faster link automatically".
         public var automaticEnabled: Bool
         public var hasShareAddress: Bool
         public var userRequested: Bool
         public var limiter: NASReconnectRateLimiter.Verdict
 
         public init(
-            sessionKind: NASInterfaceKind?,
-            hasWiredRoute: Bool,
+            link: NASLinkAssessment.State,
             nasInUse: Bool,
             automaticEnabled: Bool,
             hasShareAddress: Bool,
             userRequested: Bool,
             limiter: NASReconnectRateLimiter.Verdict
         ) {
-            self.sessionKind = sessionKind
-            self.hasWiredRoute = hasWiredRoute
+            self.link = link
             self.nasInUse = nasInUse
             self.automaticEnabled = automaticEnabled
             self.hasShareAddress = hasShareAddress
@@ -110,22 +117,22 @@ public enum NASWiFiGuard {
 
     /// The whole policy, as a table:
     ///
-    /// | session             | wired route | → |
-    /// |---------------------|-------------|---|
-    /// | wired / other / nil | any         | nothing |
-    /// | Wi-Fi               | no          | nothing (Wi-Fi is the only way) |
-    /// | Wi-Fi               | yes         | the first match below |
+    /// | route vs session            | → |
+    /// |-----------------------------|---|
+    /// | matched / unknown           | nothing |
+    /// | route moved to slower link  | nothing (the SMB client follows) |
+    /// | route on a faster link      | the first match below |
     ///
     /// 1. no SMB address → banner(noShareAddress) — could not remount
     /// 2. NAS in use → banner(nasInUse) — even when the user asked; the
-    ///    banner's button waits for the jobs, then asks again
+    ///    switch waits for the jobs (or the queue's next job boundary)
     /// 3. user asked → reconnect
     /// 4. automatic off → banner(automaticOff)
     /// 5. limiter gave up → banner(gaveUp)
     /// 6. limiter too soon → banner(rateLimited)
     /// 7. otherwise → reconnect
     public static func decide(_ input: Input) -> NASGuardDecision {
-        guard input.sessionKind == .wifi, input.hasWiredRoute else { return .nothing }
+        guard input.link == .fasterLinkAvailable else { return .nothing }
         guard input.hasShareAddress else { return .banner(.noShareAddress) }
         if input.nasInUse { return .banner(.nasInUse) }
         if input.userRequested { return .reconnect }
@@ -135,6 +142,16 @@ public enum NASWiFiGuard {
         case .tooSoon: return .banner(.rateLimited)
         case .allowed: return .reconnect
         }
+    }
+
+    /// True when the only thing holding the switch back is a running job:
+    /// the app then waits for the job to end (or for the queue's next job
+    /// boundary) and switches by itself.
+    public static func waitsOnlyForJobs(_ input: Input) -> Bool {
+        guard input.nasInUse else { return false }
+        var idle = input
+        idle.nasInUse = false
+        return decide(idle) == .reconnect
     }
 }
 

@@ -34,6 +34,26 @@ final class StorageBottleneckAnalysisTests: XCTestCase {
         XCTAssertEqual(reading?.bottleneck.cause, .wifi)
     }
 
+    func testEthernetPluggedInButShareStillOnWiFiSaysSo() {
+        let buffer = makeTarget(id: "buffer", name: "Buffer Drive", roles: ["Buffer"], access: .readWrite)
+        let nas = makeTarget(id: "nas", name: "nas_share", roles: ["Photo Library"], access: .readWrite)
+        var context = linkContext(medium: .wifi, negotiatedMbps: 216, linkTypical: 9...18)
+        context.linkNote = "Ethernet available · share still on Wi-Fi"
+
+        let verdicts = StorageBottleneckAnalysis.verdicts(
+            targets: [buffer, nas],
+            results: ["buffer": result(read: 700e6, write: 640e6), "nas": result(read: 180e6, write: 190e6)],
+            contexts: ["nas": context],
+            transferQueue: nil
+        )
+
+        let archive = verdicts.first { $0.title == "Buffer → NAS" }
+        XCTAssertEqual(archive?.bottleneck.cause, .wifi)
+        XCTAssertTrue(archive?.bottleneck.detail.contains("share still on Wi-Fi") == true)
+        XCTAssertTrue(archive?.detail.hasPrefix("Ethernet available · share still on Wi-Fi") == true, archive?.detail ?? "")
+        XCTAssertFalse(archive?.detail.contains("Plug in Ethernet") == true, "the cable is already in")
+    }
+
     func testWiredNetworkIsTheBottleneckWhenDisksAreFaster() {
         let buffer = makeTarget(id: "buffer", name: "Buffer Drive", roles: ["Buffer"], access: .readWrite)
         let nas = makeTarget(id: "nas", name: "nas_share", roles: ["Photo Library"], access: .readWrite)

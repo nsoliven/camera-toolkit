@@ -309,6 +309,10 @@ final class DashboardModel {
     /// File jobs waiting for the job gate, oldest first; each is shown in
     /// `jobs` as queued until it starts (`enqueueFileJob`).
     @ObservationIgnored var queuedFileJobs: [QueuedFileJob] = []
+    /// Asked before the next queued file job starts; true keeps it waiting
+    /// (the NAS link switch runs at this job boundary and starts the queue
+    /// again when it is done). Never asked while a job runs.
+    @ObservationIgnored var holdQueuedFileJobs: (@MainActor () -> Bool)?
     @ObservationIgnored var jobHistoryFinishedOrder: [UUID] = []
     /// Increments when a recorded job ends, so the History list reloads.
     var jobHistoryRevision: Int = 0

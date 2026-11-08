@@ -211,16 +211,29 @@ final class NASConnectionControllerTests: XCTestCase {
         XCTAssertEqual(banner, .noShareAddress)
     }
 
-    func testAutomaticOffOnlyShowsTheBanner() async {
+    func testAutomaticSwitchOffOnlyShowsTheBanner() async {
+        let network = FakeNetwork(mounted: true, sessionOnWiFi: true)
+        let mounter = FakeMounter(network: network)
+        let controller = makeController(network: network, mounter: mounter)
+        var manual = settings
+        manual.automatic = false
+        manual.autoSwitchLink = false
+        await controller.start(settings: manual)
+        XCTAssertEqual(mounter.calls, [])
+        let banner = await controller.status.banner
+        XCTAssertEqual(banner, .automaticOff)
+    }
+
+    /// The two settings are separate: no auto-connect at launch does not
+    /// stop the link switch of a share the user mounted.
+    func testAutoConnectOffStillSwitchesTheLink() async {
         let network = FakeNetwork(mounted: true, sessionOnWiFi: true)
         let mounter = FakeMounter(network: network)
         let controller = makeController(network: network, mounter: mounter)
         var manual = settings
         manual.automatic = false
         await controller.start(settings: manual)
-        XCTAssertEqual(mounter.calls, [])
-        let banner = await controller.status.banner
-        XCTAssertEqual(banner, .automaticOff)
+        XCTAssertEqual(mounter.calls, ["unmount /Volumes/CTTestNAS", "mount smb://someone@nas.example/CTTestNAS"])
     }
 
     func testLaunchAutoConnectMountsWithoutUI() async {
@@ -345,6 +358,7 @@ final class FakeNetwork: NASNetworkProbing, @unchecked Sendable {
     private var _socketsHidden = false
     private var _sent: [String: UInt32] = ["en0": 4_294_000_000, "en7": 1_000]
     private var _mounts = 0
+    private var _primaryRoute: String? = "en7"
     let serverAddress: String
 
     init(mounted: Bool, sessionOnWiFi: Bool, serverAddress: String = "192.0.2.2") {
@@ -360,6 +374,9 @@ final class FakeNetwork: NASNetworkProbing, @unchecked Sendable {
     var scopedRoutes: Set<String> { get { lock.withLock { _scopedRoutes } } set { lock.withLock { _scopedRoutes = newValue } } }
     /// netstat lists nothing, as for a process macOS hides sockets from.
     var socketsHidden: Bool { get { lock.withLock { _socketsHidden } } set { lock.withLock { _socketsHidden = newValue } } }
+
+    /// The interface an unscoped `route get` names (nil: no route).
+    var primaryRoute: String? { get { lock.withLock { _primaryRoute } } set { lock.withLock { _primaryRoute = newValue } } }
 
     func noteMounted() { lock.withLock { _mounts += 1 } }
 
@@ -400,7 +417,7 @@ final class FakeNetwork: NASNetworkProbing, @unchecked Sendable {
     }
 
     func routeInterface(to address: String, scopedTo interface: String?) -> String? {
-        guard let interface else { return "en7" }
+        guard let interface else { return primaryRoute }
         return scopedRoutes.contains(interface) ? interface : nil
     }
 
@@ -414,6 +431,7 @@ final class FakeMounter: NASVolumeMounting, @unchecked Sendable {
     private var _remountOnWiFi = false
     private var _unmountFails = false
     private var _mountOutcome: NASMountOutcome = .mounted
+    private var _unreachableMounts = 0
 
     init(network: FakeNetwork) { self.network = network }
 
@@ -421,11 +439,19 @@ final class FakeMounter: NASVolumeMounting, @unchecked Sendable {
     var remountOnWiFi: Bool { get { lock.withLock { _remountOnWiFi } } set { lock.withLock { _remountOnWiFi = newValue } } }
     var unmountFails: Bool { get { lock.withLock { _unmountFails } } set { lock.withLock { _unmountFails = newValue } } }
     var mountOutcome: NASMountOutcome { get { lock.withLock { _mountOutcome } } set { lock.withLock { _mountOutcome = newValue } } }
+    /// The next this-many mounts find no answer, then they work again.
+    var unreachableMounts: Int { get { lock.withLock { _unreachableMounts } } set { lock.withLock { _unreachableMounts = newValue } } }
 
     private func record(_ call: String) { lock.withLock { _calls.append(call) } }
 
     func mountWithoutUI(_ url: URL) async -> (outcome: NASMountOutcome, mountPoints: [String]) {
         record("mount \(url.absoluteString)")
+        let unreachable: Bool = lock.withLock {
+            guard _unreachableMounts > 0 else { return false }
+            _unreachableMounts -= 1
+            return true
+        }
+        if unreachable { return (.unreachable, []) }
         let outcome = mountOutcome
         if outcome == .mounted {
             network.mounted = true

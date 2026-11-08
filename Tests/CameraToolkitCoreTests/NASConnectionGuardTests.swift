@@ -4,17 +4,15 @@ import XCTest
 
 final class NASConnectionGuardTests: XCTestCase {
     private func input(
-        session: NASInterfaceKind? = .wifi,
-        wired: Bool = true,
+        link: NASLinkAssessment.State = .fasterLinkAvailable,
         inUse: Bool = false,
         automatic: Bool = true,
         share: Bool = true,
         user: Bool = false,
         limiter: NASReconnectRateLimiter.Verdict = .allowed
-    ) -> NASWiFiGuard.Input {
-        NASWiFiGuard.Input(
-            sessionKind: session,
-            hasWiredRoute: wired,
+    ) -> NASLinkSwitchPolicy.Input {
+        NASLinkSwitchPolicy.Input(
+            link: link,
             nasInUse: inUse,
             automaticEnabled: automatic,
             hasShareAddress: share,
@@ -25,38 +23,46 @@ final class NASConnectionGuardTests: XCTestCase {
 
     // MARK: decision table
 
-    func testNothingUnlessOnWiFiWithAWiredRoute() {
-        for kind: NASInterfaceKind? in [.ethernet, .thunderbolt, .other, nil] {
-            XCTAssertEqual(NASWiFiGuard.decide(input(session: kind)), .nothing, "\(String(describing: kind))")
-            XCTAssertEqual(NASWiFiGuard.decide(input(session: kind, inUse: true, user: true)), .nothing)
+    func testNothingUnlessTheRouteUsesAFasterLink() {
+        for state: NASLinkAssessment.State in [.matched, .unknown, .sessionOnFasterLink] {
+            XCTAssertEqual(NASLinkSwitchPolicy.decide(input(link: state)), .nothing, state.rawValue)
+            XCTAssertEqual(NASLinkSwitchPolicy.decide(input(link: state, user: true)), .nothing, state.rawValue)
+            XCTAssertEqual(NASLinkSwitchPolicy.decide(input(link: state, inUse: true, user: true)), .nothing)
         }
-        XCTAssertEqual(NASWiFiGuard.decide(input(wired: false)), .nothing, "Wi-Fi is the only way there")
-        XCTAssertEqual(NASWiFiGuard.decide(input(wired: false, user: true)), .nothing)
+    }
+
+    func testOnlyARunningJobHoldsTheSwitchBack() {
+        XCTAssertTrue(NASLinkSwitchPolicy.waitsOnlyForJobs(input(inUse: true)))
+        XCTAssertFalse(NASLinkSwitchPolicy.waitsOnlyForJobs(input()), "idle: it switches now, nothing to wait for")
+        XCTAssertFalse(NASLinkSwitchPolicy.waitsOnlyForJobs(input(inUse: true, automatic: false)), "automatic off: no switch after the job either")
+        XCTAssertFalse(NASLinkSwitchPolicy.waitsOnlyForJobs(input(inUse: true, limiter: .gaveUp)))
+        XCTAssertFalse(NASLinkSwitchPolicy.waitsOnlyForJobs(input(link: .matched, inUse: true)))
+        XCTAssertFalse(NASLinkSwitchPolicy.waitsOnlyForJobs(input(inUse: true, share: false)))
     }
 
     func testWiFiWithWiredRouteReconnectsWhenIdle() {
-        XCTAssertEqual(NASWiFiGuard.decide(input()), .reconnect)
+        XCTAssertEqual(NASLinkSwitchPolicy.decide(input()), .reconnect)
     }
 
     func testBusyShowsTheBannerEvenWhenAsked() {
-        XCTAssertEqual(NASWiFiGuard.decide(input(inUse: true)), .banner(.nasInUse))
-        XCTAssertEqual(NASWiFiGuard.decide(input(inUse: true, user: true)), .banner(.nasInUse))
+        XCTAssertEqual(NASLinkSwitchPolicy.decide(input(inUse: true)), .banner(.nasInUse))
+        XCTAssertEqual(NASLinkSwitchPolicy.decide(input(inUse: true, user: true)), .banner(.nasInUse))
     }
 
     func testNoShareAddressCanNeverReconnect() {
-        XCTAssertEqual(NASWiFiGuard.decide(input(share: false)), .banner(.noShareAddress))
-        XCTAssertEqual(NASWiFiGuard.decide(input(share: false, user: true)), .banner(.noShareAddress))
+        XCTAssertEqual(NASLinkSwitchPolicy.decide(input(share: false)), .banner(.noShareAddress))
+        XCTAssertEqual(NASLinkSwitchPolicy.decide(input(share: false, user: true)), .banner(.noShareAddress))
     }
 
     func testAutomaticOffOnlyAllowsTheUser() {
-        XCTAssertEqual(NASWiFiGuard.decide(input(automatic: false)), .banner(.automaticOff))
-        XCTAssertEqual(NASWiFiGuard.decide(input(automatic: false, user: true)), .reconnect)
+        XCTAssertEqual(NASLinkSwitchPolicy.decide(input(automatic: false)), .banner(.automaticOff))
+        XCTAssertEqual(NASLinkSwitchPolicy.decide(input(automatic: false, user: true)), .reconnect)
     }
 
     func testLimiterVerdictsBecomeBanners() {
-        XCTAssertEqual(NASWiFiGuard.decide(input(limiter: .gaveUp)), .banner(.gaveUp))
-        XCTAssertEqual(NASWiFiGuard.decide(input(limiter: .tooSoon(until: Date()))), .banner(.rateLimited))
-        XCTAssertEqual(NASWiFiGuard.decide(input(user: true, limiter: .gaveUp)), .reconnect, "the button always tries once more")
+        XCTAssertEqual(NASLinkSwitchPolicy.decide(input(limiter: .gaveUp)), .banner(.gaveUp))
+        XCTAssertEqual(NASLinkSwitchPolicy.decide(input(limiter: .tooSoon(until: Date()))), .banner(.rateLimited))
+        XCTAssertEqual(NASLinkSwitchPolicy.decide(input(user: true, limiter: .gaveUp)), .reconnect, "the button always tries once more")
     }
 
     // MARK: rate limiting
@@ -143,9 +149,28 @@ final class NASConnectionGuardTests: XCTestCase {
         status.snapshot?.sessionInterfaces = [NASNetworkInterface(bsdName: "en0", kind: .wifi, linkSpeedMbps: 866)]
         status.speed = nil
         XCTAssertEqual(status.title, "NAS · Wi-Fi ⚠︎")
-        XCTAssertFalse(status.isOnSlowWiFi, "no wired route")
+        XCTAssertFalse(status.fasterLinkAvailable, "no route known")
+        status.snapshot?.routeInterface = NASNetworkInterface(bsdName: "en0", kind: .wifi, linkSpeedMbps: 866)
+        XCTAssertFalse(status.fasterLinkAvailable, "the route is the session's own link")
+        XCTAssertEqual(status.title, "NAS · Wi-Fi ⚠︎")
+
+        // Ethernet plugged in: the route moves at once, the session does not.
+        status.snapshot?.routeInterface = NASNetworkInterface(bsdName: "en7", kind: .ethernet, linkSpeedMbps: 1000)
         status.snapshot?.wiredRoutes = [NASNetworkInterface(bsdName: "en7", kind: .ethernet)]
-        XCTAssertTrue(status.isOnSlowWiFi)
+        XCTAssertTrue(status.fasterLinkAvailable)
+        XCTAssertEqual(status.title, "NAS · Ethernet available · share still on Wi-Fi")
+        XCTAssertEqual(status.fasterLinkName, "Ethernet")
+        XCTAssertTrue(status.showsMultichannelHint)
+        XCTAssertTrue(status.detail(now: Date()).contains("Route to the NAS: Ethernet 1 GbE — en7"))
+        XCTAssertTrue(status.detail(now: Date()).contains("SMB session: Wi-Fi — en0"))
+        XCTAssertTrue(status.detail(now: Date()).contains("multichannel"))
+        status.phase = .reconnecting
+        XCTAssertEqual(status.title, "NAS · Switching to Ethernet…")
+
+        // A multichannel session needs no hint.
+        status.phase = .connected
+        status.snapshot?.multichannel = true
+        XCTAssertFalse(status.showsMultichannelHint)
     }
 
     // MARK: temp-file cleanup
