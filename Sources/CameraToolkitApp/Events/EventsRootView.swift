@@ -73,24 +73,27 @@ struct EventsRootView: View {
                 .onGeometryChange(for: Double.self) { $0.size.width.rounded() } action: { width in
                     measuredSidebarWidth = width
                 }
+                // The footer (NAS line, Wi-Fi banner, Sync All, Jobs) is a
+                // fixed-height bar whose text, measured at zero width, made
+                // the column's minimum taller than the window during a NAS
+                // job — the whole window's content slid up under the title
+                // bar. See `pinnedSplitColumn`.
+                .pinnedSplitColumn()
                 .navigationSplitViewColumnWidth(
                     min: OrganizeChromeSizing.sidebarWidthRange.lowerBound,
                     ideal: initialSidebarWidth,
                     max: OrganizeChromeSizing.sidebarWidthRange.upperBound
                 )
         } detail: {
-            // minWidth 0 + clipped: a board too wide for the window is cut
+            // Pinned and clipped: a board too wide for the window is cut
             // on its own right edge instead of pushing the whole window
-            // wider and cutting the sidebar off on the left. minHeight 0
-            // does the same vertically: the split view measures this column
-            // at its minimum width, where the board's top bar wraps every
-            // chip and notice word onto its own line, and a column minimum
-            // taller than the window made the hosting view lay the whole
-            // split view out taller than the window — sidebar rows under
-            // the traffic lights, the storage strip under the toolbar.
+            // wider and cutting the sidebar off on the left, and a top bar
+            // that wraps every chip and notice word at zero width cannot
+            // make the column's minimum taller than the window (sidebar
+            // rows under the traffic lights, the storage strip under the
+            // toolbar). See `pinnedSplitColumn`.
             detail
-                .frame(minWidth: 0, maxWidth: .infinity, minHeight: 0, maxHeight: .infinity, alignment: .top)
-                .clipped()
+                .pinnedSplitColumn(clipped: true)
                 // On the detail column, outside the per-board `.id`, so the
                 // field keeps its text and focus across selection changes
                 // and each board's toolbar can place it.
@@ -106,6 +109,7 @@ struct EventsRootView: View {
         // laid the board out beneath the sidebar.
         .inspector(isPresented: inspectorPresented) {
             inspector
+                .pinnedSplitColumn()
                 .inspectorColumnWidth(min: 260, ideal: 300, max: 380)
         }
         // Return hands the keyboard back to the board.
@@ -905,7 +909,8 @@ private struct NASStatusFooterRow: View {
 
 /// "NAS is connected over Wi-Fi (slow)." with the button that waits for
 /// NAS jobs to finish and then reconnects over Ethernet. Never blocks.
-private struct NASWiFiBanner: View {
+/// Internal (not private) so the layout tests can measure it.
+struct NASWiFiBanner: View {
     let status: NASConnectionStatus
     let connection: NASConnectionModel
 
