@@ -35,16 +35,17 @@ final class TransferQueueWindowController: NSObject, NSWindowDelegate {
 struct TransferQueueView: View {
     @Bindable var model: DashboardModel
     @State private var showingSpeedGuide = false
-    @State private var monitor = JobActivityMonitor()
+    @State private var monitor: JobActivityMonitor
     @State private var history: JobHistoryBrowser
     @State private var selection: UUID?
 
     /// `history` is a seam for the snapshot harness, which hands in a
     /// reader it already loaded.
-    init(model: DashboardModel, selection: UUID? = nil, history: JobHistoryBrowser? = nil) {
+    init(model: DashboardModel, selection: UUID? = nil, history: JobHistoryBrowser? = nil, monitor: JobActivityMonitor? = nil) {
         self.model = model
         _history = State(initialValue: history ?? JobHistoryBrowser(model: model))
         _selection = State(initialValue: selection)
+        _monitor = State(initialValue: monitor ?? JobActivityMonitor())
     }
 
     /// Re-reads on selection and whenever a recorded job ends.
@@ -308,56 +309,183 @@ private struct JobDetailContainer: View {
 }
 
 /// The job list: waiting card batches, running jobs, then every past job
-/// by day.
+/// by day, with runs of identical clean jobs folded. Drawn rather than an
+/// `AppKit` source list so the selected row is a calm neutral highlight in
+/// every system accent colour, and a row's progress bar stays readable.
 private struct JobsSidebar: View {
     @Bindable var model: DashboardModel
     let sections: JobsList.Sections
     @Binding var selection: UUID?
     let message: String?
+    @State private var openRuns: Set<UUID> = []
 
     var body: some View {
-        List(selection: $selection) {
-            if !sections.running.isEmpty {
-                Section("Running") {
-                    ForEach(sections.running) { entry in
-                        JobListRow(entry: entry, live: model.jobs.first { $0.id == entry.id })
-                            .tag(entry.id)
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 1, pinnedViews: .sectionHeaders) {
+                    if !sections.running.isEmpty {
+                        Section {
+                            ForEach(sections.running) { entry in
+                                row(entry, live: model.jobs.first { $0.id == entry.id })
+                            }
+                        } header: {
+                            header("Running")
+                        }
+                    }
+                    // Waiting their turn, in the order they will start: card
+                    // copies saved for later, then any job the gate holds.
+                    if !model.pendingTransferBatches.isEmpty || !sections.queued.isEmpty {
+                        Section {
+                            ForEach(Array(model.pendingTransferBatches.enumerated()), id: \.element.id) { index, batch in
+                                pendingBatchRow(batch, position: index + 1)
+                                    .background(highlight(for: batch.id))
+                                    .contentShape(Rectangle())
+                                    .onTapGesture { selection = batch.id }
+                                    .id(batch.id)
+                            }
+                            ForEach(sections.queued) { entry in
+                                row(entry, live: model.jobs.first { $0.id == entry.id })
+                            }
+                        } header: {
+                            header(model.isBusy ? "Queued · starts after the current job" : "Queued")
+                        }
+                    }
+                    ForEach(sections.days) { day in
+                        Section {
+                            ForEach(day.items) { item in
+                                switch item {
+                                case .job(let entry):
+                                    row(entry, live: nil)
+                                case .run(let run):
+                                    runRow(run)
+                                    if isOpen(run) {
+                                        ForEach(run.entries) { entry in
+                                            row(entry, live: nil)
+                                                .padding(.leading, 12)
+                                        }
+                                    }
+                                }
+                            }
+                        } header: {
+                            header(day.title)
+                        }
+                    }
+                    if let message {
+                        Label(message, systemImage: "info.circle")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 8)
                     }
                 }
+                .padding(.horizontal, 8)
+                .padding(.bottom, 10)
             }
-            // Waiting their turn, in the order they will start: card copies
-            // saved for later, then any job the gate holds.
-            if !model.pendingTransferBatches.isEmpty || !sections.queued.isEmpty {
-                Section {
-                    ForEach(Array(model.pendingTransferBatches.enumerated()), id: \.element.id) { index, batch in
-                        pendingBatchRow(batch, position: index + 1)
-                            .tag(batch.id)
-                    }
-                    ForEach(sections.queued) { entry in
-                        JobListRow(entry: entry, live: model.jobs.first { $0.id == entry.id })
-                            .tag(entry.id)
-                    }
-                } header: {
-                    Text(model.isBusy ? "Queued · starts after the current job" : "Queued")
-                }
+            .focusable()
+            .focusEffectDisabled()
+            .onMoveCommand { direction in
+                move(direction)
+                if let selection { proxy.scrollTo(selection) }
             }
-            ForEach(sections.days) { day in
-                Section(day.title) {
-                    ForEach(day.entries) { entry in
-                        JobListRow(entry: entry, live: nil)
-                            .tag(entry.id)
-                    }
-                }
-            }
-            if let message {
-                Section {
-                    Label(message, systemImage: "info.circle")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+        }
+        .background(Color(nsColor: .windowBackgroundColor))
+    }
+
+    /// Selected rows are a neutral fill, so nothing here can read as an
+    /// error however the system accent is set.
+    @ViewBuilder
+    private func highlight(for id: UUID) -> some View {
+        if selection == id {
+            RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.09))
+        }
+    }
+
+    private func header(_ title: String) -> some View {
+        Text(title)
+            .font(.subheadline.weight(.semibold))
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 10)
+            .padding(.top, 10)
+            .padding(.bottom, 4)
+            .background(.bar)
+    }
+
+    private func row(_ entry: JobListEntry, live: JobSnapshot?) -> some View {
+        JobListRow(entry: entry, live: live)
+            .background(highlight(for: entry.id))
+            .contentShape(Rectangle())
+            .onTapGesture { selection = entry.id }
+            .accessibilityAddTraits(selection == entry.id ? [.isButton, .isSelected] : .isButton)
+            .id(entry.id)
+    }
+
+    private func isOpen(_ run: JobListRun) -> Bool {
+        openRuns.contains(run.id) || run.entries.contains { $0.id == selection }
+    }
+
+    /// "Copied queue to buffer  7" — what they are, how many, and when.
+    private func runRow(_ run: JobListRun) -> some View {
+        let open = isOpen(run)
+        return HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: open ? "chevron.down" : "chevron.right")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.tertiary)
+                .frame(width: 16)
+            Text(run.title)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Text(run.entries.count.formatted())
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 5)
+                .background(.quinary, in: Capsule())
+            Spacer(minLength: 4)
+            Text("\(run.oldestStart.formatted(date: .omitted, time: .shortened)) – \(run.newestStart.formatted(date: .omitted, time: .shortened))")
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .fixedSize()
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .contentShape(Rectangle())
+        .onTapGesture {
+            if openRuns.contains(run.id) { openRuns.remove(run.id) } else { openRuns.insert(run.id) }
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(.isButton)
+        .accessibilityHint(open ? "Hides these jobs" : "Lists these jobs")
+        .id(run.id)
+    }
+
+    /// The rows arrow keys walk, top to bottom; a closed run counts as its
+    /// newest job, and selecting that opens it.
+    private var visibleIDs: [UUID] {
+        var ids = sections.running.map(\.id) + model.pendingTransferBatches.map(\.id) + sections.queued.map(\.id)
+        for day in sections.days {
+            for item in day.items {
+                switch item {
+                case .job(let entry): ids.append(entry.id)
+                case .run(let run): ids.append(contentsOf: isOpen(run) ? run.entries.map(\.id) : [run.id])
                 }
             }
         }
-        .listStyle(.sidebar)
+        return ids
+    }
+
+    private func move(_ direction: MoveCommandDirection) {
+        let ids = visibleIDs
+        guard !ids.isEmpty else { return }
+        guard let current = selection, let index = ids.firstIndex(of: current) else {
+            selection = ids.first
+            return
+        }
+        switch direction {
+        case .up: selection = ids[max(index - 1, 0)]
+        case .down: selection = ids[min(index + 1, ids.count - 1)]
+        default: break
+        }
     }
 
     private func pendingBatchRow(_ batch: PendingTransferBatch, position: Int) -> some View {
@@ -382,22 +510,43 @@ private struct JobsSidebar: View {
             .buttonStyle(.borderless)
             .help("Remove this waiting batch. No files will be changed.")
         }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+    }
+}
+
+/// A thin determinate bar that stays visible on any row background.
+private struct JobRowProgressBar: View {
+    let fraction: Double
+
+    var body: some View {
+        GeometryReader { geometry in
+            ZStack(alignment: .leading) {
+                Capsule().fill(.quaternary)
+                Capsule().fill(.blue)
+                    .frame(width: geometry.size.width * min(max(fraction, 0), 1))
+            }
+        }
+        .frame(height: 3)
+        .accessibilityElement()
+        .accessibilityLabel("Progress")
+        .accessibilityValue(fraction.formatted(.percent.precision(.fractionLength(0))))
     }
 }
 
 /// One job in the list: what it was, and either its live progress or
-/// when it ran, how long, and what it moved.
+/// when it ran, how long, and what it moved. Status reads the same way on
+/// every row: blue while running, quiet when done, orange or red only when
+/// something needs a look.
 struct JobListRow: View {
     let entry: JobListEntry
     /// The session's job, for a running row's progress and current step.
     let live: JobSnapshot?
 
     var body: some View {
-        HStack(alignment: .top, spacing: 8) {
-            Image(systemName: symbol)
-                .symbolRenderingMode(.hierarchical)
-                .foregroundStyle(tint)
-                .frame(width: 18)
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            statusGlyph
+                .frame(width: 16)
             VStack(alignment: .leading, spacing: 3) {
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
                     Text(entry.title)
@@ -410,10 +559,10 @@ struct JobListRow: View {
                 }
                 switch entry.status {
                 case .running(let progress):
-                    ProgressView(value: progress)
-                        .controlSize(.small)
+                    JobRowProgressBar(fraction: progress)
+                        .padding(.vertical, 2)
                     Text(liveLine(progress))
-                        .font(.caption)
+                        .font(.caption.monospacedDigit())
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                 case .queued:
@@ -421,11 +570,11 @@ struct JobListRow: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 case .ended(let outcome):
-                    HStack(spacing: 4) {
-                        if outcome != .succeeded, let display = entry.display {
+                    HStack(spacing: 5) {
+                        if outcome != .succeeded || entry.display?.tone == .warning, let display = entry.display {
                             Text(display.label.replacingOccurrences(of: "Done · ", with: ""))
                                 .foregroundStyle(display.tone.color)
-                                .fontWeight(.semibold)
+                                .fontWeight(.medium)
                         }
                         Text(endedLine)
                             .foregroundStyle(.secondary)
@@ -435,7 +584,15 @@ struct JobListRow: View {
                 }
             }
         }
-        .padding(.vertical, 2)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+    }
+
+    private var statusGlyph: some View {
+        Image(systemName: symbol)
+            .font(.callout)
+            .symbolRenderingMode(.hierarchical)
+            .foregroundStyle(tint)
     }
 
     private var symbol: String {
@@ -448,15 +605,25 @@ struct JobListRow: View {
 
     private var tint: Color {
         switch entry.status {
-        case .queued, .running: .blue
-        case .ended(let outcome): entry.display?.tone.color ?? outcome.tint
+        case .queued: .secondary
+        case .running: .blue
+        case .ended(let outcome):
+            switch entry.display?.tone {
+            case .success, .neutral: .secondary
+            case .warning: .orange
+            case .failure: .red
+            case .running, nil: outcome.tint
+            }
         }
     }
 
-    /// "61% · Copying to NAS · DSC00001.ARW"
+    /// "61% · Copying to NAS · DSC00001.ARW", or for a scan in passes,
+    /// "50% · Pass 2 of 2 · Dogs".
     private func liveLine(_ progress: Double) -> String {
         var parts = [progress.formatted(.percent.precision(.fractionLength(0)))]
-        if let item = live?.telemetry?.activeItems.first {
+        if let label = live?.telemetry?.scanPass?.label {
+            parts.append(label)
+        } else if let item = live?.telemetry?.activeItems.first {
             parts.append("\(item.step) · \(item.name)")
         } else if let note = live?.note, !note.isEmpty {
             parts.append(note)

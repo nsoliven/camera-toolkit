@@ -120,11 +120,10 @@ final class ScanETATests: XCTestCase {
         XCTAssertTrue((43_900...44_200).contains(observed.totalFrames), "\(observed.totalFrames)")
 
         // The byte-rate path used to decay ×0.55 on every tick without a
-        // finished file and read 904 h here. It now measures between the
-        // counter's change points and holds the rate in between, so even
-        // this worst case stays in the right order of magnitude.
-        XCTAssertGreaterThan(observed.worstByteETA, 0)
-        XCTAssertLessThan(observed.worstByteETA, 3 * 3600, "the byte ETA no longer collapses between file completions")
+        // finished file and read 904 h here. A scan is measured in photos
+        // now, so that path has nothing to say about it; the time left
+        // comes from the frame plan below.
+        XCTAssertEqual(observed.worstByteETA, 0)
 
         // The work-unit estimate: remaining frames at ~12 frames/s.
         let estimate = try XCTUnwrap(monitor.remainingEstimate(for: observed.job))
@@ -134,7 +133,7 @@ final class ScanETATests: XCTestCase {
         let expected = Double(observed.totalFrames - observed.framesDone) / 12
         XCTAssertEqual(seconds, expected, accuracy: expected * 0.1)
         XCTAssertEqual(seconds / 3600, 1, accuracy: 0.1)
-        let text = JobActivityDetail.remainingText(estimate)
+        let text = try XCTUnwrap(JobActivityDetail.remainingText(estimate))
         XCTAssertTrue(text.hasPrefix("~1 h") || text.hasPrefix("~5"), text)
 
         // Progress is frames done over the plan (~3 %), not bytes.
@@ -148,7 +147,7 @@ final class ScanETATests: XCTestCase {
         let monitor = JobActivityMonitor()
         let observed = replay(until: 8, monitor: monitor)
         XCTAssertEqual(monitor.remainingEstimate(for: observed.job), .estimating)
-        XCTAssertEqual(JobActivityDetail.remainingText(.estimating), "estimating…")
+        XCTAssertNil(JobActivityDetail.remainingText(.estimating))
     }
 
     // MARK: - Formatting
