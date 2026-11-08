@@ -119,3 +119,46 @@ final class BoardNASListingTests: XCTestCase {
         func set(_ value: Bool) { lock.withLock { stored = value } }
     }
 }
+
+/// The first screen never waits for the capture-date cache to decode.
+final class CaptureDateCacheLoaderTests: XCTestCase {
+    @MainActor
+    func testTheFirstScreenAsksWithoutWaitingForADecodeInProgress() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("CaptureDateLoader-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let loader = EventsWorkspace.CaptureDateCacheLoader(url: root.appendingPathComponent("capture-dates.json")) { url in
+            entered.signal()
+            release.wait()
+            return CaptureDateCache(url: url)
+        }
+        XCTAssertNil(loader.cacheIfLoaded(), "nothing decoded yet")
+        let done = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            _ = loader.cache()
+            done.signal()
+        }
+        XCTAssertEqual(entered.wait(timeout: .now() + 10), .success)
+
+        let began = Date()
+        XCTAssertNil(loader.cacheIfLoaded(), "a decode in progress is not ready")
+        XCTAssertLessThan(Date().timeIntervalSince(began), 1)
+
+        release.signal()
+        XCTAssertEqual(done.wait(timeout: .now() + 10), .success)
+        XCTAssertNotNil(loader.cacheIfLoaded())
+    }
+
+    /// With no cache decoded when the board opens, the first screen and the build
+    /// behind it still deliver every file.
+    @MainActor
+    func testABoardOpensWithNothingDecodedYet() async throws {
+        let library = try MoveLibrary.make(.small)
+        defer { library.tearDown() }
+        library.workspace.wholeBoardFirstScreenLimit = 0
+        await library.workspace.refreshEvent(library.cityID)
+        XCTAssertEqual(library.workspace.eventStacks[library.cityID]?.flatMap(\.files).count, library.shape.city)
+    }
+}

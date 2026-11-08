@@ -1120,18 +1120,30 @@ final class EventsWorkspace {
     /// Thread-safe lazy loader for the capture-date cache.
     final class CaptureDateCacheLoader: @unchecked Sendable {
         private let url: URL
+        private let decode: @Sendable (URL) -> CaptureDateCache
         private let lock = NSLock()
         private var loaded: CaptureDateCache?
 
-        init(url: URL) { self.url = url }
+        init(url: URL, decode: @escaping @Sendable (URL) -> CaptureDateCache = { CaptureDateCache(url: $0) }) {
+            self.url = url
+            self.decode = decode
+        }
 
         func cache() -> CaptureDateCache {
             lock.lock()
             defer { lock.unlock() }
             if let loaded { return loaded }
-            let cache = CaptureDateCache(url: url)
+            let cache = decode(url)
             loaded = cache
             return cache
+        }
+
+        /// The cache if it is already decoded, without waiting for a decode
+        /// in progress (it holds the lock): nil means not ready yet.
+        func cacheIfLoaded() -> CaptureDateCache? {
+            guard lock.try() else { return nil }
+            defer { lock.unlock() }
+            return loaded
         }
     }
 
@@ -4360,7 +4372,10 @@ final class EventsWorkspace {
                 }
                 // Cache hits only — a miss is "no camera date" here, never a
                 // header read, so nothing on this pass can wait on a drive.
-                let items = OrganizeScanner.items(for: files, cache: cacheLoader.cache(), readMissingCaptureDates: false, pauseGate: gate).items
+                // Nor on the decode of the cache itself (up to 0.4 s at
+                // library scale): before it lands, the first screen goes by
+                // file times and the full build behind it brings the dates.
+                let items = OrganizeScanner.items(for: files, cache: cacheLoader.cacheIfLoaded(), readMissingCaptureDates: false, pauseGate: gate).items
                 return (
                     EventImpliedGrid(files: files, stacks: firstScreenStacking.stacks(for: items)),
                     family.count
