@@ -1950,8 +1950,9 @@ final class EventsWorkspace {
                 let plan = job.plan(isCancelled: { false })
                 let items = plan.clearable.filter { itemIDs.contains($0.id) }
                 let nasReachable = VolumeInfo.isAvailable(nasRoot, mountedVolumes: mountedProvider?() ?? VolumeInfo.mountedVolumePaths())
+                let driveName = plan.driveName ?? request.driveName
                 recorder?.setTotals(files: items.reduce(0) { $0 + $1.files.count }, bytes: items.reduce(0) { $0 + $1.byteCount })
-                let report = items.isEmpty
+                var report = items.isEmpty
                     ? CardClearReport()
                     : try CardClearService().clear(
                         items: items,
@@ -1959,7 +1960,9 @@ final class EventsWorkspace {
                         confirmation: confirmation,
                         progress: { update in
                             recorder?.observe(update)
-                            progress(DashboardModel.jobUpdate(from: update, notePrefix: "Clear from Card", command: ""))
+                            var job = DashboardModel.jobUpdate(from: update, notePrefix: "Clear from Card", command: "")
+                            job.note = CardClearWording.runningNote(update, driveName: driveName, nasReachable: nasReachable)
+                            progress(job)
                         },
                         fileSettled: { file in
                             let relative = file.sourcePath.hasPrefix(cardRoot + "/")
@@ -1984,6 +1987,8 @@ final class EventsWorkspace {
                         }
                     )
                 recorder?.notePhases(report.phases)
+                report.checks.driveName = driveName
+                recorder?.noteCardClearChecks(report.checks)
                 let dropped = itemIDs.subtracting(Set(items.map(\.id))).count
                 return CardClearOutcome(report: report, noLongerEligible: dropped)
             },

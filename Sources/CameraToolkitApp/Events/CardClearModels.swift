@@ -91,16 +91,100 @@ enum CardClearWording {
         return parts.joined(separator: " · ")
     }
 
-    static func sheetExplanation(_ request: CardClearRequest) -> String {
-        "Camera Toolkit checks every file again first: the copy on \(drive(request.driveName)) must still hash to exactly what Sync to NAS verified"
-            + (request.nasReachable ? ", the NAS copy is read again and must match it," : ",")
-            + " and the card file must hash the same as the drive copy. Only files that pass are permanently deleted from \(request.locationName). Anything that does not match stays on the card. The drive and NAS copies are not touched."
+    /// One copy the sheet shows being checked, in the order the job checks
+    /// them.
+    struct CheckLine: Equatable {
+        var systemImage: String
+        var title: String
+        var detail: String
+        /// True when the check is weaker than a fresh read (NAS unreachable).
+        var isWarning = false
     }
 
-    static func nasNote(_ request: CardClearRequest) -> String? {
-        request.nasReachable
-            ? nil
-            : "The NAS is not reachable now, so the NAS side relies on the SHA-256 that Sync to NAS recorded when it verified each copy."
+    /// The sheet's three checks: the drive copy, the NAS copy, the card file.
+    static func sheetChecks(_ request: CardClearRequest) -> [CheckLine] {
+        [
+            CheckLine(
+                systemImage: "externaldrive",
+                title: request.driveName ?? "Drive",
+                detail: "Re-read, must match the verified hash"
+            ),
+            request.nasReachable
+                ? CheckLine(systemImage: "server.rack", title: "NAS", detail: "Re-read, must match the drive copy")
+                : CheckLine(systemImage: "server.rack", title: "NAS", detail: "Using the hash recorded at sync — NAS not reachable", isWarning: true),
+            CheckLine(
+                systemImage: "sdcard",
+                title: request.locationName,
+                detail: "Must match the drive copy before it's deleted"
+            ),
+        ]
+    }
+
+    /// The rule above the checks, in one line.
+    static func sheetRule(_ request: CardClearRequest) -> String {
+        "Each file is deleted only when it is safe on both \(drive(request.driveName)) and the NAS."
+    }
+
+    /// Below the checks: what happens to anything that fails.
+    static let sheetFootnote = "Anything that does not match stays on the card. The drive and NAS copies are only read."
+
+    /// "Checking NAS copy · checked 40/165 on Buffer and the NAS ·
+    /// 38 cleared" — the running job's note, from the service's own step and
+    /// counters.
+    static func runningNote(_ update: FileOperationProgress, driveName: String?, nasReachable: Bool) -> String {
+        let telemetry = update.telemetry
+        let step = telemetry?.step ?? update.phase
+        let checked = telemetry?.counter(CardClearService.checkedCounter) ?? 0
+        let cleared = telemetry?.counter("Cleared") ?? 0
+        let skipped = telemetry?.counter("Skipped") ?? 0
+        let copies = nasReachable
+            ? "on \(drive(driveName)) and the NAS"
+            : "on \(drive(driveName)) and the recorded NAS hashes"
+        var parts = [step, "checked \(checked.formatted())/\(update.totalFiles.formatted()) \(copies)"]
+        if cleared > 0 || step == CardClearService.deletingStep {
+            parts.append("\(cleared.formatted()) cleared")
+        }
+        if skipped > 0 {
+            parts.append("\(skipped.formatted()) skipped")
+        }
+        return "Clear from Card: " + parts.joined(separator: " · ")
+    }
+
+    /// One copy's result: "165 matched on Buffer ✓", or "163/165 …"
+    /// when some did not.
+    private static func matched(_ count: Int, of checked: Int, on place: String) -> String {
+        count == checked
+            ? "\(count.formatted()) matched on \(place) ✓"
+            : "\(count.formatted())/\(checked.formatted()) matched on \(place)"
+    }
+
+    /// "165 matched on Buffer ✓ · 165 matched on the NAS ✓ · 165
+    /// cleared"; nil when nothing was checked.
+    static func checksLine(_ checks: CardClearChecks) -> String? {
+        guard checks.checked > 0 else { return nil }
+        var parts = [matched(checks.driveMatched, of: checks.checked, on: drive(checks.driveName))]
+        if checks.nasReread {
+            parts.append(matched(checks.nasMatched, of: checks.checked, on: "the NAS"))
+        } else {
+            parts.append("NAS not reachable — recorded hashes used")
+        }
+        parts.append("\(checks.cleared.formatted()) cleared")
+        return parts.joined(separator: " · ")
+    }
+
+    /// The finished job's per-copy results, one per copy, for its detail.
+    static func finishedChecks(_ checks: CardClearChecks) -> [CheckLine] {
+        guard checks.checked > 0 else { return [] }
+        func count(_ matched: Int) -> String {
+            matched == checks.checked ? "\(matched.formatted()) matched ✓" : "\(matched.formatted()) of \(checks.checked.formatted()) matched"
+        }
+        return [
+            CheckLine(systemImage: "externaldrive", title: checks.driveName ?? "Drive", detail: count(checks.driveMatched), isWarning: checks.driveMatched < checks.checked),
+            checks.nasReread
+                ? CheckLine(systemImage: "server.rack", title: "NAS", detail: count(checks.nasMatched), isWarning: checks.nasMatched < checks.checked)
+                : CheckLine(systemImage: "server.rack", title: "NAS", detail: "Not reachable — recorded hashes used", isWarning: true),
+            CheckLine(systemImage: "sdcard", title: "Card", detail: "\(checks.cleared.formatted()) cleared" + (checks.skipped > 0 ? " · \(checks.skipped.formatted()) stayed" : ""), isWarning: checks.skipped > 0),
+        ]
     }
 
     static func skippedNote(_ request: CardClearRequest) -> String? {
@@ -111,6 +195,9 @@ enum CardClearWording {
     static func summary(_ outcome: CardClearOutcome, locationName: String) -> String {
         let report = outcome.report
         var line = "Cleared \(report.cleared.count) file\(report.cleared.count == 1 ? "" : "s") (\(report.clearedBytes.formattedBytes)) from \(locationName) after re-checking their copies."
+        if let checks = checksLine(report.checks) {
+            line += " \(checks)."
+        }
         if !report.skipped.isEmpty {
             let reasons = Dictionary(grouping: report.skipped.values, by: { $0 })
                 .sorted { $0.value.count > $1.value.count }
@@ -121,8 +208,8 @@ enum CardClearWording {
         if outcome.noLongerEligible > 0 {
             line += " \(outcome.noLongerEligible) item\(outcome.noLongerEligible == 1 ? "" : "s") no longer qualified and stayed."
         }
-        if report.usedRecordedNASHashes, !report.cleared.isEmpty {
-            line += " The NAS was not reachable; its recorded verified hashes were used."
+        if report.usedRecordedNASHashes, report.checks.checked > 0 || !report.cleared.isEmpty {
+            line += " The NAS was not reachable, so the hashes Sync to NAS recorded were used instead of reading it again."
         }
         return line + " Drive and NAS copies were not touched."
     }
