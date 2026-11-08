@@ -31,6 +31,10 @@ final class NASPresenceBufferChangeTests: XCTestCase {
         configuration.savedEvents = [SavedCameraEvent(name: "Trip", eventDate: Date(), storagePolicy: .buffer)]
         let locations = EventStorageLocations(configuration: configuration)
         try FileManager.default.createDirectory(at: locations.nasRoot, withIntermediateDirectories: true)
+        // A file on the drive: with nothing to compare, the NAS is never listed.
+        let originals = locations.originalsRoot(for: configuration.savedEvents[0], deviceID: "sony-a7v", policy: .buffer)
+        try FileManager.default.createDirectory(at: originals, withIntermediateDirectories: true)
+        try Data([1]).write(to: originals.appendingPathComponent("DSC00001.ARW"))
         let context = NASPresenceContext(
             events: configuration.savedEvents,
             locations: locations,

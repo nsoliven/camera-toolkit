@@ -944,17 +944,24 @@ struct EventStorageSlots {
         let verified = counts.verifiedOnArchive
         let legacy = counts.onLegacyArchiveLayout
         let offline = counts.archiveOffline
+        // The NAS is connected but its listing failed or timed out.
+        let unknown = !offline && counts.archiveUnknown > 0
         let onDrive = counts.onEitherDrive
         // The presence index counts every file Sync to NAS would copy —
         // edits and sidecars too, which have no assignment here.
-        let indexedPending = workspace.nasPendingFamilyTotals(for: event.id)?.pendingFiles ?? 0
+        let familyTotals = workspace.nasPendingFamilyTotals(for: event.id)
+        let indexedPending = familyTotals?.pendingFiles ?? 0
+        // Only what a listing found absent is "not on the NAS yet".
+        let knownMissing = indexedPending - (familyTotals?.unknownFiles ?? 0)
         let detail: String
         if offline {
             detail = workspace.nasShareURL == nil ? "Connect the NAS share to sync" : "Not connected — Connect to NAS…"
+        } else if unknown {
+            detail = "Could not check the NAS just now — not known what is on it"
         } else if total > 0, verified == total, let date = counts.oldestArchiveVerification {
             detail = "On NAS ✓ verified \(date.formatted(date: .abbreviated, time: .shortened))"
-        } else if total > 0, onNAS == total, indexedPending > 0 {
-            detail = "On NAS · \(NASPendingText.files(indexedPending)) of edits or sidecars not on the NAS yet"
+        } else if total > 0, onNAS == total, knownMissing > 0 {
+            detail = "On NAS · \(NASPendingText.files(knownMissing)) of edits or sidecars not on the NAS yet"
         } else if total > 0, onNAS == total {
             detail = legacy > 0
                 ? "On NAS · \(legacy) in the old archive layout"
@@ -966,15 +973,17 @@ struct EventStorageSlots {
             title: "NAS",
             symbol: "server.rack",
             tint: .green,
-            value: presenceCounts == nil ? "Checking…" : (offline ? "Offline" : "\(onNAS) of \(total)"),
+            value: presenceCounts == nil ? "Checking…" : (offline ? "Offline" : (unknown ? "Unknown" : "\(onNAS) of \(total)")),
             detail: detail,
-            state: presenceCounts == nil ? .unknown : (offline ? .offline : (total > 0 && onNAS == total ? .complete : .partial))
+            state: presenceCounts == nil || unknown ? .unknown : (offline ? .offline : (total > 0 && onNAS == total ? .complete : .partial))
         ) {
             if offline {
                 if workspace.nasShareURL != nil {
                     Button("Connect to NAS…") { workspace.connectToNAS() }
                         .help("Open the configured NAS share so Finder mounts it")
                 }
+                checkAgainButton
+            } else if unknown {
                 checkAgainButton
             } else if onDrive > 0 || verified < onNAS || indexedPending > 0 {
                 Button("Sync to NAS") { workspace.syncToNAS(event.id) }

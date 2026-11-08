@@ -19,21 +19,26 @@ extension EventsWorkspace {
         let configuration = model.configuration
         let nasRoot = locations.nasRoot
         let gate = driveActivityGate
-        let work = Task.detached(priority: .utility) { () -> NASEventDiscoveryResult? in
+        let work = { Task.detached(priority: .utility) { () -> NASEventDiscoveryResult? in
             guard VolumeInfo.isAvailable(nasRoot) else { return NASEventDiscoveryResult() }
             guard gate.waitIfPaused(for: nasRoot, shouldStop: { Task.isCancelled }) else { return nil }
             let result = NASEventDiscovery.discover(configuration: configuration, isCancelled: { Task.isCancelled })
             return Task.isCancelled ? nil : result
-        }
+        } }
         nasDiscoveryTask = Task { @MainActor [weak self] in
+            // This walks the NAS: not while the board is painting.
+            await self?.waitForBoardIdle()
+            guard !Task.isCancelled else { return }
+            let running = work()
             let found = await withTaskCancellationHandler {
-                await work.value
+                await running.value
             } onCancel: {
-                work.cancel()
+                running.cancel()
             }
             guard let self, let found, !Task.isCancelled else { return }
             discoveredNASEvents = found.events
             nasDiscoveryProblems = found.problems
+            LaunchTrace.mark("discovery.nas", detail: "events=\(found.events.count) problems=\(found.problems.count)")
         }
     }
 

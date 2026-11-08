@@ -51,6 +51,7 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate, NSMenuIte
             DebugLog.shared.flush()
             exit(status)
         }
+        LaunchTrace.begin()
         CrashReporting.start()
         UserDefaults.standard.set(false, forKey: "NSQuitAlwaysKeepsWindows")
         let application = NSApplication.shared
@@ -93,7 +94,10 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate, NSMenuIte
         TrashWindowController.shared.onRestored = { report in
             CameraToolkitRuntime.workspace.reinstateTrashedAssignments(report)
         }
+        LaunchTrace.mark("launch.did_finish_launching")
+        CameraToolkitRuntime.workspace.buildAssignmentIndexOffMain()
         CameraToolkitMainWindow.shared.show(model: model)
+        LaunchTrace.mark("launch.window_shown")
         if model.transferQueue != nil || !model.pendingTransferBatches.isEmpty {
             TransferQueueWindowController.shared.show(model: model)
         }

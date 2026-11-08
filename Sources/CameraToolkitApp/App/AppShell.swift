@@ -1,4 +1,5 @@
 import AppKit
+import CameraToolkitCore
 import SwiftUI
 
 struct AppShell: View {
@@ -8,6 +9,7 @@ struct AppShell: View {
     var body: some View {
         EventsRootView(model: model, workspace: workspace)
             .onAppear {
+                LaunchTrace.markOnce("launch.shell_appear")
                 model.refreshAllIfStale(maxAge: 0)
                 workspace.observeVolumeChanges()
                 workspace.refreshConnectivity()
