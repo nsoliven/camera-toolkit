@@ -155,7 +155,7 @@ struct UnsortedBoardView: View {
                     onSplitItems: { items in
                         workspace.splitItems(items)
                     },
-                    orientationForFile: { workspace.displayTurns(for: $0) },
+                    orientationForFile: { workspace.savedTurns(for: $0) },
                     onRotate: { stack, delta in
                         workspace.rotateStack(stack, quarterTurnsCW: delta)
                     },
@@ -369,7 +369,7 @@ struct UnsortedBoardView: View {
             // event tag; a selected one is drawn at full strength.
             isDimmed: { workspace.isSorted($0) && !workspace.selectedStackIDs.contains($0.id) },
             badge: { _ in nil },
-            orientationForFile: { workspace.displayTurns(for: $0) },
+            orientationForFile: { workspace.savedTurns(for: $0) },
             onOpen: { stack, frame in
                 workspace.focus(stackID: stack.id)
                 previewFrameIndex = frame

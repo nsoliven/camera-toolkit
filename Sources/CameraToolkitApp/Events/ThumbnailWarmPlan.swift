@@ -65,7 +65,7 @@ enum ThumbnailWarmPlan {
             }
             for pairing in OrganizeFileClassifier.pair(files) where pairing.kind != .other {
                 guard let paths = sources[pairing.primary.path] else { continue }
-                let orientation = DisplayRotation.turns(for: pairing.primary, in: input.orientations)
+                let orientation = DisplayRotation.savedTurns(for: pairing.primary, in: input.orientations)
                 items.append(ThumbnailWarmer.Item(
                     key: ThumbnailDiskCache.key(
                         fileIdentity: ThumbnailDiskCache.fileIdentity(pairing.primary),

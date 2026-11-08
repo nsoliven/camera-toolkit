@@ -6,11 +6,24 @@ import ImageIO
 /// Decodes grid tiles and large previews off the main thread with a bounded
 /// queue and a cost-limited cache. RAW files use their embedded JPEG, so a
 /// tile never decodes sensor data.
+///
+/// An extracted RAW preview arrives unrotated, so the loader turns it by what
+/// the camera recorded, unless the photo has a saved rotation. The caller
+/// says which through `orientation`: nil for no saved entry, or the saved
+/// quarter-turns. `DisplayRotation` holds the rule.
 final class TileImageLoader: @unchecked Sendable {
     /// The app's one loader. A `var` only so a measurement test can install a
     /// loader whose `fileExists` and `willRead` hooks stand in for a slow
     /// network volume; nothing else assigns it.
     nonisolated(unsafe) static var shared = TileImageLoader(thumbnailCache: .appDefault)
+
+    /// A finished decode, already turned for display.
+    struct DecodedTile {
+        let image: CGImage
+        /// The camera turns a RAW's extracted preview was found with; nil for
+        /// every other kind of file.
+        let cameraTurns: Int?
+    }
 
     private final class Box {
         let image: CGImage
@@ -32,7 +45,7 @@ final class TileImageLoader: @unchecked Sendable {
         var result: CGImage?
 
         init(
-            url: URL, bucket: Int, orientation: Int, priority: Operation.QueuePriority, cacheKey: String,
+            url: URL, bucket: Int, orientation: Int?, priority: Operation.QueuePriority, cacheKey: String,
             gate: DriveActivityGate, willRead: @escaping @Sendable (URL) -> Void, disk: (cache: ThumbnailDiskCache, key: String)?
         ) {
             self.cacheKey = cacheKey
@@ -67,6 +80,11 @@ final class TileImageLoader: @unchecked Sendable {
     private var networkVolumes: [String: Bool] = [:]
     private let lock = NSLock()
     private var inFlight: [String: WaiterGroup] = [:]
+    /// What the camera recorded for each RAW this session has looked at, by
+    /// path, guarded by `lock`. One small entry per photo and never trimmed:
+    /// a preview on screen and the boxes drawn over it must agree on it for
+    /// as long as both are up.
+    private var cameraTurnsByPath: [String: Int] = [:]
     /// Decodes wait at this gate while a speed test is measuring the volume
     /// the file lives on — a tile read should never contend with, or pile
     /// onto, a drive the benchmark may be about to report as stalled.
@@ -190,10 +208,10 @@ final class TileImageLoader: @unchecked Sendable {
     /// window on a slow or stale network mount. A miss goes to `image`,
     /// which follows rename redirects on its own background path.
     ///
-    /// `orientation` is the display rotation in quarter-turns clockwise (see
-    /// `DisplayRotation`). It is part of the cache key so a rotated decode
-    /// never joins or reuses an unrotated one.
-    func cachedImage(for url: URL, maximumPixelSize: Int, orientation: Int = 0) -> CGImage? {
+    /// `orientation` is the saved rotation in quarter-turns clockwise, or nil
+    /// for none (see `DisplayRotation`). It is part of the cache key so a
+    /// rotated decode never joins or reuses an unrotated one.
+    func cachedImage(for url: URL, maximumPixelSize: Int, orientation: Int? = nil) -> CGImage? {
         let bucket = Self.bucket(for: maximumPixelSize)
         return store(for: bucket).object(forKey: key(url, bucket, orientation) as NSString)?.image
     }
@@ -218,7 +236,7 @@ final class TileImageLoader: @unchecked Sendable {
     func image(
         for url: URL,
         maximumPixelSize: Int,
-        orientation: Int = 0,
+        orientation: Int? = nil,
         priority: Operation.QueuePriority = .normal,
         timeout: Duration = TileImageLoader.waitTimeout,
         fileIdentity: String? = nil
@@ -277,7 +295,7 @@ final class TileImageLoader: @unchecked Sendable {
         cacheKey: String,
         url: URL,
         bucket: Int,
-        orientation: Int,
+        orientation: Int?,
         priority: Operation.QueuePriority,
         onNetwork: Bool = false,
         disk: (cache: ThumbnailDiskCache, key: String)? = nil
@@ -405,6 +423,9 @@ final class TileImageLoader: @unchecked Sendable {
         if inFlight[group.cacheKey] === group {
             inFlight.removeValue(forKey: group.cacheKey)
         }
+        if let turns = group.operation.cameraTurns {
+            recordCameraTurns(turns, at: group.operation.url.path)
+        }
         if let result {
             store(for: Self.bucket(for: group.operation.maximumPixelSize))
                 .setObject(Box(result), forKey: group.cacheKey as NSString, cost: result.bytesPerRow * result.height)
@@ -439,11 +460,14 @@ final class TileImageLoader: @unchecked Sendable {
                 redirects[key] = destination
             }
             redirects[source] = destination
+            if let turns = cameraTurnsByPath.removeValue(forKey: source) {
+                cameraTurnsByPath[destination] = turns
+            }
             let sourceURL = URL(filePath: source, directoryHint: .notDirectory)
             let destinationURL = URL(filePath: destination, directoryHint: .notDirectory)
             for bucket in Self.buckets {
                 let store = store(for: bucket)
-                for orientation in 0..<4 {
+                for orientation in Self.orientationVariants {
                     let oldKey = key(sourceURL, bucket, orientation)
                     let newKey = key(destinationURL, bucket, orientation)
                     if let box = store.object(forKey: oldKey as NSString) {
@@ -489,15 +513,94 @@ final class TileImageLoader: @unchecked Sendable {
         for url in urls {
             for bucket in Self.buckets {
                 let store = store(for: bucket)
-                for orientation in 0..<4 {
+                for orientation in Self.orientationVariants {
                     store.removeObject(forKey: key(url, bucket, orientation) as NSString)
                 }
             }
         }
     }
 
-    private func key(_ url: URL, _ bucket: Int, _ orientation: Int) -> String {
-        "\(url.path)#\(bucket)#\(DisplayRotation.normalized(orientation))"
+    private func key(_ url: URL, _ bucket: Int, _ orientation: Int?) -> String {
+        "\(url.path)#\(bucket)#\(DisplayRotation.requestToken(orientation))"
+    }
+
+    /// Every `orientation` a request can carry.
+    private static let orientationVariants: [Int?] = [nil, 0, 1, 2, 3]
+
+    // MARK: Camera turns
+
+    /// The turns the camera recorded, as far as this session knows: 0 for
+    /// anything but a RAW, nil for a RAW not read yet. A memory lookup with
+    /// no file access, so a view can ask while it draws. A decode records
+    /// this before it hands back a bitmap, so a photo on screen is known.
+    func knownCameraTurns(for url: URL) -> Int? {
+        guard DisplayRotation.hasCameraTurns(url) else { return 0 }
+        return lock.withLock {
+            var path = url.path
+            var hops = 0
+            while cameraTurnsByPath[path] == nil, let next = redirects[path], next != path, hops < 8 {
+                path = next
+                hops += 1
+            }
+            return cameraTurnsByPath[path]
+        }
+    }
+
+    /// Files a read under the file's current path, should a rename have
+    /// moved it while the read ran. Call with `lock` held.
+    private func recordCameraTurns(_ turns: Int, at path: String) {
+        var path = path
+        var hops = 0
+        while let next = redirects[path], next != path, hops < 8 {
+            path = next
+            hops += 1
+        }
+        cameraTurnsByPath[path] = turns
+    }
+
+    /// The turns a photo is drawn at: its saved entry, else the camera's.
+    func effectiveTurns(saved: Int?, for url: URL) -> Int {
+        DisplayRotation.effectiveTurns(saved: saved, camera: knownCameraTurns(for: url) ?? 0)
+    }
+
+    /// Reads the camera's turns of RAWs nothing has decoded yet, so Rotate
+    /// can step from what they will show. Reads happen on the decode queues,
+    /// never the caller's thread, and `timeout` releases the caller if a
+    /// volume stops answering; what could not be read stays unknown.
+    func learnCameraTurns(for urls: [URL], timeout: Duration = TileImageLoader.waitTimeout) async {
+        let unknown = urls.filter { knownCameraTurns(for: $0) == nil }
+        guard !unknown.isEmpty else { return }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            let resume = ResumeOnce(continuation)
+            // Choosing a queue can stat the volume, so even that is off the
+            // caller's thread.
+            DispatchQueue.global(qos: .userInitiated).async { [self] in
+                let finished = BlockOperation { resume() }
+                for url in unknown {
+                    let read = BlockOperation { [weak self] in self?.learnCameraTurns(at: url) }
+                    read.queuePriority = .high
+                    finished.addDependency(read)
+                    (isOnNetworkVolume(url) ? networkQueue : queue).addOperation(read)
+                }
+                queue.addOperation(finished)
+            }
+            let seconds = Double(timeout.components.seconds) + Double(timeout.components.attoseconds) / 1e18
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + seconds) { resume() }
+        }
+    }
+
+    private func learnCameraTurns(at url: URL) {
+        guard driveActivityGate.waitIfPaused(for: url) else { return }
+        let resolved = resolvedURL(for: url)
+        willRead(resolved)
+        do {
+            let preview = try EmbeddedJPEGPreviewExtractor().preview(from: resolved)
+            // No embedded JPEG: ImageIO turns the RAW itself as it decodes.
+            let turns = preview?.cameraQuarterTurns ?? 0
+            lock.withLock { recordCameraTurns(turns, at: resolved.path) }
+        } catch {
+            // Unreadable right now, so unknown: try again on the next look.
+        }
     }
 
     /// Thread QoS matching a queue priority: hero decodes get user-interactive
@@ -510,19 +613,27 @@ final class TileImageLoader: @unchecked Sendable {
         }
     }
 
-    static func decode(url: URL, maximumPixelSize: Int, orientation: Int = 0) -> CGImage? {
-        let image = decodeUnrotated(url: url, maximumPixelSize: maximumPixelSize)
-        guard let image, DisplayRotation.normalized(orientation) != 0 else { return image }
-        return DisplayRotation.rotate(image, quarterTurnsCW: orientation)
+    /// Decodes a photo and turns it for display: by its saved entry when
+    /// `orientation` carries one, else by what the camera recorded.
+    static func decode(url: URL, maximumPixelSize: Int, orientation: Int? = nil) -> DecodedTile? {
+        var cameraTurns: Int?
+        guard let image = decodeUnrotated(url: url, maximumPixelSize: maximumPixelSize, cameraTurns: &cameraTurns) else { return nil }
+        let turns = DisplayRotation.effectiveTurns(saved: orientation, camera: cameraTurns ?? 0)
+        return DecodedTile(image: DisplayRotation.rotate(image, quarterTurnsCW: turns), cameraTurns: cameraTurns)
     }
 
-    private static func decodeUnrotated(url: URL, maximumPixelSize: Int) -> CGImage? {
+    /// `cameraTurns` comes back set for a RAW alone: what its extracted
+    /// preview still needs, or 0 when ImageIO decoded the RAW itself and
+    /// already applied the rotation.
+    private static func decodeUnrotated(url: URL, maximumPixelSize: Int, cameraTurns: inout Int?) -> CGImage? {
         let ext = url.pathExtension.lowercased()
         if OrganizeFileClassifier.rawExtensions.contains(ext) {
+            cameraTurns = 0
             let preference: EmbeddedJPEGPreviewPreference = maximumPixelSize > 1_700 ? .fullSize : .thumbnail
             do {
-                if let data = try EmbeddedJPEGPreviewExtractor().jpegData(from: url, preference: preference),
-                   let image = PreviewImageDecoder.cgImage(data: data, maximumPixelSize: maximumPixelSize) {
+                if let preview = try EmbeddedJPEGPreviewExtractor().preview(from: url, preference: preference),
+                   let image = PreviewImageDecoder.cgImage(data: preview.data, maximumPixelSize: maximumPixelSize) {
+                    cameraTurns = preview.cameraQuarterTurns
                     return image
                 }
             } catch {
@@ -604,14 +715,16 @@ final class TileImageLoader: @unchecked Sendable {
 private final class TileDecodeOperation: Operation, @unchecked Sendable {
     let url: URL
     let maximumPixelSize: Int
-    let orientation: Int
+    let orientation: Int?
     let gate: DriveActivityGate
     let willRead: @Sendable (URL) -> Void
     let disk: (cache: ThumbnailDiskCache, key: String)?
     var result: CGImage?
+    /// The camera turns learned from this read, when it was a RAW.
+    var cameraTurns: Int?
 
     init(
-        url: URL, maximumPixelSize: Int, orientation: Int, gate: DriveActivityGate,
+        url: URL, maximumPixelSize: Int, orientation: Int?, gate: DriveActivityGate,
         willRead: @escaping @Sendable (URL) -> Void, disk: (cache: ThumbnailDiskCache, key: String)?
     ) {
         self.disk = disk
@@ -626,8 +739,9 @@ private final class TileDecodeOperation: Operation, @unchecked Sendable {
         guard !isCancelled else { return }
         // A thumbnail this Mac already made of a photo on another volume
         // is a small local read: no volume access, so nothing to wait for.
-        if let disk, let cached = disk.cache.image(forKey: disk.key) {
-            result = cached
+        if let disk, let cached = disk.cache.thumbnail(forKey: disk.key) {
+            result = cached.image
+            cameraTurns = cached.cameraTurns
             return
         }
         // Wait out a speed test measuring this volume rather than reading
@@ -646,11 +760,13 @@ private final class TileDecodeOperation: Operation, @unchecked Sendable {
         let start = ContinuousClock.now
         willRead(url)
         let size = DebugLog.fileSize(of: url)
-        result = autoreleasepool {
+        let decoded = autoreleasepool {
             TileImageLoader.decode(url: url, maximumPixelSize: maximumPixelSize, orientation: orientation)
         }
-        if let result, !isCancelled, let disk {
-            disk.cache.store(result, forKey: disk.key)
+        result = decoded?.image
+        cameraTurns = decoded?.cameraTurns
+        if let decoded, !isCancelled, let disk {
+            disk.cache.store(decoded.image, cameraTurns: decoded.cameraTurns, forKey: disk.key)
         }
         DebugLog.shared.log(
             "decode.finish",
@@ -662,5 +778,24 @@ private final class TileDecodeOperation: Operation, @unchecked Sendable {
             size: size,
             error: result == nil && !isCancelled ? "decode produced no image" : nil
         )
+    }
+}
+
+/// Resumes a continuation the first time it is called; a timeout and the
+/// work it guards can both finish, and a second resume would trap.
+private final class ResumeOnce: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    init(_ continuation: CheckedContinuation<Void, Never>) {
+        self.continuation = continuation
+    }
+
+    func callAsFunction() {
+        let waiting = lock.withLock {
+            defer { continuation = nil }
+            return continuation
+        }
+        waiting?.resume()
     }
 }

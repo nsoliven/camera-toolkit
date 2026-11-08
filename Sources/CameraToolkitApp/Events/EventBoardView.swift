@@ -123,7 +123,7 @@ struct EventBoardView: View {
                         onSplitItems: { items in
                             workspace.splitItems(items)
                         },
-                        orientationForFile: { workspace.displayTurns(for: $0) },
+                        orientationForFile: { workspace.savedTurns(for: $0) },
                         onRotate: { stack, delta in
                             workspace.rotateStack(stack, quarterTurnsCW: delta)
                         },
@@ -220,7 +220,7 @@ struct EventBoardView: View {
             editTagsForStack: { workspace.editTagList(for: $0, in: eventID) },
             isDimmed: { _ in false },
             badge: { workspace.badge(for: $0, in: eventID) },
-            orientationForFile: { workspace.displayTurns(for: $0) },
+            orientationForFile: { workspace.savedTurns(for: $0) },
             onOpen: { stack, frame in
                 workspace.focus(stackID: stack.id)
                 previewFrameIndex = frame
