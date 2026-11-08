@@ -128,6 +128,74 @@ final class ThumbnailDiskCacheTests: XCTestCase {
         XCTAssertTrue(stray.isEmpty, "temporary files are renamed into place, not left")
     }
 
+    func testEvictionNeverRemovesAJpegThatIsNotOneOfItsOwn() throws {
+        let folder = scratch("foreign")
+        let foreign = folder.appendingPathComponent("holiday.jpg")
+        try Data("keep".utf8).write(to: foreign)
+        let shard = folder.appendingPathComponent("ab", isDirectory: true)
+        try FileManager.default.createDirectory(at: shard, withIntermediateDirectories: true)
+        let misnamed = shard.appendingPathComponent("not-a-digest.jpg")
+        try Data("keep".utf8).write(to: misnamed)
+
+        let cache = ThumbnailDiskCache(folder: folder, byteLimit: 2_000)
+        for index in 0..<10 { cache.store(try makeImage(seed: UInt8(index)), forKey: "k\(index)") }
+        cache.flush()
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: foreign.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: misnamed.path))
+    }
+
+    func testEvictionNeverFollowsALinkOutOfTheCacheFolder() throws {
+        let folder = scratch("linked")
+        let outside = scratch("outside")
+        let name = String(repeating: "c", count: 64) + ".jpg"
+        let precious = outside.appendingPathComponent(name)
+        try Data(count: 50_000).write(to: precious)
+        // A shard that is really a link to somewhere else.
+        try FileManager.default.createSymbolicLink(at: folder.appendingPathComponent("cc", isDirectory: true), withDestinationURL: outside)
+        // And a "thumbnail" that is really a link to a file somewhere else.
+        let shard = folder.appendingPathComponent("dd", isDirectory: true)
+        try FileManager.default.createDirectory(at: shard, withIntermediateDirectories: true)
+        let otherPrecious = outside.appendingPathComponent("original.jpg")
+        try Data(count: 50_000).write(to: otherPrecious)
+        try FileManager.default.createSymbolicLink(at: shard.appendingPathComponent(String(repeating: "d", count: 64) + ".jpg"), withDestinationURL: otherPrecious)
+
+        let cache = ThumbnailDiskCache(folder: folder, byteLimit: 2_000)
+        for index in 0..<10 { cache.store(try makeImage(seed: UInt8(index)), forKey: "k\(index)") }
+        cache.flush()
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: precious.path), "a link never leads eviction out of the folder")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: otherPrecious.path))
+    }
+
+    func testTheDefaultLimitHoldsAWholeLibraryOfTilesAfterEviction() {
+        // 40,000 tiles of a high-end 85 KB each still fit in the 80% that
+        // eviction leaves.
+        XCTAssertGreaterThanOrEqual(ThumbnailDiskCache.defaultByteLimit / 5 * 4, 40_000 * 85 * 1_024)
+    }
+
+    func testNearLimitIsBelowWhereEvictionStarts() throws {
+        let probe = ThumbnailDiskCache(folder: scratch("near-probe"), byteLimit: 100_000_000)
+        let image = try makeImage()
+        probe.store(image, forKey: "size")
+        probe.flush()
+        let oneSize = probe.measuredBytes()
+
+        let cache = ThumbnailDiskCache(folder: scratch("near"), byteLimit: oneSize * 10)
+        XCTAssertFalse(cache.isNearLimit)
+        for index in 0..<9 { XCTAssertTrue(cache.storeAndWait(try makeImage(seed: UInt8(index)), forKey: "n\(index)")) }
+        XCTAssertTrue(cache.isNearLimit, "warming stops at 90%")
+        XCTAssertLessThan(cache.measuredBytes(), oneSize * 10, "and nothing has been evicted for it")
+    }
+
+    func testContainsIsAboutTheKeyAsked() throws {
+        let cache = ThumbnailDiskCache(folder: scratch("contains"), byteLimit: 10_000_000)
+        XCTAssertFalse(cache.contains(key: "a#512#0"))
+        XCTAssertTrue(cache.storeAndWait(try makeImage(), forKey: "a#512#0"))
+        XCTAssertTrue(cache.contains(key: "a#512#0"))
+        XCTAssertFalse(cache.contains(key: "b#512#0"))
+    }
+
     func testTheDefaultCacheLivesInCachesNeverInTheLibraryOrApplicationSupport() throws {
         let folder = try XCTUnwrap(ThumbnailDiskCache.appDefault).folder
         XCTAssertTrue(folder.path.contains("/Library/Caches/"), folder.path)
@@ -201,6 +269,35 @@ final class ThumbnailDiskCacheTests: XCTestCase {
         let again = await loader.image(for: renamed, maximumPixelSize: 512, fileIdentity: identity)
         XCTAssertNotNil(again)
         XCTAssertEqual(reads.count, 1, "the photo's name, size and time — not its folder — name its thumbnail")
+    }
+
+    func testATileReadFromTheBufferDriveIsKeptAndServesTheNASCopyLater() async throws {
+        let buffer = scratch("buffer")
+        let source = try makeJPEG(in: buffer, name: "DSC00005.JPG")
+        let identity = ThumbnailDiskCache.fileIdentity(file(source))
+        let reads = Reads()
+        let cache = ThumbnailDiskCache(folder: scratch("c-buffer"), byteLimit: 50_000_000)
+        let loader = TileImageLoader(
+            driveActivityGate: DriveActivityGate(),
+            willRead: { reads.note($0) },
+            purgesOnMemoryPressure: false,
+            thumbnailCache: cache,
+            networkVolumeCheck: { _ in false },
+            mountedVolumeCheck: { _ in true }
+        )
+
+        let first = await loader.image(for: source, maximumPixelSize: 512, fileIdentity: identity)
+        XCTAssertNotNil(first)
+        cache.flush()
+        XCTAssertGreaterThan(cache.measuredBytes(), 0, "a Buffer tile is saved")
+
+        // The drive is unplugged; the photo now lives on the NAS at another path.
+        let nas = scratch("nas").appendingPathComponent("DSC00005.JPG")
+        try FileManager.default.moveItem(at: source, to: nas)
+        loader.purgeForMemoryPressure()
+        let again = await loader.image(for: nas, maximumPixelSize: 512, fileIdentity: identity)
+        XCTAssertNotNil(again)
+        XCTAssertEqual(reads.count, 1, "the second look never read a volume")
     }
 
     func testNothingIsKeptForLocalFilesUnnamedPhotosOrBigDecodes() async throws {

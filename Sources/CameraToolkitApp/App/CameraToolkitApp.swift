@@ -98,6 +98,7 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate, NSMenuIte
         CameraToolkitRuntime.workspace.buildAssignmentIndexOffMain()
         CameraToolkitMainWindow.shared.show(model: model)
         LaunchTrace.mark("launch.window_shown")
+        ThumbnailWarmingCoordinator.startIfLive(workspace: CameraToolkitRuntime.workspace)
         if model.transferQueue != nil || !model.pendingTransferBatches.isEmpty {
             TransferQueueWindowController.shared.show(model: model)
         }
