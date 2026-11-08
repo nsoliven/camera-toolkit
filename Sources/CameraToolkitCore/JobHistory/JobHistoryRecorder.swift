@@ -327,6 +327,17 @@ public final class JobHistoryRecorder: @unchecked Sendable {
         }
     }
 
+    /// Clear from Card's per-copy check results, kept in the job's summary
+    /// so the finished job can show them.
+    public func noteCardClearChecks(_ checks: CardClearChecks) {
+        lock.withLock {
+            var summary = job.summary ?? JobHistorySummary()
+            summary.cardClearChecks = checks
+            job.summary = summary
+            jobChanged = true
+        }
+    }
+
     /// The job ended. `totals` are the job's final counters for jobs that
     /// did not pin their own. Everything buffered is written.
     public func finish(outcome: JobHistoryOutcome, note: String?, totals: Observation? = nil, endedAt: Date = Date()) {

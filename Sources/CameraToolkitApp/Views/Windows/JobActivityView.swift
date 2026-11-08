@@ -220,6 +220,12 @@ struct JobActivityDetail: View {
                     .textSelection(.enabled)
             }
             debugLines
+            if let checks = detail?.job.summary?.cardClearChecks, !isLive {
+                let lines = CardClearWording.finishedChecks(checks)
+                if !lines.isEmpty {
+                    CardClearChecksView(lines: lines, showsResults: true)
+                }
+            }
             if let job = detail?.job, !isLive {
                 JobIssueSection(job: job, items: detail?.items ?? [], showIssues: showIssues, compare: compare)
             }
@@ -587,6 +593,10 @@ private struct JobLiveActivity: View {
         case "copying to nas": .blue
         case "re-reading nas copy": .green
         case "hashing drive copy": .teal
+        case "checking drive copy": .teal
+        case "checking nas copy": .green
+        case "checking card file": .blue
+        case "deleting from card": .red
         default: .secondary
         }
     }

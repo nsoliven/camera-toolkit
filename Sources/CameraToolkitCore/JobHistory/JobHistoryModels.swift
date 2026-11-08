@@ -109,6 +109,8 @@ public struct JobHistorySummary: Codable, Equatable, Hashable, Sendable {
     public var foldersCreated: Int?
     /// The job's closing note — its summary line, or the error it failed on.
     public var note: String?
+    /// Clear from Card's per-copy check results; nil for every other job.
+    public var cardClearChecks: CardClearChecks?
 
     public init(
         phases: [JobPhaseTotal] = [],
@@ -118,7 +120,8 @@ public struct JobHistorySummary: Codable, Equatable, Hashable, Sendable {
         notAttempted: Int? = nil,
         hashMismatches: Int? = nil,
         foldersCreated: Int? = nil,
-        note: String? = nil
+        note: String? = nil,
+        cardClearChecks: CardClearChecks? = nil
     ) {
         self.phases = phases
         self.timings = timings
@@ -128,6 +131,7 @@ public struct JobHistorySummary: Codable, Equatable, Hashable, Sendable {
         self.hashMismatches = hashMismatches
         self.foldersCreated = foldersCreated
         self.note = note
+        self.cardClearChecks = cardClearChecks
     }
 
     public init(from decoder: Decoder) throws {
@@ -140,6 +144,7 @@ public struct JobHistorySummary: Codable, Equatable, Hashable, Sendable {
         hashMismatches = try container.decodeIfPresent(Int.self, forKey: .hashMismatches)
         foldersCreated = try container.decodeIfPresent(Int.self, forKey: .foldersCreated)
         note = try container.decodeIfPresent(String.self, forKey: .note)
+        cardClearChecks = try container.decodeIfPresent(CardClearChecks.self, forKey: .cardClearChecks)
     }
 }
 
