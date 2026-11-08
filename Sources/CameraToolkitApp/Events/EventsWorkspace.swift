@@ -889,6 +889,15 @@ final class EventsWorkspace {
     /// test can park on the archive URL to prove the grid paints before
     /// the NAS answers.
     @ObservationIgnored var presenceProbe: EventPresenceScanner.PresenceProbe?
+    /// Reads an event's NAS folder for the presence sweep; the SMB lister
+    /// when nil. A test that injected `presenceProbe` keeps its per-file
+    /// answers unless it sets this too.
+    @ObservationIgnored var presenceArchiveLister: EventArchiveListing.Lister?
+    /// How long the sweep waits for that listing before calling it failed.
+    @ObservationIgnored var presenceArchiveListingTimeout = EventArchiveListing.defaultTimeout
+    /// Runs in a refresh after the chips landed and before the burst Vision
+    /// pass. Test seam, nil in production.
+    @ObservationIgnored var beforeBurstVisionPass: (@Sendable () async -> Void)?
     /// Test seam: resolves one assignment's board path inside an event
     /// refresh — the first screen and the deferred build both go through
     /// it. Production joins the catalog-implied `Originals/<Camera>` path, pure
@@ -4084,10 +4093,14 @@ final class EventsWorkspace {
         let stacking = eventStacking()
         let catalogURL = URL(fileURLWithPath: DashboardModel.expandedPath(model.configuration.catalogDatabasePath))
         let probe = presenceProbe
+        let archiveLister = presenceArchiveLister ?? (presenceProbe == nil ? EventArchiveListing.smbLister : nil)
+        let archiveListingTimeout = presenceArchiveListingTimeout
+        let beforeVision = beforeBurstVisionPass
         let dateReadProbe = captureDateReadProbe
         let gate = driveActivityGate
-        // The NAS listing the sidebar counts from, when it is fresh: the
-        // sweep answers the NAS place from it instead of a stat per file.
+        // The NAS listing the sidebar counts from, when it is fresh and
+        // covers this family: the sweep answers the NAS place from it and
+        // does not list the folder itself.
         let archiveListing = nasPresence.boardListing()
 
         // The catalog state this pipeline proves itself against. A grid
@@ -4314,27 +4327,6 @@ final class EventsWorkspace {
                     unchanged: built.map { $0.stacks == published } ?? false
                 )
                 trace.mark("dated_grid", detail: "headers_read=\(canReadHeaders)")
-                // Burst pairs no scan compared yet (the card is gone, or this
-                // is a relaunch) get the Vision check here, from the same
-                // places the dates came from — after the dated board is up,
-                // so fingerprinting never holds it back. Only a change in
-                // grouping publishes again.
-                if canReadHeaders, !Task.isCancelled, let items = datedItems, let shown = built,
-                   stacking.needsVisualCheck(for: items) {
-                    let linked = stacking.stacks(for: items, computeMissingLinks: true, pauseGate: gate)
-                    if !Task.isCancelled, linked != shown.stacks {
-                        let regrouped = EventImpliedGrid(files: shown.files, stacks: linked)
-                        await applyEventBuild(
-                            eventID: eventID,
-                            generation: generation,
-                            revision: revisionAtStart,
-                            build: regrouped,
-                            datesRead: true,
-                            connectivity: connectivityRevisionAtStart
-                        )
-                        built = regrouped
-                    }
-                }
             }
 
             // The sweep. Its own utility task, joined through a continuation
@@ -4349,6 +4341,29 @@ final class EventsWorkspace {
                     nasRoot: locations.nasRoot.path,
                     prefixes: [locations.layout(for: event, deviceID: nil).mirrorEventFolderPath]
                 )
+                // One listing of the family's NAS folder answers the NAS
+                // place for every file — never a stat per file. A listing
+                // that fails or times out leaves those files unknown.
+                var sweepListing = archiveListing
+                var listingFailed = false
+                if let archiveLister, VolumeInfo.isAvailable(locations.nasRoot, mountedVolumes: mounted) {
+                    let folders = NASPresenceIndex.folders(for: members, locations: locations)
+                    if !EventArchiveListing.covers(archiveListing, folders: folders) {
+                        guard gate.waitIfPaused(for: locations.nasRoot, shouldStop: { Task.isCancelled }) else { return nil }
+                        let began = ContinuousClock.now
+                        switch EventArchiveListing.list(nasRoot: locations.nasRoot, folders: folders, timeout: archiveListingTimeout, lister: archiveLister) {
+                        case .listed(let listing):
+                            sweepListing = listing
+                            trace.mark("nas_listing", outcome: .ok, detail: "files=\(listing.entries.count) took=\(began.duration(to: .now))")
+                        case .failed(let reason):
+                            sweepListing = nil
+                            listingFailed = true
+                            trace.mark("nas_listing", outcome: .error, detail: reason)
+                        case .cancelled:
+                            return nil
+                        }
+                    }
+                }
                 for member in members {
                     guard !Task.isCancelled else { return nil }
                     guard let memberSummary = EventPresenceScanner.scan(
@@ -4359,7 +4374,8 @@ final class EventsWorkspace {
                         probe: probe,
                         pauseGate: gate,
                         nasFacts: nasFacts,
-                        archiveListing: archiveListing
+                        archiveListing: sweepListing,
+                        archiveListingFailed: listingFailed
                     ) else { return nil }
                     memberSummaries[member.id] = memberSummary
                 }
@@ -4385,7 +4401,8 @@ final class EventsWorkspace {
                         // its NAS mirror path (the permanent library), its
                         // tile blank until a place answers. Only files every
                         // reachable place says are missing leave the grid.
-                        guard asset.drive == .unavailable || asset.otherDrive == .unavailable || asset.archive == .unavailable,
+                        guard asset.drive == .unavailable || asset.otherDrive == .unavailable
+                            || asset.archive == .unavailable || asset.archive == .unknown,
                               let mirror = implied.path(for: asset.assignment, driveUp: false) else { continue }
                         sweptFiles.append(OrganizeFile(literalPath: mirror, size: asset.assignment.fileSize, modifiedAt: asset.assignment.modifiedAt))
                         byPath[mirror.lowercased()] = asset
@@ -4420,15 +4437,42 @@ final class EventsWorkspace {
                 sweepTask.cancel()
             }
             trace.mark("sweep_done", outcome: output == nil ? .cancel : .ok, detail: "files=\(output?.summary.total ?? 0)")
+            // A reused grid verifies against what it shows: the sweep
+            // restacks only when the files on disk are not the files on the
+            // board. Order does not matter — the baseline for a reused grid
+            // is the board's own files in stack order — but how many times
+            // each file is drawn does: a tile drawn twice is put right too.
+            let boardFiles = built?.files ?? existingStacks?.flatMap(\.files) ?? []
+            let filesMatch = output.map { $0.files.map(\.pathKey).sorted() == boardFiles.map(\.pathKey).sorted() } ?? true
+            // The chips first: nothing below can hold them back.
+            await publishPresence(eventID: eventID, generation: generation, revision: revisionAtStart, trace: trace, output: output)
+            await beforeVision?()
+            // Burst pairs no scan compared yet (the card is gone, or this is
+            // a relaunch) get the Vision check here, from the same places
+            // the dates came from — after the chips are up, so fingerprinting
+            // holds back neither them nor the dated board. Only a change in
+            // grouping publishes again. A board about to be restacked onto
+            // other paths does this as part of that restack.
+            if filesMatch, output != nil, canReadHeaders, !Task.isCancelled, let items = datedItems, let shown = built,
+               stacking.needsVisualCheck(for: items) {
+                let linked = stacking.stacks(for: items, computeMissingLinks: true, pauseGate: gate)
+                trace.mark("burst_vision")
+                if !Task.isCancelled, linked != shown.stacks {
+                    await applyEventBuild(
+                        eventID: eventID,
+                        generation: generation,
+                        revision: revisionAtStart,
+                        build: EventImpliedGrid(files: shown.files, stacks: linked),
+                        datesRead: true,
+                        connectivity: connectivityRevisionAtStart
+                    )
+                }
+            }
             await finishPresenceSweep(
                 eventID: eventID,
                 generation: generation,
                 revision: revisionAtStart,
-                trace: trace,
-                // A reused grid verifies against what it shows: the sweep
-                // restacks only when the files on disk are not the files
-                // on the board.
-                builtFiles: built?.files ?? existingStacks?.flatMap(\.files),
+                filesMatch: filesMatch,
                 output: output
             )
         }
@@ -4560,17 +4604,33 @@ final class EventsWorkspace {
         if pendingDateReads == 0 { refreshEditTags(for: eventID) }
     }
 
-    /// Main-actor landing point for the utility-priority sweep. Publishes
-    /// the storage chips and badge index, rebuilds the grid only when the
-    /// truthful paths differ from what the implied build drew, and wakes
-    /// the `refreshEvent` calls waiting on this pass. Stale generations
-    /// only resume their waiters — their results are dropped.
+    /// The storage chips and the badge index from a finished sweep, on the
+    /// main actor and as soon as the sweep is done — ahead of the burst
+    /// Vision pass. A stale generation or a board patched since drops them:
+    /// `finishPresenceSweep` reads that board again.
+    private func publishPresence(eventID: UUID, generation: UUID, revision: Int, trace: BoardOpenTrace, output: EventRefreshOutput?) {
+        guard refreshGenerations[eventID] == generation,
+              (eventGridRevisions[eventID] ?? -1) <= revision,
+              let output else { return }
+        eventAssetsByPathKey[eventID] = output.assetsByPathKey
+        fileFacts.touchAll()
+        presence[eventID] = output.summary
+        for (memberID, memberSummary) in output.memberSummaries {
+            presence[memberID] = memberSummary
+        }
+        eventImmichStatuses[eventID] = output.immich
+        trace.mark("chips_resolved", detail: "on_nas=\(output.summary.onArchive) unknown=\(output.summary.counts.archiveUnknown) of=\(output.summary.total)")
+    }
+
+    /// Main-actor landing point for the end of the pipeline: rebuilds the
+    /// grid only when the truthful paths differ from what the implied build
+    /// drew, and wakes the `refreshEvent` calls waiting on this pass. Stale
+    /// generations only resume their waiters — their results are dropped.
     private func finishPresenceSweep(
         eventID: UUID,
         generation: UUID,
         revision: Int,
-        trace: BoardOpenTrace,
-        builtFiles: [OrganizeFile]?,
+        filesMatch: Bool,
         output: EventRefreshOutput?
     ) async {
         defer { resumePresenceWaiters(for: eventID, appliedGeneration: generation) }
@@ -4605,21 +4665,7 @@ final class EventsWorkspace {
             Task { await refreshEvent(eventID) }
             return
         }
-        guard let output else { return }
-
-        eventAssetsByPathKey[eventID] = output.assetsByPathKey
-        fileFacts.touchAll()
-        presence[eventID] = output.summary
-        for (memberID, memberSummary) in output.memberSummaries {
-            presence[memberID] = memberSummary
-        }
-        eventImmichStatuses[eventID] = output.immich
-        trace.mark("chips_resolved", detail: "on_nas=\(output.summary.onArchive) of=\(output.summary.total)")
-        // Order does not matter — the baseline for a reused grid is the
-        // board's own files in stack order — but how many times each file is
-        // drawn does: only "which files are on disk, once each" decides
-        // whether a restack is owed, so a tile drawn twice is put right too.
-        guard output.files.map(\.pathKey).sorted() != (builtFiles ?? []).map(\.pathKey).sorted() else { return }
+        guard let output, !filesMatch else { return }
 
         // Files resolved somewhere other than the implied Originals path —
         // restack onto the real ones. Continuation, not `task.value`, so
@@ -5523,6 +5569,7 @@ final class EventsWorkspace {
 
         var items: [EventMoveItem] = []
         var alreadyThere: [String] = []
+        var nasUnknown: [String] = []
         // Names this batch already brings in, with where that file is now,
         // so two incoming files with one name are compared with each other.
         var claimed: [String: String] = [:]
@@ -5559,6 +5606,11 @@ final class EventsWorkspace {
             // NAS copy owes the rename, or the file is lost to the event that
             // now owns it.
             var nasCopy: NASCopyMove?
+            // The NAS could not be listed: whether a copy there owes this
+            // rename is not known, so the catalog must not move without it.
+            if move == nil, asset.source != .present, asset.archive == .unknown {
+                nasUnknown.append((asset.assignment.relativePath as NSString).lastPathComponent)
+            }
             if move == nil, asset.archive == .present, !asset.archiveIsLegacyLayout, let archive = asset.archivePath,
                let target = paths.archiveURL(for: moved, event: to)?.path,
                let from = locations.nasRelativePath(archive), let toPath = locations.nasRelativePath(target) {
@@ -5585,6 +5637,10 @@ final class EventsWorkspace {
                 takenBy: takenBy,
                 nasCopy: nasCopy
             ))
+        }
+        guard nasUnknown.isEmpty else {
+            refuseMove(title, "Nothing moved — the NAS could not be checked just now and these files have no copy on a drive. Press Check Again on the NAS chip, then try again.", files: nasUnknown)
+            return
         }
         guard !items.isEmpty else {
             refuseMove(title, "Those files are already in \(eventTitle(to)). Nothing moved.", files: alreadyThere)
@@ -6208,7 +6264,9 @@ final class EventsWorkspace {
                     nasOnly: nil
                 )
             }
-            if asset.archive != .unavailable { asset.archive = .missing }
+            // The new path's NAS copy is yet to come — but a NAS nobody can
+            // answer for stays that way, it does not become "missing".
+            if asset.archive != .unavailable, asset.archive != .unknown { asset.archive = .missing }
             asset.archiveIsLegacyLayout = false
             asset.archiveVerifiedAt = nil
             replacements[oldID] = asset
@@ -6546,9 +6604,10 @@ final class EventsWorkspace {
                     continue
                 }
                 moves.append(DriveMove(sourcePath: driveCopy, destinationPath: source, byteCount: asset.assignment.fileSize))
-            } else if asset.source != .present, asset.archive == .present {
+            } else if asset.source != .present, asset.archive == .present || asset.archive == .unknown {
                 // Its only copy is on the NAS: dropping the assignment would
-                // leave a photo nothing in the app can show.
+                // leave a photo nothing in the app can show. A NAS that could
+                // not be listed just now might be holding that copy.
                 nasOnly += 1
                 continue
             }
