@@ -120,6 +120,18 @@ final class ScanPassDisplayTests: XCTestCase {
         XCTAssertEqual(readouts.first { $0.caption == "average" }?.value, "8.0", "the average is the graph's, over the work")
     }
 
+    func testPeakIsNeverBelowTheCurrentSpeed() {
+        let created = Date(timeIntervalSince1970: 1_790_000_000)
+        let job = scan(files: 100, total: 1_000, bytes: 4_000_000_000, totalBytes: 40_000_000_000, created: created)
+        let samples = (1...120).map {
+            JobHistorySample(t: Double($0), combined: 300, filesPerSecond: 8, doneBytes: Int64($0) * 30_000_000, doneFiles: $0 * 8)
+        }
+        let graph = JobSpeedGraph.build(samples: samples, kind: "faceScan", duration: 120)
+        let readout = JobThroughputReadout(unit: .filesPerSecond, current: 12.9, average: 0.2)
+        let readouts = JobDetailFacts.liveReadouts(readout, graph: graph, job: job)
+        XCTAssertEqual(readouts.first { $0.caption == "peak" }?.value, "12.9")
+    }
+
     func testAFinishedScanLeadsInPhotosEvenWithBytes() {
         let started = Date(timeIntervalSince1970: 1_790_000_000)
         let job = JobHistoryJob(kind: "faceScan", title: "Face scan: Trip 2026", startedAt: started, endedAt: started.addingTimeInterval(120), outcome: .succeeded, totalFiles: 960, totalBytes: 40_000_000_000, bytesDone: 40_000_000_000)

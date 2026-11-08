@@ -69,7 +69,12 @@ enum JobDetailFacts {
                 ? "Photos finished over the time spent reading them, across every pass"
                 : "Everything this job has moved, over its elapsed time" + (combined ? ", all parallel transfers together" : "")
         ))
-        if let peak = peakReadout(graph, kind: job.action.rawValue) { result.append(peak) }
+        // "Now" is smoothed differently from the recorded samples, so it can
+        // run ahead of them; a peak below the current speed makes no sense.
+        let nowMatchesGraph = bytes == (graph.metric == .megabytesPerSecond)
+        if let peak = peakReadout(graph, kind: job.action.rawValue, atLeast: running && nowMatchesGraph ? readout.current : nil) {
+            result.append(peak)
+        }
         if let files = readout.filesPerSecond {
             result.append(JobReadout(
                 caption: "files", value: JobThroughputFormat.itemRate(files), unit: filesUnit(job.action.rawValue),
@@ -114,11 +119,12 @@ enum JobDetailFacts {
         return result
     }
 
-    static func peakReadout(_ graph: JobSpeedGraph, kind: String) -> JobReadout? {
+    static func peakReadout(_ graph: JobSpeedGraph, kind: String, atLeast floor: Double? = nil) -> JobReadout? {
         guard graph.summary == nil, let peak = graph.peak, let metric = graph.metric else { return nil }
+        let value = max(peak.value, floor ?? peak.value)
         return JobReadout(
             caption: "peak",
-            value: metric == .megabytesPerSecond ? JobThroughputFormat.rate(peak.value) : JobThroughputFormat.itemRate(peak.value),
+            value: metric == .megabytesPerSecond ? JobThroughputFormat.rate(value) : JobThroughputFormat.itemRate(value),
             unit: metric == .megabytesPerSecond ? metric.unit : filesUnit(kind),
             help: "The fastest stretch, at \(JobActivityDetail.durationText(peak.t)) — each sample spans about five seconds"
         )
