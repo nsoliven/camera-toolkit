@@ -13,6 +13,48 @@ public enum FaceImageDecoder {
         BurstVisualLinker.previewImage(for: url, maximumPixelSize: maximumPixelSize)
     }
 
+    /// A bounded decode for the pet detector, stood upright: a RAW's
+    /// embedded JPEG turned by the camera's rotation, read in the one walk
+    /// of the file that fetches the JPEG. Ordinary photos — and RAWs ImageIO
+    /// decodes itself — are already upright, so their turn is 0. Nil when
+    /// nothing could be read or the turn could not be applied.
+    public static func uprightDetectionImage(for url: URL, maximumPixelSize: Int) -> UprightDetectionImage? {
+        if OrganizeFileClassifier.rawExtensions.contains(url.pathExtension.lowercased()),
+           let preview = try? EmbeddedJPEGPreviewExtractor().preview(from: url, preference: .fullSize),
+           let source = CGImageSourceCreateWithData(preview.data as CFData, nil),
+           let decoded = BurstVisualLinker.thumbnail(source: source, maximumPixelSize: maximumPixelSize) {
+            let turns = DisplayRotation.normalized(preview.cameraQuarterTurns)
+            let upright = DisplayRotation.rotate(decoded, quarterTurnsCW: turns)
+            // `rotate` hands back its input when a bitmap cannot be made;
+            // detecting on that would store boxes in the wrong space.
+            guard turns == 0 || upright !== decoded else { return nil }
+            return UprightDetectionImage(
+                image: upright,
+                storedPixelSize: sourceSize(source) ?? CGSize(width: decoded.width, height: decoded.height),
+                cameraTurns: turns
+            )
+        }
+        guard let image = detectionImage(for: url, maximumPixelSize: maximumPixelSize) else { return nil }
+        return UprightDetectionImage(
+            image: image,
+            storedPixelSize: pixelSize(of: url) ?? CGSize(width: image.width, height: image.height),
+            cameraTurns: 0
+        )
+    }
+
+    /// The camera's rotation of a RAW, from the smallest useful preview so a
+    /// NAS file costs one short read: 0 for a RAW with no embedded JPEG
+    /// (ImageIO decodes those upright), nil when the file cannot be read.
+    /// Blocking I/O — call it off the main actor.
+    public static func cameraQuarterTurns(for url: URL) -> Int? {
+        do {
+            let preview = try EmbeddedJPEGPreviewExtractor().preview(from: url, preference: .thumbnail)
+            return DisplayRotation.normalized(preview?.cameraQuarterTurns ?? 0)
+        } catch {
+            return nil
+        }
+    }
+
     /// A clip's representative frame — one second in, unlimited seek
     /// tolerance, track transform applied, the same poster the tile grid
     /// shows — so a video contributes faces without sweeping keyframes.
@@ -47,6 +89,17 @@ public enum FaceImageDecoder {
               width > 0, height > 0 else { return nil }
         return CGSize(width: width, height: height)
     }
+}
+
+/// A picture ready for the pet detector, and what turns the detector's
+/// boxes back into the stored space.
+public struct UprightDetectionImage {
+    public var image: CGImage
+    /// Native pixel size of the unturned picture — the space stored boxes
+    /// and the size floor are measured in.
+    public var storedPixelSize: CGSize
+    /// Quarter-turns clockwise that were applied to reach `image`.
+    public var cameraTurns: Int
 }
 
 /// Encodes decoded images for the sidecar and for stored crops.

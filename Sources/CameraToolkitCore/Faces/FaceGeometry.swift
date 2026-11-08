@@ -118,6 +118,14 @@ public enum FaceBoxProjection {
     public static func unrotatedTopLeftRect(_ rect: CGRect, quarterTurnsCW turns: Int) -> CGRect {
         rotatedTopLeftRect(rect, quarterTurnsCW: -turns)
     }
+
+    /// A box measured on a picture turned `turns` clockwise, in the stored
+    /// space of the unturned picture — how a dog found on an upright decode
+    /// joins the same table as every other stored box.
+    public static func storedBox(fromTurned box: NormalizedFaceBox, quarterTurnsCW turns: Int) -> NormalizedFaceBox {
+        guard DisplayRotation.normalized(turns) != 0 else { return box }
+        return self.box(ofTopLeftRect: unrotatedTopLeftRect(topLeftRect(of: box), quarterTurnsCW: turns))
+    }
 }
 
 /// The pointer-proximity regions that reveal a stored face's overlay

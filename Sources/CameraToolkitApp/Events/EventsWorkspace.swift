@@ -8588,7 +8588,12 @@ final class EventsWorkspace {
         }
         defer { (analyzer as? PetSidecarPool)?.shutdown() }
         let reporter = ScanPassReporter(pass: pass)
-        return try FaceIndexService(store: store, options: options).scan(
+        var service = FaceIndexService(store: store, options: options)
+        // Application Support, never beside a catalog moved onto a NAS.
+        service.uprightBackupFolder = support
+            .appendingPathComponent("CameraToolkit", isDirectory: true)
+            .appendingPathComponent(PetIndexDatabase.backupFolderName, isDirectory: true)
+        return try service.scan(
             stacks: stacks,
             analyzer: analyzer
         ) { update in

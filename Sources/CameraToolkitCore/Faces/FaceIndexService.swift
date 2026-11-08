@@ -23,6 +23,14 @@ import GRDB
 public struct FaceIndexService: Sendable {
     public var options: FaceScanOptions
     private let store: FaceIndexStore
+    /// The progress phase while a pet pass reads RAW headers for rotation.
+    public static let orientationCheckPhase = "Checking photo orientation"
+    /// Where a pet pass backs the index up before its first upright rescan.
+    /// The app points this at Application Support; nil means beside the
+    /// index.
+    public var uprightBackupFolder: URL?
+    /// Reads a RAW's camera rotation; the seam a test counts reads through.
+    var cameraTurnsReader: @Sendable (URL) -> Int? = { FaceImageDecoder.cameraQuarterTurns(for: $0) }
 
     public init(catalogURL: URL, options: FaceScanOptions = FaceScanOptions()) {
         self.store = FaceIndexStore(url: catalogURL)
@@ -118,20 +126,29 @@ public struct FaceIndexService: Sendable {
         // is skipped without decoding.
         let existing = try store.photos(pathKeys: targets.map(\.primary.pathKey))
         var pending: [OrganizeItem] = []
+        var alreadyScanned: [OrganizeItem] = []
         for item in targets {
             let file = item.primary
             if let known = existing[file.pathKey],
                known.covers(options.mode, engine: store.engine),
                known.describes(path: file.path, size: file.size, modifiedAt: file.modifiedAt) {
-                report.photosSkipped += 1
+                alreadyScanned.append(item)
             } else {
                 pending.append(item)
             }
         }
+        let rescans = try selectUprightRescans(
+            pending: &pending,
+            alreadyScanned: &alreadyScanned,
+            existing: existing,
+            progress: progress
+        )
+        report.photosSkipped += alreadyScanned.count
 
         try executeScan(
             pending: pending,
             covered: [],
+            rescans: rescans,
             analyzer: analyzer,
             report: &report,
             progress: progress
@@ -185,22 +202,37 @@ public struct FaceIndexService: Sendable {
         let existing = try store.photos(pathKeys: eligible.map(\.primary.pathKey))
         var pending: [OrganizeItem] = []
         var covered: [OrganizeItem] = []
+        var alreadyScanned: [OrganizeItem] = []
         for item in eligible {
             let file = item.primary
             if let known = existing[file.pathKey],
                known.covers(options.mode, engine: store.engine),
                known.describes(path: file.path, size: file.size, modifiedAt: file.modifiedAt) {
-                report.photosSkipped += 1
+                // A burst frame only stamped by its sibling's sample was
+                // never read at all, so it is not a sideways-read photo.
+                if burstMemberIDs.contains(item.id), !sampledIDs.contains(item.id) {
+                    report.photosSkipped += 1
+                } else {
+                    alreadyScanned.append(item)
+                }
             } else if burstMemberIDs.contains(item.id), !sampledIDs.contains(item.id) {
                 covered.append(item)
             } else {
                 pending.append(item)
             }
         }
+        let rescans = try selectUprightRescans(
+            pending: &pending,
+            alreadyScanned: &alreadyScanned,
+            existing: existing,
+            progress: progress
+        )
+        report.photosSkipped += alreadyScanned.count
 
         try executeScan(
             pending: pending,
             covered: covered,
+            rescans: rescans,
             analyzer: analyzer,
             report: &report,
             progress: progress
@@ -208,12 +240,82 @@ public struct FaceIndexService: Sendable {
         return report
     }
 
+    /// Pet passes only: picks the already-scanned RAWs whose dogs were
+    /// detected sideways and moves them from the skip list (or the ordinary
+    /// list, where `replaceFaces` would drop their sorting) into `pending`,
+    /// returning each with the row it replaces. One header read per RAW
+    /// lacking the marker, in worker batches, and never again once it has
+    /// one; ordinary photos, new photos and marked photos cost no read.
+    private func selectUprightRescans(
+        pending: inout [OrganizeItem],
+        alreadyScanned: inout [OrganizeItem],
+        existing: [String: FacePhotoRecord],
+        progress: FileOperationProgressHandler?
+    ) throws -> [String: FacePhotoRecord] {
+        guard options.uprightRawDetection, store.engine == PetFaceEngine.identifier else { return [:] }
+        let store = self.store
+        var candidates = (pending + alreadyScanned).filter { item in
+            guard item.kind == .raw, let known = existing[item.primary.pathKey] else { return false }
+            return known.engine == store.engine
+                && known.scanGrade != .none
+                && known.describes(path: item.primary.path, size: item.primary.size, modifiedAt: item.primary.modifiedAt)
+        }
+        let checked = try store.uprightCheckedPhotos(pathKeys: candidates.map(\.primary.pathKey))
+        candidates.removeAll { checked.contains($0.primary.pathKey) }
+        guard !candidates.isEmpty else { return [:] }
+
+        // Before any marker or rescan is written.
+        try store.backupBeforeFirstUprightRescan(
+            into: uprightBackupFolder
+                ?? store.url.deletingLastPathComponent().appendingPathComponent(PetIndexDatabase.backupFolderName, isDirectory: true)
+        )
+
+        var rescans: [String: FacePhotoRecord] = [:]
+        let total = candidates.count
+        let batchSize = 256
+        let reader = cameraTurnsReader
+        let concurrency = options.concurrency
+        var finished = 0
+        for start in stride(from: 0, to: total, by: batchSize) {
+            let batch = Array(candidates[start..<min(start + batchSize, total)])
+            progress?(FileOperationProgress(phase: Self.orientationCheckPhase, processedFiles: finished, totalFiles: total))
+            let turns: [Int?] = OrganizeScanner.parallelMap(
+                count: batch.count,
+                width: concurrency,
+                onCompleted: { _ in },
+                transform: { index in autoreleasepool { reader(batch[index].primary.url) } }
+            )
+            var upright: [String] = []
+            for (item, turn) in zip(batch, turns) {
+                // Unreadable (NAS gone): neither marked nor rescanned, so
+                // the next scan asks again.
+                guard let turn else { continue }
+                if turn == 0 {
+                    upright.append(item.primary.pathKey)
+                } else if let known = existing[item.primary.pathKey] {
+                    rescans[item.primary.pathKey] = known
+                }
+            }
+            try store.markDetectedUpright(pathKeys: upright)
+            finished += batch.count
+        }
+        progress?(FileOperationProgress(phase: Self.orientationCheckPhase, processedFiles: total, totalFiles: total))
+
+        guard !rescans.isEmpty else { return [:] }
+        let promoted = alreadyScanned.filter { rescans[$0.primary.pathKey] != nil }
+        alreadyScanned.removeAll { rescans[$0.primary.pathKey] != nil }
+        pending.append(contentsOf: promoted)
+        return rescans
+    }
+
     /// Runs the decode/detect/embed pass over `pending`, stamps covered
     /// burst members with the executed grade, then re-matches and re-groups
-    /// the stored faces.
+    /// the stored faces. A photo in `rescans` is re-read upright and merged
+    /// with its old boxes instead of replacing them.
     private func executeScan(
         pending: [OrganizeItem],
         covered: [OrganizeItem],
+        rescans: [String: FacePhotoRecord] = [:],
         analyzer: FaceAnalyzing,
         report: inout FaceScanReport,
         progress: FileOperationProgressHandler?
@@ -299,7 +401,8 @@ public struct FaceIndexService: Sendable {
                         options: options,
                         analyzer: analyzer,
                         store: store,
-                        telemetry: telemetry
+                        telemetry: telemetry,
+                        rescanning: rescans[items[index].primary.pathKey]
                     )
                 }
             }
@@ -311,6 +414,10 @@ public struct FaceIndexService: Sendable {
                 report.photosProcessed += 1
                 report.facesDetected += faces
                 report.videoFramesRead += videoFrames
+            case .rescannedUpright(let faces):
+                report.photosProcessed += 1
+                report.facesDetected += faces
+                report.photosRescannedUpright += 1
             case .failed:
                 report.photosFailed += 1
             case .skipped:
@@ -465,6 +572,7 @@ public struct FaceIndexService: Sendable {
 
     private enum PhotoOutcome {
         case processed(faces: Int, videoFrames: Int)
+        case rescannedUpright(faces: Int)
         case failed
         case skipped
     }
@@ -482,13 +590,14 @@ public struct FaceIndexService: Sendable {
         options: FaceScanOptions,
         analyzer: FaceAnalyzing,
         store: FaceIndexStore,
-        telemetry: FaceScanTelemetry?
+        telemetry: FaceScanTelemetry?,
+        rescanning known: FacePhotoRecord? = nil
     ) -> PhotoOutcome {
         telemetry?.begin(token, file: item.primary)
         if item.kind == .video {
             return processVideo(item, token: token, options: options, analyzer: analyzer, store: store, telemetry: telemetry)
         }
-        return processPhoto(item, token: token, options: options, analyzer: analyzer, store: store, telemetry: telemetry)
+        return processPhoto(item, token: token, options: options, analyzer: analyzer, store: store, telemetry: telemetry, rescanning: known)
     }
 
     /// Detect → align → embed for every face on one image, all inside the
@@ -504,20 +613,24 @@ public struct FaceIndexService: Sendable {
         options: FaceScanOptions,
         analyzer: FaceAnalyzing,
         engine: String,
-        telemetry: FaceScanTelemetry?
+        telemetry: FaceScanTelemetry?,
+        cameraTurns: Int = 0
     ) throws -> [FaceRecord] {
         telemetry?.step(token, .detect)
         let analyzed = try analyzer.analyze(image, options: options)
         telemetry?.step(token, .embed)
         let grade = executedGrade(for: options.mode)
         return analyzed.compactMap { face in
+            // Every stored box is in the unturned picture's space, whatever
+            // this pass detected on.
+            let box = FaceBoxProjection.storedBox(fromTurned: face.box, quarterTurnsCW: cameraTurns)
             // The size floor is measured on the native image so it means
             // the same thing at every decode bound.
-            let nativeMinSide = min(face.box.width * pixelSize.width, face.box.height * pixelSize.height)
+            let nativeMinSide = min(box.width * pixelSize.width, box.height * pixelSize.height)
             guard nativeMinSide >= options.minimumFacePixels else { return nil }
             return FaceRecord(
                 photoID: file.pathKey,
-                box: face.box,
+                box: box,
                 detScore: face.detScore,
                 quality: face.quality,
                 facePixels: face.facePixels,
@@ -537,33 +650,68 @@ public struct FaceIndexService: Sendable {
         options: FaceScanOptions,
         analyzer: FaceAnalyzing,
         store: FaceIndexStore,
-        telemetry: FaceScanTelemetry?
+        telemetry: FaceScanTelemetry?,
+        rescanning known: FacePhotoRecord? = nil
     ) -> PhotoOutcome {
         let file = item.primary
         let url = file.url
-        guard let image = FaceImageDecoder.detectionImage(for: url, maximumPixelSize: options.detectPixels) else {
-            telemetry?.finish(token, faces: 0, videoFramesRead: 0, failed: true)
-            return .failed
+        // A rescan keeps the photo at the grade it was read at, so a lower
+        // pass cannot lose the small dogs its size floor would refuse.
+        let grade = max(executedGrade(for: options.mode), known?.scanGrade ?? .none)
+        let passOptions = grade == options.mode ? options : FaceScanOptions.pets(mode: grade, fast: options.fast)
+        let image: CGImage
+        let fullSize: CGSize
+        var cameraTurns = 0
+        if options.uprightRawDetection {
+            guard let upright = FaceImageDecoder.uprightDetectionImage(for: url, maximumPixelSize: passOptions.detectPixels) else {
+                telemetry?.finish(token, faces: 0, videoFramesRead: 0, failed: true)
+                return .failed
+            }
+            telemetry?.noteReadBytes(file.size)
+            image = upright.image
+            fullSize = upright.storedPixelSize
+            cameraTurns = upright.cameraTurns
+        } else {
+            guard let decoded = FaceImageDecoder.detectionImage(for: url, maximumPixelSize: options.detectPixels) else {
+                telemetry?.finish(token, faces: 0, videoFramesRead: 0, failed: true)
+                return .failed
+            }
+            telemetry?.noteReadBytes(file.size)
+            image = decoded
+            fullSize = FaceImageDecoder.pixelSize(of: url)
+                ?? CGSize(width: decoded.width, height: decoded.height)
         }
-        telemetry?.noteReadBytes(file.size)
-        let fullSize = FaceImageDecoder.pixelSize(of: url)
-            ?? CGSize(width: image.width, height: image.height)
 
         guard let faces = try? facesOnImage(
             image,
             pixelSize: fullSize,
             file: file,
             token: token,
-            options: options,
+            options: passOptions,
             analyzer: analyzer,
             engine: store.engine,
-            telemetry: telemetry
+            telemetry: telemetry,
+            cameraTurns: cameraTurns
         ) else {
             telemetry?.finish(token, faces: 0, videoFramesRead: 0, failed: true)
             return .failed
         }
 
         telemetry?.step(token, .write)
+        if let known {
+            guard (try? store.applyUprightRescan(
+                photo: known,
+                detected: faces,
+                cameraTurns: cameraTurns,
+                grade: grade,
+                options: passOptions
+            )) != nil else {
+                telemetry?.finish(token, faces: 0, videoFramesRead: 0, failed: true)
+                return .failed
+            }
+            telemetry?.finish(token, faces: faces.count, videoFramesRead: 0, failed: false)
+            return .rescannedUpright(faces: faces.count)
+        }
         let photo = FacePhotoRecord(
             pathKey: file.pathKey,
             path: file.path,
@@ -575,7 +723,14 @@ public struct FaceIndexService: Sendable {
             faceCount: faces.count,
             engine: store.engine
         )
-        guard (try? store.replaceFaces(photo: photo, faces: faces)) != nil else {
+        // A pet pass marks the photo with its rows, in one transaction, so
+        // the marker can never describe rows that did not land.
+        let marker: ((Database) throws -> Void)? = options.uprightRawDetection && store.engine == PetFaceEngine.identifier
+            ? { database in
+                try FaceIndexStore.writeUprightMarker(pathKey: file.pathKey, cameraTurns: cameraTurns, database: database)
+            }
+            : nil
+        guard (try? store.replaceFaces(photo: photo, faces: faces, alsoWrite: marker)) != nil else {
             telemetry?.finish(token, faces: 0, videoFramesRead: 0, failed: true)
             return .failed
         }
