@@ -195,6 +195,29 @@ final class PetGallery: FaceReviewGallery {
         }
     }
 
+    /// The preview's tag picker on a dog box: the detection is assigned to
+    /// the pet and confirmed (frozen), and pinned as a match reference.
+    func tagFace(_ faceID: UUID, as petID: UUID) {
+        change("Tagged. The photo file was not modified.", failure: "Could not tag the dog") { store in
+            try store.assignFace(faceID, to: petID, state: .confirmed, score: nil)
+            try store.addTemplate(personID: petID, faceID: faceID)
+            try store.refreshFaceCounts()
+        }
+    }
+
+    /// "New Pet" in the preview's tag picker: an approved pet in the pet
+    /// index. Nil while no pet scan has created the index — a dog box only
+    /// exists once one has.
+    func createPet(named name: String) -> FacePerson? {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        var created: FacePerson?
+        change("Added \(trimmed) to the pets list.", failure: "Could not add the pet") { store in
+            created = try store.createPerson(name: trimmed, isRoster: true)
+        }
+        return created
+    }
+
     func rejectFace(_ faceID: UUID) {
         guard let face = try? store()?.face(id: faceID) else { return }
         guard face.state != .confirmed else {
