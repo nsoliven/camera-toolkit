@@ -589,6 +589,9 @@ struct FrameInspectorPanel: View {
                 row("Name", item.primary.name)
                 let size = item.primary.size.formattedBytes
                 row("Size", item.companions.isEmpty ? size : "\(size) + \(item.companions.count) sidecar\(item.companions.count == 1 ? "" : "s")")
+                ForEach(item.companions, id: \.path) { companion in
+                    row("With", "\(companion.name) · \(companion.size.formattedBytes)")
+                }
                 row("Kind", kindLabel)
             }
         }
