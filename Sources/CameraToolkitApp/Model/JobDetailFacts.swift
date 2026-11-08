@@ -38,6 +38,8 @@ enum JobDetailFacts {
     static func liveReadouts(_ readout: JobThroughputReadout, graph: JobSpeedGraph, job: JobSnapshot) -> [JobReadout] {
         let bytes = readout.unit == .megabytesPerSecond
         let format: (Double) -> String = { bytes ? JobThroughputFormat.rate($0) : JobThroughputFormat.itemRate($0) }
+        let unit = bytes ? readout.unit.axisLabel : filesUnit(job.action.rawValue)
+        let scan = job.action == .faceScan
         let combined = job.telemetry?.transferBytes != nil
         let nowCaption = combined ? "now · combined" : "now"
         let running = job.state == .running || job.state == .queued
@@ -47,7 +49,7 @@ enum JobDetailFacts {
             result.append(JobReadout(
                 caption: readout.heldFor.map { "\(nowCaption) · held \(JobActivityDetail.durationText($0))" } ?? nowCaption,
                 value: readout.current.map(format),
-                unit: readout.unit.axisLabel,
+                unit: unit,
                 prominent: true,
                 faded: readout.isHeld,
                 help: (readout.isHeld
@@ -55,12 +57,17 @@ enum JobDetailFacts {
                     : "Smoothed over about the last 5 seconds") + (combined ? " All parallel transfers together." : "")
             ))
         }
+        // A scan's average is over the time it spent reading photos, which
+        // the graph knows: it leaves out matching and the gaps between passes.
+        let average = scan ? graph.average ?? readout.average : readout.average
         result.append(JobReadout(
             caption: combined ? "average · combined" : "average",
-            value: readout.average.map(format),
-            unit: readout.unit.axisLabel,
+            value: average.map(format),
+            unit: unit,
             prominent: !running,
-            help: "Everything this job has moved, over its elapsed time" + (combined ? ", all parallel transfers together" : "")
+            help: scan
+                ? "Photos finished over the time spent reading them, across every pass"
+                : "Everything this job has moved, over its elapsed time" + (combined ? ", all parallel transfers together" : "")
         ))
         if let peak = peakReadout(graph, kind: job.action.rawValue) { result.append(peak) }
         if let files = readout.filesPerSecond {
@@ -80,7 +87,9 @@ enum JobDetailFacts {
     static func finishedReadouts(job: JobHistoryJob, graph: JobSpeedGraph) -> [JobReadout] {
         var result: [JobReadout] = []
         let combined = job.transferBytes != nil
-        if let rate = job.averageBytesPerSecond() {
+        // A scan reads in photos, whatever bytes it passed over.
+        let scan = job.kind == JobAction.faceScan.rawValue
+        if !scan, let rate = job.averageBytesPerSecond() {
             result.append(JobReadout(
                 caption: combined ? "average · combined" : "average",
                 value: JobThroughputFormat.rate(JobThroughputFormat.megabytes(rate)),
@@ -95,7 +104,7 @@ enum JobDetailFacts {
             ))
         }
         if let peak = peakReadout(graph, kind: job.kind) { result.append(peak) }
-        let filesAlreadyLead = graph.metric == .filesPerSecond && job.averageBytesPerSecond() == nil
+        let filesAlreadyLead = scan || (graph.metric == .filesPerSecond && job.averageBytesPerSecond() == nil)
         if !filesAlreadyLead, let files = graph.averageFilesPerSecond {
             result.append(JobReadout(
                 caption: "files", value: JobThroughputFormat.itemRate(files), unit: filesUnit(job.kind),
@@ -111,12 +120,127 @@ enum JobDetailFacts {
             caption: "peak",
             value: metric == .megabytesPerSecond ? JobThroughputFormat.rate(peak.value) : JobThroughputFormat.itemRate(peak.value),
             unit: metric == .megabytesPerSecond ? metric.unit : filesUnit(kind),
-            help: "The fastest recorded moment, at \(JobActivityDetail.durationText(peak.t)) — each sample spans about five seconds"
+            help: "The fastest stretch, at \(JobActivityDetail.durationText(peak.t)) — each sample spans about five seconds"
         )
     }
 
     static func filesUnit(_ kind: String) -> String {
         kind == JobAction.faceScan.rawValue ? "photos/s" : "files/s"
+    }
+
+    // MARK: The answer at the top
+
+    /// What a running job is doing, in a few words.
+    static func liveHeadline(_ job: JobSnapshot) -> String {
+        if job.action != .faceScan, let step = job.telemetry?.step, !step.isEmpty { return step }
+        guard !job.note.isEmpty else { return job.action.displayName }
+        guard let colon = job.note.range(of: ": ") else { return job.note }
+        return String(job.note[colon.upperBound...])
+    }
+
+    /// "Pass 2 of 2 · Dogs · ~12 m left in this pass", or just the time
+    /// left; nil when there is nothing true to say yet.
+    static func liveSubline(_ job: JobSnapshot, remaining: String?) -> String? {
+        let pass = job.telemetry?.scanPass
+        var parts: [String] = []
+        if let label = pass?.label { parts.append(label) }
+        if let remaining {
+            let moreAfterThis = (pass?.index ?? 1) < (pass?.count ?? 1)
+            parts.append(moreAfterThis ? "\(remaining) in this pass" : remaining)
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
+    /// "3,412 of 8,200 files · 4,788 to go · 61 faces · 2.1 GB read" — real
+    /// counters only; whatever a job does not report does not appear. A
+    /// scan shows the count of the pass it is in, the percent that goes
+    /// with it, and what the pass found.
+    static func liveCounts(_ job: JobSnapshot) -> String {
+        var parts: [String] = []
+        let pass = job.telemetry?.scanPass
+        let scan = job.action == .faceScan
+        if job.totalFiles > 0 {
+            parts.append("\(job.processedFiles.formatted()) of \(job.totalFiles.formatted()) files")
+            if pass?.isMultiPass == true {
+                let fraction = min(max(Double(job.processedFiles) / Double(job.totalFiles), 0), 1)
+                parts.append("\(fraction.formatted(.percent.precision(.fractionLength(0)))) of this pass")
+            }
+            let remaining = max(job.totalFiles - job.processedFiles, 0)
+            if !scan, job.state == .running, remaining > 0 {
+                parts.append("\(remaining.formatted()) to go")
+            }
+        } else if job.processedFiles > 0 {
+            parts.append("\(job.processedFiles.formatted()) files")
+        }
+        if let work = job.telemetry?.work, let label = work.unitLabel, !scan || work.unitsDone != job.processedFiles {
+            // Video-heavy scans: the frame plan is the honest progress unit.
+            if let total = work.unitsTotal {
+                let approx = work.totalIsEstimate ? "~" : ""
+                parts.append("\(work.unitsDone.formatted()) of \(approx)\(total.formatted()) \(label)")
+            } else {
+                parts.append("\(work.unitsDone.formatted()) \(label)")
+            }
+        }
+        if job.totalBytes > 0 {
+            parts.append("\(job.processedBytes.formattedBytes) of \(job.totalBytes.formattedBytes) read")
+        }
+        if let counters = job.telemetry?.counters {
+            parts.append(contentsOf: counters.map { "\($0.value.formatted()) \($0.label.lowercased())" })
+        }
+        return parts.isEmpty ? "Waiting for the job to report" : parts.joined(separator: " · ")
+    }
+
+    /// The result of a finished job, in one line.
+    struct FinishedHero: Equatable {
+        var headline: String
+        /// The headline amount: bytes moved, or photos read.
+        var value: String?
+        var subline: String?
+    }
+
+    static func finishedHero(
+        job: JobHistoryJob?,
+        live: JobSnapshot?,
+        outcome: JobHistoryOutcome,
+        display: JobOutcomeDisplay,
+        graph: JobSpeedGraph,
+        elapsed: TimeInterval
+    ) -> FinishedHero {
+        // A job a quit left behind has no end; its samples say how long it ran.
+        let seconds = job.map { $0.endedAt == nil ? graph.duration : $0.duration() } ?? elapsed
+        let time = JobActivityDetail.durationText(seconds)
+        let headline: String
+        switch outcome {
+        case .succeeded, .running:
+            headline = display.tone == .warning
+                ? display.label.replacingOccurrences(of: "Done · ", with: "Done with ")
+                : "Done in \(time)"
+        case .failed:
+            headline = display.tone == .warning
+                ? display.label.replacingOccurrences(of: "Done · ", with: "Done with ")
+                : "Failed after \(time)"
+        case .cancelled: headline = "Cancelled after \(time)"
+        case .interrupted: headline = "Interrupted after \(time)"
+        }
+        let kind = job?.kind ?? live?.action.rawValue ?? ""
+        let scan = kind == JobAction.faceScan.rawValue
+        let unit = filesUnit(kind)
+        var value: String?
+        var subline: String?
+        if scan {
+            if graph.filesDone > 0 { value = "\(graph.filesDone.formatted()) photos" }
+            subline = graph.average.map { "\(JobThroughputFormat.itemRate($0)) \(unit) on average" }
+        } else if let job {
+            if job.bytesDone > 0 {
+                value = job.bytesDone.formattedBytes
+            } else if job.totalFiles > 0 {
+                value = "\(job.totalFiles.formatted()) files"
+            }
+            subline = job.averageBytesPerSecond().map { "\(JobThroughputFormat.rate(JobThroughputFormat.megabytes($0))) MB/s on average" }
+        } else if let live, live.processedBytes > 0 {
+            value = live.processedBytes.formattedBytes
+        }
+        return FinishedHero(headline: headline, value: value, subline: subline)
     }
 
     // MARK: Tally
@@ -244,13 +368,16 @@ enum JobDetailFacts {
     /// only for the jobs that use the GPU.
     static func hoverLines(sample: JobHistorySample?, t: Double, graph: JobSpeedGraph, kind: String) -> (title: String, rows: [(label: String, value: String)]) {
         let phases = graph.phases(at: t).map(\.label).joined(separator: " + ")
-        let title = JobActivityDetail.durationText(t) + (phases.isEmpty ? "" : " · \(phases)")
+        let pass = graph.scanPass(at: t)?.label
+        let title = JobActivityDetail.durationText(t) + (phases.isEmpty ? "" : " · \(phases)") + (pass.map { " · \($0)" } ?? "")
+        // Matching counts faces, not files: no number it reports is a speed.
+        if graph.isScanFinishing(at: t) { return (title, [("", "Matching and grouping")]) }
         guard let sample else { return (title, [("", "No samples — nothing reported")]) }
         var rows: [(String, String)] = []
         let unit = filesUnit(kind)
         if graph.metric == .filesPerSecond {
             rows.append(("Speed", sample.filesPerSecond.map { "\(JobThroughputFormat.itemRate($0)) \(unit)" } ?? JobThroughputFormat.placeholder))
-            if let bytes = sample.combined, bytes > 0 { rows.append(("Read", "\(JobThroughputFormat.rate(bytes)) MB/s")) }
+            if kind != JobAction.faceScan.rawValue, let bytes = sample.combined, bytes > 0 { rows.append(("Read", "\(JobThroughputFormat.rate(bytes)) MB/s")) }
         } else {
             rows.append(("Speed", sample.combined.map { "\(JobThroughputFormat.rate($0)) MB/s" } ?? JobThroughputFormat.placeholder))
             if let files = sample.filesPerSecond, files > 0 { rows.append(("Files", "\(JobThroughputFormat.itemRate(files)) \(unit)")) }

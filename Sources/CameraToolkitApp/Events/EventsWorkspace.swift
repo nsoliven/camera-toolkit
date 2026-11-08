@@ -8122,12 +8122,12 @@ final class EventsWorkspace {
             && (petGallery.faceEngineInstalled || petProvider != nil)
         let petsURL = petGallery.databaseURL
         let petOptions = FaceScanOptions.pets(mode: options.mode, fast: options.fast)
-        let faceUpperBound = includePets ? 0.6 : 0.98
+        let passCount = includePets ? 2 : 1
         let petsNote = includePets ? " Then looked for dogs on the same files with the pet engine and filed them into the pet index's Inbox." : ""
         model.runAsyncJob(
             action: .faceScan,
             runningNote: includePets ? "Scanning \(title) for faces and dogs" : "Scanning \(title) for faces",
-            logTitle: "Face scan: \(title)",
+            logTitle: includePets ? "Face and dog scan: \(title)" : "Face scan: \(title)",
             logDetail: "Quality \(options.mode.rawValue). Detected faces on \(burstScope), single stills, and — at MED and above — video frames with the on-device face engine; matched faces against the approved people and grouped the rest — every classification lands in the Inbox, unapproved until the user says so.\(petsNote) Files were only read — nothing was written or moved.",
             operation: { progress in
                 let faces = try await Self.runFaceScanPass(
@@ -8137,7 +8137,7 @@ final class EventsWorkspace {
                     configuration: configuration,
                     support: support,
                     analyzerProvider: analyzerProvider,
-                    upperBound: faceUpperBound,
+                    pass: JobScanPass(index: 1, count: passCount, subject: .faces),
                     progress: progress
                 )
                 guard includePets else { return FaceAndPetScanReport(faces: faces) }
@@ -8150,7 +8150,7 @@ final class EventsWorkspace {
                         petsURL: petsURL,
                         support: support,
                         analyzerProvider: petProvider,
-                        lowerBound: faceUpperBound,
+                        pass: JobScanPass(index: 2, count: passCount, subject: .dogs),
                         progress: progress
                     )
                     return FaceAndPetScanReport(faces: faces, pets: pets)
@@ -8179,7 +8179,7 @@ final class EventsWorkspace {
         configuration: AppConfiguration,
         support: URL,
         analyzerProvider: (@Sendable () async throws -> FaceAnalyzing?)?,
-        upperBound: Double,
+        pass: JobScanPass,
         progress: @escaping @Sendable (BackgroundJobUpdate) -> Void
     ) async throws -> FaceScanReport {
         // Bootstrap is idempotent: it guarantees the face tables exist
@@ -8197,6 +8197,7 @@ final class EventsWorkspace {
             analyzer = try FaceSidecarPool.open(applicationSupport: support, options: options)
         }
         defer { (analyzer as? FaceSidecarPool)?.shutdown() }
+        let reporter = ScanPassReporter(pass: pass)
         // The board's burst stacks drive sampling — a burst decodes its
         // first/middle/last stills instead of every frame (all stills at
         // HIGH and above).
@@ -8204,13 +8205,7 @@ final class EventsWorkspace {
             stacks: stacks,
             analyzer: analyzer
         ) { update in
-            progress(DashboardModel.jobUpdate(
-                from: update,
-                lowerBound: 0.02,
-                upperBound: upperBound,
-                notePrefix: "Face scan",
-                command: ""
-            ))
+            progress(reporter.update(from: update))
         }
     }
 
@@ -8223,7 +8218,7 @@ final class EventsWorkspace {
         petsURL: URL,
         support: URL,
         analyzerProvider: (@Sendable () async throws -> FaceAnalyzing?)?,
-        lowerBound: Double,
+        pass: JobScanPass,
         progress: @escaping @Sendable (BackgroundJobUpdate) -> Void
     ) async throws -> FaceScanReport {
         let store = try PetIndexDatabase.open(url: petsURL)
@@ -8234,17 +8229,12 @@ final class EventsWorkspace {
             analyzer = try PetSidecarPool.open(applicationSupport: support)
         }
         defer { (analyzer as? PetSidecarPool)?.shutdown() }
+        let reporter = ScanPassReporter(pass: pass)
         return try FaceIndexService(store: store, options: options).scan(
             stacks: stacks,
             analyzer: analyzer
         ) { update in
-            progress(DashboardModel.jobUpdate(
-                from: update,
-                lowerBound: lowerBound,
-                upperBound: 0.98,
-                notePrefix: "Pet scan",
-                command: ""
-            ))
+            progress(reporter.update(from: update))
         }
     }
 
