@@ -80,7 +80,7 @@ Each rescanned photo's old boxes are paired with the new ones (`PetBoxRemap`) in
 | New box with no old box | Stored unassigned; the normal match and group pass files it. |
 | Old box with no new box | Removed only if it was an unassigned detection. Anything confirmed, grouped, a template or named in a verdict stays. |
 
-IoU 0.5 is measured on real vertical frames: boxes on the same dog scored 0.59 to 0.96, boxes on a different dog 0.00 to 0.05, and a real two-dog box 0.33 to 0.59 against each dog it spanned. So 0.5 alone cannot tell a two-dog box from its larger dog; a box that covers two distinct new boxes is treated as a merge first, and a box matching one of them at 0.75 or more is a single dog with extra front or back boxes, not a merge.
+IoU 0.5 is measured on real vertical frames: boxes on the same dog scored 0.64 to 0.96, boxes on a different dog 0.00 to 0.05, and a real two-dog box 0.29 to 0.59 against each dog it spanned. So 0.5 alone cannot tell a two-dog box from its larger dog; a box that covers two distinct new boxes is treated as a merge first, and a box matching one of them at 0.75 or more is a single dog with extra front or back boxes, not a merge.
 
 ## Thresholds and where they come from
 

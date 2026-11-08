@@ -13,8 +13,8 @@ enum PetBoxRemap {
     /// however many other boxes sit inside it: a dog with an extra "front"
     /// or "back" box is one dog, not a two-dog merge.
     ///
-    /// Measured on real vertical frames: same-dog pairs scored 0.59 to 0.96,
-    /// a two-dog box scored 0.33 to 0.59 against each dog, and a different
+    /// Measured on real vertical frames: same-dog pairs scored 0.64 to 0.96,
+    /// a two-dog box scored 0.29 to 0.59 against each dog, and a different
     /// dog's box 0.00 to 0.05.
     static let oneDogIoU = 0.75
 
