@@ -5,7 +5,7 @@ import Foundation
 import ImageIO
 import UniformTypeIdentifiers
 
-/// Tile-sized thumbnails of photos that live on a network volume (the NAS),
+/// Tile-sized thumbnails of photos that live on the NAS or the Buffer drive,
 /// kept on this Mac so a board that was scrolled once scrolls again without
 /// reading the NAS. The in-memory cache holds a few hundred tiles; a family
 /// board has thousands, and every one that fell out of memory was a network
@@ -21,14 +21,21 @@ import UniformTypeIdentifiers
 /// already follows a file between folders — so a thumbnail survives a Move
 /// to Event, and an edited file (new size or time) gets a new one.
 final class ThumbnailDiskCache: @unchecked Sendable {
-    /// The app's cache: `~/Library/Caches/<app>/Thumbnails`, 1 GB. Nil when
-    /// the system has no Caches folder to offer.
+    /// What the app's cache may hold. A grid tile is the 512 px bucket
+    /// (220 pt at 2x), 512×341 at JPEG quality 0.82: about 2–4 bits a pixel
+    /// for a real photo, so 45–85 KB. A 40,000-photo library is then
+    /// 1.8–3.4 GB of tiles. Evicting to 80% still keeps the high end of that,
+    /// with room left for filmstrip sizes, rotated copies and new photos.
+    static let defaultByteLimit: Int64 = 5 * 1_024 * 1_024 * 1_024
+
+    /// The app's cache: `~/Library/Caches/<app>/Thumbnails`. Nil when the
+    /// system has no Caches folder to offer.
     static let appDefault: ThumbnailDiskCache? = {
         guard let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first else { return nil }
         let folder = caches
             .appendingPathComponent("org.cameratoolkit.CameraToolkit", isDirectory: true)
             .appendingPathComponent("Thumbnails", isDirectory: true)
-        return ThumbnailDiskCache(folder: folder, byteLimit: 1_024 * 1_024 * 1_024)
+        return ThumbnailDiskCache(folder: folder, byteLimit: defaultByteLimit)
     }()
 
     /// The largest decode bucket worth keeping: tiles and filmstrip frames.
@@ -71,6 +78,11 @@ final class ThumbnailDiskCache: @unchecked Sendable {
         return image
     }
 
+    /// Whether a thumbnail is on disk. One local stat; never reads the photo.
+    func contains(key: String) -> Bool {
+        FileManager.default.fileExists(atPath: fileURL(forKey: key).path)
+    }
+
     // MARK: Writing
 
     /// Keeps a thumbnail. Encoded and written on the cache's own queue —
@@ -78,23 +90,44 @@ final class ThumbnailDiskCache: @unchecked Sendable {
     /// temporary file renamed into place, so a half-written thumbnail is
     /// never read.
     func store(_ image: CGImage, forKey key: String) {
-        queue.async { [self] in
-            guard let data = Self.encode(image) else { return }
-            let url = fileURL(forKey: key)
-            let directory = url.deletingLastPathComponent()
-            do {
-                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-                let temporary = directory.appendingPathComponent(".\(UUID().uuidString).tmp")
-                try data.write(to: temporary)
-                if rename(temporary.path, url.path) != 0 {
-                    try? FileManager.default.removeItem(at: temporary)
-                    return
-                }
-            } catch {
-                return
-            }
-            recordStore(bytes: Int64(data.count))
+        queue.async { [self] in _ = write(image, forKey: key) }
+    }
+
+    /// `store`, waiting for the file to land. False when it could not be
+    /// written. Background warming uses this so it never runs ahead of the
+    /// disk, and so a full disk stops it instead of being retried per photo.
+    func storeAndWait(_ image: CGImage, forKey key: String) -> Bool {
+        queue.sync { write(image, forKey: key) }
+    }
+
+    /// Whether the folder has grown to where background warming should
+    /// stop: 90% of the limit, under the size that triggers eviction, so
+    /// warming never pushes out a thumbnail someone actually looked at.
+    var isNearLimit: Bool {
+        queue.sync {
+            if knownBytes == nil { knownBytes = scanBytes() }
+            return (knownBytes ?? 0) >= byteLimit / 10 * 9
         }
+    }
+
+    /// Runs on `queue`.
+    private func write(_ image: CGImage, forKey key: String) -> Bool {
+        guard let data = Self.encode(image) else { return false }
+        let url = fileURL(forKey: key)
+        let directory = url.deletingLastPathComponent()
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let temporary = directory.appendingPathComponent(".\(UUID().uuidString).tmp")
+            try data.write(to: temporary)
+            if rename(temporary.path, url.path) != 0 {
+                try? FileManager.default.removeItem(at: temporary)
+                return false
+            }
+        } catch {
+            return false
+        }
+        recordStore(bytes: Int64(data.count))
+        return true
     }
 
     /// Waits for pending writes — for tests.
@@ -156,12 +189,29 @@ final class ThumbnailDiskCache: @unchecked Sendable {
             options: [.skipsHiddenFiles]
         ) else { return [] }
         var result: [Entry] = []
-        for case let url as URL in enumerator where url.pathExtension == "jpg" {
+        for case let url as URL in enumerator where Self.hasThumbnailName(url) {
             guard let values = try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey, .isRegularFileKey]),
                   values.isRegularFile == true else { continue }
             result.append(Entry(url: url, size: Int64(values.fileSize ?? 0), modified: values.contentModificationDate ?? .distantPast))
         }
         return result
+    }
+
+    /// The shape `fileURL` gives every thumbnail: `<2 hex>/<64 hex>.jpg`,
+    /// the folder being the name's first two characters. Anything else that
+    /// ended up in the folder is not ours to count or remove.
+    private static func hasThumbnailName(_ url: URL) -> Bool {
+        guard url.pathExtension == "jpg" else { return false }
+        let name = url.deletingPathExtension().lastPathComponent
+        let isDigest = name.utf8.count == 64 && name.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) }
+        return isDigest && url.deletingLastPathComponent().lastPathComponent == String(name.prefix(2))
+    }
+
+    /// Whether a thumbnail's real location, with every symlink followed, is
+    /// one shard folder directly under this cache's real folder. Asked
+    /// before each removal.
+    private func isInsideCacheFolder(_ url: URL, resolvedFolder: URL) -> Bool {
+        url.resolvingSymlinksInPath().deletingLastPathComponent().deletingLastPathComponent().path == resolvedFolder.path
     }
 
     /// Runs on `queue`. Removes the oldest thumbnails until the folder is at
@@ -170,8 +220,10 @@ final class ThumbnailDiskCache: @unchecked Sendable {
         let all = entries().sorted { $0.modified < $1.modified }
         var total = all.reduce(Int64(0)) { $0 + $1.size }
         let target = byteLimit / 5 * 4
+        let resolvedFolder = folder.resolvingSymlinksInPath()
         for oldest in all {
             guard total > target else { break }
+            guard isInsideCacheFolder(oldest.url, resolvedFolder: resolvedFolder) else { continue }
             if (try? FileManager.default.removeItem(at: oldest.url)) != nil { total -= oldest.size }
         }
         knownBytes = total
