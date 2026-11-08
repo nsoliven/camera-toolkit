@@ -52,7 +52,7 @@ event folder: shared Buffer, or hidden private staging
     │ OrganizedArchiveService + SHA-256
     ▼
 NAS library originals ── Take Off Drive: VerifiedRemovalService → drive _Trash
-    │ ImmichClient upload + album
+    │ library scan + path match + albums
     ▼
 Immich
 ```
@@ -215,7 +215,7 @@ photo library originals
 
 `CatalogBackupService` backs the catalog up with the SQLite online backup API — at launch when the newest backup is over a day old, after a burst of catalog writes, and from Settings — into `Application Support/CameraToolkit/Backups` and the configured NAS folder. Every set holds the catalog snapshot, the face labels (`FaceLabelExport`), `config.json`, and a manifest, and is verified before it counts. Retention keeps 7 daily and 4 weekly sets and only ever deletes files a manifest of its own lists.
 
-Integration API keys are stored separately by `KeychainSecretStore`. `ImmichClient` performs connection checks, checksum-presence reads, streamed multipart uploads, and album creation. `TrueNASClient` uses the secure JSON-RPC WebSocket API, optionally pins a self-signed TLS certificate, resolves a mounted SMB share to its deepest matching dataset, and reads dataset/pool capacity without changing NAS state.
+Integration API keys are stored separately by `KeychainSecretStore`. `ImmichClient` performs connection checks, library scans and listings, and album writes; `ImmichLibrarySync` compares a library with the catalog (see `IMMICH.md`). `TrueNASClient` uses the secure JSON-RPC WebSocket API, optionally pins a self-signed TLS certificate, resolves a mounted SMB share to its deepest matching dataset, and reads dataset/pool capacity without changing NAS state.
 
 ## Responsiveness and memory
 
@@ -229,7 +229,6 @@ Integration API keys are stored separately by `KeychainSecretStore`. `ImmichClie
 - RAW decoding reads the embedded JPEG instead of decoding the full sensor payload.
 - Preview images are downsampled to a requested pixel budget before becoming `NSImage` instances.
 - Capture-time reads touch a bounded header block and are cached on disk.
-- Immich uploads stream file bytes through a bound stream pair instead of loading clips into memory.
 - SQLite sync is debounced and runs at utility priority; event and assignment saves write only changed rows on a background writer.
 - A machine-readable debug stream (`DebugLog`, Core/Diagnostics) appends one JSON line per event to `~/Library/Logs/CameraToolkit/debug.jsonl` — tile/preview decode start/finish/timeout, video probes, trash and job finishes — with duration, outcome, extension, size, and a sanitized error (`NSError` domain+code, never a path beyond the basename). Writes queue on a utility serial queue, failures are swallowed, and the file trims its oldest half in place past 4 MB so a `tail -F` survives.
 

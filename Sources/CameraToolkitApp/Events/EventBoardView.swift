@@ -985,35 +985,50 @@ struct EventStorageSlots {
     }
 
     var immich: StorageSlot<some View> {
-        let statuses = workspace.eventImmichStatuses[event.id] ?? [:]
-        let present = statuses.values.count { $0.status == "present" && !$0.isTrashed }
-        let albumText: String = switch event.resolvedImmichAlbumPolicy {
-        case .none: "No album"
-        case .event: "Album “\(event.name)”"
-        case .custom: "Album “\(event.immichAlbumName ?? event.name)”"
+        let summary = ImmichEventSummary(statuses: (workspace.eventImmichStatuses[event.id] ?? [:]).values)
+        let isConfigured = workspace.immichIsConfigured
+        let isPrivate = workspace.locations.resolvedPolicy(for: event) == .archiveOnly
+        let album = event.immichAlbumTitle(isPrivate: isPrivate)
+        let detail: String = if !isConfigured {
+            "Choose your Immich library in Settings"
+        } else if let outstanding = summary.outstandingText {
+            outstanding
+        } else if isPrivate, !summary.isEmpty {
+            "Private here, but Immich reads the whole NAS"
+        } else if let album {
+            "Album “\(album)”"
+        } else if summary.isEmpty {
+            "Not checked yet"
+        } else {
+            "No album"
         }
         return StorageSlot(
             title: "Immich",
             symbol: "cloud.fill",
             tint: .teal,
-            value: event.sendsToImmich ? "\(present) sent" : "Off",
-            detail: event.sendsToImmich ? albumText : "This event stays out of Immich",
-            state: event.sendsToImmich ? (present > 0 && present >= counts.total ? .complete : .partial) : .unknown
+            value: isConfigured ? "\(summary.inImmich.formatted()) in Immich" : "Off",
+            detail: detail,
+            state: !isConfigured || summary.isEmpty ? .unknown : (summary.needsAttention ? .partial : .complete)
         ) {
-            Toggle("Send", isOn: Binding(
-                get: { event.sendsToImmich },
-                set: { model.setEventImmichUploadEnabled(event.id, enabled: $0) }
-            ))
-            if event.sendsToImmich {
-                Menu("Album") {
-                    ForEach(ImmichAlbumPolicy.allCases) { policy in
-                        Button(policy.displayName) { model.setEventImmichAlbumPolicy(event.id, policy: policy) }
-                    }
+            if isConfigured {
+                Button(workspace.immichIsChecking ? "Checking…" : "Check") { workspace.checkImmichNow() }
+                    .disabled(workspace.immichIsChecking)
+                    .help("Asks Immich to scan the NAS library again and compares what it has. Nothing is uploaded.")
+                if isPrivate {
+                    Toggle("Allow album", isOn: Binding(
+                        get: { event.sendsToImmich },
+                        set: { model.setEventImmichUploadEnabled(event.id, enabled: $0) }
+                    ))
+                    .help("Private events never get an Immich album unless you allow it here.")
                 }
-                .fixedSize()
-                Button("Upload") { workspace.uploadToImmich(event.id) }
-                    .disabledWhileBusy(model, or: presenceCounts == nil)
-                    .help(UndoScopeWording.immichUpload)
+                if !isPrivate || event.sendsToImmich {
+                    Menu("Album") {
+                        ForEach(ImmichAlbumPolicy.allCases) { policy in
+                            Button(policy.displayName) { model.setEventImmichAlbumPolicy(event.id, policy: policy) }
+                        }
+                    }
+                    .fixedSize()
+                }
             }
         }
     }

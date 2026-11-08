@@ -443,27 +443,10 @@ private struct NASSyncJobOutcome: Sendable {
     var queuedRenamesLeft = 0
 }
 
-private struct ImmichCandidate: Sendable {
-    var id: String
-    var path: String
-    var size: Int64
-    var modifiedAt: Date
-    /// The owning event's album pick — a family board can span several.
-    var albumName: String?
-}
-
 private struct BurstRegroupOutcome: Sendable {
     var stacks: [OrganizeStack]
     var links: Set<BurstVisualLink>
     var grouping: BurstGroupingConfiguration
-}
-
-private struct ImmichUploadOutcome: Sendable {
-    var uploaded = 0
-    var duplicates = 0
-    var alreadyPresent = 0
-    var albumName: String?
-    var albumAdded = 0
 }
 
 private struct SourceCleanupGroup: Sendable {
@@ -581,7 +564,7 @@ private final class SweepTaskHandle: @unchecked Sendable {
 
 /// State and actions for the event-first organizer: sorting unsorted folders
 /// into events, moving events between the shared Buffer and private staging,
-/// archiving to the NAS, freeing cards and drives, and sending to Immich.
+/// archiving to the NAS, freeing cards and drives, and keeping Immich in step.
 extension OrganizeStack {
     /// Whether any file of the stack — each frame's primary and companions —
     /// satisfies `predicate`, without building the array `files` does. A
@@ -700,6 +683,12 @@ final class EventsWorkspace {
     /// what is reachable and names the rest.
     var eventReachability: [UUID: EventReachabilityReport] = [:]
     var eventImmichStatuses: [UUID: [String: ImmichCatalogStatus]] = [:]
+    /// How the last look at the Immich library went, for Settings.
+    var immichCheckLine = ""
+    var immichIsChecking = false
+    /// A scan request Immich has not accepted yet; survives a failed follow-up.
+    @ObservationIgnored var immichScanOwed = false
+    @ObservationIgnored var immichFollowUp: Task<Void, Never>?
     var discoveredDriveEvents: [DiscoveredDriveEvent] = []
     /// Event folders in the NAS mirror whose files no assignment covers
     /// (`NASEventDiscovery`) — "Found on the NAS" in the sidebar.
@@ -6835,6 +6824,7 @@ final class EventsWorkspace {
                 // the folders are listed again.
                 let proven = Set(outcome.report.copied + outcome.report.matchedExisting + outcome.report.alreadyVerified)
                 self?.nasPresence.noteSynced(outcome.plan.items.filter { proven.contains($0.relativePath) })
+                if !outcome.report.copied.isEmpty { self?.followNASChangeInImmich() }
                 for eventID in refresh {
                     Task { await self?.refreshEvent(eventID) }
                 }
@@ -7639,136 +7629,6 @@ final class EventsWorkspace {
         model.statusMessage = stacks.count == 1
             ? "Rotated \(frames) frame\(frames == 1 ? "" : "s") \(direction). Originals untouched — the turn is remembered, not written."
             : "Rotated \(stacks.count) bursts (\(frames) frames) \(direction). Originals untouched — the turn is remembered, not written."
-    }
-
-    // MARK: - Immich
-
-    func uploadToImmich(_ eventID: UUID) {
-        guard let event = event(eventID), let summary = presence[eventID] else { return }
-        let serverURL = model.configuration.immichServerURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !serverURL.isEmpty else {
-            model.statusMessage = "Add the Immich server URL in Settings first."
-            return
-        }
-        var apiKey = model.immichAPIKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
-        if apiKey.isEmpty {
-            apiKey = ((try? model.secretStore.read(account: DashboardModel.immichAPIKeyAccount)) ?? nil)?
-                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        }
-        guard !apiKey.isEmpty else {
-            model.statusMessage = "Save an Immich API key in Settings first."
-            return
-        }
-        let immichKey = apiKey
-        let uploadable = OrganizeFileClassifier.rawExtensions
-            .union(OrganizeFileClassifier.photoExtensions)
-            .union(OrganizeFileClassifier.videoExtensions)
-        // Family scope: each candidate follows the Send flag and album
-        // policy of the event that actually owns it — a subevent's files
-        // never upload under the parent's settings.
-        let candidates = summary.assets.compactMap { asset -> ImmichCandidate? in
-            let owner = self.event(asset.assignment.eventID) ?? event
-            guard asset.assignment.immichUploadOverride ?? owner.sendsToImmich,
-                  uploadable.contains((asset.assignment.relativePath as NSString).pathExtension.lowercased()),
-                  let path = asset.bestLocalPath else { return nil }
-            let albumName: String? = switch owner.resolvedImmichAlbumPolicy {
-            case .none: nil
-            case .event: owner.name
-            case .custom:
-                owner.immichAlbumName.flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 } ?? owner.name
-            }
-            return ImmichCandidate(id: asset.id, path: path, size: asset.assignment.fileSize, modifiedAt: asset.assignment.modifiedAt, albumName: albumName)
-        }
-        guard !candidates.isEmpty else {
-            model.statusMessage = event.sendsToImmich
-                ? "No reachable photos or videos to send. Connect the drive or NAS that has them."
-                : "Turn on Send to Immich for \(eventTitle(event)) first."
-            return
-        }
-        // The Immich status rows reference the catalog's assignment rows.
-        model.persistCatalogStateNow()
-        let catalogURL = URL(fileURLWithPath: DashboardModel.expandedPath(model.configuration.catalogDatabasePath))
-        let configuration = model.configuration
-
-        model.runAsyncJob(
-            action: .immichUpload,
-            runningNote: "Sending \(candidates.count) file(s) from \(eventTitle(event)) to Immich",
-            logTitle: "Sent \(eventTitle(event)) to Immich",
-            logDetail: "Checked each file's SHA-1 with Immich, uploaded only missing originals, and kept the API key in Keychain.",
-            operation: { progress in
-                let client = try ImmichClient(serverURL: serverURL, apiKey: immichKey)
-                var hashes: [String: String] = [:]
-                for (index, candidate) in candidates.enumerated() {
-                    try Task.checkCancellation()
-                    hashes[candidate.id] = try FileSHA1.hexDigest(of: URL(fileURLWithPath: candidate.path))
-                    progress(BackgroundJobUpdate(
-                        progress: 0.02 + 0.2 * Double(index + 1) / Double(candidates.count),
-                        note: "Checking \((candidate.path as NSString).lastPathComponent)",
-                        processedFiles: index + 1,
-                        totalFiles: candidates.count
-                    ))
-                }
-                var remoteIDs: [String: String] = [:]
-                var outcome = ImmichUploadOutcome(albumName: nil)
-                for start in stride(from: 0, to: candidates.count, by: 100) {
-                    let batch = candidates[start..<min(start + 100, candidates.count)]
-                    let results = try await client.checkBulkUpload(batch.compactMap { candidate in
-                        hashes[candidate.id].map { ImmichChecksumQuery(id: candidate.id, checksum: $0) }
-                    })
-                    for result in results where result.isPresent && !result.isTrashed {
-                        remoteIDs[result.id] = result.assetID
-                    }
-                }
-                outcome.alreadyPresent = remoteIDs.count
-
-                var statuses: [ImmichCatalogStatus] = []
-                for (index, candidate) in candidates.enumerated() {
-                    try Task.checkCancellation()
-                    if remoteIDs[candidate.id] == nil {
-                        let result = try await client.uploadAsset(
-                            fileURL: URL(fileURLWithPath: candidate.path),
-                            deviceAssetID: "\((candidate.path as NSString).lastPathComponent)-\(candidate.size)",
-                            fileCreatedAt: candidate.modifiedAt,
-                            fileModifiedAt: candidate.modifiedAt
-                        )
-                        remoteIDs[candidate.id] = result.assetID
-                        if result.isDuplicate { outcome.duplicates += 1 } else { outcome.uploaded += 1 }
-                    }
-                    statuses.append(ImmichCatalogStatus(
-                        eventAssetID: candidate.id,
-                        status: "present",
-                        immichAssetID: remoteIDs[candidate.id],
-                        checksumSHA1: hashes[candidate.id]
-                    ))
-                    progress(BackgroundJobUpdate(
-                        progress: 0.25 + 0.7 * Double(index + 1) / Double(candidates.count),
-                        note: "Sending \((candidate.path as NSString).lastPathComponent)",
-                        processedFiles: index + 1,
-                        totalFiles: candidates.count
-                    ))
-                }
-                // Each candidate's album is its owning event's pick —
-                // a family upload can fill several albums in one pass.
-                var albumAssetIDs: [String: Set<String>] = [:]
-                for candidate in candidates {
-                    guard let remote = remoteIDs[candidate.id], let album = candidate.albumName else { continue }
-                    albumAssetIDs[album, default: []].insert(remote)
-                }
-                for (name, ids) in albumAssetIDs {
-                    let album = try await client.ensureAlbum(named: name)
-                    outcome.albumAdded += try await client.addAssets(Array(ids), toAlbum: album.id).added
-                }
-                if albumAssetIDs.count == 1 { outcome.albumName = albumAssetIDs.keys.first }
-                _ = try? CatalogStore(url: catalogURL).bootstrap(configuration: configuration, createBackup: false, createLibraryFolders: false)
-                try? CatalogInspector(url: catalogURL).saveImmichStatuses(statuses)
-                return outcome
-            },
-            completion: { [weak self] outcome in
-                Task { await self?.refreshEvent(eventID) }
-                let album = outcome.albumName.map { " Added \(outcome.albumAdded) to the “\($0)” album." } ?? ""
-                return "Immich: \(outcome.uploaded) uploaded, \(outcome.alreadyPresent + outcome.duplicates) already there.\(album)"
-            }
-        )
     }
 
     // MARK: - Faces
