@@ -462,7 +462,6 @@ struct EventsSidebar: View {
                 let arrangeable = query.isEmpty && !workspace.search.hasActiveConditions
                 ForEach(workspace.sidebarRows(matching: query, applying: workspace.search), id: \.event.id) { row in
                     eventRow(row.event, depth: row.depth)
-                        .tag(EventsSidebarSelection.event(row.event.id))
                         .contentShape(Rectangle())
                         .simultaneousGesture(TapGesture().onEnded {
                             workspace.selection = .event(row.event.id)
@@ -477,6 +476,10 @@ struct EventsSidebar: View {
                         .contextMenu {
                             EventSidebarMenu(event: row.event, workspace: workspace)
                         }
+                        // Outermost: a tag inside the drag modifier's
+                        // conditional never reaches the List, and the row
+                        // stops being selectable.
+                        .tag(EventsSidebarSelection.event(row.event.id))
                 }
             } header: {
                 SidebarSectionHeader(
