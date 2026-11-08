@@ -259,6 +259,8 @@ final class StorageBenchmarkViewModel {
     @ObservationIgnored private let makeService: () -> StorageBenchmarkService
     @ObservationIgnored private var task: Task<Void, Never>?
     @ObservationIgnored private var refreshTask: Task<Void, Never>?
+    /// Re-reads the links when the NAS share's route or session moved.
+    @ObservationIgnored private var linkObserver: (any NSObjectProtocol)?
 
     init(
         driveActivityGate: DriveActivityGate = .shared,
@@ -268,6 +270,18 @@ final class StorageBenchmarkViewModel {
         self.driveActivityGate = driveActivityGate
         self.makeService = makeService
         self.stability = stability ?? StabilityTestViewModel(driveActivityGate: driveActivityGate)
+        // Ethernet plugged in or pulled: the NAS row's link and the
+        // bottleneck verdicts follow within seconds, not at the next open.
+        linkObserver = NotificationCenter.default.addObserver(
+            forName: .cameraToolkitNASLinkChanged,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, let model = self.dashboardModel else { return }
+                self.refresh(from: model)
+            }
+        }
     }
 
     /// Opens the stability sheet for a drive.

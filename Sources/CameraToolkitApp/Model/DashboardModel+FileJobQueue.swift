@@ -51,6 +51,9 @@ extension DashboardModel {
 
     func startNextQueuedFileJobIfPossible() {
         while !isBusy, !isStorageBenchmarkRunning, !queuedFileJobs.isEmpty {
+            // A job boundary: the NAS link switch may take its turn here
+            // (nothing is mid-file); it starts the queue again when done.
+            if holdQueuedFileJobs?() == true { return }
             let next = queuedFileJobs.removeFirst()
             next.start(next.id)
             // It decided there was nothing to do: close its row.

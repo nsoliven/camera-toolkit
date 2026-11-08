@@ -15,10 +15,13 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
     /// The SMB share the NAS library lives on (`smb://host/share`), opened
     /// by "Connect to NAS…" when the share is not mounted. Empty means none.
     public var nasSMBURL: String
-    /// Mount the share at launch (keychain credential, no dialog) and move
-    /// its SMB session from Wi-Fi to a wired link by itself when that is
-    /// safe. Only acts when `nasSMBURL` is set.
+    /// Mount the share at launch (keychain credential, no dialog). Only
+    /// acts when `nasSMBURL` is set.
     public var nasAutoConnect: Bool
+    /// Reconnect the share by itself when the route to the NAS moved to a
+    /// faster link (Ethernet plugged in) than its SMB session uses — only
+    /// when no job is using the NAS. Only acts when `nasSMBURL` is set.
+    public var nasAutoSwitchLink: Bool
     /// Sync to NAS: files copied at once (`NASSyncOptions.parallelRange`).
     public var nasSyncParallelTransfers: Int
     /// Sync to NAS: verify each copy by hashing it on the NAS over SSH
@@ -70,6 +73,7 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         archiveLayoutRootPath: String = "",
         nasSMBURL: String = "",
         nasAutoConnect: Bool = true,
+        nasAutoSwitchLink: Bool = true,
         nasSyncParallelTransfers: Int = NASSyncOptions.defaultParallelTransfers,
         nasSyncVerifyViaSSH: Bool = false,
         nasSyncSSHHost: String = "",
@@ -104,6 +108,7 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         self.archiveLayoutRootPath = archiveLayoutRootPath
         self.nasSMBURL = nasSMBURL
         self.nasAutoConnect = nasAutoConnect
+        self.nasAutoSwitchLink = nasAutoSwitchLink
         self.nasSyncParallelTransfers = NASSyncOptions.clamp(nasSyncParallelTransfers)
         self.nasSyncVerifyViaSSH = nasSyncVerifyViaSSH
         self.nasSyncSSHHost = nasSyncSSHHost
@@ -142,6 +147,7 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         case archiveLayoutRootPath
         case nasSMBURL
         case nasAutoConnect
+        case nasAutoSwitchLink
         case nasSyncParallelTransfers
         case nasSyncVerifyViaSSH
         case nasSyncSSHHost
@@ -187,6 +193,7 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         try values.encode(archiveLayoutRootPath, forKey: .archiveLayoutRootPath)
         try values.encode(nasSMBURL, forKey: .nasSMBURL)
         try values.encode(nasAutoConnect, forKey: .nasAutoConnect)
+        try values.encode(nasAutoSwitchLink, forKey: .nasAutoSwitchLink)
         try values.encode(nasSyncParallelTransfers, forKey: .nasSyncParallelTransfers)
         try values.encode(nasSyncVerifyViaSSH, forKey: .nasSyncVerifyViaSSH)
         try values.encode(nasSyncSSHHost, forKey: .nasSyncSSHHost)
@@ -235,6 +242,7 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         archiveLayoutRootPath = try values.decodeIfPresent(String.self, forKey: .archiveLayoutRootPath) ?? ""
         nasSMBURL = try values.decodeIfPresent(String.self, forKey: .nasSMBURL) ?? ""
         nasAutoConnect = try values.decodeIfPresent(Bool.self, forKey: .nasAutoConnect) ?? true
+        nasAutoSwitchLink = try values.decodeIfPresent(Bool.self, forKey: .nasAutoSwitchLink) ?? true
         nasSyncParallelTransfers = NASSyncOptions.clamp(
             try values.decodeIfPresent(Int.self, forKey: .nasSyncParallelTransfers) ?? NASSyncOptions.defaultParallelTransfers
         )

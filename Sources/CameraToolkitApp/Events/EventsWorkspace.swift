@@ -1009,6 +1009,13 @@ final class EventsWorkspace {
         }
         faceLabelsRestoredObserver.observers = [observer]
         nasConnection.isNASInUse = { [weak self] in self?.nasIsInUse ?? true }
+        // The NAS link switch takes its turn between two queued jobs.
+        model.holdQueuedFileJobs = { [weak nasConnection] in
+            nasConnection?.claimJobBoundary() ?? false
+        }
+        nasConnection.resumeJobQueue = { [weak model] in
+            model?.startNextQueuedFileJobIfPossible()
+        }
         nasPresence.context = { [weak self] in self?.nasPresenceContext }
         nasPresence.onReportChanged = { [weak self] old, new in self?.nasPresenceChanged(from: old, to: new) }
         // A job that only renames files on the drives never writes the
@@ -6539,7 +6546,8 @@ final class EventsWorkspace {
         NASConnectionSettings(
             nasRoot: locations.nasRoot,
             shareURL: nasShareURL,
-            automatic: model.configuration.nasAutoConnect
+            automatic: model.configuration.nasAutoConnect,
+            autoSwitchLink: model.configuration.nasAutoSwitchLink
         )
     }
 

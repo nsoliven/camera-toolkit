@@ -228,7 +228,13 @@ struct LibrarySettingsPane: View {
                     set: { value in model.updateConfiguration { $0.nasAutoConnect = value } }
                 ))
                 .disabled(NASConnectionSettings.shareURL(from: model.configuration.nasSMBURL) == nil)
-                .help("At launch, mount the share with the keychain's saved password when it is not connected. When the share is on Wi-Fi while an Ethernet link to the NAS is up, reconnect it over Ethernet when no job is using the NAS. Needs the NAS share address above.")
+                .help("At launch, mount the share with the keychain's saved password when it is not connected. Needs the NAS share address above.")
+                Toggle("Switch the NAS share to the faster link automatically", isOn: Binding(
+                    get: { model.configuration.nasAutoSwitchLink },
+                    set: { value in model.updateConfiguration { $0.nasAutoSwitchLink = value } }
+                ))
+                .disabled(NASConnectionSettings.shareURL(from: model.configuration.nasSMBURL) == nil)
+                .help("When Ethernet is plugged in, macOS routes the NAS over it at once, but the share's SMB session stays on Wi-Fi until it reconnects. With this on, the share is reconnected over the faster link as soon as no job is using the NAS (or between two queued jobs) — a running copy, hash or delete is never interrupted, and the share is left alone when another app has files open on it. Off: the NAS status offers “Switch to Ethernet Now” instead. SMB multichannel on the NAS makes this unnecessary.")
                 Stepper(
                     "Parallel transfers (\(model.configuration.nasSyncParallelTransfers))",
                     value: Binding(

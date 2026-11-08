@@ -1,3 +1,4 @@
+import CameraToolkitCore
 import Foundation
 import XCTest
 @testable import CameraToolkitApp
@@ -210,5 +211,55 @@ final class StorageLinkInspectorTests: XCTestCase {
         XCTAssertTrue(context.headline.contains("216"))
         XCTAssertNotNil(context.linkTypicalMBps)
         XCTAssertLessThan(context.linkTypicalMBps?.upperBound ?? 0, 40)
+    }
+
+    func testAPendingSwitchIsNamedInTheShareDetail() {
+        let context = StorageLinkInspector.networkContext(
+            host: "192.0.2.10",
+            interfaceName: "en0",
+            interfaceHardwareName: "Wi-Fi",
+            mediaMegabitsPerSecond: nil,
+            wifiMegabitsPerSecond: 216,
+            linkNote: "Ethernet available · share still on Wi-Fi"
+        )
+        XCTAssertEqual(context.medium, .wifi, "the session's link, not the route's")
+        XCTAssertEqual(context.linkNote, "Ethernet available · share still on Wi-Fi")
+        XCTAssertTrue(context.detail?.hasPrefix("Ethernet available · share still on Wi-Fi") == true)
+    }
+
+    func testLiveRegistryAnswersForItsShareAndPostsOnLinkChanges() {
+        let center = NotificationCenter()
+        let registry = NASLiveLinkRegistry(notificationCenter: center)
+        var posts = 0
+        let token = center.addObserver(forName: .cameraToolkitNASLinkChanged, object: nil, queue: nil) { _ in posts += 1 }
+        defer { center.removeObserver(token) }
+
+        let wifi = NASNetworkInterface(bsdName: "en0", kind: .wifi)
+        let ethernet = NASNetworkInterface(bsdName: "en7", kind: .ethernet, linkSpeedMbps: 1000)
+        var snapshot = NASConnectionSnapshot(
+            mountPoint: "/Volumes/nas_share",
+            mount: .mounted(NASMountSource(host: "nas.example", share: "nas_share")),
+            sessionInterfaces: [wifi],
+            routeInterface: wifi
+        )
+        registry.update(snapshot)
+        XCTAssertEqual(posts, 1)
+        registry.update(snapshot)
+        XCTAssertEqual(posts, 1, "nothing moved")
+
+        snapshot.routeInterface = ethernet
+        registry.update(snapshot)
+        XCTAssertEqual(posts, 2, "Ethernet plugged in")
+        let entry = registry.entry(forMountSource: "//someone@NAS.example/nas_share")
+        XCTAssertEqual(entry?.assessment.session?.bsdName, "en0")
+        XCTAssertEqual(entry?.assessment.summary, "Ethernet available · share still on Wi-Fi")
+        XCTAssertNil(registry.entry(forMountSource: "//someone@other.example/nas_share"))
+
+        snapshot.sessionInterfaces = [ethernet]
+        registry.update(snapshot)
+        XCTAssertEqual(posts, 3, "the share moved")
+        registry.update(nil)
+        XCTAssertEqual(posts, 4)
+        XCTAssertNil(registry.entry(forMountSource: "//someone@nas.example/nas_share"))
     }
 }

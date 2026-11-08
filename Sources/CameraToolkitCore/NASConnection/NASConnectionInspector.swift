@@ -62,6 +62,11 @@ public struct NASConnectionSnapshot: Sendable, Equatable {
     /// is hidden from this process (seen for processes macOS has not given
     /// network visibility), not a machine with no connections.
     public var socketListHidden = false
+    /// The interface `primaryRouteInterface` names, with its kind and speed.
+    public var routeInterface: NASNetworkInterface?
+    /// smbutil says the session runs SMB multichannel (it can then use
+    /// every link at once and never needs a reconnect to move).
+    public var multichannel = false
 
     public init(
         mountPoint: String,
@@ -72,7 +77,9 @@ public struct NASConnectionSnapshot: Sendable, Equatable {
         wiredRoutes: [NASNetworkInterface] = [],
         primaryRouteInterface: String? = nil,
         sessionIdentity: String? = nil,
-        socketListHidden: Bool = false
+        socketListHidden: Bool = false,
+        routeInterface: NASNetworkInterface? = nil,
+        multichannel: Bool = false
     ) {
         self.mountPoint = mountPoint
         self.mount = mount
@@ -83,6 +90,14 @@ public struct NASConnectionSnapshot: Sendable, Equatable {
         self.primaryRouteInterface = primaryRouteInterface
         self.sessionIdentity = sessionIdentity
         self.socketListHidden = socketListHidden
+        self.routeInterface = routeInterface
+        self.multichannel = multichannel
+    }
+
+    /// The route to the NAS against the session's link.
+    public var linkAssessment: NASLinkAssessment {
+        guard isMounted else { return NASLinkAssessment(route: nil, sessionInterfaces: []) }
+        return NASLinkAssessment(route: routeInterface, sessionInterfaces: sessionInterfaces)
     }
 
     /// Names one mount's one SMB session: a remount or an SMB-level
@@ -153,19 +168,9 @@ public struct NASConnectionInspector: Sendable {
         if match == nil, let measured, measured.mountKey == key {
             match = NASSessionMatch(localAddresses: [], interfaceNames: [measured.interface], confidence: .measuredBySpeedTest)
         }
-        var sessionInterfaces: [NASNetworkInterface] = []
-        if let match {
-            for name in match.interfaceNames {
-                if let interface = interfaces.first(where: { $0.bsdName == name }) { sessionInterfaces.append(interface) }
-            }
-            for address in match.localAddresses {
-                if let interface = interfaces.first(where: { $0.has(address: address) }),
-                   !sessionInterfaces.contains(where: { $0.bsdName == interface.bsdName }) {
-                    sessionInterfaces.append(interface)
-                }
-            }
-        }
+        let sessionInterfaces = NASSessionLocator.interfaces(for: match, in: interfaces)
         let wired = wiredRoutes(to: servers, interfaces: interfaces)
+        let routeName = servers.first.flatMap { probe.routeInterface(to: $0, scopedTo: nil) }
         return NASConnectionSnapshot(
             mountPoint: mountPoint,
             mount: .mounted(source),
@@ -173,9 +178,11 @@ public struct NASConnectionInspector: Sendable {
             session: match,
             sessionInterfaces: sessionInterfaces,
             wiredRoutes: wired,
-            primaryRouteInterface: servers.first.flatMap { probe.routeInterface(to: $0, scopedTo: nil) },
+            primaryRouteInterface: routeName,
             sessionIdentity: session?.sessionIdentity,
-            socketListHidden: connections.isEmpty
+            socketListHidden: connections.isEmpty,
+            routeInterface: routeName.flatMap { name in interfaces.first { $0.bsdName == name } },
+            multichannel: session?.multichannel ?? false
         )
     }
 
@@ -286,6 +293,29 @@ public struct SystemNASNetworkProbe: NASNetworkProbing {
             counters[String(cString: entry.pointee.ifa_name)] = data.pointee.ifi_obytes
         }
         return counters
+    }
+
+    /// `NASInterfaceSignature` of the live interfaces, from `getifaddrs`
+    /// alone (no SystemConfiguration, no `ifconfig`): cheap enough to poll.
+    public static func interfaceSignature() -> String {
+        var entries: [String: (isUp: Bool, addresses: [String])] = [:]
+        var head: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&head) == 0, let first = head else { return "" }
+        defer { freeifaddrs(first) }
+        var cursor: UnsafeMutablePointer<ifaddrs>? = first
+        while let entry = cursor {
+            cursor = entry.pointee.ifa_next
+            let name = String(cString: entry.pointee.ifa_name)
+            let flags = Int32(entry.pointee.ifa_flags)
+            var current = entries[name] ?? ((flags & IFF_UP) != 0 && (flags & IFF_RUNNING) != 0, [])
+            if let address = entry.pointee.ifa_addr,
+               [AF_INET, AF_INET6].contains(Int32(address.pointee.sa_family)),
+               let host = numericHost(address) {
+                current.addresses.append(host)
+            }
+            entries[name] = current
+        }
+        return NASInterfaceSignature.make(entries.map { ($0.key, $0.value.isUp, $0.value.addresses) })
     }
 
     public func interfaces() -> [NASNetworkInterface] {

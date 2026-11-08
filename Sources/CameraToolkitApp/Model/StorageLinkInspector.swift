@@ -188,6 +188,9 @@ struct StorageLinkContext: Equatable, Sendable {
     var mediaTypicalReadMBps: ClosedRange<Double>?
     var mediaTypicalWriteMBps: ClosedRange<Double>?
     var isSolidState: Bool?
+    /// For a NAS share whose route moved to a faster link than its SMB
+    /// session uses: "Ethernet available · share still on Wi-Fi".
+    var linkNote: String?
 
     /// The binding constraint: whichever of link and media is typically slower.
     var typicalRead: ClosedRange<Double>? {
@@ -361,9 +364,14 @@ enum StorageLinkInspector {
 
     // MARK: Network volumes
 
-    static func networkContext(mountSource: String) -> StorageLinkContext {
+    /// The share's link. When the NAS connection has pinned down the
+    /// interface its SMB session uses, that interface — the route alone
+    /// would name Ethernet the moment a cable is plugged in, while the
+    /// session stays on Wi-Fi until the share reconnects.
+    static func networkContext(mountSource: String, registry: NASLiveLinkRegistry = .shared) -> StorageLinkContext {
         let host = parseMountHost(mountSource)
-        let interface = host.flatMap(routeInterface(to:))
+        let live = registry.entry(forMountSource: mountSource)
+        let interface = live?.assessment.session?.bsdName ?? host.flatMap(routeInterface(to:))
         let wifiRate = interface.flatMap(wifiTransmitRate(interface:))
         let hardwareName = interface.flatMap(hardwarePortName(interface:))
         let mediaRate = interface.flatMap(ifconfigMediaRate(interface:))
@@ -372,11 +380,34 @@ enum StorageLinkInspector {
             interfaceName: interface,
             interfaceHardwareName: hardwareName,
             mediaMegabitsPerSecond: mediaRate,
-            wifiMegabitsPerSecond: wifiRate
+            wifiMegabitsPerSecond: wifiRate,
+            linkNote: live?.assessment.summary
         )
     }
 
     static func networkContext(
+        host: String?,
+        interfaceName: String?,
+        interfaceHardwareName: String?,
+        mediaMegabitsPerSecond: Int?,
+        wifiMegabitsPerSecond: Double?,
+        linkNote: String? = nil
+    ) -> StorageLinkContext {
+        var context = networkContextIgnoringRoute(
+            host: host,
+            interfaceName: interfaceName,
+            interfaceHardwareName: interfaceHardwareName,
+            mediaMegabitsPerSecond: mediaMegabitsPerSecond,
+            wifiMegabitsPerSecond: wifiMegabitsPerSecond
+        )
+        if let linkNote {
+            context.linkNote = linkNote
+            context.detail = "\(linkNote) — it moves when no job is using the NAS. " + (context.detail ?? "")
+        }
+        return context
+    }
+
+    private static func networkContextIgnoringRoute(
         host: String?,
         interfaceName: String?,
         interfaceHardwareName: String?,

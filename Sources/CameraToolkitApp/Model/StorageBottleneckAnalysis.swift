@@ -20,6 +20,9 @@ struct StoragePathLink: Identifiable, Equatable, Sendable {
     var cause: Cause
     /// The device whose link this element describes (for "X negotiated …").
     var owner: String?
+    /// A NAS share whose route already uses a faster link than its SMB
+    /// session: "Ethernet available · share still on Wi-Fi".
+    var linkNote: String? = nil
 }
 
 struct StoragePathVerdict: Identifiable, Equatable, Sendable {
@@ -133,6 +136,15 @@ enum StorageBottleneckAnalysis {
         _ target: StorageBenchmarkTarget,
         contexts: [String: StorageLinkContext]
     ) -> StoragePathLink? {
+        guard var link = transportLinkIgnoringNote(target, contexts: contexts) else { return nil }
+        link.linkNote = contexts[target.id]?.linkNote
+        return link
+    }
+
+    private static func transportLinkIgnoringNote(
+        _ target: StorageBenchmarkTarget,
+        contexts: [String: StorageLinkContext]
+    ) -> StoragePathLink? {
         guard let context = contexts[target.id] else { return nil }
         let rate = context.linkTypicalMBps.map(TransferSpeedReference.midpoint)
         switch context.medium {
@@ -157,9 +169,9 @@ enum StorageBottleneckAnalysis {
                 name: "Network",
                 megabytesPerSecond: rate,
                 isMeasured: false,
-                detail: context.negotiatedBitsPerSecond.map {
+                detail: withLinkNote(context.negotiatedBitsPerSecond.map {
                     StorageLinkInspector.formattedBitsPerSecond($0)
-                } ?? "typical",
+                } ?? "typical", context),
                 cause: .network,
                 owner: target.name
             )
@@ -169,9 +181,9 @@ enum StorageBottleneckAnalysis {
                 name: "Wi-Fi",
                 megabytesPerSecond: rate,
                 isMeasured: false,
-                detail: context.negotiatedBitsPerSecond.map {
+                detail: withLinkNote(context.negotiatedBitsPerSecond.map {
                     "negotiated \(StorageLinkInspector.formattedBitsPerSecond($0))"
-                } ?? "typical",
+                } ?? "typical", context),
                 cause: .wifi,
                 owner: target.name
             )
@@ -180,6 +192,12 @@ enum StorageBottleneckAnalysis {
         case .internalStorage, .unknown:
             return nil
         }
+    }
+
+    /// "negotiated 866 Mb/s · Ethernet available · share still on Wi-Fi".
+    private static func withLinkNote(_ detail: String, _ context: StorageLinkContext) -> String {
+        guard let note = context.linkNote else { return detail }
+        return "\(detail) · \(note)"
     }
 
     private static func genericNetworkLink(owner: String? = nil) -> StoragePathLink {
@@ -223,7 +241,12 @@ enum StorageBottleneckAnalysis {
                     ? ", while \(stripDirection(from: $0.name)) measures ~\(Int($0.megabytesPerSecond.rounded())) MB/s"
                     : ", while \(stripDirection(from: $0.name))'s ~\(Int($0.megabytesPerSecond.rounded())) MB/s is still an estimate until tested"
             } ?? ""
-            detail = "This Mac is on Wi-Fi at ~\(rate) MB/s\(nasNote). Plug in Ethernet and the archive gets faster."
+            if let note = bottleneck.linkNote {
+                // The cable is in; only the share has not moved yet.
+                detail = "\(note): the share still runs at ~\(rate) MB/s\(nasNote). It moves to the faster link by itself as soon as no job is using the NAS, or use Switch Now in the NAS status."
+            } else {
+                detail = "This Mac is on Wi-Fi at ~\(rate) MB/s\(nasNote). Plug in Ethernet and the archive gets faster."
+            }
         case .network:
             headline = "\(title) is limited by the network"
             let nasNote = nasElement.map {

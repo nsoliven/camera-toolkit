@@ -832,7 +832,8 @@ private struct NASSyncAllFooterRow: View {
 
 /// Always-visible NAS line: how the share is connected and how fast it
 /// last measured ("NAS · Ethernet 1 GbE · 75 MB/s"), with Connect when it
-/// is offline and the Wi-Fi banner when a wired link would be faster.
+/// is offline and the link banner when the route to the NAS uses a faster
+/// link than the share ("Ethernet available · share still on Wi-Fi").
 /// Reads the published status only — no filesystem calls here.
 private struct NASStatusFooterRow: View {
     let connection: NASConnectionModel
@@ -841,8 +842,8 @@ private struct NASStatusFooterRow: View {
         let status = connection.status
         if status.phase != .notConfigured {
             VStack(alignment: .leading, spacing: 6) {
-                if status.isOnSlowWiFi, status.banner != nil || status.isWaitingToReconnect {
-                    NASWiFiBanner(status: status, connection: connection)
+                if status.fasterLinkAvailable || status.phase == .reconnecting && status.linkAssessment.state == .fasterLinkAvailable {
+                    NASLinkBanner(status: status, connection: connection)
                 }
                 HStack(spacing: 6) {
                     Button {
@@ -883,6 +884,7 @@ private struct NASStatusFooterRow: View {
         case .connecting, .reconnecting: return "arrow.triangle.2.circlepath"
         case .notSMB: return "externaldrive"
         case .connected:
+            if status.fasterLinkAvailable { return "arrow.left.arrow.right.circle" }
             switch status.snapshot?.sessionKind {
             case .wifi: return "wifi.exclamationmark"
             case .ethernet: return "cable.connector"
@@ -894,7 +896,7 @@ private struct NASStatusFooterRow: View {
 
     private func tint(for status: NASConnectionStatus) -> Color {
         guard status.phase == .connected else { return .secondary }
-        return status.snapshot?.sessionKind == .wifi ? .orange : .green
+        return status.snapshot?.sessionKind == .wifi || status.fasterLinkAvailable ? .orange : .green
     }
 
     private func help(for status: NASConnectionStatus) -> String {
@@ -907,16 +909,17 @@ private struct NASStatusFooterRow: View {
     }
 }
 
-/// "NAS is connected over Wi-Fi (slow)." with the button that waits for
-/// NAS jobs to finish and then reconnects over Ethernet. Never blocks.
+/// "Ethernet available · share still on Wi-Fi." with what happens next,
+/// the "Switch to Ethernet now" button (it waits for a running job, never
+/// interrupts one), and the multichannel hint. Never blocks.
 /// Internal (not private) so the layout tests can measure it.
-struct NASWiFiBanner: View {
+struct NASLinkBanner: View {
     let status: NASConnectionStatus
     let connection: NASConnectionModel
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Label("NAS is connected over Wi-Fi (slow).", systemImage: "wifi.exclamationmark")
+            Label(headline, systemImage: "arrow.left.arrow.right.circle")
                 .font(.callout.weight(.semibold))
                 .fixedSize(horizontal: false, vertical: true)
             if let reason = reasonText {
@@ -925,20 +928,35 @@ struct NASWiFiBanner: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            if status.isWaitingToReconnect {
+            if status.phase == .reconnecting {
                 HStack(spacing: 6) {
                     ProgressView()
                         .controlSize(.mini)
-                    Text("Waiting for NAS jobs to finish…")
+                    Text("Switching the share to \(status.fasterLinkName)…")
+                        .font(.caption)
+                }
+            } else if status.isWaitingToReconnect {
+                HStack(spacing: 6) {
+                    ProgressView()
+                        .controlSize(.mini)
+                    Text("Waiting for the NAS job to finish…")
                         .font(.caption)
                     Spacer(minLength: 0)
                     Button("Cancel") { connection.cancelReconnect() }
                         .controlSize(.small)
                 }
             } else {
-                Button("Reconnect over Ethernet") { connection.reconnectOverEthernet() }
-                    .controlSize(.small)
-                    .help("Waits until no job uses the NAS, then disconnects the share and mounts it again over the wired link")
+                Button(status.lastSwitchFailed ? "Try Again" : "Switch to \(status.fasterLinkName) Now") {
+                    connection.reconnectOverEthernet()
+                }
+                .controlSize(.small)
+                .help("Waits until no job uses the NAS (a running job is never interrupted), then disconnects the share normally and mounts it again over the faster link. If another app has files open on the share, it stays as it is.")
+            }
+            if status.showsMultichannelHint {
+                Text(NASConnectionStatus.multichannelHint)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
         .padding(8)
@@ -946,14 +964,24 @@ struct NASWiFiBanner: View {
         .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
     }
 
+    private var headline: String {
+        let summary = status.linkAssessment.summary ?? "\(status.fasterLinkName) available"
+        return summary + "."
+    }
+
     private var reasonText: String? {
+        if status.lastSwitchFailed, let message = status.message { return message }
+        if status.linkSwitchPending {
+            return "It switches by itself once the running NAS job finishes, or between two queued jobs. Nothing is interrupted."
+        }
         switch status.banner {
-        case .nasInUse: "A job is using the NAS, so it was not reconnected."
-        case .gaveUp: "Two reconnects did not move it to Ethernet."
-        case .rateLimited: status.message
-        case .automaticOff: "Automatic reconnects are off in Settings."
-        case .noShareAddress: "Set the NAS share address in Settings to reconnect it."
-        case nil: nil
+        case .nasInUse: return "A job is using the NAS; switching waits until it finishes."
+        case .gaveUp: return "Two reconnects did not move the share to \(status.fasterLinkName)."
+        case .rateLimited: return status.message ?? "The next automatic try waits a moment."
+        case .automaticOff: return "Automatic switching is off in Settings → Locations."
+        case .noShareAddress: return "Set the NAS share address in Settings to switch it."
+        case .shareBusyElsewhere: return "Another app (Finder, Time Machine, …) has files open on the share, so it stays where it is."
+        case nil: return nil
         }
     }
 }

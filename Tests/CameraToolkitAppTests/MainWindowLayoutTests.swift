@@ -247,7 +247,7 @@ final class MainWindowLayoutTests: XCTestCase {
         status.phase = .connected
         status.banner = .nasInUse
         status.isWaitingToReconnect = true
-        let banner = NASWiFiBanner(status: status, connection: NASConnectionModel())
+        let banner = NASLinkBanner(status: status, connection: NASConnectionModel())
         let size = NSSize(width: 1320, height: 840)
 
         // The footer really is adversarial: at zero width it alone is
@@ -492,7 +492,7 @@ final class MainWindowLayoutTests: XCTestCase {
 /// The main window's split view in miniature: a sidebar list with the
 /// footer as its bottom bar, pinned as `EventsRootView` pins its columns.
 private struct SidebarFooterLayoutProbe: View {
-    let banner: NASWiFiBanner
+    let banner: NASLinkBanner
 
     var body: some View {
         NavigationSplitView {
