@@ -244,6 +244,9 @@ public actor NASConnectionController {
     private let speedTester: any NASSpeedTesting
     private let now: @Sendable () -> Date
     private let isNASInUse: @Sendable () async -> Bool
+    /// True while the app would rather the automatic speed test waited (the
+    /// first board is still loading). It asks again with a later `refresh`.
+    private let deferAutomaticSpeedTest: @Sendable () async -> Bool
     private let onChange: @Sendable (NASConnectionStatus) -> Void
 
     public private(set) var settings: NASConnectionSettings?
@@ -273,8 +276,10 @@ public actor NASConnectionController {
         now: @escaping @Sendable () -> Date = Date.init,
         remountRetryDelay: Duration = .seconds(3),
         isNASInUse: @escaping @Sendable () async -> Bool,
+        deferAutomaticSpeedTest: @escaping @Sendable () async -> Bool = { false },
         onChange: @escaping @Sendable (NASConnectionStatus) -> Void
     ) {
+        self.deferAutomaticSpeedTest = deferAutomaticSpeedTest
         self.remountRetryDelay = remountRetryDelay
         self.inspector = inspector
         self.mounter = mounter
@@ -324,7 +329,7 @@ public actor NASConnectionController {
         let decision = await evaluateGuard(userRequested: trigger == .userRequested)
         if decision == .reconnect {
             await reconnect(userRequested: trigger == .userRequested)
-        } else if status.phase == .connected, needsSpeedTest, !(await isNASInUse()) {
+        } else if status.phase == .connected, needsSpeedTest, !(await isNASInUse()), !(await deferAutomaticSpeedTest()) {
             await runSpeedTest(onDemand: false)
             // The test may just have shown the session is on Wi-Fi (when
             // the socket list is hidden, it is the only way to tell).

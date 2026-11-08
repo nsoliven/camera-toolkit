@@ -75,18 +75,6 @@ final class BoardNASListingTests: XCTestCase {
         XCTAssertEqual(summary.counts.archiveUnknown, library.shape.city)
     }
 
-    func testAFreshListingThatCoversTheFamilySavesTheFolderRead() async throws {
-        let library = try makeLibrary()
-        defer { library.tearDown() }
-        let counter = ListingCounter()
-        library.workspace.presenceArchiveLister = { root, folders, isCancelled in
-            counter.note(folders)
-            return try EventArchiveListing.smbLister(root, folders, isCancelled)
-        }
-        await library.workspace.refreshEvent(library.cityID)
-        XCTAssertEqual(counter.calls.count, 1)
-    }
-
     func testTheChipsLandBeforeTheBurstVisionPass() async throws {
         let library = try makeLibrary()
         defer { library.tearDown() }

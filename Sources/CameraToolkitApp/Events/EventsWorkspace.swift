@@ -807,6 +807,13 @@ final class EventsWorkspace {
     /// How many board reads (`refreshEvent`) have started — what a test
     /// compares to prove a move did not re-read the boards it patched.
     @ObservationIgnored private(set) var boardReadCount = 0
+    /// Until this moment the board counts as busy even with no refresh
+    /// running yet — from launch, and right after a board is clicked, so NAS
+    /// work asked for in that same moment waits for the board's own start.
+    @ObservationIgnored private var boardQuietUntil: Date?
+    @ObservationIgnored var boardLaunchQuiet: TimeInterval = 3
+    @ObservationIgnored var boardBusyWaitLimit: TimeInterval = 30
+    @ObservationIgnored private var boardIdleWatcher: Task<Void, Never>?
     /// When each board was last clicked, until its refresh picks it up — the
     /// zero of that open's timing lines (`BoardOpenTrace`).
     @ObservationIgnored private var boardSelectedAt: [UUID: ContinuousClock.Instant] = [:]
@@ -1031,6 +1038,11 @@ final class EventsWorkspace {
         }
         faceLabelsRestoredObserver.observers = [observer]
         nasConnection.isNASInUse = { [weak self] in self?.nasIsInUse ?? true }
+        nasConnection.deferSpeedTest = { [weak self] in
+            guard let self, boardIsBusy else { return false }
+            scheduleWorkAfterBoardIdle()
+            return true
+        }
         // The NAS link switch takes its turn between two queued jobs.
         model.holdQueuedFileJobs = { [weak nasConnection] in
             nasConnection?.claimJobBoundary() ?? false
@@ -1039,6 +1051,7 @@ final class EventsWorkspace {
             model?.startNextQueuedFileJobIfPossible()
         }
         nasPresence.context = { [weak self] in self?.nasPresenceContext }
+        nasPresence.onWaitingForBoard = { [weak self] in self?.scheduleWorkAfterBoardIdle() }
         nasPresence.onReportChanged = { [weak self] old, new in self?.nasPresenceChanged(from: old, to: new) }
         // A job that only renames files on the drives never writes the
         // NAS, so it neither pauses a NAS listing nor triggers a new one.
@@ -2759,6 +2772,9 @@ final class EventsWorkspace {
             let selectedAt = ContinuousClock.now
             boardSelectedAt[eventID] = selectedAt
             BoardOpenTrace(eventID: eventID, selectedAt: selectedAt).mark("selected")
+            if nasPresence.isEnabled {
+                boardQuietUntil = max(boardQuietUntil ?? .distantPast, Date().addingTimeInterval(1))
+            }
             nasPresence.refresh(.boardOpened)
         }
         cancelPendingSelectionCollapse()
@@ -6735,6 +6751,7 @@ final class EventsWorkspace {
     /// Launch: status, auto-connect, and the Wi-Fi guard. App only.
     func startNASConnection() {
         LaunchTrace.markOnce("launch.nas_connection_start")
+        boardQuietUntil = Date().addingTimeInterval(boardLaunchQuiet)
         nasConnection.start(settings: nasConnectionSettings)
         nasPresence.isEnabled = true
         nasPresence.refresh(.launch)
@@ -6772,11 +6789,7 @@ final class EventsWorkspace {
             model.statusMessage = "There are no events to sync."
             return
         }
-        let report = nasPresence.report
-        let stale = report?.listedAt.map { Date().timeIntervalSince($0) > NASPresenceSchedule.automaticInterval } ?? true
-        if nasIsConnected, stale, !nasPresence.isChecking {
-            nasPresence.refresh(.manual)
-        }
+        if nasIsConnected { nasPresence.refreshForSyncAll() }
         // The switch keeps what the owner last chose; it is only greyed out
         // (and ignored) while the drive is away.
         syncAllDriveMounted = NASCatchUp.driveIsMounted(locations)
@@ -6817,8 +6830,46 @@ final class EventsWorkspace {
             catalogURL: URL(fileURLWithPath: DashboardModel.expandedPath(model.configuration.catalogDatabasePath)),
             configuration: model.configuration,
             nasAvailable: nasIsConnected,
-            nasJobRunning: nasIsInUse
+            nasJobRunning: nasIsInUse,
+            selectedFamily: selectedEventFamily,
+            boardIsBusy: boardIsBusy
         )
+    }
+
+    private var selectedEventFamily: [SavedCameraEvent]? {
+        guard case .event(let eventID) = selection else { return nil }
+        let family = eventFamily(eventID)
+        return family.isEmpty ? nil : family
+    }
+
+    // MARK: Waiting for the board
+
+    /// True while a board is loading, or just about to: NAS listings and the
+    /// speed test wait, so they do not compete with its first paint.
+    var boardIsBusy: Bool {
+        refreshesInFlight > 0 || boardQuietUntil.map { Date() < $0 } == true
+    }
+
+    /// Waits until the board is idle, at most `boardBusyWaitLimit` — a board
+    /// that never settles does not hold the NAS work back forever.
+    func waitForBoardIdle() async {
+        let started = Date()
+        while boardIsBusy, !Task.isCancelled, Date().timeIntervalSince(started) < boardBusyWaitLimit {
+            try? await Task.sleep(for: .milliseconds(250))
+        }
+    }
+
+    /// Runs what was held back for the board, once it is idle.
+    private func scheduleWorkAfterBoardIdle() {
+        guard boardIdleWatcher == nil else { return }
+        boardIdleWatcher = Task { @MainActor [weak self] in
+            await self?.waitForBoardIdle()
+            guard let self else { return }
+            boardIdleWatcher = nil
+            LaunchTrace.markOnce("launch.board_idle")
+            nasPresence.boardBecameIdle()
+            nasConnection.boardBecameIdle()
+        }
     }
 
     /// A new NAS presence answer: the open board re-reads its NAS place

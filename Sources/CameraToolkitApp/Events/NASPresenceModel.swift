@@ -79,6 +79,11 @@ struct NASPresenceContext: Sendable {
     var configuration: AppConfiguration
     var nasAvailable: Bool
     var nasJobRunning: Bool
+    /// The open event board and its subevents; nil with no event open. An
+    /// automatic check lists these folders instead of the whole library.
+    var selectedFamily: [SavedCameraEvent]? = nil
+    /// The board is still loading: an automatic listing waits for it.
+    var boardIsBusy = false
 }
 
 /// Keeps "which event files are not on the NAS yet" current in the
@@ -98,7 +103,14 @@ final class NASPresenceModel {
 
     /// The NAS listing the counts and the board use.
     @ObservationIgnored private(set) var listing: NASTreeListing?
+    /// When the whole library was last asked to be listed.
     @ObservationIgnored private var lastListingAttempt: Date?
+    /// When each event's folder was last asked to be listed by itself.
+    @ObservationIgnored private var lastEventAttempts: [UUID: Date] = [:]
+    /// When a listing of the whole library last succeeded.
+    @ObservationIgnored private var lastFullListing: Date?
+    /// A whole-library listing is running now.
+    @ObservationIgnored private var isListingWholeLibrary = false
     @ObservationIgnored private var waiting: Request?
     @ObservationIgnored private var task: Task<Void, Never>?
     @ObservationIgnored private var generation = 0
@@ -107,6 +119,9 @@ final class NASPresenceModel {
     @ObservationIgnored var isEnabled = false
     @ObservationIgnored var now: @Sendable () -> Date = { Date() }
     @ObservationIgnored var context: (@MainActor () -> NASPresenceContext?)?
+    /// An automatic listing is waiting for the board; the workspace answers
+    /// with `boardBecameIdle` when it is.
+    @ObservationIgnored var onWaitingForBoard: (@MainActor () -> Void)?
     /// Called on the main actor after a check publishes, with the previous
     /// report.
     @ObservationIgnored var onReportChanged: (@MainActor (_ old: NASPresenceReport?, _ new: NASPresenceReport) -> Void)?
@@ -142,7 +157,7 @@ final class NASPresenceModel {
     }
 
     /// Starts a check if the schedule allows one. Cheap to call often.
-    func refresh(_ trigger: NASPresenceTrigger, scope: [SavedCameraEvent]? = nil) {
+    func refresh(_ trigger: NASPresenceTrigger, scope: [SavedCameraEvent]? = nil, boardWaitOver: Bool = false) {
         guard isEnabled else { return }
         var request = Request(trigger: trigger, scope: scope)
         if let waiting {
@@ -161,10 +176,15 @@ final class NASPresenceModel {
             start(request, context: context, list: false)
             return
         }
+        // An automatic check only lists what is on screen; the whole library
+        // is listed for Sync All, or when no event is open.
+        if request.scope == nil, request.trigger.isAutomatic {
+            request.scope = context.selectedFamily
+        }
         let decision = NASPresenceSchedule.decide(
             trigger: request.trigger,
             now: now(),
-            lastListingAttempt: lastListingAttempt,
+            lastListingAttempt: lastAttempt(for: request.scope),
             nasAvailable: context.nasAvailable,
             nasJobRunning: context.nasJobRunning,
             isChecking: isChecking
@@ -173,8 +193,13 @@ final class NASPresenceModel {
         case .wait:
             waiting = request
         case .list:
+            if request.trigger.isAutomatic, context.boardIsBusy, !boardWaitOver {
+                waiting = request
+                onWaitingForBoard?()
+                return
+            }
             waiting = nil
-            lastListingAttempt = now()
+            noteAttempt(for: request.scope)
             start(request, context: context, list: true)
         case .skip(let reason):
             waiting = nil
@@ -184,6 +209,43 @@ final class NASPresenceModel {
         }
     }
 
+    /// The board finished loading, or waited long enough: the listing that
+    /// was held back for it runs now.
+    func boardBecameIdle() {
+        guard let waiting, waiting.trigger.isAutomatic else { return }
+        self.waiting = nil
+        refresh(waiting.trigger, scope: waiting.scope, boardWaitOver: true)
+    }
+
+    /// Sync All is opening. Its confirmation counts every event, so a
+    /// listing that only covered the boards opened so far is not enough:
+    /// list the whole library unless that just happened or is happening.
+    func refreshForSyncAll() {
+        guard isEnabled, !isListingWholeLibrary else { return }
+        if let lastFullListing, now().timeIntervalSince(lastFullListing) <= NASPresenceSchedule.automaticInterval { return }
+        refresh(.manual)
+    }
+
+    /// When `scope` was last listed: nil when any of its events never was.
+    private func lastAttempt(for scope: [SavedCameraEvent]?) -> Date? {
+        guard let scope else { return lastListingAttempt }
+        var oldest: Date?
+        for event in scope {
+            guard let at = [lastEventAttempts[event.id], lastListingAttempt].compactMap({ $0 }).max() else { return nil }
+            oldest = oldest.map { min($0, at) } ?? at
+        }
+        return oldest
+    }
+
+    private func noteAttempt(for scope: [SavedCameraEvent]?) {
+        let time = now()
+        guard let scope else {
+            lastListingAttempt = time
+            return
+        }
+        for event in scope { lastEventAttempts[event.id] = time }
+    }
+
     /// A NAS job is starting: a running check stops (it would compete) and
     /// asks again once the job ends.
     func pauseForJob() {
@@ -191,6 +253,7 @@ final class NASPresenceModel {
         task.cancel()
         self.task = nil
         isChecking = false
+        isListingWholeLibrary = false
         generation += 1
         let again = Request(trigger: .jobFinished, scope: nil)
         waiting = waiting.map { $0.merged(with: again) } ?? again
@@ -240,6 +303,7 @@ final class NASPresenceModel {
         generation += 1
         let generation = self.generation
         isChecking = true
+        isListingWholeLibrary = list && request.scope == nil
         listedFiles = 0
         let base = listing
         let now = self.now
@@ -261,6 +325,10 @@ final class NASPresenceModel {
         var listing: NASTreeListing?
         var note: String?
         var cancelled = false
+        /// The whole library was listed and answered.
+        var listedWholeLibrary = false
+        /// No listing was run: there was nothing on the drive to compare.
+        var nothingToCompare = false
     }
 
     /// The check itself, off the main actor: the drive plan (local folder
@@ -283,7 +351,13 @@ final class NASPresenceModel {
         let records = NASSyncStore.existingRecords(catalogURL: context.catalogURL, nasRoot: nasRoot.path)
         var listing = base?.root == nasRoot.standardizedFileURL.path ? base : nil
         var note: String?
-        if list {
+        var listedWholeLibrary = false
+        // Listing the whole library is pointless with nothing to compare it
+        // against: no drive mounted, or nothing on it.
+        let nothingToCompare = list && request.scope == nil && plan.items.isEmpty
+        if nothingToCompare {
+            note = "Nothing on the drive to compare with the NAS."
+        } else if list {
             let remote = NASRemoteLister.from(configuration: context.configuration, nasRoot: nasRoot)
             // Over SSH every event folder costs nothing extra; over SMB only
             // the folders that hold drive files are read.
@@ -308,6 +382,7 @@ final class NASPresenceModel {
                 if let reason = result.sshFallbackReason {
                     note = "Listed over SMB — SSH did not answer: \(reason)"
                 }
+                listedWholeLibrary = request.scope == nil
             } catch is CancellationError {
                 return Outcome(cancelled: true)
             } catch {
@@ -318,7 +393,9 @@ final class NASPresenceModel {
         return Outcome(
             report: NASPresenceIndex.report(plan: plan, records: records, listing: listing, checkedAt: now()),
             listing: listing,
-            note: note
+            note: note,
+            listedWholeLibrary: listedWholeLibrary,
+            nothingToCompare: nothingToCompare
         )
     }
 
@@ -326,6 +403,10 @@ final class NASPresenceModel {
         guard generation == self.generation else { return }
         task = nil
         isChecking = false
+        isListingWholeLibrary = false
+        // Nothing was listed: the next mount must not be throttled by it.
+        if outcome.nothingToCompare { lastListingAttempt = nil }
+        if outcome.listedWholeLibrary { lastFullListing = now() }
         LaunchTrace.mark("nas.presence.finish", outcome: outcome.cancelled ? .cancel : .ok, detail: "listed_at=\(outcome.report?.listedAt != nil) drive_files=\(outcome.report?.total.files ?? 0)")
         if !outcome.cancelled, let report = outcome.report {
             let old = self.report
@@ -385,9 +466,10 @@ enum NASPendingText {
         }
         let total = report.total
         if total.pendingFiles > 0 {
-            // Only Sync to NAS's records answered: "not verified" is all
-            // that is known.
-            let unverifiedOnly = total.unknownFiles == total.pendingFiles && report.listedAt == nil
+            // Some of it rests on Sync to NAS's records alone — no listing
+            // has covered those folders — so "not verified" is all that is
+            // known about them.
+            let unverifiedOnly = total.unknownFiles > 0
             return "\(files(total.pendingFiles)) · \(total.pendingBytes.formattedBytes) \(unverifiedOnly ? "not verified on NAS" : "not on NAS")"
         }
         if total.differentFiles > 0 {
@@ -399,7 +481,9 @@ enum NASPendingText {
 
     /// The help text of a sidebar event's badge.
     static func badgeHelp(_ totals: NASPresenceTotals) -> String {
-        var parts = ["\(files(totals.pendingFiles)) · \(totals.pendingBytes.formattedBytes) not on the NAS yet"]
+        // Pending only because no listing covered them yet: not known to be missing.
+        let wording = totals.unknownFiles > 0 ? "not verified on the NAS" : "not on the NAS yet"
+        var parts = ["\(files(totals.pendingFiles)) · \(totals.pendingBytes.formattedBytes) \(wording)"]
         if totals.differentFiles > 0 { parts.append("\(files(totals.differentFiles)) differ on the NAS (never overwritten)") }
         return parts.joined(separator: " · ")
     }
