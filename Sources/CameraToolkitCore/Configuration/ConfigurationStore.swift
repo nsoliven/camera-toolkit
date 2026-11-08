@@ -617,6 +617,12 @@ public struct SavedCameraEvent: Identifiable, Codable, Equatable, Hashable, Send
     /// default for top-level events; the folder then sits directly under the
     /// drive's year folder.
     public var parentEventID: UUID?
+    /// Where the event sits among its siblings in the sidebar, set by
+    /// dragging it there. `nil` — every event saved before manual ordering
+    /// existed, and every new one — sorts by the default order (newest
+    /// first, then by name), so an older config lists exactly as it did.
+    /// Ordering never touches a file; see `EventHierarchy.siblingPrecedes`.
+    public var sidebarOrder: Int?
 
     public init(
         id: UUID = UUID(),
@@ -628,7 +634,8 @@ public struct SavedCameraEvent: Identifiable, Codable, Equatable, Hashable, Send
         immichAlbumPolicy: ImmichAlbumPolicy? = nil,
         immichAlbumName: String? = nil,
         storagePolicy: EventStoragePolicy? = nil,
-        parentEventID: UUID? = nil
+        parentEventID: UUID? = nil,
+        sidebarOrder: Int? = nil
     ) {
         self.id = id
         self.name = name
@@ -640,6 +647,7 @@ public struct SavedCameraEvent: Identifiable, Codable, Equatable, Hashable, Send
         self.immichAlbumName = immichAlbumName
         self.storagePolicy = storagePolicy
         self.parentEventID = parentEventID
+        self.sidebarOrder = sidebarOrder
     }
 
     public var sendsToImmich: Bool { immichUploadEnabled ?? false }
@@ -720,10 +728,140 @@ public enum EventHierarchy {
     }
 
     /// Direct subevents of `eventID` in the same sibling order `flattened`
-    /// uses — newest first, then by name.
+    /// uses — see `siblingPrecedes`.
     public static func children(of eventID: UUID, in events: [SavedCameraEvent]) -> [SavedCameraEvent] {
-        events.filter { $0.parentEventID == eventID }
-            .sorted { $0.eventDate == $1.eventDate ? $0.name < $1.name : $0.eventDate > $1.eventDate }
+        events.filter { $0.parentEventID == eventID }.sorted(by: siblingPrecedes)
+    }
+
+    /// The default sibling order: newest first, then by name.
+    public static func datePrecedes(_ lhs: SavedCameraEvent, _ rhs: SavedCameraEvent) -> Bool {
+        lhs.eventDate == rhs.eventDate ? lhs.name < rhs.name : lhs.eventDate > rhs.eventDate
+    }
+
+    /// Sibling order in the sidebar. Events the user placed by hand
+    /// (`sidebarOrder` set) keep that order; events never placed — every
+    /// event of a config written before manual ordering, and each new
+    /// event — come first, in the default date order. With no event
+    /// placed this is exactly the date order the sidebar always had.
+    public static func siblingPrecedes(_ lhs: SavedCameraEvent, _ rhs: SavedCameraEvent) -> Bool {
+        switch (lhs.sidebarOrder, rhs.sidebarOrder) {
+        case let (left?, right?):
+            return left == right ? datePrecedes(lhs, rhs) : left < right
+        case (nil, .some):
+            return true
+        case (.some, nil):
+            return false
+        case (nil, nil):
+            return datePrecedes(lhs, rhs)
+        }
+    }
+
+    /// The parent the sidebar nests `event` under: its nearest reachable
+    /// ancestor, or nil for a top-level event (and for one whose parent is
+    /// missing or loops, which lists at the top level too).
+    public static func sidebarParentID(of event: SavedCameraEvent, byID: [UUID: SavedCameraEvent]) -> UUID? {
+        ancestors(of: event, byID: byID).last?.id
+    }
+
+    /// The events listed directly under `parentID` (nil: the top level),
+    /// in sidebar order.
+    public static func siblings(under parentID: UUID?, in events: [SavedCameraEvent]) -> [SavedCameraEvent] {
+        let byID = index(events)
+        return events.filter { sidebarParentID(of: $0, byID: byID) == parentID }.sorted(by: siblingPrecedes)
+    }
+
+    /// `events` with `eventID` placed among the events listed under
+    /// `parentID`, just before `beforeID` (at the end when `beforeID` is nil
+    /// or not one of them). The first placement in a group freezes the order
+    /// it shows right now: every sibling gets its current position, then the
+    /// event moves. Only `sidebarOrder` changes — never a parent, a name or
+    /// a date, and never a file. The caller has already given the event its
+    /// parent; an event listed elsewhere is returned unchanged.
+    public static func placing(
+        _ eventID: UUID,
+        under parentID: UUID?,
+        before beforeID: UUID?,
+        in events: [SavedCameraEvent]
+    ) -> [SavedCameraEvent] {
+        let byID = index(events)
+        guard let moving = byID[eventID], sidebarParentID(of: moving, byID: byID) == parentID else { return events }
+        var group = siblings(under: parentID, in: events).map(\.id).filter { $0 != eventID }
+        let slot = beforeID.flatMap { id in group.firstIndex(of: id) } ?? group.count
+        group.insert(eventID, at: slot)
+        var position: [UUID: Int] = [:]
+        for (offset, id) in group.enumerated() { position[id] = offset }
+        return events.map { event in
+            guard let order = position[event.id] else { return event }
+            var placed = event
+            placed.sidebarOrder = order
+            return placed
+        }
+    }
+
+    /// How many levels of subevents hang under `eventID`: 0 for an event
+    /// with none, 1 when it has subevents, 2 when one of them has its own.
+    public static func subtreeHeight(of eventID: UUID, in events: [SavedCameraEvent]) -> Int {
+        let byID = index(events)
+        guard let root = byID[eventID] else { return 0 }
+        let rootDepth = ancestors(of: root, byID: byID).count
+        return descendants(of: eventID, in: events)
+            .map { ancestors(of: $0, byID: byID).count - rootDepth }
+            .max() ?? 0
+    }
+
+    /// Why `eventID` can't be moved under `newParentID` (nil: the top
+    /// level), or nil when it can. Never a cycle: an event can't go into
+    /// itself or one of its own subevents. Never deeper than `maxDepth`:
+    /// the event and every subevent it carries must still fit — unless the
+    /// move makes the family no deeper than it already is.
+    public static func reparentProblem(
+        moving eventID: UUID,
+        to newParentID: UUID?,
+        in events: [SavedCameraEvent]
+    ) -> ReparentProblem? {
+        let byID = index(events)
+        guard let event = byID[eventID] else { return .missingEvent }
+        let currentParentID = sidebarParentID(of: event, byID: byID)
+        guard let newParentID else {
+            return currentParentID == nil ? .alreadyThere : nil
+        }
+        guard let parent = byID[newParentID] else { return .missingEvent }
+        if newParentID == eventID { return .ontoItself }
+        if ancestors(of: parent, byID: byID).contains(where: { $0.id == eventID }) { return .intoOwnSubevent }
+        if currentParentID == newParentID { return .alreadyThere }
+        let height = subtreeHeight(of: eventID, in: events)
+        let newDeepest = ancestors(of: parent, byID: byID).count + 1 + height
+        let oldDeepest = ancestors(of: event, byID: byID).count + height
+        if newDeepest > maxDepth, newDeepest > oldDeepest { return .tooDeep }
+        return nil
+    }
+
+    /// Every event `eventID` may move into — the events `reparentProblem`
+    /// allows, minus the parent it already has. One pass over the list, so
+    /// a menu or picker can ask without a walk per candidate.
+    public static func reparentTargets(for eventID: UUID, in events: [SavedCameraEvent]) -> Set<UUID> {
+        let byID = index(events)
+        guard let event = byID[eventID] else { return [] }
+        let currentParentID = sidebarParentID(of: event, byID: byID)
+        let height = subtreeHeight(of: eventID, in: events)
+        let oldDeepest = ancestors(of: event, byID: byID).count + height
+        var targets: Set<UUID> = []
+        for candidate in byID.values where candidate.id != eventID && candidate.id != currentParentID {
+            let chain = ancestors(of: candidate, byID: byID)
+            guard !chain.contains(where: { $0.id == eventID }) else { continue }
+            let newDeepest = chain.count + 1 + height
+            if newDeepest > maxDepth, newDeepest > oldDeepest { continue }
+            targets.insert(candidate.id)
+        }
+        return targets
+    }
+
+    public enum ReparentProblem: Equatable, Sendable {
+        case missingEvent
+        case ontoItself
+        case intoOwnSubevent
+        case alreadyThere
+        case tooDeep
     }
 
     /// The deepest a saved event may nest: depth 0 is a top-level event,
@@ -754,14 +892,13 @@ public enum EventHierarchy {
         chain(of: event, byID: byID).map(\.name).joined(separator: " / ")
     }
 
-    /// Events flattened for list display: parents in the usual newest-first
-    /// order, each followed by its subevents (depth drives indentation).
+    /// Events flattened for list display: parents in sibling order
+    /// (`siblingPrecedes` — newest first until the user drags one), each
+    /// followed by its subevents (depth drives indentation).
     /// Members of a parent loop have no top-level root; they surface sorted
     /// at the end instead of vanishing.
     public static func flattened(_ events: [SavedCameraEvent]) -> [(event: SavedCameraEvent, depth: Int)] {
-        let order: (SavedCameraEvent, SavedCameraEvent) -> Bool = {
-            $0.eventDate == $1.eventDate ? $0.name < $1.name : $0.eventDate > $1.eventDate
-        }
+        let order: (SavedCameraEvent, SavedCameraEvent) -> Bool = siblingPrecedes
         let byID = index(events)
         var children: [UUID: [SavedCameraEvent]] = [:]
         var roots: [SavedCameraEvent] = []

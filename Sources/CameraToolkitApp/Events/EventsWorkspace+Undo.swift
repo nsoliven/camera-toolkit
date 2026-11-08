@@ -1299,6 +1299,13 @@ extension EventsWorkspace {
 
     // MARK: - Events: rename, re-date, re-parent
 
+    nonisolated static func differOnlyInSidebarOrder(_ lhs: SavedCameraEvent, _ rhs: SavedCameraEvent) -> Bool {
+        var aligned = lhs
+        aligned.sidebarOrder = rhs.sidebarOrder
+        aligned.lastUsedAt = rhs.lastUsedAt
+        return aligned == rhs
+    }
+
     /// The fields an edit changes.
     private func sameEventFields(_ lhs: SavedCameraEvent, _ rhs: SavedCameraEvent) -> Bool {
         lhs.name == rhs.name
@@ -1423,6 +1430,11 @@ extension EventsWorkspace {
                 configuration.savedEvents[index].eventDate = target.eventDate
                 configuration.savedEvents[index].parentEventID = target.parentEventID
                 configuration.savedEvents[index].storagePolicy = target.storagePolicy
+                // A re-parent also took a place among the new siblings; its
+                // reversal puts the event back where it was listed.
+                if edit.before.parentEventID != edit.after.parentEventID {
+                    configuration.savedEvents[index].sidebarOrder = target.sidebarOrder
+                }
                 // Adopted entries point straight at the folders.
                 for step in steps {
                     let from = URL(fileURLWithPath: step.old).standardizedFileURL.path + "/"
@@ -1581,10 +1593,18 @@ extension EventsWorkspace {
                 configuration.savedEvents[index].name = target.name
                 configuration.savedEvents[index].eventDate = target.eventDate
                 configuration.savedEvents[index].parentEventID = target.parentEventID
+                // A sidebar reorder changes only this; other edits leave it.
+                if pair.before.sidebarOrder != pair.after.sidebarOrder {
+                    configuration.savedEvents[index].sidebarOrder = target.sidebarOrder
+                }
             }
         }
         if case .event(let id) = selection, removing.contains(where: { $0.id == id }) { selection = nil }
-        for pair in change.edited { Task { await refreshEvent(pair.before.id) } }
+        // A board draws nothing of the sidebar order, so a reorder alone
+        // refreshes none.
+        for pair in change.edited where !Self.differOnlyInSidebarOrder(pair.before, pair.after) {
+            Task { await refreshEvent(pair.before.id) }
+        }
         return nil
     }
 
