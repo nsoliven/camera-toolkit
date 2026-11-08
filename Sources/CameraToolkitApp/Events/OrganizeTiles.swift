@@ -353,7 +353,7 @@ struct TileThumbnail: View {
     }
 }
 
-private extension View {
+extension View {
     /// A flat dark capsule for labels drawn on a photo — no material, so a
     /// board of hundreds of tiles never runs hundreds of live blurs.
     func photoBadgeScrim() -> some View {
@@ -401,6 +401,7 @@ private func stackAccessibilityLabel(
     if isMixed { parts.append("Mixed events") }
     if let badge { parts.append(badge.label) }
     if !editTags.isEmpty { parts.append("Edited: " + editTags.joined(separator: ", ")) }
+    if let marker = CombinedFilesMarker(stack: stack) { parts.append(marker.accessibilityText) }
     return parts.joined(separator: ", ")
 }
 
@@ -502,6 +503,9 @@ struct StackTileView: View {
                                 .help("Edits in Edited/: " + editTags.joined(separator: ", "))
                         }
                         Spacer(minLength: 0)
+                        if let marker = CombinedFilesMarker(stack: stack) {
+                            CombinedFilesPill(marker: marker)
+                        }
                     }
                 }
                 .padding(6)
@@ -935,6 +939,9 @@ struct StackRowView<MoreMenu: View>: View {
                     if let title = editTagBadgeTitle(editTags) {
                         Label(title, systemImage: "slider.horizontal.3")
                             .lineLimit(1)
+                    }
+                    if let marker = CombinedFilesMarker(stack: stack) {
+                        CombinedFilesRowLabel(marker: marker)
                     }
                 }
                 .font(.caption)

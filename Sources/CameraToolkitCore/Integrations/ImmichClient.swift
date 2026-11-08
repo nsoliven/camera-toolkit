@@ -424,7 +424,7 @@ public struct ImmichMultipartUpload: Sendable {
         case "dng": "image/x-adobe-dng"
         case "jpg", "jpeg": "image/jpeg"
         case "heic": "image/heic"
-        case "heif": "image/heif"
+        case "heif", "hif": "image/heif"
         case "png": "image/png"
         case "tif", "tiff": "image/tiff"
         case "mp4": "video/mp4"

@@ -1862,14 +1862,14 @@ final class EventsWorkspace {
         refreshIndexIfNeeded(tracking: false)
         var inputs: [CardClearInput] = []
         var eventIDs = Set<UUID>()
-        for item in result.items {
-            let entries = item.files.map { file -> CardClearInput.Entry in
+        for unit in Self.cardClearUnits(result.items) {
+            let entries = unit.map { file -> CardClearInput.Entry in
                 let assignment = currentAssignment(for: file)
                 if let assignment { eventIDs.insert(assignment.eventID) }
                 return CardClearInput.Entry(path: file.path, assignment: assignment)
             }
-            guard entries.contains(where: { $0.assignment != nil }) else { continue }
-            inputs.append(CardClearInput(id: item.primary.pathKey, entries: entries))
+            guard entries.contains(where: { $0.assignment != nil }), let primary = unit.first else { continue }
+            inputs.append(CardClearInput(id: primary.pathKey, entries: entries))
         }
         return CardClearJobInputs(
             inputs: inputs,
@@ -3099,10 +3099,11 @@ final class EventsWorkspace {
 
         let gate = driveActivityGate
         let linkMemory = burstLinkMemory
+        let ownership = sideFileOwnership()
         Task { @MainActor [weak self] in
             let outcome: Result<OrganizeScanResult, any Error> = await Task.detached(priority: .userInitiated) {
                 Result {
-                    let result = try OrganizeScanner().scan(root: root, cache: cache, burstGrouping: BurstGroupingConfiguration.resolved(), burstSplits: burstSplits, pauseGate: gate, progress: reportProgress)
+                    let result = try OrganizeScanner().scan(root: root, cache: cache, burstGrouping: BurstGroupingConfiguration.resolved(), burstSplits: burstSplits, pauseGate: gate, ownership: ownership, progress: reportProgress)
                     // What the Vision check decided here holds for every
                     // copy of these frames, so event boards group alike.
                     linkMemory.record(result)
@@ -3331,6 +3332,7 @@ final class EventsWorkspace {
         applyAssignmentChange(change, touching: eventID, addedItems: eligibleItems)
         noteRecent(eventID)
         recordAssignmentUndo(change)
+        rescanIfSideFilesParted(stacks, in: location)
         let skipped = files.count - eligible.count
         model.statusMessage = "Sorted \(stacks.count) item\(stacks.count == 1 ? "" : "s") (\(eligible.count) file\(eligible.count == 1 ? "" : "s")) into \(eventTitle(event)). Nothing moves until you press Apply."
             + (skipped > 0 ? " \(skipped) file(s) already live in another event's folder and were left alone." : "")
@@ -3353,6 +3355,9 @@ final class EventsWorkspace {
         let change = AssignmentChange(title: "Unsort", removed: removable, added: [])
         applyAssignmentChange(change, touching: nil)
         recordAssignmentUndo(change)
+        if let location = location(locationID) {
+            rescanIfSideFilesParted(result.stacks.filter { stackIDs.contains($0.id) }, in: location)
+        }
         model.statusMessage = "Unsorted \(removable.count) file\(removable.count == 1 ? "" : "s")."
     }
 
@@ -3475,10 +3480,10 @@ final class EventsWorkspace {
         for boardID in Array(eventStacks.keys) {
             guard let stacks = eventStacks[boardID] else { continue }
             let items = stacks.flatMap(\.items)
-            let remaining = items.filter { item in
-                !item.files.contains { fileKeys.contains(Self.fileKey($0)) }
+            let remaining = items.flatMap { item in
+                item.removingFiles { fileKeys.contains(Self.fileKey($0)) }
             }
-            guard remaining.count != items.count else { continue }
+            guard remaining != items else { continue }
             eventStacks[boardID] = stacking.stacks(for: remaining)
                 .carryingIDs(from: stacks)
             eventGridRevisions[boardID] = model.catalogStateRevision
@@ -4165,13 +4170,12 @@ final class EventsWorkspace {
                 let earliest = family
                     .sorted { ($0.modifiedAt, $0.relativePath) < ($1.modifiedAt, $1.relativePath) }
                     .prefix(limit)
-                let files = earliest.compactMap { assignment -> OrganizeFile? in
-                    guard let path = implied.path(for: assignment, driveUp: mountTableAvailable[assignment.eventID] == true) else { return nil }
-                    return OrganizeFile(literalPath: path, size: assignment.fileSize, modifiedAt: assignment.modifiedAt)
+                let (files, ownership) = Self.drawnFiles(for: earliest) { assignment in
+                    implied.path(for: assignment, driveUp: mountTableAvailable[assignment.eventID] == true)
                 }
                 // Cache hits only — a miss is "no camera date" here, never a
                 // header read, so nothing on this pass can wait on a drive.
-                let items = OrganizeScanner.items(for: files, cache: cacheLoader.cache(), readMissingCaptureDates: false, pauseGate: gate).items
+                let items = OrganizeScanner.items(for: files, cache: cacheLoader.cache(), readMissingCaptureDates: false, pauseGate: gate, ownership: ownership).items
                 return (
                     EventImpliedGrid(files: files, stacks: stacking.stacks(for: items)),
                     family.count
@@ -4212,11 +4216,11 @@ final class EventsWorkspace {
             let (familyAssignments, assignmentsByEvent) = await familyTask.value
             let cache = cacheLoader.cache()
             var files: [OrganizeFile] = []
+            var ownership = SideFileOwnership()
             if !gridIsCurrent {
-                files.reserveCapacity(familyAssignments.count)
-                for assignment in familyAssignments where !Task.isCancelled {
-                    guard let path = implied.path(for: assignment, driveUp: mountTableAvailable[assignment.eventID] == true) else { continue }
-                    files.append(OrganizeFile(literalPath: path, size: assignment.fileSize, modifiedAt: assignment.modifiedAt))
+                (files, ownership) = Self.drawnFiles(for: familyAssignments) { assignment in
+                    guard !Task.isCancelled else { return nil }
+                    return implied.path(for: assignment, driveUp: mountTableAvailable[assignment.eventID] == true)
                 }
                 if !Task.isCancelled, !files.isEmpty {
                     // The provisional grid stacks on whatever the cache already
@@ -4225,7 +4229,7 @@ final class EventsWorkspace {
                     // out the remaining capture-date reads. The count of those
                     // reads rides the apply so the board can say dates are
                     // still coming without saying files are.
-                    let undated = OrganizeScanner.items(for: files, cache: cache, readMissingCaptureDates: false, pauseGate: gate)
+                    let undated = OrganizeScanner.items(for: files, cache: cache, readMissingCaptureDates: false, pauseGate: gate, ownership: ownership)
                     let provisional = stacking.stacks(for: undated.items)
                     // A refresh that rebuilds the very grid the board already
                     // shows publishes nothing: the comparison runs here, off
@@ -4273,7 +4277,7 @@ final class EventsWorkspace {
                     // place is back reads the dates.
                     let previousProbe = cache.timestampProbe
                     cache.timestampProbe = dateReadProbe
-                    let dated = OrganizeScanner.items(for: files, cache: cache, readMissingCaptureDates: canReadHeaders, pauseGate: gate)
+                    let dated = OrganizeScanner.items(for: files, cache: cache, readMissingCaptureDates: canReadHeaders, pauseGate: gate, ownership: ownership)
                     cache.timestampProbe = previousProbe
                     datedItems = dated.items
                     built = EventImpliedGrid(files: files, stacks: stacking.stacks(for: dated.items))
@@ -4593,12 +4597,15 @@ final class EventsWorkspace {
         let stacking = eventStacking()
         let gate = driveActivityGate
         let files = output.files
+        let ownership = SideFileOwnership(owners: output.assetsByPathKey.mapValues {
+            SideFileOwnership.Owner(eventID: $0.assignment.eventID, fileSize: $0.assignment.fileSize)
+        })
         let rebuilt = await withCheckedContinuation { (cc: CheckedContinuation<[OrganizeStack], Never>) in
             Task.detached(priority: .utility) {
                 // These are the copies the sweep found on disk, so the
                 // Vision check may read them for pairs nobody compared yet.
                 cc.resume(returning: stacking.stacks(
-                    for: OrganizeScanner.items(for: files, cache: cache, pauseGate: gate).items,
+                    for: OrganizeScanner.items(for: files, cache: cache, pauseGate: gate, ownership: ownership).items,
                     computeMissingLinks: true,
                     pauseGate: gate
                 ))
@@ -7524,10 +7531,10 @@ final class EventsWorkspace {
         for eventID in ids {
             guard let stacks = eventStacks[eventID] else { continue }
             let items = stacks.flatMap(\.items)
-            let remaining = items.filter { item in
-                !item.files.contains { pathKeys.contains($0.pathKey) }
+            let remaining = items.flatMap { item in
+                item.removingFiles { pathKeys.contains($0.pathKey) }
             }
-            guard remaining.count != items.count else { continue }
+            guard remaining != items else { continue }
             eventStacks[eventID] = stacking.stacks(for: remaining)
                 .carryingIDs(from: stacks)
             eventGridRevisions[eventID] = model.catalogStateRevision

@@ -144,6 +144,34 @@ final class CardClearTests: XCTestCase {
         }
     }
 
+    /// The preview shares its clip's tile, so it clears with the clip or the
+    /// clip stays. Its own NAS copy is checked like any other file's.
+    func testAClipStaysWhenItsScreenPreviewsNASCopyDiffers() throws {
+        try withTemporaryDirectory { root in
+            let names = ["CAM_0001_D.OSV", "CAM_0001_D.SCR"]
+            let f = try fixture(root, names)
+            try Data(repeating: 0x5A, count: 2_048).write(to: f.nas.appendingPathComponent("CAM_0001_D.SCR"))
+            let before = try snapshot(f)
+
+            let report = try CardClearService().clear(items: [try f.item(names)], nasReachable: true, confirmation: "DELETE")
+
+            XCTAssertTrue(report.cleared.isEmpty)
+            XCTAssertEqual(report.skipped.count, 2)
+            for name in names { XCTAssertTrue(exists(f.card.appendingPathComponent(name)), name) }
+            XCTAssertEqual(try snapshot(f), before)
+        }
+    }
+
+    func testAClipAndItsScreenPreviewLeaveTogether() throws {
+        try withTemporaryDirectory { root in
+            let names = ["CAM_0002_D.OSV", "CAM_0002_D.SCR"]
+            let f = try fixture(root, names)
+            let report = try CardClearService().clear(items: [try f.item(names)], nasReachable: true, confirmation: "DELETE")
+            XCTAssertEqual(report.cleared.count, 2)
+            for name in names { XCTAssertFalse(exists(f.card.appendingPathComponent(name)), name) }
+        }
+    }
+
     func testUnreachableNASFallsBackToTheRecordedHashAndSaysSo() throws {
         try withTemporaryDirectory { root in
             let f = try fixture(root, ["DSC00001.ARW", "DSC00002.ARW"])

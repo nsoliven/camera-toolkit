@@ -15,14 +15,24 @@ public enum OrganizeFileClassifier {
         "arw", "cr2", "cr3", "nef", "nrw", "orf", "raf", "rw2", "pef", "srw", "dng"
     ]
     public static let photoExtensions: Set<String> = [
-        "jpg", "jpeg", "heic", "heif", "png", "tif", "tiff", "webp"
+        "jpg", "jpeg", "heic", "heif", "hif", "png", "tif", "tiff", "webp"
     ]
     public static let videoExtensions: Set<String> = [
         "mp4", "mov", "m4v", "mts", "m2ts", "mxf", "avi", "insv", "osv"
     ]
+    /// Files that exist only because of the photo or clip beside them. They
+    /// share its tile while staying ordinary files: each still has its own
+    /// catalog row, copy, NAS verification and Trash entry.
+    ///
+    /// `scr` is a DJI screen preview (a small JPEG), `met` is DJI telemetry
+    /// and `textclipping` is a Finder drag leftover.
     public static let companionExtensions: Set<String> = [
-        "xmp", "xml", "thm", "lrf", "lrv", "srt", "aae", "photo-edit"
+        "xmp", "xml", "thm", "lrf", "lrv", "srt", "aae", "photo-edit", "scr", "met", "textclipping"
     ]
+    /// Extensions that used to be tiles of their own, so a catalog may hold
+    /// rows for them that disagree with their partner's
+    /// (`SideFileOwnership` decides at read time).
+    public static let formerlyStandaloneExtensions: Set<String> = ["scr", "met", "textclipping", "hif"]
     public static let ignoredFileNames: Set<String> = ["thumbs.db", "desktop.ini", ".ds_store"]
 
     public static func kind(forExtension ext: String) -> OrganizeMediaKind {
@@ -43,8 +53,14 @@ public enum OrganizeFileClassifier {
     /// ordinary photos; a JPEG beside a RAW of the same stem becomes that
     /// RAW's companion. Sony clip sidecars such as `C0001M01.XML` pair with
     /// `C0001.MP4`. Sidecars without a partner become their own items so no
-    /// file is silently left behind.
-    public static func pair(_ files: [OrganizeFile]) -> [Pairing] {
+    /// file is silently left behind; an unpartnered DJI screen preview takes
+    /// the leftover side files of its own stem into its tile.
+    ///
+    /// `keepApart` can refuse a pairing, leaving that file its own item.
+    public static func pair(
+        _ files: [OrganizeFile],
+        keepApart: ((_ primary: OrganizeFile, _ sideFile: OrganizeFile) -> Bool)? = nil
+    ) -> [Pairing] {
         var byFolder: [String: [OrganizeFile]] = [:]
         for file in files {
             byFolder[file.folderPath, default: []].append(file)
@@ -94,7 +110,7 @@ public enum OrganizeFileClassifier {
 
             var attached: [String: [OrganizeFile]] = [:]
             for photo in secondaryPhotos {
-                if primaries[photo.stem] != nil {
+                if let primary = primaries[photo.stem], keepApart?(primary.file, photo) != true {
                     attached[photo.stem, default: []].append(photo)
                 } else {
                     others.append(photo)
@@ -102,13 +118,26 @@ public enum OrganizeFileClassifier {
             }
             for companion in companions {
                 let stem = companion.stem
-                if primaries[stem] != nil {
-                    attached[stem, default: []].append(companion)
-                } else if let sonyClip = sonyClipStem(stem), primaries[sonyClip] != nil {
-                    attached[sonyClip, default: []].append(companion)
+                let partnerStem = primaries[stem] != nil
+                    ? stem
+                    : sonyClipStem(stem).flatMap { primaries[$0] != nil ? $0 : nil }
+                if let partnerStem, let primary = primaries[partnerStem], keepApart?(primary.file, companion) != true {
+                    attached[partnerStem, default: []].append(companion)
                 } else {
                     others.append(companion)
                 }
+            }
+
+            var screenPreviews: [String: OrganizeFile] = [:]
+            for file in others where file.fileExtension == "scr" && screenPreviews[file.stem] == nil {
+                screenPreviews[file.stem] = file
+            }
+            var taken: [String: [OrganizeFile]] = [:]
+            var takenPaths: Set<String> = []
+            for file in others where companionExtensions.contains(file.fileExtension) && file.fileExtension != "scr" {
+                guard let preview = screenPreviews[file.stem], keepApart?(preview, file) != true else { continue }
+                taken[preview.path, default: []].append(file)
+                takenPaths.insert(file.path)
             }
 
             for (stem, primary) in primaries {
@@ -118,8 +147,12 @@ public enum OrganizeFileClassifier {
                     kind: primary.kind
                 ))
             }
-            for file in others where !ignoredFileNames.contains(file.name.lowercased()) {
-                pairings.append(Pairing(primary: file, companions: [], kind: .other))
+            for file in others where !ignoredFileNames.contains(file.name.lowercased()) && !takenPaths.contains(file.path) {
+                pairings.append(Pairing(
+                    primary: file,
+                    companions: (taken[file.path] ?? []).sorted { $0.path < $1.path },
+                    kind: .other
+                ))
             }
         }
         return pairings.sorted { $0.primary.path < $1.primary.path }
@@ -286,6 +319,67 @@ public struct OrganizeItem: Identifiable, Hashable, Sendable {
     public var files: [OrganizeFile] { [primary] + companions }
     /// No temporary array: a board header sums this over thousands of items.
     public var byteCount: Int64 { companions.reduce(primary.size) { $0 + $1.size } }
+
+    /// What is left of the item once some of its files have gone. A file
+    /// that stayed never leaves with its partner: if the primary went, each
+    /// surviving companion becomes an item of its own.
+    public func removingFiles(where isGone: (OrganizeFile) -> Bool) -> [OrganizeItem] {
+        let survivors = companions.filter { !isGone($0) }
+        guard isGone(primary) else {
+            var kept = self
+            kept.companions = survivors
+            return [kept]
+        }
+        return survivors.map { survivor in
+            OrganizeItem(
+                primary: survivor,
+                kind: OrganizeFileClassifier.kind(forExtension: survivor.fileExtension),
+                captureDate: captureDate,
+                hasCameraDate: false,
+                metadataCamera: metadataCamera
+            )
+        }
+    }
+}
+
+/// Who owns each file, for deciding at read time whether a side file may
+/// share its partner's tile. Nothing here writes: a side file that was
+/// already its own item keeps its catalog row, and when that row disagrees
+/// with its partner's the two are simply drawn apart.
+public struct SideFileOwnership: Sendable {
+    public struct Owner: Equatable, Sendable {
+        public var eventID: UUID
+        public var fileSize: Int64
+
+        public init(eventID: UUID, fileSize: Int64) {
+            self.eventID = eventID
+            self.fileSize = fileSize
+        }
+    }
+
+    private var owners: [String: Owner]
+
+    /// `owners` is keyed by `OrganizeFile.pathKey`.
+    public init(owners: [String: Owner] = [:]) {
+        self.owners = owners
+    }
+
+    /// The owning event; a row for another file of a different size at this
+    /// path (a reused card number) does not count.
+    public func owner(of file: OrganizeFile) -> UUID? {
+        guard let owner = owners[file.pathKey], owner.fileSize == file.size else { return nil }
+        return owner.eventID
+    }
+
+    /// True when the side file was a tile of its own before it could be
+    /// combined and its assignment differs from its partner's: in different
+    /// events, or sorted on one side only. Always-combined sidecars are
+    /// unaffected.
+    public func keepsApart(primary: OrganizeFile, sideFile: OrganizeFile) -> Bool {
+        guard OrganizeFileClassifier.formerlyStandaloneExtensions.contains(sideFile.fileExtension)
+            || OrganizeFileClassifier.kind(forExtension: primary.fileExtension) == .other else { return false }
+        return owner(of: primary) != owner(of: sideFile)
+    }
 }
 
 public struct OrganizeStack: Identifiable, Hashable, Sendable {
