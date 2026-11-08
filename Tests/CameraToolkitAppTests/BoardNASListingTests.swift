@@ -162,3 +162,17 @@ final class CaptureDateCacheLoaderTests: XCTestCase {
         XCTAssertEqual(library.workspace.eventStacks[library.cityID]?.flatMap(\.files).count, library.shape.city)
     }
 }
+
+/// Launch asks for drive discovery once.
+@MainActor
+final class LaunchDiscoveryTests: XCTestCase {
+    func testStartLeavesDiscoveryToTheFirstConnectivityPass() throws {
+        let library = try MoveLibrary.make(.small)
+        defer { library.tearDown() }
+        let workspace = library.workspace
+        workspace.start()
+        XCTAssertEqual(workspace.driveDiscoveryRuns, 0)
+        workspace.refreshConnectivity()
+        XCTAssertEqual(workspace.driveDiscoveryRuns, 1)
+    }
+}

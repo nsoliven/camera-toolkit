@@ -807,6 +807,8 @@ final class EventsWorkspace {
     /// How many board reads (`refreshEvent`) have started — what a test
     /// compares to prove a move did not re-read the boards it patched.
     @ObservationIgnored private(set) var boardReadCount = 0
+    /// How many drive discoveries have started.
+    @ObservationIgnored private(set) var driveDiscoveryRuns = 0
     /// Until this moment the board counts as busy even with no refresh
     /// running yet — from launch, and right after a board is clicked, so NAS
     /// work asked for in that same moment waits for the board's own start.
@@ -2902,7 +2904,8 @@ final class EventsWorkspace {
         LaunchTrace.markOnce("launch.workspace_start")
         observeVolumeChanges()
         Task { await loadUndoHistory() }
-        discoverDriveEvents()
+        // Discovery is not started here: AppShell's first connectivity pass
+        // runs it, and starting it twice listed every drive twice at launch.
         scheduleRosterWarm()
         // Decode the capture-date cache now, off the main actor, so the
         // first board opened never waits for it.
@@ -4170,6 +4173,7 @@ final class EventsWorkspace {
     }
 
     func discoverDriveEvents() {
+        driveDiscoveryRuns += 1
         let configuration = model.configuration
         let locations = self.locations
         let gate = driveActivityGate
