@@ -88,6 +88,8 @@ private struct JobSpeedMark: Identifiable {
     var mean: Double
     var low: Double
     var high: Double
+    /// The scan pass this column belongs to; nil for single-pass jobs.
+    var pass: Int?
 }
 
 /// The chart itself and the phase lanes under it, sharing the plot's
@@ -107,20 +109,28 @@ private struct JobSpeedPlot: View {
 
     static let tint = Color.blue
 
+    /// One colour per pass, so a change of pass reads at a glance.
+    static func tint(forPass pass: Int?) -> Color {
+        pass == 2 ? .teal : tint
+    }
+
     var body: some View {
         let visible = zoom.visible
         let columns = graph.visibleBuckets(in: visible, buckets: max(Int(plot.width / 3), 60))
         var marks: [JobSpeedMark] = []
         for (segment, buckets) in columns.enumerated() {
             for bucket in buckets {
-                marks.append(JobSpeedMark(id: marks.count, segment: segment, t: bucket.t, mean: bucket.mean, low: bucket.low, high: bucket.high))
+                marks.append(JobSpeedMark(id: marks.count, segment: segment, t: bucket.t, mean: bucket.mean, low: bucket.low, high: bucket.high, pass: graph.scanPass(at: bucket.t)?.index))
             }
         }
         let showsRange = marks.contains { $0.high > $0.low }
         let unit = Self.unit(graph.metric, kind: kind)
         return VStack(alignment: .leading, spacing: 6) {
+            if !graph.scanPasses.isEmpty {
+                JobScanPassLabels(passes: graph.scanPasses, visible: visible, plot: plot)
+            }
             Text(unit)
-                .font(.caption2.weight(.semibold))
+                .font(.caption)
                 .foregroundStyle(.secondary)
                 .accessibilityHidden(true)
             Chart {
@@ -133,7 +143,7 @@ private struct JobSpeedPlot: View {
                             series: .value("Range", "range-\(mark.segment)")
                         )
                         .interpolationMethod(.monotone)
-                        .foregroundStyle(Self.tint.opacity(0.14))
+                        .foregroundStyle(Self.tint(forPass: mark.pass).opacity(0.14))
                     }
                     AreaMark(
                         x: .value("Elapsed", mark.t),
@@ -142,7 +152,7 @@ private struct JobSpeedPlot: View {
                         series: .value("Area", "area-\(mark.segment)")
                     )
                     .interpolationMethod(.monotone)
-                    .foregroundStyle(.linearGradient(colors: [Self.tint.opacity(0.22), Self.tint.opacity(0.02)], startPoint: .top, endPoint: .bottom))
+                    .foregroundStyle(.linearGradient(colors: [Self.tint(forPass: mark.pass).opacity(0.22), Self.tint(forPass: mark.pass).opacity(0.02)], startPoint: .top, endPoint: .bottom))
                     LineMark(
                         x: .value("Elapsed", mark.t),
                         y: .value(unit, mark.mean),
@@ -150,13 +160,21 @@ private struct JobSpeedPlot: View {
                     )
                     .interpolationMethod(.monotone)
                     .lineStyle(StrokeStyle(lineWidth: 1.8, lineCap: .round, lineJoin: .round))
-                    .foregroundStyle(Self.tint)
+                    .foregroundStyle(Self.tint(forPass: mark.pass))
                 }
-                if let average = graph.average {
+                ForEach(graph.scanPasses.dropFirst(), id: \.index) { pass in
+                    RuleMark(x: .value("Pass start", pass.start))
+                        .lineStyle(StrokeStyle(lineWidth: 1))
+                        .foregroundStyle(Color.secondary.opacity(0.5))
+                }
+                // One dashed average across passes would average two
+                // different scans; the readouts carry it instead.
+                if graph.scanPasses.isEmpty, let average = graph.average {
                     RuleMark(y: .value("Average", average))
                         .lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 3]))
                         .foregroundStyle(Color.secondary)
-                        .annotation(position: .top, alignment: .trailing, spacing: 2) {
+                        // On the side the peak's label is not.
+                        .annotation(position: .top, alignment: Self.averageLabelAlignment(peak: graph.peak?.t, visible: visible), spacing: 2) {
                             Text("avg \(Self.format(average, unit: unit))")
                                 .font(.caption2.monospacedDigit())
                                 .foregroundStyle(.secondary)
@@ -225,6 +243,11 @@ private struct JobSpeedPlot: View {
         }
     }
 
+    static func averageLabelAlignment(peak: Double?, visible: ClosedRange<Double>) -> Alignment {
+        guard let peak, visible.contains(peak) else { return .leading }
+        return peak < (visible.lowerBound + visible.upperBound) / 2 ? .trailing : .leading
+    }
+
     static func unit(_ metric: JobSpeedGraph.Metric?, kind: String) -> String {
         switch metric {
         case .filesPerSecond: JobDetailFacts.filesUnit(kind)
@@ -235,6 +258,42 @@ private struct JobSpeedPlot: View {
 
     static func format(_ value: Double, unit: String) -> String {
         unit == "MB/s" ? "\(JobThroughputFormat.rate(value)) MB/s" : "\(JobThroughputFormat.itemRate(value)) \(unit)"
+    }
+}
+
+/// "Pass 1 · Faces" above the plot where each pass starts — outside the
+/// plot, so the hover card and the peak label have it to themselves. A
+/// pass starting near the right edge is labelled back from that edge.
+private struct JobScanPassLabels: View {
+    let passes: [JobSpeedGraph.ScanPass]
+    let visible: ClosedRange<Double>
+    let plot: CGRect
+
+    /// Past this share of the plot a label would run off the end.
+    static let trailingFrom = 0.8
+
+    var body: some View {
+        let span = max(visible.upperBound - visible.lowerBound, .leastNonzeroMagnitude)
+        ZStack(alignment: .topLeading) {
+            Color.clear.frame(height: 14)
+            ForEach(passes, id: \.index) { pass in
+                if pass.end >= visible.lowerBound, pass.start <= visible.upperBound {
+                    let position = (max(pass.start, visible.lowerBound) - visible.lowerBound) / span
+                    let text = Text(pass.label)
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(JobSpeedPlot.tint(forPass: pass.index))
+                        .lineLimit(1)
+                        .fixedSize()
+                    if position >= Self.trailingFrom {
+                        text.frame(width: plot.maxX, alignment: .trailing)
+                    } else {
+                        text.offset(x: plot.minX + CGFloat(position) * plot.width + 2)
+                    }
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .combine)
     }
 }
 
@@ -425,7 +484,9 @@ private struct JobSpeedHoverCard: View {
             }
         }
         .padding(8)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 7))
+        // Opaque: chart labels under the card must not show through it.
+        .background(Color(nsColor: .windowBackgroundColor), in: RoundedRectangle(cornerRadius: 7))
         .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(.quaternary, lineWidth: 1))
+        .shadow(color: .black.opacity(0.12), radius: 4, y: 1)
     }
 }

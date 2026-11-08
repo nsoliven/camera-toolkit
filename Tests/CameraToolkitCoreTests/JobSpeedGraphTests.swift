@@ -230,16 +230,20 @@ final class JobSpeedGraphTests: XCTestCase {
 
     // MARK: Outliers and smoothing
 
-    /// A face scan that ran at ~30 photos/s and settled thousands of
-    /// cached files in its last second: the axis follows the run, and the
-    /// burst is the peak, marked off the scale.
+    /// A job that ran at ~30 files/s and settled thousands of cached files
+    /// in its last second: the axis follows the run, and the burst is the
+    /// peak, marked off the scale. A scan drops such a burst altogether.
     func testALoneBurstDoesNotFlattenTheRun() {
         var samples = (1...600).map { JobHistorySample(t: Double($0), combined: 0, filesPerSecond: 25 + Double($0 % 10), doneFiles: $0 * 30) }
         samples.append(JobHistorySample(t: 601, combined: 0, filesPerSecond: 8_551, doneFiles: 18_100))
-        let graph = JobSpeedGraph.build(samples: samples, kind: "faceScan", duration: 601)
+        let graph = JobSpeedGraph.build(samples: samples, kind: "organize", duration: 601)
         XCTAssertEqual(graph.peak?.value, 8_551)
         XCTAssertEqual(graph.yUpper, 50)
         XCTAssertTrue(graph.peakIsOffScale)
+
+        let scan = JobSpeedGraph.build(samples: samples, kind: "faceScan", duration: 601)
+        XCTAssertLessThan(scan.peak?.value ?? .infinity, 40)
+        XCTAssertFalse(scan.peakIsOffScale)
     }
 
     func testAnOrdinaryPeakStaysOnTheScale() {
