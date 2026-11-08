@@ -77,7 +77,7 @@ final class VideoPreviewTests: XCTestCase {
 
         let tile = try XCTUnwrap(TileImageLoader.dji360Thumbnail(url: osv, maximumPixelSize: 384))
         XCTAssertEqual(tile.width, 128)
-        let poster = try XCTUnwrap(TileImageLoader.decode(url: osv, maximumPixelSize: 2_400))
+        let poster = try XCTUnwrap(TileImageLoader.decode(url: osv, maximumPixelSize: 2_400)?.image)
         XCTAssertEqual(poster.width, 128)
         XCTAssertEqual(poster.height, 96)
 

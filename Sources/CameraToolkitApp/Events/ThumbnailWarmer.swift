@@ -20,7 +20,8 @@ final class ThumbnailWarmer: @unchecked Sendable {
         let key: String
         let sources: [String]
         let bucket: Int
-        let orientation: Int
+        /// The saved rotation, or nil to use the camera's.
+        let orientation: Int?
     }
 
     struct Hooks: Sendable {
@@ -31,7 +32,7 @@ final class ThumbnailWarmer: @unchecked Sendable {
         /// Whether the volume a path lives on is mounted.
         var isAvailable: @Sendable (String) -> Bool
         var fileExists: @Sendable (String) -> Bool = { FileManager.default.fileExists(atPath: $0) }
-        var decode: @Sendable (_ path: String, _ bucket: Int, _ orientation: Int) -> CGImage?
+        var decode: @Sendable (_ path: String, _ bucket: Int, _ orientation: Int?) -> TileImageLoader.DecodedTile?
     }
 
     struct Timing: Sendable {
@@ -220,8 +221,8 @@ final class ThumbnailWarmer: @unchecked Sendable {
 
     private func readAndStore(_ item: Item) -> Outcome {
         for source in item.sources where hooks.isAvailable(source) && hooks.fileExists(source) {
-            guard let image = hooks.decode(source, item.bucket, item.orientation) else { continue }
-            return cache.storeAndWait(image, forKey: item.key) ? .saved : .storeFailed
+            guard let decoded = hooks.decode(source, item.bucket, item.orientation) else { continue }
+            return cache.storeAndWait(decoded.image, cameraTurns: decoded.cameraTurns, forKey: item.key) ? .saved : .storeFailed
         }
         // Asked after the reads: a volume that left during one is an absence
         // to wait out, not a bad file.

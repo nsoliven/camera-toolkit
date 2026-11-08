@@ -7913,10 +7913,21 @@ final class EventsWorkspace {
 
     // MARK: - Display rotation
 
-    /// Quarter-turns clockwise recorded for this file's identity — survives
-    /// the file moving between the card, the Buffer, and the NAS.
+    /// The latest rotate still waiting to read a camera turn — so a test can
+    /// wait for it. Nothing else depends on it.
+    private(set) var pendingRotation: Task<Void, Never>?
+
+    /// The saved rotation for this file's identity, or nil to use the
+    /// camera's — survives the file moving between the card, the Buffer,
+    /// and the NAS. This is what a tile asks the loader for.
+    func savedTurns(for file: OrganizeFile) -> Int? {
+        DisplayRotation.savedTurns(for: file, in: model.orientationsForDisplay)
+    }
+
+    /// The quarter-turns the file is drawn at right now: its saved rotation,
+    /// else the camera's as far as a decode has found it. No file access.
     func displayTurns(for file: OrganizeFile) -> Int {
-        DisplayRotation.turns(for: file, in: model.orientationsForDisplay)
+        TileImageLoader.shared.effectiveTurns(saved: savedTurns(for: file), for: file.url)
     }
 
     /// Rotates every rotatable file in `stack` — all burst frames plus their
@@ -7940,13 +7951,32 @@ final class EventsWorkspace {
                 : "Nothing to rotate in the selection."
             return
         }
+        // A rotate steps from what the photo shows, which for a RAW depends
+        // on the camera. Frames that have been decoded are known; the rest of
+        // a burst (only its cover draws on the board) is read off the main
+        // actor first. A file that cannot be read counts as not turned.
+        let loader = TileImageLoader.shared
+        let unknown = rotated.map(\.url).filter { loader.knownCameraTurns(for: $0) == nil }
+        guard !unknown.isEmpty else {
+            applyRotation(of: stacks, files: rotated, quarterTurnsCW: delta)
+            return
+        }
+        pendingRotation = Task { [weak self] in
+            await loader.learnCameraTurns(for: unknown)
+            self?.applyRotation(of: stacks, files: rotated, quarterTurnsCW: delta)
+        }
+    }
+
+    private func applyRotation(of stacks: [OrganizeStack], files rotated: [OrganizeFile], quarterTurnsCW delta: Int) {
+        let loader = TileImageLoader.shared
         let orientationsBefore = model.configuration.displayOrientations
         model.updateConfiguration { configuration in
             for stack in stacks {
                 configuration.displayOrientations = DisplayRotation.rotatedMap(
                     configuration.displayOrientations,
                     applying: delta,
-                    to: stack
+                    to: stack,
+                    cameraTurns: { loader.knownCameraTurns(for: $0.url) ?? 0 }
                 )
             }
         }
@@ -7960,7 +7990,7 @@ final class EventsWorkspace {
             recordUndo("Rotate \(direction)", detail: stacks.count == 1 ? nil : "\(stacks.count) bursts", .config(.orientations(orientationChanges)))
         }
         for file in rotated {
-            TileImageLoader.shared.invalidate(url: file.url)
+            loader.invalidate(url: file.url)
         }
         let frames = stacks.reduce(0) { $0 + $1.items.count }
         let direction = abs(delta) == 2 ? "180°" : (delta > 0 ? "90° clockwise" : "90° counter-clockwise")

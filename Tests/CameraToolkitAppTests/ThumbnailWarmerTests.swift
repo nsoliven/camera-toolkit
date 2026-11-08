@@ -86,7 +86,7 @@ final class ThumbnailWarmerTests: XCTestCase {
                 fileExists: exists,
                 decode: { path, _, _ in
                     probe.noteDecode(path)
-                    return decoder(path)
+                    return decoder(path).map { TileImageLoader.DecodedTile(image: $0, cameraTurns: nil) }
                 }
             ),
             timing: fastTiming
@@ -184,7 +184,7 @@ final class ThumbnailWarmerTests: XCTestCase {
         XCTAssertTrue(only.sources[1].hasPrefix("/Volumes/nas_share/"), "then the NAS")
         XCTAssertTrue(only.sources.allSatisfy { $0.hasSuffix("DSC00001.ARW") }, "the RAW is the file its tile shows")
         let identity = ThumbnailDiskCache.fileIdentity(OrganizeFile(path: only.sources[0], size: 1_000, modifiedAt: Date(timeIntervalSince1970: 1_772_000_000)))
-        XCTAssertEqual(only.key, ThumbnailDiskCache.key(fileIdentity: identity, bucket: 512, orientation: 0), "the key is the one the tile will look up")
+        XCTAssertEqual(only.key, ThumbnailDiskCache.key(fileIdentity: identity, bucket: 512, orientation: nil), "the key is the one the tile will look up")
     }
 
     func testARotatedPhotoIsWarmedAtItsRotation() throws {
@@ -422,7 +422,7 @@ final class ThumbnailWarmerTests: XCTestCase {
                 fileExists: { _ in true },
                 decode: { path, _, _ in
                     probe.noteDecode(path)
-                    return Self.makeImage()
+                    return TileImageLoader.DecodedTile(image: Self.makeImage(), cameraTurns: nil)
                 }
             ),
             timing: fastTiming

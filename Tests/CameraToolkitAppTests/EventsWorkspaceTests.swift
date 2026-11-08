@@ -3087,6 +3087,7 @@ final class EventsWorkspaceTests: XCTestCase {
             let beforeBytes = try beforeListing.map { try Data(contentsOf: folder.appendingPathComponent($0)) }
 
             workspace.rotateStack(burst, quarterTurnsCW: 1)
+            await workspace.pendingRotation?.value
 
             for file in burst.files {
                 let expected = DisplayRotation.isRotatable(file) ? 1 : 0
@@ -3136,6 +3137,7 @@ final class EventsWorkspaceTests: XCTestCase {
             let beforeBytes = try beforeListing.map { try Data(contentsOf: folder.appendingPathComponent($0)) }
 
             workspace.rotateStacks(bursts, quarterTurnsCW: -1)
+            await workspace.pendingRotation?.value
 
             for burst in bursts {
                 for file in burst.files {
@@ -3152,6 +3154,41 @@ final class EventsWorkspaceTests: XCTestCase {
             }
             XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: folder.path).sorted(), beforeListing)
             XCTAssertEqual(try beforeListing.map { try Data(contentsOf: folder.appendingPathComponent($0)) }, beforeBytes)
+        }
+    }
+
+    /// Rotating a RAW nothing has decoded yet reads the camera's rotation
+    /// first (off the main actor), so the photo moves one step from what it
+    /// will show, and the catalog keeps the 0 that the camera disagrees with.
+    func testRotateOfAnUndecodedRawStepsFromTheCameraTurns() async throws {
+        try await withOrganizerSandbox { root, model, workspace in
+            let folder = root.appendingPathComponent("Drive/Unsorted A7V/Transfer 1", isDirectory: true)
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            let url = folder.appendingPathComponent("DSC00001.ARW")
+            try SyntheticRAW.file(orientation: 8, width: 60, height: 40).write(to: url)
+            let before = try Data(contentsOf: url)
+
+            let file = OrganizeFile(path: url.path, size: Int64(before.count), modifiedAt: Date(timeIntervalSince1970: 1_772_000_000))
+            let stack = OrganizeStack(items: [OrganizeItem(primary: file, companions: [], kind: .raw, captureDate: file.modifiedAt, hasCameraDate: true)])
+            let key = DisplayRotation.fileKey(for: file)
+
+            XCTAssertNil(workspace.savedTurns(for: file))
+            workspace.rotateStack(stack, quarterTurnsCW: 1)
+            await workspace.pendingRotation?.value
+
+            XCTAssertEqual(model.configuration.displayOrientations[key], 0)
+            XCTAssertEqual(workspace.displayTurns(for: file), 0)
+
+            // One more step counter-clockwise goes back to the camera's 3.
+            workspace.rotateStack(stack, quarterTurnsCW: -1)
+            await workspace.pendingRotation?.value
+            XCTAssertNil(model.configuration.displayOrientations[key], "back on the camera's turn, the override is gone")
+            XCTAssertEqual(workspace.displayTurns(for: file), 3)
+
+            // Undo restores the saved 0 exactly.
+            workspace.undo()
+            XCTAssertEqual(model.configuration.displayOrientations[key], 0)
+            XCTAssertEqual(try Data(contentsOf: url), before, "the RAW itself is never touched")
         }
     }
 

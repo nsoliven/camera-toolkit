@@ -259,9 +259,10 @@ struct TileThumbnail: View {
     /// Longest edge in points — the decode asks for `pointSize × displayScale`
     /// pixels, so a 1× monitor never pays for a Retina-sized bitmap.
     let pointSize: CGFloat
-    /// Display rotation in quarter-turns clockwise; part of the task id so a
-    /// "Rotate Burst" change re-decodes this tile without a rescan.
-    var orientation: Int = 0
+    /// Saved rotation in quarter-turns clockwise, or nil for none: a RAW then
+    /// stands as the camera recorded it. Part of the task id so a "Rotate
+    /// Burst" change re-decodes this tile without a rescan.
+    var orientation: Int? = nil
     /// Part of the task id: a change re-runs a decode that failed while the
     /// file's volume was away.
     var retryToken: Int = 0
@@ -306,7 +307,7 @@ struct TileThumbnail: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .task(id: "\(url.path)#\(TileImageLoader.bucket(for: pixelSize))#\(orientation)#\(retryToken)") {
+        .task(id: "\(url.path)#\(TileImageLoader.bucket(for: pixelSize))#\(DisplayRotation.requestToken(orientation))#\(retryToken)") {
             await load()
         }
         .onDisappear {
@@ -429,8 +430,8 @@ struct StackTileView: View {
     /// Subfolder the stack lives in, relative to the scan root — shown as a
     /// tooltip. Nil when the stack sits directly in the scanned folder.
     var originFolder: String? = nil
-    /// Display rotation of the cover frame in quarter-turns clockwise.
-    var orientation: Int = 0
+    /// Saved rotation of the cover frame in quarter-turns clockwise, or nil.
+    var orientation: Int? = nil
     /// Toggles the inline expansion of a burst. Nil falls back to `onOpen`.
     var onExpand: (() -> Void)? = nil
     /// Opens playback for a video tile. Nil falls back to `onOpen`… callers
@@ -734,6 +735,7 @@ extension StackRowView: @preconcurrency Equatable {
             && lhs.badge == rhs.badge
             && lhs.editTags == rhs.editTags
             && lhs.originFolder == rhs.originFolder
+            && lhs.orientation == rhs.orientation
     }
 }
 
@@ -889,6 +891,8 @@ struct StackRowView<MoreMenu: View>: View {
     let badge: TileLocationBadge?
     var editTags: [String] = []
     var originFolder: String? = nil
+    /// Saved rotation of the cover frame in quarter-turns clockwise, or nil.
+    var orientation: Int? = nil
     var onExpand: (() -> Void)? = nil
     var onPlay: (() -> Void)? = nil
     var onOpen: (() -> Void)? = nil
@@ -899,7 +903,7 @@ struct StackRowView<MoreMenu: View>: View {
     var body: some View {
         let _ = BoardRenderCounter.hit(.stackTile)
         HStack(spacing: 10) {
-            TileThumbnail(url: stack.coverItem.primary.url, kind: stack.kind, pointSize: 88, file: stack.coverItem.primary)
+            TileThumbnail(url: stack.coverItem.primary.url, kind: stack.kind, pointSize: 88, orientation: orientation, file: stack.coverItem.primary)
                 .frame(width: 72, height: 48)
                 .background(.quaternary)
                 .clipped()
@@ -1026,6 +1030,8 @@ struct BurstExpansionView: View {
     let stack: OrganizeStack
     /// Edge length of the small frame thumbnails.
     var frameSize: CGFloat = 104
+    /// Saved rotation for a frame, in quarter-turns clockwise, or nil.
+    var orientationForFile: (OrganizeFile) -> Int? = { _ in nil }
     var onOpenFrame: ((Int) -> Void)? = nil
     var onCollapse: (() -> Void)? = nil
 
@@ -1054,7 +1060,7 @@ struct BurstExpansionView: View {
             ) {
                 ForEach(Array(stack.items.enumerated()), id: \.element.id) { index, frame in
                     let shape = RoundedRectangle(cornerRadius: BoardMetrics.frameRadius, style: .continuous)
-                    TileThumbnail(url: frame.primary.url, kind: frame.kind, pointSize: frameSize, file: frame.primary)
+                    TileThumbnail(url: frame.primary.url, kind: frame.kind, pointSize: frameSize, orientation: orientationForFile(frame.primary), file: frame.primary)
                         .frame(width: frameSize, height: frameSize * 2 / 3)
                         .clipped()
                         .clipShape(shape)
@@ -1148,9 +1154,10 @@ struct OrganizeGrid<MenuContent: View>: View {
     var editTagsForStack: (OrganizeStack) -> [String] = { _ in [] }
     let isDimmed: (OrganizeStack) -> Bool
     let badge: (OrganizeStack) -> TileLocationBadge?
-    /// Display rotation recorded for a file, in quarter-turns clockwise —
+    /// Saved rotation for a file, in quarter-turns clockwise, or nil to use
+    /// the camera's —
     /// the cover frame's value drives the tile decode.
-    var orientationForFile: (OrganizeFile) -> Int = { _ in 0 }
+    var orientationForFile: (OrganizeFile) -> Int? = { _ in nil }
     /// Opens the full preview at a specific frame of the stack (0 for the
     /// usual double-click/Space path).
     let onOpen: (OrganizeStack, Int) -> Void
@@ -1373,6 +1380,7 @@ struct OrganizeGrid<MenuContent: View>: View {
         BurstExpansionView(
             stack: stack,
             frameSize: compact ? 96 : min(max(tileWidth * 0.5, 84), 132),
+            orientationForFile: orientationForFile,
             onOpenFrame: { onOpen(stack, $0) },
             onCollapse: { workspace.setExpanded(stack.id, expanded: false) }
         )
@@ -1449,6 +1457,7 @@ struct OrganizeGrid<MenuContent: View>: View {
                     forFolderPath: stack.coverItem.primary.folderPath,
                     rootPath: rootPath
                 ),
+                orientation: orientationForFile(stack.coverItem.primary),
                 onExpand: { workspace.toggleExpanded(stack.id) },
                 onPlay: { onOpen(stack, 0) },
                 onOpen: { onOpen(stack, 0) },
@@ -1736,7 +1745,8 @@ struct FilmstripSelection: Equatable {
 /// rotation it should be decoded with.
 private struct HiResRequest: Equatable {
     var path: String
-    var turns: Int
+    /// The saved rotation, or nil to use the camera's.
+    var turns: Int?
 }
 
 /// Full-size review of one burst at a time with a filmstrip of every frame.
@@ -1772,8 +1782,8 @@ struct StackPreviewOverlay: View {
     /// Enables "Move to New Burst" on the frame and thumbnail menus: the
     /// selected frames leave this stack and stay split on later rescans.
     var onSplitItems: (([OrganizeItem]) -> Void)? = nil
-    /// Display rotation recorded for a file, in quarter-turns clockwise.
-    var orientationForFile: (OrganizeFile) -> Int = { _ in 0 }
+    /// Saved rotation for a file, in quarter-turns clockwise, or nil.
+    var orientationForFile: (OrganizeFile) -> Int? = { _ in nil }
     /// "Rotate Burst" — applies `delta` quarter-turns clockwise to every
     /// frame of the stack. Nil hides the menu and disables the keys.
     var onRotate: ((OrganizeStack, Int) -> Void)? = nil
@@ -1840,13 +1850,19 @@ struct StackPreviewOverlay: View {
     private var item: OrganizeItem? {
         stack.map { $0.items[min(max(frameIndex, 0), $0.items.count - 1)] }
     }
-    /// Quarter-turns recorded for the frame on screen right now.
+    /// The saved rotation of the frame on screen — what a decode asks for.
+    private var itemOrientation: Int? {
+        item.flatMap { orientationForFile($0.primary) }
+    }
+    /// The quarter-turns the frame on screen is drawn at, for everything
+    /// placed over it. Faces and dogs are stored against the unrotated
+    /// preview, so for a RAW this includes the camera's turn.
     private var itemRotation: Int {
-        item.map { orientationForFile($0.primary) } ?? 0
+        item.map { TileImageLoader.shared.effectiveTurns(saved: orientationForFile($0.primary), for: $0.primary.url) } ?? 0
     }
     /// What the hi-res decode should be working on for the current frame.
     private var currentHiResKey: HiResRequest? {
-        item.map { HiResRequest(path: $0.primary.path, turns: itemRotation) }
+        item.map { HiResRequest(path: $0.primary.path, turns: itemOrientation) }
     }
 
     /// The frame the canvas should draw: the hi-res decode once it exists for
@@ -1917,7 +1933,7 @@ struct StackPreviewOverlay: View {
             hiResImage = nil
             hiResRequest = nil
         }
-        .onChange(of: itemRotation) { _, _ in
+        .onChange(of: itemOrientation) { _, _ in
             // Rotate Burst turned the stack: drop the old hi-res decode and
             // re-request it at the new orientation if still zoomed in.
             hiResImage = nil
@@ -1939,7 +1955,7 @@ struct StackPreviewOverlay: View {
                 stackID = stacks[min(max(old ?? 0, 0), stacks.count - 1)].id
             }
         }
-        .task(id: "\(item?.primary.path ?? "")#\(itemRotation)") { await load() }
+        .task(id: "\(item?.primary.path ?? "")#\(DisplayRotation.requestToken(itemOrientation))") { await load() }
         .task(id: hiResRequest) { await loadHiRes() }
         // Face rows and EXIF ride their own tasks, detached from `load()` —
         // the cheap preview paint never waits on the catalog or ImageIO.
@@ -2490,7 +2506,7 @@ struct StackPreviewOverlay: View {
     private func load() async {
         guard let item else { return }
         let url = item.primary.url
-        let orientation = itemRotation
+        let orientation = itemOrientation
         failed = false
         videoPlayer?.pause()
         videoPlayer = nil

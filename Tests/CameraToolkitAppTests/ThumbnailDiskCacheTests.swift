@@ -63,10 +63,10 @@ final class ThumbnailDiskCacheTests: XCTestCase {
         let image = try makeImage()
         cache.store(image, forKey: "a#512#0")
         cache.flush()
-        let back = try XCTUnwrap(cache.image(forKey: "a#512#0"))
+        let back = try XCTUnwrap(cache.thumbnail(forKey: "a#512#0")).image
         XCTAssertEqual(back.width, image.width)
         XCTAssertEqual(back.height, image.height)
-        XCTAssertNil(cache.image(forKey: "b#512#0"))
+        XCTAssertNil(cache.thumbnail(forKey: "b#512#0"))
     }
 
     func testTheKeyNamesTheFileTheSizeAndTheRotation() {
@@ -110,8 +110,8 @@ final class ThumbnailDiskCacheTests: XCTestCase {
         }
         cache.flush()
         XCTAssertLessThanOrEqual(cache.measuredBytes(), oneSize * 6, "the folder is held to its limit")
-        XCTAssertNotNil(cache.image(forKey: "photo13"), "the newest survive")
-        XCTAssertNil(cache.image(forKey: "photo0"), "the oldest are the ones removed")
+        XCTAssertNotNil(cache.thumbnail(forKey: "photo13"), "the newest survive")
+        XCTAssertNil(cache.thumbnail(forKey: "photo0"), "the oldest are the ones removed")
     }
 
     private var seenPaths: Set<String> = []

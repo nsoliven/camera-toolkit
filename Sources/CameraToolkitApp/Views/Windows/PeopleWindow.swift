@@ -1146,11 +1146,17 @@ private struct FacePhotoPreviewOverlay: View {
                     imageSize: CGSize(width: image.width, height: image.height),
                     in: geometry.size
                 )
+                // Stored against the unrotated preview; a RAW is drawn turned
+                // the way the camera recorded it, so the box turns with it.
+                let turned = FaceBoxProjection.rotatedTopLeftRect(
+                    FaceBoxProjection.topLeftRect(of: face.box),
+                    quarterTurnsCW: url.flatMap { TileImageLoader.shared.knownCameraTurns(for: $0) } ?? 0
+                )
                 let rect = CGRect(
-                    x: fit.minX + face.box.x * fit.width,
-                    y: fit.minY + (1 - face.box.y - face.box.height) * fit.height,
-                    width: face.box.width * fit.width,
-                    height: face.box.height * fit.height
+                    x: fit.minX + turned.minX * fit.width,
+                    y: fit.minY + turned.minY * fit.height,
+                    width: turned.width * fit.width,
+                    height: turned.height * fit.height
                 )
                 RoundedRectangle(cornerRadius: 6)
                     .stroke(Color.yellow, lineWidth: 3)

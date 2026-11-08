@@ -56,6 +56,7 @@ final class ThumbnailWarmingCoordinator {
     /// too, and must never reach the real Caches folder.
     static func startIfLive(workspace: EventsWorkspace) {
         guard current == nil, workspace.model.jobHistoryEnabled, let cache = ThumbnailDiskCache.appDefault else { return }
+        cache.removeOlderLayouts()
         let coordinator = ThumbnailWarmingCoordinator(workspace: workspace, cache: cache)
         current = coordinator
         coordinator.start()
