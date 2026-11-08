@@ -88,11 +88,16 @@ final class TileImageLoader: @unchecked Sendable {
     /// Nothing in the app sets it; a measurement test delays reads with it
     /// to stand in for a network volume.
     private let willRead: @Sendable (URL) -> Void
-    /// Thumbnails of network-volume photos kept on this Mac; nil keeps none.
+    /// Thumbnails of NAS and Buffer photos kept on this Mac; nil keeps none.
     private let thumbnailCache: ThumbnailDiskCache?
     /// Overrides the built-in "is this on a network volume" test — a
     /// measurement test stands a temporary folder in for the NAS.
     private let networkVolumeCheck: (@Sendable (URL) -> Bool)?
+    /// Overrides "is this on a mounted volume" (`/Volumes/...`), which
+    /// decides whether a tile's thumbnail is kept on disk.
+    private let mountedVolumeCheck: (@Sendable (URL) -> Bool)?
+    /// When a tile last asked for a decode. Guarded by `lock`.
+    private var lastForegroundRequest: ContinuousClock.Instant?
 
     init(
         driveActivityGate: DriveActivityGate = .shared,
@@ -100,13 +105,15 @@ final class TileImageLoader: @unchecked Sendable {
         willRead: @escaping @Sendable (URL) -> Void = { _ in },
         purgesOnMemoryPressure: Bool = true,
         thumbnailCache: ThumbnailDiskCache? = nil,
-        networkVolumeCheck: (@Sendable (URL) -> Bool)? = nil
+        networkVolumeCheck: (@Sendable (URL) -> Bool)? = nil,
+        mountedVolumeCheck: (@Sendable (URL) -> Bool)? = nil
     ) {
         self.driveActivityGate = driveActivityGate
         self.fileExists = fileExists
         self.willRead = willRead
         self.thumbnailCache = thumbnailCache
         self.networkVolumeCheck = networkVolumeCheck
+        self.mountedVolumeCheck = mountedVolumeCheck
         cache.totalCostLimit = 320 * 1_024 * 1_024
         previewCache.totalCostLimit = 192 * 1_024 * 1_024
         queue = OperationQueue()
@@ -167,6 +174,17 @@ final class TileImageLoader: @unchecked Sendable {
     var tileCacheCostLimit: Int { cache.totalCostLimit }
     var previewCacheCostLimit: Int { previewCache.totalCostLimit }
 
+    /// Whether tiles have left the loader alone for `quiet`: nothing decoding
+    /// and nothing asked for lately. Background warming waits for this, so a
+    /// tile on screen never competes with it.
+    func isForegroundQuiet(for quiet: Duration) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard inFlight.isEmpty else { return false }
+        guard let lastForegroundRequest else { return true }
+        return ContinuousClock.now - lastForegroundRequest >= quiet
+    }
+
     /// A pure memory lookup — no filesystem call, ever. A tile asks this on
     /// the main actor for every cache miss, and a stat there can park the
     /// window on a slow or stale network mount. A miss goes to `image`,
@@ -195,7 +213,8 @@ final class TileImageLoader: @unchecked Sendable {
     ///
     /// `fileIdentity` (`ThumbnailDiskCache.fileIdentity`) names the photo
     /// for the on-disk thumbnail cache: a tile-sized decode of a photo on a
-    /// network volume is kept, and read back without touching the volume.
+    /// network or external volume is kept, and read back without touching
+    /// the volume.
     func image(
         for url: URL,
         maximumPixelSize: Int,
@@ -204,6 +223,7 @@ final class TileImageLoader: @unchecked Sendable {
         timeout: Duration = TileImageLoader.waitTimeout,
         fileIdentity: String? = nil
     ) async -> CGImage? {
+        lock.withLock { lastForegroundRequest = .now }
         let bucket = Self.bucket(for: maximumPixelSize)
         let askedKey = key(url, bucket, orientation)
         let store = store(for: bucket)
@@ -220,7 +240,10 @@ final class TileImageLoader: @unchecked Sendable {
 
         let onNetwork = isOnNetworkVolume(resolved)
         var disk: (cache: ThumbnailDiskCache, key: String)?
-        if onNetwork, bucket <= ThumbnailDiskCache.largestBucket, let cache = thumbnailCache, let fileIdentity {
+        // Both NAS and Buffer tiles are kept. A thumbnail is named by the
+        // photo, not the path, so one made from the Buffer still answers
+        // after the drive is unplugged and the photo is only on the NAS.
+        if onNetwork || isOnMountedVolume(resolved), bucket <= ThumbnailDiskCache.largestBucket, let cache = thumbnailCache, let fileIdentity {
             disk = (cache, ThumbnailDiskCache.key(fileIdentity: fileIdentity, bucket: bucket, orientation: orientation))
         }
         let group = joinGroup(
@@ -295,6 +318,13 @@ final class TileImageLoader: @unchecked Sendable {
         networkVolumes[root] = !isLocal
         volumeLock.unlock()
         return !isLocal
+    }
+
+    /// Whether the file is on an external or network volume. Lexical, so
+    /// it costs nothing on the decode path.
+    private func isOnMountedVolume(_ url: URL) -> Bool {
+        if let mountedVolumeCheck { return mountedVolumeCheck(url) }
+        return url.path.hasPrefix("/Volumes/")
     }
 
     /// Lock-guarded wait registration: parks the continuation on the group,
@@ -594,7 +624,7 @@ private final class TileDecodeOperation: Operation, @unchecked Sendable {
 
     override func main() {
         guard !isCancelled else { return }
-        // A thumbnail this Mac already made of a photo on a network volume
+        // A thumbnail this Mac already made of a photo on another volume
         // is a small local read: no volume access, so nothing to wait for.
         if let disk, let cached = disk.cache.image(forKey: disk.key) {
             result = cached
