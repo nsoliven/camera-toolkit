@@ -162,6 +162,72 @@ final class CardClearTests: XCTestCase {
         }
     }
 
+    func testCountsEachCopyCheckAsItPassesWithTheNASReachable() throws {
+        try withTemporaryDirectory { root in
+            let names = ["DSC00001.ARW", "DSC00002.ARW", "DSC00003.ARW", "DSC00004.ARW"]
+            let f = try fixture(root, names)
+            // DSC00002: drive copy no longer the verified one (fails first).
+            let good2 = try FileScanner.sha256(f.drive.appendingPathComponent("DSC00002.ARW"))
+            try Data(repeating: 0x42, count: 2_048).write(to: f.drive.appendingPathComponent("DSC00002.ARW"))
+            // DSC00003: the NAS copy differs (drive passed). DSC00004: the
+            // card file differs (drive and NAS passed).
+            try Data(repeating: 0x44, count: 2_048).write(to: f.nas.appendingPathComponent("DSC00003.ARW"))
+            try Data(repeating: 0x45, count: 2_048).write(to: f.card.appendingPathComponent("DSC00004.ARW"))
+            let steps = StepLog()
+            let report = try CardClearService().clear(
+                items: [
+                    try f.item(["DSC00001.ARW"]),
+                    try f.item(["DSC00002.ARW"], verified: ["DSC00002.ARW": good2]),
+                    try f.item(["DSC00003.ARW"]),
+                    try f.item(["DSC00004.ARW"]),
+                ],
+                nasReachable: true,
+                confirmation: FreeUpService.confirmationToken,
+                progress: { steps.note($0.telemetry?.step) }
+            )
+            XCTAssertEqual(report.checks, CardClearChecks(
+                checked: 4, driveMatched: 3, nasMatched: 2, nasReread: true, cardMatched: 1, cleared: 1, skipped: 3
+            ))
+            XCTAssertEqual(report.checks.nasVouched, 2)
+            XCTAssertEqual(report.checks.cleared, report.cleared.count)
+            XCTAssertEqual(report.checks.skipped, report.skipped.count)
+            // Each check announced itself before it read, in check order.
+            XCTAssertEqual(Array(steps.all.prefix(3)), [
+                CardClearService.checkingDriveStep, CardClearService.checkingNASStep, CardClearService.checkingCardStep,
+            ])
+            XCTAssertEqual(steps.all.last, CardClearService.deletingStep)
+            XCTAssertTrue(exists(f.card.appendingPathComponent("DSC00004.ARW")))
+            XCTAssertFalse(exists(f.card.appendingPathComponent("DSC00001.ARW")))
+        }
+    }
+
+    func testCountsRestOnTheRecordedHashWhenTheNASIsUnreachable() throws {
+        try withTemporaryDirectory { root in
+            let f = try fixture(root, ["DSC00001.ARW", "DSC00002.ARW", "DSC00003.ARW"])
+            try FileManager.default.removeItem(at: f.nas)
+            let wrong = String(repeating: "f", count: 64)
+            let steps = StepLog()
+            let report = try CardClearService().clear(
+                items: [
+                    try f.item(["DSC00001.ARW"]),
+                    try f.item(["DSC00002.ARW"]),
+                    try f.item(["DSC00003.ARW"], verified: ["DSC00003.ARW": wrong]),
+                ],
+                nasReachable: false,
+                confirmation: FreeUpService.confirmationToken,
+                progress: { steps.note($0.telemetry?.step) }
+            )
+            XCTAssertEqual(report.checks, CardClearChecks(
+                checked: 3, driveMatched: 2, nasMatched: 0, nasReread: false, cardMatched: 2, cleared: 2, skipped: 1
+            ))
+            // The recorded hash stood in for the NAS: the drive matches are
+            // what vouched for it.
+            XCTAssertEqual(report.checks.nasVouched, 2)
+            XCTAssertFalse(steps.all.contains(CardClearService.checkingNASStep))
+            XCTAssertTrue(report.usedRecordedNASHashes)
+        }
+    }
+
     func testWrongTokenRemovesNothing() throws {
         try withTemporaryDirectory { root in
             let f = try fixture(root, ["DSC00001.ARW"])
@@ -200,4 +266,11 @@ private final class PhaseLog: @unchecked Sendable {
     private var phases: [String] = []
     var all: [String] { lock.withLock { phases } }
     func note(_ phase: String) { lock.withLock { if phases.last != phase { phases.append(phase) } } }
+}
+
+private final class StepLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var steps: [String] = []
+    var all: [String] { lock.withLock { steps } }
+    func note(_ step: String?) { lock.withLock { if let step, steps.last != step { steps.append(step) } } }
 }

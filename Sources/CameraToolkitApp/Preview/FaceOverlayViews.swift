@@ -1,58 +1,91 @@
 import CameraToolkitCore
 import SwiftUI
 
-/// Face boxes drawn over the photo in `StackPreviewOverlay`, aligned to the
-/// canvas's reported image frame so zoom and pan keep them attached.
+/// Face and dog boxes drawn over the photo in `StackPreviewOverlay`,
+/// aligned to the canvas's reported image frame so zoom and pan keep them
+/// attached.
 ///
-/// The chrome stays hidden until the pointer comes near a face: each stored
-/// face owns invisible proximity targets — its displayed box grown by
+/// The chrome stays hidden until the pointer comes near a box: each stored
+/// detection owns invisible proximity targets — its displayed box grown by
 /// `FaceHoverRegion.margin`, plus the chip strip — that reveal a solid
 /// named box (confirmed), a dashed "?" box with a one-click confirm
 /// (proposed), or a faint dashed box with a "+" tag button (unnamed). One
-/// face shows at a time; leaving the neighborhood hides it again. The
+/// box shows at a time; leaving the neighborhood hides it again. The
 /// targets never hit-test, so clicks still fall through to the canvas's
 /// zoom and pan — only the chips' buttons consume events.
+///
+/// Dogs come from the pet index and behave exactly like faces; their chips
+/// carry a paw and an unnamed dog's box is tinted warm instead of gray.
+/// Every action hands back the box's subject, so the caller can route a
+/// dog to the pet index and a face to the catalog.
 struct FaceBoxesOverlay: View {
     let faces: [FaceRecord]
     var personNames: [UUID: String] = [:]
+    /// Dog detections on the frame, from the pet index.
+    var pets: [FaceRecord] = []
+    var petNames: [UUID: String] = [:]
     /// Quarter-turns clockwise applied to the decoded image right now.
     var rotation: Int = 0
     /// The photo's displayed rect in this view's coordinates — `.zero`
     /// hides everything (no photo on screen yet).
     var imageFrame: CGRect = .zero
-    var onConfirm: (FaceRecord) -> Void = { _ in }
-    /// A face plus its box rect in this view's space, to anchor the picker.
-    var onTag: (FaceRecord, CGRect) -> Void = { _, _ in }
+    var onConfirm: (FaceRecord, FaceGallerySubject) -> Void = { _, _ in }
+    /// A box plus its rect in this view's space, to anchor the picker.
+    var onTag: (FaceRecord, FaceGallerySubject, CGRect) -> Void = { _, _, _ in }
 
-    /// One proximity tracker firing — a face's expanded box or its chip
+    /// The tint of a dog box nobody has named yet.
+    static let unnamedPetColor = Color.orange
+
+    /// One drawn box: the two indexes keep their own ids, so a box is
+    /// keyed by subject and id together.
+    struct Entry: Identifiable, Equatable {
+        struct Key: Hashable {
+            let subject: FaceGallerySubject
+            let face: UUID
+        }
+
+        let face: FaceRecord
+        let subject: FaceGallerySubject
+        var id: Key { Key(subject: subject, face: face.id) }
+    }
+
+    /// Faces first, then dogs — the order the boxes stack in.
+    static func entries(faces: [FaceRecord], pets: [FaceRecord]) -> [Entry] {
+        faces.map { Entry(face: $0, subject: .people) }
+            + pets.map { Entry(face: $0, subject: .pets) }
+    }
+
+    /// One proximity tracker firing — a box's expanded rect or its chip
     /// strip. The regions overlap, so inside-ness is tracked per part: a
-    /// face counts as near while any of its parts holds the pointer, and
+    /// box counts as near while any of its parts holds the pointer, and
     /// one part exiting can't drop the chrome while another still holds.
     private struct InsidePart: Hashable {
-        let face: UUID
+        let entry: Entry.Key
         let part: Int
     }
 
     /// Parts currently holding the pointer, in entry order — the last
-    /// entry's face is the one whose chrome is up, and leaving it falls
+    /// entry's box is the one whose chrome is up, and leaving it falls
     /// back to whatever the pointer is still inside.
     @State private var insideParts: [InsidePart] = []
 
-    /// The face to reveal — nil keeps the photo clean.
-    private var hovered: UUID? { insideParts.last?.face }
+    /// The box to reveal — nil keeps the photo clean.
+    private var hovered: Entry.Key? { insideParts.last?.entry }
+
+    private var allEntries: [Entry] { Self.entries(faces: faces, pets: pets) }
 
     var body: some View {
         ZStack {
             if !imageFrame.isEmpty {
-                ForEach(faces) { face in
-                    faceGroup(face)
+                ForEach(allEntries) { entry in
+                    faceGroup(entry)
                 }
             }
         }
-        .onChange(of: faces.map(\.id)) { _, ids in
-            // A removed face's target dies without an exit event — drop it
-            // so a stale winner can't mask the face now under the pointer.
-            insideParts.removeAll { !ids.contains($0.face) }
+        .onChange(of: allEntries.map(\.id)) { _, ids in
+            // A removed box's target dies without an exit event — drop it
+            // so a stale winner can't mask the box now under the pointer.
+            insideParts.removeAll { !ids.contains($0.entry) }
         }
         .onChange(of: imageFrame.isEmpty) { _, empty in
             if empty { insideParts.removeAll() }
@@ -64,7 +97,7 @@ struct FaceBoxesOverlay: View {
         if inside { insideParts.append(part) }
     }
 
-    /// The face's box in this overlay's coordinate space: stored
+    /// The box in this overlay's coordinate space: stored
     /// bottom-left-normalized → top-left-normalized → rotated like the
     /// decoded image → scaled into the displayed rect.
     private func displayRect(for face: FaceRecord) -> CGRect {
@@ -80,18 +113,24 @@ struct FaceBoxesOverlay: View {
         )
     }
 
-    private func color(for face: FaceRecord) -> Color {
-        face.personID.map { EventPalette.color(for: $0) } ?? .gray
+    private func color(for entry: Entry) -> Color {
+        if let personID = entry.face.personID { return EventPalette.color(for: personID) }
+        return entry.subject == .pets ? Self.unnamedPetColor : .gray
+    }
+
+    private func name(for entry: Entry) -> String? {
+        let names = entry.subject == .pets ? petNames : personNames
+        return entry.face.personID.flatMap { names[$0] }
     }
 
     @ViewBuilder
-    private func faceGroup(_ face: FaceRecord) -> some View {
-        let boxRect = displayRect(for: face)
-        let isHovered = hovered == face.id
+    private func faceGroup(_ entry: Entry) -> some View {
+        let boxRect = displayRect(for: entry.face)
+        let isHovered = hovered == entry.id
         // The chip strip rides just under the box — or just over it near
         // the photo's bottom edge — and its rect stays a hover target of
         // its own, so the pointer can travel from box to chip without
-        // dropping even when the strip sits wider than a narrow face.
+        // dropping even when the strip sits wider than a narrow box.
         let chipHeight: CGFloat = 22
         let chipBelow = boxRect.maxY + chipHeight + 6 <= imageFrame.maxY
         let strip = CGRect(
@@ -105,20 +144,20 @@ struct FaceBoxesOverlay: View {
 
         ZStack {
             // The invisible targets exist while the chrome is hidden, so
-            // approaching the face can reveal it — and they never
+            // approaching the box can reveal it — and they never
             // hit-test, so zoom/pan clicks still reach the canvas.
-            proximityTarget(regions.box, in: groupRect, part: InsidePart(face: face.id, part: 0))
-            proximityTarget(regions.strip, in: groupRect, part: InsidePart(face: face.id, part: 1))
+            proximityTarget(regions.box, in: groupRect, part: InsidePart(entry: entry.id, part: 0))
+            proximityTarget(regions.strip, in: groupRect, part: InsidePart(entry: entry.id, part: 1))
             if isHovered {
                 Group {
-                    boxShape(face)
+                    boxShape(entry)
                         .frame(width: boxRect.width, height: boxRect.height)
                         .position(
                             x: boxRect.midX - groupRect.minX,
                             y: boxRect.midY - groupRect.minY
                         )
                         .allowsHitTesting(false)
-                    chip(for: face, boxRect: boxRect)
+                    chip(for: entry, boxRect: boxRect)
                         .fixedSize()
                         .position(
                             x: boxRect.midX - groupRect.minX,
@@ -134,7 +173,7 @@ struct FaceBoxesOverlay: View {
         .position(x: groupRect.midX, y: groupRect.midY)
         .animation(.easeInOut(duration: 0.12), value: isHovered)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel(accessibilityLabel(for: face))
+        .accessibilityLabel(accessibilityLabel(for: entry))
     }
 
     /// A hover-only region: an AppKit tracking view reports pointer
@@ -151,9 +190,9 @@ struct FaceBoxesOverlay: View {
     /// Box fill/stroke per state, drawn only while revealed: solid+bright
     /// for confirmed, dashed for proposed, faint dashed for unnamed.
     @ViewBuilder
-    private func boxShape(_ face: FaceRecord) -> some View {
-        let color = color(for: face)
-        switch face.state {
+    private func boxShape(_ entry: Entry) -> some View {
+        let color = color(for: entry)
+        switch entry.face.state {
         case .confirmed:
             RoundedRectangle(cornerRadius: 4)
                 .strokeBorder(color, lineWidth: 2)
@@ -177,15 +216,28 @@ struct FaceBoxesOverlay: View {
         }
     }
 
-    /// The name chip below the box: solid color for confirmed people, a
+    /// A small paw leading every dog chip — the one mark that tells a dog
+    /// box from a face box.
+    @ViewBuilder
+    private func petMark(_ entry: Entry) -> some View {
+        if entry.subject == .pets {
+            Image(systemName: "pawprint.fill")
+                .font(.caption2)
+                .imageScale(.small)
+        }
+    }
+
+    /// The name chip below the box: solid color for confirmed names, a
     /// dark capsule with confirm/tag buttons for everything still movable.
     @ViewBuilder
-    private func chip(for face: FaceRecord, boxRect: CGRect) -> some View {
-        let name = face.personID.flatMap { personNames[$0] }
+    private func chip(for entry: Entry, boxRect: CGRect) -> some View {
+        let face = entry.face
+        let name = name(for: entry)
+        let isPet = entry.subject == .pets
         switch face.state {
         case .confirmed:
             HStack(spacing: 3) {
-                Image(systemName: "person.fill")
+                Image(systemName: isPet ? "pawprint.fill" : "person.fill")
                     .font(.caption2)
                     .imageScale(.small)
                 Text(name ?? "Confirmed")
@@ -195,9 +247,10 @@ struct FaceBoxesOverlay: View {
             .foregroundStyle(.white)
             .padding(.horizontal, 7)
             .padding(.vertical, 3)
-            .background(color(for: face), in: Capsule())
+            .background(color(for: entry), in: Capsule())
         case .proposed:
             HStack(spacing: 5) {
+                petMark(entry)
                 Text(name.map { "\($0)?" } ?? "Match?")
                     .lineLimit(1)
                 if let score = face.matchScore {
@@ -205,15 +258,15 @@ struct FaceBoxesOverlay: View {
                         .foregroundStyle(.white.opacity(0.65))
                 }
                 Button {
-                    onConfirm(face)
+                    onConfirm(face, entry.subject)
                 } label: {
                     Label("Confirm", systemImage: "checkmark.circle.fill")
                         .labelStyle(.iconOnly)
                         .foregroundStyle(.green)
                 }
                 .buttonStyle(.plain)
-                .help("Confirm this is \(name ?? "the match") — confirmed faces are frozen")
-                tagButton(for: face, boxRect: boxRect)
+                .help("Confirm this is \(name ?? "the match") — confirmed \(isPet ? "dogs" : "faces") are frozen")
+                tagButton(for: entry, boxRect: boxRect)
             }
             .font(.caption.weight(.semibold))
             .foregroundStyle(.white)
@@ -221,13 +274,14 @@ struct FaceBoxesOverlay: View {
             .padding(.vertical, 3)
             .background(.black.opacity(0.75), in: Capsule())
             .overlay {
-                Capsule().strokeBorder(color(for: face).opacity(0.8), lineWidth: 1)
+                Capsule().strokeBorder(color(for: entry).opacity(0.8), lineWidth: 1)
             }
         case .cached, .other:
             HStack(spacing: 5) {
-                Text(name ?? "Face")
+                petMark(entry)
+                Text(name ?? (isPet ? "Dog" : "Face"))
                     .lineLimit(1)
-                tagButton(for: face, boxRect: boxRect)
+                tagButton(for: entry, boxRect: boxRect)
             }
             .font(.caption.weight(.semibold))
             .foregroundStyle(.white)
@@ -237,32 +291,37 @@ struct FaceBoxesOverlay: View {
         }
     }
 
-    /// The "+" affordance that opens the person picker for this face.
-    private func tagButton(for face: FaceRecord, boxRect: CGRect) -> some View {
-        Button {
-            onTag(face, boxRect)
+    /// The "+" affordance that opens the picker for this box — people for
+    /// a face, pets for a dog.
+    private func tagButton(for entry: Entry, boxRect: CGRect) -> some View {
+        let isPet = entry.subject == .pets
+        return Button {
+            onTag(entry.face, entry.subject, boxRect)
         } label: {
-            Label("Tag Face", systemImage: "plus.circle.fill")
+            Label(isPet ? "Tag Dog" : "Tag Face", systemImage: "plus.circle.fill")
                 .labelStyle(.iconOnly)
                 .foregroundStyle(.white.opacity(0.9))
         }
         .buttonStyle(.plain)
-        .help("Tag this face as a person")
+        .help(isPet ? "Tag this dog as a pet" : "Tag this face as a person")
     }
 
-    private func accessibilityLabel(for face: FaceRecord) -> String {
-        let name = face.personID.flatMap { personNames[$0] }
-        switch face.state {
-        case .confirmed: return "Confirmed face: \(name ?? "unknown")"
-        case .proposed: return "Proposed face: \(name ?? "unknown")"
-        case .other: return "Grouped face: \(name ?? "unnamed")"
-        case .cached: return "Unmatched face"
+    private func accessibilityLabel(for entry: Entry) -> String {
+        let name = name(for: entry)
+        let noun = entry.subject == .pets ? "dog" : "face"
+        switch entry.face.state {
+        case .confirmed: return "Confirmed \(noun): \(name ?? "unknown")"
+        case .proposed: return "Proposed \(noun): \(name ?? "unknown")"
+        case .other: return "Grouped \(noun): \(name ?? "unnamed")"
+        case .cached: return "Unmatched \(noun)"
         }
     }
 }
 
 /// What the tag picker is tagging — an existing detection, or a box the
 /// owner drew. `anchor` positions the picker in canvas coordinates.
+/// `subject` says which index the detection lives in: a dog box tags
+/// against the pets, never the people. A drawn box is always a face.
 struct FaceTagRequest: Identifiable {
     enum Target {
         case face(UUID)
@@ -272,15 +331,19 @@ struct FaceTagRequest: Identifiable {
     let id = UUID()
     var target: Target
     var anchor: CGRect
+    var subject: FaceGallerySubject = .people
 }
 
 /// The person picker the burst overlay shows in a native popover anchored
 /// on the face being tagged: pick an existing roster person, or type a
 /// name to create one. The popover supplies the chrome and dismisses on
 /// Esc or a click outside. All writes land in the face catalog — the
-/// photo file is never touched.
+/// photo file is never touched. With `subject` `.pets` the same picker
+/// lists the approved pets for a dog box, and its writes land in the pet
+/// index instead.
 struct FaceTagPicker: View {
     let people: [FacePerson]
+    var subject: FaceGallerySubject = .people
     var onPick: (FacePerson) -> Void = { _ in }
     var onCreate: (String) -> Void = { _ in }
     var onCancel: () -> Void = {}
@@ -305,14 +368,14 @@ struct FaceTagPicker: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("Tag This Face")
+            Text(subject == .pets ? "Tag This Dog" : "Tag This Face")
                 .font(.headline)
-            TextField("Person name", text: $query)
+            TextField(subject == .pets ? "Pet name" : "Person name", text: $query)
                 .textFieldStyle(.roundedBorder)
                 .focused($queryFocused)
                 .onSubmit(submit)
             if filtered.isEmpty {
-                Text(people.isEmpty ? "No people yet — type a name to create one." : "No match for “\(trimmedQuery)”.")
+                Text(people.isEmpty ? "No \(subject.nounPlural) yet — type a name to create one." : "No match for “\(trimmedQuery)”.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } else {
@@ -331,12 +394,14 @@ struct FaceTagPicker: View {
                 Button {
                     onCreate(trimmedQuery)
                 } label: {
-                    Label("New Person “\(trimmedQuery)”", systemImage: "plus.circle.fill")
+                    Label("New \(subject == .pets ? "Pet" : "Person") “\(trimmedQuery)”", systemImage: "plus.circle.fill")
                         .lineLimit(1)
                 }
                 .buttonStyle(.borderless)
             }
-            Text("Catalog only — the photo file is never modified.")
+            Text(subject == .pets
+                ? "Pet index only — the photo file is never modified."
+                : "Catalog only — the photo file is never modified.")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
         }

@@ -238,6 +238,54 @@ public enum CardClearPlanner {
     }
 }
 
+/// How many files passed each of Clear from Card's checks — counted as the
+/// checks run, never inferred. A file stops at its first failed check, so
+/// each count is at most the one before it.
+public struct CardClearChecks: Codable, Equatable, Hashable, Sendable {
+    /// Files whose checks ran (passed or not).
+    public var checked: Int
+    /// Drive copies that re-hashed to the hash Sync to NAS verified.
+    public var driveMatched: Int
+    /// NAS copies that were read again and matched the drive copy. Zero
+    /// when the NAS was not reachable.
+    public var nasMatched: Int
+    /// True when the NAS was read again; false when the recorded Sync to NAS
+    /// hash stood in for it (the drive match is then the NAS answer too).
+    public var nasReread: Bool
+    /// Card files that hashed the same as their drive copy.
+    public var cardMatched: Int
+    /// Card files deleted.
+    public var cleared: Int
+    /// Card files that stayed, for any reason.
+    public var skipped: Int
+    /// The drive's volume name, when the caller knows it.
+    public var driveName: String?
+
+    public init(
+        checked: Int = 0,
+        driveMatched: Int = 0,
+        nasMatched: Int = 0,
+        nasReread: Bool = true,
+        cardMatched: Int = 0,
+        cleared: Int = 0,
+        skipped: Int = 0,
+        driveName: String? = nil
+    ) {
+        self.checked = checked
+        self.driveMatched = driveMatched
+        self.nasMatched = nasMatched
+        self.nasReread = nasReread
+        self.cardMatched = cardMatched
+        self.cleared = cleared
+        self.skipped = skipped
+        self.driveName = driveName
+    }
+
+    /// Files the NAS side vouched for: fresh re-reads, or — with the NAS
+    /// unreachable — drive copies that matched the recorded NAS hash.
+    public var nasVouched: Int { nasReread ? nasMatched : driveMatched }
+}
+
 public struct CardClearReport: Equatable, Sendable {
     /// Card files deleted.
     public var cleared: [String] = []
@@ -249,6 +297,8 @@ public struct CardClearReport: Equatable, Sendable {
     public var usedRecordedNASHashes = false
     /// Busy seconds and bytes read per phase ("Verify", "Remove").
     public var phases: [JobPhaseTotal] = []
+    /// Per-copy results of the checks that ran.
+    public var checks = CardClearChecks()
 
     public init() {}
 }
@@ -285,6 +335,14 @@ public struct CardClearService {
     public static let verifyPhase = "Verify"
     public static let removePhase = "Remove"
 
+    /// The check running this instant, reported as the telemetry step.
+    public static let checkingDriveStep = "Checking drive copy"
+    public static let checkingNASStep = "Checking NAS copy"
+    public static let checkingCardStep = "Checking card file"
+    public static let deletingStep = "Deleting from card"
+    /// Telemetry counter: files whose checks ran so far.
+    public static let checkedCounter = "Checked"
+
     private struct Identity: Equatable {
         var size: Int64
         var modified: Date?
@@ -309,6 +367,7 @@ public struct CardClearService {
         }
         var report = CardClearReport()
         report.usedRecordedNASHashes = !nasReachable
+        report.checks.nasReread = nasReachable
         let totalFiles = items.reduce(0) { $0 + $1.files.count }
         let readsPerFile: Int64 = nasReachable ? 3 : 2
         let verifyBytes = items.reduce(Int64(0)) { $0 + $1.byteCount } * readsPerFile
@@ -324,6 +383,8 @@ public struct CardClearService {
                 report.cleared.append(file.sourcePath)
                 report.clearedBytes += file.byteCount
             }
+            report.checks.cleared = report.cleared.count
+            report.checks.skipped = report.skipped.count
             fileSettled?(CardClearFileResult(
                 sourcePath: file.sourcePath,
                 relativePath: file.relativePath,
@@ -333,17 +394,18 @@ public struct CardClearService {
                 reason: reason
             ))
         }
-        func telemetry(_ phase: String) -> JobTelemetry {
+        func telemetry(_ phase: String, step: String, read: Int64? = nil) -> JobTelemetry {
             JobTelemetry(
-                step: phase,
+                step: step,
                 counters: [
+                    JobCounter(label: Self.checkedCounter, value: report.checks.checked),
                     JobCounter(label: "Cleared", value: report.cleared.count),
                     JobCounter(label: "Skipped", value: report.skipped.count),
                 ],
                 phases: report.phases + [JobPhaseTotal(
                     label: phase,
                     seconds: Date().timeIntervalSince(phase == Self.verifyPhase ? verifyStarted : removeStarted),
-                    bytes: phase == Self.verifyPhase ? verifyRead : removedSoFar
+                    bytes: read ?? (phase == Self.verifyPhase ? verifyRead : removedSoFar)
                 )]
             )
         }
@@ -360,16 +422,24 @@ public struct CardClearService {
             var identities: [String: Identity] = [:]
             var failure: String?
             for file in item.files {
-                progress?(FileOperationProgress(
-                    phase: Self.verifyPhase,
-                    currentPath: (file.sourcePath as NSString).lastPathComponent,
-                    processedFiles: settledFiles,
-                    totalFiles: totalFiles,
-                    processedBytes: verifyRead,
-                    totalBytes: verifyBytes,
-                    telemetry: telemetry(Self.verifyPhase)
-                ))
-                if let reason = verify(file, nasReachable: nasReachable, identities: &identities, read: &verifyRead) {
+                // Reports only: each check announces itself before it
+                // reads, with the bytes read so far.
+                let stage: (String, Int64) -> Void = { step, read in
+                    progress?(FileOperationProgress(
+                        phase: Self.verifyPhase,
+                        currentPath: (file.sourcePath as NSString).lastPathComponent,
+                        processedFiles: settledFiles,
+                        totalFiles: totalFiles,
+                        processedBytes: read,
+                        totalBytes: verifyBytes,
+                        telemetry: telemetry(Self.verifyPhase, step: step, read: read)
+                    ))
+                }
+                var checks = report.checks
+                let reason = verify(file, nasReachable: nasReachable, identities: &identities, read: &verifyRead, checks: &checks, stage: stage)
+                checks.checked += 1
+                report.checks = checks
+                if let reason {
                     failure = "\((file.sourcePath as NSString).lastPathComponent): \(reason)"
                     break
                 }
@@ -390,7 +460,7 @@ public struct CardClearService {
                 currentPath: item.files.first.map { ($0.sourcePath as NSString).lastPathComponent },
                 processedFiles: settledFiles,
                 totalFiles: totalFiles,
-                telemetry: telemetry(Self.removePhase)
+                telemetry: telemetry(Self.removePhase, step: Self.deletingStep)
             ))
             let unchanged = item.files.allSatisfy { file in
                 (try? identity(file.sourcePath)) == identities[file.sourcePath]
@@ -426,8 +496,9 @@ public struct CardClearService {
             processedFiles: settledFiles,
             totalFiles: totalFiles,
             telemetry: JobTelemetry(
-                step: Self.removePhase,
+                step: Self.deletingStep,
                 counters: [
+                    JobCounter(label: Self.checkedCounter, value: report.checks.checked),
                     JobCounter(label: "Cleared", value: report.cleared.count),
                     JobCounter(label: "Skipped", value: report.skipped.count),
                 ],
@@ -440,11 +511,15 @@ public struct CardClearService {
 
     /// Nil when the card file, its drive copy and (when reachable) its NAS
     /// copy all hash to exactly what Sync to NAS verified; otherwise why not.
+    /// `checks` counts each check as it passes and `stage` names each one
+    /// before it reads — reporting only, neither changes what is checked.
     private func verify(
         _ file: CardClearFile,
         nasReachable: Bool,
         identities: inout [String: Identity],
-        read: inout Int64
+        read: inout Int64,
+        checks: inout CardClearChecks,
+        stage: (String, Int64) -> Void
     ) -> String? {
         guard fileManager.fileExists(atPath: file.sourcePath) else { return "The card file is gone." }
         guard fileManager.fileExists(atPath: file.drivePath) else { return "The drive copy is missing." }
@@ -453,20 +528,26 @@ public struct CardClearService {
             let driveBefore = try identity(file.drivePath)
             guard cardBefore.size == file.byteCount else { return "The card file's size changed." }
             guard driveBefore.size == file.byteCount else { return "The drive copy's size changed." }
+            stage(Self.checkingDriveStep, read)
             let driveHash = try FileScanner.sha256(URL(fileURLWithPath: file.drivePath)).lowercased()
             read += file.byteCount
             guard driveHash == file.verifiedSHA256.lowercased() else {
                 return "The drive copy no longer matches the copy Sync to NAS verified."
             }
+            checks.driveMatched += 1
             if nasReachable {
                 guard fileManager.fileExists(atPath: file.nasPath) else { return "The NAS copy is missing." }
+                stage(Self.checkingNASStep, read)
                 let nasHash = try FileScanner.sha256(URL(fileURLWithPath: file.nasPath)).lowercased()
                 read += file.byteCount
                 guard nasHash == driveHash else { return "The NAS copy differs from the drive copy." }
+                checks.nasMatched += 1
             }
+            stage(Self.checkingCardStep, read)
             let cardHash = try FileScanner.sha256(URL(fileURLWithPath: file.sourcePath)).lowercased()
             read += file.byteCount
             guard cardHash == driveHash else { return "The card file differs from its drive copy." }
+            checks.cardMatched += 1
             guard try identity(file.sourcePath) == cardBefore, try identity(file.drivePath) == driveBefore else {
                 return "The card file or drive copy changed during the check."
             }

@@ -409,8 +409,11 @@ struct CardClearConfirmSheet: View {
             systemImage: "sdcard",
             iconTint: .red
         ) {
-            Text(CardClearWording.sheetExplanation(request))
-                .fixedSize(horizontal: false, vertical: true)
+            CardClearChecksView(
+                rule: CardClearWording.sheetRule(request),
+                lines: CardClearWording.sheetChecks(request),
+                footnote: CardClearWording.sheetFootnote
+            )
             ScrollView {
                 VStack(alignment: .leading, spacing: 4) {
                     ForEach(Array(request.events.enumerated()), id: \.offset) { _, line in
@@ -428,12 +431,6 @@ struct CardClearConfirmSheet: View {
                 }
             }
             .frame(maxHeight: 160)
-            if let note = CardClearWording.nasNote(request) {
-                Text(note)
-                    .font(.callout)
-                    .foregroundStyle(.orange)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
             if let note = CardClearWording.skippedNote(request) {
                 Text(note)
                     .font(.callout)
@@ -463,6 +460,73 @@ struct CardClearConfirmSheet: View {
                 onConfirm(confirmation)
             }
             .disabled(!Self.isConfirmed(confirmation))
+        }
+    }
+}
+
+/// Clear from Card's checks as a short list: one row per copy — the drive,
+/// the NAS, the card — each with its icon and what it must match, under the
+/// rule they add up to. A weaker check (the NAS unreachable) is orange.
+/// Shared by the confirmation sheet and the finished job's detail.
+struct CardClearChecksView: View {
+    var rule: String?
+    let lines: [CardClearWording.CheckLine]
+    var footnote: String?
+    /// True for results (a finished job): a green check per passed copy.
+    /// The sheet shows checks still to run, so it marks only a warning.
+    var showsResults = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if let rule {
+                Label {
+                    Text(rule)
+                        .fontWeight(.semibold)
+                        .fixedSize(horizontal: false, vertical: true)
+                } icon: {
+                    Image(systemName: "checkmark.shield")
+                        .foregroundStyle(.green)
+                }
+            }
+            VStack(alignment: .leading, spacing: 6) {
+                ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Image(systemName: line.systemImage)
+                            .frame(width: 20)
+                            .foregroundStyle(line.isWarning ? Color.orange : Color.secondary)
+                            .accessibilityHidden(true)
+                        Text(line.title)
+                            .fontWeight(.medium)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .frame(minWidth: 90, alignment: .leading)
+                            .fixedSize()
+                        Text(line.detail)
+                            .foregroundStyle(line.isWarning ? Color.orange : Color.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Spacer(minLength: 0)
+                        if line.isWarning {
+                            Image(systemName: "exclamationmark.circle")
+                                .foregroundStyle(.orange)
+                                .accessibilityHidden(true)
+                        } else if showsResults {
+                            Image(systemName: "checkmark.circle.fill")
+                                .foregroundStyle(.green)
+                                .accessibilityHidden(true)
+                        }
+                    }
+                    .font(.callout)
+                    .accessibilityElement(children: .combine)
+                }
+            }
+            .padding(10)
+            .background(.background.secondary, in: RoundedRectangle(cornerRadius: 8))
+            if let footnote {
+                Text(footnote)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
     }
 }

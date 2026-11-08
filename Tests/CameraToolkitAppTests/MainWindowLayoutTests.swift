@@ -189,6 +189,101 @@ final class MainWindowLayoutTests: XCTestCase {
         try assertLayout(window, name: "welcome-minimum", board: false)
     }
 
+    /// The Clear from Card sequence on an unsorted board: a long job
+    /// running, the confirmation sheet shown and dismissed, the card
+    /// rescanned under the job, and the job ending. None of it may move the
+    /// window's content.
+    func testUnsortedBoardThroughClearFromCardKeepsContentInsideTheWindow() async throws {
+        try await makeLibrary(subevents: 2)
+        let window = try await openEventBoard()
+        workspace.selection = .unsorted(unsorted.id)
+        try await settle(window)
+        try assertLayout(window, name: "card-clear-start", board: false)
+
+        model.jobs = [JobSnapshot(
+            action: .freeUp,
+            state: .running,
+            progress: 0.3,
+            note: "Verify: rechecking 1,234 file(s) on the card against the drive and the NAS"
+        )]
+        try await settle(window)
+        try assertLayout(window, name: "card-clear-job", board: false)
+
+        workspace.pendingCardClear = CardClearRequest(
+            locationID: unsorted.id,
+            locationName: unsorted.name,
+            itemIDs: [],
+            fileCount: 12,
+            byteCount: 12_000_000,
+            events: [],
+            waitingForNASFiles: 0,
+            driveName: "Drive",
+            nasReachable: true
+        )
+        try await settle(window)
+        try assertLayout(window, name: "card-clear-sheet", board: false)
+        workspace.pendingCardClear = nil
+        try await settle(window)
+        try assertLayout(window, name: "card-clear-sheet-dismissed", board: false)
+
+        workspace.scan(unsorted, force: true)
+        try await settle(window)
+        try assertLayout(window, name: "card-clear-rescanned", board: false)
+
+        model.jobs = []
+        try await settle(window)
+        try assertLayout(window, name: "card-clear-done", board: false)
+    }
+
+    /// The sidebar's footer is a fixed-height bar, and the split view asks
+    /// each column for its minimum height at zero width, where its text
+    /// breaks after every character. The NAS Wi-Fi banner (shown while a
+    /// job keeps the NAS from moving to Ethernet) measured far taller than
+    /// the window there, the hosting view laid the split view out taller
+    /// than the window, and both columns slid up under the title bar. A
+    /// pinned column takes the height it is offered whatever its footer.
+    func testSidebarFooterTextCannotPushTheWindowContentOffScreen() async throws {
+        var status = NASConnectionStatus()
+        status.phase = .connected
+        status.banner = .nasInUse
+        status.isWaitingToReconnect = true
+        let banner = NASLinkBanner(status: status, connection: NASConnectionModel())
+        let size = NSSize(width: 1320, height: 840)
+
+        // The footer really is adversarial: at zero width it alone is
+        // taller than the window.
+        let zeroWidth = NSHostingView(rootView: banner.fixedSize(horizontal: false, vertical: true).frame(width: 0))
+        XCTAssertGreaterThan(zeroWidth.fittingSize.height, size.height, "the banner no longer measures tall at zero width; this test needs a taller footer")
+
+        let hosting = NSHostingController(rootView: SidebarFooterLayoutProbe(banner: banner))
+        hosting.sceneBridgingOptions = .all
+        let window = OffscreenWindow(
+            contentRect: NSRect(origin: SnapshotWindows.offscreen, size: size),
+            styleMask: MainWindowFactory.styleMask,
+            backing: .buffered,
+            defer: false
+        )
+        window.isReleasedWhenClosed = false
+        window.contentViewController = hosting
+        window.toolbarStyle = .unified
+        window.setContentSize(size)
+        SnapshotWindows.hide(window)
+        window.orderFrontRegardless()
+        self.window = window
+        try await Task.sleep(for: .milliseconds(400))
+        window.contentView?.superview?.layoutSubtreeIfNeeded()
+
+        let content = try XCTUnwrap(window.contentView)
+        XCTAssertLessThanOrEqual(content.fittingSize.height, size.height + 0.5, "the content needs \(content.fittingSize) in a \(size) window")
+        for subview in content.subviews {
+            XCTAssertEqual(subview.frame.minY, 0, accuracy: 0.5, "the split view \(subview.frame) is laid out off the window")
+            XCTAssertEqual(subview.frame.height, size.height, accuracy: 0.5, "the split view \(subview.frame) is taller than the window")
+        }
+        let table = try XCTUnwrap(sidebarTable(in: window))
+        let top = size.height - table.convert(table.rect(ofRow: 0), to: nil).maxY
+        XCTAssertGreaterThanOrEqual(top, titlebarBottom(window) - 0.5, "the sidebar's first row (top \(top)) is under the title bar")
+    }
+
     /// The scrolling part of the top bar hugs short content and stops at
     /// its limit for tall content.
     func testBarScrollRegionHugsShortContentAndCapsTallContent() {
@@ -391,5 +486,39 @@ final class MainWindowLayoutTests: XCTestCase {
         ]
         CGImageDestinationAddImage(destination, image, properties as CFDictionary)
         XCTAssertTrue(CGImageDestinationFinalize(destination))
+    }
+}
+
+/// The main window's split view in miniature: a sidebar list with the
+/// footer as its bottom bar, pinned as `EventsRootView` pins its columns.
+private struct SidebarFooterLayoutProbe: View {
+    let banner: NASLinkBanner
+
+    var body: some View {
+        NavigationSplitView {
+            List {
+                ForEach(0..<30, id: \.self) { Text("Folder \($0)") }
+            }
+            .listStyle(.sidebar)
+            .safeAreaBar(edge: .bottom) {
+                VStack(alignment: .leading, spacing: 6) {
+                    banner
+                    Label("Jobs", systemImage: "list.bullet.clipboard")
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .fixedSize(horizontal: false, vertical: true)
+            }
+            .pinnedSplitColumn()
+            .navigationSplitViewColumnWidth(
+                min: OrganizeChromeSizing.sidebarWidthRange.lowerBound,
+                ideal: OrganizeChromeSizing.defaultSidebarWidth,
+                max: OrganizeChromeSizing.sidebarWidthRange.upperBound
+            )
+        } detail: {
+            Color.clear
+                .pinnedSplitColumn(clipped: true)
+        }
+        .frame(minWidth: MainWindowFactory.minimumSize.width, minHeight: MainWindowFactory.minimumSize.height)
     }
 }
