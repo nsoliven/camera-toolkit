@@ -712,3 +712,89 @@ struct FaceScanSheet: View {
         }
     }
 }
+
+/// Confirms a sidebar nest or un-nest before any folder moves: the event,
+/// where it is listed now and where it goes, each folder that moves, and
+/// what it holds. A reorder within the same group never asks.
+struct EventReparentConfirmSheet: View {
+    let request: EventReparentRequest
+    let onCancel: () -> Void
+    let onConfirm: () -> Void
+
+    var body: some View {
+        SheetScaffold(
+            title: Self.title(request),
+            systemImage: "folder.badge.gearshape"
+        ) {
+            Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 6) {
+                GridRow {
+                    Text("From").foregroundStyle(.secondary)
+                    Text(request.fromTitle)
+                }
+                GridRow {
+                    Text("To").foregroundStyle(.secondary)
+                    Text(request.toTitle)
+                }
+                GridRow {
+                    Text("Holds").foregroundStyle(.secondary)
+                    Text(Self.holdings(request))
+                        .monospacedDigit()
+                }
+            }
+            if request.folderMoves.isEmpty {
+                Text("It has no folder on the drive yet, so only its place in the list changes there.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(Array(request.folderMoves.enumerated()), id: \.offset) { _, move in
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(move.from)
+                                .foregroundStyle(.secondary)
+                            Text("→ " + move.to)
+                        }
+                        .font(.caption.monospaced())
+                        .lineLimit(2)
+                        .truncationMode(.middle)
+                        .textSelection(.enabled)
+                    }
+                }
+                .padding(8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 6))
+            }
+            Text(Self.explanation)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if let note = request.storageNote {
+                Text(note)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        } actions: {
+            Button("Cancel", action: onCancel)
+                .keyboardShortcut(.cancelAction)
+            Button("Move", action: onConfirm)
+                .keyboardShortcut(.defaultAction)
+        }
+    }
+
+    static func title(_ request: EventReparentRequest) -> String {
+        request.newParentID == nil
+            ? "Move “\(request.eventName)” to the top level?"
+            : "Move “\(request.eventName)” into \(request.toTitle)?"
+    }
+
+    static func holdings(_ request: EventReparentRequest) -> String {
+        var parts = ["\(request.fileCount.formatted()) file\(request.fileCount == 1 ? "" : "s")"]
+        if request.subeventCount > 0 {
+            parts.append("\(request.subeventCount) subevent\(request.subeventCount == 1 ? "" : "s"), moving with it")
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    static let explanation = "The folder moves on the same drive in one rename: nothing is copied, replaced or deleted, and a folder already at the new place stops the move. The NAS copy follows with one journaled folder rename, now or when the NAS is next connected. ⌘Z puts it all back."
+}

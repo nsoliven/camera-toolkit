@@ -736,6 +736,16 @@ final class EventsWorkspace {
     /// Per event: sorted files whose event name is taken by another file.
     var applyConflictSourceKeys: [UUID: Set<String>] = [:]
     var pendingRemoval: RemovalRequest?
+    /// The sidebar's "move this event's folder under another event" sheet.
+    var pendingReparent: EventReparentRequest?
+    /// The sidebar's Move Into… event picker.
+    var moveIntoRequest: MoveIntoEventRequest?
+    /// The Move Into… pick, held until the picker has finished closing.
+    @ObservationIgnored var moveIntoChoice: (eventID: UUID, parentID: UUID)?
+    /// The event a sidebar row drag carries, set when the drag starts so the
+    /// rows it passes over can draw where it would land. Only the drop's
+    /// own payload decides what happens.
+    @ObservationIgnored var draggingSidebarEventID: UUID?
     var syncAllRequest: SyncAllToNASRequest?
     /// The Sync All sheet's "Reconcile NAS after moves" switch and the
     /// counts it shows (read from records, never from the NAS).
@@ -1236,7 +1246,7 @@ final class EventsWorkspace {
     /// rebuilt once per configuration revision and shared by every caller in
     /// between, so titles never rebuild `locations` (a filesystem-touching
     /// resolver) inside a menu body or row render.
-    private var eventsByID: [UUID: SavedCameraEvent] {
+    var eventsByID: [UUID: SavedCameraEvent] {
         if let cached = eventsByIDCache, cached.revision == model.eventsRevision {
             return cached.byID
         }
@@ -3007,6 +3017,8 @@ final class EventsWorkspace {
     @ObservationIgnored private(set) var dragPayloadBuildCount = 0
 
     func dragPayload(for stackID: String, origin: OrganizeDragPayload.Origin, containerID: UUID) -> String {
+        // A tile drag, not an event row: the sidebar draws it as one.
+        draggingSidebarEventID = nil
         dragPayloadBuildCount += 1
         return OrganizeDragPayload(origin: origin, containerID: containerID, stackIDs: Array(targetStackIDs(including: stackID))).encoded
     }
@@ -3727,11 +3739,50 @@ final class EventsWorkspace {
 
     func renameEvent(_ eventID: UUID, name rawName: String, date: Date, policy: EventStoragePolicy?, parentEventID: UUID?) {
         renameRequest = nil
-        guard let event = event(eventID) else { return }
-        let validation = EventNamePolicy.validate(rawName)
-        guard validation.isValid else {
+        editEvent(eventID, name: rawName, date: date, policy: policy, parentEventID: parentEventID, purpose: .rename)
+    }
+
+    /// What an event edit is for — the words its refusals and status use.
+    /// A sidebar re-parent (`.reparent`) is the same folder move as an
+    /// edit that changes the parent, placed among its new siblings after.
+    enum EventEditPurpose {
+        case rename
+        case reparent(placeBefore: UUID?, placed: Bool)
+    }
+
+    /// Renames, re-dates, re-parents or re-policies an event: its folders
+    /// on every drive move first (same-volume exclusive renames, never
+    /// over anything), then the configuration follows, the NAS folder
+    /// rename is journaled and queued, and one Undo entry is recorded.
+    /// Returns whether the edit went through.
+    @discardableResult
+    func editEvent(
+        _ eventID: UUID,
+        name rawName: String,
+        date: Date,
+        policy: EventStoragePolicy?,
+        parentEventID: UUID?,
+        purpose: EventEditPurpose
+    ) -> Bool {
+        guard let event = event(eventID) else { return false }
+        let actionTitle: String
+        let verb: String
+        switch purpose {
+        case .rename:
+            actionTitle = "Rename \(eventTitle(event))"
+            verb = "renamed"
+        case .reparent:
+            actionTitle = "Move \(eventTitle(event))"
+            verb = "moved"
+        }
+        let isReparent: Bool
+        if case .reparent = purpose { isReparent = true } else { isReparent = false }
+        // A re-parent keeps the name and date exactly as they are, so the
+        // folder keeps its own name and only changes where it sits.
+        let validation = EventNamePolicy.validate(isReparent ? event.name : rawName)
+        guard isReparent || validation.isValid else {
             model.statusMessage = validation.errorMessage ?? "Choose a different event name."
-            return
+            return false
         }
         // The folders move with the name, and a job (or a queued move) has
         // absolute paths it worked out before the rename: it would recreate
@@ -3739,22 +3790,32 @@ final class EventsWorkspace {
         // new one. And a drive that is not there cannot have its folder
         // renamed, which would split the event from its files.
         guard !model.isBusy, !model.isStorageBenchmarkRunning, pendingMoves.isEmpty else {
-            refuseMove("Rename \(eventTitle(event))", "A file job or a queued move is running. Rename \(eventTitle(event)) after it finishes — its folders move with the name.")
-            return
+            if case .rename = purpose {
+                refuseMove(actionTitle, "A file job or a queued move is running. Rename \(eventTitle(event)) after it finishes — its folders move with the name.")
+            } else {
+                refuseMove(actionTitle, "A file job or a queued move is running. Move \(eventTitle(event)) after it finishes — its folders move with it.")
+            }
+            return false
         }
         let policiesInUse = Set(eventFamily(eventID).map { self.locations.resolvedPolicy(for: $0) })
         if let missing = EventStoragePolicy.allCases.first(where: { policiesInUse.contains($0) && !VolumeInfo.isAvailable(self.locations.driveRoot(for: $0)) }) {
             refuseMove(
-                "Rename \(eventTitle(event))",
-                "The drive holding \(self.locations.driveRoot(for: missing).path) isn't connected, so \(eventTitle(event)) was not renamed. Connect it first, so the folder and the name change together."
+                actionTitle,
+                "The drive holding \(self.locations.driveRoot(for: missing).path) isn't connected, so \(eventTitle(event)) was not \(verb). Connect it first, so the folder and the event change together."
             )
-            return
+            return false
         }
         var renamed = event
-        renamed.name = validation.normalizedName
-        renamed.eventDate = Calendar.current.startOfDay(for: date)
+        if !isReparent {
+            renamed.name = validation.normalizedName
+            renamed.eventDate = Calendar.current.startOfDay(for: date)
+        }
         renamed.parentEventID = validParentEventID(parentEventID, for: eventID)
         renamed.storagePolicy = policy
+        if isReparent, renamed.parentEventID != parentEventID {
+            refuseMove(actionTitle, "\(eventTitle(event)) can't go there — it would nest too deep or inside itself. Nothing moved.")
+            return false
+        }
         let locations = self.locations
         let fileManager = FileManager.default
         let oldResolved = locations.resolvedPolicy(for: event)
@@ -3773,8 +3834,15 @@ final class EventsWorkspace {
             let caseOnly = sameFolder && old.path != new.path
             guard fileManager.fileExists(atPath: old.path), !sameFolder || caseOnly else { continue }
             guard caseOnly || !fileManager.fileExists(atPath: new.path) else {
-                model.statusMessage = "A folder named “\(new.lastPathComponent)” already exists. Choose another name or date."
-                return
+                if case .rename = purpose {
+                    model.statusMessage = "A folder named “\(new.lastPathComponent)” already exists. Choose another name or date."
+                } else {
+                    refuseMove(
+                        actionTitle,
+                        "A folder named “\(new.lastPathComponent)” is already there (\(new.deletingLastPathComponent().path)). Nothing moved and nothing was replaced. Rename one of the events first."
+                    )
+                }
+                return false
             }
             folderMoves.append((old, new, caseOnly))
         }
@@ -3796,8 +3864,8 @@ final class EventsWorkspace {
                         try? DriveMoveService().moveFolder(from: renamedFolder, to: original)
                     }
                 }
-                model.statusMessage = "Could not rename the event folder: \(error.localizedDescription)"
-                return
+                model.statusMessage = "Could not \(verb == "moved" ? "move" : "rename") the event folder: \(error.localizedDescription) Nothing was changed."
+                return false
             }
         }
 
@@ -3815,6 +3883,17 @@ final class EventsWorkspace {
             configuration.savedEvents[index].eventDate = renamed.eventDate
             configuration.savedEvents[index].parentEventID = renamed.parentEventID
             configuration.savedEvents[index].storagePolicy = renamed.storagePolicy
+            // A re-parented event takes its place among its new siblings —
+            // where it was dropped, or by date when nothing chose a spot.
+            if case .reparent(let placeBefore, let placed) = purpose {
+                if placed {
+                    configuration.savedEvents = EventHierarchy.placing(
+                        eventID, under: renamed.parentEventID, before: placeBefore, in: configuration.savedEvents
+                    )
+                } else {
+                    configuration.savedEvents[index].sidebarOrder = nil
+                }
+            }
             // Adopted assignments point straight at the old folder.
             for (old, new, _) in moved {
                 let oldPrefix = old.standardizedFileURL.path + "/"
@@ -3869,7 +3948,14 @@ final class EventsWorkspace {
            fileManager.fileExists(atPath: locations.legacyArchiveEventFolder(for: event).path) {
             nasNote += " Copies in the old NAS archive layout keep the old folder name."
         }
-        model.statusMessage = "Renamed to \(eventTitle(renamed))." + nasNote
+        let headline: String
+        if case .reparent = purpose {
+            headline = renamed.parentEventID.flatMap { self.event($0) }.map { "Moved \(renamed.name) into \(eventTitle($0))." }
+                ?? "Moved \(renamed.name) to the top level."
+        } else {
+            headline = "Renamed to \(eventTitle(renamed))."
+        }
+        model.statusMessage = headline + nasNote
             + (newResolved == oldResolved ? ""
                 : newResolved == .archiveOnly
                     ? " Its originals stay out of the shared Buffer. Use Move to Private for any copies already there."
@@ -3886,6 +3972,7 @@ final class EventsWorkspace {
                 nasLink: nasLink
             )
         }
+        return true
     }
 
     func discoverDriveEvents() {
