@@ -107,6 +107,7 @@ final class DashboardModel {
     var immichConnectionStatus: String = "Not connected. Add your server URL and API key in Config."
     var immichConnectionReport: ImmichConnectionReport?
     var immichIsTestingConnection: Bool = false
+    var immichLibraries: [ImmichLibrary] = []
     var trueNASAPIKeyDraft: String = ""
     var trueNASConnectionStatus: String = "Not configured. Add the TrueNAS server in Settings."
     var trueNASConnectionReport: TrueNASCapacityReport?
@@ -485,8 +486,8 @@ extension DashboardModel {
             configuration.savedEvents[index].lastUsedAt = Date()
         }
         statusMessage = enabled
-            ? "This event is marked for Immich. Nothing was uploaded."
-            : "This event is storage-only. Nothing will be sent to Immich."
+            ? "This private event may keep an Immich album."
+            : "This private event will not get an Immich album."
     }
 
     func setEventImmichAlbumPolicy(_ eventID: UUID, policy: ImmichAlbumPolicy) {
@@ -495,8 +496,8 @@ extension DashboardModel {
             configuration.savedEvents[index].immichAlbumPolicy = policy
         }
         statusMessage = policy == .none
-            ? "Immich uploads for this event will not create an album."
-            : "Saved the Immich album preference. Nothing was uploaded."
+            ? "This event will not get an Immich album."
+            : "Saved. The album fills on the next Immich check."
     }
 
     func setEventImmichAlbumName(_ eventID: UUID, name: String) {
@@ -506,38 +507,6 @@ extension DashboardModel {
         }
     }
 
-    func setAssignmentImmichOverride(_ assignment: PhotoEventAssignment, value: Bool?) {
-        updateConfiguration { configuration in
-            guard let index = configuration.photoEventAssignments.firstIndex(where: {
-                CatalogStore.eventAssetID($0) == CatalogStore.eventAssetID(assignment)
-            }) else { return }
-            configuration.photoEventAssignments[index].immichUploadOverride = value
-        }
-    }
-
-    func checkImmichPresence(_ assets: [ImmichChecksumQuery]) async throws -> [ImmichChecksumResult] {
-        let serverURL = configuration.immichServerURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !serverURL.isEmpty else {
-            throw ToolkitError.commandFailed("Add the Immich server URL in Settings first.")
-        }
-        var apiKey = immichAPIKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
-        if apiKey.isEmpty {
-            apiKey = try secretStore.read(account: Self.immichAPIKeyAccount)?
-                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        }
-        guard !apiKey.isEmpty else {
-            throw ToolkitError.commandFailed("Save an Immich API key in Settings first.")
-        }
-        let client = try ImmichClient(serverURL: serverURL, apiKey: apiKey)
-        var results: [ImmichChecksumResult] = []
-        for start in stride(from: 0, to: assets.count, by: 100) {
-            let end = min(start + 100, assets.count)
-            results += try await client.checkBulkUpload(Array(assets[start..<end]))
-        }
-        return results
-    }
-
-    @discardableResult
     func chooseFolder(title: String, keyPath: WritableKeyPath<AppConfiguration, String>) -> Bool {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
@@ -777,6 +746,14 @@ extension DashboardModel {
             }
         }
         statusMessage = "Event folder changed."
+    }
+
+    func setImmichLibraryID(_ value: String) {
+        updateConfiguration { $0.immichLibraryID = value }
+    }
+
+    func setImmichCarriesAlbumsAcrossRenames(_ value: Bool) {
+        updateConfiguration { $0.immichCarriesAlbumsAcrossRenames = value }
     }
 
     func setImmichServerURL(_ value: String) {
@@ -1309,6 +1286,7 @@ extension DashboardModel {
 
             let report = try await client.testConnection()
             immichConnectionReport = report
+            immichLibraries = (try? await client.libraries()) ?? []
             immichConnectionStatus = "Connected to Immich \(report.version) as \(report.userName) <\(report.userEmail)>."
             if shouldRecordActivity {
                 recordActivity(

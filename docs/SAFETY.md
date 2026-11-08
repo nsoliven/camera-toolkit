@@ -32,7 +32,7 @@ Camera Toolkit treats source media as read-only during normal browsing and trans
 - **Free Up Source** re-hashes each card or unsorted-folder original against its drive copy and permanently removes the source originals only when the whole set matches, exactly like Free Up Camera. It is never offered for files whose only copy is the drive copy.
 - Adopting event folders already on the drive only records assignments. No file moves.
 - Adding event folders found on the NAS only records assignments, after a verified photo-list backup. The NAS is listed, never opened or written; the files show as NAS only, and no Sync to NAS record is made up for them — none of them counts as verified.
-- Immich upload sends only files in events marked **Send to Immich**, skips content Immich already has by SHA-1, and keeps the API key in Keychain.
+- Immich reads the NAS as an external library. The app never uploads to it and never deletes from it; it requests scans, compares paths, and adds to albums only for events that opted in (see `IMMICH.md`). The API key stays in Keychain.
 - Face scans are read-only on media: detection and embedding read photo bytes (or their embedded previews) and — at Medium and High — decoded video frames; they write only to the local catalog database. Naming, merging, and junking groups change catalog rows — a junked group's face rows are deleted from the index, but no photo, sidecar, or catalog event is ever touched. Confirmed faces are frozen and are never reclassified or removed by later scans. Clearing the face index removes the `face_photos`, `faces`, `people`, and `face_templates` rows only — every other catalog table and every file on disk is untouched.
 
 ## Failure behavior

@@ -196,6 +196,7 @@ extension EventsWorkspace {
     func nasRenamesApplied(_ result: NASFollowResult, remaining: Int) {
         pendingNASRenameCount = remaining
         nasPresence.noteRenamed(result)
+        if result.changed > 0 { followNASChangeInImmich(moves: result.applied) }
         // Every open board's NAS place was read before the copies moved. The
         // renames of a plain move are patched into the rows they belong to;
         // anything else re-reads the boards.
@@ -213,6 +214,7 @@ extension EventsWorkspace {
         pendingNASRenameCount = remaining
         nasPresence.noteRenamed(result)
         guard result.changed > 0 else { return }
+        followNASChangeInImmich(moves: result.applied)
         await RunLoopTurn.afterCommit()
         if !(await patchPresenceInSlices(afterNASRenames: result)) {
             for eventID in Array(eventStacks.keys) where presence[eventID] != nil {

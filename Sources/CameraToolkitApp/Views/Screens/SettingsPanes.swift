@@ -477,6 +477,28 @@ struct ServicesSettingsPane: View {
                     }
                     .disabled(model.immichIsTestingConnection)
                 }
+                Picker("Library", selection: Binding(
+                    get: { model.configuration.immichLibraryID },
+                    set: { model.setImmichLibraryID($0) }
+                )) {
+                    Text("None").tag("")
+                    if !model.configuration.immichLibraryID.isEmpty,
+                       !model.immichLibraries.contains(where: { $0.id == model.configuration.immichLibraryID }) {
+                        Text("Saved library").tag(model.configuration.immichLibraryID)
+                    }
+                    ForEach(model.immichLibraries) { library in
+                        Text(library.name).tag(library.id)
+                    }
+                }
+                .disabled(model.immichLibraries.isEmpty && model.configuration.immichLibraryID.isEmpty)
+                Toggle("Keep renamed files in their albums", isOn: Binding(
+                    get: { model.configuration.immichCarriesAlbumsAcrossRenames },
+                    set: { model.setImmichCarriesAlbumsAcrossRenames($0) }
+                ))
+                .disabled(model.configuration.immichLibraryID.isEmpty)
+                Text("Immich reads the NAS itself: pick the external library whose folder is your NAS library. The app asks it to scan after Sync to NAS and renames, and shows what it found on each event. It never uploads.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             Section {
