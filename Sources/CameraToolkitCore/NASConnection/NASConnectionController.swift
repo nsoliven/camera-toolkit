@@ -469,6 +469,7 @@ public actor NASConnectionController {
         status.isTestingSpeed = true
         status.speedTestError = nil
         publish()
+        LaunchTrace.mark("nas.speed_test.start", detail: "on_demand=\(onDemand)")
         let tester = speedTester
         let probe = inspector.probe
         let root = settings.mountPoint.map { URL(fileURLWithPath: $0, isDirectory: true) } ?? settings.nasRoot
@@ -488,6 +489,7 @@ public actor NASConnectionController {
         if !heldByCaller { isBusy = false }
         status.isTestingSpeed = false
         testedMount = testedKey
+        LaunchTrace.mark("nas.speed_test.finish", outcome: (try? result.get()) == nil ? .error : .ok)
         switch result {
         case .success(let speed):
             status.speed = speed

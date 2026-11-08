@@ -243,6 +243,7 @@ final class NASPresenceModel {
         listedFiles = 0
         let base = listing
         let now = self.now
+        LaunchTrace.mark("nas.presence.start", detail: "trigger=\(request.trigger.rawValue) list=\(list) scope=\(request.scope.map { String($0.count) } ?? "all")")
         let progress = ListingProgress { [weak self] count in
             Task { @MainActor in
                 guard let self, self.generation == generation else { return }
@@ -325,6 +326,7 @@ final class NASPresenceModel {
         guard generation == self.generation else { return }
         task = nil
         isChecking = false
+        LaunchTrace.mark("nas.presence.finish", outcome: outcome.cancelled ? .cancel : .ok, detail: "listed_at=\(outcome.report?.listedAt != nil) drive_files=\(outcome.report?.total.files ?? 0)")
         if !outcome.cancelled, let report = outcome.report {
             let old = self.report
             listing = outcome.listing

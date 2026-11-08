@@ -807,6 +807,9 @@ final class EventsWorkspace {
     /// How many board reads (`refreshEvent`) have started — what a test
     /// compares to prove a move did not re-read the boards it patched.
     @ObservationIgnored private(set) var boardReadCount = 0
+    /// When each board was last clicked, until its refresh picks it up — the
+    /// zero of that open's timing lines (`BoardOpenTrace`).
+    @ObservationIgnored private var boardSelectedAt: [UUID: ContinuousClock.Instant] = [:]
     /// How many times the assignment lookups were rebuilt from every
     /// assignment — ~750 ms on the main actor at 17,000 rows.
     @ObservationIgnored private(set) var assignmentIndexRebuildCount = 0
@@ -2721,6 +2724,7 @@ final class EventsWorkspace {
     // MARK: - Startup and selection
 
     func start() {
+        LaunchTrace.markOnce("launch.workspace_start")
         observeVolumeChanges()
         Task { await loadUndoHistory() }
         discoverDriveEvents()
@@ -2728,7 +2732,10 @@ final class EventsWorkspace {
         // Decode the capture-date cache now, off the main actor, so the
         // first board opened never waits for it.
         let loader = captureDateCacheLoader
-        Task.detached(priority: .utility) { _ = loader.cache() }
+        Task.detached(priority: .utility) {
+            _ = loader.cache()
+            LaunchTrace.markOnce("launch.capture_dates_loaded")
+        }
     }
 
     func startGuide() {
@@ -2739,7 +2746,12 @@ final class EventsWorkspace {
     }
 
     func selectionChanged() {
-        if case .event = selection { nasPresence.refresh(.boardOpened) }
+        if case .event(let eventID) = selection {
+            let selectedAt = ContinuousClock.now
+            boardSelectedAt[eventID] = selectedAt
+            BoardOpenTrace(eventID: eventID, selectedAt: selectedAt).mark("selected")
+            nasPresence.refresh(.boardOpened)
+        }
         cancelPendingSelectionCollapse()
         // The board just opened gets its own selection back; the one just
         // left keeps its selection for when it is opened again.
@@ -3993,6 +4005,7 @@ final class EventsWorkspace {
             }.value
             self?.discoveredDriveEvents = found.0
             self?.legacyLayoutFolders = found.1
+            LaunchTrace.mark("discovery.drive", detail: "events=\(found.0.count)")
         }
         discoverNASEvents()
     }
@@ -4060,6 +4073,8 @@ final class EventsWorkspace {
         refreshesInFlight += 1
         boardReadCount += 1
         defer { refreshesInFlight -= 1 }
+        let trace = BoardOpenTrace(eventID: eventID, selectedAt: boardSelectedAt.removeValue(forKey: eventID))
+        trace.mark("refresh_start")
         let generation = UUID()
         refreshGenerations[eventID] = generation
         presenceTasks[eventID]?.cancel()
@@ -4186,6 +4201,15 @@ final class EventsWorkspace {
             eventGridRevisions[eventID] = revisionAtStart
             let remaining = firstPaint.familyCount - firstPaint.grid.files.count
             eventBuildRemainders[eventID] = remaining > 0 ? remaining : nil
+            trace.mark("first_grid", detail: "files=\(firstPaint.grid.files.count) family=\(firstPaint.familyCount)")
+            if BoardOpenTrace.appLog != nil {
+                // Drawn at the end of this run-loop turn, not when assigned.
+                Task { @MainActor in
+                    await RunLoopTurn.afterCommit()
+                    trace.mark("first_paint")
+                    LaunchTrace.markOnce("launch.first_board_paint")
+                }
+            }
         } else if eventStacks[eventID] == nil {
             eventBuildRemainders[eventID] = nil
         }
@@ -4239,6 +4263,7 @@ final class EventsWorkspace {
                         unchanged: provisional == published
                     )
                     published = provisional
+                    trace.mark("full_grid", detail: "files=\(files.count) dates_to_read=\(undated.missingCaptureDates)")
                 }
             }
 
@@ -4250,6 +4275,7 @@ final class EventsWorkspace {
             // its storage chip saying so.
             let report = await reachabilityCheck.value
             await applyReachability(report, for: eventID, generation: generation)
+            trace.mark("reachability", detail: "offline=\(report.offlinePlaces.count) unresponsive=\(report.unresponsiveVolumes.count)")
             let mounted = mountedAll.subtracting(report.unresponsiveVolumes)
             let driveAvailableByMember = Dictionary(uniqueKeysWithValues: members.map { member in
                 (member.id, VolumeInfo.isAvailable(locations.driveRoot(for: locations.resolvedPolicy(for: member)), mountedVolumes: mounted))
@@ -4287,6 +4313,7 @@ final class EventsWorkspace {
                     connectivity: connectivityRevisionAtStart,
                     unchanged: built.map { $0.stacks == published } ?? false
                 )
+                trace.mark("dated_grid", detail: "headers_read=\(canReadHeaders)")
                 // Burst pairs no scan compared yet (the card is gone, or this
                 // is a relaunch) get the Vision check here, from the same
                 // places the dates came from — after the dated board is up,
@@ -4392,10 +4419,12 @@ final class EventsWorkspace {
             } onCancel: {
                 sweepTask.cancel()
             }
+            trace.mark("sweep_done", outcome: output == nil ? .cancel : .ok, detail: "files=\(output?.summary.total ?? 0)")
             await finishPresenceSweep(
                 eventID: eventID,
                 generation: generation,
                 revision: revisionAtStart,
+                trace: trace,
                 // A reused grid verifies against what it shows: the sweep
                 // restacks only when the files on disk are not the files
                 // on the board.
@@ -4407,6 +4436,7 @@ final class EventsWorkspace {
         await withCheckedContinuation { (cc: CheckedContinuation<Void, Never>) in
             presenceWaiters[eventID, default: []].append((generation, cc))
         }
+        trace.mark("finished", outcome: refreshGenerations[eventID] == generation ? .ok : .cancel)
         if refreshGenerations[eventID] == generation, eventStacks[eventID]?.isEmpty == false, presence[eventID] != nil {
             boardVerifications[eventID] = BoardVerification(
                 catalog: revisionAtStart,
@@ -4456,7 +4486,10 @@ final class EventsWorkspace {
     /// re-stacks or re-sweeps it. Anything else refreshes behind the tiles
     /// already on screen.
     func refreshEventIfStale(_ eventID: UUID) async {
-        guard !isBoardFresh(eventID) else { return }
+        guard !isBoardFresh(eventID) else {
+            BoardOpenTrace(eventID: eventID, selectedAt: boardSelectedAt.removeValue(forKey: eventID)).mark("already_fresh")
+            return
+        }
         await refreshEvent(eventID)
     }
 
@@ -4536,6 +4569,7 @@ final class EventsWorkspace {
         eventID: UUID,
         generation: UUID,
         revision: Int,
+        trace: BoardOpenTrace,
         builtFiles: [OrganizeFile]?,
         output: EventRefreshOutput?
     ) async {
@@ -4580,6 +4614,7 @@ final class EventsWorkspace {
             presence[memberID] = memberSummary
         }
         eventImmichStatuses[eventID] = output.immich
+        trace.mark("chips_resolved", detail: "on_nas=\(output.summary.onArchive) of=\(output.summary.total)")
         // Order does not matter — the baseline for a reused grid is the
         // board's own files in stack order — but how many times each file is
         // drawn does: only "which files are on disk, once each" decides
@@ -6640,6 +6675,7 @@ final class EventsWorkspace {
 
     /// Launch: status, auto-connect, and the Wi-Fi guard. App only.
     func startNASConnection() {
+        LaunchTrace.markOnce("launch.nas_connection_start")
         nasConnection.start(settings: nasConnectionSettings)
         nasPresence.isEnabled = true
         nasPresence.refresh(.launch)

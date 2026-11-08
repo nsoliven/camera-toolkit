@@ -34,6 +34,7 @@ extension EventsWorkspace {
             guard let self, let found, !Task.isCancelled else { return }
             discoveredNASEvents = found.events
             nasDiscoveryProblems = found.problems
+            LaunchTrace.mark("discovery.nas", detail: "events=\(found.events.count) problems=\(found.problems.count)")
         }
     }
 
