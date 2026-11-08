@@ -1700,7 +1700,9 @@ final class EventsWorkspaceTests: XCTestCase {
             XCTAssertFalse(model.jobs.contains { $0.action == .faceScan })
 
             // Assigned files that exist nowhere right now still block the
-            // scan — presence resolves to zero reachable stacks.
+            // scan — presence resolves to zero reachable stacks. The NAS is
+            // there and says so: a NAS root that is gone is "unknown" instead.
+            try FileManager.default.createDirectory(at: workspace.locations.nasRoot, withIntermediateDirectories: true)
             let ghost = try XCTUnwrap(workspace.createEvent(name: "Ghost", date: organizerDay("2026-08-26"), policy: .buffer))
             model.updateConfiguration { configuration in
                 configuration.photoEventAssignments.append(PhotoEventAssignment(
