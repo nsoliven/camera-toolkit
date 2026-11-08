@@ -591,11 +591,10 @@ public struct NASLayoutMigrationPlanner {
 
     static func kind(of name: String) -> NASLayoutMigrationPlan.FileKind {
         let ext = (name as NSString).pathExtension.lowercased()
-        let media: Set<String> = ["arw", "cr2", "cr3", "nef", "dng", "raf", "rw2", "orf", "jpg", "jpeg", "heic", "heif", "png", "tif", "tiff",
+        let media: Set<String> = ["arw", "cr2", "cr3", "nef", "dng", "raf", "rw2", "orf", "jpg", "jpeg", "heic", "heif", "png", "tif", "tiff", "hif",
                                   "mp4", "mov", "m4v", "mts", "insv", "osv", "insp", "wav", "m4a", "mp3"]
-        let sidecar: Set<String> = ["xmp", "lrf", "lrv", "thm", "xml", "srt", "photo-edit", "aae"]
         if media.contains(ext) { return .media }
-        if sidecar.contains(ext) { return .sidecar }
+        if OrganizeFileClassifier.companionExtensions.contains(ext) { return .sidecar }
         return .other
     }
 

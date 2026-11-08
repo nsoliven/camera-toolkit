@@ -40,7 +40,7 @@ public enum CaptureDateReader {
     static let tiffExtensions: Set<String> = [
         "arw", "dng", "nef", "nrw", "cr2", "orf", "rw2", "pef", "srw", "tif", "tiff"
     ]
-    static let imageIOExtensions: Set<String> = ["jpg", "jpeg", "heic", "heif", "png", "webp"]
+    static let imageIOExtensions: Set<String> = ["jpg", "jpeg", "heic", "heif", "hif", "png", "webp"]
 
     public static func canRead(_ url: URL) -> Bool {
         let ext = url.pathExtension.lowercased()
