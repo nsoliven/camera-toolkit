@@ -1803,6 +1803,13 @@ struct StackPreviewOverlay: View {
     @State private var facePersonNames: [UUID: String] = [:]
     /// Roster for the tag picker's person list.
     @State private var rosterPeople: [FacePerson] = []
+    /// Dogs on the frame on screen, read off the main actor from the pet
+    /// index (`pets.sqlite`) — empty while no pet scan has made one. Like
+    /// the faces, the image paint never waits on them.
+    @State private var petsOnFrame: PetFrameBoxes = .empty
+    /// Settings › Organizing "Look for dogs" — off hides the dog boxes,
+    /// the same switch that hides the People window's Pets side.
+    @AppStorage(PetGallery.scanEnabledDefaultsKey) private var petsEnabled = true
     /// The current frame's EXIF — read on a background queue after paint.
     @State private var frameMetadata: PhotoMetadata?
     @State private var frameMetadataLoaded = false
@@ -1931,6 +1938,9 @@ struct StackPreviewOverlay: View {
         // the cheap preview paint never waits on the catalog or ImageIO.
         .task(id: "\(item?.primary.pathKey ?? "")#\(workspace.facesRevision)") {
             await loadFaceInfo()
+        }
+        .task(id: "\(item?.primary.pathKey ?? "")#\(workspace.petGallery.facesRevision)#\(petsEnabled)") {
+            await loadPetInfo()
         }
         .task(id: item?.primary.path) { await loadMetadata() }
     }
@@ -2132,11 +2142,13 @@ struct StackPreviewOverlay: View {
                 FaceBoxesOverlay(
                     faces: facesOnFrame,
                     personNames: facePersonNames,
+                    pets: petsOnFrame.faces,
+                    petNames: petsOnFrame.names,
                     rotation: itemRotation,
                     imageFrame: canvasImageFrame,
-                    onConfirm: { workspace.confirmFace($0.id) },
-                    onTag: { face, rect in
-                        tagRequest = FaceTagRequest(target: .face(face.id), anchor: rect)
+                    onConfirm: { face, subject in faceActions.confirm(face.id, subject: subject) },
+                    onTag: { face, subject, rect in
+                        tagRequest = FaceTagRequest(target: .face(face.id), anchor: rect, subject: subject)
                     }
                 )
             }
@@ -2146,12 +2158,13 @@ struct StackPreviewOverlay: View {
             item: $tagRequest,
             attachmentAnchor: .rect(.rect(tagRequest?.anchor ?? .zero)),
             arrowEdge: .bottom
-        ) { _ in
+        ) { request in
             FaceTagPicker(
-                people: rosterPeople,
+                people: request.subject == .pets ? petsOnFrame.approvedPets : rosterPeople,
+                subject: request.subject,
                 onPick: { person in applyTag(person) },
                 onCreate: { name in
-                    if let person = workspace.createRosterPerson(named: name) {
+                    if let person = faceActions.create(named: name, subject: request.subject) {
                         applyTag(person)
                     }
                 },
@@ -2603,6 +2616,30 @@ struct StackPreviewOverlay: View {
         rosterPeople = result.3
     }
 
+    /// Reads the frame's dogs from the pet index off the main actor, by the
+    /// same file identity the faces use. Read-only: a missing or empty
+    /// `pets.sqlite` yields no boxes and creates nothing, and the catalog
+    /// is never consulted.
+    private func loadPetInfo() async {
+        guard petsEnabled, let item, item.kind != .video else {
+            petsOnFrame = .empty
+            return
+        }
+        let file = item.primary
+        let url = workspace.petGallery.databaseURL
+        let boxes = await Task.detached(priority: .userInitiated) {
+            PetFrameLookup.boxes(petIndexURL: url, file: file)
+        }.value
+        guard !Task.isCancelled else { return }
+        petsOnFrame = boxes
+    }
+
+    /// Confirm and tag on a preview box go to the index the box came from:
+    /// faces to the catalog, dogs to the pet index.
+    private var faceActions: FaceBoxActionRouter {
+        FaceBoxActionRouter(people: workspace, pets: workspace.petGallery)
+    }
+
     /// EXIF for the inspector, read through ImageIO properties on a utility
     /// queue — never on the paint path.
     private func loadMetadata() async {
@@ -2651,14 +2688,16 @@ struct StackPreviewOverlay: View {
         tagRequest = FaceTagRequest(target: .drawnBox(box, crop: crop), anchor: anchor)
     }
 
-    /// Applies the picker's choice: an existing face is assigned+confirmed;
-    /// a drawn box becomes a new confirmed catalog face. Both go through
-    /// the store — confirmed faces stay frozen, photos are never rewritten.
+    /// Applies the picker's choice: an existing detection is
+    /// assigned+confirmed in its own index (a dog in the pet index, a face
+    /// in the catalog); a drawn box becomes a new confirmed catalog face.
+    /// All go through the store — confirmed rows stay frozen, photos are
+    /// never rewritten.
     private func applyTag(_ person: FacePerson) {
         guard let request = tagRequest else { return }
         switch request.target {
         case .face(let faceID):
-            workspace.tagFace(faceID, as: person.id)
+            faceActions.tag(faceID, as: person.id, subject: request.subject)
         case .drawnBox(let box, let crop):
             if let item {
                 workspace.tagDrawnFace(
