@@ -95,6 +95,7 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate, NSMenuIte
             CameraToolkitRuntime.workspace.reinstateTrashedAssignments(report)
         }
         LaunchTrace.mark("launch.did_finish_launching")
+        CameraToolkitRuntime.workspace.buildAssignmentIndexOffMain()
         CameraToolkitMainWindow.shared.show(model: model)
         LaunchTrace.mark("launch.window_shown")
         if model.transferQueue != nil || !model.pendingTransferBatches.isEmpty {

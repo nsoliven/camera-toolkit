@@ -831,6 +831,15 @@ final class EventsWorkspace {
     @ObservationIgnored var pendingNASArrivals: [String: PendingNASArrival] = [:]
     @ObservationIgnored private var indexRevision = -1
     @ObservationIgnored private var indexCount = -1
+    /// What `assignmentCounts`/`assignmentBytes` were added up from while
+    /// the path keys are still building off the main actor.
+    @ObservationIgnored private var totalsRevision = -1
+    @ObservationIgnored private var totalsCount = -1
+    /// On in the app (`buildAssignmentIndexOffMain`), off in tests.
+    @ObservationIgnored private(set) var buildsAssignmentIndexOffMain = false
+    @ObservationIgnored private var indexBuild: (stamp: Int, count: Int, task: Task<Void, Never>)?
+    /// Runs at the start of a background index build. Test seam.
+    @ObservationIgnored var assignmentIndexBuildHook: (@Sendable () -> Void)?
     @ObservationIgnored var assignmentsByPathKey: [String: PhotoEventAssignment] = [:]
     /// Clicked Move to Event batches that have not landed: tiles already
     /// moved in memory, rename running or queued behind another job.
@@ -1605,6 +1614,26 @@ final class EventsWorkspace {
         guard indexRevision != revision || indexCount != model.assignmentCountSnapshot else { return }
         let assignments = model.configuration.photoEventAssignments
         assignmentIndexRebuildCount += 1
+        let lookups = Self.buildAssignmentLookups(assignments: assignments, locations: locations, eventsByID: eventsByID, isCancelled: { false })
+        guard let lookups else { return }
+        publishAssignmentLookups(lookups, stamp: model.assignmentIndexStamp, count: assignments.count)
+    }
+
+    /// The path-key lookup and the per-event totals, built from every
+    /// assignment. Pure, so it can run off the main actor.
+    struct AssignmentLookups: Sendable {
+        var byPathKey: [String: PhotoEventAssignment]
+        var counts: [UUID: Int]
+        var bytes: [UUID: Int64]
+    }
+
+    /// Nil when `isCancelled` said stop part way.
+    nonisolated static func buildAssignmentLookups(
+        assignments: [PhotoEventAssignment],
+        locations: EventStorageLocations,
+        eventsByID: [UUID: SavedCameraEvent],
+        isCancelled: () -> Bool
+    ) -> AssignmentLookups? {
         var index: [String: PhotoEventAssignment] = [:]
         index.reserveCapacity(assignments.count * 2)
         var counts: [UUID: Int] = [:]
@@ -1621,12 +1650,12 @@ final class EventsWorkspace {
                 bytes[assignment.eventID, default: 0] += assignment.fileSize
             }
         }
+        if isCancelled() { return nil }
         // The board's tiles point at Originals/<Camera> (or the other drive,
         // a not-yet-migrated legacy Card Copy, or the NAS), not at the path
         // the file was imported from. Index those too, without letting them
         // steal a source path that already belongs to a different
         // assignment.
-        let eventsByID = self.eventsByID
         for assignment in assignments {
             autoreleasepool {
                 for key in builder.impliedKeys(for: assignment, owner: eventsByID[assignment.eventID]) {
@@ -1634,18 +1663,121 @@ final class EventsWorkspace {
                 }
             }
         }
-        assignmentsByPathKey = index
+        return AssignmentLookups(byPathKey: index, counts: counts, bytes: bytes)
+    }
+
+    /// All the lookups at once, in one turn of the main actor: a reader sees
+    /// the old set or the new one, never half of each.
+    private func publishAssignmentLookups(_ lookups: AssignmentLookups, stamp: Int, count: Int) {
+        assignmentsByPathKey = lookups.byPathKey
+        assignmentCounts = lookups.counts
+        assignmentBytes = lookups.bytes
+        assignmentsByEventAndName = [:]
+        indexRevision = stamp
+        indexCount = count
+        fileFacts.touchAll()
+    }
+
+    // MARK: Building the lookups off the main actor
+
+    /// The app builds the lookups on a background task at launch and draws
+    /// around them until they land. Tests that rely on a read building them
+    /// keep the synchronous path.
+    func buildAssignmentIndexOffMain() {
+        buildsAssignmentIndexOffMain = true
+        startAssignmentIndexBuild()
+    }
+
+    /// Starts a background build for the catalog as it is now, unless the
+    /// lookups are current or that build is already running. Anything that
+    /// must be right immediately still calls `refreshIndexIfNeeded`, which
+    /// builds on the spot; this build then finds nothing left to do.
+    private func startAssignmentIndexBuild() {
+        guard !assignmentIndexIsCurrent else { return }
+        let stamp = model.assignmentIndexStamp
+        let count = model.assignmentCountSnapshot
+        if let build = indexBuild, build.stamp == stamp, build.count == count { return }
+        indexBuild?.task.cancel()
+        assignmentIndexRebuildCount += 1
+        let assignments = model.configuration.photoEventAssignments
+        let locations = self.locations
+        let eventsByID = self.eventsByID
+        let hook = assignmentIndexBuildHook
+        let task = Task.detached(priority: .userInitiated) { [weak self] in
+            hook?()
+            let began = ContinuousClock.now
+            guard let lookups = Self.buildAssignmentLookups(
+                assignments: assignments, locations: locations, eventsByID: eventsByID, isCancelled: { Task.isCancelled }
+            ) else { return }
+            LaunchTrace.mark("assignment_index.built", detail: "rows=\(assignments.count) took=\(began.duration(to: .now))")
+            await self?.landAssignmentIndex(lookups, stamp: stamp, count: count)
+        }
+        indexBuild = (stamp, count, task)
+    }
+
+    private func landAssignmentIndex(_ lookups: AssignmentLookups, stamp: Int, count: Int) {
+        guard let build = indexBuild, build.stamp == stamp, build.count == count else { return }
+        indexBuild = nil
+        // The catalog moved on while this was building: it describes a
+        // catalog that no longer exists, so build again.
+        guard model.assignmentIndexStamp == stamp, model.assignmentCountSnapshot == count else {
+            startAssignmentIndexBuild()
+            return
+        }
+        guard !assignmentIndexIsCurrent else { return }
+        publishAssignmentLookups(lookups, stamp: stamp, count: count)
+        boardChipsRevision &+= 1
+    }
+
+    /// For a read that decorates a tile or a chip and can wait: answers from
+    /// what is there and has the lookups rebuilt in the background.
+    private func refreshIndexForDrawing() {
+        guard buildsAssignmentIndexOffMain else {
+            refreshIndexIfNeeded(tracking: false)
+            return
+        }
+        startAssignmentIndexBuild()
+    }
+
+    /// Totals only need the assignments added up, not their path keys —
+    /// a few milliseconds even at 40,000 rows — so a count is right at once
+    /// while the path keys are still building. Whoever asks whether an
+    /// event is empty gets the true answer, not a pending one.
+    private func refreshAssignmentTotalsIfNeeded() {
+        guard buildsAssignmentIndexOffMain else {
+            refreshIndexIfNeeded()
+            return
+        }
+        let revision = model.assignmentIndexRevision
+        let count = model.assignmentCountSnapshot
+        guard indexRevision != revision || indexCount != count else { return }
+        startAssignmentIndexBuild()
+        guard totalsRevision != revision || totalsCount != count else { return }
+        var counts: [UUID: Int] = [:]
+        var bytes: [UUID: Int64] = [:]
+        for assignment in model.configuration.photoEventAssignments {
+            counts[assignment.eventID, default: 0] += 1
+            bytes[assignment.eventID, default: 0] += assignment.fileSize
+        }
         assignmentCounts = counts
         assignmentBytes = bytes
-        assignmentsByEventAndName = [:]
-        indexRevision = model.assignmentIndexStamp
-        indexCount = assignments.count
-        fileFacts.touchAll()
+        totalsRevision = revision
+        totalsCount = count
+    }
+
+    /// Waits for the background build, when one is owed. Cancellation ends
+    /// the wait early; the caller checks for itself what it can rely on.
+    func assignmentIndexReady() async {
+        while !assignmentIndexIsCurrent, !Task.isCancelled {
+            startAssignmentIndexBuild()
+            guard let task = indexBuild?.task else { return }
+            await task.value
+        }
     }
 
     /// Whether the lookup indexes match the catalog right now — read
     /// before a catalog change so `patchAssignmentIndex` knows it may patch.
-    private var assignmentIndexIsCurrent: Bool {
+    var assignmentIndexIsCurrent: Bool {
         indexRevision == model.assignmentIndexStamp && indexCount == model.assignmentCountSnapshot
     }
 
@@ -1725,7 +1857,7 @@ final class EventsWorkspace {
     /// alone, not on every catalog change and every move in flight.
     func tileAssignment(for file: OrganizeFile) -> PhotoEventAssignment? {
         fileFacts.track(file.pathKey)
-        refreshIndexIfNeeded(tracking: false)
+        refreshIndexForDrawing()
         return currentAssignment(for: file)
     }
 
@@ -1743,13 +1875,13 @@ final class EventsWorkspace {
     /// parent's count covers its subevents; a subevent never counts the
     /// parent's files.
     func assignmentCount(for eventID: UUID) -> Int {
-        refreshIndexIfNeeded()
+        refreshAssignmentTotalsIfNeeded()
         _ = moveOverlayRevision
         return scopeIDs(eventID).reduce(0) { $0 + (assignmentCounts[$1] ?? 0) + (optimisticCounts[$1] ?? 0) }
     }
 
     func assignmentBytes(for eventID: UUID) -> Int64 {
-        refreshIndexIfNeeded()
+        refreshAssignmentTotalsIfNeeded()
         _ = moveOverlayRevision
         return scopeIDs(eventID).reduce(Int64(0)) { $0 + (assignmentBytes[$1] ?? 0) + (optimisticBytes[$1] ?? 0) }
     }
@@ -2353,6 +2485,15 @@ final class EventsWorkspace {
             let entry = boardCamerasCache.remove(at: index)
             boardCamerasCache.insert(entry, at: 0)
             return entry.cameras
+        }
+        // Chips are decoration: while the lookups build, count what is known
+        // without keeping the answer. The landing asks for a recount.
+        if buildsAssignmentIndexOffMain, !assignmentIndexIsCurrent {
+            startAssignmentIndexBuild()
+            let resolver = cameraResolver
+            return Self.boardCameras(stacks) { self.cameraIDs(for: $0, resolver: resolver) } name: { id in
+                CameraCatalog.camera(id: id)
+            }
         }
         refreshIndexIfNeeded()
         let resolver = cameraResolver
@@ -3473,11 +3614,15 @@ final class EventsWorkspace {
     /// split made on a card names card paths; each member's identity comes
     /// from its catalog row or from a board that draws it. View-only: it
     /// decides tiles, never which file an action touches.
-    func eventStacking() -> BurstStackingContext {
+    ///
+    /// `indexMayLag`: only for a board's first screen, which must not wait
+    /// for the lookups — a manual split may be drawn unapplied there, and
+    /// the full build right behind it uses the complete context.
+    func eventStacking(indexMayLag: Bool = false) -> BurstStackingContext {
         let splits = model.configuration.burstSplits
         var identities: [String: String] = [:]
         if !splits.isEmpty {
-            refreshIndexIfNeeded(tracking: false)
+            if indexMayLag { refreshIndexForDrawing() } else { refreshIndexIfNeeded(tracking: false) }
             var unresolved = Set<String>()
             for key in splits.lazy.flatMap(\.memberPathKeys) where identities[key] == nil {
                 if let assignment = assignmentsByPathKey[key] {
@@ -4106,7 +4251,7 @@ final class EventsWorkspace {
         let locations = self.locations
         let policy = locations.resolvedPolicy(for: event)
         let cacheLoader = captureDateCacheLoader
-        let stacking = eventStacking()
+        let firstScreenStacking = eventStacking(indexMayLag: true)
         let catalogURL = URL(fileURLWithPath: DashboardModel.expandedPath(model.configuration.catalogDatabasePath))
         let probe = presenceProbe
         let archiveLister = presenceArchiveLister ?? (presenceProbe == nil ? EventArchiveListing.smbLister : nil)
@@ -4217,7 +4362,7 @@ final class EventsWorkspace {
                 // header read, so nothing on this pass can wait on a drive.
                 let items = OrganizeScanner.items(for: files, cache: cacheLoader.cache(), readMissingCaptureDates: false, pauseGate: gate).items
                 return (
-                    EventImpliedGrid(files: files, stacks: stacking.stacks(for: items)),
+                    EventImpliedGrid(files: files, stacks: firstScreenStacking.stacks(for: items)),
                     family.count
                 )
             }.value
@@ -4263,6 +4408,9 @@ final class EventsWorkspace {
             // What the board shows, as far as this pipeline has put it there.
             var published = existingStacks
             let (familyAssignments, assignmentsByEvent) = await familyTask.value
+            // The build owes the board its manual splits: with the lookups
+            // still building, wait for them here, off the first screen's path.
+            let stacking = await completeEventStacking(firstScreenStacking)
             let cache = cacheLoader.cache()
             var files: [OrganizeFile] = []
             if !gridIsCurrent {
@@ -4569,6 +4717,14 @@ final class EventsWorkspace {
     /// `appendingPathComponent(_:)` does for every call.
     nonisolated static func resolvedPath(root: URL, relativePath: String) -> String {
         root.appending(path: relativePath, directoryHint: .notDirectory).path
+    }
+
+    /// `stacking` when it was complete, else a fresh one once the lookups a
+    /// manual split needs have landed.
+    private func completeEventStacking(_ stacking: BurstStackingContext) async -> BurstStackingContext {
+        guard buildsAssignmentIndexOffMain, !model.configuration.burstSplits.isEmpty else { return stacking }
+        await assignmentIndexReady()
+        return Task.isCancelled ? stacking : eventStacking()
     }
 
     /// Main-actor landing point for the reachability answer. A stale
