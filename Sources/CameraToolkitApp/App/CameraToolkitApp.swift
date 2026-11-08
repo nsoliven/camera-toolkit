@@ -94,6 +94,7 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate, NSMenuIte
             CameraToolkitRuntime.workspace.reinstateTrashedAssignments(report)
         }
         CameraToolkitMainWindow.shared.show(model: model)
+        ThumbnailWarmingCoordinator.startIfLive(workspace: CameraToolkitRuntime.workspace)
         if model.transferQueue != nil || !model.pendingTransferBatches.isEmpty {
             TransferQueueWindowController.shared.show(model: model)
         }
