@@ -32,6 +32,14 @@ final class ScanPassReporter: @unchecked Sendable {
 
     /// Called from the scan's worker threads.
     func update(from update: FileOperationProgress) -> BackgroundJobUpdate {
+        // The header check runs before the scan's own count starts, so it
+        // reports only words and holds the bar where it is.
+        if update.phase == FaceIndexService.orientationCheckPhase {
+            var checking = DashboardModel.jobUpdate(from: update, lowerBound: 0, upperBound: 1, notePrefix: pass.subject.scanName, command: "")
+            checking.progress = lock.withLock { highestProgress }
+            checking.note = "\(pass.subject.scanName): \(Self.phrase(update.phase, subject: pass.subject))"
+            return checking
+        }
         // Only the per-file part of a scan estimates its work.
         let finishing = update.telemetry?.work == nil
         var reported = update

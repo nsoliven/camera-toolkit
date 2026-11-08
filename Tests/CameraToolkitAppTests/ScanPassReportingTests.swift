@@ -17,6 +17,17 @@ final class ScanPassReporterTests: XCTestCase {
         FileOperationProgress(phase: "Matching people", processedFiles: done, totalFiles: total, telemetry: JobTelemetry(step: "Match", counters: [JobCounter(label: "Faces", value: 5)]))
     }
 
+    /// The orientation check runs before the scan counts anything: it must
+    /// say so without moving the bar or jumping it to the end of the pass.
+    func testTheOrientationCheckHoldsTheBar() {
+        let dogs = ScanPassReporter(pass: JobScanPass(index: 2, count: 2, subject: .dogs))
+        let before = dogs.update(from: working(0))
+        let checking = dogs.update(from: FileOperationProgress(phase: FaceIndexService.orientationCheckPhase, processedFiles: 400, totalFiles: 900))
+        XCTAssertEqual(checking.progress, before.progress, accuracy: 1e-9)
+        XCTAssertTrue(checking.note.contains(FaceIndexService.orientationCheckPhase))
+        XCTAssertGreaterThanOrEqual(dogs.update(from: working(100)).progress, checking.progress)
+    }
+
     func testPercentNeverGoesBackwardAcrossPassesAndMatching() {
         let faces = ScanPassReporter(pass: JobScanPass(index: 1, count: 2, subject: .faces))
         let dogs = ScanPassReporter(pass: JobScanPass(index: 2, count: 2, subject: .dogs))

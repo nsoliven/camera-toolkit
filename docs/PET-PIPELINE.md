@@ -57,6 +57,31 @@ Pet data goes in **`pets.sqlite`, beside `catalog.sqlite`**. It never goes into 
 
 The two code changes the face pipeline needed are both no-ops for people. `FaceIndexStore` and `FaceIndexService` now read the engine identifier from the store instead of a constant (default `FaceEngine.identifier`). The automatic group prefix comes from the engine too ("Person" or "Dog"), so a face Re-match never dissolves a dog group, and a dog Re-match never dissolves a person group.
 
+## Upright detection
+
+Dog detection runs on an upright picture. A vertical RAW's embedded JPEG has no rotation of its own, so a pet pass turns the decode by the camera's rotation (`FaceScanOptions.uprightRawDetection`, set only by `.pets`) and detects and embeds on that. The people pass is unchanged: it still reads the unturned preview, and its boxes and rows are not touched. Measured on three real vertical frames, the sideways picture gave one box over two dogs at 0.52 to 0.74 confidence; upright gave two boxes at 0.85 to 0.92.
+
+- **One stored space.** Boxes go back to the unrotated preview's space (`FaceBoxProjection.storedBox(fromTurned:quarterTurnsCW:)`) before they are stored, so the preview overlay and every existing row keep working. Stored crops are the upright ones.
+- **No new identifier.** `PetFaceEngine.identifier` stays the same: the detector, embedder, crop rule and vector space have not changed, only which way up the picture was. Changing it would make every stored photo and row belong to another engine: every template and group vector would disappear from matching until a full rescan, which is what the identifier exists to force.
+- **No pet manual boxes.** A drawn box is always a face (`FaceTagRequest`), so nothing crops a stored or drawn dog from a RAW; the sidecar's `embed_crop` is only reached by its test.
+
+### The one-time rescan
+
+`pet_photo_orientation` (`v2-upright-detection`) records, per photo, the camera turn detection ran at. A photo without a row was read before this change. It lives in its own table so the five face tables still match the catalog's column for column.
+
+An ordinary dog scan checks the RAWs in its scope that have no marker: one short header read each, off the main actor, never again once marked. Ordinary photos and new photos cost no header read; a turn of 0 is marked done on the spot. A turn other than 0 means the photo is re-read upright, at its own grade so a lower pass cannot lose small dogs, one transaction per photo. Failed reads, whether of the header or the picture, leave the rows and marker alone and are retried by the next scan. Before the first rescan write, `pets.sqlite` is copied once with the SQLite backup API into `Backups/` under Application Support; the copy stays.
+
+Each rescanned photo's old boxes are paired with the new ones (`PetBoxRemap`) in the shared stored space:
+
+| Old and new | What happens |
+|---|---|
+| One to one, IoU at least 0.5 | The old row is refreshed in place, so its person, state, templates, rejections and any cover pointing at it stay. |
+| One old box over two or more distinct new boxes (each at least 70% inside it, none of them matching it at IoU 0.75 or more): a two-dog merge. A dog already claimed by another old box stays with that box | Each remaining new box is checked against only the old box's group, by the rules that group applies to any dog. An approved pet's templates or a "looks like" row file it as a suggestion, never onto the pet itself; an automatic group needs its average-linkage threshold with the merged row left out. Everything else stays unassigned for the normal pass. The old row is removed unless the user confirmed it, it is a template or a verdict names it, or it is the group's last face. |
+| New box with no old box | Stored unassigned; the normal match and group pass files it. |
+| Old box with no new box | Removed only if it was an unassigned detection. Anything confirmed, grouped, a template or named in a verdict stays. |
+
+IoU 0.5 is measured on real vertical frames: boxes on the same dog scored 0.59 to 0.96, boxes on a different dog 0.00 to 0.05, and a real two-dog box 0.33 to 0.59 against each dog it spanned. So 0.5 alone cannot tell a two-dog box from its larger dog; a box that covers two distinct new boxes is treated as a merge first, and a box matching one of them at 0.75 or more is a single dog with extra front or back boxes, not a merge.
+
 ## Thresholds and where they come from
 
 | Setting | Pet default | Face default | Source |
@@ -144,6 +169,6 @@ False dogs: 3 boxes on monkeys (COCO has no monkey class), 1 goat, and 2 dog fig
 ## Not done yet
 
 - Pet review actions are not in the Undo history. Destructive ones (Remove group, Clear Pet Scan) keep their confirmations, and none can touch a file.
-- `pets.sqlite` is not part of the catalog backup set mirrored to the NAS. It is backed up locally before migrations only.
+- `pets.sqlite` is not part of the catalog backup set mirrored to the NAS. It is backed up locally before migrations and once before the first upright rescan.
 - Event chips and the board's People filter list people only; pets show in the People window. Adding pets to the chips needs a paw marker on the chip.
 - Cats: COCO has the class, and adding `"cat"` to `SPECIES` in the sidecar would find them. That changes what the engine stores, so it needs a new identifier and a species column.

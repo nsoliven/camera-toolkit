@@ -6,6 +6,26 @@ import XCTest
 /// The People window footer must report the scan grades actually stored
 /// in the catalog — never the old hardcoded "LOW quality".
 final class FaceScanSummaryTests: XCTestCase {
+    func testTheJobSummaryCountsVerticalPhotosRescannedUpright() {
+        var pets = FaceScanReport()
+        pets.facesDetected = 3
+        pets.photosProcessed = 4
+        pets.photosRescannedUpright = 2
+        pets.photosFailed = 1
+        let summary = FaceAndPetScanReport(faces: FaceScanReport(), pets: pets).petSummary
+        XCTAssertTrue(summary.contains("Rescanned 2 vertical photos upright."), summary)
+        XCTAssertTrue(summary.contains("1 could not be read and will be retried next scan."), summary)
+
+        pets.photosRescannedUpright = 1
+        pets.photosFailed = 0
+        let single = FaceAndPetScanReport(faces: FaceScanReport(), pets: pets).petSummary
+        XCTAssertTrue(single.contains("Rescanned 1 vertical photo upright."), single)
+        XCTAssertFalse(single.contains("retried"), single)
+
+        pets.photosRescannedUpright = 0
+        XCTAssertFalse(FaceAndPetScanReport(faces: FaceScanReport(), pets: pets).petSummary.contains("vertical"))
+    }
+
     func testEmptyIndexSaysNoFaceScanStored() throws {
         try withTempCatalog { store in
             XCTAssertEqual(try store.storedScanGrades(), [])

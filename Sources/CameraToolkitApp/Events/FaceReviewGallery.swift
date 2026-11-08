@@ -210,6 +210,12 @@ struct FaceAndPetScanReport: Sendable {
         }
         guard let pets else { return "" }
         let dogs = "\(pets.facesDetected) dog\(pets.facesDetected == 1 ? "" : "s")"
-        return " Dogs: \(dogs) on \(pets.photosProcessed) photo(s), \(pets.photosSkipped) already scanned; \(pets.facesProposed) filed as lookalikes, \(pets.facesGrouped) grouped."
+        let vertical = pets.photosRescannedUpright > 0
+            ? " Rescanned \(pets.photosRescannedUpright) vertical photo\(pets.photosRescannedUpright == 1 ? "" : "s") upright."
+            : ""
+        let retry = pets.photosFailed > 0
+            ? " \(pets.photosFailed) could not be read and will be retried next scan."
+            : ""
+        return " Dogs: \(dogs) on \(pets.photosProcessed) photo(s), \(pets.photosSkipped) already scanned; \(pets.facesProposed) filed as lookalikes, \(pets.facesGrouped) grouped.\(vertical)\(retry)"
     }
 }

@@ -71,7 +71,17 @@ public enum PetIndexDatabase {
     /// which can miss pages still in the WAL — into
     /// `Backups/pets-<timestamp>.sqlite` and checks the copy's integrity.
     static func backup(writer: any DatabaseWriter, besides url: URL, now: Date) throws -> URL {
-        let folder = url.deletingLastPathComponent().appendingPathComponent(backupFolderName, isDirectory: true)
+        try backup(
+            writer: writer,
+            into: url.deletingLastPathComponent().appendingPathComponent(backupFolderName, isDirectory: true),
+            now: now
+        )
+    }
+
+    /// `backup(writer:besides:now:)` into a chosen folder — the Application
+    /// Support copy taken before the upright rescan, which must not land on
+    /// a NAS even if the catalog has been moved there.
+    static func backup(writer: any DatabaseWriter, into folder: URL, now: Date) throws -> URL {
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
@@ -85,6 +95,9 @@ public enum PetIndexDatabase {
         }
         let copy = try DatabaseQueue(path: destination.path)
         try writer.backup(to: copy)
+        // The source is WAL, and the copy keeps that header; rewrite it as
+        // one self-contained file so the backup is a single .sqlite to copy.
+        _ = try copy.writeWithoutTransaction { try String.fetchOne($0, sql: "PRAGMA journal_mode = DELETE") }
         let integrity = try copy.read { try String.fetchOne($0, sql: "PRAGMA integrity_check") }
         try copy.close()
         guard integrity == "ok" else {
@@ -171,6 +184,23 @@ public enum PetIndexDatabase {
                 FOREIGN KEY(face_id) REFERENCES faces(id) ON DELETE CASCADE
             );
             CREATE INDEX face_rejections_face_id ON face_rejections(face_id);
+            """)
+        }
+        // Whether a photo's dogs were detected upright, in its own table so
+        // the five face tables keep matching the catalog column for column.
+        // A photo with no row here was scanned before upright detection.
+        migrator.registerMigration("v2-upright-detection") { database in
+            try database.execute(sql: """
+            CREATE TABLE pet_photo_orientation (
+                path_key TEXT PRIMARY KEY
+                    REFERENCES face_photos(path_key) ON DELETE CASCADE,
+                camera_turns INTEGER NOT NULL,
+                checked_at TEXT NOT NULL
+            );
+            CREATE TABLE pet_index_state (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
             """)
         }
         return migrator
