@@ -95,8 +95,7 @@ public struct ImmichCatalogFile: Equatable, Sendable {
         let eventsByID = Dictionary(events.map { ($0.id, $0) }) { first, _ in first }
         return assignments.compactMap { assignment in
             guard let event = eventsByID[assignment.eventID],
-                  let url = locations.archiveURL(for: assignment, event: event),
-                  let relative = locations.nasRelativePath(url.path) else { return nil }
+                  let relative = locations.archiveRelativePath(for: assignment, event: event) else { return nil }
             let isPrivate = locations.resolvedPolicy(for: event) == .archiveOnly
             return ImmichCatalogFile(
                 eventAssetID: CatalogStore.eventAssetID(assignment),
