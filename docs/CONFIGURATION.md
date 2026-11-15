@@ -28,12 +28,12 @@ For exact capacity, add the TrueNAS HTTPS server URL and a read-only API key in 
 
 The sidebar then shows dataset free space, while its help text also identifies the underlying pool, pool free space, and health. No NAS address, dataset, username, or key is part of the repository defaults.
 
-## Immich policy
+## Immich
 
-Each event can be marked for storage only or for a future Immich upload. Album policy can be:
+`immichLibraryID` picks the external library that reads the NAS root; empty leaves Immich alone. `immichCarriesAlbumsAcrossRenames` keeps renamed files in their albums. Each event's album policy can be:
 
-- no album;
-- an album named after the event; or
-- a custom album name.
+- `none`
+- `event`
+- `custom`
 
-These settings describe intent only. The current app can test the server and check checksum presence, but it does not upload assets or create albums.
+Private events get no album unless opted in. See `IMMICH.md`.

@@ -18,7 +18,7 @@ New here? Press **Start Guided Setup** on the welcome screen, or **Guide** in th
 2. Select photos and press 1–3 for a recent event, drag them onto an event, or press N to make a new event. **Event…** searches every event by name.
 3. Mark an event **Private · NAS only** when it should never sit in the shared Buffer.
 4. Press **Apply**. Files already on the working drive move into their event folders instantly; files on a card are copied and verified.
-5. Open an event and use its storage strip: **Sync to NAS**, **Take Off Drive**, **Free Up Source**, and **Upload** to Immich.
+5. Open an event and use its storage strip: **Sync to NAS**, **Take Off Drive**, and **Free Up Source**. Immich reads the NAS on its own; the event shows what it has found.
 6. Edit the RAW files in Photomator straight from the event.
 
 ## What the app does
@@ -31,7 +31,7 @@ New here? Press **Start Guided Setup** on the welcome screen, or **Guide** in th
 - Shows, for every event, how many files are on the card or unsorted folder, on the drive, on the NAS, and in Immich, with one action for each.
 - Finds event folders that were already organized on the drive by hand and adds them as events without moving anything.
 - Journals every move so **Undo** can put files back.
-- Uploads event originals to Immich with a streamed multipart body, skips content Immich already has, and adds the uploads to an event or custom album.
+- Keeps a read-only Immich external library in step: asks it to scan after NAS changes, shows what it has per event, and can keep an album per event.
 - Builds thumbnails and large previews from the JPEG embedded in supported Sony `.ARW` files, including lossless-compressed RAW variants that Finder may not preview.
 - Opens a separate persistent Transfer Queue window with per-file bytes copied, speed, verification state, and clear disconnect failures.
 - Runs sequential storage speed tests inside the app: camera/card sources are read-only, while Buffer/library targets use a flushed, uncached, automatically removed temporary file.
@@ -113,7 +113,7 @@ Then add cards and unsorted folders from the Events sidebar with **Add Folder or
 5. Open the event. Choose **Shared Buffer** or **Private · NAS only**.
 6. **Sync to NAS** copies only what the NAS is missing, to the same paths as the drive, and re-reads every copy from the NAS to check its SHA-256; a different file already there is reported as a conflict, never overwritten. **Take Off Drive** only takes files whose NAS copy a sync verified, re-hashes them against the NAS and moves the drive copies to the drive's hidden `_Trash`.
 7. **Free Up Source** re-hashes card originals against their drive copies before removing them.
-8. Turn on **Send to Immich** and press **Upload** for events you want in Immich.
+8. In Settings, press **Test Connection** and choose your Immich external library.
 
 The layout is intentionally readable:
 
@@ -169,6 +169,6 @@ See [Safety](docs/SAFETY.md), [Configuration](docs/CONFIGURATION.md), and [Archi
 
 ## Project status
 
-Camera Toolkit is early-stage macOS software. The event organizer, local browsing, preview, verified-copy, archive, catalog, and Immich upload paths are implemented. Immich upload is covered by tests against a recording transport. App signing and notarization are not implemented.
+Camera Toolkit is early-stage macOS software. The event organizer, local browsing, preview, verified-copy, archive, catalog, and Immich library paths are implemented. App signing and notarization are not implemented.
 
 Contributions are welcome; start with [CONTRIBUTING.md](CONTRIBUTING.md). Camera Toolkit is available under the [MIT License](LICENSE).

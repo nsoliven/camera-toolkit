@@ -69,7 +69,6 @@ private struct EventLibraryView: View {
     @State private var rows: [EventAssetRow] = []
     @State private var immichStatuses: [String: ImmichCatalogStatus] = [:]
     @State private var isScanningLocations = false
-    @State private var isCheckingImmich = false
     @State private var statusText = "Choose an event to see every saved photo location."
     @State private var customAlbumName = ""
     @State private var activeRefreshID: UUID?
@@ -145,11 +144,11 @@ private struct EventLibraryView: View {
 
     @ToolbarContentBuilder
     private var toolbar: some ToolbarContent {
-        if isScanningLocations || isCheckingImmich {
+        if isScanningLocations {
             ToolbarItem {
                 ProgressView()
                     .controlSize(.small)
-                    .help(isCheckingImmich ? "Checking Immich…" : "Checking drives…")
+                    .help("Checking drives…")
             }
         }
         ToolbarItem {
@@ -158,15 +157,6 @@ private struct EventLibraryView: View {
             }
             .disabled(selectedEvent == nil)
             .help("Re-check every saved location of this event's photos")
-        }
-        ToolbarItem {
-            Button {
-                Task { await checkImmich() }
-            } label: {
-                Label(isCheckingImmich ? "Checking…" : "Check Immich", systemImage: "checkmark.icloud")
-            }
-            .disabled(isCheckingImmich || rows.isEmpty)
-            .help("Hash local files in bounded chunks and ask Immich whether that exact content already exists. No upload is performed.")
         }
         ToolbarItem {
             Button("SQL Inspector", systemImage: "cylinder.split.1x2") {
@@ -193,8 +183,8 @@ private struct EventLibraryView: View {
                             Text(row.event.eventDate.formatted(date: .abbreviated, time: .omitted))
                             Text("·")
                             Label(
-                                row.event.sendsToImmich ? "Immich" : "Storage only",
-                                systemImage: row.event.sendsToImmich ? "cloud" : "externaldrive"
+                                row.event.resolvedImmichAlbumPolicy == .none ? "No album" : "Album",
+                                systemImage: row.event.resolvedImmichAlbumPolicy == .none ? "externaldrive" : "rectangle.stack"
                             )
                         }
                         .font(.caption)
@@ -214,14 +204,6 @@ private struct EventLibraryView: View {
     private func eventControls(_ event: SavedCameraEvent) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 12) {
-                Toggle("Send to Immich", isOn: Binding(
-                    get: { selectedEvent?.sendsToImmich ?? false },
-                    set: { model.setEventImmichUploadEnabled(event.id, enabled: $0) }
-                ))
-                .toggleStyle(.switch)
-
-                Divider().frame(height: 24)
-
                 Picker("Album", selection: Binding(
                     get: { selectedEvent?.resolvedImmichAlbumPolicy ?? .none },
                     set: { model.setEventImmichAlbumPolicy(event.id, policy: $0) }
@@ -231,7 +213,7 @@ private struct EventLibraryView: View {
                     }
                 }
                 .frame(width: 210)
-                .disabled(!event.sendsToImmich)
+                .disabled(immichAlbumsLocked(event))
 
                 if event.resolvedImmichAlbumPolicy == .custom {
                     TextField("Album name", text: $customAlbumName)
@@ -241,7 +223,7 @@ private struct EventLibraryView: View {
                 }
 
                 Spacer()
-                Text("Routing preference only · uploads remain locked")
+                Text(immichAlbumsLocked(event) ? "Private: allow an album on the event page" : "Album fills on the next Immich check")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -299,7 +281,7 @@ private struct EventLibraryView: View {
             .width(110)
 
             TableColumn("Immich") { row in
-                immichPolicyMenu(row)
+                immichStatusLabel(row)
             }
             .width(min: 125, ideal: 150)
         }
@@ -354,34 +336,30 @@ private struct EventLibraryView: View {
         model.configuration.photoEventAssignments.lazy.filter { $0.eventID == eventID }.count
     }
 
-    private func effectiveImmichValue(for row: EventAssetRow) -> Bool {
-        row.assignment.immichUploadOverride ?? selectedEvent?.sendsToImmich ?? false
+    private func immichAlbumsLocked(_ event: SavedCameraEvent) -> Bool {
+        EventStorageLocations(configuration: model.configuration).resolvedPolicy(for: event) == .archiveOnly && !event.sendsToImmich
     }
 
     @ViewBuilder
-    private func immichPolicyMenu(_ row: EventAssetRow) -> some View {
-        let isIncluded = effectiveImmichValue(for: row)
-        Menu {
-            Button("Follow event setting") { model.setAssignmentImmichOverride(row.assignment, value: nil) }
-            Button("Include in Immich") { model.setAssignmentImmichOverride(row.assignment, value: true) }
-            Button("Storage only") { model.setAssignmentImmichOverride(row.assignment, value: false) }
-        } label: {
-            if !isIncluded {
-                Label("Storage only", systemImage: "externaldrive")
-                    .foregroundStyle(.secondary)
-            } else if let status = immichStatuses[row.id] {
-                Label(
-                    status.status == "present" ? (status.isTrashed ? "In trash" : "In Immich") : "Not in Immich",
-                    systemImage: status.status == "present" ? (status.isTrashed ? "trash" : "checkmark.circle.fill") : "circle.dashed"
-                )
-                .foregroundStyle(status.status == "present" ? Color.green : Color.orange)
+    private func immichStatusLabel(_ row: EventAssetRow) -> some View {
+        switch immichStatuses[row.id]?.presence {
+        case .present:
+            if immichStatuses[row.id]?.isTrashed == true {
+                Label("In Immich trash", systemImage: "trash").foregroundStyle(.orange)
             } else {
-                Label("Not checked", systemImage: "questionmark.circle")
-                    .foregroundStyle(.secondary)
+                Label("In Immich", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
             }
+        case .offline:
+            Label("Offline", systemImage: "exclamationmark.triangle").foregroundStyle(.orange)
+        case .pendingScan:
+            Label("Waiting for scan", systemImage: "clock").foregroundStyle(.secondary)
+        case .excluded:
+            Label("Not imported", systemImage: "minus.circle").foregroundStyle(.secondary)
+        case .notOnNAS:
+            Label("Not on NAS", systemImage: "circle.dashed").foregroundStyle(.secondary)
+        case nil:
+            Label("Not checked", systemImage: "questionmark.circle").foregroundStyle(.secondary)
         }
-        .menuStyle(.button)
-        .buttonStyle(.borderless)
     }
 
     @ViewBuilder
@@ -571,52 +549,6 @@ private struct EventLibraryView: View {
             case .archive: rows[index].archivePresence = state
             }
         }
-    }
-
-    @MainActor
-    private func checkImmich() async {
-        guard selectedEvent != nil else { return }
-        let candidates = rows.filter { effectiveImmichValue(for: $0) && $0.bestExistingURL != nil }
-        guard !candidates.isEmpty else {
-            statusText = "No Immich-included photos have a readable local copy to hash."
-            return
-        }
-        isCheckingImmich = true
-        statusText = "Hashing \(candidates.count) exact file\(candidates.count == 1 ? "" : "s") in 4 MB chunks…"
-        do {
-            let checks: [(String, String)] = try await Task.detached {
-                try candidates.map { row in
-                    guard let url = row.bestExistingURL else {
-                        throw ToolkitError.commandFailed("No local copy exists for \(row.name)")
-                    }
-                    return (row.id, try FileSHA1.hexDigest(of: url))
-                }
-            }.value
-            statusText = "Asking Immich whether those exact checksums already exist…"
-            let results = try await model.checkImmichPresence(
-                checks.map { ImmichChecksumQuery(id: $0.0, checksum: $0.1) }
-            )
-            let checksums = Dictionary(uniqueKeysWithValues: checks)
-            let statuses = results.map {
-                ImmichCatalogStatus(
-                    eventAssetID: $0.id,
-                    status: $0.isPresent ? "present" : "missing",
-                    immichAssetID: $0.assetID,
-                    checksumSHA1: checksums[$0.id],
-                    isTrashed: $0.isTrashed
-                )
-            }
-            let currentCatalogURL = catalogURL
-            try await Task.detached {
-                try CatalogInspector(url: currentCatalogURL).saveImmichStatuses(statuses)
-            }.value
-            immichStatuses.merge(Dictionary(uniqueKeysWithValues: statuses.map { ($0.eventAssetID, $0) })) { _, new in new }
-            let present = statuses.count(where: { $0.status == "present" })
-            statusText = "Immich check complete: \(present) present, \(statuses.count - present) not present. No files or albums were changed."
-        } catch {
-            statusText = "Immich check failed: \(error.localizedDescription)"
-        }
-        isCheckingImmich = false
     }
 
     nonisolated private static func resolveRows(

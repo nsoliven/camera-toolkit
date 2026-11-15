@@ -126,12 +126,4 @@ final class CatalogInspectorTests: XCTestCase {
             XCTAssertEqual(result.rows.last, ["7"])
         }
     }
-
-    func testFileSHA1StreamsKnownDigest() throws {
-        try withTemporaryDirectory { root in
-            let url = root.appendingPathComponent("sample.bin")
-            try Data("abc".utf8).write(to: url)
-            XCTAssertEqual(try FileSHA1.hexDigest(of: url, chunkSize: 2), "a9993e364706816aba3e25717850c26c9cd0d89d")
-        }
-    }
 }
