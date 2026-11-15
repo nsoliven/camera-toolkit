@@ -716,7 +716,7 @@ private struct UnsortedApplyBanner: View {
                     line(
                         symbol: "checkmark.shield",
                         text: CardClearWording.bannerLine(clear),
-                        button: clear.clearableFiles > 0 ? "Clear from Card…" : nil,
+                        button: clear.offersClear ? "Clear from Card…" : nil,
                         help: "Re-checks every copy first, then permanently deletes only matching files from the card. Asks you to confirm.",
                         prominent: false
                     ) {

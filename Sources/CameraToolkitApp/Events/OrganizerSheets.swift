@@ -304,6 +304,7 @@ struct ApplyPlanSheet: View {
             ApplySafetyFactsView(facts: ApplyPlanOverview.safetyFacts(
                 moveCount: overview.moveCount + decisions.keepBoth.count,
                 copyCount: overview.copyCount,
+                nasCount: overview.nasCount,
                 trashCount: decisions.trash.count
             ))
         } actions: {
@@ -394,18 +395,23 @@ struct RemovalConfirmSheet: View {
 struct CardClearConfirmSheet: View {
     let request: CardClearRequest
     let onCancel: () -> Void
-    let onConfirm: (String) -> Void
+    /// The typed token, and whether the owner chose the files whose only
+    /// other copy is on the NAS.
+    let onConfirm: (String, Bool) -> Void
 
     @State private var confirmation = ""
+    /// Off by default: clearing those leaves the NAS copy as the only one.
+    @State private var includeNASOnly = false
 
     static func isConfirmed(_ typed: String) -> Bool {
         typed == FreeUpService.confirmationToken
     }
 
     var body: some View {
+        let chosen = CardClearWording.chosenCount(request, includeNASOnly: includeNASOnly)
         SheetScaffold(
-            title: "Clear \(request.fileCount) file\(request.fileCount == 1 ? "" : "s") from \(request.locationName)?",
-            subtitle: "\(request.byteCount.formattedBytes) · permanently deleted from the card",
+            title: "Clear \(chosen.files) file\(chosen.files == 1 ? "" : "s") from \(request.locationName)?",
+            subtitle: "\(chosen.bytes.formattedBytes) · permanently deleted from the card",
             systemImage: "sdcard",
             iconTint: .red
         ) {
@@ -431,6 +437,17 @@ struct CardClearConfirmSheet: View {
                 }
             }
             .frame(maxHeight: 160)
+            if request.nasOnlyFiles > 0 {
+                VStack(alignment: .leading, spacing: 4) {
+                    Toggle(CardClearWording.nasOnlyToggle(request), isOn: $includeNASOnly)
+                        .toggleStyle(.checkbox)
+                    Text(CardClearWording.nasOnlyExplanation(request))
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.leading, 20)
+                }
+            }
             if let note = CardClearWording.skippedNote(request) {
                 Text(note)
                     .font(.callout)
@@ -457,9 +474,9 @@ struct CardClearConfirmSheet: View {
                 .keyboardShortcut(.cancelAction)
             // Deliberately not the default button: Return must never delete.
             Button("Verify and Clear from Card", role: .destructive) {
-                onConfirm(confirmation)
+                onConfirm(confirmation, includeNASOnly)
             }
-            .disabled(!Self.isConfirmed(confirmation))
+            .disabled(!Self.isConfirmed(confirmation) || chosen.files == 0)
         }
     }
 }

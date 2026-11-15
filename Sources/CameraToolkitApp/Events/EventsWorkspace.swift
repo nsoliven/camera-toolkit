@@ -132,13 +132,46 @@ struct OrganizeApplyPlan: Identifiable, Sendable {
         var files: [FileRecord]
     }
 
+    /// Files from one source folder that Apply copies straight into the
+    /// event's NAS folder because the event's drive is not connected
+    /// (`NASDirectApply`, the Sync to NAS engine).
+    struct NASBatch: Sendable {
+        var sourceRoot: String
+        /// The NAS folder they land in (`<event>/Originals/<Camera>`).
+        var destinationRoot: String
+        /// Relative to `sourceRoot`, for the plan's file lists.
+        var files: [FileRecord]
+        var targets: [NASDirectCopyFile]
+    }
+
     struct EventGroup: Identifiable, Sendable {
         var id: UUID { event.id }
         var event: SavedCameraEvent
         var moves: [DriveMove]
         var copies: [CopyBatch]
         var alreadyThere: Int
+        /// Files whose source is on a drive that is not connected.
         var unavailable: Int
+        /// Straight-to-NAS copies, when the event's drive is not connected
+        /// but the NAS is. `destinationFolder` is then the event's NAS folder.
+        var nasCopies: [NASBatch] = []
+        /// Files already verified in the event's NAS folder (sent there
+        /// straight from this source earlier): nothing to do, and never
+        /// copied back to the drive.
+        var alreadyOnNAS: Int = 0
+        /// Files that cannot go anywhere: the event's drive is not
+        /// connected, and neither is the NAS.
+        var waitingForDrive: Int = 0
+        /// Files Apply cannot place while the event's drive is away: gone
+        /// from their source, already inside the NAS, or without a usable
+        /// NAS path. Not waiting for anything; nothing is done with them.
+        var notPlannable: Int = 0
+        /// The event's drive by name ("Buffer"), for the plan's wording.
+        var driveName: String = ""
+        /// The volume that drive is on ("this Mac" for a folder on the Mac).
+        var driveVolume: String = ""
+        /// True when the event's drive was not connected while planning.
+        var driveIsOffline: Bool = false
         var destinationFolder: String
         /// The event's resolved private flag (subevents inherit it), for the
         /// chip lock in the plan sheet.
@@ -153,6 +186,8 @@ struct OrganizeApplyPlan: Identifiable, Sendable {
         var conflicts: [ApplyCollision] = []
 
         var copyFileCount: Int { copies.reduce(0) { $0 + $1.files.count } }
+        var nasCopyCount: Int { nasCopies.reduce(0) { $0 + $1.targets.count } }
+        var nasCopyBytes: Int64 { nasCopies.reduce(Int64(0)) { $0 + $1.targets.reduce(Int64(0)) { $0 + $1.byteCount } } }
         /// Files that cannot move because their name is taken by another file
         /// (sidecars held back with them are not counted).
         var nameConflictCount: Int { conflicts.count { $0.kind == .nameConflict } }
@@ -162,13 +197,23 @@ struct OrganizeApplyPlan: Identifiable, Sendable {
     var title: String
     var groups: [EventGroup]
     var pruneBoundaries: [URL]
+    /// Whether the NAS could take straight-to-NAS copies while planning.
+    var nasConnected = false
 
     var moveCount: Int { groups.reduce(0) { $0 + $1.moves.count } }
     var copyCount: Int { groups.reduce(0) { $0 + $1.copyFileCount } }
-    /// Files Apply will relocate — every move plus every verified copy.
-    var fileCount: Int { moveCount + copyCount }
+    /// Files copied straight to the NAS (their event's drive is offline).
+    var nasCopyCount: Int { groups.reduce(0) { $0 + $1.nasCopyCount } }
+    var nasCopyBytes: Int64 { groups.reduce(Int64(0)) { $0 + $1.nasCopyBytes } }
+    /// Files Apply will relocate — every move, every verified copy, and
+    /// every straight-to-NAS copy.
+    var fileCount: Int { moveCount + copyCount + nasCopyCount }
     var byteCount: Int64 { groups.reduce(Int64(0)) { $0 + $1.byteCount } }
-    var isEmpty: Bool { moveCount == 0 && copyCount == 0 }
+    var isEmpty: Bool { moveCount == 0 && copyCount == 0 && nasCopyCount == 0 }
+    var unavailableCount: Int { groups.reduce(0) { $0 + $1.unavailable } }
+    var waitingForDriveCount: Int { groups.reduce(0) { $0 + $1.waitingForDrive } }
+    var alreadyOnNASCount: Int { groups.reduce(0) { $0 + $1.alreadyOnNAS } }
+    var notPlannableCount: Int { groups.reduce(0) { $0 + $1.notPlannable } }
     var duplicateCount: Int { groups.reduce(0) { $0 + $1.duplicates.count } }
     var conflictCount: Int { groups.reduce(0) { $0 + $1.nameConflictCount } }
     var hasCollisions: Bool { groups.contains { !$0.duplicates.isEmpty || !$0.conflicts.isEmpty } }
@@ -688,6 +733,8 @@ final class EventsWorkspace {
     var immichIsChecking = false
     /// A scan request Immich has not accepted yet; survives a failed follow-up.
     @ObservationIgnored var immichScanOwed = false
+    /// Test seam: hears every `followNASChangeInImmich` call, configured or not.
+    @ObservationIgnored var nasChangeFollowObserver: (([NASRename]) -> Void)?
     @ObservationIgnored var immichFollowUp: Task<Void, Never>?
     var discoveredDriveEvents: [DiscoveredDriveEvent] = []
     /// Event folders in the NAS mirror whose files no assignment covers
@@ -695,6 +742,18 @@ final class EventsWorkspace {
     var discoveredNASEvents: [DiscoveredNASEvent] = []
     /// What the last NAS discovery left alone, and why.
     var nasDiscoveryProblems: [NASDiscoveryProblem] = []
+    /// The outcome of the last Add to Events from "Found on the NAS", shown
+    /// under the button while the section is still there — why nothing (or
+    /// not everything) was added. Nil before any click.
+    var nasAdoptNote: String?
+    /// Per scanned source root: sorted files Apply copied straight to the
+    /// NAS whose copy the background refresh did not check (source path key
+    /// → event). Neither applied nor waiting for Apply.
+    var nasUncheckedSourceEvents: [String: [String: UUID]] = [:]
+    /// Folders an Add to Events could not add anything from, with the
+    /// listing they had then: until that listing changes they are reported
+    /// as left out instead of being offered again.
+    @ObservationIgnored var nasAdoptRefusedFolders: [String: NASAdoptRefusal] = [:]
     @ObservationIgnored var nasDiscoveryTask: Task<Void, Never>?
     /// Per event board: which of its originals have edits under the
     /// family's `Edited/<Tag>` folders (`EditTagLinker`). Loaded off the
@@ -1987,18 +2046,25 @@ final class EventsWorkspace {
 
     /// Re-learns which sorted files of a scanned source are already in their
     /// event (`AppliedSourceCheck`, off the main actor; it stats the source
-    /// and drive copies only, never the NAS). The board calls it after a
-    /// scan, a sort, an Apply or a copy finishing, and a mount change. A
-    /// newer call supersedes an older one still running.
+    /// and drive copies only, and never touches the NAS share — a hung SMB
+    /// mount cannot pile up these refreshes). Files Apply copied straight to
+    /// the NAS are therefore never "applied" or "safe" here: they are listed
+    /// as copied earlier and not checked, and only Clear from Card (and its
+    /// job) lists the NAS to check them. The board calls it after a scan, a
+    /// sort, an Apply or a copy finishing, and a mount change. A newer call
+    /// supersedes an older one still running.
     func refreshAppliedSources(for locationID: UUID) async {
         guard let result = sources[locationID]?.result else { return }
         let generation = UUID()
         appliedRefreshGenerations[locationID] = generation
-        let plan = await cardClearPlan(for: locationID, result: result)
+        let plan = await cardClearPlan(for: locationID, result: result, probeNAS: false)
         guard appliedRefreshGenerations[locationID] == generation,
               sources[locationID]?.result?.rootPath == result.rootPath else { return }
         if appliedSourceEvents[result.rootPath] != plan.applied {
             appliedSourceEvents[result.rootPath] = plan.applied
+        }
+        if nasUncheckedSourceEvents[result.rootPath] != plan.nasUnchecked {
+            nasUncheckedSourceEvents[result.rootPath] = plan.nasUnchecked
         }
         let summary = CardClearSummary(plan)
         if cardClearSummaries[result.rootPath] != summary {
@@ -2009,11 +2075,12 @@ final class EventsWorkspace {
     /// A fresh `CardClearPlanner` pass for one scanned source, off the main
     /// actor: the applied answer for every sorted file, and which items are
     /// safe on the drive and verified on the NAS. Reads the catalog, the
-    /// card and the drive; never the NAS share.
-    func cardClearPlan(for locationID: UUID, result: OrganizeScanResult) async -> CardClearPlan {
+    /// card and the drive; the NAS share only with `probeNAS` (one listing
+    /// per folder of the files Apply sent straight there).
+    func cardClearPlan(for locationID: UUID, result: OrganizeScanResult, probeNAS: Bool = true) async -> CardClearPlan {
         let job = cardClearJobInputs(result: result)
         return await Task.detached(priority: .utility) {
-            job.plan(isCancelled: { Task.isCancelled })
+            job.plan(probeNAS: probeNAS, isCancelled: { Task.isCancelled })
         }.value
     }
 
@@ -2053,12 +2120,18 @@ final class EventsWorkspace {
         let plan = await cardClearPlan(for: locationID, result: result)
         guard sources[locationID]?.result?.rootPath == result.rootPath else { return }
         guard !plan.clearable.isEmpty else {
-            model.statusMessage = plan.waitingForNAS.isEmpty
+            model.statusMessage = plan.nasUncheckedFiles > 0
+                ? "\(plan.nasUncheckedFiles) file(s) were copied to the NAS earlier, but the NAS isn’t connected, so they can’t be checked. Nothing was removed."
+                : plan.waitingForNAS.isEmpty
                 ? "Nothing here is safe to clear yet. Apply, then Sync to NAS first."
                 : "\(plan.waitingFiles) file(s) are in their events but not verified on the NAS yet. Sync to NAS first — nothing was removed."
             return
         }
-        let byEvent = Dictionary(grouping: plan.clearable, by: \.eventID)
+        // Files whose only other copy is the NAS are offered separately and
+        // left out unless the owner chooses them in the sheet.
+        let nasOnlyItems = plan.clearable.filter { $0.files.contains(where: \.nasOnly) }
+        let driveItems = plan.clearable.filter { !$0.files.contains(where: \.nasOnly) }
+        let byEvent = Dictionary(grouping: driveItems, by: \.eventID)
             .map { eventID, items in
                 CardClearRequest.EventLine(
                     name: event(eventID).map { eventTitle($0) } ?? "An event",
@@ -2070,13 +2143,16 @@ final class EventsWorkspace {
         pendingCardClear = CardClearRequest(
             locationID: locationID,
             locationName: location.name,
-            itemIDs: Set(plan.clearable.map(\.id)),
-            fileCount: plan.clearableFiles,
-            byteCount: plan.clearableBytes,
+            itemIDs: Set(driveItems.map(\.id)),
+            fileCount: driveItems.reduce(0) { $0 + $1.files.count },
+            byteCount: driveItems.reduce(Int64(0)) { $0 + $1.byteCount },
             events: byEvent,
             waitingForNASFiles: plan.waitingFiles,
             driveName: plan.driveName,
-            nasReachable: VolumeInfo.isAvailable(locations.nasRoot, mountedVolumes: mountedVolumesProvider?() ?? VolumeInfo.mountedVolumePaths())
+            nasReachable: VolumeInfo.isAvailable(locations.nasRoot, mountedVolumes: mountedVolumesProvider?() ?? VolumeInfo.mountedVolumePaths()),
+            nasOnlyItemIDs: Set(nasOnlyItems.map(\.id)),
+            nasOnlyFiles: nasOnlyItems.reduce(0) { $0 + $1.files.count },
+            nasOnlyBytes: nasOnlyItems.reduce(Int64(0)) { $0 + $1.byteCount }
         )
     }
 
@@ -2085,8 +2161,13 @@ final class EventsWorkspace {
     /// clears only items the sheet listed that still qualify, each after its
     /// own final hash checks (`CardClearService`). Outside Undo — the sheet
     /// says so.
-    func confirmCardClear(_ request: CardClearRequest, confirmation: String) {
+    func confirmCardClear(_ request: CardClearRequest, confirmation: String, includeNASOnly: Bool = false) {
         pendingCardClear = nil
+        let request = Self.cardClearChoice(request, includeNASOnly: includeNASOnly)
+        guard request.fileCount > 0 else {
+            model.statusMessage = "Nothing was removed — no file was chosen to clear."
+            return
+        }
         guard confirmation == FreeUpService.confirmationToken else {
             model.statusMessage = "Nothing was removed — type \(FreeUpService.confirmationToken) to clear files from the card."
             return
@@ -2104,6 +2185,24 @@ final class EventsWorkspace {
                 self?.runCardClear(request, confirmation: confirmation, jobID: jobID)
             }
         }
+    }
+
+    /// The request the job runs: only the drive + NAS items, or also the
+    /// NAS-only ones the owner turned on in the sheet.
+    nonisolated static func cardClearChoice(_ request: CardClearRequest, includeNASOnly: Bool) -> CardClearRequest {
+        // `itemIDs` stays the items confirmed with a drive copy;
+        // `nasOnlyItemIDs` is only what the owner opted in as NAS-only. The
+        // job keeps the two apart (`CardClearRequest.jobItems`).
+        var chosen = request
+        let counts = CardClearWording.chosenCount(request, includeNASOnly: includeNASOnly)
+        chosen.fileCount = counts.files
+        chosen.byteCount = counts.bytes
+        if !includeNASOnly {
+            chosen.nasOnlyItemIDs = []
+            chosen.nasOnlyFiles = 0
+            chosen.nasOnlyBytes = 0
+        }
+        return chosen
     }
 
     private func runCardClear(_ request: CardClearRequest, confirmation: String, jobID: UUID) {
@@ -2125,7 +2224,11 @@ final class EventsWorkspace {
             jobID: jobID,
             operation: { progress in
                 let plan = job.plan(isCancelled: { false })
-                let items = plan.clearable.filter { itemIDs.contains($0.id) }
+                // Strictly what the sheet chose: a NAS-only item only if it
+                // was opted in as NAS-only; one that lost its drive copy
+                // since the sheet stays on the card.
+                let chosen = CardClearRequest.jobItems(plan.clearable, request: request)
+                let items = chosen.items
                 let nasReachable = VolumeInfo.isAvailable(nasRoot, mountedVolumes: mountedProvider?() ?? VolumeInfo.mountedVolumePaths())
                 let driveName = plan.driveName ?? request.driveName
                 recorder?.setTotals(files: items.reduce(0) { $0 + $1.files.count }, bytes: items.reduce(0) { $0 + $1.byteCount })
@@ -2166,8 +2269,12 @@ final class EventsWorkspace {
                 recorder?.notePhases(report.phases)
                 report.checks.driveName = driveName
                 recorder?.noteCardClearChecks(report.checks)
-                let dropped = itemIDs.subtracting(Set(items.map(\.id))).count
-                return CardClearOutcome(report: report, noLongerEligible: dropped)
+                let dropped = itemIDs.subtracting(Set(items.map(\.id))).subtracting(chosen.driveCopyGone.map(\.id)).count
+                return CardClearOutcome(
+                    report: report,
+                    noLongerEligible: dropped,
+                    driveCopyGoneFiles: chosen.driveCopyGone.reduce(0) { $0 + $1.files.count }
+                )
             },
             completion: { [weak self] outcome in
                 guard let self else { return "" }
@@ -2750,12 +2857,16 @@ final class EventsWorkspace {
     func sortedFiles(in result: OrganizeScanResult) -> (files: Int, bytes: Int64) {
         let duplicates = applyDuplicateSourceKeys.values.reduce(into: Set<String>()) { $0.formUnion($1) }
         let applied = appliedSourceEvents[result.rootPath] ?? [:]
+        // Copied straight to the NAS earlier, not checked now: not waiting
+        // for Apply either (Apply has nothing to do for them).
+        let unchecked = nasUncheckedSourceEvents[result.rootPath] ?? [:]
         var files = 0
         var bytes: Int64 = 0
         for item in result.items {
             for file in item.files {
                 guard let assignment = assignment(for: file), !duplicates.contains(file.pathKey),
-                      applied[file.pathKey] != assignment.eventID else { continue }
+                      applied[file.pathKey] != assignment.eventID,
+                      unchecked[file.pathKey] != assignment.eventID else { continue }
                 files += 1
                 bytes += file.size
             }
@@ -4190,18 +4301,33 @@ final class EventsWorkspace {
         discoverNASEvents()
     }
 
+    /// Add to Events for "Found on Your Drive". A catalog write only, so it
+    /// runs at once; every click ends in a status line that says what was
+    /// added, or why nothing was.
     func adoptDiscoveredDriveEvents() {
         let found = discoveredDriveEvents
-        guard !found.isEmpty else { return }
+        guard !found.isEmpty else {
+            model.statusMessage = "Nothing was added: no drive folder is waiting to be added any more. The drive is listed again now."
+            discoverDriveEvents()
+            return
+        }
         var summary = (createdEvents: 0, addedAssignments: 0)
         model.updateConfiguration { configuration in
             summary = DriveEventDiscovery.adopt(found, into: &configuration)
         }
         discoveredDriveEvents = []
-        // The NAS list may name the same files; it is read again against
-        // the new assignments.
-        discoverNASEvents()
-        model.statusMessage = "Added \(summary.createdEvents) event(s) and \(summary.addedAssignments) file(s) already organized on the drive. No files moved."
+        // Both lists are read again against the new assignments: the NAS
+        // list may name the same files, and a folder that added nothing
+        // must not come back looking addable without a word.
+        discoverDriveEvents()
+        model.statusMessage = Self.driveAdoptionSummaryLine(createdEvents: summary.createdEvents, addedAssignments: summary.addedAssignments)
+    }
+
+    nonisolated static func driveAdoptionSummaryLine(createdEvents: Int, addedAssignments: Int) -> String {
+        guard createdEvents > 0 || addedAssignments > 0 else {
+            return "Nothing was added: those drive folders are already events and their files are already listed. No files moved."
+        }
+        return "Added \(createdEvents) event(s) and \(addedAssignments) file(s) already organized on the drive. No files moved."
     }
 
     // MARK: - Presence
@@ -4948,10 +5074,7 @@ final class EventsWorkspace {
             guard let self else { return }
             noteApplyCollisions(plan, events: events.map(\.id))
             if plan.isEmpty && !plan.hasCollisions {
-                let unavailable = plan.groups.reduce(0) { $0 + $1.unavailable }
-                model.statusMessage = unavailable > 0
-                    ? "\(unavailable) file(s) are on a disconnected drive. Connect it and try again."
-                    : "Nothing to move. Every sorted file is already where its event keeps it."
+                model.statusMessage = ApplyPlanOverview.emptyPlanMessage(plan)
                 return
             }
             model.statusMessage = plan.isEmpty
@@ -4984,25 +5107,77 @@ final class EventsWorkspace {
         onlyUnder root: String?,
         title: String,
         unsortedRoots: [URL],
-        pauseGate: DriveActivityGate? = nil
+        pauseGate: DriveActivityGate? = nil,
+        /// Whether the NAS can take straight-to-NAS copies; nil checks it.
+        nasAvailable: Bool? = nil
     ) -> OrganizeApplyPlan {
         let mounted = VolumeInfo.mountedVolumePaths()
         let rootPrefix = root.map { EventStorageLocations.pathKey($0) + "/" }
         var sameVolumeCache: [String: Bool] = [:]
         var groups: [OrganizeApplyPlan.EventGroup] = []
+        let nasUsable = nasAvailable ?? NASDirectApply.isNASUsable(locations)
+        let catalogPath = NSString(string: configuration.catalogDatabasePath).expandingTildeInPath
+        let catalogURL = catalogPath.isEmpty ? nil : URL(fileURLWithPath: catalogPath)
 
         for event in events {
             let policy = locations.resolvedPolicy(for: event)
             let driveRoot = locations.driveRoot(for: policy)
+            let driveIsOffline = !VolumeInfo.isAvailable(driveRoot, mountedVolumes: mounted)
             let assignments = configuration.photoEventAssignments.filter { $0.eventID == event.id }
             guard let summary = EventPresenceScanner.scan(event: event, assignments: assignments, locations: locations, mountedVolumes: mounted, pauseGate: pauseGate) else { continue }
             var candidates: [ApplyMoveCandidate] = []
             var copies: [String: OrganizeApplyPlan.CopyBatch] = [:]
+            var nasBatches: [String: OrganizeApplyPlan.NASBatch] = [:]
             var destinationRoots: [String: String] = [:]
             var standardizedSourceRoots: [String: String] = [:]
             var alreadyThere = 0
             var unavailable = 0
+            var alreadyOnNAS = 0
+            var waitingForDrive = 0
+            var notPlannable = 0
             var copyBytes: Int64 = 0
+            var nasBytes: Int64 = 0
+
+            func inScope(_ asset: EventAssetPresence) -> Bool {
+                guard let rootPrefix else { return true }
+                return asset.sourcePath.map { $0.lowercased().hasPrefix(rootPrefix) } ?? false
+            }
+            func isSeparateSource(_ asset: EventAssetPresence) -> Bool {
+                asset.source == .present && !asset.sourceIsDriveCopy && asset.sourcePath != nil
+                    && !(asset.sourcePath.map(CameraSupportFiles.isCameraGenerated) ?? false)
+            }
+            // A sorted file whose event's drive copy is not there may already
+            // be verified in the event's NAS folder — sent there straight
+            // from this source while the drive was away. Such a file is in
+            // its event: it is never copied again, to the NAS or back to
+            // the drive. One catalog read per event.
+            var mirrors: [String: String] = [:]
+            var nasCandidates: [(sourcePath: String, mirrorPath: String, byteCount: Int64)] = []
+            for asset in summary.assets where asset.drive != .present && inScope(asset) && isSeparateSource(asset) {
+                guard let source = asset.sourcePath,
+                      let mirror = NASDirectApply.mirrorPath(for: asset.assignment, event: event, locations: locations) else { continue }
+                mirrors[asset.id] = mirror
+                nasCandidates.append((source, mirror, asset.assignment.fileSize))
+            }
+            // With the NAS here, its copy must still be there at its size (one
+            // listing per folder); with the NAS away the record is all there
+            // is — enough not to copy the file again, never enough to clear.
+            let vouched = nasCandidates.isEmpty ? Set<String>() : NASDirectApply.vouchedSources(
+                nasCandidates,
+                records: NASDirectApply.records(catalogURL: catalogURL, nasRoot: locations.nasRoot.path, mirrorPaths: nasCandidates.map(\.mirrorPath)),
+                presentOnNAS: nasUsable
+                    ? NASDirectApply.presentOnNAS(nasCandidates.map { ($0.mirrorPath, $0.byteCount) }, nasRoot: locations.nasRoot.path)
+                    : nil
+            )
+            let nasPrefix = locations.nasRoot.standardizedFileURL.path + "/"
+            func sourceRoot(of asset: EventAssetPresence) -> String {
+                standardizedSourceRoots[asset.assignment.sourceRootPath] ?? {
+                    let built = URL(fileURLWithPath: NSString(string: asset.assignment.sourceRootPath).expandingTildeInPath, isDirectory: true)
+                        .standardizedFileURL.path
+                    standardizedSourceRoots[asset.assignment.sourceRootPath] = built
+                    return built
+                }()
+            }
 
             func isSameVolume(_ path: String) -> Bool {
                 let folder = (path as NSString).deletingLastPathComponent
@@ -5045,7 +5220,49 @@ final class EventsWorkspace {
                     }
                     continue
                 case .unavailable:
-                    unavailable += 1
+                    // The event's drive is not connected. A file still at a
+                    // separate source goes straight to the event's NAS
+                    // folder when the NAS is here; otherwise it waits for
+                    // the drive — said as such, never as "on a disconnected
+                    // drive" when it is the destination that is missing.
+                    if isSeparateSource(asset), let sourcePath = asset.sourcePath {
+                        if vouched.contains(EventStorageLocations.pathKey(sourcePath)) {
+                            alreadyOnNAS += 1
+                        } else if sourcePath.hasPrefix(nasPrefix) {
+                            // A folder on the NAS itself is not copied onto
+                            // the NAS; it waits for the drive.
+                            notPlannable += 1
+                        } else if nasUsable, let mirror = mirrors[asset.id] {
+                            let root = sourceRoot(of: asset)
+                            let device = asset.assignment.deviceID ?? ""
+                            let key = root + "\u{0}" + device
+                            var batch = nasBatches[key] ?? OrganizeApplyPlan.NASBatch(
+                                sourceRoot: root,
+                                destinationRoot: locations.nasOriginalsRoot(for: event, deviceID: asset.assignment.deviceID).path,
+                                files: [],
+                                targets: []
+                            )
+                            batch.files.append(FileRecord(path: asset.assignment.relativePath, size: size, modifiedAt: asset.assignment.modifiedAt))
+                            batch.targets.append(NASDirectCopyFile(sourcePath: sourcePath, relativePath: mirror, byteCount: size, eventID: event.id))
+                            nasBatches[key] = batch
+                            nasBytes += size
+                        } else if nasUsable {
+                            // The NAS is here but the file has no usable
+                            // NAS path.
+                            notPlannable += 1
+                        } else {
+                            waitingForDrive += 1
+                        }
+                    } else if asset.sourceIsDriveCopy {
+                        // Already kept in the event on that drive: nothing
+                        // for Apply to do, whether or not it is plugged in.
+                    } else if asset.source == .unavailable {
+                        unavailable += 1
+                    } else if !sourceIsCameraSupport, asset.source != .present {
+                        // Gone from its source, with no drive copy to see:
+                        // nothing to wait for.
+                        notPlannable += 1
+                    }
                     continue
                 default:
                     break
@@ -5067,6 +5284,10 @@ final class EventsWorkspace {
                         move: DriveMove(sourcePath: sourcePath, destinationPath: drivePath, byteCount: size),
                         assignment: asset.assignment
                     ))
+                } else if vouched.contains(EventStorageLocations.pathKey(sourcePath)) {
+                    // Already verified in the event's NAS folder: the drive
+                    // came back, but the file is not copied back to it.
+                    alreadyOnNAS += 1
                 } else {
                     // Both roots depend only on the event/device/root
                     // string — standardizing per file paid realpath for
@@ -5076,12 +5297,7 @@ final class EventsWorkspace {
                         destinationRoots[asset.assignment.deviceID ?? ""] = built
                         return built
                     }()
-                    let sourceRoot = standardizedSourceRoots[asset.assignment.sourceRootPath] ?? {
-                        let built = URL(fileURLWithPath: NSString(string: asset.assignment.sourceRootPath).expandingTildeInPath, isDirectory: true)
-                            .standardizedFileURL.path
-                        standardizedSourceRoots[asset.assignment.sourceRootPath] = built
-                        return built
-                    }()
+                    let sourceRoot = sourceRoot(of: asset)
                     let key = sourceRoot + "\u{0}" + destinationRoot
                     copies[key, default: OrganizeApplyPlan.CopyBatch(
                         sourceRoot: sourceRoot,
@@ -5102,29 +5318,46 @@ final class EventsWorkspace {
             // never reaches the rename job, so Apply cannot silently no-op.
             let partition = ApplyCollisionCheck.partition(candidates)
             let moves = partition.clear.map(\.move)
-            let bytes = copyBytes + moves.reduce(Int64(0)) { $0 + $1.byteCount }
+            let bytes = copyBytes + nasBytes + moves.reduce(Int64(0)) { $0 + $1.byteCount }
 
-            guard !moves.isEmpty || !copies.isEmpty || unavailable > 0
+            guard !moves.isEmpty || !copies.isEmpty || unavailable > 0 || !nasBatches.isEmpty
+                || alreadyOnNAS > 0 || waitingForDrive > 0 || notPlannable > 0
                 || !partition.duplicates.isEmpty || !partition.conflicts.isEmpty else { continue }
-            groups.append(OrganizeApplyPlan.EventGroup(
+            var group = OrganizeApplyPlan.EventGroup(
                 event: event,
                 moves: moves,
                 copies: copies.values.sorted { $0.sourceRoot < $1.sourceRoot },
                 alreadyThere: alreadyThere,
                 unavailable: unavailable,
-                destinationFolder: locations.eventFolder(for: event, policy: policy).path,
+                // Straight-to-NAS files land in the event's NAS folder.
+                destinationFolder: nasBatches.isEmpty || !moves.isEmpty || !copies.isEmpty
+                    ? locations.eventFolder(for: event, policy: policy).path
+                    : locations.nasEventFolder(for: event).path,
                 isPrivate: policy == .archiveOnly,
                 byteCount: bytes,
                 duplicates: partition.duplicates,
                 conflicts: partition.conflicts
-            ))
+            )
+            group.nasCopies = nasBatches.values.sorted { $0.sourceRoot < $1.sourceRoot }
+            for index in group.nasCopies.indices {
+                group.nasCopies[index].files.sort { $0.path < $1.path }
+            }
+            group.alreadyOnNAS = alreadyOnNAS
+            group.waitingForDrive = waitingForDrive
+            group.notPlannable = notPlannable
+            group.driveIsOffline = driveIsOffline
+            group.driveName = ApplyPlanOverview.driveRoleName(policy: policy, driveRoot: driveRoot.path)
+            group.driveVolume = ApplyPathLabel.driveName(for: driveRoot.path)
+            groups.append(group)
         }
 
-        return OrganizeApplyPlan(
+        var plan = OrganizeApplyPlan(
             title: title,
             groups: groups.sorted { $0.event.eventDate < $1.event.eventDate },
             pruneBoundaries: unsortedRoots + [locations.bufferRoot, locations.privateStagingRoot]
         )
+        plan.nasConnected = nasUsable
+        return plan
     }
 
     func performApply(_ plan: OrganizeApplyPlan) {
@@ -5207,6 +5440,7 @@ final class EventsWorkspace {
             model.statusMessage = "Copying \(plan.copyCount) file(s) with checksum verification. Originals stay on the card."
                 + (ApplyStatusWording.collisionNote(for: plan).map { " " + $0 } ?? "")
         }
+        startNASDirectApply(plan)
     }
 
     // MARK: - Apply collisions (identical copies and taken names)
@@ -5285,7 +5519,7 @@ final class EventsWorkspace {
         let trash = decisions.trash
         guard !keep.isEmpty else {
             if plan.moveCount == 0 {
-                if plan.copyCount > 0 { performApply(plan) }
+                if plan.copyCount > 0 || plan.nasCopyCount > 0 { performApply(plan) }
                 if !trash.isEmpty { requestTrashApplyDuplicates(trash) }
                 pendingApplyPlan = nil
                 return
@@ -5362,6 +5596,7 @@ final class EventsWorkspace {
         }
         if jobID != nil {
             enqueueCopies(plan)
+            startNASDirectApply(plan)
         }
     }
 
