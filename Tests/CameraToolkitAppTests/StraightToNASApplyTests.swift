@@ -89,6 +89,59 @@ final class StraightToNASApplyTests: XCTestCase {
         }
     }
 
+    /// Apply from an event's board (no source folder given) with the Buffer
+    /// unplugged copies straight to the NAS too, and the card board stops
+    /// counting those files as waiting for Apply.
+    func testApplyFromTheEventBoardGoesStraightToTheNASWhenTheBufferIsAway() async throws {
+        try await withSandbox(createNAS: true) { root, model, workspace in
+            let (card, events) = try sortCard(root: root, model: model, workspace: workspace)
+            let location = ConfiguredLocation(role: .importSource, name: "Card", path: card.path, deviceID: "sony-a7v")
+            model.updateConfiguration { $0.configuredLocations.append(location) }
+            workspace.scan(location)
+            try await waitUntil { workspace.sources[location.id]?.result != nil }
+            let result = try XCTUnwrap(workspace.sources[location.id]?.result)
+            await workspace.refreshAppliedSources(for: location.id)
+            XCTAssertEqual(workspace.sortedFiles(in: result).files, 3, "waiting for Apply before")
+            let cardBefore = try tree(card)
+
+            // The event board's Apply: every file of the events, no folder.
+            workspace.prepareApply(eventIDs: events.map(\.id), title: "Apply Beach Day")
+            try await waitUntil { workspace.pendingApplyPlan != nil }
+            let plan = try XCTUnwrap(workspace.pendingApplyPlan)
+            XCTAssertEqual(plan.nasCopyCount, 3)
+            XCTAssertEqual(plan.moveCount + plan.copyCount, 0)
+            XCTAssertTrue(ApplyPlanOverview(plan: plan).sentence.contains("straight to the NAS"))
+
+            workspace.performApply(plan)
+            try await waitUntil { model.jobs.contains { $0.action == .syncBuffer && $0.state != .running && $0.state != .queued } }
+            try await waitUntil { !model.isBusy }
+            let job = try XCTUnwrap(model.jobs.first { $0.action == .syncBuffer })
+            XCTAssertEqual(job.state, .done, job.note)
+
+            for row in model.configuration.photoEventAssignments {
+                let event = try XCTUnwrap(workspace.event(row.eventID))
+                let nasCopy = try XCTUnwrap(workspace.locations.archiveURL(for: row, event: event))
+                XCTAssertTrue(nasCopy.path.hasPrefix(workspace.locations.nasEventFolder(for: event).path + "/"))
+                XCTAssertTrue(FileManager.default.fileExists(atPath: nasCopy.path), nasCopy.path)
+            }
+            XCTAssertEqual(try tree(card), cardBefore)
+
+            // The card board no longer pushes Apply for them, and never calls
+            // them safe without the NAS being checked.
+            await workspace.refreshAppliedSources(for: location.id)
+            XCTAssertEqual(workspace.sortedFiles(in: result).files, 0)
+            let summary = try XCTUnwrap(workspace.cardClearSummaries[result.rootPath])
+            XCTAssertEqual(summary.nasUncheckedFiles, 3)
+            XCTAssertFalse(CardClearWording.bannerLine(summary).contains("safe"))
+            // Clear from Card checks the NAS and offers them only as NAS-only.
+            await workspace.requestClearFromCard(location.id)
+            let request = try XCTUnwrap(workspace.pendingCardClear)
+            XCTAssertEqual(request.fileCount, 0)
+            XCTAssertEqual(request.nasOnlyFiles, 3)
+            workspace.pendingCardClear = nil
+        }
+    }
+
     func testWithNeitherTheDriveNorTheNASTheMessageNamesTheMissingDrive() async throws {
         try await withSandbox(createNAS: false) { root, model, workspace in
             let (card, events) = try sortCard(root: root, model: model, workspace: workspace)
