@@ -311,9 +311,15 @@ public struct EventStorageLocations: Sendable {
     /// The assignment's NAS copy in the mirror layout: the drive's
     /// `Originals/<Camera>/<relative path>` under the NAS root.
     public func archiveURL(for assignment: PhotoEventAssignment, event: SavedCameraEvent) -> URL? {
-        guard let relative = try? layout(for: event, deviceID: assignment.deviceID)
-            .mirrorRelativePath(for: assignment.relativePath) else { return nil }
-        return nasRoot.appendingPathComponent(relative).standardizedFileURL
+        archiveRelativePath(for: assignment, event: event)
+            .map { nasRoot.appendingPathComponent($0).standardizedFileURL }
+    }
+
+    /// The assignment's NAS copy relative to the NAS root. Unlike
+    /// `archiveURL` this asks the share nothing, so a sweep of the whole
+    /// catalog stays off the network.
+    public func archiveRelativePath(for assignment: PhotoEventAssignment, event: SavedCameraEvent) -> String? {
+        try? layout(for: event, deviceID: assignment.deviceID).mirrorRelativePath(for: assignment.relativePath)
     }
 
     /// Where the legacy archive layout kept the assignment's NAS copy

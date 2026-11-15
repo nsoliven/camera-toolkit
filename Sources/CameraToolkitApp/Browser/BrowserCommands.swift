@@ -67,7 +67,7 @@ enum CameraToolkitShortcutCatalog {
                 .init(action: "New event", keys: "N", detail: "Creates an event and assigns the selected stacks to it."),
                 .init(action: "Rotate selected frames", keys: "[  ]", detail: "Rotates the selection 90° left or right; R and ⇧R also work."),
                 .init(action: "Undo", keys: "⌘Z", detail: "Takes back the newest action — a sort, a move, an Apply, a Trash, a merge, an event rename, a face change. Edit ▸ Undo names it. Files that moved are renamed back and nothing is ever replaced."),
-                .init(action: "Redo", keys: "⇧⌘Z", detail: "Does the action you just undid again. Remove from Source, Empty Trash, Sync to NAS, Immich upload and Settings are not in the history."),
+                .init(action: "Redo", keys: "⇧⌘Z", detail: "Does the action you just undid again. Remove from Source, Empty Trash, Sync to NAS and Settings are not in the history."),
                 .init(action: "Open in Photomator", keys: "⌘O", detail: "Opens the selected files in Photomator, or the default app when it is not installed. Osmo 360 clips open in DJI Studio when it is installed."),
                 .init(action: "Reveal in Finder", keys: "⇧⌘R", detail: "Shows the selected files in Finder."),
                 .init(action: "Move to Trash", keys: "⌘Delete", detail: "Confirms, then moves the selected files to macOS Trash. Camera originals and configured locations stay protected."),

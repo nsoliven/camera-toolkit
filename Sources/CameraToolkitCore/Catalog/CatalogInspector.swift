@@ -268,6 +268,13 @@ public struct CatalogInspector: Sendable {
         }
     }
 
+    /// Every assignment row the catalog holds.
+    public func eventAssetIDs() throws -> Set<String> {
+        try read { database in
+            Set(try String.fetchAll(database, sql: "SELECT id FROM event_assets"))
+        }
+    }
+
     public func saveImmichStatuses(_ statuses: [ImmichCatalogStatus]) throws {
         guard !statuses.isEmpty else { return }
         let queue = try CatalogDatabase.writer(for: url)

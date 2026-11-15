@@ -401,7 +401,7 @@ struct SetupGuidePanel: View {
             GuideBullet(symbol: "sdcard", text: "Card / Unsorted: photos still on the card or in the unsorted folder. Free Up Source clears them after checking the drive copies.")
             GuideBullet(symbol: "externaldrive.fill", text: "Shared Buffer or Private: the switch at the top of the event picks which. Put on Buffer or Move to Private does the move.")
             GuideBullet(symbol: "server.rack", text: "NAS: Sync to NAS makes the permanent copy and verifies it. Take Off Drive then frees the drive after re-checking every file.")
-            GuideBullet(symbol: "cloud.fill", text: "Immich: turn on Send, then press Upload.")
+            GuideBullet(symbol: "cloud.fill", text: "Immich: reads the NAS on its own. The event shows how many photos it has found, and you can keep an album per event.")
         }
     }
 
@@ -437,7 +437,7 @@ struct PlacesExplainer: View {
             GuideBullet(symbol: "sdcard", text: "Card or unsorted folder: where photos start.")
             GuideBullet(symbol: "externaldrive.fill", text: "Your travel drive: each event gets a folder in the shared Buffer, or in a hidden private folder.")
             GuideBullet(symbol: "server.rack", text: "NAS: the permanent, checked copy.")
-            GuideBullet(symbol: "cloud.fill", text: "Immich: optional, for events you want to share.")
+            GuideBullet(symbol: "cloud.fill", text: "Immich: optional. It reads your NAS library; the app only tells it to look again.")
         }
     }
 }

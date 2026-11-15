@@ -15,7 +15,7 @@ import Foundation
 //
 // Deliberately outside the history, and said so where they are confirmed:
 // Remove from Source, Take Off Drive (its copies wait in Trash), Empty
-// Trash, Sync to NAS, Immich upload, and Settings.
+// Trash, Sync to NAS, and Settings.
 
 /// What is deliberately outside Undo (⌘Z), in the words the confirmations use.
 enum UndoScopeWording {
@@ -23,7 +23,6 @@ enum UndoScopeWording {
     static let takeOffDrive = "This is not part of Undo (⌘Z). The drive copies wait in _Trash, so restore them from the Trash window."
     static let emptyTrash = "Empty Trash is not part of Undo (⌘Z) — deleted files cannot be brought back."
     static let syncToNAS = "Sync to NAS is not part of Undo (⌘Z): it only adds verified copies, and nothing on the NAS is overwritten or removed."
-    static let immichUpload = "Uploading is not part of Undo (⌘Z). Remove the uploads in Immich if you change your mind."
     static let settings = "Changes here are not part of Undo (⌘Z)."
 }
 

@@ -2,8 +2,7 @@ import CameraToolkitCore
 import Foundation
 
 extension DashboardModel {
-    /// Like `runBackgroundJob`, for work that awaits network calls such as
-    /// Immich uploads. It shares the single-job gate, job list, and activity log.
+    /// Like `runBackgroundJob`, for work that awaits network calls. It shares the single-job gate, job list, and activity log.
     func runAsyncJob<Result: Sendable>(
         action: JobAction,
         runningNote: String,

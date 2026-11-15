@@ -42,6 +42,12 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
     public var selectedBufferID: UUID?
     public var activityLogPath: String
     public var immichServerURL: String
+    /// The Immich external library that reads the NAS root. Empty: the app
+    /// leaves Immich alone.
+    public var immichLibraryID: String
+    /// After a NAS rename, add the renamed file's new Immich asset to the
+    /// albums the old one was in.
+    public var immichCarriesAlbumsAcrossRenames: Bool
     public var trueNASServerURL: String
     public var trueNASUsername: String
     public var trueNASDataset: String
@@ -86,6 +92,8 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         selectedBufferID: UUID? = nil,
         activityLogPath: String,
         immichServerURL: String = "",
+        immichLibraryID: String = "",
+        immichCarriesAlbumsAcrossRenames: Bool = false,
         trueNASServerURL: String = "",
         trueNASUsername: String = "",
         trueNASDataset: String = "",
@@ -121,6 +129,8 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         self.selectedBufferID = selectedBufferID
         self.activityLogPath = activityLogPath
         self.immichServerURL = immichServerURL
+        self.immichLibraryID = immichLibraryID
+        self.immichCarriesAlbumsAcrossRenames = immichCarriesAlbumsAcrossRenames
         self.trueNASServerURL = trueNASServerURL
         self.trueNASUsername = trueNASUsername
         self.trueNASDataset = trueNASDataset
@@ -160,6 +170,8 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         case selectedBufferID
         case activityLogPath
         case immichServerURL
+        case immichLibraryID
+        case immichCarriesAlbumsAcrossRenames
         case trueNASServerURL
         case trueNASUsername
         case trueNASDataset
@@ -206,6 +218,8 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         try values.encodeIfPresent(selectedBufferID, forKey: .selectedBufferID)
         try values.encode(activityLogPath, forKey: .activityLogPath)
         try values.encode(immichServerURL, forKey: .immichServerURL)
+        try values.encode(immichLibraryID, forKey: .immichLibraryID)
+        try values.encode(immichCarriesAlbumsAcrossRenames, forKey: .immichCarriesAlbumsAcrossRenames)
         try values.encode(trueNASServerURL, forKey: .trueNASServerURL)
         try values.encode(trueNASUsername, forKey: .trueNASUsername)
         try values.encode(trueNASDataset, forKey: .trueNASDataset)
@@ -257,6 +271,8 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         selectedBufferID = try values.decodeIfPresent(UUID.self, forKey: .selectedBufferID)
         activityLogPath = try values.decodeIfPresent(String.self, forKey: .activityLogPath) ?? defaults.activityLogPath
         immichServerURL = try values.decodeIfPresent(String.self, forKey: .immichServerURL) ?? defaults.immichServerURL
+        immichLibraryID = try values.decodeIfPresent(String.self, forKey: .immichLibraryID) ?? defaults.immichLibraryID
+        immichCarriesAlbumsAcrossRenames = try values.decodeIfPresent(Bool.self, forKey: .immichCarriesAlbumsAcrossRenames) ?? defaults.immichCarriesAlbumsAcrossRenames
         trueNASServerURL = try values.decodeIfPresent(String.self, forKey: .trueNASServerURL) ?? defaults.trueNASServerURL
         trueNASUsername = try values.decodeIfPresent(String.self, forKey: .trueNASUsername) ?? defaults.trueNASUsername
         trueNASDataset = try values.decodeIfPresent(String.self, forKey: .trueNASDataset) ?? defaults.trueNASDataset
@@ -605,7 +621,8 @@ public struct SavedCameraEvent: Identifiable, Codable, Equatable, Hashable, Send
     public var eventDate: Date
     public var createdAt: Date
     public var lastUsedAt: Date
-    /// `nil` is the migration-safe default for events created before Immich routing existed.
+    /// For a private event: `true` is the owner's opt-in to keeping an Immich album.
+    /// `nil` is the default for events created before this setting existed.
     /// It intentionally behaves like `false`: storage-only until the user opts in.
     public var immichUploadEnabled: Bool?
     public var immichAlbumPolicy: ImmichAlbumPolicy?
