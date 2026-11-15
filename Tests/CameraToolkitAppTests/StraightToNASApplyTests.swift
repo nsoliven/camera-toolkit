@@ -40,12 +40,17 @@ final class StraightToNASApplyTests: XCTestCase {
             XCTAssertTrue(overview.safetyFacts.contains { $0.text.contains("SHA-256") })
             XCTAssertTrue(ApplyRouteDiagram.routes(for: plan.groups[0]).allSatisfy { $0.destinationLabel.hasPrefix("NAS") })
 
+            var immichFollowUps: [[NASRename]] = []
+            workspace.nasChangeFollowObserver = { immichFollowUps.append($0) }
             workspace.performApply(plan)
             try await waitUntil { model.jobs.contains { $0.action == .syncBuffer && $0.state == .done } }
             try await waitUntil { !model.isBusy }
             let job = try XCTUnwrap(model.jobs.first { $0.action == .syncBuffer })
             XCTAssertEqual(job.state, .done, job.note)
             XCTAssertTrue(job.note.contains("3 copied and verified"), job.note)
+            // The same post-copy hook as Sync to NAS, once, with no renames.
+            XCTAssertEqual(immichFollowUps.count, 1)
+            XCTAssertEqual(immichFollowUps.first, [])
 
             // Each file is where Sync to NAS would have put its drive copy;
             // the card is untouched; the catalog rows still name the card.

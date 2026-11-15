@@ -726,6 +726,8 @@ final class EventsWorkspace {
     var immichIsChecking = false
     /// A scan request Immich has not accepted yet; survives a failed follow-up.
     @ObservationIgnored var immichScanOwed = false
+    /// Test seam: hears every `followNASChangeInImmich` call, configured or not.
+    @ObservationIgnored var nasChangeFollowObserver: (([NASRename]) -> Void)?
     @ObservationIgnored var immichFollowUp: Task<Void, Never>?
     var discoveredDriveEvents: [DiscoveredDriveEvent] = []
     /// Event folders in the NAS mirror whose files no assignment covers

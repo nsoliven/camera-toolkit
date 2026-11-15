@@ -33,6 +33,7 @@ extension EventsWorkspace {
     /// it once its copies are verified; it does nothing until a library is
     /// chosen in Settings.
     func followNASChangeInImmich(moves: [NASRename] = []) {
+        nasChangeFollowObserver?(moves)
         guard immichIsConfigured else { return }
         let catalogURL = URL(fileURLWithPath: DashboardModel.expandedPath(model.configuration.catalogDatabasePath))
         immichScanOwed = true
