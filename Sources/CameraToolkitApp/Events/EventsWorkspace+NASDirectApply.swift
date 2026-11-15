@@ -35,6 +35,10 @@ extension EventsWorkspace {
 
     private func runNASDirectApply(_ targets: [NASDirectCopyFile], events: [SavedCameraEvent], title: String, jobID: UUID) {
         let locations = self.locations
+        // The catalog as it is when the job starts — not when Apply was
+        // pressed: anything renamed or re-sorted while it waited is left out.
+        model.flushConfigurationSave()
+        let configuration = model.configuration
         guard NASDirectApply.isNASUsable(locations) else {
             model.statusMessage = "The NAS is not connected, so nothing was copied. The originals stay where they are; Apply again once the NAS or the event's drive is back."
             return
@@ -62,8 +66,7 @@ extension EventsWorkspace {
                 let store = try? NASSyncStore(catalogURL: catalogURL)
                 let outcome = try NASDirectApply.run(
                     targets,
-                    events: events,
-                    locations: locations,
+                    configuration: configuration,
                     store: store,
                     options: options,
                     recorder: recorder,

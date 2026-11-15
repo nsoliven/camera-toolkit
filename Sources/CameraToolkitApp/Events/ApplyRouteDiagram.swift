@@ -111,6 +111,7 @@ struct ApplyEventSummary: Identifiable, Equatable, Sendable {
     var alreadyOnNAS: Int = 0
     var waitingForDrive: Int = 0
     var driveName: String = ""
+    var notPlannable: Int = 0
 
     var id: UUID { event.id }
 
@@ -121,16 +122,18 @@ struct ApplyEventSummary: Identifiable, Equatable, Sendable {
             unavailable: unavailable,
             alreadyOnNAS: alreadyOnNAS,
             waitingForDrive: waitingForDrive,
-            driveName: driveName
+            driveName: driveName,
+            notPlannable: notPlannable
         )
     }
 
-    static func footnote(alreadyThere: Int, unavailable: Int, alreadyOnNAS: Int, waitingForDrive: Int, driveName: String) -> String? {
+    static func footnote(alreadyThere: Int, unavailable: Int, alreadyOnNAS: Int, waitingForDrive: Int, driveName: String, notPlannable: Int = 0) -> String? {
         let parts = [
             alreadyThere > 0 ? "\(alreadyThere) already in place" : nil,
             alreadyOnNAS > 0 ? "\(alreadyOnNAS) already on the NAS" : nil,
             waitingForDrive > 0 ? "\(waitingForDrive) wait for the \(driveName.isEmpty ? "event’s" : driveName) drive (not connected, and no NAS)" : nil,
             unavailable > 0 ? "\(unavailable) on a source drive that isn’t connected" : nil,
+            notPlannable > 0 ? "\(notPlannable) can’t be placed while the drive is away" : nil,
         ].compactMap { $0 }
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
@@ -261,7 +264,8 @@ enum ApplyRouteDiagram {
                 unavailable: group.unavailable,
                 alreadyOnNAS: group.alreadyOnNAS,
                 waitingForDrive: group.waitingForDrive,
-                driveName: group.driveName
+                driveName: group.driveName,
+                notPlannable: group.notPlannable
             )
             for route in routes(for: group) {
                 summary.fileCount += route.fileCount
@@ -434,7 +438,8 @@ struct ApplyEventGroupCard: View {
                     unavailable: group.unavailable,
                     alreadyOnNAS: group.alreadyOnNAS,
                     waitingForDrive: group.waitingForDrive,
-                    driveName: group.driveName
+                    driveName: group.driveName,
+                    notPlannable: group.notPlannable
                 ) {
                     Text(footnote)
                         .font(.caption)
@@ -448,7 +453,7 @@ struct ApplyEventGroupCard: View {
 
     private var fileCount: Int {
         group.moves.count + group.copyFileCount + group.nasCopyCount + group.alreadyThere + group.unavailable
-            + group.alreadyOnNAS + group.waitingForDrive
+            + group.alreadyOnNAS + group.waitingForDrive + group.notPlannable
     }
 }
 

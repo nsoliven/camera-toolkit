@@ -93,6 +93,10 @@ public struct CardClearPlan: Equatable, Sendable {
     /// Items whose every file is in its event on the drive, but not every
     /// file has a verified NAS copy yet: "waiting for Sync to NAS".
     public var waitingForNAS: [WaitingItem] = []
+    /// Sorted files Apply copied straight to the NAS earlier whose copy
+    /// cannot be checked now because the NAS is not connected. Neither
+    /// applied nor clearable until it is.
+    public var nasUncheckedFiles = 0
     /// `AppliedSourceCheck`'s answer for the same files, from the same pass.
     public var applied: [String: UUID] = [:]
     /// The drive's volume name, for "safe on <drive> and the NAS".
@@ -176,7 +180,7 @@ public enum CardClearPlanner {
         let records = catalogURL.map {
             NASSyncStore.records(catalogURL: $0, nasRoot: locations.nasRoot.path, pathKeys: Array(Set(mirrorKeys.values)))
         } ?? [:]
-        let nasOnly = nasOnlyCopies(
+        let (nasOnly, nasUnchecked) = nasOnlyCopies(
             inputs: inputs,
             root: root,
             assets: assets,
@@ -187,6 +191,7 @@ public enum CardClearPlanner {
             mountedVolumes: mountedVolumes,
             sameVolume: sameVolume
         )
+        plan.nasUncheckedFiles = nasUnchecked
         for (key, copy) in nasOnly { plan.applied[key] = copy.assignment.eventID }
         guard !plan.applied.isEmpty, !isCancelled() else { return plan }
 
@@ -295,14 +300,18 @@ public enum CardClearPlanner {
         /// `nasPath` minus the relative path: the folder the cleanup
         /// service pairs with the card root.
         var nasRootPath: String
+        var mirrorPath: String
         var sha256: String
     }
 
     /// Source path key → its NAS-only copy, for sorted files under the card
     /// root that the drive check did not find in their event: not a drive
     /// copy themselves, not on the event drive's volume, not a camera
-    /// support file, and vouched for by a verified record
-    /// (`NASDirectApply.vouches`).
+    /// support file, vouched for by a verified record
+    /// (`NASDirectApply.vouches`), and — the record is not enough — its NAS
+    /// file still there at that size (one listing per folder). With the NAS
+    /// not connected nothing qualifies; the second value counts the files
+    /// a record vouches for that could not be checked.
     static func nasOnlyCopies(
         inputs: [CardClearInput],
         root: String,
@@ -313,8 +322,9 @@ public enum CardClearPlanner {
         records: [String: NASSyncRecord],
         mountedVolumes: Set<String>?,
         sameVolume: AppliedSourceCheck.SameVolume?
-    ) -> [String: NASOnlyCopy] {
+    ) -> (copies: [String: NASOnlyCopy], unchecked: Int) {
         let mounted = mountedVolumes ?? VolumeInfo.mountedVolumePaths()
+        let nasConnected = NASDirectApply.isNASUsable(locations)
         let sameVolume = sameVolume ?? { source, root, mounted in
             VolumeInfo.isSameVolume(source.deletingLastPathComponent(), root, mountedVolumes: mounted)
         }
@@ -350,11 +360,18 @@ public enum CardClearPlanner {
                     sourceRootPath: sourceRootPath,
                     nasPath: nasPath,
                     nasRootPath: nasRootPath,
+                    mirrorPath: mirror,
                     sha256: sha.lowercased()
                 )
             }
         }
-        return found
+        guard !found.isEmpty else { return ([:], 0) }
+        guard nasConnected else { return ([:], found.count) }
+        let present = NASDirectApply.presentOnNAS(
+            found.values.map { ($0.mirrorPath, $0.assignment.fileSize) },
+            nasRoot: nasRoot
+        )
+        return (found.filter { present.contains(NASSyncStore.pathKey($0.value.mirrorPath)) }, 0)
     }
 }
 

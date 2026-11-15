@@ -637,9 +637,11 @@ struct ApplyPlanOverview: Sendable {
         let waiting = plan.waitingForDriveCount
         let unavailable = plan.unavailableCount
         let onNAS = plan.alreadyOnNASCount
+        let unplannable = plan.notPlannableCount
         if waiting > 0 {
             let (drive, isAre) = drivePhrase(plan.groups.filter { $0.waitingForDrive > 0 })
-            var line = "\(plural(waiting, "sorted file")) can’t go to \(waiting == 1 ? "its event" : "their events") yet: \(drive) \(isAre) connected, and neither is the NAS. Connect either one, then Apply again. Nothing was moved or copied."
+            let nas = plan.nasConnected ? "" : ", and neither is the NAS. Connect either one"
+            var line = "\(plural(waiting, "sorted file")) can’t go to \(waiting == 1 ? "its event" : "their events") yet: \(drive) \(isAre) connected\(nas.isEmpty ? ". Connect it" : nas), then Apply again. Nothing was moved or copied."
             if unavailable > 0 {
                 line += " \(unavailable.formatted()) more \(unavailable == 1 ? "is" : "are") on a source drive that isn’t connected."
             }
@@ -647,6 +649,10 @@ struct ApplyPlanOverview: Sendable {
         }
         if unavailable > 0 {
             return "\(plural(unavailable, "sorted file")) \(unavailable == 1 ? "is" : "are") on a source drive that isn’t connected. Connect it, then Apply again."
+        }
+        if unplannable > 0 {
+            return "Nothing to move. \(plural(unplannable, "sorted file")) can’t be placed while \(unplannable == 1 ? "its event’s" : "their events’") drive is away: gone from the source, already on the NAS, or without a usable NAS path."
+                + (onNAS > 0 ? " \(onNAS.formatted()) more \(onNAS == 1 ? "is" : "are") already in the event’s NAS folder." : "")
         }
         if onNAS > 0 {
             return "Nothing to move. Every sorted file is already in its event — \(onNAS.formatted()) of them in the event’s NAS folder."

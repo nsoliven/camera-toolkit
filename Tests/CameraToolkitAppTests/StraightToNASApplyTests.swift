@@ -121,6 +121,77 @@ final class StraightToNASApplyTests: XCTestCase {
         XCTAssertTrue(ApplyPlanOverview.emptyPlanMessage(plan).contains("source drive that isn’t connected"))
     }
 
+    func testAFileGoneFromTheCardIsNotWaitingAndTheNASIsNotBlamed() async throws {
+        try await withSandbox(createNAS: true) { root, model, workspace in
+            let (card, events) = try sortCard(root: root, model: model, workspace: workspace)
+            try FileManager.default.removeItem(at: card.appendingPathComponent("DSC00001.ARW"))
+            var plan = EventsWorkspace.buildApplyPlan(
+                events: events, configuration: model.configuration, locations: workspace.locations,
+                onlyUnder: card.path, title: "Apply", unsortedRoots: [card]
+            )
+            XCTAssertEqual(plan.nasCopyCount, 2)
+            XCTAssertEqual(plan.notPlannableCount, 1)
+            XCTAssertEqual(plan.waitingForDriveCount, 0)
+            for name in ["DSC00002.ARW", "DSC00003.ARW"] {
+                try FileManager.default.removeItem(at: card.appendingPathComponent(name))
+            }
+            plan = EventsWorkspace.buildApplyPlan(
+                events: events, configuration: model.configuration, locations: workspace.locations,
+                onlyUnder: nil, title: "Apply", unsortedRoots: [card]
+            )
+            XCTAssertTrue(plan.isEmpty)
+            let message = ApplyPlanOverview.emptyPlanMessage(plan)
+            XCTAssertFalse(message.contains("NAS isn"), message)
+            XCTAssertFalse(message.contains("neither is the NAS"), message)
+            XCTAssertTrue(message.contains("gone from the source"), message)
+        }
+    }
+
+    func testASourceInsideTheNASIsNotCopiedOntoTheNAS() async throws {
+        try await withSandbox(createNAS: true) { root, model, workspace in
+            let inside = workspace.locations.nasRoot.appendingPathComponent("Unsorted Phone", isDirectory: true)
+            let (card, events) = try sortCard(root: root, model: model, workspace: workspace, card: inside)
+            let plan = EventsWorkspace.buildApplyPlan(
+                events: events, configuration: model.configuration, locations: workspace.locations,
+                onlyUnder: card.path, title: "Apply", unsortedRoots: [card]
+            )
+            XCTAssertEqual(plan.nasCopyCount, 0)
+            XCTAssertEqual(plan.notPlannableCount, 3)
+        }
+    }
+
+    // MARK: - Clear from Card: NAS-only files need the owner's choice
+
+    func testNASOnlyFilesAreLeftOutOfClearFromCardUnlessChosen() {
+        let request = CardClearRequest(
+            locationID: UUID(), locationName: "Card", itemIDs: ["drive"], fileCount: 2, byteCount: 200,
+            events: [], waitingForNASFiles: 0, driveName: "Buffer", nasReachable: true,
+            nasOnlyItemIDs: ["nas-a", "nas-b"], nasOnlyFiles: 3, nasOnlyBytes: 300
+        )
+        let off = EventsWorkspace.cardClearChoice(request, includeNASOnly: false)
+        XCTAssertEqual(off.itemIDs, ["drive"])
+        XCTAssertEqual(off.fileCount, 2)
+        XCTAssertEqual(off.nasOnlyFiles, 0)
+        let on = EventsWorkspace.cardClearChoice(request, includeNASOnly: true)
+        XCTAssertEqual(on.itemIDs, ["drive", "nas-a", "nas-b"])
+        XCTAssertEqual(on.fileCount, 5)
+        XCTAssertEqual(on.byteCount, 500)
+        // The job clears only the chosen items.
+        let items = ["drive", "nas-a", "nas-b"].map { CardClearItem(id: $0, eventID: UUID(), sourceRoot: "/c", driveRoot: "/d", files: []) }
+        XCTAssertEqual(CardClearRequest.chosen(items, itemIDs: off.itemIDs).map(\.id), ["drive"])
+        XCTAssertEqual(CardClearRequest.chosen(items, itemIDs: on.itemIDs).map(\.id), ["drive", "nas-a", "nas-b"])
+        XCTAssertTrue(CardClearWording.nasOnlyToggle(request).hasPrefix("Also clear 3 files"))
+        XCTAssertTrue(CardClearWording.nasOnlyToggle(request).contains("whose only other copy is on the NAS"))
+    }
+
+    func testCopiesTheNASCannotCheckAreNeverCalledSafe() {
+        var plan = CardClearPlan()
+        plan.nasUncheckedFiles = 3
+        let line = CardClearWording.bannerLine(CardClearSummary(plan))
+        XCTAssertEqual(line, "3 were copied to the NAS earlier, not checked now (NAS not connected)")
+        XCTAssertFalse(line.contains("safe"))
+    }
+
     // MARK: - Add to Events outcomes
 
     func testAddToEventsAlwaysEndsInAVisibleOutcome() async throws {
@@ -190,8 +261,8 @@ final class StraightToNASApplyTests: XCTestCase {
     // MARK: - Fixtures
 
     /// Three card files sorted into a shared and a private event.
-    private func sortCard(root: URL, model: DashboardModel, workspace: EventsWorkspace) throws -> (URL, [SavedCameraEvent]) {
-        let card = root.appendingPathComponent("Card/DCIM/100MSDCF", isDirectory: true)
+    private func sortCard(root: URL, model: DashboardModel, workspace: EventsWorkspace, card cardFolder: URL? = nil) throws -> (URL, [SavedCameraEvent]) {
+        let card = cardFolder ?? root.appendingPathComponent("Card/DCIM/100MSDCF", isDirectory: true)
         let beach = try XCTUnwrap(workspace.createEvent(name: "Beach Day", date: day("2026-08-26"), policy: .buffer))
         let hotel = try XCTUnwrap(workspace.createEvent(name: "Hotel Night", date: day("2026-08-26"), policy: .archiveOnly))
         var rows: [PhotoEventAssignment] = []

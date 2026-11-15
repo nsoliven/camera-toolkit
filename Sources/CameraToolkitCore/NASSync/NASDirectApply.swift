@@ -77,18 +77,50 @@ public enum NASDirectApply {
         return abs(recorded - entry.modifiedAt) < 0.001
     }
 
-    /// One catalog read: the source path keys (`EventStorageLocations.pathKey`)
-    /// of the candidates whose NAS copy a verified record vouches for.
+    /// The source path keys (`EventStorageLocations.pathKey`) of the
+    /// candidates whose NAS copy a verified record vouches for. With
+    /// `presentOnNAS` (from `presentOnNAS(_:nasRoot:)`), the NAS file must
+    /// also still be there at its size: a record alone never stands for a
+    /// copy deleted or moved outside the app.
     public static func vouchedSources(
         _ candidates: [(sourcePath: String, mirrorPath: String, byteCount: Int64)],
-        records: [String: NASSyncRecord]
+        records: [String: NASSyncRecord],
+        presentOnNAS: Set<String>? = nil
     ) -> Set<String> {
         var vouched: Set<String> = []
-        for candidate in candidates
-        where vouches(records[NASSyncStore.pathKey(candidate.mirrorPath)], sourcePath: candidate.sourcePath, byteCount: candidate.byteCount) {
+        for candidate in candidates {
+            let key = NASSyncStore.pathKey(candidate.mirrorPath)
+            guard vouches(records[key], sourcePath: candidate.sourcePath, byteCount: candidate.byteCount),
+                  presentOnNAS.map({ $0.contains(key) }) ?? true else { continue }
             vouched.insert(EventStorageLocations.pathKey(candidate.sourcePath))
         }
         return vouched
+    }
+
+    /// `NASSyncStore.pathKey`s of the mirror paths whose NAS file is a
+    /// regular file of the given size — one `DirectoryListing` per folder,
+    /// nothing opened or hashed. A folder that cannot be listed vouches for
+    /// nothing in it.
+    public static func presentOnNAS(
+        _ entries: [(mirrorPath: String, byteCount: Int64)],
+        nasRoot: String,
+        list: (String) throws -> [DirectoryListingEntry] = DirectoryListing.list
+    ) -> Set<String> {
+        var byFolder: [String: [(name: String, key: String, size: Int64)]] = [:]
+        for entry in entries {
+            let folder = (entry.mirrorPath as NSString).deletingLastPathComponent
+            byFolder[folder, default: []].append(((entry.mirrorPath as NSString).lastPathComponent, NASSyncStore.pathKey(entry.mirrorPath), entry.byteCount))
+        }
+        var present: Set<String> = []
+        for (folder, wanted) in byFolder {
+            guard let listing = try? list(folder.isEmpty ? nasRoot : nasRoot + "/" + folder) else { continue }
+            var sizes: [String: Int64] = [:]
+            for item in listing where item.kind == .file { sizes[NASSyncStore.pathKey(item.name)] = item.size }
+            for file in wanted where sizes[NASSyncStore.pathKey(file.name)] == file.size {
+                present.insert(file.key)
+            }
+        }
+        return present
     }
 
     /// The catalog's records for these mirror paths (keyed by
@@ -154,13 +186,55 @@ public enum NASDirectApply {
         return (NASSyncPlan(items: items, eventFolders: folders.sorted()), skipped)
     }
 
+    /// The files still meant to go where they were planned, against the
+    /// catalog as it is now: the event still exists, an assignment of that
+    /// event still names this source file, and the event's NAS folder for it
+    /// is still the planned path. Anything renamed, re-sorted or removed
+    /// while the job waited is left out and reported — never copied into a
+    /// folder the event no longer uses.
+    public static func revalidate(
+        _ files: [NASDirectCopyFile],
+        configuration: AppConfiguration
+    ) -> (kept: [NASDirectCopyFile], dropped: [NASSyncIssue]) {
+        let locations = EventStorageLocations(configuration: configuration)
+        let events = EventHierarchy.index(configuration.savedEvents)
+        let wanted = Set(files.map { EventStorageLocations.pathKey($0.sourcePath) })
+        var rows: [String: [PhotoEventAssignment]] = [:]
+        for row in configuration.photoEventAssignments {
+            guard let source = locations.sourceURL(for: row) else { continue }
+            let key = EventStorageLocations.pathKey(source.path)
+            if wanted.contains(key) { rows[key, default: []].append(row) }
+        }
+        var kept: [NASDirectCopyFile] = []
+        var dropped: [NASSyncIssue] = []
+        for file in files {
+            guard let event = events[file.eventID] else {
+                dropped.append(NASSyncIssue(path: file.sourcePath, reason: "Its event was deleted while the copy waited."))
+                continue
+            }
+            guard let row = rows[EventStorageLocations.pathKey(file.sourcePath)]?.first(where: { $0.eventID == file.eventID }) else {
+                dropped.append(NASSyncIssue(path: file.sourcePath, reason: "It was sorted into another event, or unsorted, while the copy waited."))
+                continue
+            }
+            guard let mirror = mirrorPath(for: row, event: event, locations: locations),
+                  NASSyncStore.pathKey(mirror) == NASSyncStore.pathKey(file.relativePath) else {
+                dropped.append(NASSyncIssue(path: file.sourcePath, reason: "Its event's NAS folder changed while the copy waited (renamed or moved). Apply again."))
+                continue
+            }
+            kept.append(file)
+        }
+        return (kept, dropped)
+    }
+
     /// Copies the files through the Sync to NAS engine. Like Sync to NAS,
     /// queued NAS renames are applied first; while any is still waiting
-    /// nothing is copied (an event's NAS folder may be about to move).
+    /// nothing is copied (an event's NAS folder may be about to move). Then
+    /// every file is checked against `configuration` — the catalog when the
+    /// job started — and only the ones still headed for the same NAS path
+    /// are copied (`revalidate`).
     public static func run(
         _ files: [NASDirectCopyFile],
-        events: [SavedCameraEvent],
-        locations: EventStorageLocations,
+        configuration: AppConfiguration,
         store: NASSyncStore?,
         options: NASSyncOptions,
         recorder: JobHistoryRecorder? = nil,
@@ -168,6 +242,8 @@ public enum NASDirectApply {
         isCancelled: @escaping @Sendable () -> Bool = { Task.isCancelled },
         progress: NASSyncService.Progress? = nil
     ) throws -> NASDirectApplyOutcome {
+        let locations = EventStorageLocations(configuration: configuration)
+        let events = configuration.savedEvents
         guard isNASUsable(locations) else {
             throw ToolkitError.commandFailed("The NAS is not connected. Nothing was copied; the originals stay where they are.")
         }
@@ -181,9 +257,10 @@ public enum NASDirectApply {
                     + "\(waiting) NAS rename\(waiting == 1 ? " is" : "s are") still waiting, so nothing was copied. Try again once Sync to NAS has run them; the originals stay where they are."
             )
         }
-        let prepared = plan(files, events: events, locations: locations)
+        let current = revalidate(files, configuration: configuration)
+        let prepared = plan(current.kept, events: events, locations: locations)
         let report = try NASSyncService(store: store, options: options, recorder: recorder, isCancelled: isCancelled)
             .sync(prepared.plan, nasRoot: nasRoot, progress: progress)
-        return NASDirectApplyOutcome(report: report, plan: prepared.plan, follow: follow, skipped: prepared.skipped)
+        return NASDirectApplyOutcome(report: report, plan: prepared.plan, follow: follow, skipped: current.dropped + prepared.skipped)
     }
 }

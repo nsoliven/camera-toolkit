@@ -35,6 +35,9 @@ struct CardClearSummary: Equatable, Sendable {
     var driveName: String?
     /// Clearable files whose only other copy is on the NAS.
     var nasOnlyFiles: Int = 0
+    /// Files copied straight to the NAS earlier whose copy cannot be checked
+    /// now (NAS not connected): never called safe.
+    var nasUncheckedFiles: Int = 0
 
     init(_ plan: CardClearPlan) {
         clearableFiles = plan.clearableFiles
@@ -42,9 +45,10 @@ struct CardClearSummary: Equatable, Sendable {
         waitingForNASFiles = plan.waitingFiles
         driveName = plan.driveName
         nasOnlyFiles = plan.nasOnlyFiles
+        nasUncheckedFiles = plan.nasUncheckedFiles
     }
 
-    var isEmpty: Bool { clearableFiles == 0 && waitingForNASFiles == 0 }
+    var isEmpty: Bool { clearableFiles == 0 && waitingForNASFiles == 0 && nasUncheckedFiles == 0 }
 }
 
 /// The open Clear from Card confirmation: what the planner found when the
@@ -66,9 +70,23 @@ struct CardClearRequest: Identifiable {
     var waitingForNASFiles: Int
     var driveName: String?
     var nasReachable: Bool
-    /// Of `fileCount`: files whose only other copy is on the NAS (Apply sent
-    /// them there while their event's drive was not connected).
+    /// Clearable files whose only other copy is on the NAS (Apply sent them
+    /// there while their event's drive was not connected). Not part of
+    /// `itemIDs`/`fileCount`: the sheet leaves them out unless the owner
+    /// turns on "Also clear N files whose only other copy is on the NAS".
+    var nasOnlyItemIDs: Set<String> = []
     var nasOnlyFiles: Int = 0
+    var nasOnlyBytes: Int64 = 0
+
+    /// The items the job clears: the drive + NAS ones always, the NAS-only
+    /// ones only when the owner chose them in the sheet.
+    func chosenItemIDs(includeNASOnly: Bool) -> Set<String> {
+        includeNASOnly ? itemIDs.union(nasOnlyItemIDs) : itemIDs
+    }
+
+    static func chosen(_ clearable: [CardClearItem], itemIDs: Set<String>) -> [CardClearItem] {
+        clearable.filter { itemIDs.contains($0.id) }
+    }
 }
 
 struct CardClearOutcome: Sendable {
@@ -86,15 +104,15 @@ enum CardClearWording {
     /// The banner's line.
     static func bannerLine(_ summary: CardClearSummary) -> String {
         var parts: [String] = []
-        if summary.clearableFiles > 0 {
-            let files = "\(summary.clearableFiles.formatted()) file\(summary.clearableFiles == 1 ? " here is" : "s here are")"
-            if summary.nasOnlyFiles >= summary.clearableFiles {
-                parts.append("\(files) safe in \(summary.clearableFiles == 1 ? "its event" : "their events") on the NAS")
-            } else if summary.nasOnlyFiles > 0 {
-                parts.append("\(files) safe on \(drive(summary.driveName)) and the NAS (\(summary.nasOnlyFiles.formatted()) on the NAS only)")
-            } else {
-                parts.append("\(files) safe on \(drive(summary.driveName)) and the NAS")
-            }
+        let both = summary.clearableFiles - summary.nasOnlyFiles
+        if both > 0 {
+            parts.append("\(both.formatted()) file\(both == 1 ? " here is" : "s here are") safe on \(drive(summary.driveName)) and the NAS")
+        }
+        if summary.nasOnlyFiles > 0 {
+            parts.append("\(summary.nasOnlyFiles.formatted()) \(both > 0 ? "more" : "file\(summary.nasOnlyFiles == 1 ? "" : "s") here") \(summary.nasOnlyFiles == 1 ? "has" : "have") a checked copy only on the NAS")
+        }
+        if summary.nasUncheckedFiles > 0 {
+            parts.append("\(summary.nasUncheckedFiles.formatted()) \(summary.nasUncheckedFiles == 1 ? "was" : "were") copied to the NAS earlier, not checked now (NAS not connected)")
         }
         if summary.waitingForNASFiles > 0 {
             parts.append(summary.clearableFiles > 0
@@ -135,14 +153,25 @@ enum CardClearWording {
 
     /// The rule above the checks, in one line.
     static func sheetRule(_ request: CardClearRequest) -> String {
-        let rule = "Each file is deleted only when it is safe on both \(drive(request.driveName)) and the NAS."
-        guard request.nasOnlyFiles > 0 else { return rule }
-        let files = request.nasOnlyFiles == request.fileCount
-            ? "\(request.fileCount == 1 ? "This file was" : "These files were") sent straight to the NAS"
-            : "\(request.nasOnlyFiles.formatted()) of them were sent straight to the NAS"
-        let nasOnly = "\(files) while their event’s drive wasn’t connected, so the NAS holds the only other copy: it is read again and must match before a card file is deleted."
-        let unreachable = request.nasReachable ? "" : " The NAS isn’t reachable now, so those stay on the card."
-        return request.nasOnlyFiles == request.fileCount ? nasOnly + unreachable : rule + " " + nasOnly + unreachable
+        "Each file is deleted only when it is safe on both \(drive(request.driveName)) and the NAS."
+    }
+
+    /// The toggle that adds the files whose only other copy is the NAS.
+    static func nasOnlyToggle(_ request: CardClearRequest) -> String {
+        "Also clear \(request.nasOnlyFiles.formatted()) file\(request.nasOnlyFiles == 1 ? "" : "s") (\(request.nasOnlyBytes.formattedBytes)) whose only other copy is on the NAS"
+    }
+
+    /// Under the toggle: what choosing it means.
+    static func nasOnlyExplanation(_ request: CardClearRequest) -> String {
+        "Apply sent \(request.nasOnlyFiles == 1 ? "this file" : "these files") straight to the NAS while \(request.nasOnlyFiles == 1 ? "its event’s" : "their events’") drive wasn’t connected. After clearing, the NAS copy is the only one left. Each NAS copy is read again and must match before its card file is deleted."
+            + (request.nasReachable ? "" : " The NAS isn’t reachable now, so they would stay on the card anyway.")
+    }
+
+    /// Files the sheet would delete for the owner's choice.
+    static func chosenCount(_ request: CardClearRequest, includeNASOnly: Bool) -> (files: Int, bytes: Int64) {
+        includeNASOnly
+            ? (request.fileCount + request.nasOnlyFiles, request.byteCount + request.nasOnlyBytes)
+            : (request.fileCount, request.byteCount)
     }
 
     /// Below the checks: what happens to anything that fails.

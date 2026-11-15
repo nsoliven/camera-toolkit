@@ -95,8 +95,7 @@ final class NASDirectApplyTests: XCTestCase {
     private func run(_ f: Fixture, _ targets: [NASDirectCopyFile]? = nil) throws -> NASDirectApplyOutcome {
         try NASDirectApply.run(
             targets ?? f.targets(),
-            events: f.configuration.savedEvents,
-            locations: f.locations,
+            configuration: f.configuration,
             store: try NASSyncStore(catalogURL: f.catalog),
             options: NASSyncOptions(),
             isCancelled: { false }
@@ -248,6 +247,74 @@ final class NASDirectApplyTests: XCTestCase {
             XCTAssertEqual(cleared.checks.nasMatched, 3)
             XCTAssertEqual(cleared.checks.cardMatched, 3)
             XCTAssertEqual(try treeBytes(f.nas), nasBefore)
+        }
+    }
+
+    private func clearPlan(_ f: Fixture) -> CardClearPlan {
+        let inputs = f.assignments.map { row in
+            CardClearInput(
+                id: EventStorageLocations.pathKey(f.card.appendingPathComponent(row.relativePath).path),
+                entries: [.init(path: f.card.appendingPathComponent(row.relativePath).path, assignment: row)]
+            )
+        }
+        let events = Dictionary(uniqueKeysWithValues: f.configuration.savedEvents.map { ($0.id, $0) })
+        return CardClearPlanner.plan(inputs: inputs, sourceRoot: f.card.path, events: events, locations: f.locations, catalogURL: f.catalog)
+    }
+
+    /// The record alone never makes a card file "applied" or clearable: a
+    /// NAS copy deleted outside the app, or a NAS that is not connected,
+    /// leaves it waiting.
+    func testARecordAloneIsNotEnoughWhenTheNASCopyIsGoneOrTheNASIsAway() throws {
+        try withTemporaryDirectory { root in
+            let f = try makeFixture(root)
+            XCTAssertTrue(try run(f).succeeded)
+            XCTAssertEqual(clearPlan(f).nasOnlyFiles, 3)
+
+            // One NAS copy deleted outside the app.
+            let gone = f.targets()[0]
+            try FileManager.default.removeItem(at: f.nas.appendingPathComponent(gone.relativePath))
+            var plan = clearPlan(f)
+            XCTAssertNil(plan.applied[EventStorageLocations.pathKey(gone.sourcePath)])
+            XCTAssertEqual(plan.nasOnlyFiles, 2)
+            XCTAssertFalse(plan.clearable.contains { $0.files.contains { $0.sourcePath == gone.sourcePath } })
+
+            // The NAS not connected: nothing is applied or clearable on it,
+            // and the files are counted as not checked.
+            let away = root.appendingPathComponent("NAS away", isDirectory: true)
+            try FileManager.default.moveItem(at: f.nas, to: away)
+            plan = clearPlan(f)
+            XCTAssertTrue(plan.applied.isEmpty)
+            XCTAssertTrue(plan.clearable.isEmpty)
+            XCTAssertEqual(plan.nasUncheckedFiles, 3)
+            try FileManager.default.moveItem(at: away, to: f.nas)
+        }
+    }
+
+    /// The copy uses the catalog as it is when the job starts: a file whose
+    /// event was renamed or which was re-sorted while the job waited is left
+    /// out and reported, never copied into the old folder.
+    func testAFileRenamedOrReSortedWhileTheJobWaitedIsLeftOut() throws {
+        try withTemporaryDirectory { root in
+            let f = try makeFixture(root)
+            let planned = f.targets()
+            var later = f.configuration
+            // Beach Day renamed; the private event's file re-sorted into it.
+            later.savedEvents[0].name = "Beach Weekend"
+            later.photoEventAssignments[2].eventID = f.beach.id
+            let checked = NASDirectApply.revalidate(planned, configuration: later)
+            XCTAssertTrue(checked.kept.isEmpty)
+            XCTAssertEqual(checked.dropped.count, 3)
+            XCTAssertEqual(checked.dropped.filter { $0.reason.contains("NAS folder changed") }.count, 2)
+            XCTAssertEqual(checked.dropped.filter { $0.reason.contains("another event") }.count, 1)
+
+            let outcome = try NASDirectApply.run(planned, configuration: later, store: try NASSyncStore(catalogURL: f.catalog), options: NASSyncOptions(), isCancelled: { false })
+            XCTAssertTrue(outcome.report.copied.isEmpty)
+            XCTAssertEqual(outcome.skipped.count, 3)
+            XCTAssertFalse(outcome.succeeded)
+            XCTAssertEqual(try treeBytes(f.nas), [:], "nothing lands in the old folder")
+
+            // Unchanged, everything is kept.
+            XCTAssertEqual(NASDirectApply.revalidate(planned, configuration: f.configuration).kept, planned)
         }
     }
 

@@ -272,7 +272,7 @@ struct EventsRootView: View {
             CardClearConfirmSheet(
                 request: request,
                 onCancel: { workspace.pendingCardClear = nil },
-                onConfirm: { workspace.confirmCardClear(request, confirmation: $0) }
+                onConfirm: { workspace.confirmCardClear(request, confirmation: $0, includeNASOnly: $1) }
             )
         }
         .sheet(item: $workspace.pendingRemoval) { request in
