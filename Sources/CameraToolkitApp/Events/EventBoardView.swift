@@ -1012,15 +1012,15 @@ struct EventStorageSlots {
         let summary = ImmichEventSummary(statuses: (workspace.eventImmichStatuses[event.id] ?? [:]).values)
         let isConfigured = workspace.immichIsConfigured
         let isPrivate = workspace.locations.resolvedPolicy(for: event) == .archiveOnly
-        let album = event.immichAlbumTitle(isPrivate: isPrivate)
+        let album = workspace.immichAlbumTitles[event.id]
         let detail: String = if !isConfigured {
             "Choose your Immich library in Settings"
         } else if let outstanding = summary.outstandingText {
-            outstanding
-        } else if isPrivate, !summary.isEmpty {
+            album.map { "Album “\($0)” · \(outstanding)" } ?? outstanding
+        } else if isPrivate, !summary.isEmpty, album == nil {
             "Private here, but Immich reads the whole NAS"
         } else if let album {
-            "Album “\(album)”"
+            "Album “\(album)” · \(summary.inImmich.formatted()) photo\(summary.inImmich == 1 ? "" : "s")"
         } else if summary.isEmpty {
             "Not checked yet"
         } else {
@@ -1047,6 +1047,9 @@ struct EventStorageSlots {
                 }
                 if !isPrivate || event.sendsToImmich {
                     Menu("Album") {
+                        Button(model.configuration.immichAlbumsForEveryEvent ? "Automatic (Event album)" : "Automatic (No album)") {
+                            model.setEventImmichAlbumPolicy(event.id, policy: nil)
+                        }
                         ForEach(ImmichAlbumPolicy.allCases) { policy in
                             Button(policy.displayName) { model.setEventImmichAlbumPolicy(event.id, policy: policy) }
                         }

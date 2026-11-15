@@ -205,7 +205,7 @@ private struct EventLibraryView: View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 12) {
                 Picker("Album", selection: Binding(
-                    get: { selectedEvent?.resolvedImmichAlbumPolicy ?? .none },
+                    get: { selectedEvent?.effectiveImmichAlbumPolicy(albumsForEveryEvent: model.configuration.immichAlbumsForEveryEvent) ?? .none },
                     set: { model.setEventImmichAlbumPolicy(event.id, policy: $0) }
                 )) {
                     ForEach(ImmichAlbumPolicy.allCases) { policy in

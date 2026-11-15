@@ -25,7 +25,11 @@ Checks run outside the job gate, so a slow or absent server never holds up a fil
 
 ## Albums
 
-Off by default. An event with an **Event album** or **Custom album** has every online, untrashed asset added on each check. Albums are only ever added to, so a photo removed from such an album returns on the next check; set the event back to **No album** to stop that.
+**Make an album for every event** (Settings, on by default; nothing happens until a library is chosen) gives every event whose album choice is still the default an Event album, new events included. An event set to **No album** or **Custom album** keeps its choice; **Automatic** in the event's Album menu puts it back on the default. Settings says how many events will get one before it is turned on.
+
+An album named after its event takes the event's date as well when another event has the same name, because albums are found by name. A custom name is used exactly as typed, so it can join an album that already exists.
+
+Albums are created and filled on the next check, which runs after any copy to the NAS. Each check adds every online, untrashed asset of the event and never removes one, so a photo taken out of such an album comes back on the next check; set the event to **No album** to stop that.
 
 A private event never gets an album unless **Allow album** is on for that event. That only governs albums: Immich reads the whole NAS root, so a private event's files are visible in Immich unless the library's exclusion patterns cover them. The event says so when it happens.
 

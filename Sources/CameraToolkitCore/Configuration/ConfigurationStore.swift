@@ -48,6 +48,9 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
     /// After a NAS rename, add the renamed file's new Immich asset to the
     /// albums the old one was in.
     public var immichCarriesAlbumsAcrossRenames: Bool
+    /// Every event whose album policy is still the default gets an Event
+    /// album. Nothing happens until a library is chosen.
+    public var immichAlbumsForEveryEvent: Bool
     public var trueNASServerURL: String
     public var trueNASUsername: String
     public var trueNASDataset: String
@@ -105,6 +108,7 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         immichServerURL: String = "",
         immichLibraryID: String = "",
         immichCarriesAlbumsAcrossRenames: Bool = false,
+        immichAlbumsForEveryEvent: Bool = true,
         trueNASServerURL: String = "",
         trueNASUsername: String = "",
         trueNASDataset: String = "",
@@ -145,6 +149,7 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         self.immichServerURL = immichServerURL
         self.immichLibraryID = immichLibraryID
         self.immichCarriesAlbumsAcrossRenames = immichCarriesAlbumsAcrossRenames
+        self.immichAlbumsForEveryEvent = immichAlbumsForEveryEvent
         self.trueNASServerURL = trueNASServerURL
         self.trueNASUsername = trueNASUsername
         self.trueNASDataset = trueNASDataset
@@ -189,6 +194,7 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         case immichServerURL
         case immichLibraryID
         case immichCarriesAlbumsAcrossRenames
+        case immichAlbumsForEveryEvent
         case trueNASServerURL
         case trueNASUsername
         case trueNASDataset
@@ -240,6 +246,7 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         try values.encode(immichServerURL, forKey: .immichServerURL)
         try values.encode(immichLibraryID, forKey: .immichLibraryID)
         try values.encode(immichCarriesAlbumsAcrossRenames, forKey: .immichCarriesAlbumsAcrossRenames)
+        try values.encode(immichAlbumsForEveryEvent, forKey: .immichAlbumsForEveryEvent)
         try values.encode(trueNASServerURL, forKey: .trueNASServerURL)
         try values.encode(trueNASUsername, forKey: .trueNASUsername)
         try values.encode(trueNASDataset, forKey: .trueNASDataset)
@@ -296,6 +303,7 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         immichServerURL = try values.decodeIfPresent(String.self, forKey: .immichServerURL) ?? defaults.immichServerURL
         immichLibraryID = try values.decodeIfPresent(String.self, forKey: .immichLibraryID) ?? defaults.immichLibraryID
         immichCarriesAlbumsAcrossRenames = try values.decodeIfPresent(Bool.self, forKey: .immichCarriesAlbumsAcrossRenames) ?? defaults.immichCarriesAlbumsAcrossRenames
+        immichAlbumsForEveryEvent = try values.decodeIfPresent(Bool.self, forKey: .immichAlbumsForEveryEvent) ?? defaults.immichAlbumsForEveryEvent
         trueNASServerURL = try values.decodeIfPresent(String.self, forKey: .trueNASServerURL) ?? defaults.trueNASServerURL
         trueNASUsername = try values.decodeIfPresent(String.self, forKey: .trueNASUsername) ?? defaults.trueNASUsername
         trueNASDataset = try values.decodeIfPresent(String.self, forKey: .trueNASDataset) ?? defaults.trueNASDataset

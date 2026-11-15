@@ -30,7 +30,7 @@ The sidebar then shows dataset free space, while its help text also identifies t
 
 ## Immich
 
-`immichLibraryID` picks the external library that reads the NAS root; empty leaves Immich alone. `immichCarriesAlbumsAcrossRenames` keeps renamed files in their albums. Each event's album policy can be:
+`immichLibraryID` picks the external library that reads the NAS root; empty leaves Immich alone. `immichCarriesAlbumsAcrossRenames` keeps renamed files in their albums. `immichAlbumsForEveryEvent` (default on) gives every event left at the default policy an Event album. Each event's album policy can be unset (follow `immichAlbumsForEveryEvent`) or:
 
 - `none`
 - `event`
