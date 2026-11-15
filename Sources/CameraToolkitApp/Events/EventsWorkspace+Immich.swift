@@ -18,7 +18,20 @@ extension EventsWorkspace {
             && !model.configuration.immichServerURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
-    /// The NAS changed: remember its renames and have Immich catch up.
+    /// Every event's Immich album title, for the storage strip.
+    var immichAlbumTitles: [UUID: String] {
+        ImmichAlbumNaming.titles(
+            events: model.configuration.savedEvents,
+            locations: locations,
+            albumsForEveryEvent: model.configuration.immichAlbumsForEveryEvent
+        )
+    }
+
+    /// The single post-copy hook: files landed on the NAS or were renamed
+    /// there. It records the renames, asks Immich to scan, and the checks that
+    /// follow fill event albums. Every path that puts files on the NAS calls
+    /// it once its copies are verified; it does nothing until a library is
+    /// chosen in Settings.
     func followNASChangeInImmich(moves: [NASRename] = []) {
         guard immichIsConfigured else { return }
         let catalogURL = URL(fileURLWithPath: DashboardModel.expandedPath(model.configuration.catalogDatabasePath))
@@ -102,6 +115,7 @@ extension EventsWorkspace {
     private func checkImmichOnce(_ sync: ImmichLibrarySync) async throws -> ImmichLibrarySyncOutcome {
         let assignments = model.configuration.photoEventAssignments
         let events = model.configuration.savedEvents
+        let albumsForEveryEvent = model.configuration.immichAlbumsForEveryEvent
         let locations = self.locations
         let catalogURL = sync.catalogURL
         let files = await Task.detached(priority: .utility) { () -> [ImmichCatalogFile] in
@@ -111,7 +125,8 @@ extension EventsWorkspace {
                 assignments: assignments,
                 events: events,
                 locations: locations,
-                verifiedPathKeys: Set(verified.keys)
+                verifiedPathKeys: Set(verified.keys),
+                albumsForEveryEvent: albumsForEveryEvent
             )
         }.value
         return try await sync.check(files: files)
