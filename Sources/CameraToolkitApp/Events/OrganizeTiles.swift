@@ -2921,7 +2921,7 @@ extension StackPreviewOverlay {
                 grading.renderGradedCopies(of: [OrganizeStack(items: [item])], boardEventID: boardEventID)
                 isFocused = true
             },
-            renderNote: "Writes \(GradedRenderNaming.candidateName(forSource: item.primary.url, attempt: 1)) into the event’s Edited/\(GradedRenderNaming.folderName). The original is never changed."
+            renderNote: "Writes \(GradedRenderNaming.candidateName(forSource: item.primary.url, attempt: 1)) into the event’s Edited/\(GradedRenderNaming.folderName). A copy made earlier with another grade is kept, and this one is saved beside it as “(2)”. The original is never changed."
         )
     }
 

@@ -72,6 +72,9 @@ public enum EditTagLinker {
                 guard !JunkPolicy.isJunkFile(entry.name) else { continue }
                 let relative = String(entry.path.dropFirst(edited.count + 1))
                 let components = relative.split(separator: "/")
+                // A render still being written (or one a crash left) is not
+                // an edit; neither is anything under a temporary folder.
+                guard !components.contains(where: { NASSyncPlanner.isJunk(String($0)) }) else { continue }
                 let tag = components.count > 1 ? String(components[0]) : EventStorageLocations.editedFolderName
                 result.append(EditedFile(path: entry.path, tag: tag))
             }

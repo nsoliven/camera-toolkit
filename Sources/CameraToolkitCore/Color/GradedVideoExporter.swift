@@ -17,8 +17,13 @@ public struct GradedRenderRequest: Sendable {
     public var outputFolder: URL
     public var make: String?
     public var model: String?
+    /// The NAS mirror of `outputFolder` when the copy is written on the
+    /// drive: a copy Sync already carried there counts as rendered, and its
+    /// name is never reused for a different render (Sync would conflict).
+    public var mirrorFolder: URL?
 
-    public init(source: URL, recipe: GradeRecipe, sourceKey: String, sourceModifiedAt: Date, outputFolder: URL, make: String? = nil, model: String? = nil) {
+    public init(source: URL, recipe: GradeRecipe, sourceKey: String, sourceModifiedAt: Date, outputFolder: URL, make: String? = nil, model: String? = nil, mirrorFolder: URL? = nil) {
+        self.mirrorFolder = mirrorFolder
         self.source = source
         self.recipe = recipe
         self.sourceKey = sourceKey
@@ -30,15 +35,31 @@ public struct GradedRenderRequest: Sendable {
 }
 
 public enum GradedRenderOutcome: Equatable, Sendable {
-    case rendered(URL)
-    /// A copy with the same original and the same grade is already there.
+    /// `beside`: older copies of the same original (another grade) that
+    /// took the earlier names. They are kept, never replaced.
+    case rendered(URL, beside: [URL])
+    /// A copy with the same original and the same grade is already there
+    /// (on the drive, or on the NAS mirror).
     case alreadyRendered(URL)
 
     public var url: URL {
         switch self {
-        case .rendered(let url), .alreadyRendered(let url): url
+        case .rendered(let url, _), .alreadyRendered(let url): url
         }
     }
+}
+
+/// What a taken name holds, as far as its tags say.
+public enum GradedRenderIdentity: Equatable, Sendable {
+    /// This original with this grade.
+    case same
+    /// This original with another grade.
+    case olderGrade
+    /// Something else (another file, no tags).
+    case other
+    /// The tags could not be read in time: not known, so nothing is
+    /// rendered beside it (a duplicate would be the likely result).
+    case unknown
 }
 
 /// Where graded copies go and what they are called. A copy never replaces
@@ -49,9 +70,44 @@ public enum GradedRenderNaming {
     public static let folderName = "Rec709"
     public static let suffix = "_709"
     public static let fileExtension = "mov"
-    /// Partial renders live here until they are verified and renamed in;
-    /// `.TemporaryItems` is excluded from every scan and sync.
-    public static let temporaryFolderName = ".TemporaryItems"
+    /// Partial renders live here until they are verified and renamed in.
+    /// Sync, the edit-tag scan and `DefaultExcludes` all skip it, and the
+    /// partial's name carries Sync's own temporary marker as well.
+    public static let temporaryFolderName = NASSyncPlanner.temporaryItemsFolder
+    /// `<UUID>.ctsync-render.partial.mov`.
+    public static let partialSuffix = NASSyncPlanner.temporaryMarker + "render.partial.mov"
+
+    public static func partialName() -> String { UUID().uuidString + partialSuffix }
+
+    /// True only for a name this exporter gives a partial — or the scratch
+    /// copy AVAssetWriter's fast-start pass makes beside it
+    /// (`<partial>.sb-<random>`).
+    public static func isPartialName(_ name: String) -> Bool {
+        var base = name
+        if let scratch = name.range(of: partialSuffix + ".sb-") {
+            base = String(name[..<scratch.lowerBound]) + partialSuffix
+        }
+        guard base.hasSuffix(partialSuffix) else { return false }
+        return UUID(uuidString: String(base.dropLast(partialSuffix.count))) != nil
+    }
+
+    /// Deletes partials a crashed or stopped render left in `outputFolder`'s
+    /// temporary folder — only files with this exporter's exact partial
+    /// name — then removes the folder if that left it empty. Returns how
+    /// many were removed. Renders run one at a time under the job gate, so
+    /// any partial found at the start of a render is stale.
+    @discardableResult
+    public static func removeStalePartials(in outputFolder: URL) -> Int {
+        let folder = outputFolder.appendingPathComponent(temporaryFolderName, isDirectory: true).path
+        guard LayoutMigrationDisk.lstatEntry(folder)?.kind == .directory,
+              let entries = try? DirectoryListing.list(folder) else { return 0 }
+        var removed = 0
+        for entry in entries where entry.kind == .file && isPartialName(entry.name) {
+            if unlink((folder as NSString).appendingPathComponent(entry.name)) == 0 { removed += 1 }
+        }
+        _ = rmdir(folder) // Only when empty; anything else stays.
+        return removed
+    }
 
     public static func outputFolder(editedRoot: URL) -> URL {
         editedRoot.appendingPathComponent(folderName, isDirectory: true)
@@ -65,22 +121,46 @@ public enum GradedRenderNaming {
             : "\(stem)\(suffix) (\(attempt)).\(fileExtension)"
     }
 
-    /// The first name that is free, or the name of an identical render
-    /// already there. `existing` answers whether a path is taken, and
-    /// `isSameRender` whether a taken path is this exact render.
+    public enum Resolution: Equatable, Sendable {
+        /// Render to `url`; `beside` are older copies of the same original.
+        case free(URL, beside: [URL])
+        /// This exact render is already at `url`.
+        case alreadyRendered(URL)
+        /// A taken name's tags could not be read: nothing is decided.
+        case undecided(URL)
+        case exhausted
+    }
+
+    /// The first name free in `folder` and in `mirror` (the NAS copy of the
+    /// folder, when there is one), or where this exact render already is.
+    /// `exists` answers whether a path is taken; `identity` what it holds.
     public static func resolve(
         source: URL,
         folder: URL,
+        mirror: URL? = nil,
         exists: (URL) -> Bool,
-        isSameRender: (URL) -> Bool,
+        identity: (URL) -> GradedRenderIdentity,
         maximumAttempts: Int = 999
-    ) -> (url: URL, alreadyRendered: Bool)? {
+    ) -> Resolution {
+        var beside: [URL] = []
         for attempt in 1...maximumAttempts {
-            let url = folder.appendingPathComponent(candidateName(forSource: source, attempt: attempt), isDirectory: false)
-            guard exists(url) else { return (url, false) }
-            if isSameRender(url) { return (url, true) }
+            let name = candidateName(forSource: source, attempt: attempt)
+            let local = folder.appendingPathComponent(name, isDirectory: false)
+            let remote = mirror?.appendingPathComponent(name, isDirectory: false)
+            let taken = [local, remote].compactMap { $0 }.filter(exists)
+            guard !taken.isEmpty else { return .free(local, beside: beside) }
+            var older = false
+            for url in taken {
+                switch identity(url) {
+                case .same: return .alreadyRendered(url)
+                case .unknown: return .undecided(url)
+                case .olderGrade: older = true
+                case .other: break
+                }
+            }
+            if older { beside.append(taken[0]) }
         }
-        return nil
+        return .exhausted
     }
 
     /// True for a file this app rendered (so it is never treated as a log
@@ -119,24 +199,44 @@ public final class GradedVideoExporter: @unchecked Sendable {
     ) throws -> GradedRenderOutcome {
         let fileManager = FileManager.default
         let folder = request.outputFolder
-        guard let target = GradedRenderNaming.resolve(
+        GradedRenderNaming.removeStalePartials(in: folder)
+        let target: URL
+        let beside: [URL]
+        switch GradedRenderNaming.resolve(
             source: request.source,
             folder: folder,
+            mirror: request.mirrorFolder,
             exists: { DriveMoveService.exists($0.path) },
-            isSameRender: { Self.isRender(at: $0, of: request) }
-        ) else {
+            identity: { Self.identity(at: $0, of: request) }
+        ) {
+        case .free(let url, let older):
+            target = url
+            beside = older
+        case .alreadyRendered(let url):
+            return .alreadyRendered(url)
+        case .undecided(let url):
+            throw ToolkitError.commandFailed("Could not read \(url.lastPathComponent) in time to tell whether it is this render, so no second copy was made. Try again once the drive or NAS answers.")
+        case .exhausted:
             throw ToolkitError.commandFailed("Every name for a graded copy of \(request.source.lastPathComponent) is taken.")
         }
-        if target.alreadyRendered { return .alreadyRendered(target.url) }
 
         try fileManager.createDirectory(at: folder, withIntermediateDirectories: true)
         let temporaryFolder = folder.appendingPathComponent(GradedRenderNaming.temporaryFolderName, isDirectory: true)
         try fileManager.createDirectory(at: temporaryFolder, withIntermediateDirectories: true)
-        let partial = temporaryFolder.appendingPathComponent("\(UUID().uuidString).partial.mov", isDirectory: false)
+        let partial = temporaryFolder.appendingPathComponent(GradedRenderNaming.partialName(), isDirectory: false)
         defer {
-            // Only the partial this call made; never anything else.
-            if DriveMoveService.exists(partial.path) { try? fileManager.removeItem(at: partial) }
-            try? fileManager.removeItem(at: temporaryFolder) // only succeeds when empty
+            // Only the partial this call made, by its exact path; the
+            // folder only when that leaves it empty.
+            if DriveMoveService.exists(partial.path) { _ = unlink(partial.path) }
+            // AVAssetWriter's fast-start pass leaves its scratch copy
+            // (`<partial>.sb-…`) until the writer goes away; it is ours, by
+            // name, so it goes too. Then the folder, only if empty.
+            if let entries = try? DirectoryListing.list(temporaryFolder.path) {
+                for entry in entries where entry.kind == .file && entry.name.hasPrefix(partial.lastPathComponent + ".sb-") {
+                    _ = unlink(temporaryFolder.appendingPathComponent(entry.name).path)
+                }
+            }
+            _ = rmdir(temporaryFolder.path)
         }
 
         try write(request, to: partial, progress: progress, isCancelled: isCancelled)
@@ -146,19 +246,25 @@ public final class GradedVideoExporter: @unchecked Sendable {
             [.modificationDate: request.sourceModifiedAt, .creationDate: request.sourceModifiedAt],
             ofItemAtPath: partial.path
         )
-        try DriveMoveService.renameExclusive(from: partial.path, to: target.url.path)
-        return .rendered(target.url)
+        // The claimed-name rename never replaces a file, on smbfs and exFAT
+        // too, where a plain rename would.
+        try NASFileIO.renameExclusive(from: partial.path, to: target.path)
+        return .rendered(target, beside: beside)
     }
 
     // MARK: Identity
 
-    /// Whether the file at `url` is a copy of this original with this grade.
-    public static func isRender(at url: URL, of request: GradedRenderRequest) -> Bool {
-        let tags = readTags(url)
-        return tags.grade == request.recipe.fingerprint && tags.source == request.sourceKey
+    /// What the file at `url` is, compared with this request.
+    public static func identity(at url: URL, of request: GradedRenderRequest) -> GradedRenderIdentity {
+        guard let tags = readTags(url) else { return .unknown }
+        guard tags.source == request.sourceKey else { return .other }
+        return tags.grade == request.recipe.fingerprint ? .same : .olderGrade
     }
 
-    public static func readTags(_ url: URL) -> (grade: String?, source: String?) {
+    /// The copy's grade and source tags; nil when they could not be read
+    /// within `timeout` (a sleeping NAS, say). A file without tags reads
+    /// as two nils, which is an answer: not ours.
+    public static func readTags(_ url: URL, timeout: TimeInterval = 20) -> (grade: String?, source: String?)? {
         let asset = AVURLAsset(url: url)
         let semaphore = DispatchSemaphore(value: 0)
         final class Box: @unchecked Sendable { var grade: String?; var source: String? }
@@ -174,8 +280,46 @@ public final class GradedVideoExporter: @unchecked Sendable {
             }
             semaphore.signal()
         }
-        _ = semaphore.wait(timeout: .now() + 20)
+        guard semaphore.wait(timeout: .now() + timeout) == .success else { return nil }
         return (box.grade, box.source)
+    }
+
+    /// Whether this exact render already exists (drive or NAS mirror),
+    /// without rendering — what the before-sync count uses.
+    public static func existingRender(of request: GradedRenderRequest) -> URL? {
+        if case .alreadyRendered(let url) = GradedRenderNaming.resolve(
+            source: request.source, folder: request.outputFolder, mirror: request.mirrorFolder,
+            exists: { DriveMoveService.exists($0.path) }, identity: { identity(at: $0, of: request) }
+        ) { return url }
+        return nil
+    }
+
+    /// Free bytes on the volume `url` is on (or would be, walking up to the
+    /// nearest folder that exists); nil when the volume does not say.
+    public static func availableBytes(near url: URL) -> Int64? {
+        var folder = url
+        while !FileManager.default.fileExists(atPath: folder.path), folder.pathComponents.count > 1 {
+            folder.deleteLastPathComponent()
+        }
+        let values = try? folder.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey, .volumeAvailableCapacityKey])
+        if let important = values?.volumeAvailableCapacityForImportantUsage, important > 0 { return important }
+        return values?.volumeAvailableCapacity.map(Int64.init)
+    }
+
+    /// About how many bytes the copy will take: the target video bit rate
+    /// plus the original's audio, over the clip's length.
+    public static func estimatedBytes(of source: URL) -> Int64? {
+        let estimate: Int64?? = try? blocking {
+            let asset = CameraVideoAsset.asset(for: source)
+            let duration = try await asset.load(.duration).seconds
+            guard duration.isFinite, duration > 0 else { return nil }
+            var audioRate: Float = 0
+            for track in try await asset.loadTracks(withMediaType: .audio) { audioRate += try await track.load(.estimatedDataRate) }
+            let videoRate = try await asset.loadTracks(withMediaType: .video).first?.load(.estimatedDataRate) ?? 0
+            let bits = (Double(bitRate(sourceDataRate: Double(videoRate))) + Double(audioRate)) * duration
+            return Int64(bits / 8 * 1.03)
+        }
+        return estimate ?? nil
     }
 
     // MARK: Writing

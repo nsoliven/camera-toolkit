@@ -104,8 +104,9 @@ final class GradedVideoExporterTests: XCTestCase {
             exporter.requireHardwareEncoder = false
             let progressBox = ProgressBox()
             let first = try exporter.render(request, progress: { progressBox.add($0.fraction) })
-            guard case .rendered(let url) = first else { return XCTFail("expected a render, got \(first)") }
+            guard case .rendered(let url, let beside) = first else { return XCTFail("expected a render, got \(first)") }
             XCTAssertEqual(url.lastPathComponent, "C0001_709.mov")
+            XCTAssertTrue(beside.isEmpty)
             XCTAssertEqual(url.deletingLastPathComponent().lastPathComponent, "Rec709")
             XCTAssertEqual(progressBox.last, 1, accuracy: 1e-9)
             XCTAssertEqual(try sha(source), originalHash, "the original is only read")
@@ -130,8 +131,8 @@ final class GradedVideoExporterTests: XCTestCase {
 
             // Capture time and grade are in the copy; it sorts by the same mtime.
             let tags = GradedVideoExporter.readTags(url)
-            XCTAssertEqual(tags.grade, request.recipe.fingerprint)
-            XCTAssertEqual(tags.source, request.sourceKey)
+            XCTAssertEqual(tags?.grade, request.recipe.fingerprint)
+            XCTAssertEqual(tags?.source, request.sourceKey)
             let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
             XCTAssertEqual((attributes[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0, stamp.timeIntervalSince1970, accuracy: 1)
             let metadata = try await asset.load(.metadata)
@@ -154,6 +155,7 @@ final class GradedVideoExporterTests: XCTestCase {
             warmer.recipe.grade.temperature = 30
             let third = try exporter.render(warmer)
             XCTAssertEqual(third.url.lastPathComponent, "C0001_709 (2).mov")
+            XCTAssertEqual(third, .rendered(third.url, beside: [url]), "the older copy is reported, and kept")
             XCTAssertEqual(try sha(url), renderedHash, "never overwritten")
 
             // A graded pixel differs from the flat one.
@@ -162,6 +164,64 @@ final class GradedVideoExporterTests: XCTestCase {
             let flatFrame = try await AVAssetImageGenerator(asset: AVURLAsset(url: source)).image(at: CMTime(value: 6, timescale: 24)).image
             XCTAssertNotEqual(meanLuma(gradedFrame), meanLuma(flatFrame), accuracy: 0.01)
         }
+    }
+
+    func testStalePartialsAreClearedAndAMirroredRenderCounts() async throws {
+        try await withTemporaryDirectoryAsync { root in
+            let source = root.appendingPathComponent("Drive/2026/Trip/Originals/A7V/C0002.MOV")
+            try FileManager.default.createDirectory(at: source.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Self.makeClip(at: source, frames: 6)
+            let output = root.appendingPathComponent("Drive/2026/Trip/Edited/Rec709", isDirectory: true)
+            let mirror = root.appendingPathComponent("NAS/2026/Trip/Edited/Rec709", isDirectory: true)
+
+            // A crash left a partial and someone left an unrelated file.
+            let temporary = output.appendingPathComponent(GradedRenderNaming.temporaryFolderName, isDirectory: true)
+            try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
+            let stale = temporary.appendingPathComponent(GradedRenderNaming.partialName())
+            try Data(repeating: 1, count: 1_000).write(to: stale)
+            let unrelated = temporary.appendingPathComponent("notes.txt")
+            try Data("keep".utf8).write(to: unrelated)
+            XCTAssertTrue(GradedRenderNaming.isPartialName(stale.lastPathComponent))
+            XCTAssertFalse(GradedRenderNaming.isPartialName("notes.txt"))
+            XCTAssertFalse(GradedRenderNaming.isPartialName("x" + GradedRenderNaming.partialSuffix))
+            XCTAssertTrue(GradedRenderNaming.isPartialName(stale.lastPathComponent + ".sb-45a471e7-abc"), "the writer's scratch copy")
+            XCTAssertFalse(GradedRenderNaming.isPartialName("C0001_709.mov.sb-1"))
+            XCTAssertTrue(NASSyncPlanner.isJunk(stale.lastPathComponent))
+
+            XCTAssertEqual(GradedRenderNaming.removeStalePartials(in: output), 1)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: stale.path))
+            XCTAssertTrue(FileManager.default.fileExists(atPath: unrelated.path), "only the exporter's own partials go")
+            try FileManager.default.removeItem(at: unrelated)
+
+            let exporter = GradedVideoExporter()
+            exporter.requireHardwareEncoder = false
+            var request = GradedRenderRequest(
+                source: source, recipe: GradeRecipe(grade: .rec709, profile: .sLog3SGamut3Cine, range: .full),
+                sourceKey: "C0002.MOV|1|1", sourceModifiedAt: Date(timeIntervalSince1970: 1_780_000_000),
+                outputFolder: output, mirrorFolder: mirror
+            )
+            // Render once, then make it look as if Sync carried it to the
+            // NAS and the drive copy is gone.
+            let made = try exporter.render(request).url
+            try FileManager.default.createDirectory(at: mirror, withIntermediateDirectories: true)
+            try FileManager.default.moveItem(at: made, to: mirror.appendingPathComponent(made.lastPathComponent))
+            XCTAssertEqual(try exporter.render(request), .alreadyRendered(mirror.appendingPathComponent("C0002_709.mov")), "the NAS copy counts")
+            XCTAssertFalse(FileManager.default.fileExists(atPath: made.path), "nothing re-rendered on the drive")
+
+            // Another grade: the NAS's name is not reused on the drive.
+            request.recipe.grade.exposure = 1
+            let next = try exporter.render(request)
+            XCTAssertEqual(next.url.lastPathComponent, "C0002_709 (2).mov")
+            XCTAssertEqual(next.url.deletingLastPathComponent().standardizedFileURL.path, output.standardizedFileURL.path)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: temporary.path), "the temporary folder goes once empty")
+        }
+    }
+
+    func testAnUnreadableTakenNameIsNeverRenderedBeside() {
+        let source = URL(fileURLWithPath: "/Volumes/Buffer/C0001.MP4")
+        let folder = URL(fileURLWithPath: "/Volumes/Buffer/Edited/Rec709")
+        let result = GradedRenderNaming.resolve(source: source, folder: folder, exists: { $0.lastPathComponent == "C0001_709.mov" }, identity: { _ in .unknown })
+        XCTAssertEqual(result, .undecided(folder.appendingPathComponent("C0001_709.mov")))
     }
 
     func testBitRateFollowsTheOriginalWithinBounds() {

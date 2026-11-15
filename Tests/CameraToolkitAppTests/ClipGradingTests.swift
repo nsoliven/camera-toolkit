@@ -136,6 +136,89 @@ final class ClipGradingTests: XCTestCase {
         }
     }
 
+    /// With render-before-sync on, the Sync is its own queued job right
+    /// behind the render: it keeps its place, and still runs when the render
+    /// is taken off the queue (or fails, or is stopped).
+    func testSyncIsQueuedBehindTheRenderAndSurvivesItsCancellation() async throws {
+        try await withSandbox { root, model, workspace in
+            let grading = workspace.grading
+            let event = SavedCameraEvent(name: "Beach Day", eventDate: Date(timeIntervalSince1970: 1_780_000_000))
+            let date = Date(timeIntervalSince1970: 1_780_000_100)
+            model.updateConfiguration { configuration in
+                configuration.savedEvents = [event]
+                configuration.photoEventAssignments = [PhotoEventAssignment(
+                    sourceRootPath: root.appendingPathComponent("Card").path, relativePath: "C0001.MP4",
+                    fileSize: 64, modifiedAt: date, eventID: event.id, deviceID: "sony-a7v"
+                )]
+                configuration.gradeDefaults.setLook(.rec709, for: .sLog3SGamut3Cine)
+                configuration.renderGradedCopiesBeforeSync = true
+            }
+            let assignment = model.configuration.photoEventAssignments[0]
+            let clip = try XCTUnwrap(workspace.locations.driveURL(for: assignment, event: event, policy: .buffer))
+            try FileManager.default.createDirectory(at: clip.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data(repeating: 1, count: 64).write(to: clip)
+            try Data(sidecar.utf8).write(to: clip.deletingLastPathComponent().appendingPathComponent("C0001M01.XML"))
+
+            var asked: [ClipGrading.RenderBeforeSyncSummary] = []
+            grading.confirmRenderBeforeSync = { summary in
+                asked.append(summary)
+                return .renderThenSync
+            }
+            UserDefaults.standard.removeObject(forKey: ClipGrading.renderBeforeSyncConfirmedKey)
+            defer { UserDefaults.standard.removeObject(forKey: ClipGrading.renderBeforeSyncConfirmedKey) }
+            // Another job holds the gate, so both wait in the queue.
+            model.isBusy = true
+            var syncedNow = false
+            var queuedSyncStarts: [UUID] = []
+            grading.renderBeforeSyncIfWanted(
+                events: [event], syncTitle: "Beach Day",
+                syncNow: { syncedNow = true },
+                queueSync: { queuedSyncStarts.append($0) }
+            )
+            let deadline = ContinuousClock.now + .seconds(20)
+            while model.queuedFileJobs.count < 2, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(20)) }
+            XCTAssertEqual(asked.count, 1, "the first run asks")
+            XCTAssertEqual(asked.first?.count, 1)
+            XCTAssertTrue(asked.first?.isFirstRun == true)
+            XCTAssertFalse(syncedNow)
+            XCTAssertEqual(model.queuedFileJobs.map(\.action), [.gradeRender, .syncBuffer], "the sync waits right behind the render")
+
+            // Taking the render off the queue leaves the sync queued.
+            model.cancelQueuedFileJob(id: model.queuedFileJobs[0].id)
+            XCTAssertEqual(model.queuedFileJobs.map(\.action), [.syncBuffer])
+            let syncID = model.queuedFileJobs[0].id
+            model.isBusy = false
+            model.startNextQueuedFileJobIfPossible()
+            XCTAssertEqual(queuedSyncStarts, [syncID], "the sync starts with its own queued row")
+        }
+    }
+
+    func testRenderJobStopsOnStopAndBeforeRunningOutOfSpace() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("GradeStop-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let requests = (1...3).map { index in
+            GradedRenderRequest(
+                source: folder.appendingPathComponent("C000\(index).MP4"),
+                recipe: GradeRecipe(grade: .rec709, profile: .sLog3SGamut3Cine),
+                sourceKey: "C000\(index)|1|1", sourceModifiedAt: Date(),
+                outputFolder: folder.appendingPathComponent("Edited/Rec709", isDirectory: true)
+            )
+        }
+        let stopped = try ClipGrading.runRender(requests, isStopped: { true }, progress: { _ in })
+        XCTAssertTrue(stopped.rendered.isEmpty)
+        XCTAssertEqual(stopped.stoppedReason, "Stopped after 0 of 3.")
+
+        let full = try ClipGrading.runRender(
+            requests,
+            availableBytes: { _ in 6 * 1_024 * 1_024 * 1_024 },
+            estimatedBytes: { _ in 2 * 1_024 * 1_024 * 1_024 },
+            progress: { _ in }
+        )
+        XCTAssertTrue(full.rendered.isEmpty, "nothing is started that would eat the last of the space")
+        XCTAssertTrue(full.stoppedReason?.hasPrefix("Stopped before C0001.MP4") == true, full.stoppedReason ?? "nil")
+        XCTAssertTrue(ClipGrading.summary(full, refusals: []).contains("kept free"))
+    }
+
     func testGradedThumbnailsAreCachedUnderTheirOwnKey() async throws {
         try await withSandbox { root, _, _ in
             let url = root.appendingPathComponent("frame.png")

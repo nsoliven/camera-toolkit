@@ -50,12 +50,18 @@ extension ClipGrading {
                     continue
                 }
                 plan.eventIDs.insert(event.id)
+                let output = GradedRenderNaming.outputFolder(editedRoot: edited)
+                // On the drive, the NAS copy of the folder is checked too:
+                // a copy Sync already carried counts, and its name is never
+                // reused for another render.
+                let onNAS = output.path.hasPrefix(workspace.locations.nasRoot.standardizedFileURL.path + "/")
                 plan.requests.append(GradedRenderRequest(
                     source: item.primary.url,
                     recipe: recipe,
                     sourceKey: Self.fileKey(item.primary),
                     sourceModifiedAt: item.primary.modifiedAt,
-                    outputFolder: GradedRenderNaming.outputFolder(editedRoot: edited)
+                    outputFolder: output,
+                    mirrorFolder: onNAS ? nil : workspace.locations.nasMirrorURL(forDrivePath: output.path)
                 ))
             }
         }
@@ -72,13 +78,43 @@ extension ClipGrading {
         enqueueRender(plan, reason: nil)
     }
 
-    /// With "Send graded versions of log videos to Immich" on, renders the
-    /// graded copies of the synced events' log clips first, then runs
-    /// `sync` once that job has settled (whether or not every copy worked).
-    /// Off, or with nothing to render, `sync` runs at once.
-    func renderBeforeSyncIfWanted(events: [SavedCameraEvent], sync: @escaping @MainActor () -> Void) {
+    // MARK: Render before Sync
+
+    /// What a before-sync render would do, shown before it starts.
+    struct RenderBeforeSyncSummary: Equatable {
+        var count: Int
+        var alreadyThere: Int
+        var estimatedBytes: Int64
+        var freeBytes: Int64?
+        var isFirstRun: Bool
+    }
+
+    enum RenderBeforeSyncChoice: Equatable {
+        case renderThenSync
+        case syncOnly
+        case cancel
+    }
+
+    /// More copies than this in one run always ask first.
+    static let renderBeforeSyncAskAbove = 5
+    static let renderBeforeSyncConfirmedKey = "CameraToolkit.renderBeforeSyncConfirmed"
+
+    /// With "Send graded versions of log videos to Immich" on, works out
+    /// which graded copies the synced events still need. With none, the
+    /// sync starts as it always did (`syncNow`). Otherwise — after asking
+    /// on the first run and whenever there are more than a handful — it
+    /// queues the render job and then the Sync itself as a queued file job
+    /// right behind it (`queueSync`, handed the queued job's id), so the
+    /// Sync keeps its place whatever the render does: done, failed, stopped
+    /// or taken off the queue.
+    func renderBeforeSyncIfWanted(
+        events: [SavedCameraEvent],
+        syncTitle: String,
+        syncNow: @escaping @MainActor () -> Void,
+        queueSync: @escaping @MainActor (UUID) -> Void
+    ) {
         guard model.configuration.renderGradedCopiesBeforeSync else {
-            sync()
+            syncNow()
             return
         }
         var policies: [UUID: EventStoragePolicy] = [:]
@@ -96,39 +132,96 @@ extension ClipGrading {
         let renderer = self.renderer
         model.statusMessage = "Looking for graded log clips to render before the sync…"
         Task { @MainActor [weak self] in
-            let requests = await Task.detached(priority: .userInitiated) { () -> [GradedRenderRequest] in
-                var ranges: [String: VideoSignalRange] = [:]
-                let found = GradedSyncPlanner.requests(
-                    inputs,
-                    detect: { LogProfileDetector.profile(clipBesideSidecar: $0) },
-                    range: { url in ranges[url.path] ?? .full }
-                )
-                for request in found { ranges[request.source.path] = await renderer.signalRange(of: request.source) ?? request.recipe.range }
-                return found.map { request in
-                    var request = request
-                    request.recipe.range = ranges[request.source.path] ?? request.recipe.range
-                    return request
-                }
+            let survey = await Task.detached(priority: .userInitiated) {
+                Self.surveyBeforeSync(inputs, renderer: renderer)
             }.value
             guard let self else { return }
-            guard !requests.isEmpty else {
-                sync()
+            guard !survey.pending.isEmpty else {
+                syncNow()
                 return
             }
-            var plan = RenderPlan()
-            plan.requests = requests
-            plan.eventIDs = Set(events.map(\.id))
-            enqueueRender(plan, reason: "Before Sync to NAS: Rec.709 copies of graded log clips into Edited/\(GradedRenderNaming.folderName), so they reach the NAS and Immich.", afterSettled: sync)
+            let firstRun = !UserDefaults.standard.bool(forKey: Self.renderBeforeSyncConfirmedKey)
+            let summary = RenderBeforeSyncSummary(
+                count: survey.pending.count, alreadyThere: survey.alreadyThere,
+                estimatedBytes: survey.estimatedBytes, freeBytes: survey.freeBytes, isFirstRun: firstRun
+            )
+            var choice = RenderBeforeSyncChoice.renderThenSync
+            if firstRun || summary.count > Self.renderBeforeSyncAskAbove {
+                choice = confirmRenderBeforeSync(summary)
+            }
+            switch choice {
+            case .cancel:
+                model.statusMessage = "Nothing was rendered or synced."
+            case .syncOnly:
+                syncNow()
+            case .renderThenSync:
+                UserDefaults.standard.set(true, forKey: Self.renderBeforeSyncConfirmedKey)
+                var plan = RenderPlan()
+                plan.requests = survey.pending
+                plan.eventIDs = Set(events.map(\.id))
+                enqueueRender(plan, reason: "Before Sync to NAS: Rec.709 copies of graded log clips into Edited/\(GradedRenderNaming.folderName), so they reach the NAS and Immich.")
+                model.enqueueFileJob(
+                    action: .syncBuffer,
+                    queuedNote: "Sync \(syncTitle) to the NAS.",
+                    detail: "Starts after the graded copies, whether or not every copy was made. Copies only files missing on the NAS and verifies each one.",
+                    skippedNote: "Did not start: the NAS was not connected when its turn came. Nothing changed.",
+                    start: queueSync
+                )
+            }
         }
     }
 
-    func enqueueRender(_ plan: RenderPlan, reason: String?, then: (@MainActor () -> Void)? = nil, afterSettled: (@MainActor () -> Void)? = nil) {
+    struct BeforeSyncSurvey: Sendable {
+        var pending: [GradedRenderRequest] = []
+        var alreadyThere = 0
+        var estimatedBytes: Int64 = 0
+        var freeBytes: Int64?
+    }
+
+    /// The planner's requests with each clip's probed signal range (the
+    /// same source a manual render uses), minus copies already made.
+    nonisolated static func surveyBeforeSync(_ inputs: GradedSyncPlanner.Inputs, renderer: GradeRenderer) -> BeforeSyncSurvey {
+        let found = GradedSyncPlanner.requests(
+            inputs,
+            detect: { LogProfileDetector.profile(clipBesideSidecar: $0) },
+            range: { _ in .full }
+        )
+        var survey = BeforeSyncSurvey()
+        for var request in found {
+            request.recipe.range = probedRange(request.source, renderer: renderer) ?? request.recipe.range
+            if GradedVideoExporter.existingRender(of: request) != nil {
+                survey.alreadyThere += 1
+                continue
+            }
+            survey.estimatedBytes += GradedVideoExporter.estimatedBytes(of: request.source) ?? 0
+            survey.pending.append(request)
+        }
+        survey.freeBytes = survey.pending.first.flatMap { GradedVideoExporter.availableBytes(near: $0.outputFolder) }
+        return survey
+    }
+
+    nonisolated static func probedRange(_ url: URL, renderer: GradeRenderer) -> VideoSignalRange? {
+        final class Box: @unchecked Sendable { var range: VideoSignalRange? }
+        let box = Box()
+        let done = DispatchSemaphore(value: 0)
+        Task.detached {
+            box.range = await renderer.signalRange(of: url)
+            done.signal()
+        }
+        _ = done.wait(timeout: .now() + 20)
+        return box.range
+    }
+
+    // MARK: Render job
+
+    func enqueueRender(_ plan: RenderPlan, reason: String?) {
         let requests = plan.requests
         let count = requests.count
         let refusals = plan.refusals
         let eventIDs = plan.eventIDs
         let title = "Render \(count) graded cop\(count == 1 ? "y" : "ies")"
         let detail = reason ?? "Rec.709 HEVC copies into Edited/\(GradedRenderNaming.folderName). Originals are only read."
+        let renderer = self.renderer
         model.enqueueFileJob(
             action: .gradeRender,
             queuedNote: "\(title).",
@@ -136,19 +229,21 @@ extension ClipGrading {
             skippedNote: "Did not start: nothing to render. Nothing changed."
         ) { [weak self] (jobID: UUID) in
             guard let self else { return }
+            let stop = RenderStopFlag()
+            model.registerStop(jobID: jobID) { stop.stop() }
+            let model = self.model
             model.runBackgroundJob(
                 action: .gradeRender,
                 runningNote: "\(title)…",
                 logTitle: title,
                 logDetail: detail,
-                onSettled: afterSettled.map { follow in { @MainActor @Sendable in Task { @MainActor in follow() } } },
+                onSettled: { @MainActor in model.unregisterStop(jobID: jobID) },
                 jobID: jobID,
                 operation: { progress in
-                    try Self.runRender(requests, progress: progress)
+                    try Self.runRender(requests, renderer: renderer, isStopped: { stop.isStopped }, progress: progress)
                 },
                 completion: { [weak self] (outcome: RenderOutcome) in
                     for eventID in eventIDs { self?.workspace.refreshEditTags(for: eventID) }
-                    then?()
                     return Self.summary(outcome, refusals: refusals)
                 }
             )
@@ -158,18 +253,41 @@ extension ClipGrading {
     struct RenderOutcome: Sendable {
         var rendered: [URL] = []
         var alreadyThere: [URL] = []
+        /// New copies saved beside an older copy of the same clip.
+        var besideOlder: [URL] = []
         var failures: [String] = []
+        /// Why the job stopped before the end (Stop, or not enough space).
+        var stoppedReason: String?
     }
+
+    /// Room kept free on the volume a copy is written to.
+    nonisolated static let freeSpaceMargin: Int64 = 5 * 1_024 * 1_024 * 1_024
 
     nonisolated static func runRender(
         _ requests: [GradedRenderRequest],
+        renderer: GradeRenderer = .shared,
+        exporter: GradedVideoExporter? = nil,
+        isStopped: @escaping @Sendable () -> Bool = { false },
+        availableBytes: (URL) -> Int64? = { GradedVideoExporter.availableBytes(near: $0) },
+        estimatedBytes: (URL) -> Int64? = { GradedVideoExporter.estimatedBytes(of: $0) },
         progress: @escaping @Sendable (BackgroundJobUpdate) -> Void
     ) throws -> RenderOutcome {
-        let exporter = GradedVideoExporter()
+        let exporter = exporter ?? GradedVideoExporter(renderer: renderer)
         var outcome = RenderOutcome()
         let total = requests.count
+        // A crash or a Stop can leave partials: clear them first, in every
+        // folder this job touches, whatever it goes on to render.
+        for folder in Set(requests.map(\.outputFolder)) {
+            GradedRenderNaming.removeStalePartials(in: folder)
+        }
         for (index, base) in requests.enumerated() {
+            if isStopped() {
+                outcome.stoppedReason = "Stopped after \(index) of \(total)."
+                break
+            }
             var prepared = base
+            // One range source for every render: the clip's own format.
+            prepared.recipe.range = probedRange(prepared.source, renderer: renderer) ?? prepared.recipe.range
             let sidecar = LogProfileDetector.sonySidecarDevice(forClip: prepared.source)
             prepared.make = sidecar?.make
             prepared.model = sidecar?.model
@@ -185,6 +303,16 @@ extension ClipGrading {
                 processedFiles: index,
                 totalFiles: total
             ))
+            if let existing = GradedVideoExporter.existingRender(of: request) {
+                outcome.alreadyThere.append(existing)
+                continue
+            }
+            if let need = estimatedBytes(request.source), let free = availableBytes(request.outputFolder),
+               free < need + freeSpaceMargin {
+                let formatter = ByteCountFormatter()
+                outcome.stoppedReason = "Stopped before \(name): \(formatter.string(fromByteCount: max(free, 0))) free where the copy goes; it needs about \(formatter.string(fromByteCount: need)) plus \(formatter.string(fromByteCount: freeSpaceMargin)) kept free."
+                break
+            }
             do {
                 let result = try exporter.render(request, progress: { step in
                     progress(BackgroundJobUpdate(
@@ -195,16 +323,22 @@ extension ClipGrading {
                         processedFiles: index,
                         totalFiles: total
                     ))
-                })
+                }, isCancelled: isStopped)
                 switch result {
-                case .rendered(let url): outcome.rendered.append(url)
-                case .alreadyRendered(let url): outcome.alreadyThere.append(url)
+                case .rendered(let url, let beside):
+                    outcome.rendered.append(url)
+                    if !beside.isEmpty { outcome.besideOlder.append(url) }
+                case .alreadyRendered(let url):
+                    outcome.alreadyThere.append(url)
                 }
+            } catch is CancellationError {
+                outcome.stoppedReason = "Stopped during \(name); its partial copy was removed."
+                break
             } catch {
                 outcome.failures.append("\(name): \(error.localizedDescription)")
             }
         }
-        if outcome.rendered.isEmpty, outcome.alreadyThere.isEmpty, let first = outcome.failures.first {
+        if outcome.rendered.isEmpty, outcome.alreadyThere.isEmpty, outcome.stoppedReason == nil, let first = outcome.failures.first {
             throw ToolkitError.commandFailed("No graded copy was made. \(first)")
         }
         return outcome
@@ -212,8 +346,12 @@ extension ClipGrading {
 
     nonisolated static func summary(_ outcome: RenderOutcome, refusals: [String]) -> String {
         var parts: [String] = []
+        if let stopped = outcome.stoppedReason { parts.append(stopped) }
         if !outcome.rendered.isEmpty {
             parts.append("Rendered \(outcome.rendered.count) graded cop\(outcome.rendered.count == 1 ? "y" : "ies") into Edited/\(GradedRenderNaming.folderName)")
+        }
+        if !outcome.besideOlder.isEmpty {
+            parts.append("\(outcome.besideOlder.count) sit\(outcome.besideOlder.count == 1 ? "s" : "") beside an older copy of the same clip with its earlier grade — the older copy is kept; remove it in Edited/\(GradedRenderNaming.folderName) if you no longer want it")
         }
         if !outcome.alreadyThere.isEmpty {
             parts.append("\(outcome.alreadyThere.count) already there unchanged")
@@ -226,4 +364,12 @@ extension ClipGrading {
         }
         return parts.joined(separator: "; ") + ". Originals untouched; Sync to NAS carries the copies."
     }
+}
+
+/// Set by Stop in the Jobs window; the render checks it between frames.
+final class RenderStopFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stopped = false
+    var isStopped: Bool { lock.withLock { stopped } }
+    func stop() { lock.withLock { stopped = true } }
 }

@@ -176,6 +176,25 @@ final class DashboardModel {
     @ObservationIgnored private(set) var colorGradesSnapshot: [String: ClipGrade] = [:]
     @ObservationIgnored private(set) var gradeDefaultsSnapshot = GradeDefaults()
     /// Heard with the old and new grades after any change to either.
+    /// Running jobs that can be stopped part-way (graded renders), and how.
+    private(set) var stoppableJobIDs: Set<UUID> = []
+    @ObservationIgnored private var jobStopHandlers: [UUID: @MainActor () -> Void] = [:]
+
+    func registerStop(jobID: UUID, _ stop: @escaping @MainActor () -> Void) {
+        jobStopHandlers[jobID] = stop
+        stoppableJobIDs.insert(jobID)
+    }
+
+    func unregisterStop(jobID: UUID) {
+        jobStopHandlers[jobID] = nil
+        stoppableJobIDs.remove(jobID)
+    }
+
+    func stopJob(id: UUID) {
+        jobStopHandlers[id]?()
+        statusMessage = "Stopping after the frame being written…"
+    }
+
     @ObservationIgnored var onColorGradesChanged: (@MainActor (_ old: [String: ClipGrade], _ new: [String: ClipGrade], _ defaultsChanged: Bool) -> Void)?
     /// The NAS share's address and its revision: the toolbar's NAS button and
     /// the sidebar read whether there is one to open, not the rest of the

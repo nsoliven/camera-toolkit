@@ -1,3 +1,4 @@
+import AppKit
 import CameraToolkitCore
 import Foundation
 import Observation
@@ -58,6 +59,31 @@ final class ClipGrading {
     }
 
     @ObservationIgnored private var lutObserver: NSObjectProtocol?
+    /// Asks before a before-sync render (first run, or a big one). Tests
+    /// answer it themselves.
+    @ObservationIgnored var confirmRenderBeforeSync: @MainActor (RenderBeforeSyncSummary) -> RenderBeforeSyncChoice = ClipGrading.askRenderBeforeSync
+
+    static func askRenderBeforeSync(_ summary: RenderBeforeSyncSummary) -> RenderBeforeSyncChoice {
+        let formatter = ByteCountFormatter()
+        let alert = NSAlert()
+        alert.messageText = "Render \(summary.count) graded cop\(summary.count == 1 ? "y" : "ies") before syncing?"
+        var lines = [
+            "About \(formatter.string(fromByteCount: summary.estimatedBytes)) of Rec.709 copies go into each event's Edited/\(GradedRenderNaming.folderName)"
+                + (summary.freeBytes.map { " (\(formatter.string(fromByteCount: $0)) free there)." } ?? "."),
+            "Sync to NAS then carries them to the NAS, where Immich picks them up. The sync waits in the queue behind the render; Stop in the Jobs window ends the render and the sync still runs.",
+        ]
+        if summary.alreadyThere > 0 { lines.append("\(summary.alreadyThere) cop\(summary.alreadyThere == 1 ? "y is" : "ies are") already there and will not be made again.") }
+        if summary.isFirstRun { lines.append("This is asked the first time, and again whenever more than \(renderBeforeSyncAskAbove) copies are due. Turn it off in Settings › Color.") }
+        alert.informativeText = lines.joined(separator: "\n\n")
+        alert.addButton(withTitle: "Render and Sync")
+        alert.addButton(withTitle: "Sync Without Rendering")
+        alert.addButton(withTitle: "Cancel")
+        switch alert.runModal() {
+        case .alertFirstButtonReturn: return .renderThenSync
+        case .alertSecondButtonReturn: return .syncOnly
+        default: return .cancel
+        }
+    }
 
     var model: DashboardModel { workspace.model }
 

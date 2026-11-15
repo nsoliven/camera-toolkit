@@ -49,11 +49,26 @@ Settings › Color › Import LUTs… copies `.cube` files (after they parse) in
 
 ## Rendered copies
 
-**Render Graded Copy** (panel) or **Color › Render Graded Copies** queues a job in the Jobs window. Each copy is hardware HEVC Main 10 (VideoToolbox), 4:2:0, tagged Rec.709 (primaries, transfer, matrix), same size and frame rate, audio passed through untouched, at 75 % of the original's video data rate (8–150 Mb/s). It goes to `<event>/Edited/Rec709/<clip>_709.mov`, written as a partial under `Edited/Rec709/.TemporaryItems`, checked (opens, one video track, same length, decodes a frame), then renamed into place without replacing anything. The copy carries the capture time (`com.apple.quicktime.creationdate`, `©day`) and camera, the original's modification time, and the grade's fingerprint and the original's identity, so rendering again with the same grade skips it, and a changed grade gets `_709 (2).mov`. The original shows **Edited · Rec709** on its tile. Copies sync to the NAS with the normal Sync.
+**Render Graded Copy** (panel) or **Color › Render Graded Copies** queues a job in the Jobs window. Each copy is hardware HEVC Main 10 (VideoToolbox), 4:2:0, tagged Rec.709 (primaries, transfer, matrix), same size and frame rate, audio passed through untouched, at 75 % of the original's video data rate (8–150 Mb/s). It goes to `<event>/Edited/Rec709/<clip>_709.mov`.
+
+- **Partials** are written as `Edited/Rec709/.TemporaryItems/<UUID>.ctsync-render.partial.mov`. Sync to NAS, the NAS listings and the edit-tag scan skip both the `.TemporaryItems` folder and the `.ctsync-` marker, so a partial a crash leaves can never be copied to the NAS. Every render clears stale partials (only names of exactly that form) in the folders it touches before it starts; the temporary folder is removed only when empty (`rmdir`).
+- A finished partial is checked (opens, one video track, same length, decodes a frame), then renamed into place with `NASFileIO.renameExclusive`, which claims the name first and so never replaces a file, on smbfs and exFAT too.
+- **Identity**: the copy carries the grade's fingerprint and the original's identity. A copy with the same grade already there — on the drive, or at the NAS mirror of the folder (where Sync already carried it) — is skipped. A NAS name is never reused for a different render on the drive. If a taken name's tags cannot be read in time, nothing is rendered beside it.
+- **Another grade**: a changed grade gets `_709 (2).mov`; the older copy is kept and the job's summary says so. Nothing is deleted.
+- Both the manual render and the before-sync render read the signal range from the clip's own format, so they agree on the fingerprint.
+- **Stop** in the Jobs window ends the job after the frame being written; the copy in progress is discarded, finished copies stay.
+- **Free space**: before each clip the job estimates the copy's size and stops, with a message, if that would leave less than 5 GB free where the copy goes.
+
+The copy carries the capture time (`com.apple.quicktime.creationdate`, `©day`) and camera, and the original's modification time. The original shows **Edited · Rec709** on its tile. Copies sync to the NAS with the normal Sync.
 
 ## Immich
 
-Immich reads the NAS library as an external library (see `IMMICH.md`), and each event's `Edited` folder is imported. **Settings › Color › Send graded versions of log videos to Immich** (off by default) renders the Rec.709 copy of every graded log clip in the events being synced, before Sync to NAS starts. The copy is written at its final name on the drive, so Immich imports it once and never sees it renamed. Nothing is uploaded and no Immich API is called by this feature.
+Immich reads the NAS library as an external library (see `IMMICH.md`), and each event's `Edited` folder is imported. **Settings › Color › Send graded versions of log videos to Immich** (off by default) renders the Rec.709 copy of every graded log clip in the events being synced before Sync to NAS:
+
+- It works from the catalog, so no board needs to be open, and counts only copies not already made (on the drive or the NAS).
+- The first time, and whenever more than five copies are due, it shows the count, the estimated size and the free space, and asks: render and sync, sync without rendering, or cancel.
+- The render is queued, and the Sync is queued as its own job right behind it. The Sync keeps its place whatever happens to the render — finished, failed, stopped, or taken off the queue.
+- Copies are written at their final name on the drive, so Immich imports each once and never sees it renamed. Nothing is uploaded and no Immich API is called by this feature.
 
 Graded copies are not stacked with their originals in Immich. Stacking would need both assets' ids after Immich's scan, writes to Immich state the app otherwise never makes, and it would break whenever a rename makes Immich treat a file as new. The copy sits next to the original by capture time instead.
 

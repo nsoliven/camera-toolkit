@@ -228,19 +228,28 @@ final class ColorGradePersistenceTests: XCTestCase {
         XCTAssertEqual(GradedRenderNaming.candidateName(forSource: source, attempt: 3), "C0001_709 (3).mov")
 
         var taken: Set<String> = []
-        func resolve(same: Set<String> = []) -> (url: URL, alreadyRendered: Bool)? {
-            GradedRenderNaming.resolve(source: source, folder: folder, exists: { taken.contains($0.lastPathComponent) }, isSameRender: { same.contains($0.lastPathComponent) })
+        func resolve(same: Set<String> = [], older: Set<String> = [], mirror: URL? = nil) -> GradedRenderNaming.Resolution {
+            GradedRenderNaming.resolve(
+                source: source, folder: folder, mirror: mirror,
+                exists: { taken.contains($0.path) },
+                identity: { same.contains($0.path) ? .same : older.contains($0.path) ? .olderGrade : .other }
+            )
         }
-        XCTAssertEqual(resolve()?.url.lastPathComponent, "C0001_709.mov")
-        XCTAssertEqual(resolve()?.alreadyRendered, false)
-        taken = ["C0001_709.mov"]
-        XCTAssertEqual(resolve()?.url.lastPathComponent, "C0001_709 (2).mov", "a different file there: next free name")
-        XCTAssertEqual(resolve(same: ["C0001_709.mov"])?.alreadyRendered, true, "the same render there: skip")
-        taken = ["C0001_709.mov", "C0001_709 (2).mov"]
-        let next = resolve(same: ["C0001_709 (2).mov"])
-        XCTAssertEqual(next?.url.lastPathComponent, "C0001_709 (2).mov")
-        XCTAssertEqual(next?.alreadyRendered, true)
-        XCTAssertNil(GradedRenderNaming.resolve(source: source, folder: folder, exists: { _ in true }, isSameRender: { _ in false }, maximumAttempts: 5))
+        func at(_ name: String, _ base: URL = folder) -> URL { base.appendingPathComponent(name) }
+        XCTAssertEqual(resolve(), .free(at("C0001_709.mov"), beside: []))
+        taken = [at("C0001_709.mov").path]
+        XCTAssertEqual(resolve(), .free(at("C0001_709 (2).mov"), beside: []), "a different file there: next free name")
+        XCTAssertEqual(resolve(older: taken), .free(at("C0001_709 (2).mov"), beside: [at("C0001_709.mov")]), "an older grade is reported and kept")
+        XCTAssertEqual(resolve(same: taken), .alreadyRendered(at("C0001_709.mov")), "the same render there: skip")
+        taken = [at("C0001_709.mov").path, at("C0001_709 (2).mov").path]
+        XCTAssertEqual(resolve(same: [at("C0001_709 (2).mov").path]), .alreadyRendered(at("C0001_709 (2).mov")))
+        XCTAssertEqual(GradedRenderNaming.resolve(source: source, folder: folder, exists: { _ in true }, identity: { _ in .other }, maximumAttempts: 5), .exhausted)
+
+        // The NAS mirror: its names are taken too, and its copy counts.
+        let nas = URL(fileURLWithPath: "/Volumes/nas_share/2026/Trip/Edited/Rec709")
+        taken = [at("C0001_709.mov", nas).path]
+        XCTAssertEqual(resolve(mirror: nas), .free(at("C0001_709 (2).mov"), beside: []), "never a name the NAS already holds")
+        XCTAssertEqual(resolve(same: taken, mirror: nas), .alreadyRendered(at("C0001_709.mov", nas)))
 
         XCTAssertTrue(GradedRenderNaming.isGradedCopy(folder.appendingPathComponent("C0001_709.mov")))
         XCTAssertTrue(GradedRenderNaming.isGradedCopy(folder.appendingPathComponent("C0001_709 (2).mov")))
@@ -253,6 +262,46 @@ final class ColorGradePersistenceTests: XCTestCase {
         XCTAssertEqual(EditTagLinker.stem(of: "C0001_709.mov"), "c0001")
         XCTAssertEqual(EditTagLinker.stem(of: "C0001_709 (2).mov"), "c0001")
         XCTAssertEqual(EditTagLinker.stem(of: "IMG_0709.MOV"), "img_0709", "a camera number is not a suffix")
+    }
+
+    func testOneUnreadableGradeInConfigKeepsTheRest() throws {
+        try withTemporaryDirectory { root in
+            var configuration = AppConfiguration.testConfiguration(root: root, catalog: root.appendingPathComponent("catalog.sqlite"))
+            configuration.colorGrades = ["good|1|1": .rec709, "also|2|2": ClipGrade(exposure: 1)]
+            var json = try JSONSerialization.jsonObject(with: JSONEncoder().encode(configuration)) as! [String: Any]
+            var grades = json["colorGrades"] as! [String: Any]
+            grades["broken|3|3"] = 42
+            json["colorGrades"] = grades
+            let decoded = try JSONDecoder().decode(AppConfiguration.self, from: JSONSerialization.data(withJSONObject: json))
+            XCTAssertEqual(decoded.colorGrades, configuration.colorGrades)
+        }
+    }
+
+    // MARK: Sync and partials
+
+    /// A partial a crashed render left must never reach the NAS, nor be
+    /// taken for an edit.
+    func testSyncAndTheEditScanIgnoreALeftoverPartial() throws {
+        try withTemporaryDirectory { root in
+            var configuration = AppConfiguration.testConfiguration(root: root, catalog: root.appendingPathComponent("catalog.sqlite"))
+            let event = SavedCameraEvent(name: "Beach Day", eventDate: Date(timeIntervalSince1970: 1_780_000_000))
+            configuration.savedEvents = [event]
+            let locations = EventStorageLocations(configuration: configuration)
+            let eventFolder = locations.eventFolder(for: event, policy: .buffer)
+            let output = GradedRenderNaming.outputFolder(editedRoot: locations.editedRoot(for: event, policy: .buffer))
+            let temporary = output.appendingPathComponent(GradedRenderNaming.temporaryFolderName, isDirectory: true)
+            try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
+            try Data(repeating: 0, count: 64).write(to: temporary.appendingPathComponent(GradedRenderNaming.partialName()))
+            try Data(repeating: 0, count: 64).write(to: output.appendingPathComponent("C0001_709.mov"))
+
+            let plan = NASSyncPlanner.plan(events: [event], locations: locations, checkLegacyLayout: false)
+            XCTAssertEqual(plan.items.map { ($0.relativePath as NSString).lastPathComponent }, ["C0001_709.mov"], "only the finished copy is synced")
+            XCTAssertTrue(plan.refused.isEmpty)
+
+            let edits = EditTagLinker.editedFiles(eventFolders: [eventFolder])
+            XCTAssertEqual(edits.map(\.name), ["C0001_709.mov"])
+            XCTAssertEqual(edits.first?.tag, "Rec709")
+        }
     }
 
     // MARK: Sync planner
@@ -290,6 +339,7 @@ final class ColorGradePersistenceTests: XCTestCase {
             XCTAssertEqual(requests[1].recipe.grade.exposure, 0.5, "its own grade")
             XCTAssertTrue(requests.allSatisfy { $0.outputFolder.path.hasSuffix("/Edited/Rec709") })
             XCTAssertTrue(requests.allSatisfy { $0.outputFolder.path.hasPrefix(locations.eventFolder(for: event, policy: .buffer).path) })
+            XCTAssertTrue(requests.allSatisfy { $0.mirrorFolder?.path.hasSuffix("/Edited/Rec709") == true }, "the NAS copy of the folder is checked too")
 
             // No defaults and no own grade: nothing to render.
             var bare = inputs

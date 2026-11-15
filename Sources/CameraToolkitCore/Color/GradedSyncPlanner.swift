@@ -80,12 +80,14 @@ public enum GradedSyncPlanner {
             case .none: break
             }
             let edited = inputs.locations.editedRoot(for: event, policy: policy)
+            let output = GradedRenderNaming.outputFolder(editedRoot: edited)
             requests.append(GradedRenderRequest(
                 source: url,
                 recipe: recipe,
                 sourceKey: key,
                 sourceModifiedAt: assignment.modifiedAt,
-                outputFolder: GradedRenderNaming.outputFolder(editedRoot: edited)
+                outputFolder: output,
+                mirrorFolder: inputs.locations.nasMirrorURL(forDrivePath: output.path)
             ))
         }
         return requests

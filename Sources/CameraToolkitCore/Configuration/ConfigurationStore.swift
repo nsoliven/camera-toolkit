@@ -320,7 +320,10 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         privateStagingPath = try values.decodeIfPresent(String.self, forKey: .privateStagingPath) ?? ""
         burstSplits = try values.decodeIfPresent([BurstSplit].self, forKey: .burstSplits) ?? []
         displayOrientations = try values.decodeIfPresent([String: Int].self, forKey: .displayOrientations) ?? [:]
-        colorGrades = (try? values.decodeIfPresent([String: ClipGrade].self, forKey: .colorGrades)) ?? [:]
+        // Entry by entry: one grade this build cannot read is dropped, not
+        // every grade with it.
+        colorGrades = ((try? values.decodeIfPresent([String: LossyGrade].self, forKey: .colorGrades)) ?? [:])
+            .compactMapValues(\.grade)
         gradeDefaults = (try? values.decodeIfPresent(GradeDefaults.self, forKey: .gradeDefaults)) ?? GradeDefaults()
         renderGradedCopiesBeforeSync = try values.decodeIfPresent(Bool.self, forKey: .renderGradedCopiesBeforeSync) ?? false
         normalizeLocationSelections()
@@ -1157,5 +1160,14 @@ public struct ConfigurationStore {
     public static func isSettingsOnly(_ data: Data) -> Bool {
         struct Marker: Decodable { var catalogOwnsEventState: Bool? }
         return (try? JSONDecoder().decode(Marker.self, from: data))?.catalogOwnsEventState == true
+    }
+}
+
+/// Decodes a grade, or nil for an entry that does not decode.
+struct LossyGrade: Decodable {
+    let grade: ClipGrade?
+
+    init(from decoder: Decoder) throws {
+        grade = try? ClipGrade(from: decoder)
     }
 }
