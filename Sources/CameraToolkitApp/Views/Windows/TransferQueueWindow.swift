@@ -644,6 +644,7 @@ struct JobListRow: View {
     static func runningSymbol(_ action: JobAction) -> String {
         switch action {
         case .faceScan: "person.crop.rectangle.stack"
+        case .gradeRender: "camera.filters"
         case .organize: "rectangle.3.group"
         case .nasRename: "arrow.left.arrow.right"
         case .ingestCard: "arrow.down.circle"
@@ -1189,6 +1190,7 @@ extension JobAction {
         case .faceScan: "Face Scan"
         case .nasRename: "NAS Rename"
         case .resolveConflict: "Resolve Conflict"
+        case .gradeRender: "Render Graded Copies"
         }
     }
 }

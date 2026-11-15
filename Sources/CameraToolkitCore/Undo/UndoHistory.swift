@@ -159,6 +159,19 @@ public struct UndoOrientationChange: Codable, Equatable, Sendable {
     }
 }
 
+/// One clip's colour grade before and after an action; nil is no grade.
+public struct UndoGradeChange: Codable, Equatable, Sendable {
+    public var key: String
+    public var before: ClipGrade?
+    public var after: ClipGrade?
+
+    public init(key: String, before: ClipGrade?, after: ClipGrade?) {
+        self.key = key
+        self.before = before
+        self.after = after
+    }
+}
+
 /// An event before and after an edit that touched no folder.
 public struct UndoEventPair: Codable, Equatable, Sendable {
     public var before: SavedCameraEvent
@@ -195,6 +208,8 @@ public enum UndoConfigChange: Codable, Equatable, Sendable {
     case burstSplit(BurstSplit)
     case orientations([UndoOrientationChange])
     case events(UndoEventsChange)
+    /// Colour grades set, pasted, applied in a batch or removed.
+    case colorGrades([UndoGradeChange])
 }
 
 /// What one Undo step replays.

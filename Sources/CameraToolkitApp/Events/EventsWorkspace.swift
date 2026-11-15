@@ -6944,6 +6944,12 @@ final class EventsWorkspace {
     /// One-way Buffer → NAS copy of the event and its subevents.
     func syncToNAS(_ eventID: UUID) {
         guard let event = event(eventID) else { return }
+        grading.renderBeforeSyncIfWanted(events: eventFamily(eventID)) { [weak self] in
+            self?.startSyncToNAS(event, eventID: eventID)
+        }
+    }
+
+    private func startSyncToNAS(_ event: SavedCameraEvent, eventID: UUID) {
         nasConnection.prepareForNASJob { [weak self] in
             guard let self else { return }
             // One event's sync renames what moved into place instead of
@@ -7064,6 +7070,12 @@ final class EventsWorkspace {
             model.statusMessage = "There are no events to sync."
             return
         }
+        grading.renderBeforeSyncIfWanted(events: events) { [weak self] in
+            self?.startSyncAllToNAS(events)
+        }
+    }
+
+    private func startSyncAllToNAS(_ events: [SavedCameraEvent]) {
         nasConnection.prepareForNASJob { [weak self] in
             // With the drive away nothing can be proven stale, so nothing is
             // set aside whatever the switch says; the renames that only put
@@ -8006,6 +8018,8 @@ final class EventsWorkspace {
     /// The pets side of the People window and of a face scan — its own
     /// index beside the catalog (`PetIndexDatabase`).
     @ObservationIgnored lazy var petGallery = PetGallery(model: model)
+    /// Colour grades, log detection, imported LUTs and graded renders.
+    @ObservationIgnored lazy var grading = ClipGrading(workspace: self)
     /// Test seam: supplies the pet engine so a pet pass can run without
     /// the pet sidecar installed. Nil in production.
     @ObservationIgnored var petAnalyzerProvider: (@Sendable () async throws -> FaceAnalyzing?)?

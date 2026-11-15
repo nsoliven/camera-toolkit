@@ -5,7 +5,7 @@ import XCTest
 @MainActor
 final class SettingsWindowTests: XCTestCase {
     func testPanesAreTheFiveToolbarTabsInOrder() {
-        XCTAssertEqual(SettingsPane.allCases.map(\.title), ["Locations", "Library", "Organizing", "Services", "Advanced"])
+        XCTAssertEqual(SettingsPane.allCases.map(\.title), ["Locations", "Library", "Organizing", "Color", "Services", "Advanced"])
         for pane in SettingsPane.allCases {
             XCTAssertNotNil(NSImage(systemSymbolName: pane.symbol, accessibilityDescription: nil), "\(pane.symbol) must exist")
             XCTAssertGreaterThanOrEqual(pane.contentSize.width, 620)

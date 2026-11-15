@@ -69,6 +69,17 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
     /// `DisplayRotation.fileKey`), in quarter-turns clockwise. Applied while
     /// decoding tiles and previews; media bytes are never rewritten.
     public var displayOrientations: [String: Int]
+    /// Colour grades per file identity key (`DisplayRotation.fileKey`).
+    /// Applied while decoding, playing and rendering copies; media bytes are
+    /// never rewritten. Catalog-owned, like `displayOrientations`.
+    public var colorGrades: [String: ClipGrade]
+    /// The look a log clip without its own grade is shown with, per profile.
+    public var gradeDefaults: GradeDefaults
+    /// Before Sync to NAS, render the Rec.709 copy of every graded log clip
+    /// the sync carries into the event's `Edited/Rec709`, so it reaches the
+    /// NAS — and Immich's external library — with the originals. Off until
+    /// the user turns it on.
+    public var renderGradedCopiesBeforeSync: Bool
 
     public init(
         demoRootPath: String,
@@ -106,7 +117,10 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         photoEventAssignments: [PhotoEventAssignment] = [],
         privateStagingPath: String = "",
         burstSplits: [BurstSplit] = [],
-        displayOrientations: [String: Int] = [:]
+        displayOrientations: [String: Int] = [:],
+        colorGrades: [String: ClipGrade] = [:],
+        gradeDefaults: GradeDefaults = GradeDefaults(),
+        renderGradedCopiesBeforeSync: Bool = false
     ) {
         self.demoRootPath = demoRootPath
         self.importSourcePath = importSourcePath
@@ -144,6 +158,9 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         self.privateStagingPath = privateStagingPath
         self.burstSplits = burstSplits
         self.displayOrientations = displayOrientations
+        self.colorGrades = colorGrades
+        self.gradeDefaults = gradeDefaults
+        self.renderGradedCopiesBeforeSync = renderGradedCopiesBeforeSync
         self.normalizeLocationSelections()
         self.normalizeEventSelection()
     }
@@ -185,6 +202,9 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         case privateStagingPath
         case burstSplits
         case displayOrientations
+        case colorGrades
+        case gradeDefaults
+        case renderGradedCopiesBeforeSync
         /// Present (true) in a settings-only file: events, assignments,
         /// display rotations, and burst splits live in the catalog.
         case catalogOwnsEventState
@@ -229,6 +249,8 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         try values.encode(batchID, forKey: .batchID)
         try values.encodeIfPresent(selectedEventID, forKey: .selectedEventID)
         try values.encode(privateStagingPath, forKey: .privateStagingPath)
+        if !gradeDefaults.isEmpty { try values.encode(gradeDefaults, forKey: .gradeDefaults) }
+        if renderGradedCopiesBeforeSync { try values.encode(true, forKey: .renderGradedCopiesBeforeSync) }
         if encoder.userInfo[Self.settingsOnlyUserInfoKey] as? Bool == true {
             try values.encode(true, forKey: .catalogOwnsEventState)
         } else {
@@ -236,6 +258,7 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
             try values.encode(photoEventAssignments, forKey: .photoEventAssignments)
             try values.encode(burstSplits, forKey: .burstSplits)
             try values.encode(displayOrientations, forKey: .displayOrientations)
+            if !colorGrades.isEmpty { try values.encode(colorGrades, forKey: .colorGrades) }
         }
     }
 
@@ -289,6 +312,9 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         privateStagingPath = try values.decodeIfPresent(String.self, forKey: .privateStagingPath) ?? ""
         burstSplits = try values.decodeIfPresent([BurstSplit].self, forKey: .burstSplits) ?? []
         displayOrientations = try values.decodeIfPresent([String: Int].self, forKey: .displayOrientations) ?? [:]
+        colorGrades = (try? values.decodeIfPresent([String: ClipGrade].self, forKey: .colorGrades)) ?? [:]
+        gradeDefaults = (try? values.decodeIfPresent(GradeDefaults.self, forKey: .gradeDefaults)) ?? GradeDefaults()
+        renderGradedCopiesBeforeSync = try values.decodeIfPresent(Bool.self, forKey: .renderGradedCopiesBeforeSync) ?? false
         normalizeLocationSelections()
         // A settings-only file has no events to validate the selection
         // against; it is normalized once the catalog's events are laid

@@ -9,6 +9,7 @@ enum SettingsPane: Int, CaseIterable, Identifiable {
     case locations
     case library
     case organizing
+    case color
     case services
     case advanced
 
@@ -22,6 +23,7 @@ enum SettingsPane: Int, CaseIterable, Identifiable {
         case .locations: "Locations"
         case .library: "Library"
         case .organizing: "Organizing"
+        case .color: "Color"
         case .services: "Services"
         case .advanced: "Advanced"
         }
@@ -32,6 +34,7 @@ enum SettingsPane: Int, CaseIterable, Identifiable {
         case .locations: "externaldrive"
         case .library: "photo.stack"
         case .organizing: "square.stack.3d.down.right"
+        case .color: "camera.filters"
         case .services: "network"
         case .advanced: "gearshape.2"
         }
@@ -42,6 +45,7 @@ enum SettingsPane: Int, CaseIterable, Identifiable {
         case .locations: NSSize(width: 680, height: 640)
         case .library: NSSize(width: 680, height: 640)
         case .organizing: NSSize(width: 680, height: 430)
+        case .color: NSSize(width: 680, height: 660)
         case .services: NSSize(width: 680, height: 620)
         case .advanced: NSSize(width: 680, height: 250)
         }
@@ -54,6 +58,7 @@ enum SettingsPane: Int, CaseIterable, Identifiable {
         case .locations: AnyView(LocationsSettingsPane(model: model))
         case .library: AnyView(LibrarySettingsPane(model: model))
         case .organizing: AnyView(OrganizingSettingsPane(model: model))
+        case .color: AnyView(ColorSettingsPane(model: model))
         case .services: AnyView(ServicesSettingsPane(model: model))
         case .advanced: AnyView(AdvancedSettingsPane(model: model))
         }

@@ -524,6 +524,66 @@ final class TileImageLoader: @unchecked Sendable {
         "\(url.path)#\(bucket)#\(DisplayRotation.requestToken(orientation))"
     }
 
+    // MARK: Graded pictures
+
+    /// The cache key of a graded picture: the plain key plus the grade's
+    /// fingerprint, so any change to the grade (look, intensity, controls,
+    /// profile, LUT) names a new picture and the tile refreshes.
+    static func gradedKeySuffix(_ recipe: GradeRecipe) -> String {
+        "#grade:\(recipe.shortFingerprint)"
+    }
+
+    /// A graded tile from memory, or nil. Like `cachedImage`, never touches
+    /// the filesystem.
+    func cachedImage(for url: URL, maximumPixelSize: Int, orientation: Int?, grade: GradeRecipe?) -> CGImage? {
+        guard let grade, !grade.grade.isIdentity else {
+            return cachedImage(for: url, maximumPixelSize: maximumPixelSize, orientation: orientation)
+        }
+        let bucket = Self.bucket(for: maximumPixelSize)
+        return store(for: bucket).object(forKey: (key(url, bucket, orientation) + Self.gradedKeySuffix(grade)) as NSString)?.image
+    }
+
+    /// A graded picture: the plain decode (shared with the ungraded tile,
+    /// its in-flight join, the disk cache and the warmer — nothing about
+    /// them changes), then the grade's cube applied on the GPU off the
+    /// main actor. Only the graded bitmap is kept, in memory.
+    func image(
+        for url: URL,
+        maximumPixelSize: Int,
+        orientation: Int?,
+        grade: GradeRecipe?,
+        priority: Operation.QueuePriority = .normal,
+        fileIdentity: String? = nil
+    ) async -> CGImage? {
+        guard let grade, !grade.grade.isIdentity else {
+            return await image(for: url, maximumPixelSize: maximumPixelSize, orientation: orientation, priority: priority, fileIdentity: fileIdentity)
+        }
+        let bucket = Self.bucket(for: maximumPixelSize)
+        let gradedKey = key(url, bucket, orientation) + Self.gradedKeySuffix(grade)
+        let store = store(for: bucket)
+        if let cached = store.object(forKey: gradedKey as NSString) { return cached.image }
+        guard let base = await image(for: url, maximumPixelSize: maximumPixelSize, orientation: orientation, priority: priority, fileIdentity: fileIdentity),
+              !Task.isCancelled else { return nil }
+        let graded: CGImage? = await withCheckedContinuation { continuation in
+            Self.gradeQueue.addOperation {
+                continuation.resume(returning: GradeRenderer.shared.grade(base, recipe: grade))
+            }
+        }
+        guard let graded else { return base }
+        store.setObject(Box(graded), forKey: gradedKey as NSString, cost: graded.bytesPerRow * graded.height)
+        return graded
+    }
+
+    /// Grades run two at a time at utility priority: a board of graded
+    /// tiles never starves the decodes or the main thread.
+    private static let gradeQueue: OperationQueue = {
+        let queue = OperationQueue()
+        queue.name = "CameraToolkit.TileImageLoader.grade"
+        queue.maxConcurrentOperationCount = 2
+        queue.qualityOfService = .utility
+        return queue
+    }()
+
     /// Every `orientation` a request can carry.
     private static let orientationVariants: [Int?] = [nil, 0, 1, 2, 3]
 

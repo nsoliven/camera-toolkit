@@ -169,6 +169,14 @@ final class DashboardModel {
     @ObservationIgnored private(set) var locationsSnapshot: [ConfiguredLocation] = []
     private(set) var orientationsRevision = 0
     @ObservationIgnored private(set) var orientationsSnapshot: [String: Int] = [:]
+    /// Colour grades and the per-profile defaults. Tiles do not read the
+    /// revision: `ClipGrading` hears `onColorGradesChanged` and touches only
+    /// the files whose grade changed.
+    private(set) var colorGradesRevision = 0
+    @ObservationIgnored private(set) var colorGradesSnapshot: [String: ClipGrade] = [:]
+    @ObservationIgnored private(set) var gradeDefaultsSnapshot = GradeDefaults()
+    /// Heard with the old and new grades after any change to either.
+    @ObservationIgnored var onColorGradesChanged: (@MainActor (_ old: [String: ClipGrade], _ new: [String: ClipGrade], _ defaultsChanged: Bool) -> Void)?
     /// The NAS share's address and its revision: the toolbar's NAS button and
     /// the sidebar read whether there is one to open, not the rest of the
     /// settings.
@@ -238,6 +246,16 @@ final class DashboardModel {
         if orientations != orientationsSnapshot {
             orientationsSnapshot = orientations
             orientationsRevision &+= 1
+        }
+        let grades = configuration.colorGrades
+        let defaults = configuration.gradeDefaults
+        if grades != colorGradesSnapshot || defaults != gradeDefaultsSnapshot {
+            let old = colorGradesSnapshot
+            let defaultsChanged = defaults != gradeDefaultsSnapshot
+            colorGradesSnapshot = grades
+            gradeDefaultsSnapshot = defaults
+            colorGradesRevision &+= 1
+            onColorGradesChanged?(old, grades, defaultsChanged)
         }
         assignmentCountSnapshot = configuration.photoEventAssignments.count
     }
@@ -332,6 +350,8 @@ final class DashboardModel {
         self.eventsSnapshot = configuration.savedEvents
         self.locationsSnapshot = configuration.configuredLocations
         self.orientationsSnapshot = configuration.displayOrientations
+        self.colorGradesSnapshot = configuration.colorGrades
+        self.gradeDefaultsSnapshot = configuration.gradeDefaults
         self.assignmentCountSnapshot = configuration.photoEventAssignments.count
         self.nasSMBURLSnapshot = configuration.nasSMBURL
         self.pathInputs = [

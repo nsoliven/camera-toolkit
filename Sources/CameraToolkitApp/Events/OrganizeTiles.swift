@@ -270,6 +270,10 @@ struct TileThumbnail: View {
     /// name, size and time name the thumbnail, so a tile fills in from this
     /// Mac when the NAS was read once already.
     var file: OrganizeFile? = nil
+    /// The clip's grade, or nil: the tile then draws the graded picture.
+    /// Its fingerprint is part of the task id and the cache key, so a
+    /// grade change redraws the tile.
+    var grade: GradeRecipe? = nil
 
     @Environment(\.displayScale) private var displayScale
     /// A bitmap that arrived from a decode after the tile was drawn. A
@@ -291,7 +295,7 @@ struct TileThumbnail: View {
         // A memory lookup — no file access — so a cached tile draws its
         // photo in its first frame. The cache answers before a bitmap this
         // tile decoded itself, which a rotation may have made stale.
-        let image = TileImageLoader.shared.cachedImage(for: url, maximumPixelSize: pixelSize, orientation: orientation) ?? decoded
+        let image = TileImageLoader.shared.cachedImage(for: url, maximumPixelSize: pixelSize, orientation: orientation, grade: grade) ?? decoded
         ZStack {
             if let image {
                 Image(decorative: image, scale: 1)
@@ -307,7 +311,7 @@ struct TileThumbnail: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .task(id: "\(url.path)#\(TileImageLoader.bucket(for: pixelSize))#\(DisplayRotation.requestToken(orientation))#\(retryToken)") {
+        .task(id: "\(url.path)#\(TileImageLoader.bucket(for: pixelSize))#\(DisplayRotation.requestToken(orientation))#\(retryToken)\(grade.map(TileImageLoader.gradedKeySuffix) ?? "")") {
             await load()
         }
         .onDisappear {
@@ -319,7 +323,7 @@ struct TileThumbnail: View {
 
     private func load() async {
         let loader = TileImageLoader.shared
-        if loader.cachedImage(for: url, maximumPixelSize: pixelSize, orientation: orientation) != nil {
+        if loader.cachedImage(for: url, maximumPixelSize: pixelSize, orientation: orientation, grade: grade) != nil {
             if decoded != nil { decoded = nil }
             if failed { failed = false }
             if showsSpinner { showsSpinner = false }
@@ -337,6 +341,7 @@ struct TileThumbnail: View {
             for: url,
             maximumPixelSize: pixelSize,
             orientation: orientation,
+            grade: grade,
             fileIdentity: file.map(ThumbnailDiskCache.fileIdentity)
         )
         guard !Task.isCancelled else { return }
@@ -432,6 +437,8 @@ struct StackTileView: View {
     var originFolder: String? = nil
     /// Saved rotation of the cover frame in quarter-turns clockwise, or nil.
     var orientation: Int? = nil
+    /// The cover clip's grade (drawn graded) or that it is flat log.
+    var gradeMark: TileGradeMark? = nil
     /// Toggles the inline expansion of a burst. Nil falls back to `onOpen`.
     var onExpand: (() -> Void)? = nil
     /// Opens playback for a video tile. Nil falls back to `onOpen`… callers
@@ -447,7 +454,7 @@ struct StackTileView: View {
         let shape = RoundedRectangle(cornerRadius: BoardMetrics.tileRadius, style: .continuous)
         VStack(alignment: .leading, spacing: 5) {
             ZStack {
-                TileThumbnail(url: stack.coverItem.primary.url, kind: stack.kind, pointSize: width, orientation: orientation, retryToken: retryToken, file: stack.coverItem.primary)
+                TileThumbnail(url: stack.coverItem.primary.url, kind: stack.kind, pointSize: width, orientation: orientation, retryToken: retryToken, file: stack.coverItem.primary, grade: gradeMark?.recipe)
                     .frame(width: width, height: width * 2 / 3)
                     .clipped()
                 VStack {
@@ -504,6 +511,9 @@ struct StackTileView: View {
                                 .help("Edits in Edited/: " + editTags.joined(separator: ", "))
                         }
                         Spacer(minLength: 0)
+                        if let gradeMark {
+                            TileGradeBadge(mark: gradeMark)
+                        }
                         if let marker = CombinedFilesMarker(stack: stack) {
                             CombinedFilesPill(marker: marker)
                         }
@@ -602,6 +612,7 @@ extension StackTileView: @preconcurrency Equatable {
             && lhs.editTags == rhs.editTags
             && lhs.originFolder == rhs.originFolder
             && lhs.orientation == rhs.orientation
+            && lhs.gradeMark == rhs.gradeMark
             && lhs.retryToken == rhs.retryToken
     }
 }
@@ -1158,6 +1169,8 @@ struct OrganizeGrid<MenuContent: View>: View {
     /// the camera's —
     /// the cover frame's value drives the tile decode.
     var orientationForFile: (OrganizeFile) -> Int? = { _ in nil }
+    /// A tile's colour: graded picture, or a quiet flat-log marker.
+    var gradeForStack: (OrganizeStack) -> TileGradeMark? = { _ in nil }
     /// Opens the full preview at a specific frame of the stack (0 for the
     /// usual double-click/Space path).
     let onOpen: (OrganizeStack, Int) -> Void
@@ -1413,6 +1426,7 @@ struct OrganizeGrid<MenuContent: View>: View {
                     rootPath: rootPath
                 ),
                 orientation: orientationForFile(stack.coverItem.primary),
+                gradeMark: gradeForStack(stack),
                 onExpand: { workspace.setExpanded(stack.id, expanded: true) },
                 onPlay: { onOpen(stack, 0) },
                 onOpen: { onOpen(stack, 0) },
@@ -1789,6 +1803,9 @@ struct StackPreviewOverlay: View {
     var onRotate: ((OrganizeStack, Int) -> Void)? = nil
     /// Frame the overlay opens on — inline expansions deep-link into a tap.
     var initialFrameIndex: Int = 0
+    /// The event board this overlay sits on, for rendering graded copies
+    /// of clips not yet assigned elsewhere. Nil on unsorted boards.
+    var boardEventID: UUID? = nil
 
     /// Frame selection state — `edge` is the frame the preview shows.
     @State private var selection = FilmstripSelection()
@@ -1840,6 +1857,14 @@ struct StackPreviewOverlay: View {
     @State private var tagRequest: FaceTagRequest?
     /// The header's Event… picker, owned outside its `ViewThatFits`.
     @State private var showEventPicker = false
+    /// The grade panel (G) for a video clip.
+    @State private var gradeMode = false
+    @State private var gradeSession: GradeSession?
+    /// What playback draws: the clip's grade, or the panel's draft.
+    @State private var liveGrade = GradeLiveState()
+    @State private var frameGrabber: GradeFrameGrabber?
+    @State private var timeObserver: TimeObserverToken?
+    @State private var lastPlayerRefresh = ContinuousClock.now
     @FocusState private var isFocused: Bool
 
     private var stackIndex: Int? { stacks.firstIndex { $0.id == stackID } }
@@ -1885,7 +1910,14 @@ struct StackPreviewOverlay: View {
                     header(stack: stack, item: item)
                     HStack(spacing: 12) {
                         previewPane(stack: stack, item: item)
-                        if inspectorVisible {
+                        if gradeMode, let gradeSession {
+                            gradePanel(gradeSession, item: item, stack: stack)
+                                .frame(width: 290)
+                                .foregroundStyle(.white, .white.opacity(0.65), .white.opacity(0.45))
+                                .glassEffect(.regular, in: .rect(cornerRadius: 18))
+                                .environment(\.colorScheme, .dark)
+                                .transition(.move(edge: .trailing).combined(with: .opacity))
+                        } else if inspectorVisible {
                             FrameInspectorPanel(
                                 item: item,
                                 photoRecord: framePhotoRecord,
@@ -1904,6 +1936,7 @@ struct StackPreviewOverlay: View {
                         }
                     }
                     .animation(.easeInOut(duration: 0.18), value: inspectorVisible)
+                    .animation(.easeInOut(duration: 0.18), value: gradeMode)
                     bottomBar(stack: stack, item: item)
                 }
                 .padding(16)
@@ -1932,6 +1965,21 @@ struct StackPreviewOverlay: View {
             // has it if the user zooms back) and stop any in-flight request.
             hiResImage = nil
             hiResRequest = nil
+            gradeSession?.flush()
+            gradeSession = nil
+            if gradeMode { openGradeSession() }
+        }
+        .onChange(of: gradeFingerprint) { _, _ in
+            // Undo, Paste or another window changed the clip's grade.
+            if let item, let gradeSession {
+                gradeSession.adopt(workspace.grading.explicitGrade(for: item) ?? workspace.grading.effectiveGrade(for: item) ?? ClipGrade())
+            } else {
+                syncLiveGrade()
+            }
+        }
+        .onDisappear {
+            gradeSession?.flush()
+            removeTimeObserver()
         }
         .onChange(of: itemOrientation) { _, _ in
             // Rotate Burst turned the stack: drop the old hi-res decode and
@@ -1966,6 +2014,13 @@ struct StackPreviewOverlay: View {
             await loadPetInfo()
         }
         .task(id: item?.primary.path) { await loadMetadata() }
+    }
+
+    /// Changes whenever the clip's stored or default grade does.
+    private var gradeFingerprint: String {
+        guard let item, ClipGrading.isGradable(item) else { return "" }
+        let grading = workspace.grading
+        return (grading.explicitGrade(for: item)?.catalogJSON() ?? "-") + "|" + (grading.recipe(for: item)?.fingerprint ?? "-")
     }
 
     /// Back button, title and position, the assign chips, then the glass
@@ -2062,6 +2117,17 @@ struct StackPreviewOverlay: View {
                             isFocused = true
                         }
                     }
+                    if ClipGrading.isGradable(item) {
+                        PreviewGlassToggle(
+                            title: "Grade",
+                            systemImage: "camera.filters",
+                            isOn: gradeMode,
+                            help: gradeMode ? "Close the grade panel (G)" : "Grade this clip — looks, LUTs, exposure, colour (G)"
+                        ) {
+                            toggleGradeMode()
+                            isFocused = true
+                        }
+                    }
                     PreviewGlassToggle(
                         title: "Frame Info",
                         systemImage: "info",
@@ -2125,9 +2191,21 @@ struct StackPreviewOverlay: View {
     private func bottomBar(stack: OrganizeStack, item: OrganizeItem) -> some View {
         let showsFilmstrip = stack.items.count > 1
         let showsZoom = item.kind != .video && displayImage != nil
-        if showsFilmstrip || showsZoom {
+        let showsLooks = gradeMode && gradeSession != nil
+        if showsFilmstrip || showsZoom || showsLooks {
             GlassEffectContainer(spacing: 12) {
                 HStack(spacing: 12) {
+                    if showsLooks, let gradeSession {
+                        GradeLookStrip(
+                            looks: gradeSession.looks,
+                            selected: gradeSession.draft.look,
+                            thumbnails: gradeSession.lookThumbnails,
+                            name: gradeSession.lookName,
+                            onChoose: { gradeSession.choose($0); isFocused = true }
+                        )
+                        .frame(maxWidth: CGFloat(gradeSession.looks.count) * 142 + 20)
+                        .glassEffect(.regular, in: .rect(cornerRadius: 16))
+                    }
                     if showsFilmstrip {
                         filmstrip(stack)
                             .padding(6)
@@ -2270,6 +2348,16 @@ struct StackPreviewOverlay: View {
             } else {
                 ProgressView()
                     .tint(.white)
+            }
+        }
+        .overlay {
+            if gradeMode, let gradeSession, gradeSession.viewMode == .split, videoPlayer != nil {
+                GradeWipeOverlay(
+                    wipe: Binding(get: { gradeSession.wipe }, set: { gradeSession.wipe = $0 }),
+                    videoSize: videoPlayer?.currentItem?.presentationSize ?? CGSize(width: 16, height: 9)
+                )
+                // Leave the player's own controls at the bottom reachable.
+                .padding(.bottom, 64)
             }
         }
         .overlay(alignment: .top) {
@@ -2460,6 +2548,14 @@ struct StackPreviewOverlay: View {
                 case "i", "I":
                     inspectorVisible.toggle()
                     return .handled
+                case "g", "G":
+                    if let item, ClipGrading.isGradable(item) { toggleGradeMode() }
+                    return .handled
+                case "b", "B":
+                    if let gradeSession {
+                        gradeSession.viewMode = gradeSession.viewMode == .before ? .after : .before
+                        return .handled
+                    }
                 case "t", "T":
                     if item?.kind != .video {
                         tagMode.toggle()
@@ -2554,6 +2650,14 @@ struct StackPreviewOverlay: View {
             if let player {
                 videoPlayable = true
                 videoPlayer = player
+                // A graded clip plays graded; the composition reads
+                // `liveGrade`, which the grade panel retargets live.
+                syncLiveGrade()
+                if gradeMode || liveGrade.snapshot.recipe != nil {
+                    await attachGradeComposition(to: player)
+                }
+                guard !Task.isCancelled else { return }
+                if gradeMode { installTimeObserver(on: player) }
                 player.play()
             } else {
                 videoPlayable = false
@@ -2771,4 +2875,175 @@ struct ScrollMetrics: Equatable {
     /// The largest offset the content currently allows.
     var reach: Double
     var inset: Double
+}
+
+
+// MARK: - Grading
+
+extension StackPreviewOverlay {
+    @ViewBuilder
+    fileprivate func gradePanel(_ session: GradeSession, item: OrganizeItem, stack: OrganizeStack) -> some View {
+        let grading = workspace.grading
+        GradePanel(
+            session: session,
+            canPaste: grading.clipboard != nil,
+            onCopy: {
+                session.flush()
+                grading.copyGrade(from: item)
+                isFocused = true
+            },
+            onPaste: {
+                session.flush()
+                grading.pasteGrade(to: [item])
+                isFocused = true
+            },
+            onRemove: {
+                session.flush()
+                grading.removeGrade(from: [item])
+                isFocused = true
+            },
+            onMarkProfile: { mark in
+                session.flush()
+                grading.markProfile(mark, for: [item])
+                // The profile decides the conversion: start over with it.
+                gradeSession = nil
+                openGradeSession()
+            },
+            onRender: {
+                session.flush()
+                grading.renderGradedCopies(of: [OrganizeStack(items: [item])], boardEventID: boardEventID)
+                isFocused = true
+            },
+            renderNote: "Writes \(GradedRenderNaming.candidateName(forSource: item.primary.url, attempt: 1)) into the event’s Edited/\(GradedRenderNaming.folderName). The original is never changed."
+        )
+    }
+
+    fileprivate func toggleGradeMode() {
+        if gradeMode {
+            gradeSession?.flush()
+            gradeSession = nil
+            gradeMode = false
+            removeTimeObserver()
+            syncLiveGrade()
+            refreshPausedFrame(force: true)
+        } else {
+            gradeMode = true
+            inspectorVisible = false
+            openGradeSession()
+        }
+    }
+
+    /// Opens the panel's session for the clip on screen.
+    fileprivate func openGradeSession() {
+        guard let item, ClipGrading.isGradable(item) else {
+            gradeSession = nil
+            return
+        }
+        let grading = workspace.grading
+        let profile = grading.profile(for: item)
+        let grade = grading.explicitGrade(for: item) ?? grading.effectiveGrade(for: item) ?? ClipGrade()
+        let session = GradeSession(
+            itemID: item.id,
+            clipName: item.primary.name,
+            grade: grade,
+            profile: profile,
+            detectedProfile: grading.detectedProfile(for: item),
+            range: grading.signalRange(for: item, profile: profile),
+            looks: grading.availableLooks(for: profile ?? grade.profileMark.resolve(detected: grading.detectedProfile(for: item))),
+            lookName: { grading.lookName($0) },
+            live: liveGrade
+        )
+        session.commit = { [weak grading] draft in
+            grading?.setGrade(draft, for: [item], undoTitle: "Adjust Grade")
+        }
+        session.refreshPlayer = { refreshPausedFrame() }
+        gradeSession = session
+        let grabber = GradeFrameGrabber(url: item.primary.url)
+        frameGrabber = grabber
+        if let player = videoPlayer {
+            Task { @MainActor in
+                await attachGradeComposition(to: player)
+                installTimeObserver(on: player)
+                await grabFrame(at: player.currentTime())
+            }
+        } else {
+            Task { @MainActor in await grabFrame(at: CMTime(seconds: 1, preferredTimescale: 600)) }
+        }
+    }
+
+    /// The live state shows the clip's stored grade when the panel is shut.
+    fileprivate func syncLiveGrade() {
+        guard gradeSession == nil else { return }
+        let recipe = item.flatMap { ClipGrading.isGradable($0) ? workspace.grading.recipe(for: $0) : nil }
+        liveGrade.update { state in
+            state.recipe = recipe
+            state.bypass = false
+            state.wipe = nil
+        }
+        refreshPausedFrame()
+    }
+
+    fileprivate func attachGradeComposition(to player: AVPlayer) async {
+        guard let playerItem = player.currentItem, playerItem.videoComposition == nil else { return }
+        if let composition = try? await GradeRenderer.shared.videoComposition(for: playerItem.asset, live: liveGrade) {
+            playerItem.videoComposition = composition
+        }
+    }
+
+    /// A paused player draws the current frame again with the new grade:
+    /// handing the item its composition again re-renders the frame it
+    /// already decoded (a seek would decode from the last keyframe).
+    fileprivate func refreshPausedFrame(force: Bool = false) {
+        guard let player = videoPlayer, let playerItem = player.currentItem,
+              player.timeControlStatus != .playing,
+              let composition = playerItem.videoComposition else { return }
+        let now = ContinuousClock.now
+        guard force || now - lastPlayerRefresh > .milliseconds(30) else {
+            // Coalesce a slider burst; the trailing refresh lands shortly.
+            Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(35))
+                refreshPausedFrame(force: true)
+            }
+            return
+        }
+        lastPlayerRefresh = now
+        playerItem.videoComposition = composition.mutableCopy() as? AVVideoComposition
+    }
+
+    fileprivate func installTimeObserver(on player: AVPlayer) {
+        removeTimeObserver()
+        let token = player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.5, preferredTimescale: 600), queue: .main) { time in
+            MainActor.assumeIsolated {
+                Task { @MainActor in await grabFrame(at: time) }
+            }
+        }
+        timeObserver = TimeObserverToken(player: player, token: token)
+    }
+
+    fileprivate func removeTimeObserver() {
+        timeObserver?.remove()
+        timeObserver = nil
+    }
+
+    /// The frame under the playhead for the scope and the look strip.
+    fileprivate func grabFrame(at time: CMTime) async {
+        guard gradeMode, let grabber = frameGrabber, let session = gradeSession else { return }
+        guard let frame = await grabber.frame(at: time), gradeSession === session else { return }
+        session.setFrame(frame)
+    }
+}
+
+/// A periodic time observer and the player it belongs to.
+final class TimeObserverToken {
+    private weak var player: AVPlayer?
+    private let token: Any
+
+    init(player: AVPlayer, token: Any) {
+        self.player = player
+        self.token = token
+    }
+
+    func remove() {
+        player?.removeTimeObserver(token)
+    }
 }
