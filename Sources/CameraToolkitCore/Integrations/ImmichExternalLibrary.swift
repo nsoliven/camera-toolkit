@@ -55,17 +55,53 @@ public struct ImmichEventSummary: Equatable, Sendable {
 }
 
 extension SavedCameraEvent {
-    /// The album this event keeps in Immich, if any. A private event gets
-    /// none unless it was opted in by hand (`immichUploadEnabled`).
-    public func immichAlbumTitle(isPrivate: Bool) -> String? {
+    /// The album policy in effect: the event's own choice, else an Event
+    /// album when every event gets one.
+    public func effectiveImmichAlbumPolicy(albumsForEveryEvent: Bool) -> ImmichAlbumPolicy {
+        immichAlbumPolicy ?? (albumsForEveryEvent ? .event : .none)
+    }
+
+    /// The album this event keeps in Immich, if any, before same-name events
+    /// are told apart (`ImmichAlbumNaming`). A private event gets none unless
+    /// it was opted in by hand (`immichUploadEnabled`).
+    public func immichAlbumTitle(isPrivate: Bool, albumsForEveryEvent: Bool = false) -> String? {
         if isPrivate, !sendsToImmich { return nil }
-        switch resolvedImmichAlbumPolicy {
+        switch effectiveImmichAlbumPolicy(albumsForEveryEvent: albumsForEveryEvent) {
         case .none: return nil
         case .event: return name
         case .custom:
             let custom = immichAlbumName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             return custom.isEmpty ? name : custom
         }
+    }
+}
+
+/// Album titles for a set of events. Albums are found by name, so two events
+/// that share a name would fill one album; an album named after its event
+/// gets the event's date added when another event has the same name. A
+/// custom name is used exactly as typed.
+public enum ImmichAlbumNaming {
+    public static func titles(
+        events: [SavedCameraEvent],
+        locations: EventStorageLocations,
+        albumsForEveryEvent: Bool
+    ) -> [UUID: String] {
+        var titles: [UUID: String] = [:]
+        var namedAfterEvent: [String: [SavedCameraEvent]] = [:]
+        for event in events {
+            let isPrivate = locations.resolvedPolicy(for: event) == .archiveOnly
+            guard let title = event.immichAlbumTitle(isPrivate: isPrivate, albumsForEveryEvent: albumsForEveryEvent) else { continue }
+            titles[event.id] = title
+            if event.effectiveImmichAlbumPolicy(albumsForEveryEvent: albumsForEveryEvent) == .event {
+                namedAfterEvent[NASSyncStore.pathKey(title), default: []].append(event)
+            }
+        }
+        for group in namedAfterEvent.values where group.count > 1 {
+            for event in group {
+                titles[event.id] = "\(event.name) · \(EventStorageLocations.eventDateString(event.eventDate))"
+            }
+        }
+        return titles
     }
 }
 
@@ -90,18 +126,19 @@ public struct ImmichCatalogFile: Equatable, Sendable {
         assignments: [PhotoEventAssignment],
         events: [SavedCameraEvent],
         locations: EventStorageLocations,
-        verifiedPathKeys: Set<String>
+        verifiedPathKeys: Set<String>,
+        albumsForEveryEvent: Bool = false
     ) -> [ImmichCatalogFile] {
         let eventsByID = Dictionary(events.map { ($0.id, $0) }) { first, _ in first }
+        let albumTitles = ImmichAlbumNaming.titles(events: events, locations: locations, albumsForEveryEvent: albumsForEveryEvent)
         return assignments.compactMap { assignment in
             guard let event = eventsByID[assignment.eventID],
                   let relative = locations.archiveRelativePath(for: assignment, event: event) else { return nil }
-            let isPrivate = locations.resolvedPolicy(for: event) == .archiveOnly
             return ImmichCatalogFile(
                 eventAssetID: CatalogStore.eventAssetID(assignment),
                 relativePath: relative,
                 isOnNAS: verifiedPathKeys.contains(NASSyncStore.pathKey(relative)),
-                albumName: assignment.immichUploadOverride == false ? nil : event.immichAlbumTitle(isPrivate: isPrivate)
+                albumName: assignment.immichUploadOverride == false ? nil : albumTitles[event.id]
             )
         }
     }

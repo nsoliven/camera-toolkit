@@ -158,6 +158,15 @@ final class ImmichEventAlbumRuleTests: XCTestCase {
         XCTAssertEqual(event(policy: .event, optIn: true).immichAlbumTitle(isPrivate: true), "Trip 2026")
     }
 
+    func testEveryEventSwitchFillsOnlyTheUntouchedDefault() {
+        let untouched = SavedCameraEvent(name: "Trip 2026", eventDate: Date(timeIntervalSince1970: 1_780_000_000))
+        XCTAssertEqual(untouched.immichAlbumTitle(isPrivate: false, albumsForEveryEvent: true), "Trip 2026")
+        XCTAssertNil(untouched.immichAlbumTitle(isPrivate: false, albumsForEveryEvent: false))
+        XCTAssertNil(event(policy: .none).immichAlbumTitle(isPrivate: false, albumsForEveryEvent: true))
+        XCTAssertEqual(event(policy: .custom, custom: "Best").immichAlbumTitle(isPrivate: false, albumsForEveryEvent: true), "Best")
+        XCTAssertNil(untouched.immichAlbumTitle(isPrivate: true, albumsForEveryEvent: true))
+    }
+
     func testSummaryCountsWhatTheStripShows() {
         let summary = ImmichEventSummary(statuses: [
             ImmichCatalogStatus(eventAssetID: "1", status: "present"),
@@ -452,6 +461,38 @@ final class ImmichLibrarySyncTests: XCTestCase {
         ], at: now)
         XCTAssertEqual(Set(try store.moves(now: now).map(\.from)), ["a", "c", "e"])
         XCTAssertTrue(try store.moves(now: now.addingTimeInterval(ImmichPathMoveStore.retention + 60)).isEmpty)
+    }
+
+    func testAlbumNamesTellSameNameEventsApartAndLeaveCustomNamesAlone() {
+        let first = SavedCameraEvent(name: "Beach Day", eventDate: Date(timeIntervalSince1970: 1_780_000_000))
+        let second = SavedCameraEvent(name: "beach day", eventDate: Date(timeIntervalSince1970: 1_790_000_000))
+        let custom = SavedCameraEvent(name: "Beach Day", eventDate: Date(timeIntervalSince1970: 1_795_000_000), immichAlbumPolicy: .custom, immichAlbumName: "Summer")
+        let optedOut = SavedCameraEvent(name: "Family Party", eventDate: Date(timeIntervalSince1970: 1_780_000_000), immichAlbumPolicy: ImmichAlbumPolicy.none)
+        let secret = SavedCameraEvent(name: "Secret", eventDate: Date(timeIntervalSince1970: 1_780_000_000), storagePolicy: .archiveOnly)
+        let child = SavedCameraEvent(name: "Secret Part", eventDate: Date(timeIntervalSince1970: 1_780_000_000), parentEventID: secret.id)
+        let events = [first, second, custom, optedOut, secret, child]
+        let locations = EventStorageLocations(configuration: configuration(events: events))
+
+        let titles = ImmichAlbumNaming.titles(events: events, locations: locations, albumsForEveryEvent: true)
+
+        XCTAssertEqual(titles[first.id], "Beach Day · \(EventStorageLocations.eventDateString(first.eventDate))")
+        XCTAssertEqual(titles[second.id], "beach day · \(EventStorageLocations.eventDateString(second.eventDate))")
+        XCTAssertEqual(titles[custom.id], "Summer")
+        XCTAssertNil(titles[optedOut.id])
+        XCTAssertNil(titles[secret.id])
+        XCTAssertNil(titles[child.id], "a subevent of a private event is private too")
+        XCTAssertTrue(ImmichAlbumNaming.titles(events: events, locations: locations, albumsForEveryEvent: false).keys.elementsEqual([custom.id]))
+    }
+
+    func testBuildGivesUntouchedEventsAnAlbumWhenEveryEventIsOn() {
+        let event = SavedCameraEvent(id: trip, name: "Trip 2026", eventDate: Date(timeIntervalSince1970: 1_780_000_000))
+        let locations = EventStorageLocations(configuration: configuration(events: [event]))
+        let assignment = PhotoEventAssignment(sourceRootPath: "/Volumes/Card", relativePath: "DSC00001.ARW", fileSize: 10, modifiedAt: Date(timeIntervalSince1970: 1_000), eventID: trip)
+        let storageOnly = PhotoEventAssignment(sourceRootPath: "/Volumes/Card", relativePath: "DSC00002.ARW", fileSize: 10, modifiedAt: Date(timeIntervalSince1970: 1_000), eventID: trip, immichUploadOverride: false)
+
+        let files = ImmichCatalogFile.build(assignments: [assignment, storageOnly], events: [event], locations: locations, verifiedPathKeys: [], albumsForEveryEvent: true)
+
+        XCTAssertEqual(files.map(\.albumName), ["Trip 2026", nil])
     }
 
     func testBuildSkipsNothingOnTheNASAndWithholdsPrivateAlbums() {
