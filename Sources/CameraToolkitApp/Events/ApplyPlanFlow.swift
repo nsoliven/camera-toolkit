@@ -204,7 +204,7 @@ struct ApplyOperationArrow: View {
             }
             ForEach(methods, id: \.label) { method in
                 VStack(spacing: 1) {
-                    Image(systemName: method == .rename ? "arrow.forward" : "doc.on.doc")
+                    Image(systemName: Self.arrowSymbol(method))
                         .font(.title3.weight(.semibold))
                         .foregroundStyle(tint(method))
                     Text(method.label)
@@ -224,7 +224,15 @@ struct ApplyOperationArrow: View {
     }
 
     private func tint(_ method: ApplyRouteMethod) -> Color {
-        method == .verifiedCopy ? .blue : .accentColor
+        method == .rename ? .accentColor : .blue
+    }
+
+    static func arrowSymbol(_ method: ApplyRouteMethod) -> String {
+        switch method {
+        case .rename: "arrow.forward"
+        case .verifiedCopy: "doc.on.doc"
+        case .nasCopy: "server.rack"
+        }
     }
 }
 
@@ -255,6 +263,13 @@ struct ApplyDestinationCard: View {
 
             Text(destination.countsLine)
                 .font(.callout.monospacedDigit())
+
+            if let nasNote = destination.nasNote {
+                Label(nasNote, systemImage: "server.rack")
+                    .font(.caption2)
+                    .foregroundStyle(.blue)
+                    .help("The files land in this event’s folder on the NAS, exactly where Sync to NAS would put them. When the drive is back they stay on the NAS and count as in their event.")
+            }
 
             if summary.isPrivate {
                 Text("Private · kept in a hidden folder until it is archived")

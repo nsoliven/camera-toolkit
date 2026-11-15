@@ -92,8 +92,10 @@ struct ApplyPlanOverview: Sendable {
         var byteCount: Int64
         /// How many event folders this folder's files are split across.
         var eventCount: Int
+        /// Files copied straight to the NAS.
+        var nasCount: Int = 0
 
-        var fileCount: Int { moveCount + copyCount }
+        var fileCount: Int { moveCount + copyCount + nasCount }
 
         /// "“Transfer 1” → 2 events" when the folder feeds more than one
         /// event, so the picture never reads as one folder → one event.
@@ -103,7 +105,7 @@ struct ApplyPlanOverview: Sendable {
 
         /// What happens to the files in this folder.
         var fateLine: String {
-            switch (moveCount > 0, copyCount > 0) {
+            switch (moveCount > 0, copyCount + nasCount > 0) {
             case (true, true): "Some move out · some are copied"
             case (false, true): "Originals stay here"
             default: "Files move out of this folder"
@@ -123,6 +125,11 @@ struct ApplyPlanOverview: Sendable {
         var copyCount: Int
         /// Every source folder that feeds this event, with its share.
         var routes: [Route]
+        /// Files copied straight into the event's NAS folder.
+        var nasCount: Int = 0
+        /// "Buffer drive isn’t connected: …" for an event whose files go
+        /// straight to the NAS.
+        var nasNote: String?
 
         var shortPath: String { shortPathParts.text }
 
@@ -136,13 +143,14 @@ struct ApplyPlanOverview: Sendable {
                 folderCount: rest.count,
                 moveCount: rest.reduce(0) { $0 + $1.moveCount },
                 copyCount: rest.reduce(0) { $0 + $1.copyCount },
-                byteCount: rest.reduce(Int64(0)) { $0 + $1.byteCount }
+                byteCount: rest.reduce(Int64(0)) { $0 + $1.byteCount },
+                nasCount: rest.reduce(0) { $0 + $1.nasCount }
             ))
         }
 
         /// The operations that reach this folder, moves first.
         var methods: [ApplyRouteMethod] {
-            (moveCount > 0 ? [.rename] : []) + (copyCount > 0 ? [.verifiedCopy] : [])
+            ApplyPlanOverview.methods(moveCount: moveCount, copyCount: copyCount, nasCount: nasCount)
         }
 
         /// "33 photos · 3 videos · 3 sidecars · 2.22 GB"
@@ -176,11 +184,12 @@ struct ApplyPlanOverview: Sendable {
         /// The whole source folder's totals across every event.
         var sourceFileCount: Int
         var sourceEventCount: Int
+        var nasCount: Int = 0
 
-        var fileCount: Int { moveCount + copyCount }
+        var fileCount: Int { moveCount + copyCount + nasCount }
 
         var methods: [ApplyRouteMethod] {
-            (moveCount > 0 ? [.rename] : []) + (copyCount > 0 ? [.verifiedCopy] : [])
+            ApplyPlanOverview.methods(moveCount: moveCount, copyCount: copyCount, nasCount: nasCount)
         }
 
         /// "1 file · 2.08 GB", or "1 of 5 files · 2.08 GB" when the folder is
@@ -204,11 +213,12 @@ struct ApplyPlanOverview: Sendable {
         var moveCount: Int
         var copyCount: Int
         var byteCount: Int64
+        var nasCount: Int = 0
 
-        var fileCount: Int { moveCount + copyCount }
+        var fileCount: Int { moveCount + copyCount + nasCount }
 
         var methods: [ApplyRouteMethod] {
-            (moveCount > 0 ? [.rename] : []) + (copyCount > 0 ? [.verifiedCopy] : [])
+            ApplyPlanOverview.methods(moveCount: moveCount, copyCount: copyCount, nasCount: nasCount)
         }
 
         /// "+ 3 more folders · 12 files · 1.2 GB"
@@ -223,6 +233,11 @@ struct ApplyPlanOverview: Sendable {
     var routes: [Route]
     var moveCount: Int
     var copyCount: Int
+    /// Files copied straight to the NAS (their event's drive is offline).
+    var nasCount: Int
+    var nasBytes: Int64
+    /// The plain line for the straight-to-NAS route, nil when there is none.
+    var nasRouteLine: String?
     var byteCount: Int64
     /// Events that receive at least one file (groups holding only
     /// disconnected files still get a card, but are not counted).
@@ -252,16 +267,23 @@ struct ApplyPlanOverview: Sendable {
                 driveName: ApplyPathLabel.driveName(for: group.destinationFolder),
                 moveCount: group.moves.count,
                 copyCount: group.copyFileCount,
-                routes: routes.filter { $0.destinationIndex == index }
+                routes: routes.filter { $0.destinationIndex == index },
+                nasCount: group.nasCopyCount,
+                nasNote: group.nasCopyCount > 0
+                    ? "\(Self.capitalizedDrive(group.driveName)) isn’t connected · straight to the NAS"
+                    : nil
             )
         }
 
         moveCount = plan.moveCount
         copyCount = plan.copyCount
+        nasCount = plan.nasCopyCount
+        nasBytes = plan.nasCopyBytes
+        nasRouteLine = Self.nasRouteLine(plan)
         byteCount = plan.byteCount
-        eventCount = plan.groups.count { !$0.moves.isEmpty || !$0.copies.isEmpty }
+        eventCount = plan.groups.count { !$0.moves.isEmpty || !$0.copies.isEmpty || !$0.nasCopies.isEmpty }
         var drives: [String] = []
-        for destination in destinations where destination.moveCount + destination.copyCount > 0 {
+        for destination in destinations where destination.moveCount + destination.copyCount + destination.nasCount > 0 {
             if !drives.contains(destination.driveName) { drives.append(destination.driveName) }
         }
         destinationDrives = drives
@@ -296,6 +318,7 @@ struct ApplyPlanOverview: Sendable {
                 switch row.method {
                 case .rename: route.moveCount += row.fileCount
                 case .verifiedCopy: route.copyCount += row.fileCount
+                case .nasCopy: route.nasCount += row.fileCount
                 }
                 route.photoCount += row.photoCount
                 route.videoCount += row.videoCount
@@ -336,6 +359,7 @@ struct ApplyPlanOverview: Sendable {
             )
             source.moveCount += route.moveCount
             source.copyCount += route.copyCount
+            source.nasCount += route.nasCount
             source.byteCount += route.byteCount
             if route.fileCount > 0 { source.eventCount += 1 }
             byPath[route.sourcePath] = source
@@ -345,7 +369,7 @@ struct ApplyPlanOverview: Sendable {
         }
     }
 
-    var fileCount: Int { moveCount + copyCount }
+    var fileCount: Int { moveCount + copyCount + nasCount }
 
     var sentence: String {
         if fileCount == 0, !collisionItems.isEmpty {
@@ -353,13 +377,15 @@ struct ApplyPlanOverview: Sendable {
             // of implying Apply will do something on its own.
             return ApplyCollisionResolution.decisionSentence(for: collisionItems)
         }
-        return Self.sentence(
+        let drive = Self.sentence(
             moveCount: moveCount,
             copyCount: copyCount,
             sourceNames: sources.map(\.name),
             eventCount: eventCount,
             destinationDrives: destinationDrives
         )
+        guard let nasRouteLine else { return drive }
+        return moveCount + copyCount == 0 ? nasRouteLine : drive + " " + nasRouteLine
     }
 
     /// The confirm button with every taken name left where it is.
@@ -372,6 +398,7 @@ struct ApplyPlanOverview: Sendable {
         Self.primaryActionTitle(
             moveCount: moveCount,
             copyCount: copyCount,
+            nasCount: nasCount,
             keepBothFiles: decisions.keepBoth.count,
             keepBothConflicts: decisions.keepBothConflictCount,
             trashCount: decisions.trash.count
@@ -386,7 +413,7 @@ struct ApplyPlanOverview: Sendable {
     /// name where it is. Nil when there is nothing else to apply, or when
     /// the choices already leave them all.
     func skipActionTitle(with decisions: ApplyCollisionDecisions) -> String? {
-        Self.skipActionTitle(moveCount: moveCount, copyCount: copyCount, hasPendingDecisions: !decisions.isEmpty)
+        Self.skipActionTitle(moveCount: moveCount, copyCount: copyCount + nasCount, hasPendingDecisions: !decisions.isEmpty)
     }
 
     /// "Leave Here" when only taken names remain — closing leaves them.
@@ -395,7 +422,7 @@ struct ApplyPlanOverview: Sendable {
     }
 
     var safetyFacts: [ApplySafetyFact] {
-        Self.safetyFacts(moveCount: moveCount, copyCount: copyCount)
+        Self.safetyFacts(moveCount: moveCount, copyCount: copyCount, nasCount: nasCount)
     }
 
     // MARK: - Wording (pure, unit-tested)
@@ -475,10 +502,16 @@ struct ApplyPlanOverview: Sendable {
     static func primaryActionTitle(
         moveCount: Int,
         copyCount: Int,
+        nasCount: Int = 0,
         keepBothFiles: Int,
         keepBothConflicts: Int,
         trashCount: Int
     ) -> String {
+        if nasCount > 0, moveCount + copyCount + keepBothFiles == 0 {
+            let trashTail = trashCount > 0 ? ", Then Trash \(plural(trashCount, "Duplicate"))…" : ""
+            return "Copy \(nasCount.formatted()) \(nasCount == 1 ? "File" : "Files") to the NAS" + trashTail
+        }
+        let copyCount = copyCount + nasCount
         let base = moveCount + copyCount
         let trashTail = trashCount > 0 ? ", Then Trash \(plural(trashCount, "Duplicate"))…" : ""
         if base == 0, keepBothFiles == 0 {
@@ -507,7 +540,7 @@ struct ApplyPlanOverview: Sendable {
     /// Two or three short safety lines. Undo applies only to moves (the
     /// journal records renames); the checksum line appears only when the
     /// plan copies something.
-    static func safetyFacts(moveCount: Int, copyCount: Int, trashCount: Int = 0) -> [ApplySafetyFact] {
+    static func safetyFacts(moveCount: Int, copyCount: Int, nasCount: Int = 0, trashCount: Int = 0) -> [ApplySafetyFact] {
         var facts = [ApplySafetyFact(
             symbol: "checkmark.circle",
             text: "Nothing is overwritten. A file already at the destination is left alone."
@@ -522,6 +555,12 @@ struct ApplyPlanOverview: Sendable {
             facts.append(ApplySafetyFact(
                 symbol: "checkmark.shield",
                 text: "Copies are checksum-verified, and the originals stay on their drive."
+            ))
+        }
+        if nasCount > 0 {
+            facts.append(ApplySafetyFact(
+                symbol: "server.rack",
+                text: "NAS copies are checked with SHA-256 one by one, as Sync to NAS does. A different NAS file with the same name is left alone and reported."
             ))
         }
         if trashCount > 0 {
@@ -543,6 +582,101 @@ struct ApplyPlanOverview: Sendable {
         if parts.isEmpty { parts.append("No files to move") }
         parts.append(byteCount.formattedBytes)
         return parts.joined(separator: " · ")
+    }
+
+    /// The arrows a route shows: moves, then drive copies, then NAS copies.
+    static func methods(moveCount: Int, copyCount: Int, nasCount: Int) -> [ApplyRouteMethod] {
+        (moveCount > 0 ? [.rename] : []) + (copyCount > 0 ? [.verifiedCopy] : []) + (nasCount > 0 ? [.nasCopy] : [])
+    }
+
+    // MARK: - Straight to the NAS (pure, unit-tested)
+
+    /// "the Buffer drive “Name”" for the event's drive: its role, plus the
+    /// volume name when it is an external drive.
+    static func driveRoleName(policy: EventStoragePolicy, driveRoot: String) -> String {
+        let role = policy == .archiveOnly ? "private" : "Buffer"
+        let volume = ApplyPathLabel.driveName(for: driveRoot)
+        return volume == "this Mac" ? role : "\(role) “\(volume)”"
+    }
+
+    /// "the Buffer “Name” drive", "the drive “Name”" when the Buffer and
+    /// private staging share it, or "the Buffer and private drives", with
+    /// the verb to match.
+    static func drivePhrase(_ groups: [OrganizeApplyPlan.EventGroup]) -> (String, String) {
+        let names = Array(Set(groups.map(\.driveName))).sorted()
+        if names.count == 1 { return (names[0].isEmpty ? "the event’s drive" : "the \(names[0]) drive", "isn’t") }
+        let volumes = Set(groups.map(\.driveVolume))
+        if volumes.count == 1, let volume = volumes.first, volume != "this Mac", !volume.isEmpty {
+            return ("the drive “\(volume)”", "isn’t")
+        }
+        let roles = Array(Set(groups.map { $0.isPrivate ? "private" : "Buffer" })).sorted()
+        return ("the \(roles.joined(separator: " and ")) drives", "aren’t")
+    }
+
+    static func capitalizedDrive(_ name: String) -> String {
+        let drive = name.isEmpty ? "the event’s drive" : "the \(name) drive"
+        return drive.prefix(1).uppercased() + drive.dropFirst()
+    }
+
+    /// "The Buffer drive isn’t connected: 348 files (15.61 GB) are copied
+    /// straight to the NAS, checked file by file. The originals stay where
+    /// they are." Nil when nothing goes to the NAS.
+    static func nasRouteLine(_ plan: OrganizeApplyPlan) -> String? {
+        let groups = plan.groups.filter { $0.nasCopyCount > 0 }
+        guard !groups.isEmpty else { return nil }
+        let (drive, isAre) = drivePhrase(groups)
+        let count = plan.nasCopyCount
+        return "\(drive.prefix(1).uppercased() + drive.dropFirst()) \(isAre) connected: \(plural(count, "file")) (\(plan.nasCopyBytes.formattedBytes)) \(count == 1 ? "is" : "are") copied straight to the NAS, checked file by file. The originals stay where they are."
+    }
+
+    /// The status line when a plan has nothing to do: names the real reason.
+    /// A file whose event's drive is missing waits for that drive (or the
+    /// NAS); only a file whose own source is offline is "on a drive that
+    /// isn't connected".
+    static func emptyPlanMessage(_ plan: OrganizeApplyPlan) -> String {
+        let waiting = plan.waitingForDriveCount
+        let unavailable = plan.unavailableCount
+        let onNAS = plan.alreadyOnNASCount
+        let unplannable = plan.notPlannableCount
+        if waiting > 0 {
+            let (drive, isAre) = drivePhrase(plan.groups.filter { $0.waitingForDrive > 0 })
+            let nas = plan.nasConnected ? "" : ", and neither is the NAS. Connect either one"
+            var line = "\(plural(waiting, "sorted file")) can’t go to \(waiting == 1 ? "its event" : "their events") yet: \(drive) \(isAre) connected\(nas.isEmpty ? ". Connect it" : nas), then Apply again. Nothing was moved or copied."
+            if unavailable > 0 {
+                line += " \(unavailable.formatted()) more \(unavailable == 1 ? "is" : "are") on a source drive that isn’t connected."
+            }
+            return line
+        }
+        if unavailable > 0 {
+            return "\(plural(unavailable, "sorted file")) \(unavailable == 1 ? "is" : "are") on a source drive that isn’t connected. Connect it, then Apply again."
+        }
+        if unplannable > 0 {
+            return "Nothing to move. \(plural(unplannable, "sorted file")) can’t be placed while \(unplannable == 1 ? "its event’s" : "their events’") drive is away: gone from the source, already on the NAS, or without a usable NAS path."
+                + (onNAS > 0 ? " \(onNAS.formatted()) more \(onNAS == 1 ? "is" : "are") already in the event’s NAS folder." : "")
+        }
+        if onNAS > 0 {
+            return "Nothing to move. Every sorted file is already in its event — \(onNAS.formatted()) of them in the event’s NAS folder."
+        }
+        return "Nothing to move. Every sorted file is already where its event keeps it."
+    }
+
+    /// The finished straight-to-NAS job's line, in Sync to NAS's words.
+    static func nasDirectSummary(_ outcome: NASDirectApplyOutcome, reportPath: String?) -> String {
+        let report = outcome.report
+        var parts: [String] = []
+        if !report.hashMismatches.isEmpty {
+            parts.append("\(report.hashMismatches.count) NAS cop\(report.hashMismatches.count == 1 ? "y" : "ies") did NOT match the source's SHA-256 (removed; check the NAS pool's health)")
+        }
+        parts += ["\(report.copied.count) copied and verified", "\(report.matchedExisting.count + report.alreadyVerified.count) already on the NAS"]
+        if !report.conflicts.isEmpty { parts.append("\(report.conflicts.count) conflict(s) — a different file already has the name on the NAS — left untouched") }
+        if !report.failed.isEmpty { parts.append("\(report.failed.count) failed and skipped") }
+        if report.notAttempted > 0 { parts.append("\(report.notAttempted) not attempted") }
+        if !outcome.skipped.isEmpty { parts.append("\(outcome.skipped.count) left out before copying (changed or gone at the source)") }
+        parts.insert(contentsOf: outcome.follow.clauses, at: 0)
+        var line = "Straight to the NAS: " + parts.joined(separator: ", ") + ". The originals were only read and stay where they are."
+        if let stopped = report.stoppedReason { line += " " + stopped }
+        if let reportPath { line += " Details: \(reportPath)" }
+        return line
     }
 
     static func plural(_ count: Int, _ noun: String) -> String {

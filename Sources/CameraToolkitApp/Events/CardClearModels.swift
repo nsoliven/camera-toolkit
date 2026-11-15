@@ -12,7 +12,9 @@ struct CardClearJobInputs: Sendable {
     var pauseGate: DriveActivityGate?
     var sameVolume: AppliedSourceCheck.SameVolume?
 
-    func plan(isCancelled: @Sendable () -> Bool) -> CardClearPlan {
+    /// `probeNAS: false` for the board's background refresh: NAS-only
+    /// copies are then reported as not checked, never listed on the share.
+    func plan(probeNAS: Bool = true, isCancelled: @Sendable () -> Bool) -> CardClearPlan {
         CardClearPlanner.plan(
             inputs: inputs,
             sourceRoot: sourceRoot,
@@ -22,6 +24,7 @@ struct CardClearJobInputs: Sendable {
             mountedVolumes: mountedVolumes,
             pauseGate: pauseGate,
             sameVolume: sameVolume,
+            probeNAS: probeNAS,
             isCancelled: isCancelled
         )
     }
@@ -33,15 +36,30 @@ struct CardClearSummary: Equatable, Sendable {
     var clearableBytes: Int64
     var waitingForNASFiles: Int
     var driveName: String?
+    /// Clearable files whose only other copy is on the NAS.
+    var nasOnlyFiles: Int = 0
+    /// Files copied straight to the NAS earlier whose copy cannot be checked
+    /// now (NAS not connected): never called safe.
+    var nasUncheckedFiles: Int = 0
+    /// True when they were not checked because the NAS is not connected;
+    /// false when the background refresh simply did not look.
+    var nasUncheckedBecauseNASIsAway = false
 
     init(_ plan: CardClearPlan) {
         clearableFiles = plan.clearableFiles
         clearableBytes = plan.clearableBytes
         waitingForNASFiles = plan.waitingFiles
         driveName = plan.driveName
+        nasOnlyFiles = plan.nasOnlyFiles
+        nasUncheckedFiles = plan.nasUncheckedFiles
+        nasUncheckedBecauseNASIsAway = plan.nasUncheckedBecauseNASIsAway
     }
 
-    var isEmpty: Bool { clearableFiles == 0 && waitingForNASFiles == 0 }
+    /// Clear from Card… is offered for checked files, and for copies only
+    /// the click itself checks (the NAS is connected but was not listed).
+    var offersClear: Bool { clearableFiles > 0 || (nasUncheckedFiles > 0 && !nasUncheckedBecauseNASIsAway) }
+
+    var isEmpty: Bool { clearableFiles == 0 && waitingForNASFiles == 0 && nasUncheckedFiles == 0 }
 }
 
 /// The open Clear from Card confirmation: what the planner found when the
@@ -63,6 +81,36 @@ struct CardClearRequest: Identifiable {
     var waitingForNASFiles: Int
     var driveName: String?
     var nasReachable: Bool
+    /// Clearable files whose only other copy is on the NAS (Apply sent them
+    /// there while their event's drive was not connected). Not part of
+    /// `itemIDs`/`fileCount`: the sheet leaves them out unless the owner
+    /// turns on "Also clear N files whose only other copy is on the NAS".
+    var nasOnlyItemIDs: Set<String> = []
+    var nasOnlyFiles: Int = 0
+    var nasOnlyBytes: Int64 = 0
+
+    /// What the job may clear from its own fresh plan, strictly by the
+    /// sheet's choice: an item with a drive copy only if it was confirmed,
+    /// and an item whose only other copy is the NAS only if the owner opted
+    /// it in *as NAS-only* in the sheet. An item confirmed with a drive copy
+    /// that has since lost it (same id, now NAS-only) is held back and
+    /// counted — the NAS copy becoming the only one was never chosen.
+    static func jobItems(_ clearable: [CardClearItem], request: CardClearRequest) -> (items: [CardClearItem], driveCopyGone: [CardClearItem]) {
+        var items: [CardClearItem] = []
+        var gone: [CardClearItem] = []
+        for item in clearable {
+            if item.files.contains(where: \.nasOnly) {
+                if request.nasOnlyItemIDs.contains(item.id) {
+                    items.append(item)
+                } else if request.itemIDs.contains(item.id) {
+                    gone.append(item)
+                }
+            } else if request.itemIDs.contains(item.id) || request.nasOnlyItemIDs.contains(item.id) {
+                items.append(item)
+            }
+        }
+        return (items, gone)
+    }
 }
 
 struct CardClearOutcome: Sendable {
@@ -70,6 +118,11 @@ struct CardClearOutcome: Sendable {
     /// Items the sheet listed that no longer qualified when the job planned
     /// again; left alone.
     var noLongerEligible: Int
+    /// Of those: files confirmed with a drive copy whose drive copy was gone
+    /// by the time the job ran (drive unplugged, Take Off Drive). Their NAS
+    /// copy would have been the only one left, which the owner did not
+    /// choose, so they stayed on the card.
+    var driveCopyGoneFiles: Int = 0
 }
 
 enum CardClearWording {
@@ -80,8 +133,18 @@ enum CardClearWording {
     /// The banner's line.
     static func bannerLine(_ summary: CardClearSummary) -> String {
         var parts: [String] = []
-        if summary.clearableFiles > 0 {
-            parts.append("\(summary.clearableFiles.formatted()) file\(summary.clearableFiles == 1 ? " here is" : "s here are") safe on \(drive(summary.driveName)) and the NAS")
+        let both = summary.clearableFiles - summary.nasOnlyFiles
+        if both > 0 {
+            parts.append("\(both.formatted()) file\(both == 1 ? " here is" : "s here are") safe on \(drive(summary.driveName)) and the NAS")
+        }
+        if summary.nasOnlyFiles > 0 {
+            parts.append("\(summary.nasOnlyFiles.formatted()) \(both > 0 ? "more" : "file\(summary.nasOnlyFiles == 1 ? "" : "s") here") \(summary.nasOnlyFiles == 1 ? "has" : "have") a checked copy only on the NAS")
+        }
+        if summary.nasUncheckedFiles > 0 {
+            let copied = "\(summary.nasUncheckedFiles.formatted()) \(summary.nasUncheckedFiles == 1 ? "was" : "were") copied to the NAS earlier"
+            parts.append(summary.nasUncheckedBecauseNASIsAway
+                ? copied + ", not checked now (NAS not connected)"
+                : copied + " — not checked yet; Clear from Card checks the NAS first")
         }
         if summary.waitingForNASFiles > 0 {
             parts.append(summary.clearableFiles > 0
@@ -123,6 +186,24 @@ enum CardClearWording {
     /// The rule above the checks, in one line.
     static func sheetRule(_ request: CardClearRequest) -> String {
         "Each file is deleted only when it is safe on both \(drive(request.driveName)) and the NAS."
+    }
+
+    /// The toggle that adds the files whose only other copy is the NAS.
+    static func nasOnlyToggle(_ request: CardClearRequest) -> String {
+        "Also clear \(request.nasOnlyFiles.formatted()) file\(request.nasOnlyFiles == 1 ? "" : "s") (\(request.nasOnlyBytes.formattedBytes)) whose only other copy is on the NAS"
+    }
+
+    /// Under the toggle: what choosing it means.
+    static func nasOnlyExplanation(_ request: CardClearRequest) -> String {
+        "Apply sent \(request.nasOnlyFiles == 1 ? "this file" : "these files") straight to the NAS while \(request.nasOnlyFiles == 1 ? "its event’s" : "their events’") drive wasn’t connected. After clearing, the NAS copy is the only one left. Each NAS copy is read again and must match before its card file is deleted."
+            + (request.nasReachable ? "" : " The NAS isn’t reachable now, so they would stay on the card anyway.")
+    }
+
+    /// Files the sheet would delete for the owner's choice.
+    static func chosenCount(_ request: CardClearRequest, includeNASOnly: Bool) -> (files: Int, bytes: Int64) {
+        includeNASOnly
+            ? (request.fileCount + request.nasOnlyFiles, request.byteCount + request.nasOnlyBytes)
+            : (request.fileCount, request.byteCount)
     }
 
     /// Below the checks: what happens to anything that fails.
@@ -204,6 +285,9 @@ enum CardClearWording {
                 .prefix(3)
                 .map { "\($0.value.count) — \($0.key)" }
             line += " \(report.skipped.count) stayed on the card: " + reasons.joined(separator: "; ")
+        }
+        if outcome.driveCopyGoneFiles > 0 {
+            line += " \(outcome.driveCopyGoneFiles) file\(outcome.driveCopyGoneFiles == 1 ? " was" : "s were") left on the card: \(outcome.driveCopyGoneFiles == 1 ? "its" : "their") drive copy is gone since you confirmed, and the NAS copy would have been the only one."
         }
         if outcome.noLongerEligible > 0 {
             line += " \(outcome.noLongerEligible) item\(outcome.noLongerEligible == 1 ? "" : "s") no longer qualified and stayed."

@@ -272,7 +272,7 @@ struct EventsRootView: View {
             CardClearConfirmSheet(
                 request: request,
                 onCancel: { workspace.pendingCardClear = nil },
-                onConfirm: { workspace.confirmCardClear(request, confirmation: $0) }
+                onConfirm: { workspace.confirmCardClear(request, confirmation: $0, includeNASOnly: $1) }
             )
         }
         .sheet(item: $workspace.pendingRemoval) { request in
@@ -400,9 +400,12 @@ struct EventsSidebar: View {
                 }
             }
             let nasFound = workspace.discoveredNASEvents(matching: query)
-            if !nasFound.isEmpty {
+            let nasLeftOut = workspace.nasDiscoveryProblems
+            // Left-out folders alone still show (they hold files no event
+            // has), without a button: nothing there can be added as it is.
+            if !nasFound.isEmpty || (query.isEmpty && !nasLeftOut.isEmpty) {
                 Section("Found on the NAS") {
-                    nasDiscoveryBanner(nasFound, skipped: workspace.nasDiscoveryProblems)
+                    nasDiscoveryBanner(nasFound, skipped: nasLeftOut, note: workspace.nasAdoptNote)
                 }
             }
 
@@ -544,32 +547,48 @@ struct EventsSidebar: View {
 
     /// Event folders only the NAS holds files for. Adding them records
     /// assignments only; the files show on their events as "NAS only".
-    private func nasDiscoveryBanner(_ found: [DiscoveredNASEvent], skipped: [NASDiscoveryProblem]) -> some View {
+    /// What discovery left out is said plainly, and the last Add to Events
+    /// outcome stays under the button while the section is here.
+    private func nasDiscoveryBanner(_ found: [DiscoveredNASEvent], skipped: [NASDiscoveryProblem], note: String?) -> some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("\(found.count) event folder\(found.count == 1 ? " has" : "s have") files on the NAS that are not in your events.")
-                .font(.callout.weight(.semibold))
-                .fixedSize(horizontal: false, vertical: true)
-            ForEach(found.prefix(3)) { folder in
-                Text("\(folder.displayName) · \(folder.fileCount.formatted()) files\(folder.matchingEventID == nil ? " · new event" : "")")
+            if !found.isEmpty {
+                Text("\(found.count) event folder\(found.count == 1 ? " has" : "s have") files on the NAS that are not in your events.")
+                    .font(.callout.weight(.semibold))
+                    .fixedSize(horizontal: false, vertical: true)
+                ForEach(found.prefix(3)) { folder in
+                    Text("\(folder.displayName) · \(folder.fileCount.formatted()) files\(folder.matchingEventID == nil ? " · new event" : "")")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .help(folder.relativeFolderPath)
+                }
+                if found.count > 3 {
+                    Text("and \(found.count - 3) more")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            if let leftOut = NASDiscoveryWording.leftOutLine(skipped) {
+                Text(leftOut)
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .help(folder.relativeFolderPath)
+                    .lineLimit(4)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .help(NASDiscoveryWording.leftOutDetails(skipped))
             }
-            if found.count > 3 {
-                Text("and \(found.count - 3) more")
+            if !found.isEmpty {
+                Button("Add to Events") { workspace.adoptDiscoveredNASEvents() }
+                    .controlSize(.small)
+                    .help("Backs up the photo list, then lists these files on their events as NAS only. Nothing on the NAS moves or changes.")
+            }
+            if let note {
+                Text(note)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .lineLimit(4)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
             }
-            if !skipped.isEmpty {
-                Text("\(skipped.count) item\(skipped.count == 1 ? "" : "s") left out")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .help(skipped.prefix(8).map { "\($0.path): \($0.reason)" }.joined(separator: "\n"))
-            }
-            Button("Add to Events") { workspace.adoptDiscoveredNASEvents() }
-                .controlSize(.small)
-                .help("Backs up the photo list, then lists these files on their events as NAS only. Nothing on the NAS moves or changes.")
         }
         .padding(.vertical, 4)
     }

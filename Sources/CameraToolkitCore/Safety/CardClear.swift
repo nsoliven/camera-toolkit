@@ -25,8 +25,13 @@ public struct CardClearFile: Hashable, Sendable {
     public var nasPath: String
     /// The SHA-256 Sync to NAS recorded as verified for that drive copy.
     public var verifiedSHA256: String
+    /// True when the NAS holds the file's only copy besides the card: Apply
+    /// sent it straight to the NAS while its event's drive was not
+    /// connected (`NASDirectApply`). `drivePath` is then the NAS copy too,
+    /// and the NAS must be reachable and read again before it is cleared.
+    public var nasOnly: Bool
 
-    public init(sourcePath: String, relativePath: String, byteCount: Int64, modifiedAt: Date, drivePath: String, nasPath: String, verifiedSHA256: String) {
+    public init(sourcePath: String, relativePath: String, byteCount: Int64, modifiedAt: Date, drivePath: String, nasPath: String, verifiedSHA256: String, nasOnly: Bool = false) {
         self.sourcePath = sourcePath
         self.relativePath = relativePath
         self.byteCount = byteCount
@@ -34,6 +39,7 @@ public struct CardClearFile: Hashable, Sendable {
         self.drivePath = drivePath
         self.nasPath = nasPath
         self.verifiedSHA256 = verifiedSHA256
+        self.nasOnly = nasOnly
     }
 }
 
@@ -87,6 +93,15 @@ public struct CardClearPlan: Equatable, Sendable {
     /// Items whose every file is in its event on the drive, but not every
     /// file has a verified NAS copy yet: "waiting for Sync to NAS".
     public var waitingForNAS: [WaitingItem] = []
+    /// Sorted files Apply copied straight to the NAS earlier whose NAS copy
+    /// was not checked in this pass — the NAS is not connected, or the pass
+    /// did not probe it (`probeNAS: false`, the board's background
+    /// refresh). Source path key → event. Neither applied nor clearable,
+    /// and never called safe; also not waiting for Apply.
+    public var nasUnchecked: [String: UUID] = [:]
+    /// Why `nasUnchecked` was not checked.
+    public var nasUncheckedBecauseNASIsAway = false
+    public var nasUncheckedFiles: Int { nasUnchecked.count }
     /// `AppliedSourceCheck`'s answer for the same files, from the same pass.
     public var applied: [String: UUID] = [:]
     /// The drive's volume name, for "safe on <drive> and the NAS".
@@ -102,6 +117,9 @@ public struct CardClearPlan: Equatable, Sendable {
     public init() {}
 
     public var clearableFiles: Int { clearable.reduce(0) { $0 + $1.files.count } }
+    /// Clearable files whose only other copy is on the NAS (sent there by
+    /// Apply while their event's drive was not connected).
+    public var nasOnlyFiles: Int { clearable.reduce(0) { $0 + $1.files.count(where: \.nasOnly) } }
     public var clearableBytes: Int64 { clearable.reduce(0) { $0 + $1.byteCount } }
     public var waitingFiles: Int { waitingForNAS.reduce(0) { $0 + $1.fileCount } }
     public var waitingBytes: Int64 { waitingForNAS.reduce(0) { $0 + $1.byteCount } }
@@ -119,6 +137,11 @@ public enum CardClearPlanner {
     ///   state `verified`, with a verification date, the same byte count, a
     ///   SHA-256, and the drive copy's current modification time — the rule
     ///   `EventPresenceScanner` applies before Take Off Drive may trust it.
+    /// Or, when the event's drive copy is not there: Apply sent the file
+    /// straight to the NAS while that drive was not connected
+    /// (`NASDirectApply`), and a verified record vouches for this very card
+    /// file (`NASDirectApply.vouches`). Such a file is `nasOnly`; the
+    /// service re-reads its NAS copy and never clears it with the NAS away.
     /// The NAS share itself is not read here.
     public static func plan(
         inputs: [CardClearInput],
@@ -129,6 +152,10 @@ public enum CardClearPlanner {
         mountedVolumes: Set<String>? = nil,
         pauseGate: DriveActivityGate? = nil,
         sameVolume: AppliedSourceCheck.SameVolume? = nil,
+        /// False for a background refresh: NAS-only copies are reported as
+        /// not checked instead of the NAS being listed (a hung share must
+        /// never block it). Clear from Card and its job pass true.
+        probeNAS: Bool = true,
         isCancelled: @Sendable () -> Bool = { false }
     ) -> CardClearPlan {
         var plan = CardClearPlan()
@@ -144,21 +171,41 @@ public enum CardClearPlanner {
             isCancelled: isCancelled
         )
         plan.applied = assets.mapValues(\.assignment.eventID)
-        guard !assets.isEmpty, !isCancelled() else { return plan }
+        guard !isCancelled() else { return plan }
 
-        // One catalog read for every applied file's NAS record.
-        var mirrorKeys: [String: String] = [:]
-        for (sourceKey, asset) in assets {
-            guard let event = events[asset.assignment.eventID],
-                  let mirror = try? locations.layout(for: event, deviceID: asset.assignment.deviceID)
-                    .mirrorRelativePath(for: asset.assignment.relativePath) else { continue }
-            mirrorKeys[sourceKey] = NASSyncStore.pathKey(mirror)
+        let root = URL(fileURLWithPath: sourceRoot, isDirectory: true).standardizedFileURL.path + "/"
+        // One catalog read for every sorted file's NAS record: the applied
+        // ones (their drive copy's record) and the rest (a record Apply wrote
+        // when it sent the file straight to the NAS).
+        var mirrorPaths: [String: String] = [:]
+        for input in inputs {
+            for entry in input.entries {
+                guard let assignment = entry.assignment, let event = events[assignment.eventID],
+                      let mirror = NASDirectApply.mirrorPath(for: assignment, event: event, locations: locations) else { continue }
+                mirrorPaths[EventStorageLocations.pathKey(entry.path)] = mirror
+            }
         }
+        let mirrorKeys = mirrorPaths.mapValues(NASSyncStore.pathKey)
         let records = catalogURL.map {
             NASSyncStore.records(catalogURL: $0, nasRoot: locations.nasRoot.path, pathKeys: Array(Set(mirrorKeys.values)))
         } ?? [:]
+        let (nasOnly, nasUnchecked) = nasOnlyCopies(
+            inputs: inputs,
+            root: root,
+            assets: assets,
+            events: events,
+            locations: locations,
+            mirrorPaths: mirrorPaths,
+            records: records,
+            mountedVolumes: mountedVolumes,
+            sameVolume: sameVolume,
+            probeNAS: probeNAS
+        )
+        plan.nasUnchecked = nasUnchecked.keys
+        plan.nasUncheckedBecauseNASIsAway = nasUnchecked.nasAway
+        for (key, copy) in nasOnly { plan.applied[key] = copy.assignment.eventID }
+        guard !plan.applied.isEmpty, !isCancelled() else { return plan }
 
-        let root = URL(fileURLWithPath: sourceRoot, isDirectory: true).standardizedFileURL.path + "/"
         var driveRoots: [String] = []
         for input in inputs {
             guard !isCancelled() else { break }
@@ -172,6 +219,21 @@ public enum CardClearPlanner {
             var eventIDs: Set<UUID> = []
             for entry in input.entries {
                 let key = EventStorageLocations.pathKey(entry.path)
+                if assets[key] == nil, let copy = nasOnly[key], let assignment = entry.assignment, copy.assignment.eventID == assignment.eventID {
+                    roots.insert(copy.sourceRootPath + "\u{0}" + copy.nasRootPath)
+                    eventIDs.insert(assignment.eventID)
+                    files.append(CardClearFile(
+                        sourcePath: copy.sourcePath,
+                        relativePath: assignment.relativePath,
+                        byteCount: assignment.fileSize,
+                        modifiedAt: assignment.modifiedAt,
+                        drivePath: copy.nasPath,
+                        nasPath: copy.nasPath,
+                        verifiedSHA256: copy.sha256,
+                        nasOnly: true
+                    ))
+                    continue
+                }
                 guard let assignment = entry.assignment,
                       let asset = assets[key], asset.assignment.eventID == assignment.eventID,
                       let source = asset.sourcePath, source.hasPrefix(root),
@@ -214,11 +276,11 @@ public enum CardClearPlanner {
                 continue
             }
             // One item clears through one cleanup call: one card root, one
-            // drive root, one event. Anything else is left alone.
+            // drive (or NAS) root, one event. Anything else is left alone.
             guard roots.count == 1, eventIDs.count == 1, let pair = roots.first else { continue }
             let parts = pair.components(separatedBy: "\u{0}")
             plan.clearable.append(CardClearItem(id: input.id, eventID: eventID, sourceRoot: parts[0], driveRoot: parts[1], files: files))
-            driveRoots.append(parts[1])
+            if !files.contains(where: \.nasOnly) { driveRoots.append(parts[1]) }
         }
         if let first = driveRoots.first ?? assets.values.first?.driveRootPath {
             plan.driveName = try? URL(fileURLWithPath: first).resourceValues(forKeys: [.volumeLocalizedNameKey]).volumeLocalizedName
@@ -235,6 +297,98 @@ public enum CardClearPlanner {
               let modified = (try? URL(fileURLWithPath: drivePath).resourceValues(forKeys: [.contentModificationDateKey]))?
                 .contentModificationDate?.timeIntervalSinceReferenceDate else { return false }
         return abs(recorded - modified) < 0.001
+    }
+
+    /// A sorted card file whose event's drive copy is not there, but whose
+    /// NAS copy Apply sent straight to the NAS and Sync to NAS's engine
+    /// verified — the record names this very card file (size and
+    /// modification time).
+    struct NASOnlyCopy {
+        var assignment: PhotoEventAssignment
+        var sourcePath: String
+        var sourceRootPath: String
+        var nasPath: String
+        /// `nasPath` minus the relative path: the folder the cleanup
+        /// service pairs with the card root.
+        var nasRootPath: String
+        var mirrorPath: String
+        var sha256: String
+    }
+
+    /// Source path key → its NAS-only copy, for sorted files under the card
+    /// root that the drive check did not find in their event: not a drive
+    /// copy themselves, not on the event drive's volume, not a camera
+    /// support file, vouched for by a verified record
+    /// (`NASDirectApply.vouches`), and — the record is not enough — its NAS
+    /// file still there at that size (one listing per folder). With the NAS
+    /// not connected nothing qualifies; the second value counts the files
+    /// a record vouches for that could not be checked.
+    static func nasOnlyCopies(
+        inputs: [CardClearInput],
+        root: String,
+        assets: [String: EventAssetPresence],
+        events: [UUID: SavedCameraEvent],
+        locations: EventStorageLocations,
+        mirrorPaths: [String: String],
+        records: [String: NASSyncRecord],
+        mountedVolumes: Set<String>?,
+        sameVolume: AppliedSourceCheck.SameVolume?,
+        probeNAS: Bool = true
+    ) -> (copies: [String: NASOnlyCopy], unchecked: (keys: [String: UUID], nasAway: Bool)) {
+        let mounted = mountedVolumes ?? VolumeInfo.mountedVolumePaths()
+        let sameVolume = sameVolume ?? { source, root, mounted in
+            VolumeInfo.isSameVolume(source.deletingLastPathComponent(), root, mountedVolumes: mounted)
+        }
+        let excluded = [locations.bufferRoot, locations.privateStagingRoot, locations.nasRoot, locations.libraryRoot]
+            .map { $0.standardizedFileURL.path }
+            .filter { $0.count > 1 }
+            .map { $0 + "/" }
+        let nasRoot = locations.nasRoot.standardizedFileURL.path
+        var found: [String: NASOnlyCopy] = [:]
+        for input in inputs {
+            for entry in input.entries {
+                let key = EventStorageLocations.pathKey(entry.path)
+                guard assets[key] == nil, let assignment = entry.assignment, let event = events[assignment.eventID],
+                      let mirror = mirrorPaths[key], !CameraSupportFiles.isCameraGenerated(entry.path) else { continue }
+                let source = URL(fileURLWithPath: entry.path).standardizedFileURL.path
+                guard source.hasPrefix(root), !excluded.contains(where: { source.hasPrefix($0) }) else { continue }
+                let sourceRootPath = URL(fileURLWithPath: NSString(string: assignment.sourceRootPath).expandingTildeInPath, isDirectory: true)
+                    .standardizedFileURL.path
+                guard EventStorageLocations.pathKey((sourceRootPath as NSString).appendingPathComponent(assignment.relativePath)) == key else { continue }
+                // A source on the event drive's own volume is a folder on
+                // that drive, not a card: the drive rules apply to it.
+                let driveRoot = locations.driveRoot(for: locations.resolvedPolicy(for: event))
+                if VolumeInfo.isAvailable(driveRoot, mountedVolumes: mounted),
+                   sameVolume(URL(fileURLWithPath: source), driveRoot, mounted) { continue }
+                let record = records[NASSyncStore.pathKey(mirror)]
+                guard NASDirectApply.vouches(record, sourcePath: source, byteCount: assignment.fileSize),
+                      let sha = record?.sha256 else { continue }
+                let nasPath = nasRoot + "/" + mirror
+                guard let nasRootPath = EventAssetPresence.root(of: nasPath, relativePath: assignment.relativePath) else { continue }
+                found[key] = NASOnlyCopy(
+                    assignment: assignment,
+                    sourcePath: source,
+                    sourceRootPath: sourceRootPath,
+                    nasPath: nasPath,
+                    nasRootPath: nasRootPath,
+                    mirrorPath: mirror,
+                    sha256: sha.lowercased()
+                )
+            }
+        }
+        guard !found.isEmpty else { return ([:], ([:], false)) }
+        let unchecked = found.mapValues(\.assignment.eventID)
+        // Without a probe, only the mount table is read (no I/O on the
+        // share) to say why the copies were not checked.
+        guard probeNAS else {
+            return ([:], (unchecked, !VolumeInfo.isAvailable(locations.nasRoot, mountedVolumes: mounted)))
+        }
+        guard NASDirectApply.isNASUsable(locations) else { return ([:], (unchecked, true)) }
+        let present = NASDirectApply.presentOnNAS(
+            found.values.map { ($0.mirrorPath, $0.assignment.fileSize) },
+            nasRoot: nasRoot
+        )
+        return (found.filter { present.contains(NASSyncStore.pathKey($0.value.mirrorPath)) }, ([:], false))
     }
 }
 
@@ -521,6 +675,9 @@ public struct CardClearService {
         checks: inout CardClearChecks,
         stage: (String, Int64) -> Void
     ) -> String? {
+        if file.nasOnly {
+            return verifyNASOnly(file, nasReachable: nasReachable, identities: &identities, read: &read, checks: &checks, stage: stage)
+        }
         guard fileManager.fileExists(atPath: file.sourcePath) else { return "The card file is gone." }
         guard fileManager.fileExists(atPath: file.drivePath) else { return "The drive copy is missing." }
         do {
@@ -553,6 +710,50 @@ public struct CardClearService {
             }
             identities[file.sourcePath] = cardBefore
             identities[file.drivePath] = driveBefore
+            return nil
+        } catch {
+            return "Could not be read: \(error.localizedDescription)"
+        }
+    }
+
+    /// A card file whose only other copy is on the NAS (Apply sent it there
+    /// while its event's drive was not connected). There is no drive copy
+    /// to stand in for the NAS, so the NAS must be reachable: its copy is
+    /// read again and must hash to what Sync to NAS's engine verified, and
+    /// the card file must hash to the same.
+    private func verifyNASOnly(
+        _ file: CardClearFile,
+        nasReachable: Bool,
+        identities: inout [String: Identity],
+        read: inout Int64,
+        checks: inout CardClearChecks,
+        stage: (String, Int64) -> Void
+    ) -> String? {
+        guard nasReachable else { return "Only the NAS holds another copy, and the NAS is not connected." }
+        guard fileManager.fileExists(atPath: file.sourcePath) else { return "The card file is gone." }
+        guard fileManager.fileExists(atPath: file.nasPath) else { return "The NAS copy is missing." }
+        do {
+            let cardBefore = try identity(file.sourcePath)
+            let nasBefore = try identity(file.nasPath)
+            guard cardBefore.size == file.byteCount else { return "The card file's size changed." }
+            guard nasBefore.size == file.byteCount else { return "The NAS copy's size changed." }
+            stage(Self.checkingNASStep, read)
+            let nasHash = try FileScanner.sha256(URL(fileURLWithPath: file.nasPath)).lowercased()
+            read += file.byteCount
+            guard nasHash == file.verifiedSHA256.lowercased() else {
+                return "The NAS copy no longer matches the copy that was verified."
+            }
+            checks.nasMatched += 1
+            stage(Self.checkingCardStep, read)
+            let cardHash = try FileScanner.sha256(URL(fileURLWithPath: file.sourcePath)).lowercased()
+            read += file.byteCount
+            guard cardHash == nasHash else { return "The card file differs from its NAS copy." }
+            checks.cardMatched += 1
+            guard try identity(file.sourcePath) == cardBefore, try identity(file.nasPath) == nasBefore else {
+                return "The card file or NAS copy changed during the check."
+            }
+            identities[file.sourcePath] = cardBefore
+            identities[file.nasPath] = nasBefore
             return nil
         } catch {
             return "Could not be read: \(error.localizedDescription)"

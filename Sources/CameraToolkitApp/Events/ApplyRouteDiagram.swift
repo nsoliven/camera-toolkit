@@ -8,6 +8,10 @@ enum ApplyRouteMethod: Equatable, Sendable {
     case rename
     /// Cross drive: a checksum-verified copy that leaves the original.
     case verifiedCopy
+    /// The event's drive is not connected: a SHA-256 verified copy from the
+    /// source straight into the event's NAS folder, by the Sync to NAS
+    /// engine. The original stays.
+    case nasCopy
 
     /// "Move", not "Rename": the owner read "Rename" as a button that
     /// renames the folder. On disk it is still an exclusive rename.
@@ -15,6 +19,7 @@ enum ApplyRouteMethod: Equatable, Sendable {
         switch self {
         case .rename: "Move"
         case .verifiedCopy: "Copy + verify"
+        case .nasCopy: "Copy to NAS"
         }
     }
 
@@ -23,6 +28,7 @@ enum ApplyRouteMethod: Equatable, Sendable {
         switch self {
         case .rename: "instant · same drive"
         case .verifiedCopy: "other drive · originals kept"
+        case .nasCopy: "drive not connected · checked file by file"
         }
     }
 
@@ -30,6 +36,16 @@ enum ApplyRouteMethod: Equatable, Sendable {
         switch self {
         case .rename: "Same drive: the files are renamed into the event folder. Instant, no bytes are copied, and nothing is overwritten."
         case .verifiedCopy: "Another drive: the files are copied, checksum-verified, and the originals stay where they are."
+        case .nasCopy: "The event's drive isn't connected: the files are copied straight into the event's folder on the NAS, the same way Sync to NAS copies, each checked with SHA-256. A NAS file with the same name is never replaced, and the originals stay where they are."
+        }
+    }
+
+    /// Rows sort moves first, then drive copies, then NAS copies.
+    var order: Int {
+        switch self {
+        case .rename: 0
+        case .verifiedCopy: 1
+        case .nasCopy: 2
         }
     }
 
@@ -37,6 +53,7 @@ enum ApplyRouteMethod: Equatable, Sendable {
         switch self {
         case .rename: "arrow.right"
         case .verifiedCopy: "checkmark.shield.fill"
+        case .nasCopy: "server.rack"
         }
     }
 }
@@ -91,14 +108,32 @@ struct ApplyEventSummary: Identifiable, Equatable, Sendable {
     var byteCount: Int64
     var alreadyThere: Int
     var unavailable: Int
+    var alreadyOnNAS: Int = 0
+    var waitingForDrive: Int = 0
+    var driveName: String = ""
+    var notPlannable: Int = 0
 
     var id: UUID { event.id }
 
-    /// "3 already in place · 2 on a disconnected drive"
+    /// "3 already in place · 2 on a disconnected source drive"
     var footnote: String? {
+        ApplyEventSummary.footnote(
+            alreadyThere: alreadyThere,
+            unavailable: unavailable,
+            alreadyOnNAS: alreadyOnNAS,
+            waitingForDrive: waitingForDrive,
+            driveName: driveName,
+            notPlannable: notPlannable
+        )
+    }
+
+    static func footnote(alreadyThere: Int, unavailable: Int, alreadyOnNAS: Int, waitingForDrive: Int, driveName: String, notPlannable: Int = 0) -> String? {
         let parts = [
             alreadyThere > 0 ? "\(alreadyThere) already in place" : nil,
-            unavailable > 0 ? "\(unavailable) on a disconnected drive" : nil,
+            alreadyOnNAS > 0 ? "\(alreadyOnNAS) already on the NAS" : nil,
+            waitingForDrive > 0 ? "\(waitingForDrive) wait for the \(driveName.isEmpty ? "event’s" : driveName) drive (not connected, and no NAS)" : nil,
+            unavailable > 0 ? "\(unavailable) on a source drive that isn’t connected" : nil,
+            notPlannable > 0 ? "\(notPlannable) can’t be placed while the drive is away" : nil,
         ].compactMap { $0 }
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
@@ -146,6 +181,27 @@ enum ApplyRouteDiagram {
         }
         rows.append(contentsOf: merged.values)
 
+        for (index, batch) in group.nasCopies.enumerated() {
+            var row = ApplyRouteRow(
+                id: "nas|\(index)",
+                method: .nasCopy,
+                sourcePath: batch.sourceRoot,
+                sourceLabel: OrganizeRouteLabel.breadcrumb(for: batch.sourceRoot),
+                destinationLabel: (["NAS"] + [OrganizeRouteLabel.subpath(of: batch.destinationRoot, under: group.destinationFolder)].filter { !$0.isEmpty })
+                    .joined(separator: " ▸ "),
+                fileCount: batch.targets.count,
+                photoCount: 0,
+                videoCount: 0,
+                otherCount: 0,
+                byteCount: batch.targets.reduce(Int64(0)) { $0 + $1.byteCount },
+                fileNames: batch.files.map(\.path)
+            )
+            for file in batch.files {
+                count(kindOf(file.path), into: &row)
+            }
+            rows.append(row)
+        }
+
         for (index, batch) in group.copies.enumerated() {
             var row = ApplyRouteRow(
                 id: "copy|\(index)",
@@ -170,7 +226,7 @@ enum ApplyRouteDiagram {
             rows[index].fileNames.sort()
         }
         return rows.sorted { lhs, rhs in
-            if lhs.method != rhs.method { return lhs.method == .rename }
+            if lhs.method != rhs.method { return lhs.method.order < rhs.method.order }
             return lhs.sourceLabel.localizedStandardCompare(rhs.sourceLabel) == .orderedAscending
         }
     }
@@ -205,7 +261,11 @@ enum ApplyRouteDiagram {
                 otherCount: 0,
                 byteCount: 0,
                 alreadyThere: group.alreadyThere,
-                unavailable: group.unavailable
+                unavailable: group.unavailable,
+                alreadyOnNAS: group.alreadyOnNAS,
+                waitingForDrive: group.waitingForDrive,
+                driveName: group.driveName,
+                notPlannable: group.notPlannable
             )
             for route in routes(for: group) {
                 summary.fileCount += route.fileCount
@@ -241,8 +301,8 @@ private struct ApplyMethodBadge: View {
             .font(.caption2.weight(.semibold))
             .padding(.horizontal, 7)
             .padding(.vertical, 2)
-            .background((method == .verifiedCopy ? Color.blue : Color.secondary).quinary, in: Capsule())
-            .foregroundStyle(method == .verifiedCopy ? Color.blue : Color.secondary)
+            .background((method == .rename ? Color.secondary : Color.blue).quinary, in: Capsule())
+            .foregroundStyle(method == .rename ? Color.secondary : Color.blue)
             .help(method.detail)
     }
 }
@@ -373,12 +433,15 @@ struct ApplyEventGroupCard: View {
                     }
                 }
 
-                let footnotes = [
-                    group.alreadyThere == 0 ? nil : "\(group.alreadyThere) already in place",
-                    group.unavailable == 0 ? nil : "\(group.unavailable) on a disconnected drive"
-                ].compactMap { $0 }
-                if !footnotes.isEmpty {
-                    Text(footnotes.joined(separator: " · "))
+                if let footnote = ApplyEventSummary.footnote(
+                    alreadyThere: group.alreadyThere,
+                    unavailable: group.unavailable,
+                    alreadyOnNAS: group.alreadyOnNAS,
+                    waitingForDrive: group.waitingForDrive,
+                    driveName: group.driveName,
+                    notPlannable: group.notPlannable
+                ) {
+                    Text(footnote)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -389,7 +452,8 @@ struct ApplyEventGroupCard: View {
     }
 
     private var fileCount: Int {
-        group.moves.count + group.copyFileCount + group.alreadyThere + group.unavailable
+        group.moves.count + group.copyFileCount + group.nasCopyCount + group.alreadyThere + group.unavailable
+            + group.alreadyOnNAS + group.waitingForDrive + group.notPlannable
     }
 }
 

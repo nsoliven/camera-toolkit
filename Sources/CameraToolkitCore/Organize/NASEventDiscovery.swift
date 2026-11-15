@@ -87,6 +87,8 @@ public struct NASAdoptionSummary: Sendable {
     /// Every event that gained assignments or was created, ancestors included.
     public var touchedEventIDs: Set<UUID> = []
     public var problems: [NASDiscoveryProblem] = []
+    /// Per discovered folder (`DiscoveredNASEvent.id`): files added to its event.
+    public var addedByFolder: [String: Int] = [:]
 
     public init() {}
 }
@@ -296,9 +298,18 @@ public enum NASEventDiscovery {
         // Parents first, so a subevent links to the event its parent
         // folder became.
         for folder in discovered.sorted(by: { $0.folderNames.count < $1.folderNames.count }) {
+            summary.addedByFolder[folder.id] = summary.addedByFolder[folder.id] ?? 0
             let year = String(folder.relativeFolderPath.prefix { $0 != "/" })
+            let problemsBefore = summary.problems.count
             guard let eventID = ensureEvent(year: year, names: folder.folderNames),
-                  let event = scratch.savedEvents.first(where: { $0.id == eventID }) else { continue }
+                  let event = scratch.savedEvents.first(where: { $0.id == eventID }) else {
+                // Every refusal says why, so the folder is never left out
+                // without a reason.
+                if summary.problems.count == problemsBefore {
+                    summary.problems.append(NASDiscoveryProblem(path: folder.relativeFolderPath, reason: "no event can be made from this folder’s name"))
+                }
+                continue
+            }
             let policy = locations.resolvedPolicy(for: event)
             for camera in folder.cameras {
                 let layout = locations.layout(for: event, deviceID: camera.deviceID)
@@ -335,6 +346,7 @@ public enum NASEventDiscovery {
                     covered.insert(key)
                     existingIDs.insert(id)
                     summary.addedAssignments += 1
+                    summary.addedByFolder[folder.id, default: 0] += 1
                     summary.touchedEventIDs.insert(eventID)
                 }
             }
@@ -386,9 +398,14 @@ public enum NASEventDiscovery {
     }
 
     /// `NASSyncStore.pathKey` of every NAS mirror path an assignment owns:
-    /// its mirror copy, and its source when that is itself under the NAS
-    /// root. `folderKeys` limits the work to events whose mirror folder is
-    /// one of them (nil: every event).
+    /// its mirror copy; its source when that is itself under the NAS root;
+    /// and, for a source on a drive root, that drive file's own mirror path
+    /// — where Sync to NAS copies it (`mirrorRelativePath(forDrivePath:)`),
+    /// which differs from the event's folder when the file was re-sorted
+    /// into another event without moving on the drive. `folderKeys` limits
+    /// the event-layout work to events whose mirror folder is one of them
+    /// (nil: every event); drive mirror paths are always counted, since the
+    /// owning event can be any event.
     static func coveredMirrorKeys(
         configuration: AppConfiguration,
         locations: EventStorageLocations,
@@ -401,11 +418,18 @@ public enum NASEventDiscovery {
         }
         var inScope: [UUID: Bool] = [:]
         let nasPrefix = locations.nasRoot.path + "/"
+        // The longer root first, in case one drive root nests in the other.
+        let driveRoots = [locations.bufferRoot.path, locations.privateStagingRoot.path]
+            .filter { $0.count > 1 }
+            .sorted { $0.count > $1.count }
         var covered: Set<String> = []
         for assignment in configuration.photoEventAssignments {
             if assignment.sourceRootPath.hasPrefix(nasPrefix) || assignment.sourceRootPath == locations.nasRoot.path,
                let source = locations.sourceURL(for: assignment), let relative = locations.nasRelativePath(source.path) {
                 covered.insert(NASSyncStore.pathKey(relative))
+            }
+            if let mirror = driveMirrorPath(assignment, driveRoots: driveRoots) {
+                covered.insert(NASSyncStore.pathKey(mirror))
             }
             guard let event = eventsByID[assignment.eventID] else { continue }
             if let folderKeys {
@@ -429,6 +453,21 @@ public enum NASEventDiscovery {
             }
         }
         return covered
+    }
+}
+
+extension NASEventDiscovery {
+    /// The NAS mirror path of an assignment whose source sits under a drive
+    /// root: the path under that root, made portable — string work only.
+    static func driveMirrorPath(_ assignment: PhotoEventAssignment, driveRoots: [String]) -> String? {
+        let rootPath = assignment.sourceRootPath
+        for drive in driveRoots where rootPath == drive || rootPath.hasPrefix(drive + "/") {
+            let folder = rootPath == drive ? "" : String(rootPath.dropFirst(drive.count + 1))
+            let relative = folder.isEmpty ? assignment.relativePath : folder + "/" + assignment.relativePath
+            guard EventStorageLocations.isLexicallyClean(relative), (try? PathSafety.validateRelativePath(relative)) != nil else { return nil }
+            return PortablePath.sanitize(relativePath: relative)
+        }
+        return nil
     }
 }
 

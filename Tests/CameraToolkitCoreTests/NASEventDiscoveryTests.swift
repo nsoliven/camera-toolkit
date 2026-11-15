@@ -186,6 +186,56 @@ final class NASEventDiscoveryTests: XCTestCase {
         }
     }
 
+    /// A file re-sorted into another event without moving on the drive
+    /// keeps its drive path, so Sync to NAS mirrors it under the first
+    /// event's folder. That NAS copy belongs to an event: it is never
+    /// offered as "not in your events" (adopting it would list the same
+    /// photo in two events).
+    func testANASCopyOfAReSortedDriveFileIsNotOffered() throws {
+        try withTemporaryDirectory { root in
+            var configuration = testConfiguration(root: root)
+            let beach = SavedCameraEvent(name: "Beach Day", eventDate: day("2026-08-26"))
+            let picnic = SavedCameraEvent(name: "Picnic", eventDate: day("2026-10-03"))
+            configuration.savedEvents = [beach, picnic]
+            let locations = EventStorageLocations(configuration: configuration)
+            let beachDrive = locations.originalsRoot(for: beach, deviceID: "sony-a7v", policy: .buffer).path
+            configuration.photoEventAssignments = [PhotoEventAssignment(
+                sourceRootPath: beachDrive,
+                relativePath: "DSC00010.ARW",
+                fileSize: 5,
+                modifiedAt: Date(timeIntervalSince1970: 1_780_000_000),
+                eventID: picnic.id,
+                deviceID: "sony-a7v"
+            )]
+            let camera = locations.nasRoot.appendingPathComponent("2026/2026-08-26 Beach Day/Originals/Sony A7V")
+            try writeFile(camera.appendingPathComponent("DSC00010.ARW"), "moved")
+            XCTAssertTrue(NASEventDiscovery.discover(configuration: configuration).events.isEmpty)
+
+            // A file nothing covers beside it is still offered — alone.
+            try writeFile(camera.appendingPathComponent("DSC00011.ARW"), "loose")
+            let found = NASEventDiscovery.discover(configuration: configuration)
+            XCTAssertEqual(found.events.flatMap { $0.cameras.flatMap(\.files).map(\.path) }, ["DSC00011.ARW"])
+        }
+    }
+
+    func testEveryRefusedFolderSaysWhy() throws {
+        try withTemporaryDirectory { root in
+            var configuration = testConfiguration(root: root)
+            let first = SavedCameraEvent(name: "Beach Day", eventDate: day("2026-08-26"))
+            let second = SavedCameraEvent(name: "Beach Day", eventDate: day("2026-08-26"))
+            configuration.savedEvents = [first, second]
+            let camera = EventStorageLocations(configuration: configuration).nasRoot.appendingPathComponent("2026/2026-08-26 Beach Day/Originals/Sony A7V")
+            try writeFile(camera.appendingPathComponent("DSC00001.ARW"), "frame")
+            let found = NASEventDiscovery.discover(configuration: configuration)
+            XCTAssertEqual(found.events.count, 1)
+            var adopted = configuration
+            let summary = NASEventDiscovery.adopt(found.events, into: &adopted)
+            XCTAssertEqual(summary.addedAssignments, 0)
+            XCTAssertEqual(summary.addedByFolder[found.events[0].id], 0)
+            XCTAssertFalse(summary.problems.isEmpty, "a folder is never left out without a reason")
+        }
+    }
+
     func testCameraFolderTheAppNamesDifferentlyIsReportedNotAdopted() throws {
         try withTemporaryDirectory { temporary in
             let root = temporary.resolvingSymlinksInPath()
