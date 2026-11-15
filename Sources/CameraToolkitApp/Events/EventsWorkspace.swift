@@ -746,6 +746,10 @@ final class EventsWorkspace {
     /// under the button while the section is still there — why nothing (or
     /// not everything) was added. Nil before any click.
     var nasAdoptNote: String?
+    /// Per scanned source root: sorted files Apply copied straight to the
+    /// NAS whose copy the background refresh did not check (source path key
+    /// → event). Neither applied nor waiting for Apply.
+    var nasUncheckedSourceEvents: [String: [String: UUID]] = [:]
     /// Folders an Add to Events could not add anything from, with the
     /// listing they had then: until that listing changes they are reported
     /// as left out instead of being offered again.
@@ -2042,18 +2046,25 @@ final class EventsWorkspace {
 
     /// Re-learns which sorted files of a scanned source are already in their
     /// event (`AppliedSourceCheck`, off the main actor; it stats the source
-    /// and drive copies only, never the NAS). The board calls it after a
-    /// scan, a sort, an Apply or a copy finishing, and a mount change. A
-    /// newer call supersedes an older one still running.
+    /// and drive copies only, and never touches the NAS share — a hung SMB
+    /// mount cannot pile up these refreshes). Files Apply copied straight to
+    /// the NAS are therefore never "applied" or "safe" here: they are listed
+    /// as copied earlier and not checked, and only Clear from Card (and its
+    /// job) lists the NAS to check them. The board calls it after a scan, a
+    /// sort, an Apply or a copy finishing, and a mount change. A newer call
+    /// supersedes an older one still running.
     func refreshAppliedSources(for locationID: UUID) async {
         guard let result = sources[locationID]?.result else { return }
         let generation = UUID()
         appliedRefreshGenerations[locationID] = generation
-        let plan = await cardClearPlan(for: locationID, result: result)
+        let plan = await cardClearPlan(for: locationID, result: result, probeNAS: false)
         guard appliedRefreshGenerations[locationID] == generation,
               sources[locationID]?.result?.rootPath == result.rootPath else { return }
         if appliedSourceEvents[result.rootPath] != plan.applied {
             appliedSourceEvents[result.rootPath] = plan.applied
+        }
+        if nasUncheckedSourceEvents[result.rootPath] != plan.nasUnchecked {
+            nasUncheckedSourceEvents[result.rootPath] = plan.nasUnchecked
         }
         let summary = CardClearSummary(plan)
         if cardClearSummaries[result.rootPath] != summary {
@@ -2064,11 +2075,12 @@ final class EventsWorkspace {
     /// A fresh `CardClearPlanner` pass for one scanned source, off the main
     /// actor: the applied answer for every sorted file, and which items are
     /// safe on the drive and verified on the NAS. Reads the catalog, the
-    /// card and the drive; never the NAS share.
-    func cardClearPlan(for locationID: UUID, result: OrganizeScanResult) async -> CardClearPlan {
+    /// card and the drive; the NAS share only with `probeNAS` (one listing
+    /// per folder of the files Apply sent straight there).
+    func cardClearPlan(for locationID: UUID, result: OrganizeScanResult, probeNAS: Bool = true) async -> CardClearPlan {
         let job = cardClearJobInputs(result: result)
         return await Task.detached(priority: .utility) {
-            job.plan(isCancelled: { Task.isCancelled })
+            job.plan(probeNAS: probeNAS, isCancelled: { Task.isCancelled })
         }.value
     }
 
@@ -2178,8 +2190,10 @@ final class EventsWorkspace {
     /// The request the job runs: only the drive + NAS items, or also the
     /// NAS-only ones the owner turned on in the sheet.
     nonisolated static func cardClearChoice(_ request: CardClearRequest, includeNASOnly: Bool) -> CardClearRequest {
+        // `itemIDs` stays the items confirmed with a drive copy;
+        // `nasOnlyItemIDs` is only what the owner opted in as NAS-only. The
+        // job keeps the two apart (`CardClearRequest.jobItems`).
         var chosen = request
-        chosen.itemIDs = request.chosenItemIDs(includeNASOnly: includeNASOnly)
         let counts = CardClearWording.chosenCount(request, includeNASOnly: includeNASOnly)
         chosen.fileCount = counts.files
         chosen.byteCount = counts.bytes
@@ -2210,8 +2224,11 @@ final class EventsWorkspace {
             jobID: jobID,
             operation: { progress in
                 let plan = job.plan(isCancelled: { false })
-                // Only what the sheet chose: NAS-only items need the toggle.
-                let items = CardClearRequest.chosen(plan.clearable, itemIDs: itemIDs)
+                // Strictly what the sheet chose: a NAS-only item only if it
+                // was opted in as NAS-only; one that lost its drive copy
+                // since the sheet stays on the card.
+                let chosen = CardClearRequest.jobItems(plan.clearable, request: request)
+                let items = chosen.items
                 let nasReachable = VolumeInfo.isAvailable(nasRoot, mountedVolumes: mountedProvider?() ?? VolumeInfo.mountedVolumePaths())
                 let driveName = plan.driveName ?? request.driveName
                 recorder?.setTotals(files: items.reduce(0) { $0 + $1.files.count }, bytes: items.reduce(0) { $0 + $1.byteCount })
@@ -2252,8 +2269,12 @@ final class EventsWorkspace {
                 recorder?.notePhases(report.phases)
                 report.checks.driveName = driveName
                 recorder?.noteCardClearChecks(report.checks)
-                let dropped = itemIDs.subtracting(Set(items.map(\.id))).count
-                return CardClearOutcome(report: report, noLongerEligible: dropped)
+                let dropped = itemIDs.subtracting(Set(items.map(\.id))).subtracting(chosen.driveCopyGone.map(\.id)).count
+                return CardClearOutcome(
+                    report: report,
+                    noLongerEligible: dropped,
+                    driveCopyGoneFiles: chosen.driveCopyGone.reduce(0) { $0 + $1.files.count }
+                )
             },
             completion: { [weak self] outcome in
                 guard let self else { return "" }
@@ -2836,12 +2857,16 @@ final class EventsWorkspace {
     func sortedFiles(in result: OrganizeScanResult) -> (files: Int, bytes: Int64) {
         let duplicates = applyDuplicateSourceKeys.values.reduce(into: Set<String>()) { $0.formUnion($1) }
         let applied = appliedSourceEvents[result.rootPath] ?? [:]
+        // Copied straight to the NAS earlier, not checked now: not waiting
+        // for Apply either (Apply has nothing to do for them).
+        let unchecked = nasUncheckedSourceEvents[result.rootPath] ?? [:]
         var files = 0
         var bytes: Int64 = 0
         for item in result.items {
             for file in item.files {
                 guard let assignment = assignment(for: file), !duplicates.contains(file.pathKey),
-                      applied[file.pathKey] != assignment.eventID else { continue }
+                      applied[file.pathKey] != assignment.eventID,
+                      unchecked[file.pathKey] != assignment.eventID else { continue }
                 files += 1
                 bytes += file.size
             }

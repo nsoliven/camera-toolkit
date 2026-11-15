@@ -93,10 +93,15 @@ public struct CardClearPlan: Equatable, Sendable {
     /// Items whose every file is in its event on the drive, but not every
     /// file has a verified NAS copy yet: "waiting for Sync to NAS".
     public var waitingForNAS: [WaitingItem] = []
-    /// Sorted files Apply copied straight to the NAS earlier whose copy
-    /// cannot be checked now because the NAS is not connected. Neither
-    /// applied nor clearable until it is.
-    public var nasUncheckedFiles = 0
+    /// Sorted files Apply copied straight to the NAS earlier whose NAS copy
+    /// was not checked in this pass — the NAS is not connected, or the pass
+    /// did not probe it (`probeNAS: false`, the board's background
+    /// refresh). Source path key → event. Neither applied nor clearable,
+    /// and never called safe; also not waiting for Apply.
+    public var nasUnchecked: [String: UUID] = [:]
+    /// Why `nasUnchecked` was not checked.
+    public var nasUncheckedBecauseNASIsAway = false
+    public var nasUncheckedFiles: Int { nasUnchecked.count }
     /// `AppliedSourceCheck`'s answer for the same files, from the same pass.
     public var applied: [String: UUID] = [:]
     /// The drive's volume name, for "safe on <drive> and the NAS".
@@ -147,6 +152,10 @@ public enum CardClearPlanner {
         mountedVolumes: Set<String>? = nil,
         pauseGate: DriveActivityGate? = nil,
         sameVolume: AppliedSourceCheck.SameVolume? = nil,
+        /// False for a background refresh: NAS-only copies are reported as
+        /// not checked instead of the NAS being listed (a hung share must
+        /// never block it). Clear from Card and its job pass true.
+        probeNAS: Bool = true,
         isCancelled: @Sendable () -> Bool = { false }
     ) -> CardClearPlan {
         var plan = CardClearPlan()
@@ -189,9 +198,11 @@ public enum CardClearPlanner {
             mirrorPaths: mirrorPaths,
             records: records,
             mountedVolumes: mountedVolumes,
-            sameVolume: sameVolume
+            sameVolume: sameVolume,
+            probeNAS: probeNAS
         )
-        plan.nasUncheckedFiles = nasUnchecked
+        plan.nasUnchecked = nasUnchecked.keys
+        plan.nasUncheckedBecauseNASIsAway = nasUnchecked.nasAway
         for (key, copy) in nasOnly { plan.applied[key] = copy.assignment.eventID }
         guard !plan.applied.isEmpty, !isCancelled() else { return plan }
 
@@ -321,10 +332,10 @@ public enum CardClearPlanner {
         mirrorPaths: [String: String],
         records: [String: NASSyncRecord],
         mountedVolumes: Set<String>?,
-        sameVolume: AppliedSourceCheck.SameVolume?
-    ) -> (copies: [String: NASOnlyCopy], unchecked: Int) {
+        sameVolume: AppliedSourceCheck.SameVolume?,
+        probeNAS: Bool = true
+    ) -> (copies: [String: NASOnlyCopy], unchecked: (keys: [String: UUID], nasAway: Bool)) {
         let mounted = mountedVolumes ?? VolumeInfo.mountedVolumePaths()
-        let nasConnected = NASDirectApply.isNASUsable(locations)
         let sameVolume = sameVolume ?? { source, root, mounted in
             VolumeInfo.isSameVolume(source.deletingLastPathComponent(), root, mountedVolumes: mounted)
         }
@@ -365,13 +376,19 @@ public enum CardClearPlanner {
                 )
             }
         }
-        guard !found.isEmpty else { return ([:], 0) }
-        guard nasConnected else { return ([:], found.count) }
+        guard !found.isEmpty else { return ([:], ([:], false)) }
+        let unchecked = found.mapValues(\.assignment.eventID)
+        // Without a probe, only the mount table is read (no I/O on the
+        // share) to say why the copies were not checked.
+        guard probeNAS else {
+            return ([:], (unchecked, !VolumeInfo.isAvailable(locations.nasRoot, mountedVolumes: mounted)))
+        }
+        guard NASDirectApply.isNASUsable(locations) else { return ([:], (unchecked, true)) }
         let present = NASDirectApply.presentOnNAS(
             found.values.map { ($0.mirrorPath, $0.assignment.fileSize) },
             nasRoot: nasRoot
         )
-        return (found.filter { present.contains(NASSyncStore.pathKey($0.value.mirrorPath)) }, 0)
+        return (found.filter { present.contains(NASSyncStore.pathKey($0.value.mirrorPath)) }, ([:], false))
     }
 }
 

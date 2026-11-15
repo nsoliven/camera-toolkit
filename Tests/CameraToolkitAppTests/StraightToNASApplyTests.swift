@@ -170,26 +170,146 @@ final class StraightToNASApplyTests: XCTestCase {
         )
         let off = EventsWorkspace.cardClearChoice(request, includeNASOnly: false)
         XCTAssertEqual(off.itemIDs, ["drive"])
+        XCTAssertEqual(off.nasOnlyItemIDs, [])
         XCTAssertEqual(off.fileCount, 2)
-        XCTAssertEqual(off.nasOnlyFiles, 0)
         let on = EventsWorkspace.cardClearChoice(request, includeNASOnly: true)
-        XCTAssertEqual(on.itemIDs, ["drive", "nas-a", "nas-b"])
+        XCTAssertEqual(on.itemIDs, ["drive"])
+        XCTAssertEqual(on.nasOnlyItemIDs, ["nas-a", "nas-b"])
         XCTAssertEqual(on.fileCount, 5)
         XCTAssertEqual(on.byteCount, 500)
-        // The job clears only the chosen items.
-        let items = ["drive", "nas-a", "nas-b"].map { CardClearItem(id: $0, eventID: UUID(), sourceRoot: "/c", driveRoot: "/d", files: []) }
-        XCTAssertEqual(CardClearRequest.chosen(items, itemIDs: off.itemIDs).map(\.id), ["drive"])
-        XCTAssertEqual(CardClearRequest.chosen(items, itemIDs: on.itemIDs).map(\.id), ["drive", "nas-a", "nas-b"])
+        func item(_ id: String, nasOnly: Bool) -> CardClearItem {
+            CardClearItem(id: id, eventID: UUID(), sourceRoot: "/c", driveRoot: "/d", files: [CardClearFile(
+                sourcePath: "/c/\(id)", relativePath: id, byteCount: 1, modifiedAt: Date(),
+                drivePath: "/d/\(id)", nasPath: "/n/\(id)", verifiedSHA256: "00", nasOnly: nasOnly
+            )])
+        }
+        let items = [item("drive", nasOnly: false), item("nas-a", nasOnly: true), item("nas-b", nasOnly: true)]
+        XCTAssertEqual(CardClearRequest.jobItems(items, request: off).items.map(\.id), ["drive"])
+        XCTAssertEqual(CardClearRequest.jobItems(items, request: on).items.map(\.id), ["drive", "nas-a", "nas-b"])
         XCTAssertTrue(CardClearWording.nasOnlyToggle(request).hasPrefix("Also clear 3 files"))
         XCTAssertTrue(CardClearWording.nasOnlyToggle(request).contains("whose only other copy is on the NAS"))
     }
 
+    /// Confirmed with a drive copy and the checkbox off; by the time the job
+    /// plans again the drive copy is gone (deleted, or the drive unplugged)
+    /// and the same item is NAS-only. The job leaves it on the card. Only
+    /// an item opted in as NAS-only in the sheet is cleared on the NAS copy.
+    func testAnItemThatLostItsDriveCopySinceTheSheetStaysOnTheCard() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CameraToolkitDriveGone-\(UUID().uuidString)", isDirectory: true)
+            .resolvingSymlinksInPath()
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let card = root.appendingPathComponent("Card/DCIM/100MSDCF", isDirectory: true)
+        let nas = root.appendingPathComponent("Library", isDirectory: true)
+        try FileManager.default.createDirectory(at: nas, withIntermediateDirectories: true)
+        var configuration = AppConfiguration(
+            demoRootPath: root.appendingPathComponent("Safety Test").path,
+            importSourcePath: card.path,
+            archivePath: nas.appendingPathComponent("Originals").path,
+            bufferPath: root.appendingPathComponent("Drive/Camera Buffer").path,
+            cameraLibraryRootPath: nas.path,
+            catalogDatabasePath: root.appendingPathComponent("catalog.sqlite").path,
+            activityLogPath: root.appendingPathComponent("activity.jsonl").path,
+            selectedDeviceID: "sony-a7v"
+        )
+        let beach = SavedCameraEvent(name: "Beach Day", eventDate: day("2026-08-26"))
+        configuration.savedEvents = [beach]
+        var locations = EventStorageLocations(configuration: configuration)
+        var inputs: [CardClearInput] = []
+        var driveCopies: [URL] = []
+        for name in ["DSC00001.ARW", "DSC00002.ARW"] {
+            let source = card.appendingPathComponent(name)
+            try write(source, String(repeating: name, count: 100))
+            let attributes = try FileManager.default.attributesOfItem(atPath: source.path)
+            let row = PhotoEventAssignment(
+                sourceRootPath: card.path, relativePath: name,
+                fileSize: (attributes[.size] as! NSNumber).int64Value,
+                modifiedAt: attributes[.modificationDate] as! Date,
+                eventID: beach.id, deviceID: "sony-a7v"
+            )
+            configuration.photoEventAssignments.append(row)
+            // Apply copied it to the drive (time kept), Sync verified it.
+            let copy = try XCTUnwrap(locations.driveURL(for: row, event: beach, policy: .buffer))
+            try FileManager.default.createDirectory(at: copy.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try FileManager.default.copyItem(at: source, to: copy)
+            driveCopies.append(copy)
+            inputs.append(CardClearInput(id: EventStorageLocations.pathKey(source.path), entries: [.init(path: source.path, assignment: row)]))
+        }
+        let catalog = URL(fileURLWithPath: configuration.catalogDatabasePath)
+        let synced = try NASSyncService(store: try NASSyncStore(catalogURL: catalog), isCancelled: { false })
+            .sync(NASSyncPlanner.plan(events: [beach], locations: locations), nasRoot: nas)
+        XCTAssertEqual(synced.copied.count, 2)
+        func plan() -> CardClearPlan {
+            CardClearPlanner.plan(
+                inputs: inputs, sourceRoot: card.path, events: [beach.id: beach], locations: locations,
+                catalogURL: catalog, sameVolume: { _, _, _ in false }
+            )
+        }
+
+        // The sheet: both items have a drive copy; the checkbox stays off.
+        let sheet = plan()
+        XCTAssertEqual(sheet.clearableFiles, 2)
+        XCTAssertEqual(sheet.nasOnlyFiles, 0)
+        let request = EventsWorkspace.cardClearChoice(CardClearRequest(
+            locationID: UUID(), locationName: "Card", itemIDs: Set(sheet.clearable.map(\.id)), fileCount: 2, byteCount: 0,
+            events: [], waitingForNASFiles: 0, driveName: "Buffer", nasReachable: true
+        ), includeNASOnly: false)
+
+        // The drive copies are removed before the job runs.
+        let parked = root.appendingPathComponent("Parked", isDirectory: true)
+        try FileManager.default.createDirectory(at: parked, withIntermediateDirectories: true)
+        for copy in driveCopies {
+            try FileManager.default.moveItem(at: copy, to: parked.appendingPathComponent(copy.lastPathComponent))
+        }
+        var later = plan()
+        XCTAssertEqual(later.nasOnlyFiles, 2, "the same items are NAS-only now")
+        var chosen = CardClearRequest.jobItems(later.clearable, request: request)
+        XCTAssertTrue(chosen.items.isEmpty)
+        XCTAssertEqual(chosen.driveCopyGone.count, 2)
+        let outcome = CardClearOutcome(report: CardClearReport(), noLongerEligible: 0, driveCopyGoneFiles: 2)
+        XCTAssertTrue(CardClearWording.summary(outcome, locationName: "Card").contains("drive copy is gone since you confirmed"))
+        for copy in driveCopies {
+            try FileManager.default.moveItem(at: parked.appendingPathComponent(copy.lastPathComponent), to: copy)
+        }
+
+        // The drive unplugged before the job runs: the same.
+        configuration.bufferPath = "/Volumes/CT-Offline-\(UUID().uuidString)/Camera Buffer"
+        locations = EventStorageLocations(configuration: configuration)
+        later = plan()
+        XCTAssertEqual(later.nasOnlyFiles, 2)
+        chosen = CardClearRequest.jobItems(later.clearable, request: request)
+        XCTAssertTrue(chosen.items.isEmpty)
+        for input in inputs { XCTAssertTrue(FileManager.default.fileExists(atPath: input.entries[0].path)) }
+
+        // Opted in as NAS-only in the sheet, and still NAS-only: cleared.
+        var optedIn = request
+        optedIn.nasOnlyItemIDs = Set(later.clearable.map(\.id))
+        chosen = CardClearRequest.jobItems(later.clearable, request: optedIn)
+        XCTAssertEqual(chosen.items.count, 2)
+        let nasBefore = try tree(nas)
+        let report = try CardClearService().clear(items: chosen.items, nasReachable: true, confirmation: FreeUpService.confirmationToken)
+        XCTAssertEqual(report.cleared.count, 2, "\(report.skipped)")
+        XCTAssertEqual(try tree(nas), nasBefore)
+    }
+
     func testCopiesTheNASCannotCheckAreNeverCalledSafe() {
         var plan = CardClearPlan()
-        plan.nasUncheckedFiles = 3
-        let line = CardClearWording.bannerLine(CardClearSummary(plan))
+        plan.nasUnchecked = ["a": UUID(), "b": UUID(), "c": UUID()]
+        plan.nasUncheckedBecauseNASIsAway = true
+        var summary = CardClearSummary(plan)
+        var line = CardClearWording.bannerLine(summary)
         XCTAssertEqual(line, "3 were copied to the NAS earlier, not checked now (NAS not connected)")
         XCTAssertFalse(line.contains("safe"))
+        XCTAssertFalse(summary.offersClear)
+        // The NAS connected but not listed by the background refresh: the
+        // click checks it, nothing is called safe before that.
+        plan.nasUncheckedBecauseNASIsAway = false
+        summary = CardClearSummary(plan)
+        line = CardClearWording.bannerLine(summary)
+        XCTAssertTrue(line.hasPrefix("3 were copied to the NAS earlier — not checked yet"), line)
+        XCTAssertFalse(line.contains("safe"))
+        XCTAssertTrue(summary.offersClear)
     }
 
     // MARK: - Add to Events outcomes

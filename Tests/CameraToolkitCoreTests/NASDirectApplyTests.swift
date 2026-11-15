@@ -278,6 +278,22 @@ final class NASDirectApplyTests: XCTestCase {
             XCTAssertEqual(plan.nasOnlyFiles, 2)
             XCTAssertFalse(plan.clearable.contains { $0.files.contains { $0.sourcePath == gone.sourcePath } })
 
+            // A background refresh never lists the NAS: the copies are
+            // reported as not checked (the NAS is connected), never as safe.
+            let inputs = f.assignments.map { row in
+                CardClearInput(id: EventStorageLocations.pathKey(f.card.appendingPathComponent(row.relativePath).path),
+                               entries: [.init(path: f.card.appendingPathComponent(row.relativePath).path, assignment: row)])
+            }
+            let quiet = CardClearPlanner.plan(
+                inputs: inputs, sourceRoot: f.card.path,
+                events: Dictionary(uniqueKeysWithValues: f.configuration.savedEvents.map { ($0.id, $0) }),
+                locations: f.locations, catalogURL: f.catalog, probeNAS: false
+            )
+            XCTAssertTrue(quiet.applied.isEmpty)
+            XCTAssertTrue(quiet.clearable.isEmpty)
+            XCTAssertEqual(quiet.nasUncheckedFiles, 3)
+            XCTAssertFalse(quiet.nasUncheckedBecauseNASIsAway)
+
             // The NAS not connected: nothing is applied or clearable on it,
             // and the files are counted as not checked.
             let away = root.appendingPathComponent("NAS away", isDirectory: true)
@@ -286,6 +302,7 @@ final class NASDirectApplyTests: XCTestCase {
             XCTAssertTrue(plan.applied.isEmpty)
             XCTAssertTrue(plan.clearable.isEmpty)
             XCTAssertEqual(plan.nasUncheckedFiles, 3)
+            XCTAssertTrue(plan.nasUncheckedBecauseNASIsAway)
             try FileManager.default.moveItem(at: away, to: f.nas)
         }
     }
