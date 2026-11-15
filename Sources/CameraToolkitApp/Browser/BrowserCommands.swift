@@ -83,6 +83,8 @@ enum CameraToolkitShortcutCatalog {
                 .init(action: "Previous or next stack", keys: "↑  ↓", detail: "Moves the preview to the neighboring stack."),
                 .init(action: "Zoom to fit or actual size", keys: "⌘0  ⌘1", detail: "Fits the whole photo, or shows one image pixel per display point."),
                 .init(action: "Play or pause a video", keys: "Space", detail: "While a video preview is open, Space toggles playback instead of closing."),
+                .init(action: "Grade a clip", keys: "G", detail: "Opens the grade panel for a video: looks, LUTs, exposure and colour, saved as data — the clip is never changed."),
+                .init(action: "Before / after", keys: "B", detail: "With the grade panel open, flips between the graded picture and the original."),
                 .init(action: "Close preview", keys: "Space  /  Esc", detail: "Returns to the board."),
             ]
         ),

@@ -747,6 +747,7 @@ extension StackRowView: @preconcurrency Equatable {
             && lhs.editTags == rhs.editTags
             && lhs.originFolder == rhs.originFolder
             && lhs.orientation == rhs.orientation
+            && lhs.gradeMark == rhs.gradeMark
     }
 }
 
@@ -904,6 +905,8 @@ struct StackRowView<MoreMenu: View>: View {
     var originFolder: String? = nil
     /// Saved rotation of the cover frame in quarter-turns clockwise, or nil.
     var orientation: Int? = nil
+    /// The cover clip's grade: the row's thumbnail draws graded.
+    var gradeMark: TileGradeMark? = nil
     var onExpand: (() -> Void)? = nil
     var onPlay: (() -> Void)? = nil
     var onOpen: (() -> Void)? = nil
@@ -914,7 +917,7 @@ struct StackRowView<MoreMenu: View>: View {
     var body: some View {
         let _ = BoardRenderCounter.hit(.stackTile)
         HStack(spacing: 10) {
-            TileThumbnail(url: stack.coverItem.primary.url, kind: stack.kind, pointSize: 88, orientation: orientation, file: stack.coverItem.primary)
+            TileThumbnail(url: stack.coverItem.primary.url, kind: stack.kind, pointSize: 88, orientation: orientation, file: stack.coverItem.primary, grade: gradeMark?.recipe)
                 .frame(width: 72, height: 48)
                 .background(.quaternary)
                 .clipped()
@@ -1472,6 +1475,7 @@ struct OrganizeGrid<MenuContent: View>: View {
                     rootPath: rootPath
                 ),
                 orientation: orientationForFile(stack.coverItem.primary),
+                gradeMark: gradeForStack(stack),
                 onExpand: { workspace.toggleExpanded(stack.id) },
                 onPlay: { onOpen(stack, 0) },
                 onOpen: { onOpen(stack, 0) },
@@ -2603,16 +2607,19 @@ struct StackPreviewOverlay: View {
         guard let item else { return }
         let url = item.primary.url
         let orientation = itemOrientation
+        // A graded clip's poster is drawn graded too, so nothing flashes
+        // flat before the player takes over.
+        let poster = ClipGrading.isGradable(item) ? workspace.grading.recipe(for: item) : nil
         failed = false
         videoPlayer?.pause()
         videoPlayer = nil
         videoPlayable = nil
-        if let full = TileImageLoader.shared.cachedImage(for: url, maximumPixelSize: 2_400, orientation: orientation) {
+        if let full = TileImageLoader.shared.cachedImage(for: url, maximumPixelSize: 2_400, orientation: orientation, grade: poster) {
             image = full
         } else {
-            image = TileImageLoader.shared.cachedImage(for: url, maximumPixelSize: 1_280, orientation: orientation)
-                ?? TileImageLoader.shared.cachedImage(for: url, maximumPixelSize: 768, orientation: orientation)
-                ?? TileImageLoader.shared.cachedImage(for: url, maximumPixelSize: 384, orientation: orientation)
+            image = TileImageLoader.shared.cachedImage(for: url, maximumPixelSize: 1_280, orientation: orientation, grade: poster)
+                ?? TileImageLoader.shared.cachedImage(for: url, maximumPixelSize: 768, orientation: orientation, grade: poster)
+                ?? TileImageLoader.shared.cachedImage(for: url, maximumPixelSize: 384, orientation: orientation, grade: poster)
             if image == nil {
                 // Cheap paint first: the filmstrip bucket reads only the
                 // embedded thumbnail on RAW, so it lands long before the
@@ -2620,10 +2627,10 @@ struct StackPreviewOverlay: View {
                 // decodes; each result paints only over a smaller image.
                 await withTaskGroup(of: CGImage?.self) { group in
                     group.addTask {
-                        await TileImageLoader.shared.image(for: url, maximumPixelSize: 384, orientation: orientation, priority: .veryHigh)
+                        await TileImageLoader.shared.image(for: url, maximumPixelSize: 384, orientation: orientation, grade: poster, priority: .veryHigh)
                     }
                     group.addTask {
-                        await TileImageLoader.shared.image(for: url, maximumPixelSize: 2_400, orientation: orientation, priority: .high)
+                        await TileImageLoader.shared.image(for: url, maximumPixelSize: 2_400, orientation: orientation, grade: poster, priority: .high)
                     }
                     for await decoded in group {
                         guard !Task.isCancelled, let decoded else { continue }
@@ -2632,7 +2639,7 @@ struct StackPreviewOverlay: View {
                         }
                     }
                 }
-            } else if let full = await TileImageLoader.shared.image(for: url, maximumPixelSize: 2_400, orientation: orientation, priority: .high), !Task.isCancelled {
+            } else if let full = await TileImageLoader.shared.image(for: url, maximumPixelSize: 2_400, orientation: orientation, grade: poster, priority: .high), !Task.isCancelled {
                 image = full
             }
             if !Task.isCancelled, image == nil {

@@ -32,6 +32,7 @@ New here? Press **Start Guided Setup** on the welcome screen, or **Guide** in th
 - Finds event folders that were already organized on the drive by hand and adds them as events without moving anything.
 - Journals every move so **Undo** can put files back.
 - Keeps a read-only Immich external library in step: asks it to scan after NAS changes, shows what it has per event, and can keep an album per event.
+- Grades log video without touching it: detects Sony S-Log3 from each clip's XML, converts it to Rec.709 (or any imported `.cube` LUT), shows graded tiles and live graded playback with a before/after wipe, applies a look to every log clip at once, and renders Rec.709 HEVC copies into the event's `Edited/Rec709` (see [Colour grading](docs/COLOR.md)).
 - Builds thumbnails and large previews from the JPEG embedded in supported Sony `.ARW` files, including lossless-compressed RAW variants that Finder may not preview.
 - Opens a separate persistent Transfer Queue window with per-file bytes copied, speed, verification state, and clear disconnect failures.
 - Runs sequential storage speed tests inside the app: camera/card sources are read-only, while Buffer/library targets use a flushed, uncached, automatically removed temporary file.
@@ -146,6 +147,7 @@ Buffer/<year>/<yyyy-MM-dd event>/
 | Delete | Unsort the selection |
 | Arrow keys | Move between items; hold Shift to extend the selection |
 | Space | Preview the selected burst; ← → step frames, ↑ ↓ move between items |
+| G | In a clip's preview: open or close the grade panel (B flips before/after) |
 | Command-Z | Undo the last sort |
 | Command-A | Select everything shown |
 | Command-R | Refresh |
