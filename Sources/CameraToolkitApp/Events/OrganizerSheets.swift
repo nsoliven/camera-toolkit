@@ -304,6 +304,7 @@ struct ApplyPlanSheet: View {
             ApplySafetyFactsView(facts: ApplyPlanOverview.safetyFacts(
                 moveCount: overview.moveCount + decisions.keepBoth.count,
                 copyCount: overview.copyCount,
+                nasCount: overview.nasCount,
                 trashCount: decisions.trash.count
             ))
         } actions: {
