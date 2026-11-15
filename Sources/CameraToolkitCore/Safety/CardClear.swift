@@ -128,6 +128,11 @@ public enum CardClearPlanner {
     ///   state `verified`, with a verification date, the same byte count, a
     ///   SHA-256, and the drive copy's current modification time — the rule
     ///   `EventPresenceScanner` applies before Take Off Drive may trust it.
+    /// Or, when the event's drive copy is not there: Apply sent the file
+    /// straight to the NAS while that drive was not connected
+    /// (`NASDirectApply`), and a verified record vouches for this very card
+    /// file (`NASDirectApply.vouches`). Such a file is `nasOnly`; the
+    /// service re-reads its NAS copy and never clears it with the NAS away.
     /// The NAS share itself is not read here.
     public static func plan(
         inputs: [CardClearInput],
