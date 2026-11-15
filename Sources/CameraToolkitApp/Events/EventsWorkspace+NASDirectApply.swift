@@ -80,6 +80,9 @@ extension EventsWorkspace {
                 let reportPath = result.reportPath
                 let proven = Set(outcome.report.copied + outcome.report.matchedExisting + outcome.report.alreadyVerified)
                 self?.nasPresence.noteSynced(outcome.plan.items.filter { proven.contains($0.relativePath) })
+                // The same post-copy hook as Sync to NAS: Immich scans the
+                // NAS event tree and checks the albums of what just landed.
+                if !outcome.report.copied.isEmpty { self?.followNASChangeInImmich() }
                 self?.nasRenamesApplied(outcome.follow, remaining: renameQueue.pendingRenameCount(nasRoot: locations.nasRoot.path))
                 for eventID in refresh {
                     Task { await self?.refreshEvent(eventID) }

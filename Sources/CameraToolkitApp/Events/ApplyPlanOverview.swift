@@ -599,6 +599,20 @@ struct ApplyPlanOverview: Sendable {
         return volume == "this Mac" ? role : "\(role) “\(volume)”"
     }
 
+    /// "the Buffer “Name” drive", "the drive “Name”" when the Buffer and
+    /// private staging share it, or "the Buffer and private drives", with
+    /// the verb to match.
+    static func drivePhrase(_ groups: [OrganizeApplyPlan.EventGroup]) -> (String, String) {
+        let names = Array(Set(groups.map(\.driveName))).sorted()
+        if names.count == 1 { return (names[0].isEmpty ? "the event’s drive" : "the \(names[0]) drive", "isn’t") }
+        let volumes = Set(groups.map(\.driveVolume))
+        if volumes.count == 1, let volume = volumes.first, volume != "this Mac", !volume.isEmpty {
+            return ("the drive “\(volume)”", "isn’t")
+        }
+        let roles = Array(Set(groups.map { $0.isPrivate ? "private" : "Buffer" })).sorted()
+        return ("the \(roles.joined(separator: " and ")) drives", "aren’t")
+    }
+
     static func capitalizedDrive(_ name: String) -> String {
         let drive = name.isEmpty ? "the event’s drive" : "the \(name) drive"
         return drive.prefix(1).uppercased() + drive.dropFirst()
@@ -610,11 +624,9 @@ struct ApplyPlanOverview: Sendable {
     static func nasRouteLine(_ plan: OrganizeApplyPlan) -> String? {
         let groups = plan.groups.filter { $0.nasCopyCount > 0 }
         guard !groups.isEmpty else { return nil }
-        let drives = Array(Set(groups.map(\.driveName))).sorted()
-        let drive = drives.count == 1 ? capitalizedDrive(drives[0]) : "Their events’ drives"
-        let isAre = drives.count == 1 ? "isn’t" : "aren’t"
+        let (drive, isAre) = drivePhrase(groups)
         let count = plan.nasCopyCount
-        return "\(drive) \(isAre) connected: \(plural(count, "file")) (\(plan.nasCopyBytes.formattedBytes)) \(count == 1 ? "is" : "are") copied straight to the NAS, checked file by file. The originals stay where they are."
+        return "\(drive.prefix(1).uppercased() + drive.dropFirst()) \(isAre) connected: \(plural(count, "file")) (\(plan.nasCopyBytes.formattedBytes)) \(count == 1 ? "is" : "are") copied straight to the NAS, checked file by file. The originals stay where they are."
     }
 
     /// The status line when a plan has nothing to do: names the real reason.
@@ -626,9 +638,8 @@ struct ApplyPlanOverview: Sendable {
         let unavailable = plan.unavailableCount
         let onNAS = plan.alreadyOnNASCount
         if waiting > 0 {
-            let drives = Array(Set(plan.groups.filter { $0.waitingForDrive > 0 }.map(\.driveName))).sorted()
-            let drive = drives.count == 1 ? "the \(drives[0].isEmpty ? "event’s" : drives[0]) drive" : "their events’ drives"
-            var line = "\(plural(waiting, "sorted file")) can’t go to \(waiting == 1 ? "its event" : "their events") yet: \(drive) \(drives.count == 1 ? "isn’t" : "aren’t") connected, and neither is the NAS. Connect either one, then Apply again. Nothing was moved or copied."
+            let (drive, isAre) = drivePhrase(plan.groups.filter { $0.waitingForDrive > 0 })
+            var line = "\(plural(waiting, "sorted file")) can’t go to \(waiting == 1 ? "its event" : "their events") yet: \(drive) \(isAre) connected, and neither is the NAS. Connect either one, then Apply again. Nothing was moved or copied."
             if unavailable > 0 {
                 line += " \(unavailable.formatted()) more \(unavailable == 1 ? "is" : "are") on a source drive that isn’t connected."
             }

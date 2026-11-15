@@ -164,6 +164,8 @@ struct OrganizeApplyPlan: Identifiable, Sendable {
         var waitingForDrive: Int = 0
         /// The event's drive by name ("Buffer"), for the plan's wording.
         var driveName: String = ""
+        /// The volume that drive is on ("this Mac" for a folder on the Mac).
+        var driveVolume: String = ""
         /// True when the event's drive was not connected while planning.
         var driveIsOffline: Bool = false
         var destinationFolder: String
@@ -5259,6 +5261,7 @@ final class EventsWorkspace {
             group.waitingForDrive = waitingForDrive
             group.driveIsOffline = driveIsOffline
             group.driveName = ApplyPlanOverview.driveRoleName(policy: policy, driveRoot: driveRoot.path)
+            group.driveVolume = ApplyPathLabel.driveName(for: driveRoot.path)
             groups.append(group)
         }
 
