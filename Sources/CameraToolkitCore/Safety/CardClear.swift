@@ -101,6 +101,11 @@ public struct CardClearPlan: Equatable, Sendable {
     public var nasUnchecked: [String: UUID] = [:]
     /// Why `nasUnchecked` was not checked.
     public var nasUncheckedBecauseNASIsAway = false
+    /// Sorted files a verified record says Apply copied straight to the NAS,
+    /// whose NAS copy a probe found missing (or not at its size) — deleted
+    /// or moved outside the app. Source path key → event. Waiting for Apply
+    /// again, which copies them anew.
+    public var nasMissing: [String: UUID] = [:]
     public var nasUncheckedFiles: Int { nasUnchecked.count }
     /// `AppliedSourceCheck`'s answer for the same files, from the same pass.
     public var applied: [String: UUID] = [:]
@@ -203,6 +208,7 @@ public enum CardClearPlanner {
         )
         plan.nasUnchecked = nasUnchecked.keys
         plan.nasUncheckedBecauseNASIsAway = nasUnchecked.nasAway
+        plan.nasMissing = nasUnchecked.missing
         for (key, copy) in nasOnly { plan.applied[key] = copy.assignment.eventID }
         guard !plan.applied.isEmpty, !isCancelled() else { return plan }
 
@@ -334,7 +340,7 @@ public enum CardClearPlanner {
         mountedVolumes: Set<String>?,
         sameVolume: AppliedSourceCheck.SameVolume?,
         probeNAS: Bool = true
-    ) -> (copies: [String: NASOnlyCopy], unchecked: (keys: [String: UUID], nasAway: Bool)) {
+    ) -> (copies: [String: NASOnlyCopy], unchecked: (keys: [String: UUID], nasAway: Bool, missing: [String: UUID])) {
         let mounted = mountedVolumes ?? VolumeInfo.mountedVolumePaths()
         let sameVolume = sameVolume ?? { source, root, mounted in
             VolumeInfo.isSameVolume(source.deletingLastPathComponent(), root, mountedVolumes: mounted)
@@ -376,19 +382,21 @@ public enum CardClearPlanner {
                 )
             }
         }
-        guard !found.isEmpty else { return ([:], ([:], false)) }
+        guard !found.isEmpty else { return ([:], ([:], false, [:])) }
         let unchecked = found.mapValues(\.assignment.eventID)
         // Without a probe, only the mount table is read (no I/O on the
         // share) to say why the copies were not checked.
         guard probeNAS else {
-            return ([:], (unchecked, !VolumeInfo.isAvailable(locations.nasRoot, mountedVolumes: mounted)))
+            return ([:], (unchecked, !VolumeInfo.isAvailable(locations.nasRoot, mountedVolumes: mounted), [:]))
         }
-        guard NASDirectApply.isNASUsable(locations) else { return ([:], (unchecked, true)) }
+        guard NASDirectApply.isNASUsable(locations) else { return ([:], (unchecked, true, [:])) }
         let present = NASDirectApply.presentOnNAS(
             found.values.map { ($0.mirrorPath, $0.assignment.fileSize) },
             nasRoot: nasRoot
         )
-        return (found.filter { present.contains(NASSyncStore.pathKey($0.value.mirrorPath)) }, ([:], false))
+        let kept = found.filter { present.contains(NASSyncStore.pathKey($0.value.mirrorPath)) }
+        let missing = found.filter { kept[$0.key] == nil }.mapValues(\.assignment.eventID)
+        return (kept, ([:], false, missing))
     }
 }
 
