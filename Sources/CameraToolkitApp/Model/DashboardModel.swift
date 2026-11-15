@@ -490,14 +490,16 @@ extension DashboardModel {
             : "This private event will not get an Immich album."
     }
 
-    func setEventImmichAlbumPolicy(_ eventID: UUID, policy: ImmichAlbumPolicy) {
+    func setEventImmichAlbumPolicy(_ eventID: UUID, policy: ImmichAlbumPolicy?) {
         updateConfiguration { configuration in
             guard let index = configuration.savedEvents.firstIndex(where: { $0.id == eventID }) else { return }
             configuration.savedEvents[index].immichAlbumPolicy = policy
         }
-        statusMessage = policy == .none
-            ? "This event will not get an Immich album."
-            : "Saved. The album fills on the next Immich check."
+        statusMessage = switch policy {
+        case .none?: "This event will not get an Immich album."
+        case nil: "This event follows the Settings choice for Immich albums."
+        default: "Saved. The album fills on the next Immich check."
+        }
     }
 
     func setEventImmichAlbumName(_ eventID: UUID, name: String) {
@@ -750,6 +752,10 @@ extension DashboardModel {
 
     func setImmichLibraryID(_ value: String) {
         updateConfiguration { $0.immichLibraryID = value }
+    }
+
+    func setImmichAlbumsForEveryEvent(_ value: Bool) {
+        updateConfiguration { $0.immichAlbumsForEveryEvent = value }
     }
 
     func setImmichCarriesAlbumsAcrossRenames(_ value: Bool) {

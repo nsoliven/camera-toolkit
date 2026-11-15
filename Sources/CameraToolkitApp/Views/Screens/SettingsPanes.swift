@@ -453,6 +453,19 @@ struct OrganizingSettingsPane: View {
 struct ServicesSettingsPane: View {
     @Bindable var model: DashboardModel
 
+    /// How many events get an album with the switch on, said before it is
+    /// turned on as well as after.
+    private var immichAlbumCountText: String {
+        let events = model.configuration.savedEvents
+        let withSwitchOn = ImmichAlbumNaming.titles(
+            events: events,
+            locations: EventStorageLocations(configuration: model.configuration),
+            albumsForEveryEvent: true
+        ).count
+        let lead = model.configuration.immichAlbumsForEveryEvent ? "" : "With this on, "
+        return "\(lead)\(withSwitchOn) of \(events.count) events \(model.configuration.immichAlbumsForEveryEvent ? "get" : "would get") an album, made on the next check. Events set to No album or Custom keep their choice; private events need Allow album."
+    }
+
     var body: some View {
         Form {
             Section("Immich") {
@@ -491,6 +504,13 @@ struct ServicesSettingsPane: View {
                     }
                 }
                 .disabled(model.immichLibraries.isEmpty && model.configuration.immichLibraryID.isEmpty)
+                Toggle("Make an album for every event", isOn: Binding(
+                    get: { model.configuration.immichAlbumsForEveryEvent },
+                    set: { model.setImmichAlbumsForEveryEvent($0) }
+                ))
+                Text(immichAlbumCountText)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 Toggle("Keep renamed files in their albums", isOn: Binding(
                     get: { model.configuration.immichCarriesAlbumsAcrossRenames },
                     set: { model.setImmichCarriesAlbumsAcrossRenames($0) }
