@@ -1,8 +1,24 @@
 import Foundation
+import ImageIO
 
 public enum EmbeddedJPEGPreviewPreference: Equatable, Sendable {
     case thumbnail
     case fullSize
+}
+
+/// An embedded JPEG plus what a display needs to show it upright.
+public struct EmbeddedJPEGPreview: Equatable, Sendable {
+    /// The JPEG's bytes, exactly as they sit in the RAW.
+    public var data: Data
+    /// Quarter-turns clockwise the decoded JPEG still needs to stand upright:
+    /// the RAW's own orientation tag, or 0 when the JPEG carries a rotation
+    /// of its own, which ImageIO applies while decoding it.
+    public var cameraQuarterTurns: Int
+
+    public init(data: Data, cameraQuarterTurns: Int) {
+        self.data = data
+        self.cameraQuarterTurns = cameraQuarterTurns
+    }
 }
 
 /// Reads JPEG previews already embedded in TIFF-based camera RAW files.
@@ -23,10 +39,45 @@ public struct EmbeddedJPEGPreviewExtractor: Sendable {
 
     public init() {}
 
+    /// The JPEG bytes alone. Face detection and the burst linker read these
+    /// and keep the unrotated picture their stored boxes are measured in.
     public func jpegData(
         from url: URL,
         preference: EmbeddedJPEGPreviewPreference = .thumbnail
     ) throws -> Data? {
+        try locate(in: url, preference: preference)?.data
+    }
+
+    /// The JPEG and the turns that make it upright, from the one walk of the
+    /// file's IFDs: reading the rotation costs no extra read.
+    public func preview(
+        from url: URL,
+        preference: EmbeddedJPEGPreviewPreference = .thumbnail
+    ) throws -> EmbeddedJPEGPreview? {
+        guard let found = try locate(in: url, preference: preference) else { return nil }
+        return EmbeddedJPEGPreview(
+            data: found.data,
+            cameraQuarterTurns: Self.jpegRotatesItself(found.data)
+                ? 0
+                : DisplayRotation.cameraTurns(forTIFFOrientation: found.tiffOrientation)
+        )
+    }
+
+    /// A JPEG with a rotation of its own comes out of ImageIO already turned
+    /// (and detection saw it that way), so the RAW's tag must not turn it
+    /// again. Sony's previews carry no tag; other makes may.
+    private static func jpegRotatesItself(_ data: Data) -> Bool {
+        let options = [kCGImageSourceShouldCache: false] as CFDictionary
+        guard let source = CGImageSourceCreateWithData(data as CFData, options),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, options) as? [CFString: Any],
+              let orientation = properties[kCGImagePropertyOrientation] as? Int else { return false }
+        return orientation != 1
+    }
+
+    private func locate(
+        in url: URL,
+        preference: EmbeddedJPEGPreviewPreference
+    ) throws -> (data: Data, tiffOrientation: Int?)? {
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
 
@@ -46,6 +97,7 @@ public struct EmbeddedJPEGPreviewExtractor: Sendable {
         var pendingIFDs = firstIFD == 0 ? [] : [firstIFD]
         var visitedIFDs: Set<UInt64> = []
         var candidates: [Candidate] = []
+        var tiffOrientation: Int?
 
         while let ifdOffset = pendingIFDs.popLast(), visitedIFDs.count < 32 {
             guard visitedIFDs.insert(ifdOffset).inserted,
@@ -69,6 +121,15 @@ public struct EmbeddedJPEGPreviewExtractor: Sendable {
                 let valueOrOffset = uint32(table, at: base + 8, order: order)
 
                 switch tag {
+                case 0x0112 where ifdOffset == firstIFD:
+                    tiffOrientation = scalarValue(
+                        type: type,
+                        count: valueCount,
+                        inlineData: table,
+                        inlineOffset: base + 8,
+                        valueOrOffset: valueOrOffset,
+                        order: order
+                    ).flatMap(Int.init(exactly:))
                 case 0x0201:
                     jpegOffset = scalarValue(
                         type: type,
@@ -130,7 +191,7 @@ public struct EmbeddedJPEGPreviewExtractor: Sendable {
         guard let chosen else { return nil }
         let data = try read(handle, offset: chosen.offset, count: chosen.length)
         guard data.count >= 4, data[0] == 0xff, data[1] == 0xd8 else { return nil }
-        return data
+        return (data, tiffOrientation)
     }
 
     private func ifdOffsets(

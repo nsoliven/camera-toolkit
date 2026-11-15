@@ -228,6 +228,32 @@ struct EventsRootView: View {
                 )
             }
         }
+        // Sidebar nest / un-nest: confirmed here before any folder moves.
+        .sheet(item: $workspace.pendingReparent) { request in
+            EventReparentConfirmSheet(
+                request: request,
+                onCancel: { workspace.pendingReparent = nil },
+                onConfirm: { workspace.confirmReparent(request) }
+            )
+        }
+        // Move Into…: the pick opens the confirmation once this sheet has
+        // finished closing.
+        .sheet(item: $workspace.moveIntoRequest, onDismiss: { workspace.moveIntoSheetDidDismiss() }) { request in
+            if let event = workspace.event(request.eventID) {
+                EventPickerSheet(
+                    workspace: workspace,
+                    verb: "Move into",
+                    summary: "\(event.name) and its folder move inside the event you pick.",
+                    excludedEventID: event.id,
+                    allowedEventIDs: workspace.moveIntoTargets(for: event.id),
+                    onPick: { picked in
+                        workspace.moveIntoChoice = (event.id, picked.id)
+                        workspace.moveIntoRequest = nil
+                    },
+                    onCancel: { workspace.moveIntoRequest = nil }
+                )
+            }
+        }
         .sheet(item: $workspace.pendingApplyPlan) { plan in
             ApplyPlanSheet(
                 plan: plan,
@@ -430,27 +456,30 @@ struct EventsSidebar: View {
                     .foregroundStyle(.tint)
                     .help("A board's filter is hiding events that don't match — click to show every event")
                 }
-                // Parents newest-first; each subevent sits indented under
-                // its parent.
+                // Parents newest-first until the user drags them; each
+                // subevent sits indented under its parent. Rows drag to
+                // reorder or nest only while the whole list is shown.
+                let arrangeable = query.isEmpty && !workspace.search.hasActiveConditions
                 ForEach(workspace.sidebarRows(matching: query, applying: workspace.search), id: \.event.id) { row in
                     eventRow(row.event, depth: row.depth)
-                        .tag(EventsSidebarSelection.event(row.event.id))
                         .contentShape(Rectangle())
                         .simultaneousGesture(TapGesture().onEnded {
                             workspace.selection = .event(row.event.id)
                         })
-                        .dropDestination(for: String.self) { items, _ in
-                            workspace.handleDrop(items, onto: row.event.id)
-                        } isTargeted: { targeted in
-                            if targeted {
-                                targetedEventID = row.event.id
-                            } else if targetedEventID == row.event.id {
-                                targetedEventID = nil
-                            }
-                        }
+                        .modifier(SidebarEventDragAndDrop(
+                            eventID: row.event.id,
+                            depth: row.depth,
+                            arrangeable: arrangeable,
+                            workspace: workspace,
+                            targetedEventID: $targetedEventID
+                        ))
                         .contextMenu {
                             EventSidebarMenu(event: row.event, workspace: workspace)
                         }
+                        // Outermost: a tag inside the drag modifier's
+                        // conditional never reaches the List, and the row
+                        // stops being selectable.
+                        .tag(EventsSidebarSelection.event(row.event.id))
                 }
             } header: {
                 SidebarSectionHeader(
@@ -1099,6 +1128,19 @@ private struct EventSidebarMenu: View {
         Button("Rename or Change Date…") {
             workspace.renameRequest = RenameEventRequest(eventID: event.id)
         }
+        Divider()
+        Button("Move Up") { workspace.moveEvent(event.id, by: -1) }
+            .disabled(!workspace.canMoveEvent(event.id, by: -1))
+        Button("Move Down") { workspace.moveEvent(event.id, by: 1) }
+            .disabled(!workspace.canMoveEvent(event.id, by: 1))
+        Button("Move Into…") { workspace.moveIntoRequest = MoveIntoEventRequest(eventID: event.id) }
+            .disabled(workspace.moveIntoTargets(for: event.id).isEmpty)
+            .help("Nest this event, and its folder, inside another event")
+        if workspace.sidebarParentID(of: event.id) != nil {
+            Button("Move to Top Level") { workspace.requestReparent(event.id, to: nil) }
+                .help("Take this event, and its folder, out of its parent event")
+        }
+        Divider()
         Button("Scan for Faces…") { workspace.requestFaceScan(event) }
             .disabled(workspace.faceScanBlocker(for: event) != nil)
             .help(workspace.faceScanBlocker(for: event)

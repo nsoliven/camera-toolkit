@@ -17,7 +17,7 @@ enum PreviewLoadMessage {
         switch ext {
         case "jpg", "jpeg": return "Reading JPEG…"
         case "png": return "Reading PNG…"
-        case "heic", "heif": return "Reading HEIC…"
+        case "heic", "heif", "hif": return "Reading HEIC…"
         case "tif", "tiff": return "Reading TIFF…"
         case "webp": return "Reading WebP…"
         default:

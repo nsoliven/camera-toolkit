@@ -36,7 +36,7 @@ final class JobActivityMonitorTests: XCTestCase {
     func testMonitorTurnsByteDeltasIntoAReadout() {
         let monitor = JobActivityMonitor(ceilingResolver: nil)
         let job = JobSnapshot(
-            action: .faceScan,
+            action: .ingestCard,
             state: .running,
             processedBytes: 0,
             totalBytes: 1_000_000

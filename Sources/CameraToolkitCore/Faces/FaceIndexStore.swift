@@ -33,7 +33,7 @@ public final class FaceIndexStore: @unchecked Sendable {
         self.injectedWriter = queue
     }
 
-    private func database() throws -> any DatabaseWriter {
+    func database() throws -> any DatabaseWriter {
         if let injectedWriter { return injectedWriter }
         return try CatalogDatabase.writer(for: url)
     }
@@ -105,7 +105,7 @@ public final class FaceIndexStore: @unchecked Sendable {
     /// One formatter/parser for every row the store maps — roster joins
     /// decode tens of thousands of ISO stamps per event, and minting a
     /// formatter per row (or per call) was the dominant cost.
-    nonisolated(unsafe) private static let formatter: ISO8601DateFormatter = {
+    nonisolated(unsafe) static let formatter: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return formatter
@@ -168,6 +168,17 @@ public final class FaceIndexStore: @unchecked Sendable {
         photo: FacePhotoRecord,
         faces: [FaceRecord],
         confirmedOverlap: Double = 0.5
+    ) throws {
+        try replaceFaces(photo: photo, faces: faces, confirmedOverlap: confirmedOverlap, alsoWrite: nil)
+    }
+
+    /// `replaceFaces` plus `alsoWrite` inside the same transaction — a pet
+    /// scan's upright marker lands with the rows it describes or not at all.
+    func replaceFaces(
+        photo: FacePhotoRecord,
+        faces: [FaceRecord],
+        confirmedOverlap: Double = 0.5,
+        alsoWrite: ((Database) throws -> Void)?
     ) throws {
         let formatter = Self.formatter
         let now = formatter.string(from: Date())
@@ -253,6 +264,7 @@ public final class FaceIndexStore: @unchecked Sendable {
                 """,
                 arguments: [photo.pathKey]
             )
+            try alsoWrite?(database)
         }
     }
 
@@ -335,7 +347,7 @@ public final class FaceIndexStore: @unchecked Sendable {
         }
     }
 
-    private func faces(photoID: String, database: Database) throws -> [FaceRecord] {
+    func faces(photoID: String, database: Database) throws -> [FaceRecord] {
         try Row.fetchAll(
             database,
             sql: "\(Self.faceSelect) WHERE f.photo_id = ? ORDER BY f.det_score DESC",
@@ -1424,7 +1436,7 @@ public final class FaceIndexStore: @unchecked Sendable {
 
     // MARK: - Row mapping
 
-    private func insertFace(
+    func insertFace(
         _ face: FaceRecord,
         database: Database,
         now: String,
@@ -1499,7 +1511,7 @@ public final class FaceIndexStore: @unchecked Sendable {
         )
     }
 
-    private static func box(_ row: Row) -> NormalizedFaceBox {
+    static func box(_ row: Row) -> NormalizedFaceBox {
         NormalizedFaceBox(
             x: row["box_x"],
             y: row["box_y"],

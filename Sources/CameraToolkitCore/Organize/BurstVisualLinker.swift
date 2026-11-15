@@ -272,7 +272,7 @@ public enum BurstVisualLinker {
         return thumbnail(source: source, maximumPixelSize: maximumPixelSize)
     }
 
-    private static func thumbnail(source: CGImageSource, maximumPixelSize: Int) -> CGImage? {
+    static func thumbnail(source: CGImageSource, maximumPixelSize: Int) -> CGImage? {
         let options: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceCreateThumbnailWithTransform: true,

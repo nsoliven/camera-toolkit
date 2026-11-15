@@ -132,6 +132,12 @@ public struct JobSpeedGraph: Equatable, Sendable {
     /// Samples further apart than this are a gap.
     public var gapThreshold: Double
     public var summary: Summary?
+    /// A scan's passes when it ran more than one, in time order; empty for
+    /// single-pass scans and every other job.
+    public var scanPasses: [ScanPass] = []
+    /// Stretches of a scan spent matching and grouping, when no photo was
+    /// being read.
+    public var scanFinishing: [ClosedRange<Double>] = []
 
     /// True when the graph marks more than one kind of phase — a single
     /// phase over the whole job tells nothing a lane could add.
@@ -154,6 +160,9 @@ public struct JobSpeedGraph: Equatable, Sendable {
         let samples = deduplicated(raw)
         let duration = max(duration, samples.last?.t ?? 0, 0)
         let gap = gapThreshold(samples)
+        if fileRateKinds.contains(kind) {
+            return buildScan(samples: samples, duration: duration, gap: gap)
+        }
 
         let bytesMoved = movedBytes ?? positiveDeltaSum(samples.map { $0.transferBytes ?? $0.doneBytes })
         let filesDone = positiveDeltaSum(samples.map { Int64($0.doneFiles) })
@@ -214,6 +223,74 @@ public struct JobSpeedGraph: Equatable, Sendable {
             gapThreshold: gap,
             summary: summary
         )
+    }
+
+    /// A scan's graph. Scans report in photos, so the plotted rate, the
+    /// average and the peak all come from the work runs `JobScanTimeline`
+    /// finds: a pass's counters restarting and the matching burst between
+    /// passes are not work and do not reach the line.
+    private static func buildScan(samples: [JobHistorySample], duration: Double, gap: Double) -> JobSpeedGraph {
+        let timeline = JobScanTimeline(samples)
+        var segments: [[Point]] = []
+        for run in timeline.runs {
+            let points = smoothedPoints(run.ratePoints, radius: scanSmoothingRadius)
+            segments.append(contentsOf: split(points, gap: gap))
+        }
+        let points = segments.flatMap { $0 }
+        let filesDone = timeline.runs.reduce(0) { $0 + $1.photos }
+        let workSeconds = timeline.runs.reduce(0.0) { $0 + $1.workSeconds }
+        let timedPhotos = timeline.runs.reduce(0) { $0 + $1.timedPhotos }
+        let average: Double? = workSeconds >= 1 && timedPhotos > 0 ? Double(timedPhotos) / workSeconds : nil
+        let peak = points.max { $0.value < $1.value }.flatMap { $0.value > 0 ? $0 : nil }
+
+        let summary: Summary?
+        if points.isEmpty, duration >= minimumChartSeconds {
+            summary = .noSamples
+        } else if duration < minimumChartSeconds || points.count < minimumChartPoints {
+            summary = .tooShort(duration: duration)
+        } else {
+            summary = nil
+        }
+        return JobSpeedGraph(
+            metric: points.isEmpty ? nil : .filesPerSecond,
+            duration: duration,
+            segments: segments,
+            phases: [],
+            average: average,
+            peak: peak,
+            filesDone: filesDone,
+            averageFilesPerSecond: average,
+            yUpper: axisUpper(points.map(\.value), average: average),
+            gapThreshold: gap,
+            summary: summary,
+            scanPasses: timeline.passes,
+            scanFinishing: timeline.finishing
+        )
+    }
+
+    /// Samples each side of a scan point that are averaged into it. The
+    /// recorded rates already span five seconds; this keeps a burst of
+    /// files finishing together from reading as the scan's top speed.
+    static let scanSmoothingRadius = 3
+
+    /// `points` smoothed by a centred moving average `radius` samples wide
+    /// on each side.
+    static func smoothedPoints(_ points: [Point], radius: Int) -> [Point] {
+        guard radius > 0, points.count > 2 else { return points }
+        return points.indices.map { index in
+            let window = points[max(index - radius, 0)...min(index + radius, points.count - 1)]
+            return Point(t: points[index].t, value: window.reduce(0) { $0 + $1.value } / Double(window.count))
+        }
+    }
+
+    /// The scan pass running at `t`, if the graph has passes.
+    public func scanPass(at t: Double) -> ScanPass? {
+        scanPasses.first { $0.start <= t && t <= $0.end + gapThreshold }
+    }
+
+    /// True when `t` falls in a stretch of matching and grouping.
+    public func isScanFinishing(at t: Double) -> Bool {
+        scanFinishing.contains { $0.contains(t) }
     }
 
     // MARK: - Drawing

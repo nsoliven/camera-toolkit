@@ -381,7 +381,8 @@ struct EventPickerSheet: View {
     var allowedEventIDs: Set<UUID>? = nil
     var canAssign = true
     let onPick: (SavedCameraEvent) -> Void
-    let onNewEvent: () -> Void
+    /// Nil hides the New Event… button (a picker that only chooses).
+    var onNewEvent: (() -> Void)? = nil
     var onCancel: (() -> Void)? = nil
 
     @Environment(\.dismiss) private var dismiss
@@ -476,15 +477,17 @@ struct EventPickerSheet: View {
             }
             Divider()
             HStack {
-                Button {
-                    guard !finished else { return }
-                    finished = true
-                    onNewEvent()
-                    dismiss()
-                } label: {
-                    Label("New Event…", systemImage: "plus")
+                if let onNewEvent {
+                    Button {
+                        guard !finished else { return }
+                        finished = true
+                        onNewEvent()
+                        dismiss()
+                    } label: {
+                        Label("New Event…", systemImage: "plus")
+                    }
+                    .help("Create an event and \(verb.lowercased()) the selection into it")
                 }
-                .help("Create an event and \(verb.lowercased()) the selection into it")
                 Spacer()
                 Button("Cancel", action: cancel)
                     .keyboardShortcut(.cancelAction)

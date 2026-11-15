@@ -40,12 +40,7 @@ public struct OrganizeScanResult: Sendable {
     public func removingFiles(withPathKeys keys: Set<String>) -> OrganizeScanResult {
         guard !keys.isEmpty else { return self }
         var copy = self
-        copy.items = items.compactMap { item in
-            if keys.contains(item.primary.pathKey) { return nil }
-            var kept = item
-            kept.companions.removeAll { keys.contains($0.pathKey) }
-            return kept
-        }
+        copy.items = items.flatMap { $0.removingFiles { keys.contains($0.pathKey) } }
         let surviving = Set(copy.items.map(\.primary.path))
         let links = visualLinks.filter {
             surviving.contains($0.previousPath) && surviving.contains($0.nextPath)
@@ -82,6 +77,7 @@ public struct OrganizeScanner: Sendable {
         burstGrouping: BurstGroupingConfiguration = BurstGroupingConfiguration(),
         burstSplits: [BurstSplit] = [],
         pauseGate: DriveActivityGate? = nil,
+        ownership: SideFileOwnership? = nil,
         progress: (@Sendable (OrganizeScanProgress) -> Void)? = nil
     ) throws -> OrganizeScanResult {
         let rootURL = root.standardizedFileURL
@@ -103,6 +99,7 @@ public struct OrganizeScanner: Sendable {
             cache: cache,
             concurrency: concurrency,
             pauseGate: pauseGate,
+            ownership: ownership,
             progress: progress
         )
         // Fingerprints run only for pairs in the visual-recovery band; when
@@ -146,9 +143,12 @@ public struct OrganizeScanner: Sendable {
         concurrency: Int = 8,
         readMissingCaptureDates: Bool = true,
         pauseGate: DriveActivityGate? = nil,
+        ownership: SideFileOwnership? = nil,
         progress: (@Sendable (OrganizeScanProgress) -> Void)? = nil
     ) -> (items: [OrganizeItem], clockOffset: TimeInterval, missingCaptureDates: Int) {
-        let pairings = OrganizeFileClassifier.pair(files)
+        let pairings = OrganizeFileClassifier.pair(files, keepApart: ownership.map { ownership in
+            { ownership.keepsApart(primary: $0, sideFile: $1) }
+        })
         // Stills carry a capture time and camera tags; clips carry camera
         // tags only. Both are read by the same one-pass metadata reader.
         let readable = pairings.indices.filter {

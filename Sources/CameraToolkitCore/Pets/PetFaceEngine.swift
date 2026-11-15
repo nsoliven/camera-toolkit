@@ -159,7 +159,8 @@ extension FaceScanOptions {
             groupingMinFacePixels: PetScanDefaults.groupingMinDogPixels,
             minimumGroupFaces: 3,
             videoDuplicateCosine: PetScanDefaults.videoDuplicateCosine,
-            flipTTA: false
+            flipTTA: false,
+            uprightRawDetection: true
         )
     }
 }

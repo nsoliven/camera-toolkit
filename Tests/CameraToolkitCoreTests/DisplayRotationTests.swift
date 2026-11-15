@@ -103,6 +103,56 @@ final class DisplayRotationTests: XCTestCase {
         XCTAssertEqual(map[DisplayRotation.fileKey(for: untouched)], 1)
     }
 
+    // MARK: The camera's turns
+
+    func testCameraTurnsForEachTIFFOrientation() {
+        XCTAssertEqual(DisplayRotation.cameraTurns(forTIFFOrientation: nil), 0)
+        XCTAssertEqual(DisplayRotation.cameraTurns(forTIFFOrientation: 1), 0)
+        XCTAssertEqual(DisplayRotation.cameraTurns(forTIFFOrientation: 6), 1)
+        XCTAssertEqual(DisplayRotation.cameraTurns(forTIFFOrientation: 3), 2)
+        XCTAssertEqual(DisplayRotation.cameraTurns(forTIFFOrientation: 8), 3)
+        for mirrored in [2, 4, 5, 7, 99] {
+            XCTAssertEqual(DisplayRotation.cameraTurns(forTIFFOrientation: mirrored), 0)
+        }
+    }
+
+    func testASavedEntryOverridesTheCamera() {
+        XCTAssertEqual(DisplayRotation.effectiveTurns(saved: nil, camera: 3), 3)
+        XCTAssertEqual(DisplayRotation.effectiveTurns(saved: 1, camera: 3), 1)
+        XCTAssertEqual(DisplayRotation.effectiveTurns(saved: 0, camera: 3), 0, "a saved 0 means shown unrotated")
+        XCTAssertEqual(DisplayRotation.effectiveTurns(saved: 5, camera: 3), 1)
+    }
+
+    func testRotateStepsFromWhatTheCameraPutOnScreen() {
+        let raw = file("B0001_DSC00001.ARW")
+        let stack = OrganizeStack(items: [item(raw)])
+        let key = DisplayRotation.fileKey(for: raw)
+
+        // The camera turned it 3; one clockwise step is 3 + 1 = 0, and that
+        // 0 is a choice the camera disagrees with, so it stays recorded.
+        var map = DisplayRotation.rotatedMap([:], applying: 1, to: stack, cameraTurns: { _ in 3 })
+        XCTAssertEqual(map[key], 0)
+
+        // A further step counter-clockwise lands back on the camera's 3:
+        // the override is gone, not left behind as a saved 3.
+        map = DisplayRotation.rotatedMap(map, applying: -1, to: stack, cameraTurns: { _ in 3 })
+        XCTAssertTrue(map.isEmpty)
+    }
+
+    func testRotateFromASavedEntryIgnoresTheCamera() {
+        let raw = file("B0001_DSC00001.ARW")
+        let key = DisplayRotation.fileKey(for: raw)
+
+        let map = DisplayRotation.rotatedMap([key: 1], applying: 1, to: OrganizeStack(items: [item(raw)]), cameraTurns: { _ in 3 })
+        XCTAssertEqual(map[key], 2, "steps from the saved 1, not the camera's 3")
+    }
+
+    func testRawsAloneHaveCameraTurns() {
+        XCTAssertTrue(DisplayRotation.hasCameraTurns(URL(filePath: "/x/DSC00001.ARW")))
+        XCTAssertFalse(DisplayRotation.hasCameraTurns(URL(filePath: "/x/DSC00001.JPG")))
+        XCTAssertFalse(DisplayRotation.hasCameraTurns(URL(filePath: "/x/DSC00001.MP4")))
+    }
+
     // MARK: File identity survives moves
 
     func testFileKeyIsStableAcrossFolders() {
@@ -114,7 +164,7 @@ final class DisplayRotationTests: XCTestCase {
 
     func testTurnsLookupNormalizesStoredValues() {
         let f = file("B0001_DSC00001.ARW")
-        XCTAssertEqual(DisplayRotation.turns(for: f, in: [DisplayRotation.fileKey(for: f): 5]), 1)
+        XCTAssertEqual(DisplayRotation.savedTurns(for: f, in: [DisplayRotation.fileKey(for: f): 5]), 1)
     }
 
     // MARK: Pixel correctness — the burst actually turns

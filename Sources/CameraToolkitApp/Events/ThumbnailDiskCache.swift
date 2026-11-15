@@ -5,7 +5,7 @@ import Foundation
 import ImageIO
 import UniformTypeIdentifiers
 
-/// Tile-sized thumbnails of photos that live on a network volume (the NAS),
+/// Tile-sized thumbnails of photos that live on the NAS or the Buffer drive,
 /// kept on this Mac so a board that was scrolled once scrolls again without
 /// reading the NAS. The in-memory cache holds a few hundred tiles; a family
 /// board has thousands, and every one that fell out of memory was a network
@@ -20,16 +20,34 @@ import UniformTypeIdentifiers
 /// A photo's identity is its name, byte count and modification time — what
 /// already follows a file between folders — so a thumbnail survives a Move
 /// to Event, and an edited file (new size or time) gets a new one.
+///
+/// Thumbnails live in a folder named for the layout's version. An older
+/// layout's files are not ours to read any more (they may hold sideways RAW
+/// previews), and a version folder is what lets them be told apart and
+/// removed instead of waiting for eviction, which background warming never
+/// reaches.
 final class ThumbnailDiskCache: @unchecked Sendable {
-    /// The app's cache: `~/Library/Caches/<app>/Thumbnails`, 1 GB. Nil when
-    /// the system has no Caches folder to offer.
+    /// What the app's cache may hold. A grid tile is the 512 px bucket
+    /// (220 pt at 2x), 512×341 at JPEG quality 0.82: about 2–4 bits a pixel
+    /// for a real photo, so 45–85 KB. A 40,000-photo library is then
+    /// 1.8–3.4 GB of tiles. Evicting to 80% still keeps the high end of that,
+    /// with room left for filmstrip sizes, rotated copies and new photos.
+    static let defaultByteLimit: Int64 = 5 * 1_024 * 1_024 * 1_024
+
+    /// The app's cache: `~/Library/Caches/<app>/Thumbnails`. Nil when the
+    /// system has no Caches folder to offer.
     static let appDefault: ThumbnailDiskCache? = {
         guard let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first else { return nil }
         let folder = caches
             .appendingPathComponent("org.cameratoolkit.CameraToolkit", isDirectory: true)
             .appendingPathComponent("Thumbnails", isDirectory: true)
-        return ThumbnailDiskCache(folder: folder, byteLimit: 1_024 * 1_024 * 1_024)
+        return ThumbnailDiskCache(folder: folder, byteLimit: defaultByteLimit)
     }()
+
+    /// The layout the thumbnails are kept in. Bumped from the unversioned
+    /// layout when RAW previews started being turned upright: an entry made
+    /// before then holds a sideways picture.
+    private static let layoutVersion = "v2"
 
     /// The largest decode bucket worth keeping: tiles and filmstrip frames.
     /// A full-screen preview is far bigger than the read it would save.
@@ -37,6 +55,8 @@ final class ThumbnailDiskCache: @unchecked Sendable {
 
     let folder: URL
     let byteLimit: Int64
+    /// Where this layout's thumbnails are: `<folder>/<version>/`.
+    private let layoutFolder: URL
     private let queue = DispatchQueue(label: "CameraToolkit.ThumbnailDiskCache", qos: .utility)
     /// Total bytes on disk once counted; kept up to date by `store`. Only
     /// touched on `queue`.
@@ -45,11 +65,13 @@ final class ThumbnailDiskCache: @unchecked Sendable {
     init(folder: URL, byteLimit: Int64) {
         self.folder = folder
         self.byteLimit = byteLimit
+        layoutFolder = folder.appendingPathComponent(Self.layoutVersion, isDirectory: true)
     }
 
-    /// The key of one decode of one photo: identity, size bucket, rotation.
-    static func key(fileIdentity: String, bucket: Int, orientation: Int) -> String {
-        "\(fileIdentity)#\(bucket)#\(DisplayRotation.normalized(orientation))"
+    /// The key of one decode of one photo: identity, size bucket, and the
+    /// saved rotation or none (`DisplayRotation.requestToken`).
+    static func key(fileIdentity: String, bucket: Int, orientation: Int?) -> String {
+        "\(layoutVersion)#\(fileIdentity)#\(bucket)#\(DisplayRotation.requestToken(orientation))"
     }
 
     /// The file identity a photo's thumbnails are kept under.
@@ -59,16 +81,22 @@ final class ThumbnailDiskCache: @unchecked Sendable {
 
     // MARK: Reading
 
-    /// The stored thumbnail, or nil. One small local file read — safe from
+    /// The stored thumbnail and the camera turns it was made with (nil for
+    /// anything but a RAW), or nil. One small local file read — safe from
     /// any thread but the main one, which never asks.
-    func image(forKey key: String) -> CGImage? {
+    func thumbnail(forKey key: String) -> (image: CGImage, cameraTurns: Int?)? {
         let url = fileURL(forKey: key)
         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
               let image = CGImageSourceCreateImageAtIndex(source, 0, [kCGImageSourceShouldCacheImmediately: true] as CFDictionary) else {
             return nil
         }
         touchIfOld(url)
-        return image
+        return (image, Self.cameraTurns(in: source))
+    }
+
+    /// Whether a thumbnail is on disk. One local stat; never reads the photo.
+    func contains(key: String) -> Bool {
+        FileManager.default.fileExists(atPath: fileURL(forKey: key).path)
     }
 
     // MARK: Writing
@@ -77,24 +105,45 @@ final class ThumbnailDiskCache: @unchecked Sendable {
     /// the caller is a decode that has already finished — through a
     /// temporary file renamed into place, so a half-written thumbnail is
     /// never read.
-    func store(_ image: CGImage, forKey key: String) {
-        queue.async { [self] in
-            guard let data = Self.encode(image) else { return }
-            let url = fileURL(forKey: key)
-            let directory = url.deletingLastPathComponent()
-            do {
-                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-                let temporary = directory.appendingPathComponent(".\(UUID().uuidString).tmp")
-                try data.write(to: temporary)
-                if rename(temporary.path, url.path) != 0 {
-                    try? FileManager.default.removeItem(at: temporary)
-                    return
-                }
-            } catch {
-                return
-            }
-            recordStore(bytes: Int64(data.count))
+    func store(_ image: CGImage, cameraTurns: Int? = nil, forKey key: String) {
+        queue.async { [self] in _ = write(image, cameraTurns: cameraTurns, forKey: key) }
+    }
+
+    /// `store`, waiting for the file to land. False when it could not be
+    /// written. Background warming uses this so it never runs ahead of the
+    /// disk, and so a full disk stops it instead of being retried per photo.
+    func storeAndWait(_ image: CGImage, cameraTurns: Int? = nil, forKey key: String) -> Bool {
+        queue.sync { write(image, cameraTurns: cameraTurns, forKey: key) }
+    }
+
+    /// Whether the folder has grown to where background warming should
+    /// stop: 90% of the limit, under the size that triggers eviction, so
+    /// warming never pushes out a thumbnail someone actually looked at.
+    var isNearLimit: Bool {
+        queue.sync {
+            if knownBytes == nil { knownBytes = scanBytes() }
+            return (knownBytes ?? 0) >= byteLimit / 10 * 9
         }
+    }
+
+    /// Runs on `queue`.
+    private func write(_ image: CGImage, cameraTurns: Int?, forKey key: String) -> Bool {
+        guard let data = Self.encode(image, cameraTurns: cameraTurns) else { return false }
+        let url = fileURL(forKey: key)
+        let directory = url.deletingLastPathComponent()
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let temporary = directory.appendingPathComponent(".\(UUID().uuidString).tmp")
+            try data.write(to: temporary)
+            if rename(temporary.path, url.path) != 0 {
+                try? FileManager.default.removeItem(at: temporary)
+                return false
+            }
+        } catch {
+            return false
+        }
+        recordStore(bytes: Int64(data.count))
+        return true
     }
 
     /// Waits for pending writes — for tests.
@@ -107,17 +156,35 @@ final class ThumbnailDiskCache: @unchecked Sendable {
 
     // MARK: Internals
 
-    private static func encode(_ image: CGImage) -> Data? {
+    /// The comment a RAW's thumbnail remembers the camera's turns in, so a
+    /// tile filled from this cache can still answer Rotate and the preview's
+    /// boxes without reading the photo.
+    private static let cameraTurnsPrefix = "CameraToolkit camera turns "
+
+    private static func encode(_ image: CGImage, cameraTurns: Int?) -> Data? {
         let data = NSMutableData()
         guard let destination = CGImageDestinationCreateWithData(data, UTType.jpeg.identifier as CFString, 1, nil) else { return nil }
-        CGImageDestinationAddImage(destination, image, [kCGImageDestinationLossyCompressionQuality: 0.82] as CFDictionary)
+        var properties: [CFString: Any] = [kCGImageDestinationLossyCompressionQuality: 0.82]
+        if let cameraTurns {
+            properties[kCGImagePropertyExifDictionary] = [kCGImagePropertyExifUserComment: "\(cameraTurnsPrefix)\(cameraTurns)"]
+        }
+        CGImageDestinationAddImage(destination, image, properties as CFDictionary)
         guard CGImageDestinationFinalize(destination) else { return nil }
         return data as Data
     }
 
+    private static func cameraTurns(in source: CGImageSource) -> Int? {
+        let options = [kCGImageSourceShouldCache: false] as CFDictionary
+        guard let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, options) as? [CFString: Any],
+              let exif = properties[kCGImagePropertyExifDictionary] as? [CFString: Any],
+              let comment = exif[kCGImagePropertyExifUserComment] as? String,
+              comment.hasPrefix(cameraTurnsPrefix) else { return nil }
+        return Int(comment.dropFirst(cameraTurnsPrefix.count))
+    }
+
     private func fileURL(forKey key: String) -> URL {
         let digest = SHA256.hash(data: Data(key.utf8)).map { String(format: "%02x", $0) }.joined()
-        return folder
+        return layoutFolder
             .appendingPathComponent(String(digest.prefix(2)), isDirectory: true)
             .appendingPathComponent(digest + ".jpg", isDirectory: false)
     }
@@ -151,17 +218,34 @@ final class ThumbnailDiskCache: @unchecked Sendable {
 
     private func entries() -> [Entry] {
         guard let enumerator = FileManager.default.enumerator(
-            at: folder,
+            at: layoutFolder,
             includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey, .isRegularFileKey],
             options: [.skipsHiddenFiles]
         ) else { return [] }
         var result: [Entry] = []
-        for case let url as URL in enumerator where url.pathExtension == "jpg" {
+        for case let url as URL in enumerator where Self.hasThumbnailName(url) {
             guard let values = try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey, .isRegularFileKey]),
                   values.isRegularFile == true else { continue }
             result.append(Entry(url: url, size: Int64(values.fileSize ?? 0), modified: values.contentModificationDate ?? .distantPast))
         }
         return result
+    }
+
+    /// The shape `fileURL` gives every thumbnail: `<2 hex>/<64 hex>.jpg`,
+    /// the folder being the name's first two characters. Anything else that
+    /// ended up in the folder is not ours to count or remove.
+    private static func hasThumbnailName(_ url: URL) -> Bool {
+        guard url.pathExtension == "jpg" else { return false }
+        let name = url.deletingPathExtension().lastPathComponent
+        let isDigest = name.utf8.count == 64 && name.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) }
+        return isDigest && url.deletingLastPathComponent().lastPathComponent == String(name.prefix(2))
+    }
+
+    /// Whether a thumbnail's real location, with every symlink followed, is
+    /// one shard folder directly under `resolvedFolder`. Asked before each
+    /// removal.
+    private func isInsideCacheFolder(_ url: URL, resolvedFolder: URL) -> Bool {
+        url.resolvingSymlinksInPath().deletingLastPathComponent().deletingLastPathComponent().path == resolvedFolder.path
     }
 
     /// Runs on `queue`. Removes the oldest thumbnails until the folder is at
@@ -170,10 +254,39 @@ final class ThumbnailDiskCache: @unchecked Sendable {
         let all = entries().sorted { $0.modified < $1.modified }
         var total = all.reduce(Int64(0)) { $0 + $1.size }
         let target = byteLimit / 5 * 4
+        let resolvedFolder = layoutFolder.resolvingSymlinksInPath()
         for oldest in all {
             guard total > target else { break }
+            guard isInsideCacheFolder(oldest.url, resolvedFolder: resolvedFolder) else { continue }
             if (try? FileManager.default.removeItem(at: oldest.url)) != nil { total -= oldest.size }
         }
         knownBytes = total
+    }
+
+    // MARK: Older layouts
+
+    /// Clears out the thumbnails of the unversioned layout, on the cache's
+    /// own queue. Only files shaped like a thumbnail, in a shard folder
+    /// directly under this cache's folder, are removed; anything else there
+    /// is not ours and stays.
+    func removeOlderLayouts() {
+        queue.async { [self] in
+            let fileManager = FileManager.default
+            let resolvedFolder = folder.resolvingSymlinksInPath()
+            guard let shards = try? fileManager.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil) else { return }
+            for shard in shards where Self.hasShardName(shard) {
+                let names = (try? fileManager.contentsOfDirectory(at: shard, includingPropertiesForKeys: nil)) ?? []
+                for file in names where Self.hasThumbnailName(file) && isInsideCacheFolder(file, resolvedFolder: resolvedFolder) {
+                    try? fileManager.removeItem(at: file)
+                }
+                // Only succeeds on a folder that ended up empty.
+                _ = rmdir(shard.path)
+            }
+        }
+    }
+
+    private static func hasShardName(_ url: URL) -> Bool {
+        let name = url.lastPathComponent
+        return name.utf8.count == 2 && name.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) }
     }
 }

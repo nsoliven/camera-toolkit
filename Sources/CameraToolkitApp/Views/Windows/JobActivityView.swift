@@ -55,23 +55,85 @@ struct JobActivityDetail: View {
     }
 
     private func content(now: Date) -> some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 18) {
             header(now: now)
             if isLive, let live {
-                JobLiveActivity(job: live)
+                JobLiveHero(job: live, remaining: remainingLine)
+            } else {
+                finishedHero(now: now)
+                problems
             }
+            if showsTally { tally }
             speedCard(now: now)
-            tally
-            footnotes
+            details
         }
-        .padding(16)
+        .padding(20)
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var remainingLine: String? {
+        guard isLive, let live, let estimate = monitor.remainingEstimate(for: live) else { return nil }
+        return JobActivityDetail.remainingText(estimate)
+    }
+
+    /// While a job runs the hero already says its files and bytes; only a
+    /// sync has more to add (copied against already there and verified).
+    private var showsTally: Bool {
+        !isLive || kind == JobAction.syncBuffer.rawValue
+    }
+
+    // MARK: - Finished
+
+    private func finishedHero(now: Date) -> some View {
+        let hero = JobDetailFacts.finishedHero(
+            job: detail?.job, live: live, outcome: outcome, display: display,
+            graph: graph(now: now), elapsed: elapsed(now: now)
+        )
+        return VStack(alignment: .leading, spacing: 4) {
+            HStack(alignment: .firstTextBaseline, spacing: 12) {
+                Text(hero.headline)
+                    .font(.title2.weight(.semibold))
+                    .foregroundStyle(display.tone == .failure || display.tone == .warning ? display.tone.color : .primary)
+                    .lineLimit(2)
+                Spacer(minLength: 8)
+                if let value = hero.value {
+                    Text(value)
+                        .font(.title2.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .fixedSize()
+                }
+            }
+            if let subline = hero.subline {
+                Text(subline)
+                    .font(.callout.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    /// Why a finished job ended the way it did: right under its result, so
+    /// a conflict or a failure is never below the fold.
+    @ViewBuilder
+    private var problems: some View {
+        if let checks = detail?.job.summary?.cardClearChecks {
+            let lines = CardClearWording.finishedChecks(checks)
+            if !lines.isEmpty {
+                CardClearChecksView(lines: lines, showsResults: true)
+            }
+        }
+        if let job = detail?.job {
+            JobIssueSection(job: job, items: detail?.items ?? [], showIssues: showIssues, compare: compare)
+        }
     }
 
     // MARK: - Header
 
+    /// The job's recorded title, naming the pass that is running now.
     private var title: String {
-        detail?.job.title ?? live?.action.displayName ?? "Job"
+        let recorded = detail?.job.title ?? live?.action.displayName ?? "Job"
+        guard isLive, let pass = live?.telemetry?.scanPass else { return recorded }
+        return pass.title(forRecorded: recorded)
     }
 
     private var outcome: JobHistoryOutcome {
@@ -92,14 +154,14 @@ struct JobActivityDetail: View {
     private func header(now: Date) -> some View {
         HStack(alignment: .center, spacing: 12) {
             Image(systemName: isLive ? (live.map { JobListRow.runningSymbol($0.action) } ?? display.symbol) : display.symbol)
-                .font(.title)
+                .font(.title2)
                 .symbolRenderingMode(.hierarchical)
-                .foregroundStyle(display.tone.color)
-                .frame(width: 34)
+                .foregroundStyle(display.tone == .success ? .secondary : display.tone.color)
+                .frame(width: 28)
                 .accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: 3) {
+            VStack(alignment: .leading, spacing: 2) {
                 Text(title)
-                    .font(.title3.weight(.semibold))
+                    .font(.headline)
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .textSelection(.enabled)
@@ -117,14 +179,12 @@ struct JobActivityDetail: View {
         JobDetailFacts.outcomeDisplay(outcome, job: isLive ? nil : detail?.job)
     }
 
-    /// "Today 12:31 – 12:33 · 2:12" or "Started 12:31 · 0:42 · ~3 m left".
+    /// "Today 12:31 – 12:33" or "Started 12:31 · 0:42"; the result and the
+    /// time left have their own place.
     private func timing(now: Date) -> String {
         guard let startedAt else { return "" }
-        var parts = [JobDetailFacts.when(start: startedAt, end: endedAt, now: now), JobActivityDetail.durationText(elapsed(now: now))]
-        if isLive, let live, let estimate = monitor.remainingEstimate(for: live) {
-            parts.append(JobActivityDetail.remainingText(estimate))
-        }
-        return parts.joined(separator: " · ")
+        let when = JobDetailFacts.when(start: startedAt, end: endedAt, now: now)
+        return isLive ? "\(when) · \(JobActivityDetail.durationText(elapsed(now: now)))" : when
     }
 
     // MARK: - Speed
@@ -148,19 +208,15 @@ struct JobActivityDetail: View {
         return detail?.job.summary.map { JobTelemetry.shares(of: $0.phases) } ?? []
     }
 
-    /// The readouts (and, while running, the machine), the speed graph,
-    /// and where the time went.
+    /// The readouts and the speed graph.
     private func speedCard(now: Date) -> some View {
         let graph = graph(now: now)
         let values = readouts(now: now, graph: graph)
-        return VStack(alignment: .leading, spacing: 12) {
-            if !values.isEmpty || isLive {
-                WrappingRowLayout {
+        return VStack(alignment: .leading, spacing: 14) {
+            if !values.isEmpty {
+                WrappingRowLayout(spacing: 28) {
                     ForEach(Array(values.enumerated()), id: \.offset) { _, readout in
                         ThroughputValue(value: readout.value, unit: readout.unit, caption: readout.caption, prominent: readout.prominent, faded: readout.faded, help: readout.help)
-                    }
-                    if isLive {
-                        hardwareStrip
                     }
                 }
             }
@@ -174,12 +230,8 @@ struct JobActivityDetail: View {
                 flights: detail?.flights,
                 items: detail?.items ?? []
             )
-            // One phase over the whole job says nothing a bar could add.
-            if phaseShares.count > 1 {
-                PhaseBreakdown(shares: phaseShares)
-            }
         }
-        .padding(12)
+        .padding(14)
         .background(.background.secondary, in: RoundedRectangle(cornerRadius: 10))
     }
 
@@ -189,55 +241,59 @@ struct JobActivityDetail: View {
     private var tally: some View {
         let items = JobDetailFacts.tally(job: detail?.job, live: live, items: detail?.items ?? [])
         if !items.isEmpty {
-            WrappingRowLayout(spacing: 26, rowSpacing: 8) {
+            WrappingRowLayout(spacing: 32, rowSpacing: 10) {
                 ForEach(Array(items.enumerated()), id: \.offset) { _, item in
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(item.label.uppercased())
-                            .font(.caption2.weight(.bold))
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(item.label)
+                            .font(.caption)
                             .foregroundStyle(.secondary)
                         Text(item.value)
-                            .font(.callout.monospacedDigit())
+                            .font(.body.monospacedDigit())
                             .foregroundStyle(item.tone.color)
                             .lineLimit(1)
                     }
                     .help(item.help ?? "")
                 }
             }
-            .padding(.horizontal, 4)
         }
     }
 
-    // MARK: - Configuration and problems
+    // MARK: - Details
 
+    /// What most people never need: how the job was set up, which models
+    /// it runs, where the time went, and the machine while it runs.
     @ViewBuilder
-    private var footnotes: some View {
+    private var details: some View {
         let configuration = JobDetailFacts.configuration(job: detail?.job, live: live)
-        VStack(alignment: .leading, spacing: 6) {
-            if !configuration.isEmpty {
-                Text(configuration)
-                    .font(.caption.monospaced())
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
-            }
-            debugLines
-            if let checks = detail?.job.summary?.cardClearChecks, !isLive {
-                let lines = CardClearWording.finishedChecks(checks)
-                if !lines.isEmpty {
-                    CardClearChecksView(lines: lines, showsResults: true)
+        let telemetry = live?.telemetry
+        let hasModels = !(telemetry?.models.isEmpty ?? true) || !(telemetry?.facts.isEmpty ?? true)
+        // One phase over the whole job says nothing a bar could add.
+        let hasPhases = phaseShares.count > 1
+        if isLive || hasModels || hasPhases || !configuration.isEmpty {
+            JobDetailsSection {
+                VStack(alignment: .leading, spacing: 10) {
+                    if !configuration.isEmpty {
+                        Text(configuration)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                    }
+                    debugLines
+                    if hasPhases {
+                        PhaseBreakdown(shares: phaseShares)
+                    }
+                    if isLive {
+                        hardwareStrip
+                    }
                 }
             }
-            if let job = detail?.job, !isLive {
-                JobIssueSection(job: job, items: detail?.items ?? [], showIssues: showIssues, compare: compare)
-            }
         }
-        .padding(.horizontal, 4)
     }
-
 
     /// CPU, GPU and thermal in one compact strip. Counters macOS does not
     /// expose are left out rather than shown as "n/a"; the tooltip says why.
     private var hardwareStrip: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: 16) {
             metricCell(
                 "CPU",
                 fraction: monitor.hardware.cpuFraction,
@@ -265,7 +321,7 @@ struct JobActivityDetail: View {
         VStack(alignment: .leading, spacing: 2) {
             HStack(alignment: .firstTextBaseline, spacing: 4) {
                 Text(label)
-                    .font(.caption2.weight(.bold))
+                    .font(.caption)
                     .foregroundStyle(.secondary)
                     // "CPU" must never fold to one letter per line.
                     .fixedSize()
@@ -283,8 +339,8 @@ struct JobActivityDetail: View {
 
     private var thermalCell: some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text("THERMAL")
-                .font(.caption2.weight(.bold))
+            Text("Thermal")
+                .font(.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
             Text(thermalLabel)
@@ -324,10 +380,10 @@ struct JobActivityDetail: View {
         if let telemetry = live?.telemetry, !telemetry.models.isEmpty || !telemetry.facts.isEmpty {
             VStack(alignment: .leading, spacing: 3) {
                 if !telemetry.models.isEmpty {
-                    debugLine("MODELS", telemetry.models.joined(separator: " · "))
+                    debugLine(telemetry.scanPass?.isMultiPass == true ? "\(telemetry.scanPass?.subject.title ?? "") models" : "Models", telemetry.models.joined(separator: " · "))
                 }
                 if !telemetry.facts.isEmpty {
-                    debugLine("SCAN", telemetry.facts.joined(separator: " · "))
+                    debugLine("Settings", telemetry.facts.joined(separator: " · "))
                 }
             }
         }
@@ -336,13 +392,13 @@ struct JobActivityDetail: View {
     private func debugLine(_ label: String, _ value: String) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             Text(label)
-                .font(.caption2.weight(.bold))
+                .font(.caption)
                 .foregroundStyle(.tertiary)
-                .frame(width: 52, alignment: .leading)
+                .frame(width: 76, alignment: .leading)
             Text(value)
-                .font(.caption.monospaced())
+                .font(.caption)
                 .foregroundStyle(.secondary)
-                .lineLimit(2)
+                .lineLimit(3)
                 .textSelection(.enabled)
         }
     }
@@ -351,10 +407,11 @@ struct JobActivityDetail: View {
     /// noise, not information.
     static let remainingDisplayCap: TimeInterval = 99 * 3600
 
-    /// "~1 h 5 m left", "~12 m left", "under a minute left",
-    /// "estimating…", or "many hours left" past `remainingDisplayCap`.
-    static func remainingText(_ estimate: JobActivityMonitor.RemainingEstimate) -> String {
-        guard case .seconds(let interval) = estimate else { return "estimating…" }
+    /// "~1 h 5 m left", "~12 m left", "under a minute left", or "many
+    /// hours left" past `remainingDisplayCap`. Nil until there is a real
+    /// estimate: the window says nothing rather than promising one.
+    static func remainingText(_ estimate: JobActivityMonitor.RemainingEstimate) -> String? {
+        guard case .seconds(let interval) = estimate else { return nil }
         guard interval.isFinite, interval <= remainingDisplayCap else { return "many hours left" }
         let minutes = Int((max(interval, 0) / 60).rounded())
         if interval < 60 { return "under a minute left" }
@@ -375,63 +432,97 @@ struct JobActivityDetail: View {
     }
 }
 
-/// What a running job is doing this instant: its progress and counters,
-/// then one steady row per parallel transfer, or the files in flight.
-private struct JobLiveActivity: View {
-    let job: JobSnapshot
+/// Details folded away until asked for. Keeps its own open state so the
+/// live pane's once-a-second redraw does not close it.
+private struct JobDetailsSection<Content: View>: View {
+    @ViewBuilder var content: () -> Content
+    @State private var expanded = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            progressAndCounts
-            headline
+        DisclosureGroup(isExpanded: $expanded) {
+            content()
+                .padding(.top, 8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        } label: {
+            Text("Details")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .contentShape(Rectangle())
+                .onTapGesture { expanded.toggle() }
         }
     }
+}
 
-    private var progressAndCounts: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            ProgressView(value: min(max(job.progress, 0), 1))
-                .tint(job.state.tint)
-            HStack(spacing: 6) {
-                Text(countsText)
-                    .lineLimit(2)
+/// The hero's progress bar: blue whatever the system accent, and in one
+/// segment per pass for a job in passes, the earlier ones full. The fill
+/// only ever grows, even as the next pass's counts restart.
+struct JobPassBar: View {
+    var segments = 1
+    /// The whole job, 0...1.
+    let fraction: Double
+
+    static func segmentFill(_ segment: Int, count: Int, fraction: Double) -> Double {
+        min(max(fraction * Double(count) - Double(segment), 0), 1)
+    }
+
+    var body: some View {
+        GeometryReader { geometry in
+            let gap: CGFloat = 3
+            let count = max(segments, 1)
+            let width = max((geometry.size.width - gap * CGFloat(count - 1)) / CGFloat(count), 0)
+            HStack(spacing: gap) {
+                ForEach(0..<count, id: \.self) { segment in
+                    ZStack(alignment: .leading) {
+                        Capsule().fill(.quaternary)
+                        Capsule().fill(.blue)
+                            .frame(width: width * Self.segmentFill(segment, count: count, fraction: fraction))
+                    }
+                    .frame(width: width)
+                }
+            }
+        }
+        .frame(height: 6)
+        .accessibilityElement()
+        .accessibilityLabel("Progress")
+        .accessibilityValue(fraction.formatted(.percent.precision(.fractionLength(0))))
+    }
+}
+
+/// The big answer for a running job: what it is doing, how far along, when
+/// it will finish, then its counts and the file in hand.
+private struct JobLiveHero: View {
+    let job: JobSnapshot
+    let remaining: String?
+
+    private var percent: String {
+        job.progress.formatted(.percent.precision(.fractionLength(0)))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline, spacing: 12) {
+                Text(JobDetailFacts.liveHeadline(job))
+                    .font(.title2.weight(.semibold))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
                 Spacer(minLength: 8)
-                Text(job.progress.formatted(.percent.precision(.fractionLength(0))))
-                    .foregroundStyle(.secondary)
+                Text(percent)
+                    .font(.title2.weight(.semibold).monospacedDigit())
                     .fixedSize()
             }
-            .font(.caption.monospacedDigit())
-        }
-    }
-
-    /// "3,412 of 8,200 files · 4,788 to go · 61 faces · 2 failed · 2.1 GB read"
-    /// — real counters only; whatever a job does not report does not appear.
-    private var countsText: String {
-        var parts: [String] = []
-        if job.totalFiles > 0 {
-            parts.append("\(job.processedFiles.formatted()) of \(job.totalFiles.formatted()) files")
-            let remaining = max(job.totalFiles - job.processedFiles, 0)
-            if job.state == .running, remaining > 0 {
-                parts.append("\(remaining.formatted()) to go")
+            if let subline = JobDetailFacts.liveSubline(job, remaining: remaining) {
+                Text(subline)
+                    .font(.callout.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
             }
-        } else if job.processedFiles > 0 {
-            parts.append("\(job.processedFiles.formatted()) files")
+            JobPassBar(segments: job.telemetry?.scanPass?.count ?? 1, fraction: min(max(job.progress, 0), 1))
+            Text(JobDetailFacts.liveCounts(job))
+                .font(.callout.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+            headline
         }
-        if let work = job.telemetry?.work, let label = work.unitLabel {
-            // Video-heavy scans: the frame plan is the honest progress unit.
-            if let total = work.unitsTotal {
-                let approx = work.totalIsEstimate ? "~" : ""
-                parts.append("\(work.unitsDone.formatted()) of \(approx)\(total.formatted()) \(label)")
-            } else {
-                parts.append("\(work.unitsDone.formatted()) \(label)")
-            }
-        }
-        if job.totalBytes > 0 {
-            parts.append("\(job.processedBytes.formattedBytes) of \(job.totalBytes.formattedBytes) read")
-        }
-        if let counters = job.telemetry?.counters {
-            parts.append(contentsOf: counters.map { "\($0.value.formatted()) \($0.label.lowercased())" })
-        }
-        return parts.isEmpty ? "Waiting for the job to report" : parts.joined(separator: " · ")
     }
 
     /// The files the job holds this instant — basenames, not library paths
@@ -482,27 +573,18 @@ private struct JobLiveActivity: View {
 
     @ViewBuilder
     var headline: some View {
-        if let configuration = job.telemetry?.configuration, job.action == .syncBuffer || !transferRows.isEmpty {
-            transferHeadline(configuration: configuration)
+        if job.telemetry?.configuration != nil, job.action == .syncBuffer || !transferRows.isEmpty {
+            transferHeadline
         } else {
             itemHeadline
         }
     }
 
-    /// "4 transfers in parallel · SSH verify", the job's status on its own
-    /// line, then one steady row per transfer.
+    /// One steady row per parallel transfer; how they are set up lives
+    /// under Details.
     @ViewBuilder
-    private func transferHeadline(configuration: String) -> some View {
+    private var transferHeadline: some View {
         VStack(alignment: .leading, spacing: 6) {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text(configuration)
-                    .font(.callout.weight(.semibold))
-                    .lineLimit(1)
-            }
-            Text(job.telemetry?.step ?? (job.note.isEmpty ? job.action.displayName : job.note))
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
             if !transferRows.isEmpty {
                 VStack(alignment: .leading, spacing: 4) {
                     ForEach(transferRows, id: \.slot) { item in
@@ -514,65 +596,24 @@ private struct JobLiveActivity: View {
         }
     }
 
+    /// The one file to look at, and how many more are in flight.
     @ViewBuilder
     private var itemHeadline: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-            if let first = headlineItems.first {
-                stepChip(first.step)
+        if let first = headlineItems.first {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text(first.step)
+                    .foregroundStyle(stepColor(first.step))
                 Text(first.name)
-                    .font(.callout.weight(.semibold).monospaced())
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .help(first.path)
                 if headlineItems.count > 1 {
                     Text("+\(headlineItems.count - 1) more")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            } else {
-                Text(job.note.isEmpty ? job.action.displayName : job.note)
-                    .font(.callout.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-        }
-
-        // A parallel job's other in-flight files — the per-worker view.
-        if headlineItems.count > 1 {
-            LazyVGrid(
-                columns: [GridItem(.adaptive(minimum: 190, maximum: 300), spacing: 8)],
-                alignment: .leading,
-                spacing: 4
-            ) {
-                ForEach(headlineItems.dropFirst().prefix(11), id: \.path) { item in
-                    HStack(spacing: 6) {
-                        Text(item.step)
-                            .font(.caption2.weight(.semibold))
-                            .foregroundStyle(stepColor(item.step))
-                            .frame(width: 44, alignment: .leading)
-                        Text(item.name)
-                            .font(.caption.monospaced())
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                            .help(item.path)
-                    }
-                }
-                if headlineItems.count > 12 {
-                    Text("+\(headlineItems.count - 12) more")
-                        .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
             }
+            .font(.callout.monospacedDigit())
         }
-    }
-
-    private func stepChip(_ step: String) -> some View {
-        Text(step)
-            .font(.caption2.weight(.bold))
-            .foregroundStyle(stepColor(step))
-            .padding(.horizontal, 7)
-            .padding(.vertical, 3)
-            .background(stepColor(step).quinary, in: Capsule())
     }
 
     private func stepColor(_ step: String) -> Color {
@@ -696,7 +737,7 @@ private struct JobIssueSection: View {
                     .font(.caption.weight(.bold))
                     .foregroundStyle(item.outcome.tint(kind: job.kind))
                 Text(item.fileName)
-                    .font(.callout.monospaced())
+                    .font(.callout)
                     .help(item.relativePath)
                 if item.outcome == .conflict, let compare {
                     Button("Compare…") { compare(item, .conflict) }
@@ -778,14 +819,14 @@ struct ThroughputValue: View {
     var help: String
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(caption.uppercased())
-                .font(.caption2.weight(.bold).monospacedDigit())
+        VStack(alignment: .leading, spacing: 1) {
+            Text(caption.prefix(1).uppercased() + caption.dropFirst())
+                .font(.caption.monospacedDigit())
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
             HStack(alignment: .firstTextBaseline, spacing: 4) {
                 Text(value ?? JobThroughputFormat.placeholder)
-                    .font(.system(size: prominent ? 28 : 18, weight: prominent ? .semibold : .medium, design: .rounded))
+                    .font(.system(size: prominent ? 22 : 17, weight: prominent ? .semibold : .regular))
                     .monospacedDigit()
                     .contentTransition(.numericText())
                     .foregroundStyle(value == nil ? .tertiary : .primary)
@@ -801,7 +842,7 @@ struct ThroughputValue: View {
         }
         // A fixed slot: the unit and the next readout stay put as digits
         // and the "held" caption come and go.
-        .frame(minWidth: prominent ? 132 : 96, alignment: .leading)
+        .frame(minWidth: prominent ? 118 : 88, alignment: .leading)
         .help(help)
     }
 }
@@ -889,7 +930,7 @@ struct TransferRow: View {
                 .lineLimit(1)
                 .frame(width: 104, alignment: .leading)
             Text(item.name)
-                .font(.caption.monospaced())
+                .font(.caption)
                 .lineLimit(1)
                 .truncationMode(.middle)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -940,8 +981,8 @@ struct PhaseBreakdown: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
             HStack(spacing: 6) {
-                Text("BUSY TIME")
-                    .font(.caption2.weight(.bold))
+                Text("Busy time")
+                    .font(.caption)
                     .foregroundStyle(.secondary)
                     .help("Share of the time spent in each phase, summed over the parallel transfers")
                 GeometryReader { geometry in

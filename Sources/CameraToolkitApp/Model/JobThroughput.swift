@@ -53,6 +53,53 @@ struct HeldRate: Equatable, Sendable {
     }
 }
 
+/// How fast the current pass of a job is going, measured from the moment
+/// its counters last started over — so a second pass is never timed by the
+/// first. Says nothing until the pass has run long enough to extrapolate.
+struct JobPassPace: Equatable, Sendable {
+    /// A pass younger than this has only its slowest, least typical files.
+    static let minimumSeconds: TimeInterval = 30
+    static let minimumFiles = 15
+
+    private var start: TimeInterval
+    private var startFiles: Int
+    private var startBytes: Int64
+    private var lastFiles: Int
+    private var lastBytes: Int64
+
+    init(files: Int, bytes: Int64, at now: TimeInterval) {
+        start = now
+        startFiles = files
+        startBytes = bytes
+        lastFiles = files
+        lastBytes = bytes
+    }
+
+    mutating func observe(files: Int, bytes: Int64, at now: TimeInterval) {
+        if files < lastFiles || bytes < lastBytes {
+            start = now
+            startFiles = files
+            startBytes = bytes
+        }
+        lastFiles = files
+        lastBytes = bytes
+    }
+
+    /// Seconds left in this pass at its own average pace: by bytes when
+    /// the job counts them, since one clip weighs hundreds of photos.
+    func secondsRemaining(totalFiles: Int, totalBytes: Int64, at now: TimeInterval) -> TimeInterval? {
+        let seconds = now - start
+        let files = lastFiles - startFiles
+        guard seconds >= Self.minimumSeconds, files >= Self.minimumFiles else { return nil }
+        let bytes = lastBytes - startBytes
+        if totalBytes > 0, bytes > 0 {
+            return Double(max(totalBytes - lastBytes, 0)) / (Double(bytes) / seconds)
+        }
+        guard totalFiles > 0 else { return nil }
+        return Double(max(totalFiles - lastFiles, 0)) / (Double(files) / seconds)
+    }
+}
+
 /// A chart y-axis upper bound that grows at once when the data needs more
 /// room but only shrinks when the data falls far below it — so one spike
 /// does not rescale the chart on every sample.

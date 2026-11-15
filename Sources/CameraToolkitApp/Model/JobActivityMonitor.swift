@@ -160,6 +160,7 @@ struct JobThroughputTrack {
     private(set) var points: [ThroughputPoint] = []
     private(set) var series: [String] = []
     private(set) var scale = StableScale()
+    private(set) var pace: JobPassPace
 
     init(unit: ThroughputUnit, job: JobSnapshot, now: TimeInterval, wallNow: Date) {
         self.unit = unit
@@ -169,6 +170,7 @@ struct JobThroughputTrack {
         let count = Self.primaryCount(job, unit: unit)
         lastPrimaryCount = count
         movedTotal = count
+        pace = JobPassPace(files: job.processedFiles, bytes: job.processedBytes, at: now)
     }
 
     func elapsed(at now: TimeInterval) -> TimeInterval {
@@ -227,6 +229,7 @@ struct JobThroughputTrack {
             movedTotal += count - lastPrimaryCount
         }
         lastPrimaryCount = count
+        pace.observe(files: job.processedFiles, bytes: job.processedBytes, at: now)
         primary.observe(count, at: now)
         files.observe(Double(job.processedFiles), at: now)
         if let frameCount = job.telemetry?.counter("Video frames") {
@@ -362,10 +365,7 @@ final class JobActivityMonitor {
         sampleHardware(now: now)
         guard let job, job.state == .running || job.state == .queued else { return }
 
-        let unit: ThroughputUnit? = job.totalBytes > 0 || job.processedBytes > 0
-            ? .megabytesPerSecond
-            : (job.totalFiles > 0 || job.processedFiles > 0 ? .filesPerSecond : nil)
-        guard let unit else { return }
+        guard let unit = Self.throughputUnit(job) else { return }
         if tracks[job.id]?.unit != unit {
             tracks[job.id] = JobThroughputTrack(unit: unit, job: job, now: now, wallNow: wallNow)
             pruneTracks()
@@ -377,13 +377,22 @@ final class JobActivityMonitor {
         requestCeiling(for: job, unit: unit)
     }
 
+    /// What a job's speed is measured in. A scan is always photos: it reads
+    /// bytes along the way, but switching unit when a pass ends would
+    /// replace the job's whole track.
+    static func throughputUnit(_ job: JobSnapshot) -> ThroughputUnit? {
+        let counts = job.totalFiles > 0 || job.processedFiles > 0
+        if job.action == .faceScan { return counts ? .filesPerSecond : nil }
+        return job.totalBytes > 0 || job.processedBytes > 0 ? .megabytesPerSecond : (counts ? .filesPerSecond : nil)
+    }
+
     /// The throughput card's numbers and chart for `job`; a job the monitor
     /// never saw running still gets its average from its own counters.
     func readout(for job: JobSnapshot, now: TimeInterval = ProcessInfo.processInfo.systemUptime) -> JobThroughputReadout {
         if let track = tracks[job.id] {
             return track.readout(for: job, at: now, ceiling: ceilings[job.id])
         }
-        let bytes = job.totalBytes > 0 || job.processedBytes > 0
+        let bytes = job.action != .faceScan && (job.totalBytes > 0 || job.processedBytes > 0)
         let end = job.finishedAt ?? Date()
         let seconds = end.timeIntervalSince(job.createdAt)
         let moved = bytes ? Double(job.telemetry?.transferBytes ?? job.processedBytes) / 1_000_000 : Double(job.processedFiles)
@@ -404,7 +413,8 @@ final class JobActivityMonitor {
 
     /// What the header's "left" readout says.
     enum RemainingEstimate: Equatable {
-        /// Too early (or too little measured) to extrapolate.
+        /// Too early (or too little measured) to extrapolate. Shown as
+        /// nothing at all.
         case estimating
         case seconds(TimeInterval)
     }
@@ -416,7 +426,14 @@ final class JobActivityMonitor {
     func remainingEstimate(for job: JobSnapshot) -> RemainingEstimate? {
         guard job.state == .running else { return nil }
         if let work = job.telemetry?.work {
-            return work.secondsRemaining.map { .seconds($0) } ?? .estimating
+            if let seconds = work.secondsRemaining { return .seconds(seconds) }
+            // A scan cannot total its clips until one has opened; the
+            // current pass's own pace answers until then.
+            if job.action == .faceScan, let track = tracks[job.id],
+               let seconds = track.pace.secondsRemaining(totalFiles: job.totalFiles, totalBytes: job.totalBytes, at: track.lastTick) {
+                return .seconds(seconds)
+            }
+            return .estimating
         }
         return estimatedRemaining(for: job).map { .seconds($0) }
     }

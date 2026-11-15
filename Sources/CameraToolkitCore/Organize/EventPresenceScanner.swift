@@ -87,6 +87,10 @@ public struct EventPresenceCounts: Equatable, Sendable {
     public var verifiedOnArchive = 0
     public var oldestArchiveVerification: Date?
     public var archiveOffline = false
+    /// Files whose NAS copy nobody could answer for: the NAS is connected
+    /// but its listing failed or ran out of time. Neither on the NAS nor
+    /// missing from it.
+    public var archiveUnknown = 0
     public var missingEverywhere = 0
 
     public init() {}
@@ -123,6 +127,7 @@ public struct EventPresenceCounts: Equatable, Sendable {
                 }
             }
             if asset.archive == .unavailable { archiveOffline = true }
+            if asset.archive == .unknown { archiveUnknown += 1 }
             if asset.bestLocalPath == nil { missingEverywhere += 1 }
         }
     }
@@ -196,6 +201,9 @@ public enum EventPresenceScanner {
     /// the NAS place from memory instead of a stat over SMB — the same
     /// listing the NAS presence index counts from, so the board and the
     /// sidebar agree. A file it does not cover is probed as before.
+    /// `archiveListingFailed` says a listing was attempted and did not
+    /// answer: the NAS place of every file on a mounted NAS is then
+    /// `.unknown` — not asked per file, and never missing or present.
     public static func scan(
         event: SavedCameraEvent,
         assignments: [PhotoEventAssignment],
@@ -205,9 +213,11 @@ public enum EventPresenceScanner {
         pauseGate: DriveActivityGate? = nil,
         nasVerified: [String: Date]? = nil,
         nasFacts: [String: NASSyncStore.VerifiedFact]? = nil,
-        archiveListing: NASTreeListing? = nil
+        archiveListing: NASTreeListing? = nil,
+        archiveListingFailed: Bool = false
     ) -> EventPresenceSummary? {
         let mounted = mountedVolumes ?? VolumeInfo.mountedVolumePaths()
+        let listingRoot = NASSyncStore.standardizedRoot(locations.nasRoot.path)
         let policy = locations.resolvedPolicy(for: event)
         let otherPolicy: EventStoragePolicy = policy == .buffer ? .archiveOnly : .buffer
         let probe = probe ?? { url, size, mounted in state(url, size: size, mounted: mounted) }
@@ -322,8 +332,11 @@ public enum EventPresenceScanner {
             // The NAS: the mirror layout first, then the legacy archive
             // layout an event archived before the mirror still sits in.
             func resolveArchive() -> (URL?, CatalogPresenceState, Bool) {
+                if archiveListingFailed, let archive, VolumeInfo.isAvailable(archive, mountedVolumes: mounted) {
+                    return (archive, .unknown, false)
+                }
                 guard let archiveListing, let archive, let mirrorRelative,
-                      archiveListing.root == locations.nasRoot.path,
+                      archiveListing.root == listingRoot,
                       archiveListing.covers(mirrorRelative),
                       VolumeInfo.isAvailable(archive, mountedVolumes: mounted) else {
                     return resolve(archive, legacyArchive)

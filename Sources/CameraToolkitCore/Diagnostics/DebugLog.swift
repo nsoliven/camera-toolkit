@@ -56,6 +56,10 @@ public enum DebugSubsystem: String, Codable, Sendable {
     case video
     case resource
     case history
+    /// App start: what ran when (`LaunchTrace`).
+    case launch
+    /// Opening an event board, step by step (`BoardOpenTrace`).
+    case board
 }
 
 public enum DebugOutcome: String, Codable, Sendable {

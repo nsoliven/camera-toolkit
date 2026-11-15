@@ -159,6 +159,8 @@ final class NASPresenceModelTests: XCTestCase {
     private final class Flags: @unchecked Sendable {
         var available = true
         var jobRunning = false
+        var selected: [SavedCameraEvent]?
+        var busy = false
     }
 
     private func model(_ f: Fixture, flags: Flags) -> NASPresenceModel {
@@ -171,7 +173,9 @@ final class NASPresenceModelTests: XCTestCase {
                 catalogURL: URL(fileURLWithPath: f.configuration.catalogDatabasePath),
                 configuration: f.configuration,
                 nasAvailable: flags.available,
-                nasJobRunning: flags.jobRunning
+                nasJobRunning: flags.jobRunning,
+                selectedFamily: flags.selected,
+                boardIsBusy: flags.busy
             )
         }
         return presence
@@ -301,6 +305,165 @@ final class NASPresenceModelTests: XCTestCase {
         XCTAssertFalse(workspace.nasPresence.isEnabled)
         XCTAssertFalse(workspace.nasPresence.isChecking)
         XCTAssertNil(workspace.nasPendingTotals(for: f.event.id))
+    }
+
+    // MARK: Launch
+
+    func testNothingOnTheDriveSkipsTheWholeLibraryListing() async throws {
+        let f = try fixture()
+        defer { try? FileManager.default.removeItem(at: f.root) }
+        // No Buffer plugged in: the drive plan is empty.
+        try FileManager.default.removeItem(at: f.locations.bufferRoot)
+        let presence = model(f, flags: Flags())
+
+        presence.refresh(.launch)
+        try await settle(presence)
+
+        XCTAssertNil(presence.listing, "nothing was listed")
+        XCTAssertEqual(presence.report?.total.files, 0)
+        XCTAssertNil(presence.report?.listedAt)
+        XCTAssertNotNil(presence.note)
+
+        // The drive comes back: the skipped listing does not throttle it.
+        try await rebuildDrive(f)
+        presence.refresh(.mounted)
+        XCTAssertTrue(presence.isChecking)
+        try await settle(presence)
+        XCTAssertNotNil(presence.listing, "a mount lists right away")
+        XCTAssertEqual(presence.report?.total.pendingFiles, 1)
+    }
+
+    private func rebuildDrive(_ f: Fixture) async throws {
+        let originals = f.locations.originalsRoot(for: f.event, deviceID: "sony-a7v", policy: .buffer)
+        try FileManager.default.createDirectory(at: originals, withIntermediateDirectories: true)
+        for (name, size) in [("A.ARW", 10), ("B.ARW", 20), ("C.ARW", 30)] {
+            try Data(repeating: 1, count: size).write(to: originals.appendingPathComponent(name))
+        }
+    }
+
+    func testAScopedRequestStillListsWithNothingOnTheDrive() async throws {
+        let f = try fixture()
+        defer { try? FileManager.default.removeItem(at: f.root) }
+        try FileManager.default.removeItem(at: f.locations.bufferRoot)
+        let presence = model(f, flags: Flags())
+        presence.refresh(.syncFinished, scope: [f.event])
+        try await settle(presence)
+        XCTAssertNotNil(presence.listing)
+    }
+
+    func testAutomaticChecksListOnlyTheOpenFamily() async throws {
+        let f = try fixture()
+        defer { try? FileManager.default.removeItem(at: f.root) }
+        let flags = Flags()
+        flags.selected = [f.event]
+        let presence = model(f, flags: flags)
+
+        presence.refresh(.launch)
+        try await settle(presence)
+
+        let folder = NASPresenceIndex.folders(for: [f.event], locations: f.locations)[0]
+        XCTAssertEqual(presence.listing.map { Array($0.coverage.keys) }, [NASTreeListing.key(folder)], "the family's folder, not the library")
+    }
+
+    func testAnEventNotListedYetIsNotThrottledByAnother() async throws {
+        let f = try fixture()
+        defer { try? FileManager.default.removeItem(at: f.root) }
+        let other = SavedCameraEvent(name: "Other", eventDate: f.event.eventDate)
+        let flags = Flags()
+        flags.selected = [f.event]
+        let presence = model(f, flags: flags)
+        presence.refresh(.boardOpened)
+        try await settle(presence)
+
+        flags.selected = [other]
+        presence.refresh(.boardOpened)
+        XCTAssertTrue(presence.isChecking, "another board's listing says nothing about this one")
+        try await settle(presence)
+
+        flags.selected = [f.event]
+        presence.refresh(.boardOpened)
+        XCTAssertFalse(presence.isChecking, "this one was just listed")
+    }
+
+    func testABusyBoardHoldsTheListingUntilItIsIdle() async throws {
+        let f = try fixture()
+        defer { try? FileManager.default.removeItem(at: f.root) }
+        let flags = Flags()
+        flags.busy = true
+        let presence = model(f, flags: flags)
+        var waits = 0
+        presence.onWaitingForBoard = { waits += 1 }
+
+        presence.refresh(.launch)
+        XCTAssertFalse(presence.isChecking, "nothing lists while the board loads")
+        XCTAssertNil(presence.report)
+        XCTAssertEqual(waits, 1)
+
+        flags.busy = false
+        presence.boardBecameIdle()
+        XCTAssertTrue(presence.isChecking)
+        try await settle(presence)
+        XCTAssertNotNil(presence.listing)
+    }
+
+    func testABoardThatNeverSettlesDoesNotHoldTheListingForever() async throws {
+        let f = try fixture()
+        defer { try? FileManager.default.removeItem(at: f.root) }
+        let flags = Flags()
+        flags.busy = true
+        let presence = model(f, flags: flags)
+        presence.refresh(.launch)
+        presence.boardBecameIdle()
+        XCTAssertTrue(presence.isChecking, "the wait is over even though the board is still busy")
+        try await settle(presence)
+    }
+
+    func testCheckAgainAndSyncDoNotWaitForTheBoard() async throws {
+        let f = try fixture()
+        defer { try? FileManager.default.removeItem(at: f.root) }
+        let flags = Flags()
+        flags.busy = true
+        let presence = model(f, flags: flags)
+        presence.refresh(.manual)
+        XCTAssertTrue(presence.isChecking)
+        try await settle(presence)
+    }
+
+    func testSyncAllListsTheWholeLibraryOverAScopedListing() async throws {
+        let f = try fixture()
+        defer { try? FileManager.default.removeItem(at: f.root) }
+        let flags = Flags()
+        flags.selected = [f.event]
+        let clock = Clock(t0)
+        let presence = model(f, flags: flags)
+        presence.now = { clock.now }
+        presence.refresh(.boardOpened)
+        try await settle(presence)
+        XCTAssertNotNil(presence.report?.listedAt, "a scoped listing is a listing, but not of everything")
+
+        presence.refreshForSyncAll()
+        XCTAssertTrue(presence.isChecking, "opening Sync All lists the library")
+        try await settle(presence)
+
+        // Right after, and within the interval, it does not list again.
+        presence.refreshForSyncAll()
+        XCTAssertFalse(presence.isChecking)
+        clock.now = t0.addingTimeInterval(NASPresenceSchedule.automaticInterval + 1)
+        presence.refreshForSyncAll()
+        XCTAssertTrue(presence.isChecking)
+        try await settle(presence)
+    }
+
+    func testPartialListingIsWordedAsUnverified() {
+        var report = NASPresenceReport(listedAt: t0, method: .smb)
+        report.total.files = 100
+        report.total.pendingFiles = 60
+        report.total.unknownFiles = 40
+        XCTAssertTrue(NASPendingText.syncAllDetail(report: report, isChecking: false, nasAvailable: true).hasSuffix("not verified on NAS"), "no listing covered 40 of them")
+        var totals = NASPresenceTotals()
+        totals.pendingFiles = 3
+        totals.unknownFiles = 3
+        XCTAssertTrue(NASPendingText.badgeHelp(totals).contains("not verified on the NAS"))
     }
 
     private final class Clock: @unchecked Sendable {

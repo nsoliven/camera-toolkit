@@ -72,7 +72,7 @@ final class DashboardModel {
     var isSidebarCollapsed: Bool = false
     /// Power assertions for in-flight file jobs — one token per job id so
     /// App Nap and idle sleep cannot stall a copy, archive, take-off-drive,
-    /// face scan, or Immich upload the user explicitly asked for.
+    /// or face scan the user explicitly asked for.
     private(set) var jobActivityAssertions: [UUID: any NSObjectProtocol] = [:]
     var jobs: [JobSnapshot]
     /// The progress relay of each running job, closed when it finishes.

@@ -40,6 +40,36 @@ struct JobListDay: Identifiable, Equatable {
     var day: Date
     var title: String
     var entries: [JobListEntry]
+
+    /// The day's rows, with runs of identical clean jobs folded together.
+    var items: [JobListItem] { JobsList.foldedRuns(entries) }
+}
+
+/// Several clean jobs of the same kind and title in a row, shown as one
+/// row that opens to list them. Only jobs that succeeded with nothing to
+/// report are ever folded, so a warning or a failure always has its own
+/// row.
+struct JobListRun: Identifiable, Equatable {
+    var entries: [JobListEntry]
+
+    var id: UUID { entries[0].id }
+    var title: String { entries[0].title }
+    /// Newest first, as the day lists them.
+    var newestStart: Date { entries[0].startedAt }
+    var oldestStart: Date { entries[entries.count - 1].startedAt }
+}
+
+/// One row of a day's list.
+enum JobListItem: Identifiable, Equatable {
+    case job(JobListEntry)
+    case run(JobListRun)
+
+    var id: UUID {
+        switch self {
+        case .job(let entry): entry.id
+        case .run(let run): run.id
+        }
+    }
 }
 
 /// Builds the Jobs window's list: running and queued jobs pinned on top,
@@ -100,10 +130,13 @@ enum JobsList {
         case .failed: .ended(.failed)
         case .cancelled: .ended(.cancelled)
         }
+        // A running scan is named for the pass that is running.
+        let recordedTitle = recorded?.title ?? job.action.displayName
+        let pass = job.state == .running || job.state == .queued ? job.telemetry?.scanPass : nil
         var entry = JobListEntry(
             id: job.id,
             kind: job.action.rawValue,
-            title: recorded?.title ?? job.action.displayName,
+            title: pass?.title(forRecorded: recordedTitle) ?? recordedTitle,
             startedAt: job.createdAt,
             endedAt: job.finishedAt,
             status: status,
@@ -152,6 +185,34 @@ enum JobsList {
         if already > 0 { return "\(already.formatted()) checked" }
         if job.totalFiles > 0 { return "\(job.totalFiles.formatted()) files" }
         return nil
+    }
+
+    /// Runs of this many or more clean identical jobs are folded.
+    static let minimumFoldedRun = 3
+
+    /// `entries` with runs of the same clean job folded into one item.
+    static func foldedRuns(_ entries: [JobListEntry]) -> [JobListItem] {
+        func foldable(_ entry: JobListEntry) -> Bool {
+            entry.status == .ended(.succeeded) && entry.display?.tone == .success
+        }
+        var items: [JobListItem] = []
+        var index = 0
+        while index < entries.count {
+            let entry = entries[index]
+            var end = index + 1
+            if foldable(entry) {
+                while end < entries.count, foldable(entries[end]), entries[end].kind == entry.kind, entries[end].title == entry.title {
+                    end += 1
+                }
+            }
+            if end - index >= minimumFoldedRun {
+                items.append(.run(JobListRun(entries: Array(entries[index..<end]))))
+            } else {
+                items.append(contentsOf: entries[index..<end].map(JobListItem.job))
+            }
+            index = end
+        }
+        return items
     }
 
     /// Past jobs under "Today", "Yesterday", then the date.

@@ -97,6 +97,8 @@ final class NASConnectionModel {
     @ObservationIgnored private let speedTester: any NASSpeedTesting
     /// True while a NAS job runs or the app has NAS files open.
     @ObservationIgnored var isNASInUse: @MainActor () -> Bool = { false }
+    /// True while the automatic speed test should wait for the board.
+    @ObservationIgnored var deferSpeedTest: @MainActor () -> Bool = { false }
 
     init(
         mounter: @escaping () -> any NASVolumeMounting = { SystemNASVolumeMounter() },
@@ -129,6 +131,9 @@ final class NASConnectionModel {
             isNASInUse: { [weak self] in
                 await MainActor.run { self?.isNASInUse() ?? true }
             },
+            deferAutomaticSpeedTest: { [weak self] in
+                await MainActor.run { self?.deferSpeedTest() ?? false }
+            },
             onChange: { status in
                 continuation.yield(status)
             }
@@ -148,6 +153,12 @@ final class NASConnectionModel {
     func connect() {
         guard let controller else { return }
         Task { await controller.connect(userInitiated: true) }
+    }
+
+    /// The board went idle: a speed test it held back can run now.
+    func boardBecameIdle() {
+        guard let controller else { return }
+        Task { await controller.refresh(trigger: .mounted) }
     }
 
     /// A volume mounted or unmounted somewhere.

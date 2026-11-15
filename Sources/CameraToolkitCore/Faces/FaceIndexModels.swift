@@ -376,6 +376,12 @@ public struct FaceScanOptions: Equatable, Sendable {
     /// spread across photos instead of whatever happened to be pinned.
     /// Off below XHIGH.
     public var rebuildTemplates: Bool
+    /// Pet scans only: a RAW's embedded JPEG is turned by the camera's
+    /// rotation before detection, because the dog detector splits or misses
+    /// dogs in sideways pictures. Stored boxes still go back to the unrotated
+    /// preview's space. Off for the people pass, whose stored boxes and
+    /// detections stay exactly as they are.
+    public var uprightRawDetection: Bool
 
     public init(
         mode: FaceScanGrade = .low,
@@ -394,7 +400,8 @@ public struct FaceScanOptions: Equatable, Sendable {
         maximumVideoFrames: Int? = nil,
         videoDuplicateCosine: Float = 0.92,
         flipTTA: Bool? = nil,
-        rebuildTemplates: Bool? = nil
+        rebuildTemplates: Bool? = nil,
+        uprightRawDetection: Bool = false
     ) {
         self.mode = mode
         self.fast = fast
@@ -413,6 +420,7 @@ public struct FaceScanOptions: Equatable, Sendable {
         self.videoDuplicateCosine = videoDuplicateCosine
         self.flipTTA = flipTTA ?? (mode == .xhigh)
         self.rebuildTemplates = rebuildTemplates ?? (mode == .xhigh)
+        self.uprightRawDetection = uprightRawDetection
     }
 
     /// The grade a scan actually achieves: every pipeline through XHIGH is
@@ -504,6 +512,9 @@ public struct FaceScanReport: Equatable, Sendable {
     /// Auto "Person N" groups the rebundle dissolved outright — rows left
     /// with no faces after their members re-pooled.
     public var groupsDissolved: Int = 0
+    /// Vertical RAWs re-read upright this pass (pet scans only), and
+    /// counted in `photosProcessed` as well.
+    public var photosRescannedUpright: Int = 0
     /// The engine and detector scales that ran — for the Jobs log, which
     /// may name packages. Nil for a vectors-only re-match.
     public var detectorSummary: String?

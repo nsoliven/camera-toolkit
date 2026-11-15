@@ -725,6 +725,16 @@ final class EventsWorkspace {
     /// Per event: sorted files whose event name is taken by another file.
     var applyConflictSourceKeys: [UUID: Set<String>] = [:]
     var pendingRemoval: RemovalRequest?
+    /// The sidebar's "move this event's folder under another event" sheet.
+    var pendingReparent: EventReparentRequest?
+    /// The sidebar's Move Into… event picker.
+    var moveIntoRequest: MoveIntoEventRequest?
+    /// The Move Into… pick, held until the picker has finished closing.
+    @ObservationIgnored var moveIntoChoice: (eventID: UUID, parentID: UUID)?
+    /// The event a sidebar row drag carries, set when the drag starts so the
+    /// rows it passes over can draw where it would land. Only the drop's
+    /// own payload decides what happens.
+    @ObservationIgnored var draggingSidebarEventID: UUID?
     var syncAllRequest: SyncAllToNASRequest?
     /// The Sync All sheet's "Reconcile NAS after moves" switch and the
     /// counts it shows (read from records, never from the NAS).
@@ -786,6 +796,18 @@ final class EventsWorkspace {
     /// How many board reads (`refreshEvent`) have started — what a test
     /// compares to prove a move did not re-read the boards it patched.
     @ObservationIgnored private(set) var boardReadCount = 0
+    /// How many drive discoveries have started.
+    @ObservationIgnored private(set) var driveDiscoveryRuns = 0
+    /// Until this moment the board counts as busy even with no refresh
+    /// running yet — from launch, and right after a board is clicked, so NAS
+    /// work asked for in that same moment waits for the board's own start.
+    @ObservationIgnored private var boardQuietUntil: Date?
+    @ObservationIgnored var boardLaunchQuiet: TimeInterval = 3
+    @ObservationIgnored var boardBusyWaitLimit: TimeInterval = 30
+    @ObservationIgnored private var boardIdleWatcher: Task<Void, Never>?
+    /// When each board was last clicked, until its refresh picks it up — the
+    /// zero of that open's timing lines (`BoardOpenTrace`).
+    @ObservationIgnored private var boardSelectedAt: [UUID: ContinuousClock.Instant] = [:]
     /// How many times the assignment lookups were rebuilt from every
     /// assignment — ~750 ms on the main actor at 17,000 rows.
     @ObservationIgnored private(set) var assignmentIndexRebuildCount = 0
@@ -800,6 +822,15 @@ final class EventsWorkspace {
     @ObservationIgnored var pendingNASArrivals: [String: PendingNASArrival] = [:]
     @ObservationIgnored private var indexRevision = -1
     @ObservationIgnored private var indexCount = -1
+    /// What `assignmentCounts`/`assignmentBytes` were added up from while
+    /// the path keys are still building off the main actor.
+    @ObservationIgnored private var totalsRevision = -1
+    @ObservationIgnored private var totalsCount = -1
+    /// On in the app (`buildAssignmentIndexOffMain`), off in tests.
+    @ObservationIgnored private(set) var buildsAssignmentIndexOffMain = false
+    @ObservationIgnored private var indexBuild: (stamp: Int, count: Int, task: Task<Void, Never>)?
+    /// Runs at the start of a background index build. Test seam.
+    @ObservationIgnored var assignmentIndexBuildHook: (@Sendable () -> Void)?
     @ObservationIgnored var assignmentsByPathKey: [String: PhotoEventAssignment] = [:]
     /// Clicked Move to Event batches that have not landed: tiles already
     /// moved in memory, rename running or queued behind another job.
@@ -865,6 +896,15 @@ final class EventsWorkspace {
     /// test can park on the archive URL to prove the grid paints before
     /// the NAS answers.
     @ObservationIgnored var presenceProbe: EventPresenceScanner.PresenceProbe?
+    /// Reads an event's NAS folder for the presence sweep; the SMB lister
+    /// when nil. A test that injected `presenceProbe` keeps its per-file
+    /// answers unless it sets this too.
+    @ObservationIgnored var presenceArchiveLister: EventArchiveListing.Lister?
+    /// How long the sweep waits for that listing before calling it failed.
+    @ObservationIgnored var presenceArchiveListingTimeout = EventArchiveListing.defaultTimeout
+    /// Runs in a refresh after the chips landed and before the burst Vision
+    /// pass. Test seam, nil in production.
+    @ObservationIgnored var beforeBurstVisionPass: (@Sendable () async -> Void)?
     /// Test seam: resolves one assignment's board path inside an event
     /// refresh — the first screen and the deferred build both go through
     /// it. Production joins the catalog-implied `Originals/<Camera>` path, pure
@@ -998,6 +1038,11 @@ final class EventsWorkspace {
         }
         faceLabelsRestoredObserver.observers = [observer]
         nasConnection.isNASInUse = { [weak self] in self?.nasIsInUse ?? true }
+        nasConnection.deferSpeedTest = { [weak self] in
+            guard let self, boardIsBusy else { return false }
+            scheduleWorkAfterBoardIdle()
+            return true
+        }
         // The NAS link switch takes its turn between two queued jobs.
         model.holdQueuedFileJobs = { [weak nasConnection] in
             nasConnection?.claimJobBoundary() ?? false
@@ -1006,6 +1051,7 @@ final class EventsWorkspace {
             model?.startNextQueuedFileJobIfPossible()
         }
         nasPresence.context = { [weak self] in self?.nasPresenceContext }
+        nasPresence.onWaitingForBoard = { [weak self] in self?.scheduleWorkAfterBoardIdle() }
         nasPresence.onReportChanged = { [weak self] old, new in self?.nasPresenceChanged(from: old, to: new) }
         // A job that only renames files on the drives never writes the
         // NAS, so it neither pauses a NAS listing nor triggers a new one.
@@ -1065,18 +1111,30 @@ final class EventsWorkspace {
     /// Thread-safe lazy loader for the capture-date cache.
     final class CaptureDateCacheLoader: @unchecked Sendable {
         private let url: URL
+        private let decode: @Sendable (URL) -> CaptureDateCache
         private let lock = NSLock()
         private var loaded: CaptureDateCache?
 
-        init(url: URL) { self.url = url }
+        init(url: URL, decode: @escaping @Sendable (URL) -> CaptureDateCache = { CaptureDateCache(url: $0) }) {
+            self.url = url
+            self.decode = decode
+        }
 
         func cache() -> CaptureDateCache {
             lock.lock()
             defer { lock.unlock() }
             if let loaded { return loaded }
-            let cache = CaptureDateCache(url: url)
+            let cache = decode(url)
             loaded = cache
             return cache
+        }
+
+        /// The cache if it is already decoded, without waiting for a decode
+        /// in progress (it holds the lock): nil means not ready yet.
+        func cacheIfLoaded() -> CaptureDateCache? {
+            guard lock.try() else { return nil }
+            defer { lock.unlock() }
+            return loaded
         }
     }
 
@@ -1225,7 +1283,7 @@ final class EventsWorkspace {
     /// rebuilt once per configuration revision and shared by every caller in
     /// between, so titles never rebuild `locations` (a filesystem-touching
     /// resolver) inside a menu body or row render.
-    private var eventsByID: [UUID: SavedCameraEvent] {
+    var eventsByID: [UUID: SavedCameraEvent] {
         if let cached = eventsByIDCache, cached.revision == model.eventsRevision {
             return cached.byID
         }
@@ -1559,6 +1617,26 @@ final class EventsWorkspace {
         guard indexRevision != revision || indexCount != model.assignmentCountSnapshot else { return }
         let assignments = model.configuration.photoEventAssignments
         assignmentIndexRebuildCount += 1
+        let lookups = Self.buildAssignmentLookups(assignments: assignments, locations: locations, eventsByID: eventsByID, isCancelled: { false })
+        guard let lookups else { return }
+        publishAssignmentLookups(lookups, stamp: model.assignmentIndexStamp, count: assignments.count)
+    }
+
+    /// The path-key lookup and the per-event totals, built from every
+    /// assignment. Pure, so it can run off the main actor.
+    struct AssignmentLookups: Sendable {
+        var byPathKey: [String: PhotoEventAssignment]
+        var counts: [UUID: Int]
+        var bytes: [UUID: Int64]
+    }
+
+    /// Nil when `isCancelled` said stop part way.
+    nonisolated static func buildAssignmentLookups(
+        assignments: [PhotoEventAssignment],
+        locations: EventStorageLocations,
+        eventsByID: [UUID: SavedCameraEvent],
+        isCancelled: () -> Bool
+    ) -> AssignmentLookups? {
         var index: [String: PhotoEventAssignment] = [:]
         index.reserveCapacity(assignments.count * 2)
         var counts: [UUID: Int] = [:]
@@ -1575,12 +1653,12 @@ final class EventsWorkspace {
                 bytes[assignment.eventID, default: 0] += assignment.fileSize
             }
         }
+        if isCancelled() { return nil }
         // The board's tiles point at Originals/<Camera> (or the other drive,
         // a not-yet-migrated legacy Card Copy, or the NAS), not at the path
         // the file was imported from. Index those too, without letting them
         // steal a source path that already belongs to a different
         // assignment.
-        let eventsByID = self.eventsByID
         for assignment in assignments {
             autoreleasepool {
                 for key in builder.impliedKeys(for: assignment, owner: eventsByID[assignment.eventID]) {
@@ -1588,18 +1666,121 @@ final class EventsWorkspace {
                 }
             }
         }
-        assignmentsByPathKey = index
+        return AssignmentLookups(byPathKey: index, counts: counts, bytes: bytes)
+    }
+
+    /// All the lookups at once, in one turn of the main actor: a reader sees
+    /// the old set or the new one, never half of each.
+    private func publishAssignmentLookups(_ lookups: AssignmentLookups, stamp: Int, count: Int) {
+        assignmentsByPathKey = lookups.byPathKey
+        assignmentCounts = lookups.counts
+        assignmentBytes = lookups.bytes
+        assignmentsByEventAndName = [:]
+        indexRevision = stamp
+        indexCount = count
+        fileFacts.touchAll()
+    }
+
+    // MARK: Building the lookups off the main actor
+
+    /// The app builds the lookups on a background task at launch and draws
+    /// around them until they land. Tests that rely on a read building them
+    /// keep the synchronous path.
+    func buildAssignmentIndexOffMain() {
+        buildsAssignmentIndexOffMain = true
+        startAssignmentIndexBuild()
+    }
+
+    /// Starts a background build for the catalog as it is now, unless the
+    /// lookups are current or that build is already running. Anything that
+    /// must be right immediately still calls `refreshIndexIfNeeded`, which
+    /// builds on the spot; this build then finds nothing left to do.
+    private func startAssignmentIndexBuild() {
+        guard !assignmentIndexIsCurrent else { return }
+        let stamp = model.assignmentIndexStamp
+        let count = model.assignmentCountSnapshot
+        if let build = indexBuild, build.stamp == stamp, build.count == count { return }
+        indexBuild?.task.cancel()
+        assignmentIndexRebuildCount += 1
+        let assignments = model.configuration.photoEventAssignments
+        let locations = self.locations
+        let eventsByID = self.eventsByID
+        let hook = assignmentIndexBuildHook
+        let task = Task.detached(priority: .userInitiated) { [weak self] in
+            hook?()
+            let began = ContinuousClock.now
+            guard let lookups = Self.buildAssignmentLookups(
+                assignments: assignments, locations: locations, eventsByID: eventsByID, isCancelled: { Task.isCancelled }
+            ) else { return }
+            LaunchTrace.mark("assignment_index.built", detail: "rows=\(assignments.count) took=\(began.duration(to: .now))")
+            await self?.landAssignmentIndex(lookups, stamp: stamp, count: count)
+        }
+        indexBuild = (stamp, count, task)
+    }
+
+    private func landAssignmentIndex(_ lookups: AssignmentLookups, stamp: Int, count: Int) {
+        guard let build = indexBuild, build.stamp == stamp, build.count == count else { return }
+        indexBuild = nil
+        // The catalog moved on while this was building: it describes a
+        // catalog that no longer exists, so build again.
+        guard model.assignmentIndexStamp == stamp, model.assignmentCountSnapshot == count else {
+            startAssignmentIndexBuild()
+            return
+        }
+        guard !assignmentIndexIsCurrent else { return }
+        publishAssignmentLookups(lookups, stamp: stamp, count: count)
+        boardChipsRevision &+= 1
+    }
+
+    /// For a read that decorates a tile or a chip and can wait: answers from
+    /// what is there and has the lookups rebuilt in the background.
+    private func refreshIndexForDrawing() {
+        guard buildsAssignmentIndexOffMain else {
+            refreshIndexIfNeeded(tracking: false)
+            return
+        }
+        startAssignmentIndexBuild()
+    }
+
+    /// Totals only need the assignments added up, not their path keys —
+    /// a few milliseconds even at 40,000 rows — so a count is right at once
+    /// while the path keys are still building. Whoever asks whether an
+    /// event is empty gets the true answer, not a pending one.
+    private func refreshAssignmentTotalsIfNeeded() {
+        guard buildsAssignmentIndexOffMain else {
+            refreshIndexIfNeeded()
+            return
+        }
+        let revision = model.assignmentIndexRevision
+        let count = model.assignmentCountSnapshot
+        guard indexRevision != revision || indexCount != count else { return }
+        startAssignmentIndexBuild()
+        guard totalsRevision != revision || totalsCount != count else { return }
+        var counts: [UUID: Int] = [:]
+        var bytes: [UUID: Int64] = [:]
+        for assignment in model.configuration.photoEventAssignments {
+            counts[assignment.eventID, default: 0] += 1
+            bytes[assignment.eventID, default: 0] += assignment.fileSize
+        }
         assignmentCounts = counts
         assignmentBytes = bytes
-        assignmentsByEventAndName = [:]
-        indexRevision = model.assignmentIndexStamp
-        indexCount = assignments.count
-        fileFacts.touchAll()
+        totalsRevision = revision
+        totalsCount = count
+    }
+
+    /// Waits for the background build, when one is owed. Cancellation ends
+    /// the wait early; the caller checks for itself what it can rely on.
+    func assignmentIndexReady() async {
+        while !assignmentIndexIsCurrent, !Task.isCancelled {
+            startAssignmentIndexBuild()
+            guard let task = indexBuild?.task else { return }
+            await task.value
+        }
     }
 
     /// Whether the lookup indexes match the catalog right now — read
     /// before a catalog change so `patchAssignmentIndex` knows it may patch.
-    private var assignmentIndexIsCurrent: Bool {
+    var assignmentIndexIsCurrent: Bool {
         indexRevision == model.assignmentIndexStamp && indexCount == model.assignmentCountSnapshot
     }
 
@@ -1679,7 +1860,7 @@ final class EventsWorkspace {
     /// alone, not on every catalog change and every move in flight.
     func tileAssignment(for file: OrganizeFile) -> PhotoEventAssignment? {
         fileFacts.track(file.pathKey)
-        refreshIndexIfNeeded(tracking: false)
+        refreshIndexForDrawing()
         return currentAssignment(for: file)
     }
 
@@ -1697,13 +1878,13 @@ final class EventsWorkspace {
     /// parent's count covers its subevents; a subevent never counts the
     /// parent's files.
     func assignmentCount(for eventID: UUID) -> Int {
-        refreshIndexIfNeeded()
+        refreshAssignmentTotalsIfNeeded()
         _ = moveOverlayRevision
         return scopeIDs(eventID).reduce(0) { $0 + (assignmentCounts[$1] ?? 0) + (optimisticCounts[$1] ?? 0) }
     }
 
     func assignmentBytes(for eventID: UUID) -> Int64 {
-        refreshIndexIfNeeded()
+        refreshAssignmentTotalsIfNeeded()
         _ = moveOverlayRevision
         return scopeIDs(eventID).reduce(Int64(0)) { $0 + (assignmentBytes[$1] ?? 0) + (optimisticBytes[$1] ?? 0) }
     }
@@ -1841,14 +2022,14 @@ final class EventsWorkspace {
         refreshIndexIfNeeded(tracking: false)
         var inputs: [CardClearInput] = []
         var eventIDs = Set<UUID>()
-        for item in result.items {
-            let entries = item.files.map { file -> CardClearInput.Entry in
+        for unit in Self.cardClearUnits(result.items) {
+            let entries = unit.map { file -> CardClearInput.Entry in
                 let assignment = currentAssignment(for: file)
                 if let assignment { eventIDs.insert(assignment.eventID) }
                 return CardClearInput.Entry(path: file.path, assignment: assignment)
             }
-            guard entries.contains(where: { $0.assignment != nil }) else { continue }
-            inputs.append(CardClearInput(id: item.primary.pathKey, entries: entries))
+            guard entries.contains(where: { $0.assignment != nil }), let primary = unit.first else { continue }
+            inputs.append(CardClearInput(id: primary.pathKey, entries: entries))
         }
         return CardClearJobInputs(
             inputs: inputs,
@@ -2308,6 +2489,15 @@ final class EventsWorkspace {
             boardCamerasCache.insert(entry, at: 0)
             return entry.cameras
         }
+        // Chips are decoration: while the lookups build, count what is known
+        // without keeping the answer. The landing asks for a recount.
+        if buildsAssignmentIndexOffMain, !assignmentIndexIsCurrent {
+            startAssignmentIndexBuild()
+            let resolver = cameraResolver
+            return Self.boardCameras(stacks) { self.cameraIDs(for: $0, resolver: resolver) } name: { id in
+                CameraCatalog.camera(id: id)
+            }
+        }
         refreshIndexIfNeeded()
         let resolver = cameraResolver
         let cameras = Self.boardCameras(stacks) { self.cameraIDs(for: $0, resolver: resolver) } name: { id in
@@ -2700,14 +2890,19 @@ final class EventsWorkspace {
     // MARK: - Startup and selection
 
     func start() {
+        LaunchTrace.markOnce("launch.workspace_start")
         observeVolumeChanges()
         Task { await loadUndoHistory() }
-        discoverDriveEvents()
+        // Discovery is not started here: AppShell's first connectivity pass
+        // runs it, and starting it twice listed every drive twice at launch.
         scheduleRosterWarm()
         // Decode the capture-date cache now, off the main actor, so the
         // first board opened never waits for it.
         let loader = captureDateCacheLoader
-        Task.detached(priority: .utility) { _ = loader.cache() }
+        Task.detached(priority: .utility) {
+            _ = loader.cache()
+            LaunchTrace.markOnce("launch.capture_dates_loaded")
+        }
     }
 
     func startGuide() {
@@ -2718,7 +2913,15 @@ final class EventsWorkspace {
     }
 
     func selectionChanged() {
-        if case .event = selection { nasPresence.refresh(.boardOpened) }
+        if case .event(let eventID) = selection {
+            let selectedAt = ContinuousClock.now
+            boardSelectedAt[eventID] = selectedAt
+            BoardOpenTrace(eventID: eventID, selectedAt: selectedAt).mark("selected")
+            if nasPresence.isEnabled {
+                boardQuietUntil = max(boardQuietUntil ?? .distantPast, Date().addingTimeInterval(1))
+            }
+            nasPresence.refresh(.boardOpened)
+        }
         cancelPendingSelectionCollapse()
         // The board just opened gets its own selection back; the one just
         // left keeps its selection for when it is opened again.
@@ -2996,6 +3199,8 @@ final class EventsWorkspace {
     @ObservationIgnored private(set) var dragPayloadBuildCount = 0
 
     func dragPayload(for stackID: String, origin: OrganizeDragPayload.Origin, containerID: UUID) -> String {
+        // A tile drag, not an event row: the sidebar draws it as one.
+        draggingSidebarEventID = nil
         dragPayloadBuildCount += 1
         return OrganizeDragPayload(origin: origin, containerID: containerID, stackIDs: Array(targetStackIDs(including: stackID))).encoded
     }
@@ -3076,10 +3281,11 @@ final class EventsWorkspace {
 
         let gate = driveActivityGate
         let linkMemory = burstLinkMemory
+        let ownership = sideFileOwnership()
         Task { @MainActor [weak self] in
             let outcome: Result<OrganizeScanResult, any Error> = await Task.detached(priority: .userInitiated) {
                 Result {
-                    let result = try OrganizeScanner().scan(root: root, cache: cache, burstGrouping: BurstGroupingConfiguration.resolved(), burstSplits: burstSplits, pauseGate: gate, progress: reportProgress)
+                    let result = try OrganizeScanner().scan(root: root, cache: cache, burstGrouping: BurstGroupingConfiguration.resolved(), burstSplits: burstSplits, pauseGate: gate, ownership: ownership, progress: reportProgress)
                     // What the Vision check decided here holds for every
                     // copy of these frames, so event boards group alike.
                     linkMemory.record(result)
@@ -3308,6 +3514,7 @@ final class EventsWorkspace {
         applyAssignmentChange(change, touching: eventID, addedItems: eligibleItems)
         noteRecent(eventID)
         recordAssignmentUndo(change)
+        rescanIfSideFilesParted(stacks, in: location)
         let skipped = files.count - eligible.count
         model.statusMessage = "Sorted \(stacks.count) item\(stacks.count == 1 ? "" : "s") (\(eligible.count) file\(eligible.count == 1 ? "" : "s")) into \(eventTitle(event)). Nothing moves until you press Apply."
             + (skipped > 0 ? " \(skipped) file(s) already live in another event's folder and were left alone." : "")
@@ -3330,6 +3537,9 @@ final class EventsWorkspace {
         let change = AssignmentChange(title: "Unsort", removed: removable, added: [])
         applyAssignmentChange(change, touching: nil)
         recordAssignmentUndo(change)
+        if let location = location(locationID) {
+            rescanIfSideFilesParted(result.stacks.filter { stackIDs.contains($0.id) }, in: location)
+        }
         model.statusMessage = "Unsorted \(removable.count) file\(removable.count == 1 ? "" : "s")."
     }
 
@@ -3413,11 +3623,15 @@ final class EventsWorkspace {
     /// split made on a card names card paths; each member's identity comes
     /// from its catalog row or from a board that draws it. View-only: it
     /// decides tiles, never which file an action touches.
-    func eventStacking() -> BurstStackingContext {
+    ///
+    /// `indexMayLag`: only for a board's first screen, which must not wait
+    /// for the lookups — a manual split may be drawn unapplied there, and
+    /// the full build right behind it uses the complete context.
+    func eventStacking(indexMayLag: Bool = false) -> BurstStackingContext {
         let splits = model.configuration.burstSplits
         var identities: [String: String] = [:]
         if !splits.isEmpty {
-            refreshIndexIfNeeded(tracking: false)
+            if indexMayLag { refreshIndexForDrawing() } else { refreshIndexIfNeeded(tracking: false) }
             var unresolved = Set<String>()
             for key in splits.lazy.flatMap(\.memberPathKeys) where identities[key] == nil {
                 if let assignment = assignmentsByPathKey[key] {
@@ -3452,10 +3666,10 @@ final class EventsWorkspace {
         for boardID in Array(eventStacks.keys) {
             guard let stacks = eventStacks[boardID] else { continue }
             let items = stacks.flatMap(\.items)
-            let remaining = items.filter { item in
-                !item.files.contains { fileKeys.contains(Self.fileKey($0)) }
+            let remaining = items.flatMap { item in
+                item.removingFiles { fileKeys.contains(Self.fileKey($0)) }
             }
-            guard remaining.count != items.count else { continue }
+            guard remaining != items else { continue }
             eventStacks[boardID] = stacking.stacks(for: remaining)
                 .carryingIDs(from: stacks)
             eventGridRevisions[boardID] = model.catalogStateRevision
@@ -3716,11 +3930,50 @@ final class EventsWorkspace {
 
     func renameEvent(_ eventID: UUID, name rawName: String, date: Date, policy: EventStoragePolicy?, parentEventID: UUID?) {
         renameRequest = nil
-        guard let event = event(eventID) else { return }
-        let validation = EventNamePolicy.validate(rawName)
-        guard validation.isValid else {
+        editEvent(eventID, name: rawName, date: date, policy: policy, parentEventID: parentEventID, purpose: .rename)
+    }
+
+    /// What an event edit is for — the words its refusals and status use.
+    /// A sidebar re-parent (`.reparent`) is the same folder move as an
+    /// edit that changes the parent, placed among its new siblings after.
+    enum EventEditPurpose {
+        case rename
+        case reparent(placeBefore: UUID?, placed: Bool)
+    }
+
+    /// Renames, re-dates, re-parents or re-policies an event: its folders
+    /// on every drive move first (same-volume exclusive renames, never
+    /// over anything), then the configuration follows, the NAS folder
+    /// rename is journaled and queued, and one Undo entry is recorded.
+    /// Returns whether the edit went through.
+    @discardableResult
+    func editEvent(
+        _ eventID: UUID,
+        name rawName: String,
+        date: Date,
+        policy: EventStoragePolicy?,
+        parentEventID: UUID?,
+        purpose: EventEditPurpose
+    ) -> Bool {
+        guard let event = event(eventID) else { return false }
+        let actionTitle: String
+        let verb: String
+        switch purpose {
+        case .rename:
+            actionTitle = "Rename \(eventTitle(event))"
+            verb = "renamed"
+        case .reparent:
+            actionTitle = "Move \(eventTitle(event))"
+            verb = "moved"
+        }
+        let isReparent: Bool
+        if case .reparent = purpose { isReparent = true } else { isReparent = false }
+        // A re-parent keeps the name and date exactly as they are, so the
+        // folder keeps its own name and only changes where it sits.
+        let validation = EventNamePolicy.validate(isReparent ? event.name : rawName)
+        guard isReparent || validation.isValid else {
             model.statusMessage = validation.errorMessage ?? "Choose a different event name."
-            return
+            return false
         }
         // The folders move with the name, and a job (or a queued move) has
         // absolute paths it worked out before the rename: it would recreate
@@ -3728,22 +3981,32 @@ final class EventsWorkspace {
         // new one. And a drive that is not there cannot have its folder
         // renamed, which would split the event from its files.
         guard !model.isBusy, !model.isStorageBenchmarkRunning, pendingMoves.isEmpty else {
-            refuseMove("Rename \(eventTitle(event))", "A file job or a queued move is running. Rename \(eventTitle(event)) after it finishes — its folders move with the name.")
-            return
+            if case .rename = purpose {
+                refuseMove(actionTitle, "A file job or a queued move is running. Rename \(eventTitle(event)) after it finishes — its folders move with the name.")
+            } else {
+                refuseMove(actionTitle, "A file job or a queued move is running. Move \(eventTitle(event)) after it finishes — its folders move with it.")
+            }
+            return false
         }
         let policiesInUse = Set(eventFamily(eventID).map { self.locations.resolvedPolicy(for: $0) })
         if let missing = EventStoragePolicy.allCases.first(where: { policiesInUse.contains($0) && !VolumeInfo.isAvailable(self.locations.driveRoot(for: $0)) }) {
             refuseMove(
-                "Rename \(eventTitle(event))",
-                "The drive holding \(self.locations.driveRoot(for: missing).path) isn't connected, so \(eventTitle(event)) was not renamed. Connect it first, so the folder and the name change together."
+                actionTitle,
+                "The drive holding \(self.locations.driveRoot(for: missing).path) isn't connected, so \(eventTitle(event)) was not \(verb). Connect it first, so the folder and the event change together."
             )
-            return
+            return false
         }
         var renamed = event
-        renamed.name = validation.normalizedName
-        renamed.eventDate = Calendar.current.startOfDay(for: date)
+        if !isReparent {
+            renamed.name = validation.normalizedName
+            renamed.eventDate = Calendar.current.startOfDay(for: date)
+        }
         renamed.parentEventID = validParentEventID(parentEventID, for: eventID)
         renamed.storagePolicy = policy
+        if isReparent, renamed.parentEventID != parentEventID {
+            refuseMove(actionTitle, "\(eventTitle(event)) can't go there — it would nest too deep or inside itself. Nothing moved.")
+            return false
+        }
         let locations = self.locations
         let fileManager = FileManager.default
         let oldResolved = locations.resolvedPolicy(for: event)
@@ -3762,8 +4025,15 @@ final class EventsWorkspace {
             let caseOnly = sameFolder && old.path != new.path
             guard fileManager.fileExists(atPath: old.path), !sameFolder || caseOnly else { continue }
             guard caseOnly || !fileManager.fileExists(atPath: new.path) else {
-                model.statusMessage = "A folder named “\(new.lastPathComponent)” already exists. Choose another name or date."
-                return
+                if case .rename = purpose {
+                    model.statusMessage = "A folder named “\(new.lastPathComponent)” already exists. Choose another name or date."
+                } else {
+                    refuseMove(
+                        actionTitle,
+                        "A folder named “\(new.lastPathComponent)” is already there (\(new.deletingLastPathComponent().path)). Nothing moved and nothing was replaced. Rename one of the events first."
+                    )
+                }
+                return false
             }
             folderMoves.append((old, new, caseOnly))
         }
@@ -3785,8 +4055,8 @@ final class EventsWorkspace {
                         try? DriveMoveService().moveFolder(from: renamedFolder, to: original)
                     }
                 }
-                model.statusMessage = "Could not rename the event folder: \(error.localizedDescription)"
-                return
+                model.statusMessage = "Could not \(verb == "moved" ? "move" : "rename") the event folder: \(error.localizedDescription) Nothing was changed."
+                return false
             }
         }
 
@@ -3804,6 +4074,17 @@ final class EventsWorkspace {
             configuration.savedEvents[index].eventDate = renamed.eventDate
             configuration.savedEvents[index].parentEventID = renamed.parentEventID
             configuration.savedEvents[index].storagePolicy = renamed.storagePolicy
+            // A re-parented event takes its place among its new siblings —
+            // where it was dropped, or by date when nothing chose a spot.
+            if case .reparent(let placeBefore, let placed) = purpose {
+                if placed {
+                    configuration.savedEvents = EventHierarchy.placing(
+                        eventID, under: renamed.parentEventID, before: placeBefore, in: configuration.savedEvents
+                    )
+                } else {
+                    configuration.savedEvents[index].sidebarOrder = nil
+                }
+            }
             // Adopted assignments point straight at the old folder.
             for (old, new, _) in moved {
                 let oldPrefix = old.standardizedFileURL.path + "/"
@@ -3858,7 +4139,14 @@ final class EventsWorkspace {
            fileManager.fileExists(atPath: locations.legacyArchiveEventFolder(for: event).path) {
             nasNote += " Copies in the old NAS archive layout keep the old folder name."
         }
-        model.statusMessage = "Renamed to \(eventTitle(renamed))." + nasNote
+        let headline: String
+        if case .reparent = purpose {
+            headline = renamed.parentEventID.flatMap { self.event($0) }.map { "Moved \(renamed.name) into \(eventTitle($0))." }
+                ?? "Moved \(renamed.name) to the top level."
+        } else {
+            headline = "Renamed to \(eventTitle(renamed))."
+        }
+        model.statusMessage = headline + nasNote
             + (newResolved == oldResolved ? ""
                 : newResolved == .archiveOnly
                     ? " Its originals stay out of the shared Buffer. Use Move to Private for any copies already there."
@@ -3875,9 +4163,11 @@ final class EventsWorkspace {
                 nasLink: nasLink
             )
         }
+        return true
     }
 
     func discoverDriveEvents() {
+        driveDiscoveryRuns += 1
         let configuration = model.configuration
         let locations = self.locations
         let gate = driveActivityGate
@@ -3895,6 +4185,7 @@ final class EventsWorkspace {
             }.value
             self?.discoveredDriveEvents = found.0
             self?.legacyLayoutFolders = found.1
+            LaunchTrace.mark("discovery.drive", detail: "events=\(found.0.count)")
         }
         discoverNASEvents()
     }
@@ -3962,19 +4253,25 @@ final class EventsWorkspace {
         refreshesInFlight += 1
         boardReadCount += 1
         defer { refreshesInFlight -= 1 }
+        let trace = BoardOpenTrace(eventID: eventID, selectedAt: boardSelectedAt.removeValue(forKey: eventID))
+        trace.mark("refresh_start")
         let generation = UUID()
         refreshGenerations[eventID] = generation
         presenceTasks[eventID]?.cancel()
         let locations = self.locations
         let policy = locations.resolvedPolicy(for: event)
         let cacheLoader = captureDateCacheLoader
-        let stacking = eventStacking()
+        let firstScreenStacking = eventStacking(indexMayLag: true)
         let catalogURL = URL(fileURLWithPath: DashboardModel.expandedPath(model.configuration.catalogDatabasePath))
         let probe = presenceProbe
+        let archiveLister = presenceArchiveLister ?? (presenceProbe == nil ? EventArchiveListing.smbLister : nil)
+        let archiveListingTimeout = presenceArchiveListingTimeout
+        let beforeVision = beforeBurstVisionPass
         let dateReadProbe = captureDateReadProbe
         let gate = driveActivityGate
-        // The NAS listing the sidebar counts from, when it is fresh: the
-        // sweep answers the NAS place from it instead of a stat per file.
+        // The NAS listing the sidebar counts from, when it is fresh and
+        // covers this family: the sweep answers the NAS place from it and
+        // does not list the folder itself.
         let archiveListing = nasPresence.boardListing()
 
         // The catalog state this pipeline proves itself against. A grid
@@ -4067,15 +4364,17 @@ final class EventsWorkspace {
                 let earliest = family
                     .sorted { ($0.modifiedAt, $0.relativePath) < ($1.modifiedAt, $1.relativePath) }
                     .prefix(limit)
-                let files = earliest.compactMap { assignment -> OrganizeFile? in
-                    guard let path = implied.path(for: assignment, driveUp: mountTableAvailable[assignment.eventID] == true) else { return nil }
-                    return OrganizeFile(literalPath: path, size: assignment.fileSize, modifiedAt: assignment.modifiedAt)
+                let (files, ownership) = Self.drawnFiles(for: earliest) { assignment in
+                    implied.path(for: assignment, driveUp: mountTableAvailable[assignment.eventID] == true)
                 }
                 // Cache hits only — a miss is "no camera date" here, never a
                 // header read, so nothing on this pass can wait on a drive.
-                let items = OrganizeScanner.items(for: files, cache: cacheLoader.cache(), readMissingCaptureDates: false, pauseGate: gate).items
+                // Nor on the decode of the cache itself (up to 0.4 s at
+                // library scale): before it lands, the first screen goes by
+                // file times and the full build behind it brings the dates.
+                let items = OrganizeScanner.items(for: files, cache: cacheLoader.cacheIfLoaded(), readMissingCaptureDates: false, pauseGate: gate, ownership: ownership).items
                 return (
-                    EventImpliedGrid(files: files, stacks: stacking.stacks(for: items)),
+                    EventImpliedGrid(files: files, stacks: firstScreenStacking.stacks(for: items)),
                     family.count
                 )
             }.value
@@ -4088,6 +4387,15 @@ final class EventsWorkspace {
             eventGridRevisions[eventID] = revisionAtStart
             let remaining = firstPaint.familyCount - firstPaint.grid.files.count
             eventBuildRemainders[eventID] = remaining > 0 ? remaining : nil
+            trace.mark("first_grid", detail: "files=\(firstPaint.grid.files.count) family=\(firstPaint.familyCount)")
+            if BoardOpenTrace.appLog != nil {
+                // Drawn at the end of this run-loop turn, not when assigned.
+                Task { @MainActor in
+                    await RunLoopTurn.afterCommit()
+                    trace.mark("first_paint")
+                    LaunchTrace.markOnce("launch.first_board_paint")
+                }
+            }
         } else if eventStacks[eventID] == nil {
             eventBuildRemainders[eventID] = nil
         }
@@ -4112,13 +4420,16 @@ final class EventsWorkspace {
             // What the board shows, as far as this pipeline has put it there.
             var published = existingStacks
             let (familyAssignments, assignmentsByEvent) = await familyTask.value
+            // The build owes the board its manual splits: with the lookups
+            // still building, wait for them here, off the first screen's path.
+            let stacking = await completeEventStacking(firstScreenStacking)
             let cache = cacheLoader.cache()
             var files: [OrganizeFile] = []
+            var ownership = SideFileOwnership()
             if !gridIsCurrent {
-                files.reserveCapacity(familyAssignments.count)
-                for assignment in familyAssignments where !Task.isCancelled {
-                    guard let path = implied.path(for: assignment, driveUp: mountTableAvailable[assignment.eventID] == true) else { continue }
-                    files.append(OrganizeFile(literalPath: path, size: assignment.fileSize, modifiedAt: assignment.modifiedAt))
+                (files, ownership) = Self.drawnFiles(for: familyAssignments) { assignment in
+                    guard !Task.isCancelled else { return nil }
+                    return implied.path(for: assignment, driveUp: mountTableAvailable[assignment.eventID] == true)
                 }
                 if !Task.isCancelled, !files.isEmpty {
                     // The provisional grid stacks on whatever the cache already
@@ -4127,7 +4438,7 @@ final class EventsWorkspace {
                     // out the remaining capture-date reads. The count of those
                     // reads rides the apply so the board can say dates are
                     // still coming without saying files are.
-                    let undated = OrganizeScanner.items(for: files, cache: cache, readMissingCaptureDates: false, pauseGate: gate)
+                    let undated = OrganizeScanner.items(for: files, cache: cache, readMissingCaptureDates: false, pauseGate: gate, ownership: ownership)
                     let provisional = stacking.stacks(for: undated.items)
                     // A refresh that rebuilds the very grid the board already
                     // shows publishes nothing: the comparison runs here, off
@@ -4141,6 +4452,7 @@ final class EventsWorkspace {
                         unchanged: provisional == published
                     )
                     published = provisional
+                    trace.mark("full_grid", detail: "files=\(files.count) dates_to_read=\(undated.missingCaptureDates)")
                 }
             }
 
@@ -4152,6 +4464,7 @@ final class EventsWorkspace {
             // its storage chip saying so.
             let report = await reachabilityCheck.value
             await applyReachability(report, for: eventID, generation: generation)
+            trace.mark("reachability", detail: "offline=\(report.offlinePlaces.count) unresponsive=\(report.unresponsiveVolumes.count)")
             let mounted = mountedAll.subtracting(report.unresponsiveVolumes)
             let driveAvailableByMember = Dictionary(uniqueKeysWithValues: members.map { member in
                 (member.id, VolumeInfo.isAvailable(locations.driveRoot(for: locations.resolvedPolicy(for: member)), mountedVolumes: mounted))
@@ -4175,7 +4488,7 @@ final class EventsWorkspace {
                     // place is back reads the dates.
                     let previousProbe = cache.timestampProbe
                     cache.timestampProbe = dateReadProbe
-                    let dated = OrganizeScanner.items(for: files, cache: cache, readMissingCaptureDates: canReadHeaders, pauseGate: gate)
+                    let dated = OrganizeScanner.items(for: files, cache: cache, readMissingCaptureDates: canReadHeaders, pauseGate: gate, ownership: ownership)
                     cache.timestampProbe = previousProbe
                     datedItems = dated.items
                     built = EventImpliedGrid(files: files, stacks: stacking.stacks(for: dated.items))
@@ -4189,27 +4502,7 @@ final class EventsWorkspace {
                     connectivity: connectivityRevisionAtStart,
                     unchanged: built.map { $0.stacks == published } ?? false
                 )
-                // Burst pairs no scan compared yet (the card is gone, or this
-                // is a relaunch) get the Vision check here, from the same
-                // places the dates came from — after the dated board is up,
-                // so fingerprinting never holds it back. Only a change in
-                // grouping publishes again.
-                if canReadHeaders, !Task.isCancelled, let items = datedItems, let shown = built,
-                   stacking.needsVisualCheck(for: items) {
-                    let linked = stacking.stacks(for: items, computeMissingLinks: true, pauseGate: gate)
-                    if !Task.isCancelled, linked != shown.stacks {
-                        let regrouped = EventImpliedGrid(files: shown.files, stacks: linked)
-                        await applyEventBuild(
-                            eventID: eventID,
-                            generation: generation,
-                            revision: revisionAtStart,
-                            build: regrouped,
-                            datesRead: true,
-                            connectivity: connectivityRevisionAtStart
-                        )
-                        built = regrouped
-                    }
-                }
+                trace.mark("dated_grid", detail: "headers_read=\(canReadHeaders)")
             }
 
             // The sweep. Its own utility task, joined through a continuation
@@ -4224,6 +4517,29 @@ final class EventsWorkspace {
                     nasRoot: locations.nasRoot.path,
                     prefixes: [locations.layout(for: event, deviceID: nil).mirrorEventFolderPath]
                 )
+                // One listing of the family's NAS folder answers the NAS
+                // place for every file — never a stat per file. A listing
+                // that fails or times out leaves those files unknown.
+                var sweepListing = archiveListing
+                var listingFailed = false
+                if let archiveLister, VolumeInfo.isAvailable(locations.nasRoot, mountedVolumes: mounted) {
+                    let folders = NASPresenceIndex.folders(for: members, locations: locations)
+                    if !EventArchiveListing.covers(archiveListing, folders: folders) {
+                        guard gate.waitIfPaused(for: locations.nasRoot, shouldStop: { Task.isCancelled }) else { return nil }
+                        let began = ContinuousClock.now
+                        switch EventArchiveListing.list(nasRoot: locations.nasRoot, folders: folders, timeout: archiveListingTimeout, lister: archiveLister) {
+                        case .listed(let listing):
+                            sweepListing = listing
+                            trace.mark("nas_listing", outcome: .ok, detail: "files=\(listing.entries.count) took=\(began.duration(to: .now))")
+                        case .failed(let reason):
+                            sweepListing = nil
+                            listingFailed = true
+                            trace.mark("nas_listing", outcome: .error, detail: reason)
+                        case .cancelled:
+                            return nil
+                        }
+                    }
+                }
                 for member in members {
                     guard !Task.isCancelled else { return nil }
                     guard let memberSummary = EventPresenceScanner.scan(
@@ -4234,7 +4550,8 @@ final class EventsWorkspace {
                         probe: probe,
                         pauseGate: gate,
                         nasFacts: nasFacts,
-                        archiveListing: archiveListing
+                        archiveListing: sweepListing,
+                        archiveListingFailed: listingFailed
                     ) else { return nil }
                     memberSummaries[member.id] = memberSummary
                 }
@@ -4260,7 +4577,8 @@ final class EventsWorkspace {
                         // its NAS mirror path (the permanent library), its
                         // tile blank until a place answers. Only files every
                         // reachable place says are missing leave the grid.
-                        guard asset.drive == .unavailable || asset.otherDrive == .unavailable || asset.archive == .unavailable,
+                        guard asset.drive == .unavailable || asset.otherDrive == .unavailable
+                            || asset.archive == .unavailable || asset.archive == .unknown,
                               let mirror = implied.path(for: asset.assignment, driveUp: false) else { continue }
                         sweptFiles.append(OrganizeFile(literalPath: mirror, size: asset.assignment.fileSize, modifiedAt: asset.assignment.modifiedAt))
                         byPath[mirror.lowercased()] = asset
@@ -4294,14 +4612,43 @@ final class EventsWorkspace {
             } onCancel: {
                 sweepTask.cancel()
             }
+            trace.mark("sweep_done", outcome: output == nil ? .cancel : .ok, detail: "files=\(output?.summary.total ?? 0)")
+            // A reused grid verifies against what it shows: the sweep
+            // restacks only when the files on disk are not the files on the
+            // board. Order does not matter — the baseline for a reused grid
+            // is the board's own files in stack order — but how many times
+            // each file is drawn does: a tile drawn twice is put right too.
+            let boardFiles = built?.files ?? existingStacks?.flatMap(\.files) ?? []
+            let filesMatch = output.map { $0.files.map(\.pathKey).sorted() == boardFiles.map(\.pathKey).sorted() } ?? true
+            // The chips first: nothing below can hold them back.
+            await publishPresence(eventID: eventID, generation: generation, revision: revisionAtStart, trace: trace, output: output)
+            await beforeVision?()
+            // Burst pairs no scan compared yet (the card is gone, or this is
+            // a relaunch) get the Vision check here, from the same places
+            // the dates came from — after the chips are up, so fingerprinting
+            // holds back neither them nor the dated board. Only a change in
+            // grouping publishes again. A board about to be restacked onto
+            // other paths does this as part of that restack.
+            if filesMatch, output != nil, canReadHeaders, !Task.isCancelled, let items = datedItems, let shown = built,
+               stacking.needsVisualCheck(for: items) {
+                let linked = stacking.stacks(for: items, computeMissingLinks: true, pauseGate: gate)
+                trace.mark("burst_vision")
+                if !Task.isCancelled, linked != shown.stacks {
+                    await applyEventBuild(
+                        eventID: eventID,
+                        generation: generation,
+                        revision: revisionAtStart,
+                        build: EventImpliedGrid(files: shown.files, stacks: linked),
+                        datesRead: true,
+                        connectivity: connectivityRevisionAtStart
+                    )
+                }
+            }
             await finishPresenceSweep(
                 eventID: eventID,
                 generation: generation,
                 revision: revisionAtStart,
-                // A reused grid verifies against what it shows: the sweep
-                // restacks only when the files on disk are not the files
-                // on the board.
-                builtFiles: built?.files ?? existingStacks?.flatMap(\.files),
+                filesMatch: filesMatch,
                 output: output
             )
         }
@@ -4309,6 +4656,7 @@ final class EventsWorkspace {
         await withCheckedContinuation { (cc: CheckedContinuation<Void, Never>) in
             presenceWaiters[eventID, default: []].append((generation, cc))
         }
+        trace.mark("finished", outcome: refreshGenerations[eventID] == generation ? .ok : .cancel)
         if refreshGenerations[eventID] == generation, eventStacks[eventID]?.isEmpty == false, presence[eventID] != nil {
             boardVerifications[eventID] = BoardVerification(
                 catalog: revisionAtStart,
@@ -4358,7 +4706,10 @@ final class EventsWorkspace {
     /// re-stacks or re-sweeps it. Anything else refreshes behind the tiles
     /// already on screen.
     func refreshEventIfStale(_ eventID: UUID) async {
-        guard !isBoardFresh(eventID) else { return }
+        guard !isBoardFresh(eventID) else {
+            BoardOpenTrace(eventID: eventID, selectedAt: boardSelectedAt.removeValue(forKey: eventID)).mark("already_fresh")
+            return
+        }
         await refreshEvent(eventID)
     }
 
@@ -4378,6 +4729,14 @@ final class EventsWorkspace {
     /// `appendingPathComponent(_:)` does for every call.
     nonisolated static func resolvedPath(root: URL, relativePath: String) -> String {
         root.appending(path: relativePath, directoryHint: .notDirectory).path
+    }
+
+    /// `stacking` when it was complete, else a fresh one once the lookups a
+    /// manual split needs have landed.
+    private func completeEventStacking(_ stacking: BurstStackingContext) async -> BurstStackingContext {
+        guard buildsAssignmentIndexOffMain, !model.configuration.burstSplits.isEmpty else { return stacking }
+        await assignmentIndexReady()
+        return Task.isCancelled ? stacking : eventStacking()
     }
 
     /// Main-actor landing point for the reachability answer. A stale
@@ -4429,16 +4788,33 @@ final class EventsWorkspace {
         if pendingDateReads == 0 { refreshEditTags(for: eventID) }
     }
 
-    /// Main-actor landing point for the utility-priority sweep. Publishes
-    /// the storage chips and badge index, rebuilds the grid only when the
-    /// truthful paths differ from what the implied build drew, and wakes
-    /// the `refreshEvent` calls waiting on this pass. Stale generations
-    /// only resume their waiters — their results are dropped.
+    /// The storage chips and the badge index from a finished sweep, on the
+    /// main actor and as soon as the sweep is done — ahead of the burst
+    /// Vision pass. A stale generation or a board patched since drops them:
+    /// `finishPresenceSweep` reads that board again.
+    private func publishPresence(eventID: UUID, generation: UUID, revision: Int, trace: BoardOpenTrace, output: EventRefreshOutput?) {
+        guard refreshGenerations[eventID] == generation,
+              (eventGridRevisions[eventID] ?? -1) <= revision,
+              let output else { return }
+        eventAssetsByPathKey[eventID] = output.assetsByPathKey
+        fileFacts.touchAll()
+        presence[eventID] = output.summary
+        for (memberID, memberSummary) in output.memberSummaries {
+            presence[memberID] = memberSummary
+        }
+        eventImmichStatuses[eventID] = output.immich
+        trace.mark("chips_resolved", detail: "on_nas=\(output.summary.onArchive) unknown=\(output.summary.counts.archiveUnknown) of=\(output.summary.total)")
+    }
+
+    /// Main-actor landing point for the end of the pipeline: rebuilds the
+    /// grid only when the truthful paths differ from what the implied build
+    /// drew, and wakes the `refreshEvent` calls waiting on this pass. Stale
+    /// generations only resume their waiters — their results are dropped.
     private func finishPresenceSweep(
         eventID: UUID,
         generation: UUID,
         revision: Int,
-        builtFiles: [OrganizeFile]?,
+        filesMatch: Bool,
         output: EventRefreshOutput?
     ) async {
         defer { resumePresenceWaiters(for: eventID, appliedGeneration: generation) }
@@ -4473,20 +4849,7 @@ final class EventsWorkspace {
             Task { await refreshEvent(eventID) }
             return
         }
-        guard let output else { return }
-
-        eventAssetsByPathKey[eventID] = output.assetsByPathKey
-        fileFacts.touchAll()
-        presence[eventID] = output.summary
-        for (memberID, memberSummary) in output.memberSummaries {
-            presence[memberID] = memberSummary
-        }
-        eventImmichStatuses[eventID] = output.immich
-        // Order does not matter — the baseline for a reused grid is the
-        // board's own files in stack order — but how many times each file is
-        // drawn does: only "which files are on disk, once each" decides
-        // whether a restack is owed, so a tile drawn twice is put right too.
-        guard output.files.map(\.pathKey).sorted() != (builtFiles ?? []).map(\.pathKey).sorted() else { return }
+        guard let output, !filesMatch else { return }
 
         // Files resolved somewhere other than the implied Originals path —
         // restack onto the real ones. Continuation, not `task.value`, so
@@ -4495,12 +4858,15 @@ final class EventsWorkspace {
         let stacking = eventStacking()
         let gate = driveActivityGate
         let files = output.files
+        let ownership = SideFileOwnership(owners: output.assetsByPathKey.mapValues {
+            SideFileOwnership.Owner(eventID: $0.assignment.eventID, fileSize: $0.assignment.fileSize)
+        })
         let rebuilt = await withCheckedContinuation { (cc: CheckedContinuation<[OrganizeStack], Never>) in
             Task.detached(priority: .utility) {
                 // These are the copies the sweep found on disk, so the
                 // Vision check may read them for pairs nobody compared yet.
                 cc.resume(returning: stacking.stacks(
-                    for: OrganizeScanner.items(for: files, cache: cache, pauseGate: gate).items,
+                    for: OrganizeScanner.items(for: files, cache: cache, pauseGate: gate, ownership: ownership).items,
                     computeMissingLinks: true,
                     pauseGate: gate
                 ))
@@ -5390,6 +5756,7 @@ final class EventsWorkspace {
 
         var items: [EventMoveItem] = []
         var alreadyThere: [String] = []
+        var nasUnknown: [String] = []
         // Names this batch already brings in, with where that file is now,
         // so two incoming files with one name are compared with each other.
         var claimed: [String: String] = [:]
@@ -5426,6 +5793,11 @@ final class EventsWorkspace {
             // NAS copy owes the rename, or the file is lost to the event that
             // now owns it.
             var nasCopy: NASCopyMove?
+            // The NAS could not be listed: whether a copy there owes this
+            // rename is not known, so the catalog must not move without it.
+            if move == nil, asset.source != .present, asset.archive == .unknown {
+                nasUnknown.append((asset.assignment.relativePath as NSString).lastPathComponent)
+            }
             if move == nil, asset.archive == .present, !asset.archiveIsLegacyLayout, let archive = asset.archivePath,
                let target = paths.archiveURL(for: moved, event: to)?.path,
                let from = locations.nasRelativePath(archive), let toPath = locations.nasRelativePath(target) {
@@ -5452,6 +5824,10 @@ final class EventsWorkspace {
                 takenBy: takenBy,
                 nasCopy: nasCopy
             ))
+        }
+        guard nasUnknown.isEmpty else {
+            refuseMove(title, "Nothing moved — the NAS could not be checked just now and these files have no copy on a drive. Press Check Again on the NAS chip, then try again.", files: nasUnknown)
+            return
         }
         guard !items.isEmpty else {
             refuseMove(title, "Those files are already in \(eventTitle(to)). Nothing moved.", files: alreadyThere)
@@ -6075,7 +6451,9 @@ final class EventsWorkspace {
                     nasOnly: nil
                 )
             }
-            if asset.archive != .unavailable { asset.archive = .missing }
+            // The new path's NAS copy is yet to come — but a NAS nobody can
+            // answer for stays that way, it does not become "missing".
+            if asset.archive != .unavailable, asset.archive != .unknown { asset.archive = .missing }
             asset.archiveIsLegacyLayout = false
             asset.archiveVerifiedAt = nil
             replacements[oldID] = asset
@@ -6413,9 +6791,10 @@ final class EventsWorkspace {
                     continue
                 }
                 moves.append(DriveMove(sourcePath: driveCopy, destinationPath: source, byteCount: asset.assignment.fileSize))
-            } else if asset.source != .present, asset.archive == .present {
+            } else if asset.source != .present, asset.archive == .present || asset.archive == .unknown {
                 // Its only copy is on the NAS: dropping the assignment would
-                // leave a photo nothing in the app can show.
+                // leave a photo nothing in the app can show. A NAS that could
+                // not be listed just now might be holding that copy.
                 nasOnly += 1
                 continue
             }
@@ -6542,6 +6921,8 @@ final class EventsWorkspace {
 
     /// Launch: status, auto-connect, and the Wi-Fi guard. App only.
     func startNASConnection() {
+        LaunchTrace.markOnce("launch.nas_connection_start")
+        boardQuietUntil = Date().addingTimeInterval(boardLaunchQuiet)
         nasConnection.start(settings: nasConnectionSettings)
         nasPresence.isEnabled = true
         nasPresence.refresh(.launch)
@@ -6579,11 +6960,7 @@ final class EventsWorkspace {
             model.statusMessage = "There are no events to sync."
             return
         }
-        let report = nasPresence.report
-        let stale = report?.listedAt.map { Date().timeIntervalSince($0) > NASPresenceSchedule.automaticInterval } ?? true
-        if nasIsConnected, stale, !nasPresence.isChecking {
-            nasPresence.refresh(.manual)
-        }
+        if nasIsConnected { nasPresence.refreshForSyncAll() }
         // The switch keeps what the owner last chose; it is only greyed out
         // (and ignored) while the drive is away.
         syncAllDriveMounted = NASCatchUp.driveIsMounted(locations)
@@ -6624,8 +7001,46 @@ final class EventsWorkspace {
             catalogURL: URL(fileURLWithPath: DashboardModel.expandedPath(model.configuration.catalogDatabasePath)),
             configuration: model.configuration,
             nasAvailable: nasIsConnected,
-            nasJobRunning: nasIsInUse
+            nasJobRunning: nasIsInUse,
+            selectedFamily: selectedEventFamily,
+            boardIsBusy: boardIsBusy
         )
+    }
+
+    private var selectedEventFamily: [SavedCameraEvent]? {
+        guard case .event(let eventID) = selection else { return nil }
+        let family = eventFamily(eventID)
+        return family.isEmpty ? nil : family
+    }
+
+    // MARK: Waiting for the board
+
+    /// True while a board is loading, or just about to: NAS listings and the
+    /// speed test wait, so they do not compete with its first paint.
+    var boardIsBusy: Bool {
+        refreshesInFlight > 0 || boardQuietUntil.map { Date() < $0 } == true
+    }
+
+    /// Waits until the board is idle, at most `boardBusyWaitLimit` — a board
+    /// that never settles does not hold the NAS work back forever.
+    func waitForBoardIdle() async {
+        let started = Date()
+        while boardIsBusy, !Task.isCancelled, Date().timeIntervalSince(started) < boardBusyWaitLimit {
+            try? await Task.sleep(for: .milliseconds(250))
+        }
+    }
+
+    /// Runs what was held back for the board, once it is idle.
+    private func scheduleWorkAfterBoardIdle() {
+        guard boardIdleWatcher == nil else { return }
+        boardIdleWatcher = Task { @MainActor [weak self] in
+            await self?.waitForBoardIdle()
+            guard let self else { return }
+            boardIdleWatcher = nil
+            LaunchTrace.markOnce("launch.board_idle")
+            nasPresence.boardBecameIdle()
+            nasConnection.boardBecameIdle()
+        }
     }
 
     /// A new NAS presence answer: the open board re-reads its NAS place
@@ -7427,10 +7842,10 @@ final class EventsWorkspace {
         for eventID in ids {
             guard let stacks = eventStacks[eventID] else { continue }
             let items = stacks.flatMap(\.items)
-            let remaining = items.filter { item in
-                !item.files.contains { pathKeys.contains($0.pathKey) }
+            let remaining = items.flatMap { item in
+                item.removingFiles { pathKeys.contains($0.pathKey) }
             }
-            guard remaining.count != items.count else { continue }
+            guard remaining != items else { continue }
             eventStacks[eventID] = stacking.stacks(for: remaining)
                 .carryingIDs(from: stacks)
             eventGridRevisions[eventID] = model.catalogStateRevision
@@ -7488,10 +7903,21 @@ final class EventsWorkspace {
 
     // MARK: - Display rotation
 
-    /// Quarter-turns clockwise recorded for this file's identity — survives
-    /// the file moving between the card, the Buffer, and the NAS.
+    /// The latest rotate still waiting to read a camera turn — so a test can
+    /// wait for it. Nothing else depends on it.
+    private(set) var pendingRotation: Task<Void, Never>?
+
+    /// The saved rotation for this file's identity, or nil to use the
+    /// camera's — survives the file moving between the card, the Buffer,
+    /// and the NAS. This is what a tile asks the loader for.
+    func savedTurns(for file: OrganizeFile) -> Int? {
+        DisplayRotation.savedTurns(for: file, in: model.orientationsForDisplay)
+    }
+
+    /// The quarter-turns the file is drawn at right now: its saved rotation,
+    /// else the camera's as far as a decode has found it. No file access.
     func displayTurns(for file: OrganizeFile) -> Int {
-        DisplayRotation.turns(for: file, in: model.orientationsForDisplay)
+        TileImageLoader.shared.effectiveTurns(saved: savedTurns(for: file), for: file.url)
     }
 
     /// Rotates every rotatable file in `stack` — all burst frames plus their
@@ -7515,13 +7941,32 @@ final class EventsWorkspace {
                 : "Nothing to rotate in the selection."
             return
         }
+        // A rotate steps from what the photo shows, which for a RAW depends
+        // on the camera. Frames that have been decoded are known; the rest of
+        // a burst (only its cover draws on the board) is read off the main
+        // actor first. A file that cannot be read counts as not turned.
+        let loader = TileImageLoader.shared
+        let unknown = rotated.map(\.url).filter { loader.knownCameraTurns(for: $0) == nil }
+        guard !unknown.isEmpty else {
+            applyRotation(of: stacks, files: rotated, quarterTurnsCW: delta)
+            return
+        }
+        pendingRotation = Task { [weak self] in
+            await loader.learnCameraTurns(for: unknown)
+            self?.applyRotation(of: stacks, files: rotated, quarterTurnsCW: delta)
+        }
+    }
+
+    private func applyRotation(of stacks: [OrganizeStack], files rotated: [OrganizeFile], quarterTurnsCW delta: Int) {
+        let loader = TileImageLoader.shared
         let orientationsBefore = model.configuration.displayOrientations
         model.updateConfiguration { configuration in
             for stack in stacks {
                 configuration.displayOrientations = DisplayRotation.rotatedMap(
                     configuration.displayOrientations,
                     applying: delta,
-                    to: stack
+                    to: stack,
+                    cameraTurns: { loader.knownCameraTurns(for: $0.url) ?? 0 }
                 )
             }
         }
@@ -7535,7 +7980,7 @@ final class EventsWorkspace {
             recordUndo("Rotate \(direction)", detail: stacks.count == 1 ? nil : "\(stacks.count) bursts", .config(.orientations(orientationChanges)))
         }
         for file in rotated {
-            TileImageLoader.shared.invalidate(url: file.url)
+            loader.invalidate(url: file.url)
         }
         let frames = stacks.reduce(0) { $0 + $1.items.count }
         let direction = abs(delta) == 2 ? "180°" : (delta > 0 ? "90° clockwise" : "90° counter-clockwise")
@@ -7895,12 +8340,12 @@ final class EventsWorkspace {
             && (petGallery.faceEngineInstalled || petProvider != nil)
         let petsURL = petGallery.databaseURL
         let petOptions = FaceScanOptions.pets(mode: options.mode, fast: options.fast)
-        let faceUpperBound = includePets ? 0.6 : 0.98
+        let passCount = includePets ? 2 : 1
         let petsNote = includePets ? " Then looked for dogs on the same files with the pet engine and filed them into the pet index's Inbox." : ""
         model.runAsyncJob(
             action: .faceScan,
             runningNote: includePets ? "Scanning \(title) for faces and dogs" : "Scanning \(title) for faces",
-            logTitle: "Face scan: \(title)",
+            logTitle: includePets ? "Face and dog scan: \(title)" : "Face scan: \(title)",
             logDetail: "Quality \(options.mode.rawValue). Detected faces on \(burstScope), single stills, and — at MED and above — video frames with the on-device face engine; matched faces against the approved people and grouped the rest — every classification lands in the Inbox, unapproved until the user says so.\(petsNote) Files were only read — nothing was written or moved.",
             operation: { progress in
                 let faces = try await Self.runFaceScanPass(
@@ -7910,7 +8355,7 @@ final class EventsWorkspace {
                     configuration: configuration,
                     support: support,
                     analyzerProvider: analyzerProvider,
-                    upperBound: faceUpperBound,
+                    pass: JobScanPass(index: 1, count: passCount, subject: .faces),
                     progress: progress
                 )
                 guard includePets else { return FaceAndPetScanReport(faces: faces) }
@@ -7923,7 +8368,7 @@ final class EventsWorkspace {
                         petsURL: petsURL,
                         support: support,
                         analyzerProvider: petProvider,
-                        lowerBound: faceUpperBound,
+                        pass: JobScanPass(index: 2, count: passCount, subject: .dogs),
                         progress: progress
                     )
                     return FaceAndPetScanReport(faces: faces, pets: pets)
@@ -7952,7 +8397,7 @@ final class EventsWorkspace {
         configuration: AppConfiguration,
         support: URL,
         analyzerProvider: (@Sendable () async throws -> FaceAnalyzing?)?,
-        upperBound: Double,
+        pass: JobScanPass,
         progress: @escaping @Sendable (BackgroundJobUpdate) -> Void
     ) async throws -> FaceScanReport {
         // Bootstrap is idempotent: it guarantees the face tables exist
@@ -7970,6 +8415,7 @@ final class EventsWorkspace {
             analyzer = try FaceSidecarPool.open(applicationSupport: support, options: options)
         }
         defer { (analyzer as? FaceSidecarPool)?.shutdown() }
+        let reporter = ScanPassReporter(pass: pass)
         // The board's burst stacks drive sampling — a burst decodes its
         // first/middle/last stills instead of every frame (all stills at
         // HIGH and above).
@@ -7977,13 +8423,7 @@ final class EventsWorkspace {
             stacks: stacks,
             analyzer: analyzer
         ) { update in
-            progress(DashboardModel.jobUpdate(
-                from: update,
-                lowerBound: 0.02,
-                upperBound: upperBound,
-                notePrefix: "Face scan",
-                command: ""
-            ))
+            progress(reporter.update(from: update))
         }
     }
 
@@ -7996,7 +8436,7 @@ final class EventsWorkspace {
         petsURL: URL,
         support: URL,
         analyzerProvider: (@Sendable () async throws -> FaceAnalyzing?)?,
-        lowerBound: Double,
+        pass: JobScanPass,
         progress: @escaping @Sendable (BackgroundJobUpdate) -> Void
     ) async throws -> FaceScanReport {
         let store = try PetIndexDatabase.open(url: petsURL)
@@ -8007,17 +8447,17 @@ final class EventsWorkspace {
             analyzer = try PetSidecarPool.open(applicationSupport: support)
         }
         defer { (analyzer as? PetSidecarPool)?.shutdown() }
-        return try FaceIndexService(store: store, options: options).scan(
+        let reporter = ScanPassReporter(pass: pass)
+        var service = FaceIndexService(store: store, options: options)
+        // Application Support, never beside a catalog moved onto a NAS.
+        service.uprightBackupFolder = support
+            .appendingPathComponent("CameraToolkit", isDirectory: true)
+            .appendingPathComponent(PetIndexDatabase.backupFolderName, isDirectory: true)
+        return try service.scan(
             stacks: stacks,
             analyzer: analyzer
         ) { update in
-            progress(DashboardModel.jobUpdate(
-                from: update,
-                lowerBound: lowerBound,
-                upperBound: 0.98,
-                notePrefix: "Pet scan",
-                command: ""
-            ))
+            progress(reporter.update(from: update))
         }
     }
 

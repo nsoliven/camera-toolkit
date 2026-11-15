@@ -312,6 +312,70 @@ public struct JobPhaseLedger: Sendable {
     }
 }
 
+/// Which pass of a scan is running. A scan with "Look for dogs" on is one
+/// job with two passes over the same files, and each pass counts its own
+/// files from zero, so anything that shows the counters needs to know which
+/// pass they belong to.
+public struct JobScanPass: Codable, Equatable, Hashable, Sendable {
+    public enum Subject: String, Codable, Equatable, Hashable, Sendable {
+        case faces
+        case dogs
+
+        /// "Faces", "Dogs".
+        public var title: String {
+            switch self {
+            case .faces: "Faces"
+            case .dogs: "Dogs"
+            }
+        }
+
+        /// "faces", "dogs".
+        public var noun: String { title.lowercased() }
+
+        /// "Face scan", "Dog scan".
+        public var scanName: String {
+            switch self {
+            case .faces: "Face scan"
+            case .dogs: "Dog scan"
+            }
+        }
+    }
+
+    /// 1-based.
+    public var index: Int
+    public var count: Int
+    public var subject: Subject
+
+    public init(index: Int, count: Int, subject: Subject) {
+        self.index = index
+        self.count = count
+        self.subject = subject
+    }
+
+    public var isMultiPass: Bool { count > 1 }
+
+    /// "Pass 2 of 2 · Dogs", or nil when the job has only this pass.
+    public var label: String? {
+        isMultiPass ? "Pass \(index) of \(count) · \(subject.title)" : nil
+    }
+
+    /// How far the whole job is, with every pass worth the same share, when
+    /// this pass is `passFraction` done.
+    public func jobFraction(passFraction: Double) -> Double {
+        guard count > 0 else { return 0 }
+        let fraction = min(max(passFraction, 0), 1)
+        return min((Double(index - 1) + fraction) / Double(count), 1)
+    }
+
+    /// A recorded job title with its scan name swapped for this pass's:
+    /// "Face and dog scan: Beach Day" reads "Dog scan: Beach Day" while the
+    /// dogs run. A title without a scan name is returned as it is.
+    public func title(forRecorded title: String) -> String {
+        guard title.contains(" scan: "), let colon = title.range(of: ": ") else { return title }
+        return "\(subject.scanName): \(title[colon.upperBound...])"
+    }
+}
+
 /// Best-effort live detail a job reports next to the coarse
 /// `FileOperationProgress` counters — the payload the Jobs window's
 /// activity pane renders. Everything in it is genuinely measured or
@@ -344,6 +408,9 @@ public struct JobTelemetry: Codable, Equatable, Hashable, Sendable {
     /// sync's copies and SMB re-reads, not hashes the NAS does itself) —
     /// the combined speed's counter. Nil: the job's byte counter is it.
     public var transferBytes: Int64?
+    /// The pass a scan is in; nil for every other job and in older
+    /// snapshots.
+    public var scanPass: JobScanPass?
 
     public init(
         step: String? = nil,
@@ -354,7 +421,8 @@ public struct JobTelemetry: Codable, Equatable, Hashable, Sendable {
         work: JobWorkEstimate? = nil,
         phases: [JobPhaseTotal] = [],
         configuration: String? = nil,
-        transferBytes: Int64? = nil
+        transferBytes: Int64? = nil,
+        scanPass: JobScanPass? = nil
     ) {
         self.step = step
         self.activeItems = activeItems
@@ -365,6 +433,7 @@ public struct JobTelemetry: Codable, Equatable, Hashable, Sendable {
         self.phases = phases
         self.configuration = configuration
         self.transferBytes = transferBytes
+        self.scanPass = scanPass
     }
 
     public init(from decoder: Decoder) throws {
@@ -378,6 +447,7 @@ public struct JobTelemetry: Codable, Equatable, Hashable, Sendable {
         phases = try container.decodeIfPresent([JobPhaseTotal].self, forKey: .phases) ?? []
         configuration = try container.decodeIfPresent(String.self, forKey: .configuration)
         transferBytes = try container.decodeIfPresent(Int64.self, forKey: .transferBytes)
+        scanPass = try container.decodeIfPresent(JobScanPass.self, forKey: .scanPass)
     }
 
     /// Each measured phase's share of the time, in the job's order. The
