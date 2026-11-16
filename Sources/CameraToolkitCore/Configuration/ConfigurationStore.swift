@@ -49,8 +49,14 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
     /// albums the old one was in.
     public var immichCarriesAlbumsAcrossRenames: Bool
     /// Every event whose album policy is still the default gets an Event
-    /// album. Nothing happens until a library is chosen.
+    /// album. Off unless the owner turns it on; nothing happens until a
+    /// library is chosen either way.
     public var immichAlbumsForEveryEvent: Bool
+    /// Make each burst, RAW+JPEG pair and original-with-edit one Immich
+    /// stack on each check. Off unless the owner turns it on. Only the app's
+    /// own stacks are ever made, replaced or removed; stacks someone else
+    /// made are left alone.
+    public var immichStacksBurstsAndEdits: Bool
     public var trueNASServerURL: String
     public var trueNASUsername: String
     public var trueNASDataset: String
@@ -108,7 +114,8 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         immichServerURL: String = "",
         immichLibraryID: String = "",
         immichCarriesAlbumsAcrossRenames: Bool = false,
-        immichAlbumsForEveryEvent: Bool = true,
+        immichAlbumsForEveryEvent: Bool = false,
+        immichStacksBurstsAndEdits: Bool = false,
         trueNASServerURL: String = "",
         trueNASUsername: String = "",
         trueNASDataset: String = "",
@@ -150,6 +157,7 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         self.immichLibraryID = immichLibraryID
         self.immichCarriesAlbumsAcrossRenames = immichCarriesAlbumsAcrossRenames
         self.immichAlbumsForEveryEvent = immichAlbumsForEveryEvent
+        self.immichStacksBurstsAndEdits = immichStacksBurstsAndEdits
         self.trueNASServerURL = trueNASServerURL
         self.trueNASUsername = trueNASUsername
         self.trueNASDataset = trueNASDataset
@@ -194,7 +202,10 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         case immichServerURL
         case immichLibraryID
         case immichCarriesAlbumsAcrossRenames
-        case immichAlbumsForEveryEvent
+        // A new key: the first release defaulted to on and wrote `true` into
+        // every config; that value was never the owner's choice.
+        case immichAlbumsForEveryEvent = "immichAlbumsForEveryEventChosen"
+        case immichStacksBurstsAndEdits
         case trueNASServerURL
         case trueNASUsername
         case trueNASDataset
@@ -247,6 +258,7 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         try values.encode(immichLibraryID, forKey: .immichLibraryID)
         try values.encode(immichCarriesAlbumsAcrossRenames, forKey: .immichCarriesAlbumsAcrossRenames)
         try values.encode(immichAlbumsForEveryEvent, forKey: .immichAlbumsForEveryEvent)
+        try values.encode(immichStacksBurstsAndEdits, forKey: .immichStacksBurstsAndEdits)
         try values.encode(trueNASServerURL, forKey: .trueNASServerURL)
         try values.encode(trueNASUsername, forKey: .trueNASUsername)
         try values.encode(trueNASDataset, forKey: .trueNASDataset)
@@ -304,6 +316,7 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         immichLibraryID = try values.decodeIfPresent(String.self, forKey: .immichLibraryID) ?? defaults.immichLibraryID
         immichCarriesAlbumsAcrossRenames = try values.decodeIfPresent(Bool.self, forKey: .immichCarriesAlbumsAcrossRenames) ?? defaults.immichCarriesAlbumsAcrossRenames
         immichAlbumsForEveryEvent = try values.decodeIfPresent(Bool.self, forKey: .immichAlbumsForEveryEvent) ?? defaults.immichAlbumsForEveryEvent
+        immichStacksBurstsAndEdits = try values.decodeIfPresent(Bool.self, forKey: .immichStacksBurstsAndEdits) ?? defaults.immichStacksBurstsAndEdits
         trueNASServerURL = try values.decodeIfPresent(String.self, forKey: .trueNASServerURL) ?? defaults.trueNASServerURL
         trueNASUsername = try values.decodeIfPresent(String.self, forKey: .trueNASUsername) ?? defaults.trueNASUsername
         trueNASDataset = try values.decodeIfPresent(String.self, forKey: .trueNASDataset) ?? defaults.trueNASDataset
@@ -677,6 +690,17 @@ public struct SavedCameraEvent: Identifiable, Codable, Equatable, Hashable, Send
     /// first, then by name), so an older config lists exactly as it did.
     /// Ordering never touches a file; see `EventHierarchy.siblingPrecedes`.
     public var sidebarOrder: Int?
+    /// The Immich album this event is paired with, by ID, so renaming the
+    /// album in Immich does not break the pairing. When set, the policy is
+    /// `.custom` and `immichAlbumName` holds the album's last-known name, so
+    /// a build that predates pairing still fills the same album by name.
+    public var immichAlbumID: String?
+    /// For a paired album: whether checks add the whole event to it. `false`
+    /// is a picks album (linked, not filled). Nil fills.
+    public var immichAlbumFill: Bool?
+    /// The album came from "Make an album for every event", not from the
+    /// owner's own choice; turning that switch off stops filling it.
+    public var immichAlbumAutomatic: Bool?
 
     public init(
         id: UUID = UUID(),
@@ -689,7 +713,8 @@ public struct SavedCameraEvent: Identifiable, Codable, Equatable, Hashable, Send
         immichAlbumName: String? = nil,
         storagePolicy: EventStoragePolicy? = nil,
         parentEventID: UUID? = nil,
-        sidebarOrder: Int? = nil
+        sidebarOrder: Int? = nil,
+        immichAlbumID: String? = nil
     ) {
         self.id = id
         self.name = name
@@ -702,6 +727,7 @@ public struct SavedCameraEvent: Identifiable, Codable, Equatable, Hashable, Send
         self.storagePolicy = storagePolicy
         self.parentEventID = parentEventID
         self.sidebarOrder = sidebarOrder
+        self.immichAlbumID = immichAlbumID
     }
 
     public var sendsToImmich: Bool { immichUploadEnabled ?? false }

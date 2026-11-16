@@ -58,6 +58,22 @@ struct KeychainSecretStore {
         }
     }
 
+    /// Other services holding an item for `account`, by name only: no
+    /// secret is read, so this never asks the user. An earlier build of the
+    /// app saved its key under another service.
+    static func otherServices(holding account: String, excluding service: String) -> [String] {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrAccount as String: account,
+            kSecReturnAttributes as String: true,
+            kSecMatchLimit as String: kSecMatchLimitAll
+        ]
+        var result: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+              let items = result as? [[String: Any]] else { return [] }
+        return items.compactMap { $0[kSecAttrService as String] as? String }.filter { $0 != service }.sorted()
+    }
+
     private func baseQuery(account: String) -> [String: Any] {
         [
             kSecClass as String: kSecClassGenericPassword,

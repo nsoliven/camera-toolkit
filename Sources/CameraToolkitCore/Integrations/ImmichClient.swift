@@ -58,7 +58,30 @@ public struct ImmichClient: Sendable {
 
     public func albums() async throws -> [ImmichAlbum] {
         let response: [AlbumResponse] = try await get("/albums", authenticated: true)
-        return response.map { ImmichAlbum(id: $0.id, name: $0.albumName) }
+        return response.map { ImmichAlbum(id: $0.id, name: $0.albumName, assetCount: $0.assetCount, ownerID: $0.ownerId) }
+    }
+
+    /// The key's user.
+    public func currentUserID() async throws -> String {
+        let user: ImmichUserResponse = try await get("/users/me", authenticated: true)
+        return user.id
+    }
+
+    /// Removes one of the app's own stacks: its assets stay, unstacked.
+    /// Callers only ever pass a stack the app made (`ImmichStackStore`).
+    public func deleteStack(stackID: String) async throws {
+        try Self.validate(id: stackID, kind: "stack")
+        let path = "/stacks/\(stackID)"
+        guard let url = endpointURL(path) else { throw ToolkitError.commandFailed("Immich endpoint URL is not valid") }
+        var request = URLRequest(url: url)
+        request.httpMethod = "DELETE"
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+        let (_, response) = try await transport.data(for: request)
+        guard let http = response as? HTTPURLResponse else { throw ToolkitError.commandFailed("Immich response was not HTTP") }
+        guard (200..<300).contains(http.statusCode) else {
+            throw ToolkitError.commandFailed("Immich \(path) failed with HTTP \(http.statusCode)")
+        }
     }
 
     /// The albums one asset is in.
@@ -110,21 +133,89 @@ public struct ImmichClient: Sendable {
     /// at a time. Uses the search fields that work on every server version
     /// this app targets; Immich marks them deprecated from v3.2 and plans to
     /// drop them in v4.
-    public func libraryAssets(libraryID: String, pageSize: Int = 1_000) async throws -> [ImmichLibraryAsset] {
+    ///
+    /// `pathContains` narrows it to paths containing that text (the server
+    /// matches it anywhere in the path, ignoring case and accents), so one
+    /// event folder is a request or two instead of the whole library.
+    public func libraryAssets(libraryID: String, pathContains: String? = nil, pageSize: Int = 1_000) async throws -> [ImmichLibraryAsset] {
         try Self.validate(id: libraryID, kind: "library")
+        return try await searchAll(MetadataSearchRequest(libraryId: libraryID, albumIds: nil, originalPath: pathContains, withDeleted: true, page: 1, size: pageSize))
+    }
+
+    /// Every asset in one album, as the album search returns them.
+    public func albumAssets(albumID: String, pageSize: Int = 1_000) async throws -> [ImmichLibraryAsset] {
+        try Self.validate(id: albumID, kind: "album")
+        return try await searchAll(MetadataSearchRequest(libraryId: nil, albumIds: [albumID], originalPath: nil, withDeleted: false, page: 1, size: pageSize))
+    }
+
+    private func searchAll(_ first: MetadataSearchRequest) async throws -> [ImmichLibraryAsset] {
+        var request = first
         var assets: [ImmichLibraryAsset] = []
-        var page = 1
         // The bound only stops a server that never says "last page".
         for _ in 0..<Self.maximumAssetPages {
-            let response: MetadataSearchResponse = try await post(
-                "/search/metadata",
-                body: MetadataSearchRequest(libraryId: libraryID, withDeleted: true, page: page, size: pageSize)
-            )
+            let response: MetadataSearchResponse = try await post("/search/metadata", body: request)
             assets += response.assets.items
             guard let next = response.assets.nextPage.flatMap(Int.init) else { return assets }
-            page = next
+            request.page = next
         }
-        throw ToolkitError.commandFailed("Immich kept returning more pages of this library; stopped after \(Self.maximumAssetPages).")
+        throw ToolkitError.commandFailed("Immich kept returning more pages; stopped after \(Self.maximumAssetPages).")
+    }
+
+    /// Every stack on the account, with its members.
+    public func stacks() async throws -> [ImmichAccountStack] {
+        let response: [StackResponse] = try await get("/stacks", authenticated: true)
+        return response.map { ImmichAccountStack(id: $0.id, primaryAssetID: $0.primaryAssetId, assetIDs: $0.assets.map(\.id)) }
+    }
+
+    /// Makes a stack with the first asset on top. Immich merges any stack
+    /// whose top asset is among `assetIDs` and takes other members out of
+    /// their stacks, so callers check membership first (`ImmichStackPlanner`).
+    public func createStack(assetIDs: [String]) async throws -> ImmichAccountStack {
+        guard assetIDs.count >= 2 else { throw ToolkitError.commandFailed("A stack needs at least two assets.") }
+        for id in assetIDs { try Self.validate(id: id, kind: "asset") }
+        let response: StackResponse = try await send(method: "POST", path: "/stacks", body: StackCreateRequest(assetIds: assetIDs))
+        return ImmichAccountStack(id: response.id, primaryAssetID: response.primaryAssetId, assetIDs: response.assets.map(\.id))
+    }
+
+    /// Puts an asset already in the stack on top.
+    public func setStackPrimary(stackID: String, assetID: String) async throws {
+        try Self.validate(id: stackID, kind: "stack")
+        try Self.validate(id: assetID, kind: "asset")
+        let _: StackResponse = try await send(method: "PUT", path: "/stacks/\(stackID)", body: StackUpdateRequest(primaryAssetId: assetID))
+    }
+
+    /// The asset's page in the Immich web app.
+    public static func webURL(serverURL: String, assetID: String) -> URL? {
+        guard (try? validate(id: assetID, kind: "asset")) != nil else { return nil }
+        return webURL(serverURL: serverURL, path: "/photos/\(assetID)")
+    }
+
+    /// The server's folder view at a library folder: `/folders?path=<full
+    /// folder path>`, as Immich's web app builds it (`Route.folders`).
+    public static func webURL(serverURL: String, folder: String) -> URL? {
+        guard var components = webURL(serverURL: serverURL, path: "/folders").flatMap({ URLComponents(url: $0, resolvingAgainstBaseURL: false) }) else { return nil }
+        components.queryItems = [URLQueryItem(name: "path", value: folder)]
+        return components.url
+    }
+
+    /// The server's home page.
+    public static func webURL(serverURL: String) -> URL? {
+        webURL(serverURL: serverURL, path: "/")
+    }
+
+    private static func webURL(serverURL: String, path: String) -> URL? {
+        guard var components = normalizedAPIBaseURL(serverURL).flatMap({ URLComponents(url: $0, resolvingAgainstBaseURL: false) }) else { return nil }
+        components.path = String(components.path.dropLast("/api".count)) + path
+        return components.url
+    }
+
+    /// The album's page in the Immich web app.
+    public static func webURL(serverURL: String, albumID: String) -> URL? {
+        guard (try? validate(id: albumID, kind: "album")) != nil,
+              var components = normalizedAPIBaseURL(serverURL).flatMap({ URLComponents(url: $0, resolvingAgainstBaseURL: false) })
+        else { return nil }
+        components.path = String(components.path.dropLast("/api".count)) + "/albums/\(albumID)"
+        return components.url
     }
 
     private static let maximumAssetPages = 10_000
@@ -282,7 +373,9 @@ private struct ServerMediaTypesResponse: Decodable {
 }
 
 private struct MetadataSearchRequest: Encodable {
-    var libraryId: String
+    var libraryId: String?
+    var albumIds: [String]?
+    var originalPath: String?
     var withDeleted: Bool
     var page: Int
     var size: Int
@@ -297,9 +390,26 @@ private struct MetadataSearchResponse: Decodable {
     var assets: Assets
 }
 
+private struct StackResponse: Decodable {
+    struct Member: Decodable { var id: String }
+    var id: String
+    var primaryAssetId: String
+    var assets: [Member]
+}
+
+private struct StackCreateRequest: Encodable {
+    var assetIds: [String]
+}
+
+private struct StackUpdateRequest: Encodable {
+    var primaryAssetId: String
+}
+
 private struct AlbumResponse: Decodable {
     var id: String
     var albumName: String
+    var assetCount: Int?
+    var ownerId: String?
 }
 
 private struct CreateAlbumRequest: Encodable {
@@ -350,13 +460,18 @@ public struct ImmichLibraryAsset: Codable, Equatable, Sendable {
     }
 }
 
-public struct ImmichAlbum: Equatable, Sendable {
+public struct ImmichAlbum: Codable, Equatable, Hashable, Identifiable, Sendable {
     public var id: String
     public var name: String
+    public var assetCount: Int?
+    /// The album's owner. Shared albums list only the key user's own assets.
+    public var ownerID: String?
 
-    public init(id: String, name: String) {
+    public init(id: String, name: String, assetCount: Int? = nil, ownerID: String? = nil) {
         self.id = id
         self.name = name
+        self.assetCount = assetCount
+        self.ownerID = ownerID
     }
 }
 

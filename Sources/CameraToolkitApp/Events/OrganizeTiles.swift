@@ -439,6 +439,8 @@ struct StackTileView: View {
     var orientation: Int? = nil
     /// The cover clip's grade (drawn graded) or that it is flat log.
     var gradeMark: TileGradeMark? = nil
+    /// The app made this burst one Immich stack.
+    var isStackedInImmich = false
     /// Toggles the inline expansion of a burst. Nil falls back to `onOpen`.
     var onExpand: (() -> Void)? = nil
     /// Opens playback for a video tile. Nil falls back to `onOpen`… callers
@@ -513,6 +515,9 @@ struct StackTileView: View {
                         Spacer(minLength: 0)
                         if let gradeMark {
                             TileGradeBadge(mark: gradeMark)
+                        }
+                        if isStackedInImmich {
+                            ImmichStackedMark()
                         }
                         if let marker = CombinedFilesMarker(stack: stack) {
                             CombinedFilesPill(marker: marker)
@@ -613,6 +618,7 @@ extension StackTileView: @preconcurrency Equatable {
             && lhs.originFolder == rhs.originFolder
             && lhs.orientation == rhs.orientation
             && lhs.gradeMark == rhs.gradeMark
+            && lhs.isStackedInImmich == rhs.isStackedInImmich
             && lhs.retryToken == rhs.retryToken
     }
 }
@@ -1174,6 +1180,9 @@ struct OrganizeGrid<MenuContent: View>: View {
     var orientationForFile: (OrganizeFile) -> Int? = { _ in nil }
     /// A tile's colour: graded picture, or a quiet flat-log marker.
     var gradeForStack: (OrganizeStack) -> TileGradeMark? = { _ in nil }
+    /// Whether the app made this burst an Immich stack, given the event the
+    /// tile is already drawn for (no other assignment read per tile).
+    var immichStackedForStack: (OrganizeStack, UUID?) -> Bool = { _, _ in false }
     /// Opens the full preview at a specific frame of the stack (0 for the
     /// usual double-click/Space path).
     let onOpen: (OrganizeStack, Int) -> Void
@@ -1430,6 +1439,7 @@ struct OrganizeGrid<MenuContent: View>: View {
                 ),
                 orientation: orientationForFile(stack.coverItem.primary),
                 gradeMark: gradeForStack(stack),
+                isStackedInImmich: stack.isBurst && immichStackedForStack(stack, assigned.event?.id),
                 onExpand: { workspace.setExpanded(stack.id, expanded: true) },
                 onPlay: { onOpen(stack, 0) },
                 onOpen: { onOpen(stack, 0) },
@@ -1800,6 +1810,9 @@ struct StackPreviewOverlay: View {
     /// Enables "Move to New Burst" on the frame and thumbnail menus: the
     /// selected frames leave this stack and stay split on later rescans.
     var onSplitItems: (([OrganizeItem]) -> Void)? = nil
+    /// "View in Immich" on the frame menu: the frame's Immich page when it is
+    /// matched, else its event. Nil hides the item.
+    var onViewInImmich: ((OrganizeItem) -> Void)? = nil
     /// Saved rotation for a file, in quarter-turns clockwise, or nil.
     var orientationForFile: (OrganizeFile) -> Int? = { _ in nil }
     /// "Rotate Burst" — applies `delta` quarter-turns clockwise to every
@@ -2467,6 +2480,10 @@ struct StackPreviewOverlay: View {
                 if !selection.selectedIDs.contains(item.id) { selection.select(index, in: stack.items) }
                 onTrashItems(targets)
             }
+        }
+        if let onViewInImmich {
+            Divider()
+            Button("View in Immich") { onViewInImmich(item) }
         }
     }
 

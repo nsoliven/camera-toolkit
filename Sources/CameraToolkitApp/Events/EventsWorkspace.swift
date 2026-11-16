@@ -736,6 +736,10 @@ final class EventsWorkspace {
     /// Test seam: hears every `followNASChangeInImmich` call, configured or not.
     @ObservationIgnored var nasChangeFollowObserver: (([NASRename]) -> Void)?
     @ObservationIgnored var immichFollowUp: Task<Void, Never>?
+    /// The Send to Immich sheet, and the send it is showing.
+    var immichSendRequest: ImmichSendRequest?
+    var immichSend: ImmichSendState?
+    @ObservationIgnored var immichSendTask: Task<Void, Never>?
     var discoveredDriveEvents: [DiscoveredDriveEvent] = []
     /// Event folders in the NAS mirror whose files no assignment covers
     /// (`NASEventDiscovery`) — "Found on the NAS" in the sidebar.

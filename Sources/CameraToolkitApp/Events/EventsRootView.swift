@@ -211,6 +211,9 @@ struct EventsRootView: View {
                 onCancel: { workspace.sortIntoRequest = nil }
             )
         }
+        .sheet(item: $workspace.immichSendRequest) { request in
+            ImmichSendSheet(model: model, workspace: workspace, request: request)
+        }
         .sheet(item: $workspace.renameRequest) { request in
             if let event = workspace.event(request.eventID) {
                 EventDetailsSheet(
@@ -632,6 +635,7 @@ struct EventsSidebar: View {
             isPrivate: isPrivate,
             fileCount: count,
             nasPending: nasPending,
+            hasImmichAlbum: event.immichAlbumID != nil,
             depth: depth,
             isDropTarget: targetedEventID == event.id,
             help: details.joined(separator: " · ")
@@ -700,13 +704,15 @@ private struct UnsortedSidebarRow: View {
 /// One event: its palette color (a lock for private events), its name, and
 /// its file count as the badge. Date, people, and drive/NAS status are in
 /// the tooltip and the board's inspector.
-private struct EventSidebarRow: View {
+struct EventSidebarRow: View {
     let name: String
     let color: Color
     let isPrivate: Bool
     let fileCount: Int
     /// Files of this event not on the NAS yet; 0 shows nothing.
     var nasPending = 0
+    /// Paired with an Immich album: a small album mark after the name.
+    var hasImmichAlbum = false
     let depth: Int
     let isDropTarget: Bool
     let help: String
@@ -716,6 +722,7 @@ private struct EventSidebarRow: View {
             HStack(spacing: 4) {
                 Text(name)
                     .lineLimit(1)
+                if hasImmichAlbum { ImmichAlbumMarker() }
                 if nasPending > 0 {
                     Spacer(minLength: 4)
                     NASPendingBadge(count: nasPending)
@@ -1160,6 +1167,15 @@ private struct EventSidebarMenu: View {
                 .help("Take this event, and its folder, out of its parent event")
         }
         Divider()
+        if workspace.immichIsConfigured {
+            Button("Send to Immich…") { workspace.requestImmichSend([event.id]) }
+                .help("Choose events, then scan now and fill their albums")
+        }
+        Button("View in Immich") {
+            if let url = workspace.model.immichWebURL(for: event) { NSWorkspace.shared.open(url) }
+        }
+        .disabled(!workspace.model.immichServerIsSet)
+        .help(workspace.model.immichServerIsSet ? "Open this event in Immich in your browser" : "Add your Immich server in Settings › Services first")
         Button("Scan for Faces…") { workspace.requestFaceScan(event) }
             .disabled(workspace.faceScanBlocker(for: event) != nil)
             .help(workspace.faceScanBlocker(for: event)

@@ -468,7 +468,7 @@ struct ServicesSettingsPane: View {
             albumsForEveryEvent: true
         ).count
         let lead = model.configuration.immichAlbumsForEveryEvent ? "" : "With this on, "
-        return "\(lead)\(withSwitchOn) of \(events.count) events \(model.configuration.immichAlbumsForEveryEvent ? "get" : "would get") an album, made on the next check. Events set to No album or Custom keep their choice; private events need Allow album."
+        return "\(lead)\(withSwitchOn) of \(events.count) events \(model.configuration.immichAlbumsForEveryEvent ? "get" : "would get") an album, made on the next check. Off, events get an album only when you pair one or choose one. Events set to No album keep their choice; private events need Allow album."
     }
 
     var body: some View {
@@ -482,6 +482,21 @@ struct ServicesSettingsPane: View {
                     )
                 )
                 SecureField("API key", text: $model.immichAPIKeyDraft)
+                LabeledContent("Saved key") {
+                    VStack(alignment: .trailing, spacing: 4) {
+                        Text(model.immichKeyIsSaved ? "Saved in the Keychain" : "No API key saved")
+                            .foregroundStyle(model.immichKeyIsSaved ? Color.secondary : Color.orange)
+                        if !model.immichKeyIsSaved, !model.immichEarlierKeyServices.isEmpty {
+                            Button("Move Key from “\(model.immichEarlierKeyServices[0])”") { model.moveEarlierImmichKey() }
+                                .controlSize(.small)
+                                .help("An earlier Camera Toolkit build saved an Immich key under this Keychain entry. This copies it into this build's entry; macOS asks first, and the old entry is left as it is.")
+                        }
+                    }
+                }
+                Text("Use a key from the account that owns the library, with: library read and scan, asset read and update, album read, create and add, stack read, create, update and delete (only the app's own stacks are ever removed).")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .onAppear { model.refreshImmichKeyStatus() }
                 LabeledContent("Status") {
                     Text(model.immichConnectionStatus)
                         .foregroundStyle(.secondary)
@@ -509,6 +524,16 @@ struct ServicesSettingsPane: View {
                     }
                 }
                 .disabled(model.immichLibraries.isEmpty && model.configuration.immichLibraryID.isEmpty)
+                HStack {
+                    Button(model.immichIsPairing ? "Pairing…" : "Pair Albums") { model.pairImmichAlbums() }
+                        .disabled(model.immichIsPairing || model.configuration.immichLibraryID.isEmpty)
+                        .help("Reads every album on your Immich account and pairs each with its event when the match is clear. Nothing is changed in Immich.")
+                    if !model.immichPairingNote.isEmpty {
+                        Text(model.immichPairingNote)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
                 Toggle("Make an album for every event", isOn: Binding(
                     get: { model.configuration.immichAlbumsForEveryEvent },
                     set: { model.setImmichAlbumsForEveryEvent($0) }
@@ -516,6 +541,11 @@ struct ServicesSettingsPane: View {
                 Text(immichAlbumCountText)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                Toggle("Stack bursts and edits in Immich", isOn: Binding(
+                    get: { model.configuration.immichStacksBurstsAndEdits },
+                    set: { model.setImmichStacksBurstsAndEdits($0) }
+                ))
+                .help("Each burst, RAW+JPEG pair, and original with its edit becomes one Immich stack, cover on top. Stacks someone else made are left alone; the app never deletes a stack.")
                 Toggle("Keep renamed files in their albums", isOn: Binding(
                     get: { model.configuration.immichCarriesAlbumsAcrossRenames },
                     set: { model.setImmichCarriesAlbumsAcrossRenames($0) }
@@ -524,6 +554,17 @@ struct ServicesSettingsPane: View {
                 Text("Immich reads the NAS itself: pick the external library whose folder is your NAS library. The app asks it to scan after Sync to NAS and renames, and shows what it found on each event. It never uploads.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+            }
+
+            if !model.configuration.immichLibraryID.isEmpty {
+                Section("Immich Albums") {
+                    ImmichPairsListView(
+                        pairs: model.immichPairRows,
+                        unpaired: model.immichUnpairedRows,
+                        onUnpair: { model.unpairImmichAlbum(for: $0) }
+                    )
+                    .onAppear { model.loadImmichAlbumStates() }
+                }
             }
 
             Section {
