@@ -53,8 +53,9 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
     /// library is chosen either way.
     public var immichAlbumsForEveryEvent: Bool
     /// Make each burst, RAW+JPEG pair and original-with-edit one Immich
-    /// stack on each check. Only the app's own stacks are ever made or
-    /// extended; stacks someone else made are left alone.
+    /// stack on each check. Off unless the owner turns it on. Only the app's
+    /// own stacks are ever made, replaced or removed; stacks someone else
+    /// made are left alone.
     public var immichStacksBurstsAndEdits: Bool
     public var trueNASServerURL: String
     public var trueNASUsername: String
@@ -114,7 +115,7 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         immichLibraryID: String = "",
         immichCarriesAlbumsAcrossRenames: Bool = false,
         immichAlbumsForEveryEvent: Bool = false,
-        immichStacksBurstsAndEdits: Bool = true,
+        immichStacksBurstsAndEdits: Bool = false,
         trueNASServerURL: String = "",
         trueNASUsername: String = "",
         trueNASDataset: String = "",
@@ -694,6 +695,12 @@ public struct SavedCameraEvent: Identifiable, Codable, Equatable, Hashable, Send
     /// `.custom` and `immichAlbumName` holds the album's last-known name, so
     /// a build that predates pairing still fills the same album by name.
     public var immichAlbumID: String?
+    /// For a paired album: whether checks add the whole event to it. `false`
+    /// is a picks album (linked, not filled). Nil fills.
+    public var immichAlbumFill: Bool?
+    /// The album came from "Make an album for every event", not from the
+    /// owner's own choice; turning that switch off stops filling it.
+    public var immichAlbumAutomatic: Bool?
 
     public init(
         id: UUID = UUID(),

@@ -53,6 +53,7 @@ public enum ImmichPairCommand {
         environment: [String: String] = ProcessInfo.processInfo.environment,
         defaultSupportFolder: URL,
         apiKey: () throws -> String?,
+        isAppRunning: () -> Bool = { false },
         transport: HTTPTransport = URLSession.shared,
         output: @escaping (String) -> Void = { print($0) }
     ) async -> Int32 {
@@ -69,13 +70,15 @@ public enum ImmichPairCommand {
             configuration.savedEvents = state.savedEvents
             configuration.photoEventAssignments = state.photoEventAssignments
 
+            if isAppRunning() { output("Note: Camera Toolkit is running. This only reads, but the numbers can change while it works.") }
             let client = try ImmichClient(serverURL: serverURL, apiKey: key, transport: transport)
             let library = try ImmichStacksCommand.library(chosenID: configuration.immichLibraryID, libraries: try await client.libraries())
             output("Library: \(library.name)")
             let locations = EventStorageLocations(configuration: configuration)
             let files = ImmichCatalogFile.build(assignments: state.photoEventAssignments, events: state.savedEvents, locations: locations, verifiedPathKeys: [])
             let albums = try await ImmichAlbumPairing.readAlbums(client: client)
-            let result = ImmichAlbumPairing.pair(albums: albums, events: state.savedEvents, files: files, library: library, locations: locations)
+            let me = try? await client.currentUserID()
+            let result = ImmichAlbumPairing.pair(albums: albums, events: state.savedEvents, files: files, library: library, locations: locations, currentUserID: me)
             output(summaryText(result, albums: albums.count, events: state.savedEvents, list: parsed.list))
             return 0
         } catch {
@@ -89,6 +92,7 @@ public enum ImmichPairCommand {
         var lines = ["Albums on the account: \(albums)"]
         let byBasis = Dictionary(grouping: result.pairs, by: \.basis).mapValues(\.count)
         lines.append("Would pair: \(result.pairs.count) (by name \(byBasis[.name] ?? 0), by photos \(byBasis[.contents] ?? 0), by both \(byBasis[.nameAndContents] ?? 0))")
+        lines.append("  of them kept filled (event albums): \(result.pairs.count(where: \.fills)); linked only (picks albums): \(result.pairs.count { !$0.fills })")
         lines.append("Already paired, left as they are: \(result.alreadyPaired)")
         lines.append("Would not pair: \(result.unpaired.count)")
         let reasons = Dictionary(grouping: result.unpaired, by: { reasonKey($0.reason) })
@@ -98,7 +102,7 @@ public enum ImmichPairCommand {
         if list {
             lines.append("")
             for pair in result.pairs {
-                lines.append("pair  \(pair.album.name)  ↔  \(names[pair.eventID] ?? "?")  [\(pair.basis.rawValue), \(pair.matchedAssets) matched]")
+                lines.append("pair  \(pair.album.name)  ↔  \(names[pair.eventID] ?? "?")  [\(pair.basis.rawValue), \(pair.matchedAssets) matched, \(pair.fills ? "kept filled" : "picks, not filled")]")
             }
             for row in result.unpaired {
                 lines.append("skip  \(row.album.name)  —  \(row.reason.text)\(row.eventID.flatMap { names[$0] }.map { " (\($0))" } ?? "")")

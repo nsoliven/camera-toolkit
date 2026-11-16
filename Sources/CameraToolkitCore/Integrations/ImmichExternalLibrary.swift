@@ -117,23 +117,30 @@ public enum ImmichAlbumNaming {
         albumsForEveryEvent: Bool
     ) -> [UUID: ImmichAlbumTarget] {
         var targets: [UUID: ImmichAlbumTarget] = [:]
-        var namedAfterEvent: [String: [SavedCameraEvent]] = [:]
+        // Events whose album is found by their name, and paired events with
+        // the same name: two of them mean the named ones get the date.
+        var sameName: [String: (named: [SavedCameraEvent], paired: Int)] = [:]
         for event in events {
             let isPrivate = locations.resolvedPolicy(for: event) == .archiveOnly
-            if isPrivate, !event.sendsToImmich { continue }
             if let id = event.immichAlbumID, !id.isEmpty {
+                sameName[NASSyncStore.pathKey(event.name), default: ([], 0)].paired += 1
+                if isPrivate, !event.sendsToImmich { continue }
+                // A picks album is linked, not filled; an automatic album stops
+                // filling when "Make an album for every event" is off.
+                guard event.fillsImmichAlbum, event.immichAlbumAutomatic != true || albumsForEveryEvent else { continue }
                 let name = event.immichAlbumName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                 targets[event.id] = .existing(id: id, name: name.isEmpty ? event.name : name)
                 continue
             }
+            if isPrivate, !event.sendsToImmich { continue }
             guard let title = event.immichAlbumTitle(isPrivate: isPrivate, albumsForEveryEvent: albumsForEveryEvent) else { continue }
             targets[event.id] = .named(title)
             if event.effectiveImmichAlbumPolicy(albumsForEveryEvent: albumsForEveryEvent) == .event {
-                namedAfterEvent[NASSyncStore.pathKey(title), default: []].append(event)
+                sameName[NASSyncStore.pathKey(title), default: ([], 0)].named.append(event)
             }
         }
-        for group in namedAfterEvent.values where group.count > 1 {
-            for event in group {
+        for group in sameName.values where group.named.count + group.paired > 1 {
+            for event in group.named {
                 targets[event.id] = .named(datedTitle(for: event))
             }
         }
@@ -708,15 +715,35 @@ public struct ImmichLibrarySync: Sendable {
     public var catalogURL: URL
     public var carriesAlbumsAcrossRenames: Bool
     public var stacksBurstsAndEdits: Bool
+    /// Albums paired with events. An album made or found by name never
+    /// resolves to one of these, so it cannot take over another event's album.
+    public var reservedAlbumIDs: Set<String>
+    /// Events whose files may be stacked (private events need Allow album).
+    public var stackableEventIDs: Set<UUID>?
+    /// Where every album addition and stack change is logged (JSON lines),
+    /// so it can be undone. Nil logs nothing.
+    public var logFolder: URL?
 
     private static let albumBatchSize = 500
 
-    public init(client: ImmichClient, libraryID: String, catalogURL: URL, carriesAlbumsAcrossRenames: Bool = false, stacksBurstsAndEdits: Bool = false) {
+    public init(
+        client: ImmichClient,
+        libraryID: String,
+        catalogURL: URL,
+        carriesAlbumsAcrossRenames: Bool = false,
+        stacksBurstsAndEdits: Bool = false,
+        reservedAlbumIDs: Set<String> = [],
+        stackableEventIDs: Set<UUID>? = nil,
+        logFolder: URL? = nil
+    ) {
         self.client = client
         self.libraryID = libraryID
         self.catalogURL = catalogURL
         self.carriesAlbumsAcrossRenames = carriesAlbumsAcrossRenames
         self.stacksBurstsAndEdits = stacksBurstsAndEdits
+        self.reservedAlbumIDs = reservedAlbumIDs
+        self.stackableEventIDs = stackableEventIDs
+        self.logFolder = logFolder
     }
 
     public func requestScan() async throws {
@@ -785,14 +812,18 @@ public struct ImmichLibrarySync: Sendable {
                               relative.localizedCaseInsensitiveContains("/Edited/") else { return nil }
                         return relative
                     }
+                    let stackable = stackableEventIDs.map { allowed in files.filter { $0.eventID.map(allowed.contains) ?? false } } ?? files
+                    let stackLog = logFolder?.appendingPathComponent("stacks.jsonl")
                     outcome.stacks = try await ImmichStackRunner.run(
                         client: client,
-                        groups: ImmichStackGrouping.groups(files: files, editPaths: editPaths),
+                        groups: ImmichStackGrouping.groups(files: stackable, editPaths: editPaths),
                         assets: assets,
                         library: library,
                         store: ImmichStackStore(catalogURL: catalogURL),
                         dryRun: false
-                    )
+                    ) { entry in
+                        if let stackLog { ImmichChangeLog.append(entry, to: stackLog) }
+                    }
                     outcome.problems += outcome.stacks?.problems ?? []
                 } catch {
                     outcome.problems.append("stacks: \(error.localizedDescription)")
@@ -824,14 +855,20 @@ public struct ImmichLibrarySync: Sendable {
     ) async {
         guard !report.albumAssets.isEmpty else { return }
         let account: [ImmichAlbum]
+        let me: String?
         do {
             account = try await client.albums()
+            me = try? await client.currentUserID()
         } catch {
             outcome.problems.append("albums: \(error.localizedDescription)")
             return
         }
         let byID = Dictionary(account.map { ($0.id, $0) }) { first, _ in first }
-        var byName = Dictionary(account.map { ($0.name, $0) }) { first, _ in first }
+        // By name, only the user's own albums that no other event is paired with.
+        var byName = Dictionary(account.filter { album in
+            !reservedAlbumIDs.contains(album.id) && (me == nil || album.ownerID == nil || album.ownerID == me)
+        }.map { ($0.name, $0) }) { first, _ in first }
+        let additionsLog = logFolder?.appendingPathComponent("album-additions.jsonl")
         for target in report.albumAssets.keys.sorted(by: { $0.displayName < $1.displayName }) {
             let wanted = report.albumAssets[target] ?? []
             let eventIDs = report.albumEvents[target] ?? []
@@ -866,7 +903,11 @@ public struct ImmichLibrarySync: Sendable {
                     let result = try await client.addAssets(batch, toAlbum: album.id)
                     outcome.addedToAlbums += result.added
                     failed.formUnion(result.failed.keys)
-                    members.formUnion(batch.filter { !result.failed.keys.contains($0) })
+                    let added = batch.filter { !result.failed.keys.contains($0) }
+                    members.formUnion(added)
+                    if let additionsLog, !added.isEmpty {
+                        ImmichChangeLog.append(ImmichAlbumAdditionEntry(albumID: album.id, albumName: album.name, assetIDs: added), to: additionsLog)
+                    }
                 }
                 if !failed.isEmpty {
                     outcome.problems.append("\(failed.count) not added to album “\(album.name)”")
@@ -914,5 +955,43 @@ public struct ImmichLibrarySync: Sendable {
             }
         }
         try store.remove(keys: plan.settledMoveKeys.subtracting(failedMoves))
+    }
+}
+
+/// One album addition, as logged: what to remove to undo it.
+public struct ImmichAlbumAdditionEntry: Codable, Equatable, Sendable {
+    public var at: Date
+    public var albumID: String
+    public var albumName: String
+    public var assetIDs: [String]
+
+    public init(at: Date = Date(), albumID: String, albumName: String, assetIDs: [String]) {
+        self.at = at
+        self.albumID = albumID
+        self.albumName = albumName
+        self.assetIDs = assetIDs
+    }
+}
+
+/// Appends JSON lines to a change log. A failed write never stops the work it
+/// records; the catalog keeps the app's own stacks either way.
+public enum ImmichChangeLog {
+    private static let lock = NSLock()
+
+    public static func append<Entry: Encodable>(_ entry: Entry, to url: URL) {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.sortedKeys]
+        guard let data = try? encoder.encode(entry) else { return }
+        lock.withLock {
+            try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            if !FileManager.default.fileExists(atPath: url.path) {
+                FileManager.default.createFile(atPath: url.path, contents: nil)
+            }
+            guard let handle = try? FileHandle(forWritingTo: url) else { return }
+            defer { try? handle.close() }
+            _ = try? handle.seekToEnd()
+            try? handle.write(contentsOf: data + Data("\n".utf8))
+        }
     }
 }

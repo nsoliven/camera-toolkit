@@ -49,7 +49,8 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate, NSMenuIte
                 let status = await ImmichPairCommand.run(
                     arguments: arguments,
                     defaultSupportFolder: support,
-                    apiKey: { try KeychainSecretStore(service: DashboardModel.keychainService).read(account: DashboardModel.immichAPIKeyAccount) }
+                    apiKey: { try KeychainSecretStore(service: DashboardModel.keychainService).read(account: DashboardModel.immichAPIKeyAccount) },
+                    isAppRunning: { LayoutMigrationAppGuard.otherInstanceIsRunning() }
                 )
                 result.set(status)
                 semaphore.signal()
@@ -67,7 +68,8 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate, NSMenuIte
                 let status = await ImmichStacksCommand.run(
                     arguments: arguments,
                     defaultSupportFolder: support,
-                    apiKey: { try KeychainSecretStore(service: DashboardModel.keychainService).read(account: DashboardModel.immichAPIKeyAccount) }
+                    apiKey: { try KeychainSecretStore(service: DashboardModel.keychainService).read(account: DashboardModel.immichAPIKeyAccount) },
+                    isAppRunning: { LayoutMigrationAppGuard.otherInstanceIsRunning() }
                 )
                 result.set(status)
                 semaphore.signal()

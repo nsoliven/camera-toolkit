@@ -48,12 +48,12 @@ public enum ImmichStackGrouping {
     public static func groups(files: [ImmichCatalogFile], editPaths: [String] = []) -> [ImmichStackGroup] {
         var result: [ImmichStackGroup] = []
         let byEvent = Dictionary(grouping: files.filter { $0.eventID != nil }, by: { $0.eventID! })
-        // Edits by event folder (`<year>/<event folder>`).
+        // Edits by the event folder that holds their `Edited` folder, so a
+        // parent's edits never join a subevent's photos or the other way round.
         var editsByFolder: [String: [String]] = [:]
         for path in editPaths {
-            let parts = path.split(separator: "/", omittingEmptySubsequences: true)
-            guard parts.count > 3, let index = parts.firstIndex(where: { $0.caseInsensitiveCompare("Edited") == .orderedSame }), index >= 2 else { continue }
-            editsByFolder[parts.prefix(2).joined(separator: "/"), default: []].append(path)
+            guard let folder = ownFolder(of: path, marker: "Edited") else { continue }
+            editsByFolder[folder, default: []].append(path)
         }
 
         for eventID in byEvent.keys.sorted(by: { $0.uuidString < $1.uuidString }) {
@@ -88,10 +88,7 @@ public enum ImmichStackGrouping {
 
             // Edits join their original's group: on top of a pair or a single,
             // right under the cover of a burst.
-            let folders = Set(eventFiles.compactMap { file -> String? in
-                let parts = file.relativePath.split(separator: "/", omittingEmptySubsequences: true)
-                return parts.count > 2 ? parts.prefix(2).joined(separator: "/") : nil
-            })
+            let folders = Set(eventFiles.compactMap { ownFolder(of: $0.relativePath, marker: "Originals") })
             var edits: [Int: [String]] = [:]
             for folder in folders.sorted() {
                 for edit in (editsByFolder[folder] ?? []).sorted() {
@@ -119,6 +116,20 @@ public enum ImmichStackGrouping {
             }
         }
         return result
+    }
+
+    /// The event folder a file sits in: everything before its `Originals`
+    /// (or `Edited`) folder, e.g. `2026/2026-01-01 Trip/Beach`.
+    static func ownFolder(of path: String, marker: String) -> String? {
+        let parts = path.split(separator: "/", omittingEmptySubsequences: true)
+        guard let index = parts.lastIndex(where: { $0.caseInsensitiveCompare(marker) == .orderedSame }), index >= 1, index < parts.count - 1 else { return nil }
+        return parts[..<index].joined(separator: "/").lowercased()
+    }
+
+    /// The files whose events may be stacked: a private event's only when
+    /// Allow album is on for it.
+    public static func stackableEventIDs(events: [SavedCameraEvent], locations: EventStorageLocations) -> Set<UUID> {
+        Set(events.filter { locations.resolvedPolicy(for: $0) != .archiveOnly || $0.sendsToImmich }.map(\.id))
     }
 
     private static func paths(of item: OrganizeItem) -> [String] {
@@ -153,19 +164,50 @@ public struct ImmichAccountStack: Equatable, Sendable {
 /// A stack the app made.
 public struct ImmichStackRecord: Codable, Equatable, Sendable {
     public var key: String
+    /// Empty while the app has removed its old stack to rebuild it.
     public var stackID: String
     public var eventID: UUID
     public var kind: ImmichStackKind
     public var assetIDs: [String]
     public var createdAt: Date
+    /// The stack is gone from Immich (someone unstacked it there), so the app
+    /// never makes it again.
+    public var removedInImmich: Bool?
 
-    public init(key: String, stackID: String, eventID: UUID, kind: ImmichStackKind, assetIDs: [String], createdAt: Date = Date()) {
+    public init(key: String, stackID: String, eventID: UUID, kind: ImmichStackKind, assetIDs: [String], createdAt: Date = Date(), removedInImmich: Bool? = nil) {
         self.key = key
         self.stackID = stackID
         self.eventID = eventID
         self.kind = kind
         self.assetIDs = assetIDs
         self.createdAt = createdAt
+        self.removedInImmich = removedInImmich
+    }
+}
+
+/// One line of the stack change log.
+public struct ImmichStackLogEntry: Codable, Equatable, Sendable {
+    public enum Action: String, Codable, Sendable {
+        case created
+        /// The app removed its own earlier stack before making the group again.
+        case removedOwn
+        /// A create whose answer was lost: the stack with exactly these
+        /// assets was found and taken as the app's.
+        case adopted
+    }
+
+    public var at: Date
+    public var action: Action
+    public var stackID: String
+    public var groupKey: String
+    public var assetIDs: [String]
+
+    public init(at: Date = Date(), action: Action, stackID: String, groupKey: String, assetIDs: [String]) {
+        self.at = at
+        self.action = action
+        self.stackID = stackID
+        self.groupKey = groupKey
+        self.assetIDs = assetIDs
     }
 }
 
@@ -174,7 +216,9 @@ public struct ImmichStackPlan: Equatable, Sendable {
         public var group: ImmichStackGroup
         /// Top first.
         public var assetIDs: [String]
-        /// The app's own stack this one replaces (a frame was added or renamed).
+        /// The app's own stack to remove first (a member left or a frame was
+        /// renamed). Removing it, rather than letting Immich merge it, keeps a
+        /// departed member from being pulled back in.
         public var replacing: String?
     }
 
@@ -184,6 +228,8 @@ public struct ImmichStackPlan: Equatable, Sendable {
             case notInImmich(found: Int, of: Int)
             /// Some of its photos are in a stack the app did not make.
             case inSomeoneElsesStack(stackID: String)
+            /// The app made it once and it was unstacked in Immich since.
+            case removedInImmich
         }
 
         public var group: ImmichStackGroup
@@ -193,14 +239,18 @@ public struct ImmichStackPlan: Equatable, Sendable {
     public var creates: [Create] = []
     public var unchanged = 0
     public var skipped: [Skip] = []
+    /// Groups whose stack disappeared from Immich since the last run.
+    public var newlyRemoved: [String] = []
 
     public var skippedNotInImmich: Int { skipped.count { if case .notInImmich = $0.reason { true } else { false } } }
     public var skippedForeign: Int { skipped.count { if case .inSomeoneElsesStack = $0.reason { true } else { false } } }
+    public var skippedRemoved: Int { skipped.count { $0.reason == .removedInImmich } }
 
     public var summary: String {
         var parts = ["\(creates.count.formatted()) stack\(creates.count == 1 ? "" : "s") to make", "\(unchanged.formatted()) already stacked by the app"]
         if skippedNotInImmich > 0 { parts.append("\(skippedNotInImmich.formatted()) not matched in Immich") }
         if skippedForeign > 0 { parts.append("\(skippedForeign.formatted()) left alone (already in a stack the app did not make)") }
+        if skippedRemoved > 0 { parts.append("\(skippedRemoved.formatted()) unstacked in Immich, not made again") }
         return parts.joined(separator: ", ")
     }
 }
@@ -210,6 +260,8 @@ public enum ImmichStackPlanner {
     /// app did not make. Immich's create merges any stack whose top photo is
     /// among the IDs and pulls other members out of their stacks, so a group
     /// with any photo in someone else's stack is skipped, not created.
+    /// A stack the user unstacked is not made again; one whose cover they
+    /// changed is left as it is.
     public static func plan(
         groups: [ImmichStackGroup],
         assets: [ImmichLibraryAsset],
@@ -228,10 +280,20 @@ public enum ImmichStackPlanner {
             for id in stack.assetIDs { stackOfAsset[id] = stack }
         }
         let accountByID = Dictionary(accountStacks.map { ($0.id, $0) }) { first, _ in first }
-        let ours = Set(records.values.map(\.stackID))
+        let ours = Set(records.values.map(\.stackID).filter { !$0.isEmpty })
 
         var plan = ImmichStackPlan()
         for group in groups {
+            let record = records[group.key]
+            if record?.removedInImmich == true {
+                plan.skipped.append(.init(group: group, reason: .removedInImmich))
+                continue
+            }
+            if let record, !record.stackID.isEmpty, accountByID[record.stackID] == nil {
+                plan.skipped.append(.init(group: group, reason: .removedInImmich))
+                plan.newlyRemoved.append(group.key)
+                continue
+            }
             var ids: [String] = []
             for path in group.relativePaths {
                 if let id = assetByKey[NASSyncStore.pathKey(path)], !ids.contains(id) { ids.append(id) }
@@ -244,13 +306,13 @@ public enum ImmichStackPlanner {
                 plan.skipped.append(.init(group: group, reason: .inSomeoneElsesStack(stackID: foreign.id)))
                 continue
             }
-            let record = records[group.key]
-            if let record, let current = accountByID[record.stackID],
-               current.primaryAssetID == ids[0], Set(current.assetIDs) == Set(ids) {
+            if let record, let current = accountByID[record.stackID], Set(current.assetIDs) == Set(ids) {
+                // Any cover: the user may have picked another.
                 plan.unchanged += 1
                 continue
             }
-            plan.creates.append(.init(group: group, assetIDs: ids, replacing: record?.stackID))
+            let replacing = record.flatMap { accountByID[$0.stackID] != nil ? $0.stackID : nil }
+            plan.creates.append(.init(group: group, assetIDs: ids, replacing: replacing))
         }
         return plan
     }
@@ -299,9 +361,9 @@ public final class ImmichStackStore: @unchecked Sendable {
         }
     }
 
-    /// Stacks per event, for the event header.
+    /// Live stacks per event, for the event header.
     public func countsByEvent() throws -> [UUID: Int] {
-        try records().values.reduce(into: [:]) { $0[$1.eventID, default: 0] += 1 }
+        try records().values.filter { !$0.stackID.isEmpty && $0.removedInImmich != true }.reduce(into: [:]) { $0[$1.eventID, default: 0] += 1 }
     }
 }
 
@@ -319,8 +381,9 @@ public struct ImmichStackRunReport: Equatable, Sendable {
 }
 
 public enum ImmichStackRunner {
-    /// Plans and, unless `dryRun`, creates the stacks. Only ever creates or
-    /// replaces the app's own stacks; never deletes one.
+    /// Plans and, unless `dryRun`, makes the stacks. Only ever makes, replaces
+    /// or removes the app's own stacks. The writes run to the end even when
+    /// the caller is cancelled, so no stack is made without being recorded.
     public static func run(
         client: ImmichClient,
         groups: [ImmichStackGroup],
@@ -328,22 +391,59 @@ public enum ImmichStackRunner {
         library: ImmichLibrary,
         store: ImmichStackStore,
         dryRun: Bool,
-        log: ((ImmichStackRecord) -> Void)? = nil
+        log: (@Sendable (ImmichStackLogEntry) -> Void)? = nil
     ) async throws -> ImmichStackRunReport {
         let accountStacks = try await client.stacks()
-        let plan = ImmichStackPlanner.plan(groups: groups, assets: assets, library: library, accountStacks: accountStacks, records: try store.records())
+        let records = try store.records()
+        let plan = ImmichStackPlanner.plan(groups: groups, assets: assets, library: library, accountStacks: accountStacks, records: records)
+        guard !dryRun else { return ImmichStackRunReport(plan: plan) }
+        return await Task.detached {
+            await execute(plan, client: client, store: store, records: records, log: log)
+        }.value
+    }
+
+    private static func execute(
+        _ plan: ImmichStackPlan,
+        client: ImmichClient,
+        store: ImmichStackStore,
+        records: [String: ImmichStackRecord],
+        log: (@Sendable (ImmichStackLogEntry) -> Void)?
+    ) async -> ImmichStackRunReport {
         var report = ImmichStackRunReport(plan: plan)
-        guard !dryRun else { return report }
+        for key in plan.newlyRemoved {
+            guard var record = records[key] else { continue }
+            record.removedInImmich = true
+            try? store.save(record)
+        }
         for create in plan.creates {
+            let group = create.group
             do {
-                var stack = try await client.createStack(assetIDs: create.assetIDs)
-                if stack.primaryAssetID != create.assetIDs[0] {
+                if let old = create.replacing {
+                    try await client.deleteStack(stackID: old)
+                    log?(ImmichStackLogEntry(action: .removedOwn, stackID: old, groupKey: group.key, assetIDs: records[group.key]?.assetIDs ?? []))
+                    // Until the new stack exists, the record says the app is rebuilding it.
+                    try store.save(ImmichStackRecord(key: group.key, stackID: "", eventID: group.eventID, kind: group.kind, assetIDs: create.assetIDs))
+                }
+                var stack: ImmichAccountStack
+                var action = ImmichStackLogEntry.Action.created
+                do {
+                    stack = try await client.createStack(assetIDs: create.assetIDs)
+                } catch {
+                    // The answer may have been lost after Immich made it.
+                    guard let found = try? await client.stacks().first(where: { Set($0.assetIDs) == Set(create.assetIDs) }) else { throw error }
+                    stack = found
+                    action = .adopted
+                }
+                if stack.primaryAssetID != create.assetIDs[0], stack.assetIDs.contains(create.assetIDs[0]) {
                     try await client.setStackPrimary(stackID: stack.id, assetID: create.assetIDs[0])
                     stack.primaryAssetID = create.assetIDs[0]
                 }
-                let record = ImmichStackRecord(key: create.group.key, stackID: stack.id, eventID: create.group.eventID, kind: create.group.kind, assetIDs: create.assetIDs)
+                if Set(stack.assetIDs) != Set(create.assetIDs) {
+                    report.problems.append("stack \(stack.id) holds \(stack.assetIDs.count) assets, not the \(create.assetIDs.count) asked for")
+                }
+                let record = ImmichStackRecord(key: group.key, stackID: stack.id, eventID: group.eventID, kind: group.kind, assetIDs: stack.assetIDs)
                 try store.save(record)
-                log?(record)
+                log?(ImmichStackLogEntry(action: action, stackID: stack.id, groupKey: group.key, assetIDs: stack.assetIDs))
                 report.created.append(record)
             } catch {
                 report.problems.append(error.localizedDescription)

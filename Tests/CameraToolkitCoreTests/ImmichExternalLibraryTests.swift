@@ -406,6 +406,39 @@ final class ImmichLibrarySyncTests: XCTestCase {
         XCTAssertEqual(try ImmichEventAlbumStore(catalogURL: catalogURL).all()[trip]?.albumName, "Trip 2026")
     }
 
+    func testANamedAlbumNeverTakesOverAnotherEventsPairedAlbum() async throws {
+        let files = try prepareCatalog(count: 1, album: .named("Trip 2026"))
+        let transport = transport(assets: [asset("a1", "2026/T/1.jpg")])
+        transport.respond("POST", "/api/search/metadata", bodies: [searchPage([asset("a1", "2026/T/1.jpg")], nextPage: nil), searchPage([], nextPage: nil)])
+        transport.respond("GET", "/api/albums", body: #"[{"id":"taken","albumName":"Trip 2026"}]"#)
+        transport.respond("POST", "/api/albums", status: 201, body: #"{"id":"fresh","albumName":"Trip 2026"}"#)
+        transport.respond("PUT", "/api/albums/fresh/assets", body: #"[{"id":"a1","success":true}]"#)
+        var sync = try sync(transport)
+        sync.reservedAlbumIDs = ["taken"]
+
+        let outcome = try await sync.check(files: files)
+
+        XCTAssertEqual(outcome.resolvedAlbums[trip]?.id, "fresh")
+        XCTAssertFalse(transport.requests.contains { $0.url?.path == "/api/albums/taken/assets" })
+    }
+
+    func testEveryAlbumAdditionIsLogged() async throws {
+        let files = try prepareCatalog(count: 1, album: .existing(id: "album-9", name: "Trip"))
+        let transport = transport(assets: [asset("a1", "2026/T/1.jpg")])
+        transport.respond("POST", "/api/search/metadata", bodies: [searchPage([asset("a1", "2026/T/1.jpg")], nextPage: nil), searchPage([], nextPage: nil)])
+        transport.respond("GET", "/api/albums", body: #"[{"id":"album-9","albumName":"Trip"}]"#)
+        transport.respond("PUT", "/api/albums/album-9/assets", body: #"[{"id":"a1","success":true}]"#)
+        var sync = try sync(transport)
+        let logs = catalogURL.deletingLastPathComponent().appendingPathComponent("Immich Logs", isDirectory: true)
+        sync.logFolder = logs
+
+        _ = try await sync.check(files: files)
+
+        let line = try String(contentsOf: logs.appendingPathComponent("album-additions.jsonl"), encoding: .utf8)
+        XCTAssertTrue(line.contains(#""albumID":"album-9""#))
+        XCTAssertTrue(line.contains(#""assetIDs":["a1"]"#))
+    }
+
     func testPairedAlbumGetsOnlyWhatIsMissingAndNothingIsRemoved() async throws {
         let files = try prepareCatalog(count: 3, album: .existing(id: "album-9", name: "Old Name"))
         let assets = [asset("a1", "2026/T/1.jpg"), asset("a2", "2026/T/2.jpg"), asset("a3", "2026/T/3.jpg")]
@@ -593,7 +626,7 @@ final class ImmichAlbumPairingTests: XCTestCase {
         (1...count).map { file("\(event.id)|\($0)", "\(folder)/\($0).jpg", event: event.id) }
     }
 
-    private func pair(_ albums: [ImmichAlbumContents], _ events: [SavedCameraEvent], _ files: [ImmichCatalogFile] = []) -> ImmichPairingResult {
+    private func pair(_ albums: [ImmichAlbumContents], _ events: [SavedCameraEvent], _ files: [ImmichCatalogFile] = [], currentUserID: String? = nil) -> ImmichPairingResult {
         // Private policy resolves through the events' own list.
         var configuration = AppConfiguration(
             demoRootPath: "/tmp/demo", importSourcePath: "/tmp/card", archivePath: "/tmp/lib/Originals",
@@ -601,7 +634,7 @@ final class ImmichAlbumPairingTests: XCTestCase {
             activityLogPath: "/tmp/a.jsonl"
         )
         configuration.savedEvents = events
-        return ImmichAlbumPairing.pair(albums: albums, events: events, files: files, library: library(), locations: EventStorageLocations(configuration: configuration))
+        return ImmichAlbumPairing.pair(albums: albums, events: events, files: files, library: library(), locations: EventStorageLocations(configuration: configuration), currentUserID: currentUserID)
     }
 
     func testPairsByNameIgnoringCaseAndUnicodeSpelling() {
@@ -677,6 +710,62 @@ final class ImmichAlbumPairingTests: XCTestCase {
         XCTAssertEqual(result.unpaired.first { $0.album.id == "o" }?.reason, .eventOptedOut)
         XCTAssertEqual(result.unpaired.first { $0.album.id == "t" }?.reason, .eventAlreadyPaired)
         XCTAssertEqual(result.alreadyPaired, 1)
+    }
+
+    // MARK: F1
+
+    func testSharedAlbumsAreNeverPaired() {
+        let event = SavedCameraEvent(name: "Beach Day", eventDate: date)
+        var shared = album("x", "Beach Day")
+        shared.album.ownerID = "friend"
+        let result = pair([shared], [event], [], currentUserID: "me")
+        XCTAssertTrue(result.pairs.isEmpty)
+        XCTAssertEqual(result.unpaired.first?.reason, .sharedWithYou)
+    }
+
+    func testTheAlbumsOwnCountDecidesTheShare() {
+        // A big album listing only ten of this event's photos is mostly others.
+        let trip = SavedCameraEvent(name: "Trip 2026", eventDate: date)
+        var big = album("x", "Shared Trip", paths: (1...10).map { "2026/T/\($0).jpg" })
+        big.album.assetCount = 500
+        let result = pair([big], [trip], files(trip, folder: "2026/T", count: 10))
+        XCTAssertTrue(result.pairs.isEmpty)
+        XCTAssertEqual(result.unpaired.first?.reason, .mixed(topShare: 0.02))
+    }
+
+    func testAPicksAlbumIsLinkedButNotFilled() {
+        // 20 picks out of a 100-photo event: clearly this event's, but not the whole event.
+        let trip = SavedCameraEvent(name: "Trip 2026", eventDate: date)
+        let picks = album("picks", "Best of the Trip", paths: (1...20).map { "2026/T/\($0).jpg" })
+        let whole = SavedCameraEvent(name: "Beach Day", eventDate: date)
+        let eventAlbum = album("whole", "Beach Day", paths: (1...9).map { "2026/B/\($0).jpg" })
+        let result = pair([picks, eventAlbum], [trip, whole], files(trip, folder: "2026/T", count: 100) + files(whole, folder: "2026/B", count: 10))
+        XCTAssertEqual(result.pairs.first { $0.album.id == "picks" }?.fills, false)
+        XCTAssertEqual(result.pairs.first { $0.album.id == "whole" }?.fills, true)
+
+        var linked = trip
+        linked.pairImmichAlbum(ImmichAlbum(id: "picks", name: "Best of the Trip"), fills: false)
+        XCTAssertNil(ImmichAlbumNaming.targets(events: [linked], locations: locations, albumsForEveryEvent: true)[linked.id], "a picks album is never filled")
+        linked.immichAlbumFill = true
+        XCTAssertEqual(ImmichAlbumNaming.targets(events: [linked], locations: locations, albumsForEveryEvent: false)[linked.id], .existing(id: "picks", name: "Best of the Trip"))
+    }
+
+    // MARK: F2, F6
+
+    func testAPairedSameNameEventMakesTheNewOneDated() {
+        var older = SavedCameraEvent(name: "Trip", eventDate: date)
+        older.pairImmichAlbum(ImmichAlbum(id: "old-album", name: "Trip"))
+        let newer = SavedCameraEvent(name: "Trip", eventDate: date.addingTimeInterval(365 * 86_400), immichAlbumPolicy: .event)
+        let targets = ImmichAlbumNaming.targets(events: [older, newer], locations: locations, albumsForEveryEvent: false)
+        XCTAssertEqual(targets[older.id], .existing(id: "old-album", name: "Trip"))
+        XCTAssertEqual(targets[newer.id], .named(ImmichAlbumNaming.datedTitle(for: newer)))
+    }
+
+    func testAnAutomaticAlbumStopsFillingWhenTheSwitchIsOff() {
+        var event = SavedCameraEvent(name: "Trip 2026", eventDate: date)
+        event.pairImmichAlbum(ImmichAlbum(id: "auto", name: "Trip 2026"), fills: true, automatic: true)
+        XCTAssertNotNil(ImmichAlbumNaming.targets(events: [event], locations: locations, albumsForEveryEvent: true)[event.id])
+        XCTAssertNil(ImmichAlbumNaming.targets(events: [event], locations: locations, albumsForEveryEvent: false)[event.id])
     }
 
     func testPairingIsByIDAndSurvivesARename() {
@@ -864,10 +953,11 @@ final class ImmichStackTests: XCTestCase {
 
         let cover = id("DSC00002.ARW")
         transport.respond("POST", "/api/stacks", body: #"{"id":"s-9","primaryAssetId":"\#(cover)","assets":[{"id":"\#(cover)"},{"id":"\#(id("DSC00001.ARW"))"},{"id":"\#(id("DSC00003.ARW"))"}]}"#)
-        var logged: [ImmichStackRecord] = []
-        let real = try await ImmichStackRunner.run(client: client, groups: groups, assets: assets(for: files), library: library(), store: store, dryRun: false) { logged.append($0) }
+        let logged = LockedEntries()
+        let real = try await ImmichStackRunner.run(client: client, groups: groups, assets: assets(for: files), library: library(), store: store, dryRun: false) { logged.add($0) }
         XCTAssertEqual(real.created.map(\.stackID), ["s-9"])
-        XCTAssertEqual(logged.map(\.stackID), ["s-9"])
+        XCTAssertEqual(logged.all.map(\.stackID), ["s-9"])
+        XCTAssertEqual(logged.all.map(\.action), [.created])
         let body = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(transport.writes.first?.httpBody)) as? [String: [String]])
         XCTAssertEqual(body["assetIds"]?.first, cover)
         XCTAssertEqual(try store.records()[groups[0].key]?.stackID, "s-9")
@@ -879,6 +969,109 @@ final class ImmichStackTests: XCTestCase {
         XCTAssertTrue(again.created.isEmpty)
         XCTAssertEqual(again.plan.unchanged, 1)
         XCTAssertEqual(transport.requests.count { $0.httpMethod == "POST" && $0.url?.path == "/api/stacks" }, 1)
+    }
+
+    // MARK: F3, F4, P1
+
+    private func stackJSON(_ id: String, primary: String, _ members: [String]) -> String {
+        #"{"id":"\#(id)","primaryAssetId":"\#(primary)","assets":[\#(members.map { #"{"id":"\#($0)"}"# }.joined(separator: ","))]}"#
+    }
+
+    func testReplacingTheAppsStackRemovesItFirstSoADepartedMemberIsNotMergedBack() async throws {
+        // The app stacked a, b, c; c has since left the burst (moved to another event).
+        let files = burst(trip, folder: "2026/T/Originals/A", first: 1, count: 2, at: start)
+        let groups = ImmichStackGrouping.groups(files: files)
+        let a = id("DSC00001.ARW"), b = id("DSC00002.ARW"), c = "moved-away"
+        let store = try ImmichStackStore(catalogURL: catalogURL)
+        try store.save(ImmichStackRecord(key: groups[0].key, stackID: "ours", eventID: trip, kind: .burst, assetIDs: [a, b, c]))
+        let transport = ScriptedTransport()
+        transport.respond("GET", "/api/stacks", body: "[\(stackJSON("ours", primary: a, [a, b, c]))]")
+        transport.respond("DELETE", "/api/stacks/ours", status: 204, body: "")
+        transport.respond("POST", "/api/stacks", body: stackJSON("new", primary: b, [b, a]))
+        let client = try ImmichClient(serverURL: "https://photos.example.com", apiKey: "secret-key", transport: transport)
+        let logged = LockedEntries()
+
+        let report = try await ImmichStackRunner.run(client: client, groups: groups, assets: assets(for: files), library: library(), store: store, dryRun: false) { logged.add($0) }
+
+        XCTAssertEqual(transport.writes.map { "\($0.httpMethod ?? "") \($0.url?.path ?? "")" }, ["DELETE /api/stacks/ours", "POST /api/stacks"])
+        XCTAssertEqual(report.created.first?.assetIDs.sorted(), [a, b].sorted(), "the record holds what Immich answered")
+        XCTAssertTrue(report.problems.isEmpty)
+        XCTAssertEqual(try store.records()[groups[0].key]?.stackID, "new")
+        XCTAssertEqual(logged.all.map(\.action), [.removedOwn, .created])
+    }
+
+    func testAStackTheUserUnstackedIsNeverMadeAgain() async throws {
+        let files = burst(trip, folder: "2026/T/Originals/A", first: 1, count: 3, at: start)
+        let groups = ImmichStackGrouping.groups(files: files)
+        let store = try ImmichStackStore(catalogURL: catalogURL)
+        try store.save(ImmichStackRecord(key: groups[0].key, stackID: "ours", eventID: trip, kind: .burst, assetIDs: assets(for: files).map(\.id)))
+        let transport = ScriptedTransport()
+        transport.respond("GET", "/api/stacks", body: "[]")
+        let client = try ImmichClient(serverURL: "https://photos.example.com", apiKey: "secret-key", transport: transport)
+
+        let first = try await ImmichStackRunner.run(client: client, groups: groups, assets: assets(for: files), library: library(), store: store, dryRun: false)
+        XCTAssertEqual(first.plan.skippedRemoved, 1)
+        XCTAssertEqual(try store.records()[groups[0].key]?.removedInImmich, true)
+        let second = try await ImmichStackRunner.run(client: client, groups: groups, assets: assets(for: files), library: library(), store: store, dryRun: false)
+        XCTAssertEqual(second.plan.skippedRemoved, 1)
+        XCTAssertTrue(transport.writes.isEmpty)
+    }
+
+    func testACoverTheUserPickedIsKept() {
+        let files = burst(trip, folder: "2026/T/Originals/A", first: 1, count: 3, at: start)
+        let groups = ImmichStackGrouping.groups(files: files)
+        let ids = assets(for: files).map(\.id)
+        let record = ImmichStackRecord(key: groups[0].key, stackID: "ours", eventID: trip, kind: .burst, assetIDs: ids)
+        let account = ImmichAccountStack(id: "ours", primaryAssetID: id("DSC00003.ARW"), assetIDs: ids)
+        let plan = ImmichStackPlanner.plan(groups: groups, assets: assets(for: files), library: library(), accountStacks: [account], records: [record.key: record])
+        XCTAssertEqual(plan.unchanged, 1)
+        XCTAssertTrue(plan.creates.isEmpty)
+    }
+
+    func testAStackWhoseCreateAnswerWasLostIsAdoptedNotOrphaned() async throws {
+        let files = burst(trip, folder: "2026/T/Originals/A", first: 1, count: 2, at: start)
+        let groups = ImmichStackGrouping.groups(files: files)
+        let ids = assets(for: files).map(\.id)
+        let store = try ImmichStackStore(catalogURL: catalogURL)
+        let transport = ScriptedTransport()
+        transport.respond("GET", "/api/stacks", bodies: ["[]", "[\(stackJSON("made", primary: ids[1], ids))]"])
+        transport.respond("POST", "/api/stacks", status: 502, body: "")
+        let client = try ImmichClient(serverURL: "https://photos.example.com", apiKey: "secret-key", transport: transport)
+        let logged = LockedEntries()
+
+        let report = try await ImmichStackRunner.run(client: client, groups: groups, assets: assets(for: files), library: library(), store: store, dryRun: false) { logged.add($0) }
+
+        XCTAssertEqual(report.created.map(\.stackID), ["made"])
+        XCTAssertEqual(try store.records()[groups[0].key]?.stackID, "made")
+        XCTAssertEqual(logged.all.map(\.action), [.adopted])
+    }
+
+    // MARK: P5, P6
+
+    func testEditsNeverCrossBetweenAParentAndItsSubevent() {
+        let parent = ImmichCatalogFile(eventAssetID: "p", relativePath: "2026/Trip/Originals/A/C0001.MP4", isOnNAS: true, eventID: trip, byteCount: 10, modifiedAt: start)
+        let sub = ImmichCatalogFile(eventAssetID: "s", relativePath: "2026/Trip/Beach/Originals/A/C0002.MP4", isOnNAS: true, eventID: party, byteCount: 10, modifiedAt: start)
+        let groups = ImmichStackGrouping.groups(files: [parent, sub], editPaths: [
+            "2026/Trip/Edited/C0002_709.mp4",
+            "2026/Trip/Beach/Edited/C0001_709.mp4"
+        ])
+        XCTAssertTrue(groups.isEmpty, "each edit sits in the other event's folder")
+        let own = ImmichStackGrouping.groups(files: [parent, sub], editPaths: ["2026/Trip/Beach/Edited/C0002_709.mp4"])
+        XCTAssertEqual(own.map(\.eventID), [party])
+    }
+
+    func testPrivateEventsAreStackedOnlyWithAllowAlbum() {
+        let open = SavedCameraEvent(name: "Trip 2026", eventDate: start)
+        let secret = SavedCameraEvent(name: "Secret", eventDate: start, storagePolicy: .archiveOnly)
+        let allowed = SavedCameraEvent(name: "Allowed", eventDate: start, immichUploadEnabled: true, storagePolicy: .archiveOnly)
+        var configuration = AppConfiguration(
+            demoRootPath: "/tmp/demo", importSourcePath: "/tmp/card", archivePath: "/tmp/lib/Originals",
+            bufferPath: "/tmp/buffer", cameraLibraryRootPath: "/tmp/lib", catalogDatabasePath: "/tmp/c.sqlite",
+            activityLogPath: "/tmp/a.jsonl"
+        )
+        configuration.savedEvents = [open, secret, allowed]
+        let ids = ImmichStackGrouping.stackableEventIDs(events: [open, secret, allowed], locations: EventStorageLocations(configuration: configuration))
+        XCTAssertEqual(ids, [open.id, allowed.id])
     }
 
     func testCommandParsesAndPicksTheOnlyLibraryOrRefuses() throws {
@@ -919,6 +1112,14 @@ final class ImmichStackTests: XCTestCase {
         XCTAssertEqual(folder?.path, "/folders")
         XCTAssertEqual(URLComponents(url: folder!, resolvingAgainstBaseURL: false)?.queryItems, [URLQueryItem(name: "path", value: "/external/library/2026/Trip 2026")])
     }
+}
+
+/// Stack log entries collected from a `@Sendable` callback.
+private final class LockedEntries: @unchecked Sendable {
+    private let lock = NSLock()
+    private var entries: [ImmichStackLogEntry] = []
+    var all: [ImmichStackLogEntry] { lock.withLock { entries } }
+    func add(_ entry: ImmichStackLogEntry) { lock.withLock { entries.append(entry) } }
 }
 
 private func encode<T: Encodable>(_ value: T) -> String {

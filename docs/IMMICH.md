@@ -32,13 +32,17 @@ Events get an album only when asked: by pairing an existing album, or by choosin
 - its name equals the event's name or its dated album title, ignoring case and Unicode spelling; or
 - at least 80% of its photos, and at least 5, are one event's files, matched by library path.
 
+Only albums the key's user owns are paired. Albums shared with them are listed as "shared with you, not paired". The share is measured against the album's own photo count, so a large shared album holding a few of the user's photos never reads as theirs.
+
+A paired album is kept filled only when it already holds at least 80% of the event's photos and videos, which makes it an event album. Otherwise it is a picks album: linked to the event and shown as "Picks · not auto-filled", and checks never add to it. **Keep This Album Filled with the Whole Event** in the event's Album menu changes that per album. Choosing a library pairs but never fills.
+
 Nothing ambiguous is paired: two events tying for a name, an album that mixes events, a name and contents that disagree, or an event that matches two albums. Private events need **Allow album**, events set to **No album** keep it, and an event that already has an album keeps that one. Each unpaired album is listed with its reason. Pairing writes nothing to Immich.
 
 To see what pairing would do without changing anything, run `CameraToolkit --immich-pair --dry-run`. It prints counts by reason; add `--list` to print each album with its event or reason. Pairing itself is done in the app.
 
 A pairing is stored by album ID, so renaming the album in Immich does not break it. The event also keeps the album's name with a custom policy, so an older build still fills the same album by name. An album made by name on a check is paired by ID from then on.
 
-**Filling.** Each check adds the event's online, untrashed photos that are missing from its album. It never removes any, so a photo taken out of such an album comes back on the next check; choose **No Album** to stop that. A paired album that is no longer in Immich is reported, not made again.
+**Filling.** Each check adds the event's online, untrashed photos that are missing from an album it fills. Every addition is written to `Immich Logs/album-additions.jsonl` beside the catalog, so it can be undone. An album made by name never resolves to an album already paired with another event; a same-name event gets the dated title instead. An album made by "Make an album for every event" is marked as automatic, and turning that switch off stops filling it. It never removes any, so a photo taken out of such an album comes back on the next check; choose **No Album** to stop that. A paired album that is no longer in Immich is reported, not made again.
 
 **Where it shows.** The event header has an Immich album chip with the album's name, its photo count, "N to add" when some are missing, and buttons for Send to Immich and Open in Immich. Paired events have an album mark in the sidebar. Settings › Services lists every pair with **Unpair**, and every unpaired album with its reason.
 
@@ -50,17 +54,17 @@ A private event never gets an album unless **Allow album** is on for that event.
 
 ## Stacks
 
-**Stack bursts and edits in Immich** (Settings, on by default; nothing happens until a library is chosen) makes, on each check and on Send to Immich:
+**Stack bursts and edits in Immich** (Settings, off by default; nothing happens until a library is chosen) makes, on each check and on Send to Immich:
 
 - each burst the board groups into one stack, with its cover frame on top;
 - each RAW file and the JPEG of the same shot into one stack;
 - each original and its edit from the event's `Edited` folder (a Photomator export, or a graded copy such as `C0001_709.mp4`) into one stack, edit on top. An edit of a burst frame sits right under the burst's cover.
 
-Groups never cross events. A file not matched to an asset in the chosen library is left out, and a group with fewer than two matched files is not made.
+Groups never cross events, and an edit joins only an original in the same event folder, so edits never cross between an event and its subevents. A private event is stacked only with Allow album on. A file not matched to an asset in the chosen library is left out, and a group with fewer than two matched files is not made.
 
 Bursts are grouped from the catalog without reading the NAS, using the board's own rules. Each file's modification time, which the camera set and verified copies keep, stands in for its capture time. Frames the board joins only after a visual check, and manual burst splits, are not known here, so such a burst can come out as two smaller stacks, never a bigger one.
 
-**Other people's stacks are never touched.** Immich's create call merges any stack whose top asset is among the IDs, and pulls other members out of their stacks. So a group with any asset already in a stack the app did not make is skipped and reported. The app keeps every stack it made in `immich_stacks` (group, stack ID, assets). A re-run with nothing changed creates nothing. When a frame was added or renamed, the app makes the group again, which replaces only its own stack. The app never deletes a stack and never changes one it did not make.
+**Other people's stacks are never touched.** Immich's create call merges any stack whose top asset is among the IDs, and pulls other members out of their stacks. So a group with any asset already in a stack the app did not make is skipped and reported. The app keeps every stack it made in `immich_stacks` (group, stack ID, assets). A re-run with nothing changed creates nothing, whatever cover the user picked since. When a frame was added, left or renamed, the app first removes its own old stack and then makes the group again; letting Immich merge would pull a departed frame back in. It checks that Immich's answer holds exactly the assets asked for. A stack the user unstacked in Immich is remembered and never made again. If a create's answer is lost, the stack with exactly those assets is adopted rather than orphaned. The writes finish even if the check is stopped. The app never deletes or changes a stack it did not make. Every stack change is logged to `Immich Logs/stacks.jsonl`.
 
 Burst tiles the app stacked show a small stack mark, and the event's Immich chip shows "N stacks".
 
@@ -71,7 +75,7 @@ CameraToolkit --immich-stacks --dry-run [--event <name>]...
 CameraToolkit --immich-stacks [--event <name>]... [--log <file.jsonl>]
 ```
 
-The dry run only reads. It reports how many stacks it would make, how many are already the app's and unchanged, how many it would leave alone because they are already in someone else's stack, and how many groups are not matched in Immich. A real run writes one JSON line per stack it made to the log (default `<support folder>/Immich Stack Logs/`); that list of stack IDs is what to undo from.
+The dry run only reads; a real run refuses while the app is running. It reports how many stacks it would make, how many are already the app's and unchanged, how many it would leave alone because they are already in someone else's stack, and how many groups are not matched in Immich. A real run writes one JSON line per stack it made to the log (default `<support folder>/Immich Logs/`); that list of stack IDs is what to undo from.
 
 ## View in Immich
 
@@ -87,9 +91,9 @@ The app remembers each rename in `immich_path_moves` for 90 days. With **Keep re
 
 In Settings › Services enter the server URL and an API key, press **Test Connection**, then choose the library. The key lives in the macOS Keychain only and is sent only as a request header.
 
-Settings says plainly when no key is saved. When an earlier build saved one under another Keychain entry, **Move the Key an Earlier Version Saved** copies it over on your click; macOS asks first, and the old entry is left alone.
+Settings says plainly when no key is saved. When an earlier Camera Toolkit build saved one under another Keychain entry (a service ending in `.CameraToolkit`), Settings names that entry and offers to copy the key over on your click. macOS asks first, and the old entry is left alone.
 
-Use a key from the account that owns the library, with these permissions: library read and scan, asset read and update, album create and add, stack create and update. Stacks and albums are made as the key's user, so another user's key, even an admin's, cannot stack or album the owner's photos.
+Use a key from the account that owns the library, with these permissions: library read and scan, asset read and update, album read, create and add, stack read, create, update and delete. Only the app's own stacks are ever removed. Stacks and albums are made as the key's user, so another user's key, even an admin's, cannot stack or album the owner's photos.
 
 ## Server version
 

@@ -25,12 +25,16 @@ public struct ImmichAlbumPair: Equatable, Sendable {
     public var basis: Basis
     /// Album assets that are this event's files.
     public var matchedAssets: Int
+    /// The album already holds most of the event (an event album), so checks
+    /// keep it filled. Otherwise it is a picks album: linked, not filled.
+    public var fills: Bool
 
-    public init(album: ImmichAlbum, eventID: UUID, basis: Basis, matchedAssets: Int) {
+    public init(album: ImmichAlbum, eventID: UUID, basis: Basis, matchedAssets: Int, fills: Bool = false) {
         self.album = album
         self.eventID = eventID
         self.basis = basis
         self.matchedAssets = matchedAssets
+        self.fills = fills
     }
 }
 
@@ -50,6 +54,8 @@ public enum ImmichPairingReason: Equatable, Sendable {
     case eventOptedOut
     /// The event already has an album.
     case eventAlreadyPaired
+    /// Someone else's album shared with the key's user.
+    case sharedWithYou
 
     public var text: String {
         switch self {
@@ -61,6 +67,7 @@ public enum ImmichPairingReason: Equatable, Sendable {
         case .privateEvent: "Its event is private; turn on Allow album to pair it"
         case .eventOptedOut: "Its event is set to No album"
         case .eventAlreadyPaired: "Its event already has an album"
+        case .sharedWithYou: "Shared with you, not your album; not paired"
         }
     }
 }
@@ -94,14 +101,26 @@ public enum ImmichAlbumPairing {
     public static let minimumShare = 0.8
     /// And at least this many of them.
     public static let minimumAssets = 5
+    /// Share of the event's photos and videos an album must already hold to
+    /// be kept filled with the whole event.
+    public static let eventAlbumShare = 0.8
 
+    /// - Parameter currentUserID: the key's user; albums owned by anyone else
+    ///   (shared with the user) are never paired.
     public static func pair(
         albums: [ImmichAlbumContents],
         events: [SavedCameraEvent],
         files: [ImmichCatalogFile],
         library: ImmichLibrary,
-        locations: EventStorageLocations
+        locations: EventStorageLocations,
+        currentUserID: String? = nil
     ) -> ImmichPairingResult {
+        let media = OrganizeFileClassifier.rawExtensions.union(OrganizeFileClassifier.photoExtensions).union(OrganizeFileClassifier.videoExtensions)
+        var eventMediaCount: [UUID: Int] = [:]
+        for file in files {
+            guard let eventID = file.eventID, media.contains((file.relativePath as NSString).pathExtension.lowercased()) else { continue }
+            eventMediaCount[eventID, default: 0] += 1
+        }
         let paths = ImmichLibraryPaths(importPaths: library.importPaths)
         let eventsByID = Dictionary(events.map { ($0.id, $0) }) { first, _ in first }
 
@@ -130,6 +149,10 @@ public enum ImmichAlbumPairing {
                 result.alreadyPaired += 1
                 continue
             }
+            if let owner = album.ownerID, let currentUserID, owner != currentUserID {
+                result.unpaired.append(ImmichUnpairedAlbum(album: album, reason: .sharedWithYou))
+                continue
+            }
             let nameMatches = eventsByNameKey[NASSyncStore.pathKey(album.name.trimmingCharacters(in: .whitespacesAndNewlines))] ?? []
             var counts: [UUID: Int] = [:]
             for path in contents.originalPaths {
@@ -137,7 +160,9 @@ public enum ImmichAlbumPairing {
                       let eventID = eventByPathKey[NASSyncStore.pathKey(relative)] else { continue }
                 counts[eventID, default: 0] += 1
             }
-            let total = max(contents.originalPaths.count, 1)
+            // The album's own count: a shared album lists only the user's
+            // assets, so the listing alone would overstate the share.
+            let total = max(album.assetCount ?? 0, contents.originalPaths.count, 1)
             let top = counts.max { $0.value < $1.value || ($0.value == $1.value && $0.key.uuidString > $1.key.uuidString) }
             let contentMatch = top.flatMap { top -> UUID? in
                 top.value >= minimumAssets && Double(top.value) / Double(total) >= minimumShare ? top.key : nil
@@ -184,7 +209,9 @@ public enum ImmichAlbumPairing {
             if (perEvent[candidate.eventID]?.count ?? 0) > 1 {
                 result.unpaired.append(ImmichUnpairedAlbum(album: candidate.album, eventID: candidate.eventID, reason: .eventMatchesSeveralAlbums))
             } else {
-                result.pairs.append(ImmichAlbumPair(album: candidate.album, eventID: candidate.eventID, basis: candidate.basis, matchedAssets: candidate.matched))
+                let eventTotal = eventMediaCount[candidate.eventID] ?? 0
+                let isEventAlbum = eventTotal > 0 && Double(candidate.matched) / Double(eventTotal) >= eventAlbumShare
+                result.pairs.append(ImmichAlbumPair(album: candidate.album, eventID: candidate.eventID, basis: candidate.basis, matchedAssets: candidate.matched, fills: isEventAlbum))
             }
         }
         result.pairs.sort { $0.album.name.localizedStandardCompare($1.album.name) == .orderedAscending }
@@ -210,21 +237,35 @@ extension ImmichAlbumPairing {
 extension SavedCameraEvent {
     /// Pairs the event with an existing album. The policy and name are kept
     /// in step so a build without pairing fills the same album by name.
-    public mutating func pairImmichAlbum(_ album: ImmichAlbum) {
+    ///
+    /// - Parameters:
+    ///   - fills: checks add the whole event to it; false links a picks album.
+    ///   - automatic: it came from "Make an album for every event".
+    public mutating func pairImmichAlbum(_ album: ImmichAlbum, fills: Bool = true, automatic: Bool = false) {
         immichAlbumID = album.id
         immichAlbumPolicy = .custom
         immichAlbumName = album.name
+        immichAlbumFill = fills
+        immichAlbumAutomatic = automatic ? true : nil
     }
 
     /// No album, and nothing pairs it again on its own.
     public mutating func unpairImmichAlbum() {
         immichAlbumID = nil
         immichAlbumPolicy = ImmichAlbumPolicy.none
+        immichAlbumFill = nil
+        immichAlbumAutomatic = nil
     }
 
     /// A new album named after the event, made on the next check.
     public mutating func useNewImmichAlbumNamedAfterEvent() {
         immichAlbumID = nil
         immichAlbumPolicy = .event
+        immichAlbumFill = nil
+        immichAlbumAutomatic = nil
     }
+
+    /// Checks add the event's photos to its album: always for an album the
+    /// app will make, for a paired album only when it is an event album.
+    public var fillsImmichAlbum: Bool { immichAlbumID == nil || (immichAlbumFill ?? true) }
 }

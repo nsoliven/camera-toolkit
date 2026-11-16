@@ -58,7 +58,30 @@ public struct ImmichClient: Sendable {
 
     public func albums() async throws -> [ImmichAlbum] {
         let response: [AlbumResponse] = try await get("/albums", authenticated: true)
-        return response.map { ImmichAlbum(id: $0.id, name: $0.albumName, assetCount: $0.assetCount) }
+        return response.map { ImmichAlbum(id: $0.id, name: $0.albumName, assetCount: $0.assetCount, ownerID: $0.ownerId) }
+    }
+
+    /// The key's user.
+    public func currentUserID() async throws -> String {
+        let user: ImmichUserResponse = try await get("/users/me", authenticated: true)
+        return user.id
+    }
+
+    /// Removes one of the app's own stacks: its assets stay, unstacked.
+    /// Callers only ever pass a stack the app made (`ImmichStackStore`).
+    public func deleteStack(stackID: String) async throws {
+        try Self.validate(id: stackID, kind: "stack")
+        let path = "/stacks/\(stackID)"
+        guard let url = endpointURL(path) else { throw ToolkitError.commandFailed("Immich endpoint URL is not valid") }
+        var request = URLRequest(url: url)
+        request.httpMethod = "DELETE"
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+        let (_, response) = try await transport.data(for: request)
+        guard let http = response as? HTTPURLResponse else { throw ToolkitError.commandFailed("Immich response was not HTTP") }
+        guard (200..<300).contains(http.statusCode) else {
+            throw ToolkitError.commandFailed("Immich \(path) failed with HTTP \(http.statusCode)")
+        }
     }
 
     /// The albums one asset is in.
@@ -386,6 +409,7 @@ private struct AlbumResponse: Decodable {
     var id: String
     var albumName: String
     var assetCount: Int?
+    var ownerId: String?
 }
 
 private struct CreateAlbumRequest: Encodable {
@@ -440,11 +464,14 @@ public struct ImmichAlbum: Codable, Equatable, Hashable, Identifiable, Sendable 
     public var id: String
     public var name: String
     public var assetCount: Int?
+    /// The album's owner. Shared albums list only the key user's own assets.
+    public var ownerID: String?
 
-    public init(id: String, name: String, assetCount: Int? = nil) {
+    public init(id: String, name: String, assetCount: Int? = nil, ownerID: String? = nil) {
         self.id = id
         self.name = name
         self.assetCount = assetCount
+        self.ownerID = ownerID
     }
 }
 

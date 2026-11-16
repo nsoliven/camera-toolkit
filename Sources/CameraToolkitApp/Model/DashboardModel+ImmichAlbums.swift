@@ -34,8 +34,19 @@ extension DashboardModel {
             libraryID: configuration.immichLibraryID,
             catalogURL: catalogURLForImmich,
             carriesAlbumsAcrossRenames: configuration.immichCarriesAlbumsAcrossRenames,
-            stacksBurstsAndEdits: configuration.immichStacksBurstsAndEdits
+            stacksBurstsAndEdits: configuration.immichStacksBurstsAndEdits,
+            reservedAlbumIDs: Set(configuration.savedEvents.compactMap(\.immichAlbumID)),
+            stackableEventIDs: ImmichStackGrouping.stackableEventIDs(
+                events: configuration.savedEvents,
+                locations: EventStorageLocations(configuration: configuration)
+            ),
+            logFolder: immichLogFolder
         )
+    }
+
+    /// Every album addition and stack change, as JSON lines to undo from.
+    var immichLogFolder: URL {
+        catalogURLForImmich.deletingLastPathComponent().appendingPathComponent("Immich Logs", isDirectory: true)
     }
 
     /// Every catalog file with its NAS path and album, off the main actor.
@@ -82,19 +93,22 @@ extension DashboardModel {
                 let files = await immichCatalogFiles()
                 let events = configuration.savedEvents
                 let locations = EventStorageLocations(configuration: configuration)
-                let result = ImmichAlbumPairing.pair(albums: contents, events: events, files: files, library: library, locations: locations)
-                let pairs = Dictionary(result.pairs.map { ($0.eventID, $0.album) }) { first, _ in first }
+                let me = try? await client.currentUserID()
+                let result = ImmichAlbumPairing.pair(albums: contents, events: events, files: files, library: library, locations: locations, currentUserID: me)
+                let pairs = Dictionary(result.pairs.map { ($0.eventID, $0) }) { first, _ in first }
                 if !pairs.isEmpty {
+                    // Event albums are kept filled; picks albums are only linked.
                     updateConfiguration { configuration in
                         for index in configuration.savedEvents.indices {
-                            if let album = pairs[configuration.savedEvents[index].id] {
-                                configuration.savedEvents[index].pairImmichAlbum(album)
+                            if let pair = pairs[configuration.savedEvents[index].id] {
+                                configuration.savedEvents[index].pairImmichAlbum(pair.album, fills: pair.fills)
                             }
                         }
                     }
                 }
                 immichPairing = result
-                immichPairingNote = "Paired \(result.pairs.count) album\(result.pairs.count == 1 ? "" : "s"); \(result.unpaired.count) not paired. Nothing was changed in Immich."
+                let picks = result.pairs.count { !$0.fills }
+                immichPairingNote = "Paired \(result.pairs.count) album\(result.pairs.count == 1 ? "" : "s") (\(picks) picks, linked only); \(result.unpaired.count) not paired. Nothing was changed in Immich."
                 loadImmichAlbumStates()
             } catch {
                 immichPairingNote = "Pairing failed: \(error.localizedDescription)"
@@ -133,7 +147,9 @@ extension DashboardModel {
     func refreshImmichKeyStatus() {
         let services = KeychainSecretStore.otherServices(holding: Self.immichAPIKeyAccount, excluding: "")
         immichKeyIsSaved = services.contains(Self.keychainService)
-        immichEarlierKeyServices = services.filter { $0 != Self.keychainService }
+        // Only entries an earlier Camera Toolkit build wrote (a bundle ID
+        // ending in .CameraToolkit), never another app's.
+        immichEarlierKeyServices = services.filter { $0 != Self.keychainService && $0.hasSuffix(".CameraToolkit") }
     }
 
     /// Copies the key an earlier build saved into this build's Keychain
@@ -195,6 +211,18 @@ extension DashboardModel {
         statusMessage = "Paired with “\(album.name)”. New photos are added on the next check; nothing is removed from it."
     }
 
+    /// Whether checks keep a paired album filled with the whole event.
+    func setImmichAlbumFill(for eventID: UUID, fills: Bool) {
+        updateConfiguration { configuration in
+            guard let index = configuration.savedEvents.firstIndex(where: { $0.id == eventID }) else { return }
+            configuration.savedEvents[index].immichAlbumFill = fills
+            configuration.savedEvents[index].immichAlbumAutomatic = nil
+        }
+        statusMessage = fills
+            ? "The album is kept filled with this event's photos from the next check. Nothing is removed from it."
+            : "The album stays linked; checks no longer add photos to it."
+    }
+
     func useNewImmichAlbum(for eventID: UUID) {
         updateConfiguration { configuration in
             guard let index = configuration.savedEvents.firstIndex(where: { $0.id == eventID }) else { return }
@@ -229,8 +257,13 @@ extension DashboardModel {
                 for index in configuration.savedEvents.indices {
                     guard let album = resolved[configuration.savedEvents[index].id] else { continue }
                     let event = configuration.savedEvents[index]
-                    if event.immichAlbumID != album.id || event.immichAlbumName != album.name {
-                        configuration.savedEvents[index].pairImmichAlbum(album)
+                    if event.immichAlbumID == nil {
+                        // An album made by name is paired by ID from now on. One
+                        // the every-event switch made is marked, so turning the
+                        // switch off stops filling it.
+                        configuration.savedEvents[index].pairImmichAlbum(album, fills: true, automatic: event.immichAlbumPolicy == nil)
+                    } else if event.immichAlbumName != album.name {
+                        configuration.savedEvents[index].immichAlbumName = album.name
                     }
                 }
             }

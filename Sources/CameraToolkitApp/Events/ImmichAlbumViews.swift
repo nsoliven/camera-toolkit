@@ -18,10 +18,14 @@ struct ImmichAlbumChipInfo: Equatable {
     var isPrivateWithoutAlbum = false
     /// Stacks the app made in Immich for this event.
     var stackCount = 0
+    /// A linked album checks do not fill (a picks album, or an automatic one
+    /// with "Make an album for every event" off).
+    var isNotFilled = false
 
     /// From an event's own statuses (not its subevents') and its album state.
-    init(albumName: String?, state: ImmichEventAlbumState?, summary: ImmichEventSummary, isPrivateWithoutAlbum: Bool, stackCount: Int = 0) {
+    init(albumName: String?, state: ImmichEventAlbumState?, summary: ImmichEventSummary, isPrivateWithoutAlbum: Bool, stackCount: Int = 0, isNotFilled: Bool = false) {
         self.stackCount = stackCount
+        self.isNotFilled = isNotFilled
         self.albumName = albumName
         inAlbum = state?.inAlbum
         let notAdded = state.map { max(0, summary.inImmich - $0.inAlbum) } ?? 0
@@ -30,8 +34,9 @@ struct ImmichAlbumChipInfo: Equatable {
         self.isPrivateWithoutAlbum = isPrivateWithoutAlbum
     }
 
-    init(albumName: String?, inAlbum: Int?, toAdd: Int, notOnNAS: Int, isPrivateWithoutAlbum: Bool = false, stackCount: Int = 0) {
+    init(albumName: String?, inAlbum: Int?, toAdd: Int, notOnNAS: Int, isPrivateWithoutAlbum: Bool = false, stackCount: Int = 0, isNotFilled: Bool = false) {
         self.stackCount = stackCount
+        self.isNotFilled = isNotFilled
         self.albumName = albumName
         self.inAlbum = inAlbum
         self.toAdd = toAdd
@@ -65,7 +70,15 @@ struct ImmichAlbumChip<AlbumMenu: View>: View {
                 Text(info.isPrivateWithoutAlbum ? "Private: no Immich album" : "No Immich album")
                     .foregroundStyle(.secondary)
             }
-            if info.toAdd > 0, info.albumName != nil {
+            if info.isNotFilled, info.albumName != nil {
+                Text("Picks · not auto-filled")
+                    .font(.caption.weight(.semibold))
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 2)
+                    .background(Capsule().fill(Color.secondary.opacity(0.18)))
+                    .foregroundStyle(.secondary)
+                    .help("Linked to this event; checks do not add photos to it. Turn on Keep This Album Filled in the Album menu to change that.")
+            } else if info.toAdd > 0, info.albumName != nil {
                 Text("\(info.toAdd.formatted()) to add")
                     .font(.caption.weight(.semibold))
                     .monospacedDigit()
@@ -121,6 +134,13 @@ struct ImmichAlbumMenuItems: View {
             ))
         }
         if !isPrivate || event.sendsToImmich {
+            if event.immichAlbumID != nil {
+                Toggle("Keep This Album Filled with the Whole Event", isOn: Binding(
+                    get: { event.fillsImmichAlbum && event.immichAlbumAutomatic != true },
+                    set: { model.setImmichAlbumFill(for: event.id, fills: $0) }
+                ))
+                Divider()
+            }
             Button("New Album Named After the Event") { model.useNewImmichAlbum(for: event.id) }
             Button("No Album") { model.unpairImmichAlbum(for: event.id) }
             Divider()
@@ -190,16 +210,21 @@ struct ImmichEventAlbumBar: View {
         let isPrivate = workspace.locations.resolvedPolicy(for: event) == .archiveOnly
         let target = workspace.immichAlbumTargets[eventID]
         let state = model.immichAlbumStates[eventID]
+        // Paired but not filled: a picks album, or an automatic one with the
+        // every-event switch off.
+        let linkedName = event.immichAlbumID == nil ? nil : (event.immichAlbumName ?? event.name)
+        let isNotFilled = linkedName != nil && target == nil && !(isPrivate && !event.sendsToImmich)
         // The event's own files only: a subevent can have its own album.
         let prefix = eventID.uuidString + "|"
         let own = (workspace.eventImmichStatuses[eventID] ?? [:]).filter { $0.key.hasPrefix(prefix) }.values
         return ImmichAlbumChip(
             info: ImmichAlbumChipInfo(
-                albumName: state?.albumName ?? target?.displayName,
+                albumName: state?.albumName ?? target?.displayName ?? linkedName,
                 state: state,
                 summary: ImmichEventSummary(statuses: own),
                 isPrivateWithoutAlbum: isPrivate && !event.sendsToImmich,
-                stackCount: model.immichStackCounts[eventID] ?? 0
+                stackCount: model.immichStackCounts[eventID] ?? 0,
+                isNotFilled: isNotFilled
             ),
             onSend: { workspace.requestImmichSend([eventID]) },
             albumMenu: { ImmichAlbumMenuItems(model: model, event: event, isPrivate: isPrivate) }
@@ -243,6 +268,8 @@ struct ImmichPairRow: Identifiable, Equatable {
     var albumName: String
     var inAlbum: Int?
     var albumCount: Int?
+    /// Linked only: checks do not add to it.
+    var isPicks = false
 }
 
 struct ImmichUnpairedRow: Identifiable, Equatable {
@@ -274,6 +301,14 @@ struct ImmichPairsListView: View {
                     Text(pair.eventName).lineLimit(1)
                     Image(systemName: "arrow.left.and.right").foregroundStyle(.secondary).font(.caption)
                     Text(pair.albumName).fontWeight(.semibold).lineLimit(1)
+                    if pair.isPicks {
+                        Text("Picks · not filled")
+                            .font(.caption)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 1)
+                            .background(Capsule().fill(Color.secondary.opacity(0.18)))
+                            .foregroundStyle(.secondary)
+                    }
                     Spacer(minLength: 8)
                     if let inAlbum = pair.inAlbum {
                         Text(pair.albumCount.map { "\(inAlbum.formatted()) of \($0.formatted())" } ?? inAlbum.formatted())
@@ -318,7 +353,8 @@ extension DashboardModel {
                     eventName: event.name,
                     albumName: state?.albumName ?? event.immichAlbumName ?? event.name,
                     inAlbum: state?.inAlbum,
-                    albumCount: state?.albumCount
+                    albumCount: state?.albumCount,
+                    isPicks: !event.fillsImmichAlbum || (event.immichAlbumAutomatic == true && !configuration.immichAlbumsForEveryEvent)
                 )
             }
             .sorted { $0.eventName.localizedStandardCompare($1.eventName) == .orderedAscending }

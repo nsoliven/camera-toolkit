@@ -487,13 +487,13 @@ struct ServicesSettingsPane: View {
                         Text(model.immichKeyIsSaved ? "Saved in the Keychain" : "No API key saved")
                             .foregroundStyle(model.immichKeyIsSaved ? Color.secondary : Color.orange)
                         if !model.immichKeyIsSaved, !model.immichEarlierKeyServices.isEmpty {
-                            Button("Move the Key an Earlier Version Saved") { model.moveEarlierImmichKey() }
+                            Button("Move Key from “\(model.immichEarlierKeyServices[0])”") { model.moveEarlierImmichKey() }
                                 .controlSize(.small)
-                                .help("An earlier build saved an Immich key under another Keychain entry. This copies it here; macOS asks first.")
+                                .help("An earlier Camera Toolkit build saved an Immich key under this Keychain entry. This copies it into this build's entry; macOS asks first, and the old entry is left as it is.")
                         }
                     }
                 }
-                Text("Use a key from the account that owns the library, with: library read and scan, asset read and update, album create and add, stack create and update.")
+                Text("Use a key from the account that owns the library, with: library read and scan, asset read and update, album read, create and add, stack read, create, update and delete (only the app's own stacks are ever removed).")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .onAppear { model.refreshImmichKeyStatus() }

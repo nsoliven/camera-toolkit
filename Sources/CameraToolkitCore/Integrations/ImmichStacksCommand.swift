@@ -30,8 +30,9 @@ public enum ImmichStacksCommand {
            options: --support-dir <folder>  (default: the app's Application Support folder;
                                              env CAMERA_TOOLKIT_SUPPORT_DIR also works)
                     --event <name>          only this event (its exact name, any case); repeatable
-                    --log <file>            where a real run lists the stacks it made
-                                            (default: <support folder>/Immich Stack Logs/stacks-<time>.jsonl)
+                    --log <file>            where a real run lists every stack it made or replaced
+                                            (default: <support folder>/Immich Logs/stacks-<time>.jsonl)
+           A real run refuses while Camera Toolkit is running; a dry run only reads.
     """
 
     public static func parse(_ arguments: [String], environment: [String: String] = [:]) throws -> Arguments {
@@ -78,6 +79,7 @@ public enum ImmichStacksCommand {
         environment: [String: String] = ProcessInfo.processInfo.environment,
         defaultSupportFolder: URL,
         apiKey: () throws -> String?,
+        isAppRunning: () -> Bool = { false },
         transport: HTTPTransport = URLSession.shared,
         now: Date = Date(),
         output: @escaping (String) -> Void = { print($0) }
@@ -132,28 +134,28 @@ public enum ImmichStacksCommand {
                       relative.localizedCaseInsensitiveContains("/Edited/") else { return nil }
                 return relative
             }
-            let groups = ImmichStackGrouping.groups(files: files, editPaths: editPaths)
+            let stackable = ImmichStackGrouping.stackableEventIDs(events: state.savedEvents, locations: locations)
+            let groups = ImmichStackGrouping.groups(files: files.filter { $0.eventID.map(stackable.contains) ?? false }, editPaths: editPaths)
             output("Events: \(events.count), files: \(files.count), Immich assets read: \(assets.count), groups: \(groups.count)")
 
-            var logHandle: FileHandle?
             var logURL: URL?
             if !parsed.dryRun {
+                guard !isAppRunning() else {
+                    throw ToolkitError.commandFailed("Camera Toolkit is running; quit it first, so the app and this command do not stack at the same time. (--dry-run works while it runs.)")
+                }
                 let formatter = ISO8601DateFormatter()
                 formatter.formatOptions = [.withFullDate, .withTime]
                 let url = parsed.logPath.map { URL(fileURLWithPath: NSString(string: $0).expandingTildeInPath) }
-                    ?? context.supportFolder.appendingPathComponent("Immich Stack Logs", isDirectory: true)
+                    ?? context.supportFolder.appendingPathComponent("Immich Logs", isDirectory: true)
                         .appendingPathComponent("stacks-\(formatter.string(from: now).replacingOccurrences(of: ":", with: "")).jsonl")
                 guard !FileManager.default.fileExists(atPath: url.path) else {
                     throw ToolkitError.commandFailed("\(url.path) already exists; pick a new --log path.")
                 }
-                try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-                FileManager.default.createFile(atPath: url.path, contents: nil)
-                logHandle = try FileHandle(forWritingTo: url)
                 logURL = url
+            } else if isAppRunning() {
+                output("Note: Camera Toolkit is running. A dry run only reads, but the numbers can change while it works.")
             }
-            defer { try? logHandle?.close() }
-            let encoder = JSONEncoder()
-            encoder.dateEncodingStrategy = .iso8601
+            let log = logURL
             let result = try await ImmichStackRunner.run(
                 client: client,
                 groups: groups,
@@ -161,11 +163,11 @@ public enum ImmichStacksCommand {
                 library: library,
                 store: ImmichStackStore(catalogURL: context.catalogURL),
                 dryRun: parsed.dryRun
-            ) { record in
-                if let data = try? encoder.encode(record) { logHandle?.write(data + Data("\n".utf8)) }
+            ) { entry in
+                if let log { ImmichChangeLog.append(entry, to: log) }
             }
             output(summaryText(result, dryRun: parsed.dryRun))
-            if let logURL { output("Log of stacks made (to undo from): \(logURL.path)") }
+            if let logURL, FileManager.default.fileExists(atPath: logURL.path) { output("Log of stack changes (to undo from): \(logURL.path)") }
             return result.problems.isEmpty ? 0 : 1
         } catch {
             output("error: \(error.localizedDescription)")
@@ -180,6 +182,8 @@ public enum ImmichStacksCommand {
         lines.append("\(dryRun ? "Would make" : "Stacks to make"): \(plan.creates.count) (bursts \(byKind[.burst] ?? 0), RAW+JPEG \(byKind[.rawPair] ?? 0), with edits \(byKind[.edit] ?? 0)); \(plan.creates.count { $0.replacing != nil }) of them replace the app's own earlier stack")
         lines.append("Already stacked by the app, unchanged: \(plan.unchanged)")
         lines.append("Left alone, already in a stack the app did not make: \(plan.skippedForeign)")
+        lines.append("Unstacked in Immich since the app made them, not made again: \(plan.skippedRemoved)")
+        lines.append("Private events without Allow album are not stacked.")
         let notMatched = plan.skipped.filter { if case .notInImmich = $0.reason { true } else { false } }
         let none = notMatched.count { if case .notInImmich(let found, _) = $0.reason { found == 0 } else { false } }
         lines.append("Not matched in Immich: \(notMatched.count) (\(none) with no file in Immich, \(notMatched.count - none) with only one)")
