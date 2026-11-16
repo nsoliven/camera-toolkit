@@ -149,7 +149,7 @@ struct ColorSettingsPane: View {
             Button("Open Sony’s Page Instead") { NSWorkspace.shared.open(SonyConversionLUTs.sourcePage) }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("Camera Toolkit fetches “Slog3-S-Gamut3.Cine To s709 V200” (about 230 KB) over HTTPS from the address Sony's LUT page links:\n\n\(SonyConversionLUTs.s709Archive.absoluteString)\n\nIt checks the file is a zip of .cube LUTs, imports them as the S-Log3 conversion, and makes s709 the default. Sony's page asks for a few details before its own download button; open it instead to download there and import the file yourself.")
+            Text("Camera Toolkit fetches “Slog3-S-Gamut3.Cine To s709 V200” (about 230 KB) over HTTPS from the address Sony's LUT page links:\n\n\(SonyConversionLUTs.s709Archive.absoluteString)\n\nIt checks the file's SHA-256 against the s709 archive it expects, imports the LUT as the S-Log3 conversion, and makes s709 the default. Sony's page asks for a few details before its own download button; open it instead to download there and import the file yourself.")
         }
     }
 

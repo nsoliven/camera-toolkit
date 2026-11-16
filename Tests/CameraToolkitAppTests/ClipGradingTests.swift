@@ -204,6 +204,53 @@ final class ClipGradingTests: XCTestCase {
         }
     }
 
+    /// The pre-sync check runs clips side by side within one time budget,
+    /// reports progress, and leaves clips a sleeping NAS did not answer for
+    /// as unchecked instead of waiting for each in turn.
+    func testPreSyncSurveyIsConcurrentBudgetedAndReportsProgress() throws {
+        let requests = (1...12).map { index in
+            GradedRenderRequest(
+                source: URL(fileURLWithPath: "/Volumes/Buffer/2026/Trip/Originals/A7V/C\(String(format: "%04d", index)).MP4"),
+                recipe: GradeRecipe(grade: .converted, profile: .sLog3SGamut3Cine),
+                sourceKey: "C\(index)|1|1", sourceModifiedAt: Date(),
+                outputFolder: URL(fileURLWithPath: "/Volumes/Buffer/2026/Trip/Edited/Rec709")
+            )
+        }
+        final class Counter: @unchecked Sendable {
+            let lock = NSLock()
+            var calls: [Int] = []
+            func add(_ value: Int) { lock.withLock { calls.append(value) } }
+        }
+        let progress = Counter()
+        var started = Date()
+        let quick = ClipGrading.survey(
+            requests, renderer: GradeRenderer(), budget: 20,
+            check: { request, _ in
+                Thread.sleep(forTimeInterval: 0.4)
+                return request.sourceKey == "C3|1|1" ? .found(URL(fileURLWithPath: "/x")) : .none
+            },
+            estimate: { _ in 1_000 },
+            progress: { done, _ in progress.add(done) }
+        )
+        XCTAssertLessThan(Date().timeIntervalSince(started), 2.5, "twelve 0.4 s checks run side by side")
+        XCTAssertEqual(quick.alreadyThere, 1)
+        XCTAssertEqual(quick.pending.count, 11)
+        XCTAssertEqual(quick.estimatedBytes, 11_000)
+        XCTAssertEqual(quick.unchecked, 0)
+        XCTAssertEqual(progress.calls.count, 12, "progress for every clip")
+
+        started = Date()
+        let asleep = ClipGrading.survey(
+            requests, renderer: GradeRenderer(), budget: 1,
+            check: { _, _ in Thread.sleep(forTimeInterval: 2.5); return .unknown },
+            estimate: { _ in 1_000 }
+        )
+        XCTAssertLessThan(Date().timeIntervalSince(started), 4.5, "bounded by the budget, not 12 × the read timeout")
+        XCTAssertEqual(asleep.unchecked, 12)
+        XCTAssertEqual(asleep.pending.count, 12, "unchecked clips stay in the plan; their render looks again")
+        XCTAssertEqual(asleep.alreadyThere, 0)
+    }
+
     func testRenderJobStopsOnStopAndBeforeRunningOutOfSpace() throws {
         let folder = FileManager.default.temporaryDirectory.appendingPathComponent("GradeStop-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: folder) }

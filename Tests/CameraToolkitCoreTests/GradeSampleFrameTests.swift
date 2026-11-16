@@ -45,6 +45,19 @@ final class GradeSampleFrameTests: XCTestCase {
         try writePNG(graded, to: out.appendingPathComponent("\(name)-1-sony-conversion.png"))
         let split = try XCTUnwrap(sideBySide(frame, graded, renderer: renderer))
         try writePNG(split, to: out.appendingPathComponent("\(name)-wipe-log-vs-conversion.png"))
+        // CT_GRADE_SAMPLE_CONVERSION_LUT: a conversion LUT (Sony's s709,
+        // kept outside the repository) beside the built-in math.
+        if let lutPath = env["CT_GRADE_SAMPLE_CONVERSION_LUT"] {
+            let lut = try CubeLUT.parse(contentsOf: URL(fileURLWithPath: lutPath))
+            renderer.lutProvider = { _ in lut }
+            let viaLUT = GradeRecipe(grade: .converted, profile: profile, conversion: .lut("sample"), range: range)
+            let lutGraded = try XCTUnwrap(renderer.grade(frame, recipe: viaLUT))
+            try writePNG(lutGraded, to: out.appendingPathComponent("\(name)-1-sony-s709-lut.png"))
+            let versus = try XCTUnwrap(sideBySide(graded, lutGraded, renderer: renderer))
+            try writePNG(versus, to: out.appendingPathComponent("\(name)-builtin-left-vs-s709-right.png"))
+            print("built-in vs s709 mean difference \(meanDifference(graded, lutGraded))")
+        }
+
         // Stage (c): each built-in look on top, at its default intensity.
         var tiles: [CGImage] = [frame, graded]
         for look in BuiltInLook.allCases {

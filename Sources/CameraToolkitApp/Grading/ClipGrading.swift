@@ -72,6 +72,7 @@ final class ClipGrading {
                 + (summary.freeBytes.map { " (\(formatter.string(fromByteCount: $0)) free there)." } ?? "."),
             "Sync to NAS then carries them to the NAS, where Immich picks them up. The sync waits in the queue behind the render; Stop in the Jobs window ends the render and the sync still runs.",
         ]
+        if summary.unchecked > 0 { lines.append("\(summary.unchecked) could not be checked in time (the NAS may be asleep). Their render looks again first and never makes a second copy.") }
         if summary.alreadyThere > 0 { lines.append("\(summary.alreadyThere) cop\(summary.alreadyThere == 1 ? "y is" : "ies are") already there and will not be made again.") }
         if summary.isFirstRun { lines.append("This is asked the first time, and again whenever more than \(renderBeforeSyncAskAbove) copies are due. Turn it off in Settings › Color.") }
         alert.informativeText = lines.joined(separator: "\n\n")
