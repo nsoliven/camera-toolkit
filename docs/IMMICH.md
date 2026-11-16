@@ -34,6 +34,8 @@ Events get an album only when asked: by pairing an existing album, or by choosin
 
 Nothing ambiguous is paired: two events tying for a name, an album that mixes events, a name and contents that disagree, or an event that matches two albums. Private events need **Allow album**, events set to **No album** keep it, and an event that already has an album keeps that one. Each unpaired album is listed with its reason. Pairing writes nothing to Immich.
 
+To see what pairing would do without changing anything, run `CameraToolkit --immich-pair --dry-run`. It prints counts by reason; add `--list` to print each album with its event or reason. Pairing itself is done in the app.
+
 A pairing is stored by album ID, so renaming the album in Immich does not break it. The event also keeps the album's name with a custom policy, so an older build still fills the same album by name. An album made by name on a check is paired by ID from then on.
 
 **Filling.** Each check adds the event's online, untrashed photos that are missing from its album. It never removes any, so a photo taken out of such an album comes back on the next check; choose **No Album** to stop that. A paired album that is no longer in Immich is reported, not made again.
@@ -73,7 +75,7 @@ The dry run only reads. It reports how many stacks it would make, how many are a
 
 ## View in Immich
 
-**View in Immich** sits beside the event's Immich chip and in the event's sidebar menu. It opens the paired album; without an album, the event's folder in Immich's folder view; without a known library, the server's home page. In the photo preview's menu it opens that photo's own Immich page when a check has matched it. It is disabled, with a hint, until a server URL is set.
+**View in Immich** sits beside the event's Immich chip and in the event's sidebar menu. It opens the paired album (`/albums/<id>`); without an album, the event's folder in Immich's folder view (`/folders?path=<full folder path>`, as Immich's web app builds it); without a known library, the server's home page. In the photo preview's menu it opens that photo's own Immich page when a check has matched it. It is disabled, with a hint, until a server URL is set.
 
 ## Renames
 

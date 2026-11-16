@@ -167,10 +167,11 @@ public struct ImmichClient: Sendable {
         return webURL(serverURL: serverURL, path: "/photos/\(assetID)")
     }
 
-    /// The server's folder view at a library folder.
+    /// The server's folder view at a library folder: `/folders?path=<full
+    /// folder path>`, as Immich's web app builds it (`Route.folders`).
     public static func webURL(serverURL: String, folder: String) -> URL? {
         guard var components = webURL(serverURL: serverURL, path: "/folders").flatMap({ URLComponents(url: $0, resolvingAgainstBaseURL: false) }) else { return nil }
-        components.queryItems = [URLQueryItem(name: "folder", value: folder)]
+        components.queryItems = [URLQueryItem(name: "path", value: folder)]
         return components.url
     }
 

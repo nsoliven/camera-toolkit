@@ -193,6 +193,20 @@ public enum ImmichAlbumPairing {
     }
 }
 
+extension ImmichAlbumPairing {
+    /// Every album on the account with its assets' paths. Reads only.
+    public static func readAlbums(client: ImmichClient, progress: @Sendable (Int, Int) -> Void = { _, _ in }) async throws -> [ImmichAlbumContents] {
+        let albums = try await client.albums()
+        var contents: [ImmichAlbumContents] = []
+        for (index, album) in albums.enumerated() {
+            progress(index + 1, albums.count)
+            let assets = try await client.albumAssets(albumID: album.id)
+            contents.append(ImmichAlbumContents(album: album, originalPaths: assets.map(\.originalPath)))
+        }
+        return contents
+    }
+}
+
 extension SavedCameraEvent {
     /// Pairs the event with an existing album. The policy and name are kept
     /// in step so a build without pairing fills the same album by name.

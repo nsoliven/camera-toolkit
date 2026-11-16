@@ -75,14 +75,10 @@ extension DashboardModel {
                 let client = try makeImmichClient()
                 let library = try await client.library(id: configuration.immichLibraryID)
                 immichLibrary = library
-                let albums = try await client.albums()
-                immichAlbums = albums.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
-                var contents: [ImmichAlbumContents] = []
-                for (index, album) in albums.enumerated() {
-                    immichPairingNote = "Reading album \(index + 1) of \(albums.count)…"
-                    let assets = try await client.albumAssets(albumID: album.id)
-                    contents.append(ImmichAlbumContents(album: album, originalPaths: assets.map(\.originalPath)))
+                let contents = try await ImmichAlbumPairing.readAlbums(client: client) { [weak self] index, total in
+                    Task { @MainActor in self?.immichPairingNote = "Reading album \(index) of \(total)…" }
                 }
+                immichAlbums = contents.map(\.album).sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
                 let files = await immichCatalogFiles()
                 let events = configuration.savedEvents
                 let locations = EventStorageLocations(configuration: configuration)

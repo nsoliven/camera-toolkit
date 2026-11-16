@@ -40,6 +40,24 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate, NSMenuIte
             exit(status)
         }
         // Immich stacks from a script: the Keychain key stays in this process.
+        if CommandLine.arguments.contains(ImmichPairCommand.flag) {
+            let support = DashboardModel.defaultApplicationSupportURL.appendingPathComponent("CameraToolkit", isDirectory: true)
+            let arguments = CommandLine.arguments
+            let result = CommandStatusBox()
+            let semaphore = DispatchSemaphore(value: 0)
+            Task.detached {
+                let status = await ImmichPairCommand.run(
+                    arguments: arguments,
+                    defaultSupportFolder: support,
+                    apiKey: { try KeychainSecretStore(service: DashboardModel.keychainService).read(account: DashboardModel.immichAPIKeyAccount) }
+                )
+                result.set(status)
+                semaphore.signal()
+            }
+            semaphore.wait()
+            DebugLog.shared.flush()
+            exit(result.value)
+        }
         if CommandLine.arguments.contains(ImmichStacksCommand.flag) {
             let support = DashboardModel.defaultApplicationSupportURL.appendingPathComponent("CameraToolkit", isDirectory: true)
             let arguments = CommandLine.arguments

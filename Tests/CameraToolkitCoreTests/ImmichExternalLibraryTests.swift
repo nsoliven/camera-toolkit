@@ -894,12 +894,30 @@ final class ImmichStackTests: XCTestCase {
         XCTAssertThrowsError(try ImmichStacksCommand.library(chosenID: "gone", libraries: [one]))
     }
 
+    func testPairCommandIsADryRunAndCountsReasons() throws {
+        XCTAssertTrue(try ImmichPairCommand.parse(["x", "--immich-pair", "--dry-run", "--list"]).list)
+        XCTAssertThrowsError(try ImmichPairCommand.parse(["x", "--immich-pair"]), "pairing for real happens in the app")
+        let event = SavedCameraEvent(name: "Beach Day", eventDate: start)
+        var result = ImmichPairingResult()
+        result.pairs = [ImmichAlbumPair(album: ImmichAlbum(id: "a", name: "Beach Day"), eventID: event.id, basis: .name, matchedAssets: 0)]
+        result.unpaired = [
+            ImmichUnpairedAlbum(album: ImmichAlbum(id: "b", name: "Screenshots"), reason: .noMatch),
+            ImmichUnpairedAlbum(album: ImmichAlbum(id: "c", name: "Favorites"), reason: .mixed(topShare: 0.4)),
+            ImmichUnpairedAlbum(album: ImmichAlbum(id: "d", name: "Mixed Again"), reason: .mixed(topShare: 0.6))
+        ]
+        let counts = ImmichPairCommand.summaryText(result, albums: 4, events: [event], list: false)
+        XCTAssertTrue(counts.contains("Would pair: 1 (by name 1"))
+        XCTAssertTrue(counts.contains("Photos from several events: 2"))
+        XCTAssertFalse(counts.contains("Screenshots"), "names only with --list")
+        XCTAssertTrue(ImmichPairCommand.summaryText(result, albums: 4, events: [event], list: true).contains("pair  Beach Day  ↔  Beach Day"))
+    }
+
     func testWebLinksForAnAssetAFolderAndHome() {
         XCTAssertEqual(ImmichClient.webURL(serverURL: "https://photos.example.com", assetID: "a-1")?.absoluteString, "https://photos.example.com/photos/a-1")
         XCTAssertEqual(ImmichClient.webURL(serverURL: "https://photos.example.com")?.absoluteString, "https://photos.example.com/")
         let folder = ImmichClient.webURL(serverURL: "https://photos.example.com", folder: "/external/library/2026/Trip 2026")
         XCTAssertEqual(folder?.path, "/folders")
-        XCTAssertEqual(URLComponents(url: folder!, resolvingAgainstBaseURL: false)?.queryItems?.first?.value, "/external/library/2026/Trip 2026")
+        XCTAssertEqual(URLComponents(url: folder!, resolvingAgainstBaseURL: false)?.queryItems, [URLQueryItem(name: "path", value: "/external/library/2026/Trip 2026")])
     }
 }
 
