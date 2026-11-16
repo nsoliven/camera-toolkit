@@ -701,6 +701,9 @@ public struct SavedCameraEvent: Identifiable, Codable, Equatable, Hashable, Send
     /// The album came from "Make an album for every event", not from the
     /// owner's own choice; turning that switch off stops filling it.
     public var immichAlbumAutomatic: Bool?
+    /// The paired album belongs to someone else (shared with the user); the
+    /// app never adds to it.
+    public var immichAlbumShared: Bool?
 
     public init(
         id: UUID = UUID(),

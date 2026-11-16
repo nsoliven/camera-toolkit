@@ -143,6 +143,15 @@ extension EventsWorkspace {
 
     /// The app made this burst one Immich stack: the same key the grouping
     /// gives it (event, kind, first frame).
+    /// The burst's group key when someone unstacked the app's stack of it
+    /// in Immich; nil otherwise.
+    func immichUnstackedKey(for stack: OrganizeStack, eventID: UUID) -> String? {
+        guard stack.isBurst, !model.immichUnstackedKeys.isEmpty, let first = stack.items.first?.primary else { return nil }
+        let identity = BurstFrameIdentity.key(fileName: first.name, byteCount: first.size, modifiedAt: first.modifiedAt)
+        let key = "\(eventID.uuidString)|burst|\(identity)"
+        return model.immichUnstackedKeys.contains(key) ? key : nil
+    }
+
     func isStackedInImmich(_ stack: OrganizeStack, eventID: UUID) -> Bool {
         guard stack.isBurst, !model.immichStackedKeys.isEmpty, let first = stack.items.first?.primary else { return false }
         let identity = BurstFrameIdentity.key(fileName: first.name, byteCount: first.size, modifiedAt: first.modifiedAt)

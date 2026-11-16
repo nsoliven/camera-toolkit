@@ -1171,6 +1171,12 @@ private struct EventSidebarMenu: View {
             Button("Send to Immich…") { workspace.requestImmichSend([event.id]) }
                 .help("Choose events, then scan now and fill their albums")
         }
+        let unstacked = workspace.model.immichUnstackedKeys.filter { $0.hasPrefix(event.id.uuidString + "|") }
+        if !unstacked.isEmpty {
+            Button("Stack \(unstacked.count) Burst\(unstacked.count == 1 ? "" : "s") Unstacked in Immich Again") {
+                workspace.model.stackAgainInImmich(groupKeys: unstacked)
+            }
+        }
         Button("View in Immich") {
             if let url = workspace.model.immichWebURL(for: event) { NSWorkspace.shared.open(url) }
         }

@@ -56,6 +56,8 @@ public enum ImmichPairingReason: Equatable, Sendable {
     case eventAlreadyPaired
     /// Someone else's album shared with the key's user.
     case sharedWithYou
+    /// The key's user could not be read, so whose album it is is unknown.
+    case ownerUnknown
 
     public var text: String {
         switch self {
@@ -68,6 +70,7 @@ public enum ImmichPairingReason: Equatable, Sendable {
         case .eventOptedOut: "Its event is set to No album"
         case .eventAlreadyPaired: "Its event already has an album"
         case .sharedWithYou: "Shared with you, not your album; not paired"
+        case .ownerUnknown: "Could not confirm it is your album (the key needs user.read); not paired"
         }
     }
 }
@@ -149,9 +152,16 @@ public enum ImmichAlbumPairing {
                 result.alreadyPaired += 1
                 continue
             }
-            if let owner = album.ownerID, let currentUserID, owner != currentUserID {
-                result.unpaired.append(ImmichUnpairedAlbum(album: album, reason: .sharedWithYou))
-                continue
+            // Fails closed: without the key's user, no album with an owner pairs.
+            if let owner = album.ownerID {
+                guard let currentUserID else {
+                    result.unpaired.append(ImmichUnpairedAlbum(album: album, reason: .ownerUnknown))
+                    continue
+                }
+                if owner != currentUserID {
+                    result.unpaired.append(ImmichUnpairedAlbum(album: album, reason: .sharedWithYou))
+                    continue
+                }
             }
             let nameMatches = eventsByNameKey[NASSyncStore.pathKey(album.name.trimmingCharacters(in: .whitespacesAndNewlines))] ?? []
             var counts: [UUID: Int] = [:]
@@ -241,12 +251,13 @@ extension SavedCameraEvent {
     /// - Parameters:
     ///   - fills: checks add the whole event to it; false links a picks album.
     ///   - automatic: it came from "Make an album for every event".
-    public mutating func pairImmichAlbum(_ album: ImmichAlbum, fills: Bool = true, automatic: Bool = false) {
+    public mutating func pairImmichAlbum(_ album: ImmichAlbum, fills: Bool = true, automatic: Bool = false, shared: Bool = false) {
         immichAlbumID = album.id
         immichAlbumPolicy = .custom
         immichAlbumName = album.name
-        immichAlbumFill = fills
+        immichAlbumFill = fills && !shared
         immichAlbumAutomatic = automatic ? true : nil
+        immichAlbumShared = shared ? true : nil
     }
 
     /// No album, and nothing pairs it again on its own.
@@ -255,6 +266,7 @@ extension SavedCameraEvent {
         immichAlbumPolicy = ImmichAlbumPolicy.none
         immichAlbumFill = nil
         immichAlbumAutomatic = nil
+        immichAlbumShared = nil
     }
 
     /// A new album named after the event, made on the next check.
@@ -263,9 +275,23 @@ extension SavedCameraEvent {
         immichAlbumPolicy = .event
         immichAlbumFill = nil
         immichAlbumAutomatic = nil
+        immichAlbumShared = nil
     }
 
     /// Checks add the event's photos to its album: always for an album the
     /// app will make, for a paired album only when it is an event album.
-    public var fillsImmichAlbum: Bool { immichAlbumID == nil || (immichAlbumFill ?? true) }
+    public var fillsImmichAlbum: Bool { immichAlbumID == nil || (immichAlbumShared != true && (immichAlbumFill ?? true)) }
+
+    /// Whether checks fill the paired album right now, as the Album menu's
+    /// switch shows it: an automatic album only while the every-event
+    /// switch is on.
+    public func isFillingImmichAlbum(albumsForEveryEvent: Bool) -> Bool {
+        fillsImmichAlbum && (immichAlbumAutomatic != true || albumsForEveryEvent)
+    }
+
+    /// The share of `eventMediaCount` an album holding `matched` of the
+    /// event's photos covers, against the event-album rule.
+    public static func immichAlbumHoldsWholeEvent(matched: Int, eventMediaCount: Int) -> Bool {
+        eventMediaCount > 0 && Double(matched) / Double(eventMediaCount) >= ImmichAlbumPairing.eventAlbumShare
+    }
 }

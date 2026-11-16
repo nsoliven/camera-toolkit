@@ -282,6 +282,13 @@ struct EventBoardView: View {
                 onBlanket: { blanketRequest = $0 }
             )
         }
+        let unstacked = Set(stacks(for: targets).compactMap { workspace.immichUnstackedKey(for: $0, eventID: workspace.assignedEvent(for: $0).event?.id ?? eventID) })
+        if !unstacked.isEmpty {
+            Button(unstacked.count == 1 ? "Stack This Burst in Immich Again" : "Stack These \(unstacked.count) Bursts in Immich Again") {
+                model.stackAgainInImmich(groupKeys: unstacked)
+            }
+            .help("It was unstacked in Immich, so the app left it alone. This makes it again on the next check.")
+        }
         Divider()
         Button("Preview") { openPreview(stack.id) }
         // A 360 clip's own editor leads when it's installed; Photomator

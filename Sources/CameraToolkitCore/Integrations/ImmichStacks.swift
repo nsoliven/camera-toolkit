@@ -216,10 +216,11 @@ public struct ImmichStackPlan: Equatable, Sendable {
         public var group: ImmichStackGroup
         /// Top first.
         public var assetIDs: [String]
-        /// The app's own stack to remove first (a member left or a frame was
-        /// renamed). Removing it, rather than letting Immich merge it, keeps a
-        /// departed member from being pulled back in.
-        public var replacing: String?
+        /// The app's own stacks to remove first: the group's earlier stack and
+        /// any other app stack holding one of these assets. Removing them,
+        /// rather than letting Immich merge them, keeps a departed member
+        /// (from another event, say) from being pulled in.
+        public var replacing: [String]
     }
 
     public struct Skip: Equatable, Sendable {
@@ -311,7 +312,13 @@ public enum ImmichStackPlanner {
                 plan.unchanged += 1
                 continue
             }
-            let replacing = record.flatMap { accountByID[$0.stackID] != nil ? $0.stackID : nil }
+            var replacing: [String] = []
+            if let own = record?.stackID, accountByID[own] != nil { replacing.append(own) }
+            for id in ids {
+                if let stack = stackOfAsset[id], ours.contains(stack.id), !replacing.contains(stack.id) {
+                    replacing.append(stack.id)
+                }
+            }
             plan.creates.append(.init(group: group, assetIDs: ids, replacing: replacing))
         }
         return plan
@@ -348,6 +355,15 @@ public final class ImmichStackStore: @unchecked Sendable {
                 }
             }
             return result
+        }
+    }
+
+    public func remove(keys: Set<String>) throws {
+        guard !keys.isEmpty else { return }
+        try CatalogDatabase.writer(for: catalogURL).write { database in
+            for key in keys {
+                try database.execute(sql: "DELETE FROM immich_stacks WHERE group_key = ?", arguments: [key])
+            }
         }
     }
 
@@ -410,6 +426,8 @@ public enum ImmichStackRunner {
         log: (@Sendable (ImmichStackLogEntry) -> Void)?
     ) async -> ImmichStackRunReport {
         var report = ImmichStackRunReport(plan: plan)
+        var deletedByApp = Set<String>()
+        var savedKeys = Set<String>()
         for key in plan.newlyRemoved {
             guard var record = records[key] else { continue }
             record.removedInImmich = true
@@ -418,9 +436,13 @@ public enum ImmichStackRunner {
         for create in plan.creates {
             let group = create.group
             do {
-                if let old = create.replacing {
+                for old in create.replacing where !deletedByApp.contains(old) {
                     try await client.deleteStack(stackID: old)
-                    log?(ImmichStackLogEntry(action: .removedOwn, stackID: old, groupKey: group.key, assetIDs: records[group.key]?.assetIDs ?? []))
+                    deletedByApp.insert(old)
+                    let owner = records.values.first { $0.stackID == old }
+                    log?(ImmichStackLogEntry(action: .removedOwn, stackID: old, groupKey: owner?.key ?? group.key, assetIDs: owner?.assetIDs ?? []))
+                }
+                if !create.replacing.isEmpty {
                     // Until the new stack exists, the record says the app is rebuilding it.
                     try store.save(ImmichStackRecord(key: group.key, stackID: "", eventID: group.eventID, kind: group.kind, assetIDs: create.assetIDs))
                 }
@@ -443,12 +465,17 @@ public enum ImmichStackRunner {
                 }
                 let record = ImmichStackRecord(key: group.key, stackID: stack.id, eventID: group.eventID, kind: group.kind, assetIDs: stack.assetIDs)
                 try store.save(record)
+                savedKeys.insert(group.key)
                 log?(ImmichStackLogEntry(action: action, stackID: stack.id, groupKey: group.key, assetIDs: stack.assetIDs))
                 report.created.append(record)
             } catch {
                 report.problems.append(error.localizedDescription)
             }
         }
+        // A stack the app removed itself is no user's unstacking: its record
+        // goes, so the group is made fresh next time instead of tombstoned.
+        let orphaned = Set(records.values.filter { deletedByApp.contains($0.stackID) && !savedKeys.contains($0.key) }.map(\.key))
+        try? store.remove(keys: orphaned)
         return report
     }
 }
