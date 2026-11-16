@@ -87,6 +87,10 @@ extension ClipGrading {
         var estimatedBytes: Int64
         var freeBytes: Int64?
         var isFirstRun: Bool
+        /// Copies whose existing file could not be checked in time (a
+        /// sleeping NAS); the render checks them again and never makes a
+        /// duplicate.
+        var unchecked: Int = 0
     }
 
     enum RenderBeforeSyncChoice: Equatable {
@@ -129,10 +133,15 @@ extension ClipGrading {
             resolver: resolver
         )
         let renderer = self.renderer
+        let model = self.model
         model.statusMessage = "Looking for graded log clips to render before the sync…"
         Task { @MainActor [weak self] in
             let survey = await Task.detached(priority: .userInitiated) {
-                Self.surveyBeforeSync(inputs, renderer: renderer)
+                Self.surveyBeforeSync(inputs, renderer: renderer, progress: { done, total in
+                    Task { @MainActor in
+                        model.statusMessage = "Checking which graded copies are already made: \(done) of \(total)…"
+                    }
+                })
             }.value
             guard let self else { return }
             guard !survey.pending.isEmpty else {
@@ -142,7 +151,8 @@ extension ClipGrading {
             let firstRun = !UserDefaults.standard.bool(forKey: Self.renderBeforeSyncConfirmedKey)
             let summary = RenderBeforeSyncSummary(
                 count: survey.pending.count, alreadyThere: survey.alreadyThere,
-                estimatedBytes: survey.estimatedBytes, freeBytes: survey.freeBytes, isFirstRun: firstRun
+                estimatedBytes: survey.estimatedBytes, freeBytes: survey.freeBytes, isFirstRun: firstRun,
+                unchecked: survey.unchecked
             )
             var choice = RenderBeforeSyncChoice.renderThenSync
             if firstRun || summary.count > Self.renderBeforeSyncAskAbove {
@@ -173,33 +183,110 @@ extension ClipGrading {
     struct BeforeSyncSurvey: Sendable {
         var pending: [GradedRenderRequest] = []
         var alreadyThere = 0
+        var unchecked = 0
         var estimatedBytes: Int64 = 0
         var freeBytes: Int64?
     }
 
+    /// How many clips are checked at once, and how long the whole check
+    /// may take: on a sleeping NAS each tag read can wait, and the user is
+    /// waiting for the sync to start.
+    nonisolated static let surveyWidth = 8
+    nonisolated static let surveyBudget: TimeInterval = 30
+
     /// The planner's requests with each clip's probed signal range (the
     /// same source a manual render uses), minus copies already made.
-    nonisolated static func surveyBeforeSync(_ inputs: GradedSyncPlanner.Inputs, renderer: GradeRenderer) -> BeforeSyncSurvey {
+    /// Clips are checked `surveyWidth` at a time within `budget`; a clip
+    /// whose existing copy did not answer in time stays in the plan as
+    /// unchecked (its render looks again and refuses to duplicate).
+    nonisolated static func surveyBeforeSync(
+        _ inputs: GradedSyncPlanner.Inputs,
+        renderer: GradeRenderer,
+        budget: TimeInterval = surveyBudget,
+        check: (@Sendable (GradedRenderRequest, TimeInterval) -> GradedVideoExporter.ExistingRenderCheck)? = nil,
+        progress: @escaping @Sendable (Int, Int) -> Void = { _, _ in }
+    ) -> BeforeSyncSurvey {
         let found = GradedSyncPlanner.requests(
             inputs,
             detect: { LogProfileDetector.profile(clipBesideSidecar: $0) },
             range: { _ in .full }
         )
-        var survey = BeforeSyncSurvey()
-        for var request in found {
-            request.recipe.range = probedRange(request.source, renderer: renderer) ?? request.recipe.range
-            if GradedVideoExporter.existingRender(of: request) != nil {
-                survey.alreadyThere += 1
-                continue
+        return survey(found, renderer: renderer, budget: budget, check: check, progress: progress)
+    }
+
+    nonisolated static func survey(
+        _ found: [GradedRenderRequest],
+        renderer: GradeRenderer,
+        budget: TimeInterval = surveyBudget,
+        check: (@Sendable (GradedRenderRequest, TimeInterval) -> GradedVideoExporter.ExistingRenderCheck)? = nil,
+        estimate: @escaping @Sendable (URL) -> Int64? = { GradedVideoExporter.estimatedBytes(of: $0) },
+        progress: @escaping @Sendable (Int, Int) -> Void = { _, _ in }
+    ) -> BeforeSyncSurvey {
+        enum Answer: Sendable { case pending(GradedRenderRequest, Int64), already, unchecked(GradedRenderRequest) }
+        final class Results: @unchecked Sendable {
+            let lock = NSLock()
+            var answers: [Int: Answer] = [:]
+            var done = 0
+        }
+        let results = Results()
+        let deadline = Date().addingTimeInterval(budget)
+        let check = check ?? { request, timeout in GradedVideoExporter.existingRenderCheck(of: request, timeout: timeout) }
+        let queue = OperationQueue()
+        queue.maxConcurrentOperationCount = surveyWidth
+        queue.qualityOfService = .userInitiated
+        let total = found.count
+        for (index, base) in found.enumerated() {
+            queue.addOperation {
+                var request = base
+                let remaining = deadline.timeIntervalSinceNow
+                let answer: Answer
+                if remaining <= 0 {
+                    answer = .unchecked(request)
+                } else {
+                    request.recipe.range = probedRange(request.source, renderer: renderer, timeout: min(remaining, 20)) ?? request.recipe.range
+                    switch check(request, max(0.5, min(deadline.timeIntervalSinceNow, 20))) {
+                    case .found: answer = .already
+                    case .unknown: answer = .unchecked(request)
+                    case .none: answer = .pending(request, estimate(request.source) ?? 0)
+                    }
+                }
+                let done = results.lock.withLock { () -> Int in
+                    results.answers[index] = answer
+                    results.done += 1
+                    return results.done
+                }
+                progress(done, total)
             }
-            survey.estimatedBytes += GradedVideoExporter.estimatedBytes(of: request.source) ?? 0
-            survey.pending.append(request)
+        }
+        // Wait for the checks, but never past the budget (plus a moment for
+        // reads already given a shorter timeout to come back).
+        let waited = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            queue.waitUntilAllOperationsAreFinished()
+            waited.signal()
+        }
+        if waited.wait(timeout: .now() + budget + 2) == .timedOut { queue.cancelAllOperations() }
+        var survey = BeforeSyncSurvey()
+        let answers = results.lock.withLock { results.answers }
+        for index in found.indices {
+            switch answers[index] {
+            case .already?: survey.alreadyThere += 1
+            case .pending(let request, let bytes)?:
+                survey.pending.append(request)
+                survey.estimatedBytes += bytes
+            case .unchecked(let request)?:
+                survey.unchecked += 1
+                survey.pending.append(request)
+            case nil:
+                survey.unchecked += 1
+                survey.pending.append(found[index])
+            }
         }
         survey.freeBytes = survey.pending.first.flatMap { GradedVideoExporter.availableBytes(near: $0.outputFolder) }
         return survey
     }
 
-    nonisolated static func probedRange(_ url: URL, renderer: GradeRenderer) -> VideoSignalRange? {
+    nonisolated static func probedRange(_ url: URL, renderer: GradeRenderer, timeout: TimeInterval = 20) -> VideoSignalRange? {
         final class Box: @unchecked Sendable { var range: VideoSignalRange? }
         let box = Box()
         let done = DispatchSemaphore(value: 0)
@@ -207,7 +294,7 @@ extension ClipGrading {
             box.range = await renderer.signalRange(of: url)
             done.signal()
         }
-        _ = done.wait(timeout: .now() + 20)
+        _ = done.wait(timeout: .now() + timeout)
         return box.range
     }
 
