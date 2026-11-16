@@ -750,6 +750,9 @@ final class EventsWorkspace {
     /// NAS whose copy the background refresh did not check (source path key
     /// → event). Neither applied nor waiting for Apply.
     var nasUncheckedSourceEvents: [String: [String: UUID]] = [:]
+    /// Per scanned source root: files whose straight-to-NAS copy a Clear
+    /// from Card probe found missing — waiting for Apply until recopied.
+    @ObservationIgnored var nasMissingSourceEvents: [String: [String: UUID]] = [:]
     /// Folders an Add to Events could not add anything from, with the
     /// listing they had then: until that listing changes they are reported
     /// as left out instead of being offered again.
@@ -2063,8 +2066,12 @@ final class EventsWorkspace {
         if appliedSourceEvents[result.rootPath] != plan.applied {
             appliedSourceEvents[result.rootPath] = plan.applied
         }
-        if nasUncheckedSourceEvents[result.rootPath] != plan.nasUnchecked {
-            nasUncheckedSourceEvents[result.rootPath] = plan.nasUnchecked
+        // A copy Clear from Card's probe found missing stays waiting for
+        // Apply until it is copied again, whatever this unprobed pass says.
+        let missing = nasMissingSourceEvents[result.rootPath] ?? [:]
+        let unchecked = plan.nasUnchecked.filter { missing[$0.key] != $0.value }
+        if nasUncheckedSourceEvents[result.rootPath] != unchecked {
+            nasUncheckedSourceEvents[result.rootPath] = unchecked
         }
         let summary = CardClearSummary(plan)
         if cardClearSummaries[result.rootPath] != summary {
@@ -2112,6 +2119,27 @@ final class EventsWorkspace {
 
     // MARK: - Clear from Card
 
+    /// A probed plan (Clear from Card's) written back to the board: what it
+    /// checked on the NAS is applied, what it found missing waits for Apply
+    /// and is remembered until a straight-to-NAS copy lands it again.
+    func noteProbedNASCopies(_ plan: CardClearPlan, rootPath: String) {
+        if appliedSourceEvents[rootPath] != plan.applied {
+            appliedSourceEvents[rootPath] = plan.applied
+        }
+        var missing = nasMissingSourceEvents[rootPath] ?? [:]
+        for key in plan.applied.keys { missing[key] = nil }
+        missing.merge(plan.nasMissing) { _, new in new }
+        nasMissingSourceEvents[rootPath] = missing.isEmpty ? nil : missing
+        let unchecked = plan.nasUnchecked.filter { missing[$0.key] != $0.value }
+        if nasUncheckedSourceEvents[rootPath] != unchecked {
+            nasUncheckedSourceEvents[rootPath] = unchecked
+        }
+        let summary = CardClearSummary(plan)
+        if cardClearSummaries[rootPath] != summary {
+            cardClearSummaries[rootPath] = summary
+        }
+    }
+
     /// "Clear from Card…": plans afresh, then opens the confirmation with
     /// what is eligible per event and what stays and why. Nothing is deleted
     /// here.
@@ -2119,7 +2147,16 @@ final class EventsWorkspace {
         guard let location = location(locationID), let result = sources[locationID]?.result else { return }
         let plan = await cardClearPlan(for: locationID, result: result)
         guard sources[locationID]?.result?.rootPath == result.rootPath else { return }
+        // The probe's answer is the board's answer too: a NAS copy found
+        // missing makes its file wait for Apply again (which recopies it).
+        noteProbedNASCopies(plan, rootPath: result.rootPath)
+        let missingNote = plan.nasMissing.isEmpty ? nil
+            : "\(plan.nasMissing.count) file\(plan.nasMissing.count == 1 ? "’s NAS copy is" : "s’ NAS copies are") missing; Apply again to recopy \(plan.nasMissing.count == 1 ? "it" : "them")."
         guard !plan.clearable.isEmpty else {
+            if let missingNote {
+                model.statusMessage = missingNote + " Nothing was removed."
+                return
+            }
             model.statusMessage = plan.nasUncheckedFiles > 0
                 ? "\(plan.nasUncheckedFiles) file(s) were copied to the NAS earlier, but the NAS isn’t connected, so they can’t be checked. Nothing was removed."
                 : plan.waitingForNAS.isEmpty
@@ -2154,6 +2191,7 @@ final class EventsWorkspace {
             nasOnlyFiles: nasOnlyItems.reduce(0) { $0 + $1.files.count },
             nasOnlyBytes: nasOnlyItems.reduce(Int64(0)) { $0 + $1.byteCount }
         )
+        if let missingNote { model.statusMessage = missingNote }
     }
 
     /// Runs the confirmed Clear from Card as a tracked job. The typed token
@@ -2269,7 +2307,10 @@ final class EventsWorkspace {
                 recorder?.notePhases(report.phases)
                 report.checks.driveName = driveName
                 recorder?.noteCardClearChecks(report.checks)
-                let dropped = itemIDs.subtracting(Set(items.map(\.id))).subtracting(chosen.driveCopyGone.map(\.id)).count
+                // Opted-in NAS-only items that no longer qualify are
+                // reported too.
+                let dropped = itemIDs.union(request.nasOnlyItemIDs)
+                    .subtracting(Set(items.map(\.id))).subtracting(chosen.driveCopyGone.map(\.id)).count
                 return CardClearOutcome(
                     report: report,
                     noLongerEligible: dropped,

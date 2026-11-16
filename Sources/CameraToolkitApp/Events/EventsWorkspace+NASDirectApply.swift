@@ -86,6 +86,14 @@ extension EventsWorkspace {
                 // The same post-copy hook as Sync to NAS: Immich scans the
                 // NAS event tree and checks the albums of what just landed.
                 if !outcome.report.copied.isEmpty { self?.followNASChangeInImmich() }
+                // Copies found missing earlier and now on the NAS again.
+                let landed = Set(outcome.plan.items.filter { proven.contains($0.relativePath) }.map { EventStorageLocations.pathKey($0.sourcePath) })
+                if let self, !landed.isEmpty {
+                    for (root, missing) in self.nasMissingSourceEvents {
+                        let left = missing.filter { !landed.contains($0.key) }
+                        self.nasMissingSourceEvents[root] = left.isEmpty ? nil : left
+                    }
+                }
                 self?.nasRenamesApplied(outcome.follow, remaining: renameQueue.pendingRenameCount(nasRoot: locations.nasRoot.path))
                 for eventID in refresh {
                     Task { await self?.refreshEvent(eventID) }
