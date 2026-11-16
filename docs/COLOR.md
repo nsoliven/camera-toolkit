@@ -57,7 +57,9 @@ The whole grade is per pixel, so it is baked into one 3D cube (33³ for tiles an
 
 ## Sony's conversion LUTs
 
-Sony lists its LUTs on its cinematography site (`https://sony-cinematography.com/resources/luts/`); the "Sony Collection" there offers `Slog3-S-Gamut3.Cine To s709 V200`. s709 is the Rec.709 look Sony's current cameras use, and it is the LUT an A7V's own clip metadata names (`SL3SG3Ctos709.cube`), so it is the default once imported. Settings › Color › **Get Sony's Official Conversion LUTs…** shows the address and, when asked, downloads the archive (about 230 KB) over HTTPS from the host that page links, checks it is a zip of `.cube` files, imports them as S-Log3 conversion LUTs and makes s709 the default. Sony's page asks for a few details before its own download button; **Open Sony's LUT Page** goes there instead, and the downloaded file can be imported by hand.
+Sony lists its LUTs on its cinematography site (`https://sony-cinematography.com/resources/luts/`); the "Sony Collection" there offers `Slog3-S-Gamut3.Cine To s709 V200`. s709 is the Rec.709 look Sony's current cameras use, and it is the LUT an A7V's own clip metadata names (`SL3SG3Ctos709.cube`), so it is the default once imported. Settings › Color › **Get Sony's Official Conversion LUTs…** shows the address and, when asked, downloads the archive (about 230 KB) from the host that page links and imports it as the S-Log3 conversion, making s709 the default. The download is HTTPS only, redirects included; its size is checked against a 20 MB cap while it streams; the file must match the archive's pinned SHA-256 (`SonyConversionLUTs.s709SHA256`) before anything is extracted; and the zip's directory must promise no more than 64 entries and 64 MB unpacked. If Sony republishes the file and the hash no longer matches, nothing is opened and the message points to Sony's page.
+
+Checked on real S-Log3 clips: s709 renders mid grey slightly brighter, contrast a little softer and colour a little calmer than the built-in math, with natural skin and clean blacks, which confirms the LUT reads the clips' full-range code values the way the app feeds them. Sony's page asks for a few details before its own download button; **Open Sony's LUT Page** goes there instead, and the downloaded file can be imported by hand.
 
 ## Imported LUTs
 
@@ -86,7 +88,7 @@ The copy carries the capture time (`com.apple.quicktime.creationdate`, `©day`) 
 
 Immich reads the NAS library as an external library (see `IMMICH.md`), and each event's `Edited` folder is imported. **Settings › Color › Send graded versions of log videos to Immich** (off by default) renders the Rec.709 copy of every graded log clip in the events being synced before Sync to NAS:
 
-- It works from the catalog, so no board needs to be open, and counts only copies not already made (on the drive or the NAS).
+- It works from the catalog, so no board needs to be open, and counts only copies not already made (on the drive or the NAS). Clips are checked eight at a time within a 30-second budget, with progress in the status line; a clip whose existing copy does not answer in time (a sleeping NAS) stays in the plan as unchecked, and its render looks again and never makes a second copy.
 - The first time, and whenever more than five copies are due, it shows the count, the estimated size and the free space, and asks: render and sync, sync without rendering, or cancel.
 - The render is queued, and the Sync is queued as its own job right behind it. The Sync keeps its place whatever happens to the render — finished, failed, stopped, or taken off the queue.
 - Copies are written at their final name on the drive, so Immich imports each once and never sees it renamed. Nothing is uploaded and no Immich API is called by this feature.

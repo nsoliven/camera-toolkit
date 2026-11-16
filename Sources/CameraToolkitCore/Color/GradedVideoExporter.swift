@@ -255,8 +255,8 @@ public final class GradedVideoExporter: @unchecked Sendable {
     // MARK: Identity
 
     /// What the file at `url` is, compared with this request.
-    public static func identity(at url: URL, of request: GradedRenderRequest) -> GradedRenderIdentity {
-        guard let tags = readTags(url) else { return .unknown }
+    public static func identity(at url: URL, of request: GradedRenderRequest, timeout: TimeInterval = 20) -> GradedRenderIdentity {
+        guard let tags = readTags(url, timeout: timeout) else { return .unknown }
         guard tags.source == request.sourceKey else { return .other }
         return tags.grade == request.recipe.fingerprint ? .same : .olderGrade
     }
@@ -287,11 +287,26 @@ public final class GradedVideoExporter: @unchecked Sendable {
     /// Whether this exact render already exists (drive or NAS mirror),
     /// without rendering — what the before-sync count uses.
     public static func existingRender(of request: GradedRenderRequest) -> URL? {
-        if case .alreadyRendered(let url) = GradedRenderNaming.resolve(
-            source: request.source, folder: request.outputFolder, mirror: request.mirrorFolder,
-            exists: { DriveMoveService.exists($0.path) }, identity: { identity(at: $0, of: request) }
-        ) { return url }
+        if case .found(let url) = existingRenderCheck(of: request) { return url }
         return nil
+    }
+
+    public enum ExistingRenderCheck: Equatable, Sendable {
+        case found(URL)
+        case none
+        /// A taken name's tags did not answer within the timeout.
+        case unknown
+    }
+
+    public static func existingRenderCheck(of request: GradedRenderRequest, timeout: TimeInterval = 20) -> ExistingRenderCheck {
+        switch GradedRenderNaming.resolve(
+            source: request.source, folder: request.outputFolder, mirror: request.mirrorFolder,
+            exists: { DriveMoveService.exists($0.path) }, identity: { identity(at: $0, of: request, timeout: timeout) }
+        ) {
+        case .alreadyRendered(let url): .found(url)
+        case .undecided: .unknown
+        case .free, .exhausted: .none
+        }
     }
 
     /// Free bytes on the volume `url` is on (or would be, walking up to the
