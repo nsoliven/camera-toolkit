@@ -421,7 +421,7 @@ private struct JobSpeedInteraction: View {
                 .onTapGesture(count: 2) { zoom.fit() }
 
             if let row = hover.row, items.indices.contains(row), let start = items[row].start {
-                band(start...items[row].end, color: Color.accentColor.opacity(0.18))
+                band(start...items[row].end, color: JobHistoryHover.inFlightTint)
                     .allowsHitTesting(false)
             }
             if let drag {

@@ -336,7 +336,7 @@ private struct JobsSidebar: View {
                     if !sections.running.isEmpty {
                         Section {
                             ForEach(sections.running) { entry in
-                                row(entry, live: model.jobs.first { $0.id == entry.id })
+                                row(entry, live: model.jobs.first { $0.id == entry.id }, active: true)
                             }
                         } header: {
                             header("Running")
@@ -351,10 +351,10 @@ private struct JobsSidebar: View {
                                     .background(highlight(for: batch.id))
                                     .contentShape(Rectangle())
                                     .onTapGesture { selection = batch.id }
-                                    .id(batch.id)
+                                    .id(Self.rowID(batch.id, active: false))
                             }
                             ForEach(sections.queued) { entry in
-                                row(entry, live: model.jobs.first { $0.id == entry.id })
+                                row(entry, live: model.jobs.first { $0.id == entry.id }, active: true)
                             }
                         } header: {
                             header(model.isBusy ? "Queued · starts after the current job" : "Queued")
@@ -395,7 +395,7 @@ private struct JobsSidebar: View {
             .focusEffectDisabled()
             .onMoveCommand { direction in
                 move(direction)
-                if let selection { proxy.scrollTo(selection) }
+                if let selection { proxy.scrollTo(Self.rowID(selection, active: sections.active.contains { $0.id == selection })) }
             }
         }
         .background(Color(nsColor: .windowBackgroundColor))
@@ -421,13 +421,21 @@ private struct JobsSidebar: View {
             .background(.bar)
     }
 
-    private func row(_ entry: JobListEntry, live: JobSnapshot?) -> some View {
+    /// A running or queued job's row has its own identity, apart from the
+    /// row the same job gets once it ends: when a job moves from "Running"
+    /// to its day, the list draws a new ended row instead of reusing the
+    /// running one (which could stay on screen at its last progress).
+    static func rowID(_ id: UUID, active: Bool) -> String {
+        active ? "active-\(id.uuidString)" : id.uuidString
+    }
+
+    private func row(_ entry: JobListEntry, live: JobSnapshot?, active: Bool = false) -> some View {
         JobListRow(entry: entry, live: live)
             .background(highlight(for: entry.id))
             .contentShape(Rectangle())
             .onTapGesture { selection = entry.id }
             .accessibilityAddTraits(selection == entry.id ? [.isButton, .isSelected] : .isButton)
-            .id(entry.id)
+            .id(Self.rowID(entry.id, active: active))
     }
 
     private func isOpen(_ run: JobListRun) -> Bool {
@@ -466,7 +474,7 @@ private struct JobsSidebar: View {
         .accessibilityElement(children: .combine)
         .accessibilityAddTraits(.isButton)
         .accessibilityHint(open ? "Hides these jobs" : "Lists these jobs")
-        .id(run.id)
+        .id(Self.rowID(run.id, active: false))
     }
 
     /// The rows arrow keys walk, top to bottom; a closed run counts as its
@@ -567,7 +575,7 @@ struct JobListRow: View {
                         .font(.caption.monospacedDigit())
                         .foregroundStyle(.secondary)
                 }
-                switch entry.status {
+                switch status {
                 case .running(let progress):
                     JobRowProgressBar(fraction: progress)
                         .padding(.vertical, 2)
@@ -598,6 +606,22 @@ struct JobListRow: View {
         .padding(.vertical, 6)
     }
 
+    /// The row's status. The session's own job has the last word: once it
+    /// has ended, the row never shows it running, whatever an older list
+    /// entry still says.
+    var status: JobListEntry.Status { Self.status(entry, live: live) }
+
+    static func status(_ entry: JobListEntry, live: JobSnapshot?) -> JobListEntry.Status {
+        guard let live, live.id == entry.id else { return entry.status }
+        switch live.state {
+        case .done, .failed, .cancelled:
+            if case .ended = entry.status { return entry.status }
+            return .ended(JobHistoryOutcome(live.state))
+        case .running, .queued:
+            return entry.status
+        }
+    }
+
     private var statusGlyph: some View {
         Image(systemName: symbol)
             .font(.callout)
@@ -606,7 +630,7 @@ struct JobListRow: View {
     }
 
     private var symbol: String {
-        switch entry.status {
+        switch status {
         case .queued: "clock"
         case .running: entry.action.map(Self.runningSymbol) ?? "arrow.trianglehead.2.clockwise.rotate.90"
         case .ended(let outcome): entry.display?.symbol ?? outcome.symbol
@@ -614,7 +638,7 @@ struct JobListRow: View {
     }
 
     private var tint: Color {
-        switch entry.status {
+        switch status {
         case .queued: .secondary
         case .running: .blue
         case .ended(let outcome):

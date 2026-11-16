@@ -1,5 +1,6 @@
 import CameraToolkitCore
 import Foundation
+import SwiftUI
 @testable import CameraToolkitApp
 import XCTest
 
@@ -40,6 +41,7 @@ final class StraightToNASApplyTests: XCTestCase {
             XCTAssertTrue(overview.safetyFacts.contains { $0.text.contains("SHA-256") })
             XCTAssertTrue(ApplyRouteDiagram.routes(for: plan.groups[0]).allSatisfy { $0.destinationLabel.hasPrefix("NAS") })
 
+            model.jobHistoryEnabled = true
             var immichFollowUps: [[NASRename]] = []
             workspace.nasChangeFollowObserver = { immichFollowUps.append($0) }
             workspace.performApply(plan)
@@ -48,6 +50,9 @@ final class StraightToNASApplyTests: XCTestCase {
             let job = try XCTUnwrap(model.jobs.first { $0.action == .syncBuffer })
             XCTAssertEqual(job.state, .done, job.note)
             XCTAssertTrue(job.note.contains("3 copied and verified"), job.note)
+            // The Jobs list row ends with the job: not running, no file in
+            // flight, one row for the id.
+            try assertFinishedRow(job.id, model: model)
             // The same post-copy hook as Sync to NAS, once, with no renames.
             XCTAssertEqual(immichFollowUps.count, 1)
             XCTAssertEqual(immichFollowUps.first, [])
@@ -76,13 +81,18 @@ final class StraightToNASApplyTests: XCTestCase {
             // copied back to it, and are not missing.
             let buffer = root.appendingPathComponent("Drive/Camera Buffer", isDirectory: true)
             try FileManager.default.createDirectory(at: buffer, withIntermediateDirectories: true)
-            model.updateConfiguration { $0.bufferPath = buffer.path }
+            plugInBuffer(buffer, model: model)
+            XCTAssertEqual(workspace.locations.bufferRoot.path, buffer.standardizedFileURL.path)
             let back = EventsWorkspace.buildApplyPlan(
                 events: events.compactMap { workspace.event($0.id) }, configuration: model.configuration, locations: workspace.locations,
                 onlyUnder: card.path, title: "Apply", unsortedRoots: [card]
             )
-            XCTAssertEqual(back.copyCount + back.moveCount + back.nasCopyCount, 0)
-            XCTAssertEqual(back.alreadyOnNASCount, 3)
+            // Nothing is copied — not back to the drive, not to the NAS again.
+            // (This sandbox's card shares the drive's volume, where Apply's
+            // rule is a rename into the event; a real card is another volume,
+            // and its files count as already on the NAS.)
+            XCTAssertEqual(back.copyCount + back.nasCopyCount, 0)
+            XCTAssertEqual(back.moveCount + back.alreadyOnNASCount, 3)
             XCTAssertEqual(back.waitingForDriveCount, 0)
             XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: buffer.path), [])
             XCTAssertEqual(try tree(card), cardBefore)
@@ -487,6 +497,97 @@ final class StraightToNASApplyTests: XCTestCase {
             EventsWorkspace.driveAdoptionSummaryLine(createdEvents: 0, addedAssignments: 0),
             "Nothing was added: those drive folders are already events and their files are already listed. No files moved."
         )
+    }
+
+    // MARK: - Jobs list rows
+
+    /// The Jobs window's row for a finished job reads as ended: one session
+    /// snapshot for its id, done, at 100%, with no file still "in flight",
+    /// and listed under its day rather than "Running".
+    private func assertFinishedRow(_ id: UUID, model: DashboardModel, file: StaticString = #filePath, line: UInt = #line) throws {
+        let rows = model.jobs.filter { $0.id == id }
+        XCTAssertEqual(rows.count, 1, "one row per job", file: file, line: line)
+        let job = try XCTUnwrap(rows.first, file: file, line: line)
+        XCTAssertEqual(job.state, .done, job.note, file: file, line: line)
+        XCTAssertEqual(job.progress, 1, file: file, line: line)
+        XCTAssertTrue(job.telemetry?.activeItems.isEmpty ?? true, "no file left in flight", file: file, line: line)
+        let history = model.jobHistoryRecorders[id].map { [$0.currentJob()] } ?? []
+        let sections = JobsList.sections(session: model.jobs, history: history)
+        XCTAssertFalse(sections.active.contains { $0.id == id }, "not listed as running", file: file, line: line)
+        let entry = try XCTUnwrap(sections.days.flatMap(\.entries).first { $0.id == id }, file: file, line: line)
+        XCTAssertEqual(entry.status, .ended(.succeeded), file: file, line: line)
+    }
+
+    func testAFinishedSyncToNASRowReadsAsEnded() async throws {
+        try await withSandbox(createNAS: true) { root, model, workspace in
+            model.jobHistoryEnabled = true
+            let buffer = root.appendingPathComponent("Drive/Camera Buffer", isDirectory: true)
+            plugInBuffer(buffer, model: model)
+            XCTAssertEqual(workspace.locations.bufferRoot.path, buffer.standardizedFileURL.path)
+            let beach = try XCTUnwrap(workspace.createEvent(name: "Beach Day", date: day("2026-08-26"), policy: .buffer))
+            let event = try XCTUnwrap(workspace.event(beach))
+            let folder = workspace.locations.originalsRoot(for: event, deviceID: "sony-a7v", policy: .buffer)
+            try write(folder.appendingPathComponent("DSC00001.ARW"), String(repeating: "frame", count: 300))
+            workspace.syncToNAS(beach)
+            try await waitUntil { model.jobs.contains { $0.action == .syncBuffer && $0.state != .running } }
+            try await waitUntil { !model.isBusy }
+            let job = try XCTUnwrap(model.jobs.first { $0.action == .syncBuffer })
+            try assertFinishedRow(job.id, model: model)
+        }
+    }
+
+    func testTheListNeverShowsAFinishedJobAsRunning() {
+        let id = UUID()
+        let running = JobSnapshot(id: id, action: .syncBuffer, state: .running, progress: 0.99, note: "Renaming into place", createdAt: Date(timeIntervalSince1970: 1_790_000_000))
+        var done = running
+        done.state = .done
+        done.progress = 1
+        done.finishedAt = Date(timeIntervalSince1970: 1_790_000_471)
+        for session in [[running, done], [done, running]] {
+            let sections = JobsList.sections(session: session, history: [])
+            XCTAssertTrue(sections.active.isEmpty)
+            XCTAssertEqual(sections.all.filter { $0.id == id }.count, 1)
+            XCTAssertEqual(sections.all.first?.status, JobListEntry.Status.ended(.succeeded))
+        }
+    }
+
+    func testARowWhoseJobEndedNeverDrawsItRunning() {
+        let id = UUID()
+        let stale = JobListEntry(id: id, kind: JobAction.syncBuffer.rawValue, title: "Copied straight to the NAS", startedAt: Date(), status: .running(progress: 0.99))
+        let done = JobSnapshot(id: id, action: .syncBuffer, state: .done, progress: 1, note: "Straight to the NAS: 348 copied and verified")
+        XCTAssertEqual(JobListRow.status(stale, live: done), JobListEntry.Status.ended(.succeeded))
+        let running = JobSnapshot(id: id, action: .syncBuffer, state: .running, progress: 0.5)
+        XCTAssertEqual(JobListRow.status(stale, live: running), JobListEntry.Status.running(progress: 0.99))
+    }
+
+    func testStartingAJobNeverLeavesTwoRowsForOneID() async throws {
+        try await withSandbox(createNAS: false) { _, model, _ in
+        let id = UUID()
+        model.jobs = [JobSnapshot(id: id, action: .syncBuffer, state: .done, progress: 1, note: "old")]
+        model.runBackgroundJob(
+            action: .syncBuffer, runningNote: "again", logTitle: "again", logDetail: "", jobID: id,
+            operation: { _ in 0 }, completion: { _ in "Done." }
+        )
+        XCTAssertEqual(model.jobs.filter { $0.id == id }.count, 1)
+        XCTAssertEqual(model.jobs.first { $0.id == id }?.state, .running)
+        try await waitUntil { !model.isBusy }
+        }
+    }
+
+    func testTheInFlightMarkerIsNeverTheSystemAccent() {
+        XCTAssertNotEqual(JobHistoryHover.inFlightTint, Color.accentColor.opacity(0.22))
+        XCTAssertEqual(JobHistoryHover.inFlightTint, Color.blue.opacity(0.14))
+    }
+
+    /// The Buffer drive comes back: the buffer location (which the
+    /// configuration's buffer path follows) points at a mounted folder.
+    private func plugInBuffer(_ buffer: URL, model: DashboardModel) {
+        model.updateConfiguration { configuration in
+            for index in configuration.configuredLocations.indices where configuration.configuredLocations[index].role == .buffer {
+                configuration.configuredLocations[index].path = buffer.path
+            }
+            configuration.bufferPath = buffer.path
+        }
     }
 
     // MARK: - Fixtures
