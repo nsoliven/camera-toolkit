@@ -103,7 +103,7 @@ enum JobsList {
         let recorded = Dictionary(history.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         var entries: [JobListEntry] = []
         var seen: Set<UUID> = []
-        for job in session {
+        for job in uniqueSession(session) {
             seen.insert(job.id)
             entries.append(entry(job, recorded: recorded[job.id], now: now))
         }
@@ -120,6 +120,30 @@ enum JobsList {
         let active = running + queued
         let past = entries.filter { !$0.isActive }.sorted { $0.startedAt > $1.startedAt }
         return Sections(active: active, days: days(past, now: now, calendar: calendar))
+    }
+
+    /// One snapshot per job id, in session order. Should two ever share an
+    /// id, the one that ended wins over one still marked running or queued:
+    /// a job that finished is never listed as running.
+    static func uniqueSession(_ session: [JobSnapshot]) -> [JobSnapshot] {
+        func rank(_ state: JobState) -> Int {
+            switch state {
+            case .queued: 0
+            case .running: 1
+            case .done, .failed, .cancelled: 2
+            }
+        }
+        var best: [UUID: JobSnapshot] = [:]
+        var order: [UUID] = []
+        for job in session {
+            if let current = best[job.id] {
+                if rank(job.state) > rank(current.state) { best[job.id] = job }
+            } else {
+                best[job.id] = job
+                order.append(job.id)
+            }
+        }
+        return order.compactMap { best[$0] }
     }
 
     static func entry(_ job: JobSnapshot, recorded: JobHistoryJob?, now: Date) -> JobListEntry {

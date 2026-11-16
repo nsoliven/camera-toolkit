@@ -1684,11 +1684,12 @@ extension DashboardModel {
             sourcePath: sourcePath,
             destinationPath: destinationPath
         )
-        if let index = jobs.firstIndex(where: { $0.id == jobID && $0.state == .queued }) {
-            jobs[index] = startedJob
-        } else {
-            jobs.insert(startedJob, at: 0)
-        }
+        // One row per job id: the queued row turns running in place, and a
+        // row already holding this id is never left beside a second one
+        // (the list would show the stale one forever).
+        let queuedAt = jobs.firstIndex { $0.id == jobID && $0.state == .queued }
+        jobs.removeAll { $0.id == jobID }
+        jobs.insert(startedJob, at: queuedAt.map { min($0, jobs.count) } ?? 0)
         beginJobActivity(id: jobID, reason: "\(logTitle) — a Camera Toolkit file job")
 
         let jobProgress = jobProgressHandler(jobID: jobID) { [weak self] update in
@@ -1832,13 +1833,19 @@ extension DashboardModel {
         logDetail: String
     ) {
         jobProgressRelays.removeValue(forKey: id)?.close()
-        if let index = jobs.firstIndex(where: { $0.id == id }) {
-            jobs[index].state = state
+        // Every row with this id ends (there should be one), and nothing in
+        // flight is left on it: a finished row never shows a running file.
+        let finishedAt = Date()
+        for index in jobs.indices where jobs[index].id == id {
+            var job = jobs[index]
+            job.state = state
             if state == .done {
-                jobs[index].progress = 1
+                job.progress = 1
             }
-            jobs[index].note = note
-            jobs[index].finishedAt = Date()
+            job.note = note
+            job.finishedAt = finishedAt
+            job.telemetry?.activeItems = []
+            jobs[index] = job
         }
         finishJobHistory(id: id, state: state, note: note)
 

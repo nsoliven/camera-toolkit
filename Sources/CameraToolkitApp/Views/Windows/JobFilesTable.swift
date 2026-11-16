@@ -183,6 +183,11 @@ final class JobHistoryHover {
     var inFlight: Set<Int> = []
     /// The file row under the pointer in the table.
     var row: Int?
+
+    /// The in-flight marker: the app's calm in-progress blue, never the
+    /// system accent — an accent set to pink or red read as an error on
+    /// every file that was merely being copied.
+    nonisolated static let inFlightTint = Color.blue.opacity(0.14)
 }
 
 // MARK: - Files
@@ -374,7 +379,7 @@ private struct JobHistoryCell<Content: View>: View {
         content
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.vertical, 1)
-            .background(hover.inFlight.contains(row.id) ? Color.accentColor.opacity(0.22) : Color.clear)
+            .background(hover.inFlight.contains(row.id) ? JobHistoryHover.inFlightTint : Color.clear)
             .contentShape(Rectangle())
             .onHover { inside in
                 if inside {
