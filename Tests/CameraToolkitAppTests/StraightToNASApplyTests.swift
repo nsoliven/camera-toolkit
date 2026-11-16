@@ -77,25 +77,38 @@ final class StraightToNASApplyTests: XCTestCase {
             XCTAssertEqual(again.alreadyOnNASCount, 3)
             XCTAssertTrue(ApplyPlanOverview.emptyPlanMessage(again).contains("NAS folder"), ApplyPlanOverview.emptyPlanMessage(again))
 
-            // The drive comes back: the files stay on the NAS, are not
-            // copied back to it, and are not missing.
+            // The drive comes back (a real card is another volume): the
+            // files stay on the NAS, are not copied back to the drive, and
+            // are not missing.
             let buffer = root.appendingPathComponent("Drive/Camera Buffer", isDirectory: true)
             try FileManager.default.createDirectory(at: buffer, withIntermediateDirectories: true)
             plugInBuffer(buffer, model: model)
             XCTAssertEqual(workspace.locations.bufferRoot.path, buffer.standardizedFileURL.path)
             let back = EventsWorkspace.buildApplyPlan(
                 events: events.compactMap { workspace.event($0.id) }, configuration: model.configuration, locations: workspace.locations,
-                onlyUnder: card.path, title: "Apply", unsortedRoots: [card]
+                onlyUnder: card.path, title: "Apply", unsortedRoots: [card], sameVolume: { _ in false }
             )
-            // Nothing is copied — not back to the drive, not to the NAS again.
-            // (This sandbox's card shares the drive's volume, where Apply's
-            // rule is a rename into the event; a real card is another volume,
-            // and its files count as already on the NAS.)
-            XCTAssertEqual(back.copyCount + back.nasCopyCount, 0)
-            XCTAssertEqual(back.moveCount + back.alreadyOnNASCount, 3)
+            XCTAssertEqual(back.copyCount, 0)
+            XCTAssertEqual(back.moveCount, 0)
+            XCTAssertEqual(back.nasCopyCount, 0)
+            XCTAssertEqual(back.alreadyOnNASCount, 3)
             XCTAssertEqual(back.waitingForDriveCount, 0)
             XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: buffer.path), [])
             XCTAssertEqual(try tree(card), cardBefore)
+
+            // A NAS copy deleted outside the app: with the drive back, that
+            // file is planned as a copy to the drive, not "already on the NAS".
+            let gone = try XCTUnwrap(model.configuration.photoEventAssignments.first)
+            let goneEvent = try XCTUnwrap(workspace.event(gone.eventID))
+            try FileManager.default.removeItem(at: try XCTUnwrap(workspace.locations.archiveURL(for: gone, event: goneEvent)))
+            let missing = EventsWorkspace.buildApplyPlan(
+                events: events.compactMap { workspace.event($0.id) }, configuration: model.configuration, locations: workspace.locations,
+                onlyUnder: card.path, title: "Apply", unsortedRoots: [card], sameVolume: { _ in false }
+            )
+            XCTAssertEqual(missing.copyCount, 1)
+            XCTAssertEqual(missing.alreadyOnNASCount, 2)
+            XCTAssertEqual(missing.moveCount + missing.nasCopyCount, 0)
+            XCTAssertEqual(missing.groups.flatMap { $0.copies.flatMap(\.files) }.map(\.path), [gone.relativePath])
         }
     }
 
@@ -207,6 +220,34 @@ final class StraightToNASApplyTests: XCTestCase {
             }
             await workspace.refreshAppliedSources(for: location.id)
             XCTAssertEqual(workspace.sortedFiles(in: result).files, 0)
+        }
+    }
+
+    /// The drive comes back and the sorted files sit on the drive's own
+    /// volume (an unsorted folder there): Apply's same-drive rule renames
+    /// them into the event. Nothing is copied, to the drive or the NAS.
+    func testWhenTheBufferComesBackASameVolumeSourceIsRenamedIntoTheEvent() async throws {
+        try await withSandbox(createNAS: true) { root, model, workspace in
+            let (card, events) = try sortCard(root: root, model: model, workspace: workspace)
+            let first = EventsWorkspace.buildApplyPlan(
+                events: events, configuration: model.configuration, locations: workspace.locations,
+                onlyUnder: card.path, title: "Apply", unsortedRoots: [card]
+            )
+            XCTAssertEqual(first.nasCopyCount, 3)
+            workspace.performApply(first)
+            try await waitUntil { model.jobs.contains { $0.action == .syncBuffer && $0.state == .done } }
+            try await waitUntil { !model.isBusy }
+
+            let buffer = root.appendingPathComponent("Drive/Camera Buffer", isDirectory: true)
+            try FileManager.default.createDirectory(at: buffer, withIntermediateDirectories: true)
+            plugInBuffer(buffer, model: model)
+            let sameDrive = EventsWorkspace.buildApplyPlan(
+                events: events.compactMap { workspace.event($0.id) }, configuration: model.configuration, locations: workspace.locations,
+                onlyUnder: card.path, title: "Apply", unsortedRoots: [card], sameVolume: { _ in true }
+            )
+            XCTAssertEqual(sameDrive.moveCount, 3)
+            XCTAssertEqual(sameDrive.copyCount, 0)
+            XCTAssertEqual(sameDrive.nasCopyCount, 0)
         }
     }
 
