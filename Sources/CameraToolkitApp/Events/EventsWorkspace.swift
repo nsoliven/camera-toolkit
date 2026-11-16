@@ -5150,7 +5150,10 @@ final class EventsWorkspace {
         unsortedRoots: [URL],
         pauseGate: DriveActivityGate? = nil,
         /// Whether the NAS can take straight-to-NAS copies; nil checks it.
-        nasAvailable: Bool? = nil
+        nasAvailable: Bool? = nil,
+        /// Test seam: whether a source file (its path) is on the event
+        /// drive's volume; nil asks the filesystem.
+        sameVolume: ((String) -> Bool)? = nil
     ) -> OrganizeApplyPlan {
         let mounted = VolumeInfo.mountedVolumePaths()
         let rootPrefix = root.map { EventStorageLocations.pathKey($0) + "/" }
@@ -5221,6 +5224,7 @@ final class EventsWorkspace {
             }
 
             func isSameVolume(_ path: String) -> Bool {
+                if let sameVolume { return sameVolume(path) }
                 let folder = (path as NSString).deletingLastPathComponent
                 if let cached = sameVolumeCache[folder] { return cached }
                 let same = VolumeInfo.isSameVolume(URL(fileURLWithPath: folder), driveRoot, mountedVolumes: mounted)
