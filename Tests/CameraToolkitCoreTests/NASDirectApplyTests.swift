@@ -276,6 +276,7 @@ final class NASDirectApplyTests: XCTestCase {
             var plan = clearPlan(f)
             XCTAssertNil(plan.applied[EventStorageLocations.pathKey(gone.sourcePath)])
             XCTAssertEqual(plan.nasOnlyFiles, 2)
+            XCTAssertEqual(Set(plan.nasMissing.keys), [EventStorageLocations.pathKey(gone.sourcePath)], "a probe reports the missing copy")
             XCTAssertFalse(plan.clearable.contains { $0.files.contains { $0.sourcePath == gone.sourcePath } })
 
             // A background refresh never lists the NAS: the copies are

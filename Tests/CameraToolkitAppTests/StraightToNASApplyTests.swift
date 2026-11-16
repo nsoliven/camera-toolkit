@@ -142,6 +142,64 @@ final class StraightToNASApplyTests: XCTestCase {
         }
     }
 
+    /// A straight-to-NAS copy deleted outside the app while the NAS is
+    /// mounted: Clear from Card's check finds it missing, says so, and puts
+    /// the file back to waiting for Apply, which copies it again.
+    func testANASCopyMissingOnAMountedNASGoesBackToWaitingForApply() async throws {
+        try await withSandbox(createNAS: true) { root, model, workspace in
+            let (card, events) = try sortCard(root: root, model: model, workspace: workspace)
+            let location = ConfiguredLocation(role: .importSource, name: "Card", path: card.path, deviceID: "sony-a7v")
+            model.updateConfiguration { $0.configuredLocations.append(location) }
+            workspace.scan(location)
+            try await waitUntil { workspace.sources[location.id]?.result != nil }
+            let result = try XCTUnwrap(workspace.sources[location.id]?.result)
+            @MainActor func apply() async throws {
+                let plan = EventsWorkspace.buildApplyPlan(
+                    events: events.compactMap { workspace.event($0.id) }, configuration: model.configuration,
+                    locations: workspace.locations, onlyUnder: card.path, title: "Apply", unsortedRoots: [card]
+                )
+                let before = model.jobs.filter { $0.action == .syncBuffer }.count
+                workspace.performApply(plan)
+                try await waitUntil { model.jobs.filter { $0.action == .syncBuffer && $0.state == .done }.count > before }
+                try await waitUntil { !model.isBusy }
+            }
+            try await apply()
+            await workspace.refreshAppliedSources(for: location.id)
+            XCTAssertEqual(workspace.sortedFiles(in: result).files, 0)
+
+            // Every NAS copy deleted outside the app; the NAS stays mounted.
+            let rows = model.configuration.photoEventAssignments
+            for row in rows {
+                let event = try XCTUnwrap(workspace.event(row.eventID))
+                try FileManager.default.removeItem(at: try XCTUnwrap(workspace.locations.archiveURL(for: row, event: event)))
+            }
+            await workspace.refreshAppliedSources(for: location.id)
+            XCTAssertEqual(workspace.sortedFiles(in: result).files, 0, "the unprobed refresh cannot tell")
+
+            await workspace.requestClearFromCard(location.id)
+            XCTAssertNil(workspace.pendingCardClear)
+            XCTAssertEqual(model.statusMessage, "3 files’ NAS copies are missing; Apply again to recopy them. Nothing was removed.")
+            XCTAssertEqual(workspace.sortedFiles(in: result).files, 3, "waiting for Apply again")
+            // A later unprobed refresh does not hide them again.
+            await workspace.refreshAppliedSources(for: location.id)
+            XCTAssertEqual(workspace.sortedFiles(in: result).files, 3)
+
+            // Apply recopies them; then they are in their events again.
+            let plan = EventsWorkspace.buildApplyPlan(
+                events: events, configuration: model.configuration, locations: workspace.locations,
+                onlyUnder: card.path, title: "Apply", unsortedRoots: [card]
+            )
+            XCTAssertEqual(plan.nasCopyCount, 3)
+            try await apply()
+            for row in rows {
+                let event = try XCTUnwrap(workspace.event(row.eventID))
+                XCTAssertTrue(FileManager.default.fileExists(atPath: try XCTUnwrap(workspace.locations.archiveURL(for: row, event: event)).path))
+            }
+            await workspace.refreshAppliedSources(for: location.id)
+            XCTAssertEqual(workspace.sortedFiles(in: result).files, 0)
+        }
+    }
+
     func testWithNeitherTheDriveNorTheNASTheMessageNamesTheMissingDrive() async throws {
         try await withSandbox(createNAS: false) { root, model, workspace in
             let (card, events) = try sortCard(root: root, model: model, workspace: workspace)
