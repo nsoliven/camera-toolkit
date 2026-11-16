@@ -39,6 +39,25 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate, NSMenuIte
             DebugLog.shared.flush()
             exit(status)
         }
+        // Immich stacks from a script: the Keychain key stays in this process.
+        if CommandLine.arguments.contains(ImmichStacksCommand.flag) {
+            let support = DashboardModel.defaultApplicationSupportURL.appendingPathComponent("CameraToolkit", isDirectory: true)
+            let arguments = CommandLine.arguments
+            let result = CommandStatusBox()
+            let semaphore = DispatchSemaphore(value: 0)
+            Task.detached {
+                let status = await ImmichStacksCommand.run(
+                    arguments: arguments,
+                    defaultSupportFolder: support,
+                    apiKey: { try KeychainSecretStore(service: DashboardModel.keychainService).read(account: DashboardModel.immichAPIKeyAccount) }
+                )
+                result.set(status)
+                semaphore.signal()
+            }
+            semaphore.wait()
+            DebugLog.shared.flush()
+            exit(result.value)
+        }
         // Found on the NAS → Add to Events from a script: catalog rows only,
         // from a reviewed plan; same support folder and app-running rules.
         if CommandLine.arguments.contains(NASAdoptCommand.flag) {
@@ -371,4 +390,12 @@ private final class CameraToolkitMainWindow: NSObject, NSWindowDelegate {
         window.makeKeyAndOrderFront(nil)
         NSApp.activate()
     }
+}
+
+/// The exit status a detached command task hands back to `main`.
+private final class CommandStatusBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: Int32 = 2
+    var value: Int32 { lock.withLock { stored } }
+    func set(_ status: Int32) { lock.withLock { stored = status } }
 }

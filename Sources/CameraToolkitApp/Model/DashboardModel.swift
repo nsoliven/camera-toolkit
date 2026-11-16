@@ -116,6 +116,16 @@ final class DashboardModel {
     var immichIsPairing = false
     /// Each event's album as the last check left it.
     var immichAlbumStates: [UUID: ImmichEventAlbumState] = [:]
+    /// Stacks the app made in Immich, per event.
+    var immichStackCounts: [UUID: Int] = [:]
+    /// Group keys of the app's Immich stacks, for the burst tiles' mark.
+    var immichStackedKeys: Set<String> = []
+    /// The chosen library as the last check or pairing read it.
+    var immichLibrary: ImmichLibrary?
+    /// Whether a key is saved, and where an earlier build left one. Read
+    /// without touching the secret, so no Keychain prompt.
+    var immichKeyIsSaved = false
+    var immichEarlierKeyServices: [String] = []
     var trueNASAPIKeyDraft: String = ""
     var trueNASConnectionStatus: String = "Not configured. Add the TrueNAS server in Settings."
     var trueNASConnectionReport: TrueNASCapacityReport?
@@ -315,7 +325,8 @@ final class DashboardModel {
     @ObservationIgnored let configurationStore: ConfigurationStore
     @ObservationIgnored private let transferQueueStore: TransferQueueStore
     @ObservationIgnored private let pendingTransferQueueStore: PendingTransferQueueStore
-    @ObservationIgnored let secretStore = KeychainSecretStore(service: "org.cameratoolkit.CameraToolkit")
+    nonisolated static let keychainService = "org.cameratoolkit.CameraToolkit"
+    @ObservationIgnored let secretStore = KeychainSecretStore(service: DashboardModel.keychainService)
     @ObservationIgnored private var catalogSyncTask: Task<Void, Never>?
     @ObservationIgnored private var configurationSaveTask: Task<Void, Never>?
     /// True when `configuration` holds changes the debounced save has not
@@ -806,6 +817,10 @@ extension DashboardModel {
         if changed, !value.isEmpty { pairImmichAlbums() }
     }
 
+    func setImmichStacksBurstsAndEdits(_ value: Bool) {
+        updateConfiguration { $0.immichStacksBurstsAndEdits = value }
+    }
+
     func setImmichAlbumsForEveryEvent(_ value: Bool) {
         updateConfiguration { $0.immichAlbumsForEveryEvent = value }
     }
@@ -961,6 +976,7 @@ extension DashboardModel {
                 ? "API key removed from Keychain."
                 : "API key saved in Keychain."
             configMessage = "Immich API key saved in macOS Keychain."
+            refreshImmichKeyStatus()
         } catch {
             immichConnectionStatus = "Could not save API key: \(error.localizedDescription)"
         }
@@ -2219,7 +2235,7 @@ extension DashboardModel {
         defaultApplicationSupportURL.appendingPathComponent("CameraToolkit/config.json")
     }
 
-    static let immichAPIKeyAccount = "immich-api-key"
+    nonisolated static let immichAPIKeyAccount = "immich-api-key"
     private static let trueNASAPIKeyAccount = "truenas-api-key"
 
     private static func shortFingerprint(_ fingerprint: String) -> String {

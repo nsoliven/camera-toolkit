@@ -1,3 +1,4 @@
+import AppKit
 import CameraToolkitCore
 import Foundation
 
@@ -124,5 +125,27 @@ extension EventsWorkspace {
         for (eventID, statuses) in loaded where eventImmichStatuses[eventID] != statuses {
             eventImmichStatuses[eventID] = statuses
         }
+    }
+
+    /// Opens a frame's own Immich page when the last check matched it, else
+    /// its event's page.
+    func viewInImmich(_ item: OrganizeItem, boardEventID: UUID) {
+        let server = model.configuration.immichServerURL
+        if let assignment = assignment(for: item.primary),
+           let assetID = eventImmichStatuses[boardEventID]?[CatalogStore.eventAssetID(assignment)]?.immichAssetID,
+           let url = ImmichClient.webURL(serverURL: server, assetID: assetID) {
+            NSWorkspace.shared.open(url)
+            return
+        }
+        let event = assignment(for: item.primary).flatMap { event($0.eventID) } ?? event(boardEventID)
+        if let event, let url = model.immichWebURL(for: event) { NSWorkspace.shared.open(url) }
+    }
+
+    /// The app made this burst one Immich stack: the same key the grouping
+    /// gives it (event, kind, first frame).
+    func isStackedInImmich(_ stack: OrganizeStack, eventID: UUID) -> Bool {
+        guard stack.isBurst, !model.immichStackedKeys.isEmpty, let first = stack.items.first?.primary else { return false }
+        let identity = BurstFrameIdentity.key(fileName: first.name, byteCount: first.size, modifiedAt: first.modifiedAt)
+        return model.immichStackedKeys.contains("\(eventID.uuidString)|burst|\(identity)")
     }
 }

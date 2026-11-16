@@ -33,7 +33,8 @@ extension DashboardModel {
             client: try makeImmichClient(),
             libraryID: configuration.immichLibraryID,
             catalogURL: catalogURLForImmich,
-            carriesAlbumsAcrossRenames: configuration.immichCarriesAlbumsAcrossRenames
+            carriesAlbumsAcrossRenames: configuration.immichCarriesAlbumsAcrossRenames,
+            stacksBurstsAndEdits: configuration.immichStacksBurstsAndEdits
         )
     }
 
@@ -73,6 +74,7 @@ extension DashboardModel {
             do {
                 let client = try makeImmichClient()
                 let library = try await client.library(id: configuration.immichLibraryID)
+                immichLibrary = library
                 let albums = try await client.albums()
                 immichAlbums = albums.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
                 var contents: [ImmichAlbumContents] = []
@@ -116,11 +118,70 @@ extension DashboardModel {
     func loadImmichAlbumStates() {
         let catalogURL = catalogURLForImmich
         Task { @MainActor [weak self] in
-            let states = await Task.detached(priority: .utility) {
-                (try? ImmichEventAlbumStore(catalogURL: catalogURL).all()) ?? [:]
+            let (states, records) = await Task.detached(priority: .utility) {
+                ((try? ImmichEventAlbumStore(catalogURL: catalogURL).all()) ?? [:],
+                 (try? ImmichStackStore(catalogURL: catalogURL).records()) ?? [:])
             }.value
+            let counts = records.values.reduce(into: [UUID: Int]()) { $0[$1.eventID, default: 0] += 1 }
+            let keys = Set(records.keys)
             if self?.immichAlbumStates != states { self?.immichAlbumStates = states }
+            if self?.immichStackCounts != counts { self?.immichStackCounts = counts }
+            if self?.immichStackedKeys != keys { self?.immichStackedKeys = keys }
         }
+    }
+
+    // MARK: - Key
+
+    /// Says whether a key is saved, and whether an earlier build left one
+    /// under another Keychain service. Reads names only, never the secret.
+    func refreshImmichKeyStatus() {
+        let services = KeychainSecretStore.otherServices(holding: Self.immichAPIKeyAccount, excluding: "")
+        immichKeyIsSaved = services.contains(Self.keychainService)
+        immichEarlierKeyServices = services.filter { $0 != Self.keychainService }
+    }
+
+    /// Copies the key an earlier build saved into this build's Keychain
+    /// entry, on the user's click. macOS asks before the old entry is read.
+    /// The old entry is left where it is.
+    func moveEarlierImmichKey() {
+        guard let service = immichEarlierKeyServices.first else { return }
+        do {
+            guard let key = try KeychainSecretStore(service: service).read(account: Self.immichAPIKeyAccount),
+                  !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                immichConnectionStatus = "The earlier key is empty."
+                return
+            }
+            try secretStore.save(key, account: Self.immichAPIKeyAccount)
+            immichConnectionStatus = "Moved the earlier API key into this app's Keychain entry. Press Test Connection."
+        } catch {
+            immichConnectionStatus = "Could not move the earlier key: \(error.localizedDescription)"
+        }
+        refreshImmichKeyStatus()
+    }
+
+    // MARK: - View in Immich
+
+    /// Where View in Immich goes for an event: its paired album, else its
+    /// folder in Immich's folder view, else the server's home page. Nil when
+    /// no server is set.
+    func immichWebURL(for event: SavedCameraEvent) -> URL? {
+        let server = configuration.immichServerURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !server.isEmpty else { return nil }
+        if let albumID = immichAlbumStates[event.id]?.albumID ?? event.immichAlbumID,
+           let url = ImmichClient.webURL(serverURL: server, albumID: albumID) {
+            return url
+        }
+        let library = immichLibrary ?? immichLibraries.first { $0.id == configuration.immichLibraryID }
+        if let root = library?.importPaths.first {
+            let folder = EventStorageLocations(configuration: configuration).nasEventFolderRelativePath(for: event)
+            let trimmed = root.hasSuffix("/") ? String(root.dropLast()) : root
+            if let url = ImmichClient.webURL(serverURL: server, folder: "\(trimmed)/\(folder)") { return url }
+        }
+        return ImmichClient.webURL(serverURL: server)
+    }
+
+    var immichServerIsSet: Bool {
+        !configuration.immichServerURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     // MARK: - One event's album
@@ -181,5 +242,7 @@ extension DashboardModel {
         for (eventID, state) in outcome.albumStates where immichAlbumStates[eventID] != state {
             immichAlbumStates[eventID] = state
         }
+        if let library = outcome.library { immichLibrary = library }
+        if let created = outcome.stacks?.created, !created.isEmpty { loadImmichAlbumStates() }
     }
 }

@@ -124,6 +124,7 @@ struct EventBoardView: View {
                         onSplitItems: { items in
                             workspace.splitItems(items)
                         },
+                        onViewInImmich: model.immichServerIsSet ? { item in workspace.viewInImmich(item, boardEventID: eventID) } : nil,
                         orientationForFile: { workspace.savedTurns(for: $0) },
                         onRotate: { stack, delta in
                             workspace.rotateStack(stack, quarterTurnsCW: delta)
@@ -225,6 +226,7 @@ struct EventBoardView: View {
             badge: { workspace.badge(for: $0, in: eventID) },
             orientationForFile: { workspace.savedTurns(for: $0) },
             gradeForStack: { workspace.grading.tileMark(for: $0) },
+            immichStackedForStack: { stack in workspace.isStackedInImmich(stack, eventID: workspace.assignedEvent(for: stack).event?.id ?? eventID) },
             onOpen: { stack, frame in
                 workspace.focus(stackID: stack.id)
                 previewFrameIndex = frame

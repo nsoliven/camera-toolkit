@@ -16,35 +16,35 @@ struct ImmichAlbumChipInfo: Equatable {
     var toAdd: Int
     var notOnNAS: Int
     var isPrivateWithoutAlbum = false
-    var canOpen: Bool
+    /// Stacks the app made in Immich for this event.
+    var stackCount = 0
 
     /// From an event's own statuses (not its subevents') and its album state.
-    init(albumName: String?, state: ImmichEventAlbumState?, summary: ImmichEventSummary, isPrivateWithoutAlbum: Bool, canOpen: Bool) {
+    init(albumName: String?, state: ImmichEventAlbumState?, summary: ImmichEventSummary, isPrivateWithoutAlbum: Bool, stackCount: Int = 0) {
+        self.stackCount = stackCount
         self.albumName = albumName
         inAlbum = state?.inAlbum
         let notAdded = state.map { max(0, summary.inImmich - $0.inAlbum) } ?? 0
         toAdd = summary.pendingScan + summary.notOnNAS + notAdded
         notOnNAS = summary.notOnNAS
         self.isPrivateWithoutAlbum = isPrivateWithoutAlbum
-        self.canOpen = canOpen
     }
 
-    init(albumName: String?, inAlbum: Int?, toAdd: Int, notOnNAS: Int, isPrivateWithoutAlbum: Bool = false, canOpen: Bool) {
+    init(albumName: String?, inAlbum: Int?, toAdd: Int, notOnNAS: Int, isPrivateWithoutAlbum: Bool = false, stackCount: Int = 0) {
+        self.stackCount = stackCount
         self.albumName = albumName
         self.inAlbum = inAlbum
         self.toAdd = toAdd
         self.notOnNAS = notOnNAS
         self.isPrivateWithoutAlbum = isPrivateWithoutAlbum
-        self.canOpen = canOpen
     }
 }
 
 /// The event header's Immich album: a tinted capsule with the album's name,
-/// how many photos it holds, how many are still to add, and buttons to open
-/// it in Immich, send now, or choose another album.
+/// how many photos it holds, how many are still to add, its stacks, and
+/// buttons to send now or choose another album. View in Immich sits beside it.
 struct ImmichAlbumChip<AlbumMenu: View>: View {
     let info: ImmichAlbumChipInfo
-    let onOpen: () -> Void
     let onSend: () -> Void
     @ViewBuilder let albumMenu: () -> AlbumMenu
 
@@ -77,6 +77,12 @@ struct ImmichAlbumChip<AlbumMenu: View>: View {
                         ? "\(info.notOnNAS.formatted()) not on the NAS yet: sync first. The rest are added when Immich lists them."
                         : "Added on the next check, or press Send to Immich now.")
             }
+            if info.stackCount > 0 {
+                Label("\(info.stackCount.formatted()) stack\(info.stackCount == 1 ? "" : "s")", systemImage: "square.stack.3d.up.fill")
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+                    .help("Bursts, RAW+JPEG pairs and edits the app stacked in Immich")
+            }
             Divider().frame(height: 14)
             Menu {
                 albumMenu()
@@ -90,13 +96,6 @@ struct ImmichAlbumChip<AlbumMenu: View>: View {
             }
             .buttonStyle(.borderless)
             .help("Scan now and add this event's photos to its album")
-            if info.canOpen {
-                Button(action: onOpen) {
-                    Label("Open in Immich", systemImage: "arrow.up.right.square")
-                }
-                .buttonStyle(.borderless)
-                .help("Open the album in Immich in your browser")
-            }
         }
         .font(.callout)
         .fixedSize()
@@ -145,43 +144,66 @@ struct ImmichAlbumMenuItems: View {
     }
 }
 
-/// The header row that holds the chip. Reads its own state, so a check
-/// redraws the chip and not the board.
+/// "View in Immich": a clear button that opens the event's album, else its
+/// folder, else the server, in the browser. Disabled with a hint when no
+/// server is set.
+struct ViewInImmichButton: View {
+    let url: URL?
+
+    var body: some View {
+        Button {
+            if let url { NSWorkspace.shared.open(url) }
+        } label: {
+            Label("View in Immich", systemImage: "safari")
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.small)
+        .disabled(url == nil)
+        .help(url == nil ? "Add your Immich server in Settings › Services first" : "Open this event in Immich in your browser")
+    }
+}
+
+/// The header row that holds the chip and View in Immich. Reads its own
+/// state, so a check redraws the chip and not the board.
 struct ImmichEventAlbumBar: View {
     let model: DashboardModel
     let workspace: EventsWorkspace
     let eventID: UUID
 
     var body: some View {
-        if workspace.immichIsConfigured, let event = workspace.event(eventID) {
-            let isPrivate = workspace.locations.resolvedPolicy(for: event) == .archiveOnly
-            let target = workspace.immichAlbumTargets[eventID]
-            let state = model.immichAlbumStates[eventID]
-            // The event's own files only: a subevent can have its own album.
-            let prefix = eventID.uuidString + "|"
-            let own = (workspace.eventImmichStatuses[eventID] ?? [:]).filter { $0.key.hasPrefix(prefix) }.values
-            let albumID = state?.albumID ?? target?.albumID
-            ImmichAlbumChip(
-                info: ImmichAlbumChipInfo(
-                    albumName: state?.albumName ?? target?.displayName,
-                    state: state,
-                    summary: ImmichEventSummary(statuses: own),
-                    isPrivateWithoutAlbum: isPrivate && !event.sendsToImmich,
-                    canOpen: albumID != nil
-                ),
-                onOpen: {
-                    if let albumID, let url = ImmichClient.webURL(serverURL: model.configuration.immichServerURL, albumID: albumID) {
-                        NSWorkspace.shared.open(url)
-                    }
-                },
-                onSend: { workspace.requestImmichSend([eventID]) },
-                albumMenu: { ImmichAlbumMenuItems(model: model, event: event, isPrivate: isPrivate) }
-            )
+        if let event = workspace.event(eventID) {
+            HStack(spacing: 8) {
+                if workspace.immichIsConfigured {
+                    chip(event)
+                }
+                ViewInImmichButton(url: model.immichWebURL(for: event))
+            }
             .task {
+                guard workspace.immichIsConfigured else { return }
                 model.loadImmichAlbumsIfNeeded()
-                if model.immichAlbumStates.isEmpty { model.loadImmichAlbumStates() }
+                if model.immichAlbumStates.isEmpty && model.immichStackCounts.isEmpty { model.loadImmichAlbumStates() }
             }
         }
+    }
+
+    private func chip(_ event: SavedCameraEvent) -> some View {
+        let isPrivate = workspace.locations.resolvedPolicy(for: event) == .archiveOnly
+        let target = workspace.immichAlbumTargets[eventID]
+        let state = model.immichAlbumStates[eventID]
+        // The event's own files only: a subevent can have its own album.
+        let prefix = eventID.uuidString + "|"
+        let own = (workspace.eventImmichStatuses[eventID] ?? [:]).filter { $0.key.hasPrefix(prefix) }.values
+        return ImmichAlbumChip(
+            info: ImmichAlbumChipInfo(
+                albumName: state?.albumName ?? target?.displayName,
+                state: state,
+                summary: ImmichEventSummary(statuses: own),
+                isPrivateWithoutAlbum: isPrivate && !event.sendsToImmich,
+                stackCount: model.immichStackCounts[eventID] ?? 0
+            ),
+            onSend: { workspace.requestImmichSend([eventID]) },
+            albumMenu: { ImmichAlbumMenuItems(model: model, event: event, isPrivate: isPrivate) }
+        )
     }
 }
 
@@ -195,6 +217,20 @@ struct ImmichAlbumMarker: View {
             .foregroundStyle(Color.teal)
             .help("Paired with an Immich album")
             .accessibilityLabel("Immich album")
+    }
+}
+
+/// The small mark on a burst tile the app stacked in Immich.
+struct ImmichStackedMark: View {
+    var body: some View {
+        Image(systemName: "square.stack.3d.up.fill")
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(.white)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 3)
+            .background(Capsule().fill(Color.teal.opacity(0.85)))
+            .help("Stacked in Immich")
+            .accessibilityLabel("Stacked in Immich")
     }
 }
 

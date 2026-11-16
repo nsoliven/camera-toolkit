@@ -154,13 +154,26 @@ public struct ImmichCatalogFile: Equatable, Sendable {
     public var isOnNAS: Bool
     public var album: ImmichAlbumTarget?
     public var eventID: UUID?
+    /// The file's size and modification time, which burst grouping reads.
+    public var byteCount: Int64
+    public var modifiedAt: Date
 
-    public init(eventAssetID: String, relativePath: String, isOnNAS: Bool, album: ImmichAlbumTarget? = nil, eventID: UUID? = nil) {
+    public init(
+        eventAssetID: String,
+        relativePath: String,
+        isOnNAS: Bool,
+        album: ImmichAlbumTarget? = nil,
+        eventID: UUID? = nil,
+        byteCount: Int64 = 0,
+        modifiedAt: Date = .distantPast
+    ) {
         self.eventAssetID = eventAssetID
         self.relativePath = relativePath
         self.isOnNAS = isOnNAS
         self.album = album
         self.eventID = eventID
+        self.byteCount = byteCount
+        self.modifiedAt = modifiedAt
     }
 
     /// Every assignment that has a NAS path. `verifiedPathKeys` are the
@@ -182,7 +195,9 @@ public struct ImmichCatalogFile: Equatable, Sendable {
                 relativePath: relative,
                 isOnNAS: verifiedPathKeys.contains(NASSyncStore.pathKey(relative)),
                 album: assignment.immichUploadOverride == false ? nil : albumTargets[event.id],
-                eventID: event.id
+                eventID: event.id,
+                byteCount: assignment.fileSize,
+                modifiedAt: assignment.modifiedAt
             )
         }
     }
@@ -598,6 +613,7 @@ public struct ImmichEventAlbumState: Codable, Equatable, Sendable {
 public enum ImmichSyncStep: Equatable, Sendable {
     case reading
     case adding(count: Int, album: String)
+    case stacking
     case done
 }
 
@@ -613,12 +629,17 @@ public struct ImmichLibrarySyncOutcome: Equatable, Sendable {
     public var albumStates: [UUID: ImmichEventAlbumState] = [:]
     /// Paired albums Immich no longer has.
     public var missingAlbumIDs: Set<String> = []
+    /// What stacking did, when it ran.
+    public var stacks: ImmichStackRunReport?
+    /// The library as Immich has it now.
+    public var library: ImmichLibrary?
 
     public var summary: String {
         var parts = ["\(report.count(.present).formatted()) in Immich"]
         if report.count(.pendingScan) > 0 { parts.append("\(report.count(.pendingScan).formatted()) waiting for scan") }
         if report.count(.offline) > 0 { parts.append("\(report.count(.offline).formatted()) offline") }
         if addedToAlbums > 0 { parts.append("\(addedToAlbums.formatted()) added to event albums") }
+        if let made = stacks?.created.count, made > 0 { parts.append("\(made.formatted()) stack\(made == 1 ? "" : "s") made") }
         if carriedOver > 0 { parts.append("\(carriedOver.formatted()) renamed file(s) kept in their albums") }
         if !problems.isEmpty { parts.append("\(problems.count) problem(s): \(problems.prefix(3).joined(separator: "; "))") }
         return parts.joined(separator: ", ")
@@ -686,14 +707,16 @@ public struct ImmichLibrarySync: Sendable {
     public var libraryID: String
     public var catalogURL: URL
     public var carriesAlbumsAcrossRenames: Bool
+    public var stacksBurstsAndEdits: Bool
 
     private static let albumBatchSize = 500
 
-    public init(client: ImmichClient, libraryID: String, catalogURL: URL, carriesAlbumsAcrossRenames: Bool = false) {
+    public init(client: ImmichClient, libraryID: String, catalogURL: URL, carriesAlbumsAcrossRenames: Bool = false, stacksBurstsAndEdits: Bool = false) {
         self.client = client
         self.libraryID = libraryID
         self.catalogURL = catalogURL
         self.carriesAlbumsAcrossRenames = carriesAlbumsAcrossRenames
+        self.stacksBurstsAndEdits = stacksBurstsAndEdits
     }
 
     public func requestScan() async throws {
@@ -750,9 +773,31 @@ public struct ImmichLibrarySync: Sendable {
         report.statuses = []
 
         var outcome = ImmichLibrarySyncOutcome(report: report)
+        outcome.library = library
         if fillsAlbums {
             await syncAlbums(report, into: &outcome, progress: progress)
             try? ImmichEventAlbumStore(catalogURL: catalogURL).save(outcome.albumStates)
+            if stacksBurstsAndEdits {
+                progress(.stacking)
+                do {
+                    let editPaths = assets.compactMap { asset -> String? in
+                        guard !asset.isOffline, !asset.isTrashed, let relative = paths.relativePath(forOriginalPath: asset.originalPath),
+                              relative.localizedCaseInsensitiveContains("/Edited/") else { return nil }
+                        return relative
+                    }
+                    outcome.stacks = try await ImmichStackRunner.run(
+                        client: client,
+                        groups: ImmichStackGrouping.groups(files: files, editPaths: editPaths),
+                        assets: assets,
+                        library: library,
+                        store: ImmichStackStore(catalogURL: catalogURL),
+                        dryRun: false
+                    )
+                    outcome.problems += outcome.stacks?.problems ?? []
+                } catch {
+                    outcome.problems.append("stacks: \(error.localizedDescription)")
+                }
+            }
         }
         if events == nil {
             try await carryOverAlbums(assets: assets, library: library, into: &outcome)

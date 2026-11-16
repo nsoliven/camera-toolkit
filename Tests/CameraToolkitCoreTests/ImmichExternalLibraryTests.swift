@@ -731,6 +731,178 @@ final class ImmichAlbumPairingTests: XCTestCase {
     }
 }
 
+final class ImmichStackTests: XCTestCase {
+    private let trip = UUID(uuidString: "33333333-3333-4333-8333-333333333333")!
+    private let party = UUID(uuidString: "44444444-4444-4444-8444-444444444444")!
+    private let start = Date(timeIntervalSince1970: 1_780_000_000)
+    private var catalogURL: URL!
+
+    override func setUpWithError() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("immich-stacks-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        catalogURL = folder.appendingPathComponent("catalog.sqlite")
+        addTeardownBlock { [folder] in try? FileManager.default.removeItem(at: folder) }
+    }
+
+    /// A burst of `count` RAW frames, half a second apart, in `folder`.
+    private func burst(_ event: UUID, folder: String, first: Int, count: Int, at time: Date) -> [ImmichCatalogFile] {
+        (0..<count).map { index in
+            let name = String(format: "DSC%05d.ARW", first + index)
+            return ImmichCatalogFile(eventAssetID: "\(event)|\(name)", relativePath: "\(folder)/\(name)", isOnNAS: true, eventID: event, byteCount: 1_000 + Int64(index), modifiedAt: time.addingTimeInterval(Double(index) * 0.5))
+        }
+    }
+
+    private func assets(for files: [ImmichCatalogFile]) -> [ImmichLibraryAsset] {
+        files.map { asset("id-" + (($0.relativePath as NSString).lastPathComponent as NSString).deletingPathExtension + "-" + (($0.relativePath as NSString).pathExtension), $0.relativePath) }
+    }
+
+    private func id(_ name: String) -> String { "id-" + (name as NSString).deletingPathExtension + "-" + (name as NSString).pathExtension }
+
+    func testBurstIsOneGroupWithItsCoverOnTop() {
+        let files = burst(trip, folder: "2026/T/Originals/A", first: 1, count: 5, at: start)
+        let groups = ImmichStackGrouping.groups(files: files)
+        XCTAssertEqual(groups.count, 1)
+        XCTAssertEqual(groups[0].kind, .burst)
+        // The board's cover is the middle frame.
+        XCTAssertEqual((groups[0].relativePaths[0] as NSString).lastPathComponent, "DSC00003.ARW")
+        XCTAssertEqual(Set(groups[0].relativePaths), Set(files.map(\.relativePath)))
+    }
+
+    func testNeverAcrossEvents() {
+        // Same folder name pattern, back-to-back frames, two events.
+        let files = burst(trip, folder: "2026/T/Originals/A", first: 1, count: 2, at: start)
+            + burst(party, folder: "2026/P/Originals/A", first: 3, count: 2, at: start.addingTimeInterval(1))
+        let groups = ImmichStackGrouping.groups(files: files)
+        XCTAssertEqual(groups.count, 2)
+        for group in groups {
+            XCTAssertTrue(group.relativePaths.allSatisfy { $0.hasPrefix(group.eventID == trip ? "2026/T/" : "2026/P/") })
+        }
+    }
+
+    func testRawAndJpegOfOneShotAreAPair() {
+        let files = ["DSC00010.ARW", "DSC00010.JPG"].map {
+            ImmichCatalogFile(eventAssetID: $0, relativePath: "2026/T/Originals/A/\($0)", isOnNAS: true, eventID: trip, byteCount: 10, modifiedAt: start)
+        }
+        let groups = ImmichStackGrouping.groups(files: files)
+        XCTAssertEqual(groups.map(\.kind), [.rawPair])
+        XCTAssertEqual(groups.first?.relativePaths.count, 2)
+    }
+
+    func testAnEditGoesOnTopOfItsOriginal() {
+        let original = ImmichCatalogFile(eventAssetID: "o", relativePath: "2026/T/Originals/A/C0001.MP4", isOnNAS: true, eventID: trip, byteCount: 10, modifiedAt: start)
+        let groups = ImmichStackGrouping.groups(files: [original], editPaths: ["2026/T/Edited/C0001_709.mp4", "2026/T/Edited/C00012.mp4", "2026/P/Edited/C0001_709.mp4"])
+        XCTAssertEqual(groups.map(\.kind), [.edit])
+        XCTAssertEqual(groups.first?.relativePaths, ["2026/T/Edited/C0001_709.mp4", "2026/T/Originals/A/C0001.MP4"])
+        XCTAssertTrue(ImmichStackGrouping.isEdit("dsc00001-edit", of: "dsc00001"))
+        XCTAssertFalse(ImmichStackGrouping.isEdit("dsc000012", of: "dsc00001"))
+    }
+
+    func testPlanCreatesCoverFirstAndRerunIsUnchanged() throws {
+        let files = burst(trip, folder: "2026/T/Originals/A", first: 1, count: 3, at: start)
+        let groups = ImmichStackGrouping.groups(files: files)
+        var plan = ImmichStackPlanner.plan(groups: groups, assets: assets(for: files), library: library(), accountStacks: [], records: [:])
+        XCTAssertEqual(plan.creates.first?.assetIDs.first, id("DSC00002.ARW"))
+        let record = ImmichStackRecord(key: groups[0].key, stackID: "s-1", eventID: trip, kind: .burst, assetIDs: plan.creates[0].assetIDs)
+        let account = ImmichAccountStack(id: "s-1", primaryAssetID: id("DSC00002.ARW"), assetIDs: plan.creates[0].assetIDs)
+        plan = ImmichStackPlanner.plan(groups: groups, assets: assets(for: files), library: library(), accountStacks: [account], records: [record.key: record])
+        XCTAssertTrue(plan.creates.isEmpty)
+        XCTAssertEqual(plan.unchanged, 1)
+    }
+
+    func testAUserStackWhosePrimaryIsInTheBurstIsNeverTouched() {
+        let files = burst(trip, folder: "2026/T/Originals/A", first: 1, count: 3, at: start)
+        let groups = ImmichStackGrouping.groups(files: files)
+        let users = ImmichAccountStack(id: "theirs", primaryAssetID: id("DSC00001.ARW"), assetIDs: [id("DSC00001.ARW"), "elsewhere"])
+        let plan = ImmichStackPlanner.plan(groups: groups, assets: assets(for: files), library: library(), accountStacks: [users], records: [:])
+        XCTAssertTrue(plan.creates.isEmpty)
+        XCTAssertEqual(plan.skipped.first?.reason, .inSomeoneElsesStack(stackID: "theirs"))
+    }
+
+    func testANonPrimaryMemberOfAUserStackIsNotStolen() {
+        let files = burst(trip, folder: "2026/T/Originals/A", first: 1, count: 3, at: start)
+        let groups = ImmichStackGrouping.groups(files: files)
+        let users = ImmichAccountStack(id: "theirs", primaryAssetID: "elsewhere", assetIDs: ["elsewhere", id("DSC00003.ARW")])
+        let plan = ImmichStackPlanner.plan(groups: groups, assets: assets(for: files), library: library(), accountStacks: [users], records: [:])
+        XCTAssertTrue(plan.creates.isEmpty)
+        XCTAssertEqual(plan.skippedForeign, 1)
+    }
+
+    func testARenamedFrameIsAddedBackToTheAppsOwnStack() {
+        let before = burst(trip, folder: "2026/Old/Originals/A", first: 1, count: 3, at: start)
+        let key = ImmichStackGrouping.groups(files: before)[0].key
+        let oldIDs = assets(for: before).map(\.id)
+        let record = ImmichStackRecord(key: key, stackID: "ours", eventID: trip, kind: .burst, assetIDs: oldIDs)
+        // The folder was renamed: same frames, new paths, new Immich assets.
+        let after = burst(trip, folder: "2026/New/Originals/A", first: 1, count: 3, at: start)
+        let newAssets = after.map { asset("new-" + ($0.relativePath as NSString).lastPathComponent, $0.relativePath) }
+        let groups = ImmichStackGrouping.groups(files: after)
+        XCTAssertEqual(groups[0].key, key, "the group keeps its identity across a rename")
+        let account = ImmichAccountStack(id: "ours", primaryAssetID: oldIDs[0], assetIDs: oldIDs)
+        let plan = ImmichStackPlanner.plan(groups: groups, assets: newAssets, library: library(), accountStacks: [account], records: [key: record])
+        XCTAssertEqual(plan.creates.count, 1)
+        XCTAssertEqual(plan.creates.first?.replacing, "ours")
+        XCTAssertEqual(plan.creates.first?.assetIDs.first, "new-DSC00002.ARW")
+    }
+
+    func testFramesNotInImmichAreReportedNotStacked() {
+        let files = burst(trip, folder: "2026/T/Originals/A", first: 1, count: 3, at: start)
+        let plan = ImmichStackPlanner.plan(groups: ImmichStackGrouping.groups(files: files), assets: Array(assets(for: files).prefix(1)), library: library(), accountStacks: [], records: [:])
+        XCTAssertEqual(plan.skipped.first?.reason, .notInImmich(found: 1, of: 3))
+    }
+
+    func testRunnerCreatesCoverFirstStoresTheStackAndADryRunWritesNothing() async throws {
+        let files = burst(trip, folder: "2026/T/Originals/A", first: 1, count: 3, at: start)
+        let groups = ImmichStackGrouping.groups(files: files)
+        let store = try ImmichStackStore(catalogURL: catalogURL)
+        let transport = ScriptedTransport()
+        transport.respond("GET", "/api/stacks", body: "[]")
+        let client = try ImmichClient(serverURL: "https://photos.example.com", apiKey: "secret-key", transport: transport)
+
+        let dry = try await ImmichStackRunner.run(client: client, groups: groups, assets: assets(for: files), library: library(), store: store, dryRun: true)
+        XCTAssertEqual(dry.plan.creates.count, 1)
+        XCTAssertTrue(transport.writes.isEmpty, "a dry run only reads")
+
+        let cover = id("DSC00002.ARW")
+        transport.respond("POST", "/api/stacks", body: #"{"id":"s-9","primaryAssetId":"\#(cover)","assets":[{"id":"\#(cover)"},{"id":"\#(id("DSC00001.ARW"))"},{"id":"\#(id("DSC00003.ARW"))"}]}"#)
+        var logged: [ImmichStackRecord] = []
+        let real = try await ImmichStackRunner.run(client: client, groups: groups, assets: assets(for: files), library: library(), store: store, dryRun: false) { logged.append($0) }
+        XCTAssertEqual(real.created.map(\.stackID), ["s-9"])
+        XCTAssertEqual(logged.map(\.stackID), ["s-9"])
+        let body = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(transport.writes.first?.httpBody)) as? [String: [String]])
+        XCTAssertEqual(body["assetIds"]?.first, cover)
+        XCTAssertEqual(try store.records()[groups[0].key]?.stackID, "s-9")
+        XCTAssertFalse(transport.requests.contains { $0.httpMethod == "DELETE" })
+
+        // Run again with Immich now holding that stack: nothing is created.
+        transport.respond("GET", "/api/stacks", body: #"[{"id":"s-9","primaryAssetId":"\#(cover)","assets":[{"id":"\#(cover)"},{"id":"\#(id("DSC00001.ARW"))"},{"id":"\#(id("DSC00003.ARW"))"}]}]"#)
+        let again = try await ImmichStackRunner.run(client: client, groups: groups, assets: assets(for: files), library: library(), store: store, dryRun: false)
+        XCTAssertTrue(again.created.isEmpty)
+        XCTAssertEqual(again.plan.unchanged, 1)
+        XCTAssertEqual(transport.requests.count { $0.httpMethod == "POST" && $0.url?.path == "/api/stacks" }, 1)
+    }
+
+    func testCommandParsesAndPicksTheOnlyLibraryOrRefuses() throws {
+        let parsed = try ImmichStacksCommand.parse(["CameraToolkit", "--immich-stacks", "--dry-run", "--event", "Beach Day"])
+        XCTAssertTrue(parsed.dryRun)
+        XCTAssertEqual(parsed.eventNames, ["Beach Day"])
+        XCTAssertThrowsError(try ImmichStacksCommand.parse(["x", "--immich-stacks", "--bogus"]))
+        let one = ImmichLibrary(id: "a", name: "A", importPaths: ["/a"])
+        let two = ImmichLibrary(id: "b", name: "B", importPaths: ["/b"])
+        XCTAssertEqual(try ImmichStacksCommand.library(chosenID: "", libraries: [one]).id, "a")
+        XCTAssertEqual(try ImmichStacksCommand.library(chosenID: "b", libraries: [one, two]).id, "b")
+        XCTAssertThrowsError(try ImmichStacksCommand.library(chosenID: "", libraries: [one, two]))
+        XCTAssertThrowsError(try ImmichStacksCommand.library(chosenID: "gone", libraries: [one]))
+    }
+
+    func testWebLinksForAnAssetAFolderAndHome() {
+        XCTAssertEqual(ImmichClient.webURL(serverURL: "https://photos.example.com", assetID: "a-1")?.absoluteString, "https://photos.example.com/photos/a-1")
+        XCTAssertEqual(ImmichClient.webURL(serverURL: "https://photos.example.com")?.absoluteString, "https://photos.example.com/")
+        let folder = ImmichClient.webURL(serverURL: "https://photos.example.com", folder: "/external/library/2026/Trip 2026")
+        XCTAssertEqual(folder?.path, "/folders")
+        XCTAssertEqual(URLComponents(url: folder!, resolvingAgainstBaseURL: false)?.queryItems?.first?.value, "/external/library/2026/Trip 2026")
+    }
+}
+
 private func encode<T: Encodable>(_ value: T) -> String {
     String(decoding: try! JSONEncoder().encode(value), as: UTF8.self)
 }

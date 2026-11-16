@@ -52,6 +52,10 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
     /// album. Off unless the owner turns it on; nothing happens until a
     /// library is chosen either way.
     public var immichAlbumsForEveryEvent: Bool
+    /// Make each burst, RAW+JPEG pair and original-with-edit one Immich
+    /// stack on each check. Only the app's own stacks are ever made or
+    /// extended; stacks someone else made are left alone.
+    public var immichStacksBurstsAndEdits: Bool
     public var trueNASServerURL: String
     public var trueNASUsername: String
     public var trueNASDataset: String
@@ -110,6 +114,7 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         immichLibraryID: String = "",
         immichCarriesAlbumsAcrossRenames: Bool = false,
         immichAlbumsForEveryEvent: Bool = false,
+        immichStacksBurstsAndEdits: Bool = true,
         trueNASServerURL: String = "",
         trueNASUsername: String = "",
         trueNASDataset: String = "",
@@ -151,6 +156,7 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         self.immichLibraryID = immichLibraryID
         self.immichCarriesAlbumsAcrossRenames = immichCarriesAlbumsAcrossRenames
         self.immichAlbumsForEveryEvent = immichAlbumsForEveryEvent
+        self.immichStacksBurstsAndEdits = immichStacksBurstsAndEdits
         self.trueNASServerURL = trueNASServerURL
         self.trueNASUsername = trueNASUsername
         self.trueNASDataset = trueNASDataset
@@ -198,6 +204,7 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         // A new key: the first release defaulted to on and wrote `true` into
         // every config; that value was never the owner's choice.
         case immichAlbumsForEveryEvent = "immichAlbumsForEveryEventChosen"
+        case immichStacksBurstsAndEdits
         case trueNASServerURL
         case trueNASUsername
         case trueNASDataset
@@ -250,6 +257,7 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         try values.encode(immichLibraryID, forKey: .immichLibraryID)
         try values.encode(immichCarriesAlbumsAcrossRenames, forKey: .immichCarriesAlbumsAcrossRenames)
         try values.encode(immichAlbumsForEveryEvent, forKey: .immichAlbumsForEveryEvent)
+        try values.encode(immichStacksBurstsAndEdits, forKey: .immichStacksBurstsAndEdits)
         try values.encode(trueNASServerURL, forKey: .trueNASServerURL)
         try values.encode(trueNASUsername, forKey: .trueNASUsername)
         try values.encode(trueNASDataset, forKey: .trueNASDataset)
@@ -307,6 +315,7 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
         immichLibraryID = try values.decodeIfPresent(String.self, forKey: .immichLibraryID) ?? defaults.immichLibraryID
         immichCarriesAlbumsAcrossRenames = try values.decodeIfPresent(Bool.self, forKey: .immichCarriesAlbumsAcrossRenames) ?? defaults.immichCarriesAlbumsAcrossRenames
         immichAlbumsForEveryEvent = try values.decodeIfPresent(Bool.self, forKey: .immichAlbumsForEveryEvent) ?? defaults.immichAlbumsForEveryEvent
+        immichStacksBurstsAndEdits = try values.decodeIfPresent(Bool.self, forKey: .immichStacksBurstsAndEdits) ?? defaults.immichStacksBurstsAndEdits
         trueNASServerURL = try values.decodeIfPresent(String.self, forKey: .trueNASServerURL) ?? defaults.trueNASServerURL
         trueNASUsername = try values.decodeIfPresent(String.self, forKey: .trueNASUsername) ?? defaults.trueNASUsername
         trueNASDataset = try values.decodeIfPresent(String.self, forKey: .trueNASDataset) ?? defaults.trueNASDataset

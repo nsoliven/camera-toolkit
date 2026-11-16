@@ -25,6 +25,7 @@ struct ImmichSendState: Equatable {
     enum Phase: Equatable {
         case scanning(waiting: Int?)
         case adding(count: Int, album: String)
+        case stacking
         case done
         case failed(String)
     }
@@ -33,6 +34,7 @@ struct ImmichSendState: Equatable {
     var eventCount: Int
     var results: [ImmichSendResult] = []
     var addedToAlbums = 0
+    var stacksMade = 0
 
     var isFinished: Bool {
         switch phase {
@@ -46,7 +48,13 @@ struct ImmichSendState: Equatable {
         case .scanning(nil): "Asking Immich to scan…"
         case .scanning(let waiting?): waiting == 0 ? "Scanning… all files found" : "Scanning… waiting for \(waiting.formatted()) file\(waiting == 1 ? "" : "s")"
         case .adding(let count, let album): "Adding \(count.formatted()) photo\(count == 1 ? "" : "s") to “\(album)”…"
-        case .done: addedToAlbums > 0 ? "Done. Added \(addedToAlbums.formatted()) photo\(addedToAlbums == 1 ? "" : "s") to albums." : "Done."
+        case .stacking: "Stacking bursts and edits…"
+        case .done:
+            [
+                "Done.",
+                addedToAlbums > 0 ? "Added \(addedToAlbums.formatted()) photo\(addedToAlbums == 1 ? "" : "s") to albums." : nil,
+                stacksMade > 0 ? "Made \(stacksMade.formatted()) stack\(stacksMade == 1 ? "" : "s")." : nil
+            ].compactMap { $0 }.joined(separator: " ")
         case .failed(let message): message
         }
     }
@@ -87,11 +95,17 @@ extension EventsWorkspace {
                     files = await model.immichCatalogFiles()
                 }
                 let outcome = try await sync.check(files: files, events: eventIDs, fillsAlbums: true) { [weak self] step in
-                    guard case .adding(let count, let album) = step else { return }
-                    Task { @MainActor in self?.immichSend?.phase = .adding(count: count, album: album) }
+                    let phase: ImmichSendState.Phase? = switch step {
+                    case .adding(let count, let album): .adding(count: count, album: album)
+                    case .stacking: .stacking
+                    default: nil
+                    }
+                    guard let phase else { return }
+                    Task { @MainActor in self?.immichSend?.phase = phase }
                 }
                 model.applyImmichAlbumOutcome(outcome)
                 immichSend?.addedToAlbums = outcome.addedToAlbums
+                immichSend?.stacksMade = outcome.stacks?.created.count ?? 0
                 immichSend?.results = await immichSendResults(eventIDs)
                 immichSend?.phase = outcome.problems.isEmpty ? .done : .failed("Done with problems: " + outcome.problems.prefix(3).joined(separator: "; "))
                 immichCheckLine = outcome.summary

@@ -482,6 +482,21 @@ struct ServicesSettingsPane: View {
                     )
                 )
                 SecureField("API key", text: $model.immichAPIKeyDraft)
+                LabeledContent("Saved key") {
+                    VStack(alignment: .trailing, spacing: 4) {
+                        Text(model.immichKeyIsSaved ? "Saved in the Keychain" : "No API key saved")
+                            .foregroundStyle(model.immichKeyIsSaved ? Color.secondary : Color.orange)
+                        if !model.immichKeyIsSaved, !model.immichEarlierKeyServices.isEmpty {
+                            Button("Move the Key an Earlier Version Saved") { model.moveEarlierImmichKey() }
+                                .controlSize(.small)
+                                .help("An earlier build saved an Immich key under another Keychain entry. This copies it here; macOS asks first.")
+                        }
+                    }
+                }
+                Text("Use a key from the account that owns the library, with: library read and scan, asset read and update, album create and add, stack create and update.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .onAppear { model.refreshImmichKeyStatus() }
                 LabeledContent("Status") {
                     Text(model.immichConnectionStatus)
                         .foregroundStyle(.secondary)
@@ -526,6 +541,11 @@ struct ServicesSettingsPane: View {
                 Text(immichAlbumCountText)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                Toggle("Stack bursts and edits in Immich", isOn: Binding(
+                    get: { model.configuration.immichStacksBurstsAndEdits },
+                    set: { model.setImmichStacksBurstsAndEdits($0) }
+                ))
+                .help("Each burst, RAW+JPEG pair, and original with its edit becomes one Immich stack, cover on top. Stacks someone else made are left alone; the app never deletes a stack.")
                 Toggle("Keep renamed files in their albums", isOn: Binding(
                     get: { model.configuration.immichCarriesAlbumsAcrossRenames },
                     set: { model.setImmichCarriesAlbumsAcrossRenames($0) }

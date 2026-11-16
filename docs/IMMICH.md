@@ -46,6 +46,35 @@ A pairing is stored by album ID, so renaming the album in Immich does not break 
 
 A private event never gets an album unless **Allow album** is on for that event. That only governs albums: Immich reads the whole NAS root, so a private event's files are visible in Immich unless the library's exclusion patterns cover them. The event says so when it happens.
 
+## Stacks
+
+**Stack bursts and edits in Immich** (Settings, on by default; nothing happens until a library is chosen) makes, on each check and on Send to Immich:
+
+- each burst the board groups into one stack, with its cover frame on top;
+- each RAW file and the JPEG of the same shot into one stack;
+- each original and its edit from the event's `Edited` folder (a Photomator export, or a graded copy such as `C0001_709.mp4`) into one stack, edit on top. An edit of a burst frame sits right under the burst's cover.
+
+Groups never cross events. A file not matched to an asset in the chosen library is left out, and a group with fewer than two matched files is not made.
+
+Bursts are grouped from the catalog without reading the NAS, using the board's own rules. Each file's modification time, which the camera set and verified copies keep, stands in for its capture time. Frames the board joins only after a visual check, and manual burst splits, are not known here, so such a burst can come out as two smaller stacks, never a bigger one.
+
+**Other people's stacks are never touched.** Immich's create call merges any stack whose top asset is among the IDs, and pulls other members out of their stacks. So a group with any asset already in a stack the app did not make is skipped and reported. The app keeps every stack it made in `immich_stacks` (group, stack ID, assets). A re-run with nothing changed creates nothing. When a frame was added or renamed, the app makes the group again, which replaces only its own stack. The app never deletes a stack and never changes one it did not make.
+
+Burst tiles the app stacked show a small stack mark, and the event's Immich chip shows "N stacks".
+
+From a script, with the saved server URL, the chosen library (or the only external library on the account), and the Keychain key read inside that one process:
+
+```
+CameraToolkit --immich-stacks --dry-run [--event <name>]...
+CameraToolkit --immich-stacks [--event <name>]... [--log <file.jsonl>]
+```
+
+The dry run only reads. It reports how many stacks it would make, how many are already the app's and unchanged, how many it would leave alone because they are already in someone else's stack, and how many groups are not matched in Immich. A real run writes one JSON line per stack it made to the log (default `<support folder>/Immich Stack Logs/`); that list of stack IDs is what to undo from.
+
+## View in Immich
+
+**View in Immich** sits beside the event's Immich chip and in the event's sidebar menu. It opens the paired album; without an album, the event's folder in Immich's folder view; without a known library, the server's home page. In the photo preview's menu it opens that photo's own Immich page when a check has matched it. It is disabled, with a hint, until a server URL is set.
+
 ## Renames
 
 Immich has no notion of a file moving. After a NAS rename the old asset goes offline and is trashed, and the new path becomes a new asset without the old one's albums or face tags. Once Immich's trash window passes, the old asset is gone along with that membership. The file itself is untouched.
@@ -54,7 +83,11 @@ The app remembers each rename in `immich_path_moves` for 90 days. With **Keep re
 
 ## Setup
 
-In Settings › Services enter the server URL and an API key, press **Test Connection**, then choose the library. The key lives in the macOS Keychain only and is sent only as a request header. Scanning and listing libraries need an admin user's key.
+In Settings › Services enter the server URL and an API key, press **Test Connection**, then choose the library. The key lives in the macOS Keychain only and is sent only as a request header.
+
+Settings says plainly when no key is saved. When an earlier build saved one under another Keychain entry, **Move the Key an Earlier Version Saved** copies it over on your click; macOS asks first, and the old entry is left alone.
+
+Use a key from the account that owns the library, with these permissions: library read and scan, asset read and update, album create and add, stack create and update. Stacks and albums are made as the key's user, so another user's key, even an admin's, cannot stack or album the owner's photos.
 
 ## Server version
 

@@ -1171,6 +1171,11 @@ private struct EventSidebarMenu: View {
             Button("Send to Immich…") { workspace.requestImmichSend([event.id]) }
                 .help("Choose events, then scan now and fill their albums")
         }
+        Button("View in Immich") {
+            if let url = workspace.model.immichWebURL(for: event) { NSWorkspace.shared.open(url) }
+        }
+        .disabled(!workspace.model.immichServerIsSet)
+        .help(workspace.model.immichServerIsSet ? "Open this event in Immich in your browser" : "Add your Immich server in Settings › Services first")
         Button("Scan for Faces…") { workspace.requestFaceScan(event) }
             .disabled(workspace.faceScanBlocker(for: event) != nil)
             .help(workspace.faceScanBlocker(for: event)

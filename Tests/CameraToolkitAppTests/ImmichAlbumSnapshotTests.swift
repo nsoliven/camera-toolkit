@@ -17,10 +17,37 @@ final class ImmichAlbumSnapshotTests: XCTestCase {
         let folder = URL(fileURLWithPath: out, isDirectory: true)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
 
+        let server = URL(string: "https://photos.example.com/albums/sample")
         let chips = VStack(alignment: .leading, spacing: 12) {
-            ImmichAlbumChip(info: ImmichAlbumChipInfo(albumName: "Beach Day", inAlbum: 248, toAdd: 12, notOnNAS: 4, canOpen: true), onOpen: {}, onSend: {}) { Button("New Album Named After the Event") {} }
-            ImmichAlbumChip(info: ImmichAlbumChipInfo(albumName: "Trip 2026", inAlbum: 1_310, toAdd: 0, notOnNAS: 0, canOpen: true), onOpen: {}, onSend: {}) { Button("No Album") {} }
-            ImmichAlbumChip(info: ImmichAlbumChipInfo(albumName: nil, inAlbum: nil, toAdd: 0, notOnNAS: 0, canOpen: false), onOpen: {}, onSend: {}) { Button("No Album") {} }
+            HStack(spacing: 8) {
+                ImmichAlbumChip(info: ImmichAlbumChipInfo(albumName: "Beach Day", inAlbum: 248, toAdd: 12, notOnNAS: 4, stackCount: 31), onSend: {}) { Button("New Album Named After the Event") {} }
+                ViewInImmichButton(url: server)
+            }
+            HStack(spacing: 8) {
+                ImmichAlbumChip(info: ImmichAlbumChipInfo(albumName: "Trip 2026", inAlbum: 1_310, toAdd: 0, notOnNAS: 0), onSend: {}) { Button("No Album") {} }
+                ViewInImmichButton(url: server)
+            }
+            HStack(spacing: 8) {
+                ImmichAlbumChip(info: ImmichAlbumChipInfo(albumName: nil, inAlbum: nil, toAdd: 0, notOnNAS: 0), onSend: {}) { Button("No Album") {} }
+                ViewInImmichButton(url: server)
+            }
+            HStack(spacing: 8) {
+                Text("No server set:").foregroundStyle(.secondary)
+                ViewInImmichButton(url: nil)
+            }
+            HStack(spacing: 12) {
+                ForEach(0..<3) { index in
+                    RoundedRectangle(cornerRadius: 10)
+                        .fill(LinearGradient(colors: [.orange.opacity(0.7), .purple.opacity(0.7)], startPoint: .topLeading, endPoint: .bottomTrailing))
+                        .frame(width: 150, height: 100)
+                        .overlay(alignment: .bottomTrailing) {
+                            if index != 1 { ImmichStackedMark().padding(6) }
+                        }
+                        .overlay(alignment: .topLeading) {
+                            Text(index == 1 ? "Single" : "Burst · 8").font(.caption).foregroundStyle(.white).padding(6)
+                        }
+                }
+            }
         }
         .padding(16)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -66,7 +93,9 @@ final class ImmichAlbumSnapshotTests: XCTestCase {
             Divider()
             ImmichSendProgressView(state: ImmichSendState(phase: .adding(count: 40, album: "Beach Day"), eventCount: 2))
             Divider()
-            ImmichSendProgressView(state: ImmichSendState(phase: .done, eventCount: 2, results: results, addedToAlbums: 52))
+            ImmichSendProgressView(state: ImmichSendState(phase: .stacking, eventCount: 2))
+            Divider()
+            ImmichSendProgressView(state: ImmichSendState(phase: .done, eventCount: 2, results: results, addedToAlbums: 52, stacksMade: 14))
         }
         .padding(20)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -74,10 +103,10 @@ final class ImmichAlbumSnapshotTests: XCTestCase {
 
         for appearance in [NSAppearance.Name.aqua, .darkAqua] {
             let suffix = appearance == .aqua ? "light" : "dark"
-            try render(AnyView(chips), size: NSSize(width: 760, height: 150), appearance: appearance, to: folder.appendingPathComponent("immich-chip-\(suffix).png"))
+            try render(AnyView(chips), size: NSSize(width: 980, height: 330), appearance: appearance, to: folder.appendingPathComponent("immich-chip-\(suffix).png"))
             try render(AnyView(sidebar), size: NSSize(width: 280, height: 260), appearance: appearance, to: folder.appendingPathComponent("immich-sidebar-\(suffix).png"))
             try render(AnyView(pairs), size: NSSize(width: 620, height: 470), appearance: appearance, to: folder.appendingPathComponent("immich-pairs-\(suffix).png"))
-            try render(AnyView(progress), size: NSSize(width: 520, height: 420), appearance: appearance, to: folder.appendingPathComponent("immich-send-\(suffix).png"))
+            try render(AnyView(progress), size: NSSize(width: 520, height: 480), appearance: appearance, to: folder.appendingPathComponent("immich-send-\(suffix).png"))
         }
     }
 

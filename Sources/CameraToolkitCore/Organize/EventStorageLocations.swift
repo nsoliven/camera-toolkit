@@ -308,6 +308,11 @@ public struct EventStorageLocations: Sendable {
             .appendingPathComponent(layout(for: event, deviceID: nil).mirrorEventFolderPath, isDirectory: true)
     }
 
+    /// The event's folder under the NAS root, e.g. `2026/2026-08-21 Trip`.
+    public func nasEventFolderRelativePath(for event: SavedCameraEvent) -> String {
+        layout(for: event, deviceID: nil).mirrorEventFolderPath
+    }
+
     /// The assignment's NAS copy in the mirror layout: the drive's
     /// `Originals/<Camera>/<relative path>` under the NAS root.
     public func archiveURL(for assignment: PhotoEventAssignment, event: SavedCameraEvent) -> URL? {
