@@ -28,6 +28,9 @@ public struct ImmichEventSummary: Equatable, Sendable {
     public var inTrash = 0
     public var pendingScan = 0
     public var offline = 0
+    /// Photos and videos with no verified NAS copy: Immich cannot see them
+    /// until they are synced.
+    public var notOnNAS = 0
 
     public init(statuses: some Sequence<ImmichCatalogStatus>) {
         for status in statuses {
@@ -36,7 +39,8 @@ public struct ImmichEventSummary: Equatable, Sendable {
                 if status.isTrashed { inTrash += 1 } else { inImmich += 1 }
             case .pendingScan: pendingScan += 1
             case .offline: offline += 1
-            case .excluded, .notOnNAS, nil: break
+            case .notOnNAS: notOnNAS += 1
+            case .excluded, nil: break
             }
         }
     }
@@ -76,32 +80,69 @@ extension SavedCameraEvent {
     }
 }
 
+/// Which album an event's photos go to: one paired by ID, or one found (or
+/// made) by name on the next check.
+public enum ImmichAlbumTarget: Hashable, Sendable {
+    case existing(id: String, name: String)
+    case named(String)
+
+    public var displayName: String {
+        switch self {
+        case .existing(_, let name), .named(let name): name
+        }
+    }
+
+    public var albumID: String? {
+        if case .existing(let id, _) = self { return id }
+        return nil
+    }
+}
+
 /// Album titles for a set of events. Albums are found by name, so two events
 /// that share a name would fill one album; an album named after its event
 /// gets the event's date added when another event has the same name. A
-/// custom name is used exactly as typed.
+/// custom name is used exactly as typed. A paired album is used by ID.
 public enum ImmichAlbumNaming {
     public static func titles(
         events: [SavedCameraEvent],
         locations: EventStorageLocations,
         albumsForEveryEvent: Bool
     ) -> [UUID: String] {
-        var titles: [UUID: String] = [:]
+        targets(events: events, locations: locations, albumsForEveryEvent: albumsForEveryEvent).mapValues(\.displayName)
+    }
+
+    public static func targets(
+        events: [SavedCameraEvent],
+        locations: EventStorageLocations,
+        albumsForEveryEvent: Bool
+    ) -> [UUID: ImmichAlbumTarget] {
+        var targets: [UUID: ImmichAlbumTarget] = [:]
         var namedAfterEvent: [String: [SavedCameraEvent]] = [:]
         for event in events {
             let isPrivate = locations.resolvedPolicy(for: event) == .archiveOnly
+            if isPrivate, !event.sendsToImmich { continue }
+            if let id = event.immichAlbumID, !id.isEmpty {
+                let name = event.immichAlbumName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                targets[event.id] = .existing(id: id, name: name.isEmpty ? event.name : name)
+                continue
+            }
             guard let title = event.immichAlbumTitle(isPrivate: isPrivate, albumsForEveryEvent: albumsForEveryEvent) else { continue }
-            titles[event.id] = title
+            targets[event.id] = .named(title)
             if event.effectiveImmichAlbumPolicy(albumsForEveryEvent: albumsForEveryEvent) == .event {
                 namedAfterEvent[NASSyncStore.pathKey(title), default: []].append(event)
             }
         }
         for group in namedAfterEvent.values where group.count > 1 {
             for event in group {
-                titles[event.id] = "\(event.name) · \(EventStorageLocations.eventDateString(event.eventDate))"
+                targets[event.id] = .named(datedTitle(for: event))
             }
         }
-        return titles
+        return targets
+    }
+
+    /// "Name · yyyy-MM-dd", the title a same-name event's album gets.
+    public static func datedTitle(for event: SavedCameraEvent) -> String {
+        "\(event.name) · \(EventStorageLocations.eventDateString(event.eventDate))"
     }
 }
 
@@ -111,13 +152,15 @@ public struct ImmichCatalogFile: Equatable, Sendable {
     /// The file's path under the NAS root.
     public var relativePath: String
     public var isOnNAS: Bool
-    public var albumName: String?
+    public var album: ImmichAlbumTarget?
+    public var eventID: UUID?
 
-    public init(eventAssetID: String, relativePath: String, isOnNAS: Bool, albumName: String? = nil) {
+    public init(eventAssetID: String, relativePath: String, isOnNAS: Bool, album: ImmichAlbumTarget? = nil, eventID: UUID? = nil) {
         self.eventAssetID = eventAssetID
         self.relativePath = relativePath
         self.isOnNAS = isOnNAS
-        self.albumName = albumName
+        self.album = album
+        self.eventID = eventID
     }
 
     /// Every assignment that has a NAS path. `verifiedPathKeys` are the
@@ -130,7 +173,7 @@ public struct ImmichCatalogFile: Equatable, Sendable {
         albumsForEveryEvent: Bool = false
     ) -> [ImmichCatalogFile] {
         let eventsByID = Dictionary(events.map { ($0.id, $0) }) { first, _ in first }
-        let albumTitles = ImmichAlbumNaming.titles(events: events, locations: locations, albumsForEveryEvent: albumsForEveryEvent)
+        let albumTargets = ImmichAlbumNaming.targets(events: events, locations: locations, albumsForEveryEvent: albumsForEveryEvent)
         return assignments.compactMap { assignment in
             guard let event = eventsByID[assignment.eventID],
                   let relative = locations.archiveRelativePath(for: assignment, event: event) else { return nil }
@@ -138,7 +181,8 @@ public struct ImmichCatalogFile: Equatable, Sendable {
                 eventAssetID: CatalogStore.eventAssetID(assignment),
                 relativePath: relative,
                 isOnNAS: verifiedPathKeys.contains(NASSyncStore.pathKey(relative)),
-                albumName: assignment.immichUploadOverride == false ? nil : albumTitles[event.id]
+                album: assignment.immichUploadOverride == false ? nil : albumTargets[event.id],
+                eventID: event.id
             )
         }
     }
@@ -248,8 +292,12 @@ public struct ImmichReconcileReport: Equatable, Sendable {
     /// False when the library has assets and files are on the NAS but no path
     /// matched: the library is not reading the NAS root the app syncs to.
     public var pathsLineUp = true
-    /// Album name → assets the album should hold.
-    public var albumAssets: [String: [String]] = [:]
+    /// Album → assets the album should hold.
+    public var albumAssets: [ImmichAlbumTarget: [String]] = [:]
+    /// Album → the events whose photos go to it.
+    public var albumEvents: [ImmichAlbumTarget: Set<UUID>] = [:]
+    /// Event → its assets that should be in its album.
+    public var eventAlbumAssets: [UUID: [String]] = [:]
 
     public func count(_ status: ImmichPresenceStatus) -> Int { counts[status, default: 0] }
 }
@@ -296,8 +344,12 @@ public enum ImmichReconciler {
                 } else {
                     status = .present
                     isTrashed = asset.isTrashed
-                    if !isTrashed, let album = file.albumName {
+                    if !isTrashed, let album = file.album {
                         report.albumAssets[album, default: []].append(asset.id)
+                        if let eventID = file.eventID {
+                            report.albumEvents[album, default: []].insert(eventID)
+                            report.eventAlbumAssets[eventID, default: []].append(asset.id)
+                        }
                     }
                 }
             } else if isExcluded(file.relativePath, paths: paths, exclusions: exclusions, mediaExtensions: mediaExtensions) {
@@ -520,12 +572,47 @@ public enum ImmichAlbumCarryOver {
     }
 }
 
+/// Where one event's album stands after a check.
+public struct ImmichEventAlbumState: Codable, Equatable, Sendable {
+    public var albumID: String
+    public var albumName: String
+    /// Photos in the album, all events' together.
+    public var albumCount: Int
+    /// This event's photos that are in Immich and in the album.
+    public var inAlbum: Int
+    /// This event's photos in Immich that could not be added.
+    public var failedToAdd: Int
+    public var checkedAt: Date
+
+    public init(albumID: String, albumName: String, albumCount: Int, inAlbum: Int, failedToAdd: Int = 0, checkedAt: Date = Date()) {
+        self.albumID = albumID
+        self.albumName = albumName
+        self.albumCount = albumCount
+        self.inAlbum = inAlbum
+        self.failedToAdd = failedToAdd
+        self.checkedAt = checkedAt
+    }
+}
+
+/// What a check is doing, for a progress line.
+public enum ImmichSyncStep: Equatable, Sendable {
+    case reading
+    case adding(count: Int, album: String)
+    case done
+}
+
 public struct ImmichLibrarySyncOutcome: Equatable, Sendable {
     public var report: ImmichReconcileReport
     public var albumsCreated = 0
     public var addedToAlbums = 0
     public var carriedOver = 0
     public var problems: [String] = []
+    /// Each event's album as Immich has it now: found or made by name (so the
+    /// event can be paired by ID from now on), or paired and maybe renamed.
+    public var resolvedAlbums: [UUID: ImmichAlbum] = [:]
+    public var albumStates: [UUID: ImmichEventAlbumState] = [:]
+    /// Paired albums Immich no longer has.
+    public var missingAlbumIDs: Set<String> = []
 
     public var summary: String {
         var parts = ["\(report.count(.present).formatted()) in Immich"]
@@ -535,6 +622,59 @@ public struct ImmichLibrarySyncOutcome: Equatable, Sendable {
         if carriedOver > 0 { parts.append("\(carriedOver.formatted()) renamed file(s) kept in their albums") }
         if !problems.isEmpty { parts.append("\(problems.count) problem(s): \(problems.prefix(3).joined(separator: "; "))") }
         return parts.joined(separator: ", ")
+    }
+}
+
+/// The last known state of every event's album, kept in the catalog so the
+/// event page shows it before the next check.
+public final class ImmichEventAlbumStore: @unchecked Sendable {
+    static let schema = """
+    CREATE TABLE IF NOT EXISTS immich_event_albums (
+        event_id TEXT PRIMARY KEY,
+        state TEXT NOT NULL
+    );
+    """
+
+    public let catalogURL: URL
+
+    public init(catalogURL: URL) throws {
+        self.catalogURL = catalogURL
+        try CatalogDatabase.writer(for: catalogURL).write { try $0.execute(sql: Self.schema) }
+    }
+
+    public func save(_ states: [UUID: ImmichEventAlbumState]) throws {
+        guard !states.isEmpty else { return }
+        let encoder = JSONEncoder()
+        try CatalogDatabase.writer(for: catalogURL).write { database in
+            for (eventID, state) in states {
+                try database.execute(
+                    sql: "INSERT INTO immich_event_albums(event_id, state) VALUES (?, ?) ON CONFLICT(event_id) DO UPDATE SET state = excluded.state",
+                    arguments: [eventID.uuidString, String(decoding: try encoder.encode(state), as: UTF8.self)]
+                )
+            }
+        }
+    }
+
+    public func remove(eventIDs: Set<UUID>) throws {
+        guard !eventIDs.isEmpty else { return }
+        try CatalogDatabase.writer(for: catalogURL).write { database in
+            for id in eventIDs {
+                try database.execute(sql: "DELETE FROM immich_event_albums WHERE event_id = ?", arguments: [id.uuidString])
+            }
+        }
+    }
+
+    public func all() throws -> [UUID: ImmichEventAlbumState] {
+        let decoder = JSONDecoder()
+        return try CatalogDatabase.writer(for: catalogURL).read { database in
+            var result: [UUID: ImmichEventAlbumState] = [:]
+            for row in try Row.fetchAll(database, sql: "SELECT event_id, state FROM immich_event_albums") {
+                guard let id = UUID(uuidString: row["event_id"]),
+                      let state = try? decoder.decode(ImmichEventAlbumState.self, from: Data((row["state"] as String).utf8)) else { continue }
+                result[id] = state
+            }
+            return result
+        }
     }
 }
 
@@ -560,10 +700,36 @@ public struct ImmichLibrarySync: Sendable {
         try await client.requestLibraryScan(libraryID: libraryID)
     }
 
-    public func check(files: [ImmichCatalogFile]) async throws -> ImmichLibrarySyncOutcome {
+    /// Compares the library with the catalog and fills albums.
+    ///
+    /// - Parameters:
+    ///   - events: only these events' files and albums; their assets are read
+    ///     by folder, so a few events take a few requests. Nil is everything.
+    ///   - fillsAlbums: false compares only (the waiting part of Send to Immich).
+    public func check(
+        files allFiles: [ImmichCatalogFile],
+        events: Set<UUID>? = nil,
+        fillsAlbums: Bool = true,
+        progress: @Sendable (ImmichSyncStep) -> Void = { _ in }
+    ) async throws -> ImmichLibrarySyncOutcome {
+        progress(.reading)
         let library = try await client.library(id: libraryID)
         let mediaExtensions = try await client.supportedMediaExtensions()
-        let assets = try await client.libraryAssets(libraryID: libraryID)
+        let files = events.map { scope in allFiles.filter { $0.eventID.map(scope.contains) ?? false } } ?? allFiles
+        let paths = ImmichLibraryPaths(importPaths: library.importPaths)
+        var assets: [ImmichLibraryAsset] = []
+        if events == nil {
+            assets = try await client.libraryAssets(libraryID: libraryID)
+        } else {
+            var seen = Set<String>()
+            for folder in Self.eventFolders(of: files) {
+                guard let serverFolder = paths.originalPath(forRelativePath: folder) else { continue }
+                for asset in try await client.libraryAssets(libraryID: libraryID, pathContains: serverFolder + "/")
+                where seen.insert(asset.id).inserted {
+                    assets.append(asset)
+                }
+            }
+        }
         let inspector = CatalogInspector(url: catalogURL)
 
         // Status rows reference catalog rows; a file the catalog has not
@@ -584,40 +750,95 @@ public struct ImmichLibrarySync: Sendable {
         report.statuses = []
 
         var outcome = ImmichLibrarySyncOutcome(report: report)
-        await syncAlbums(report.albumAssets, into: &outcome)
-        try await carryOverAlbums(assets: assets, library: library, into: &outcome)
+        if fillsAlbums {
+            await syncAlbums(report, into: &outcome, progress: progress)
+            try? ImmichEventAlbumStore(catalogURL: catalogURL).save(outcome.albumStates)
+        }
+        if events == nil {
+            try await carryOverAlbums(assets: assets, library: library, into: &outcome)
+        }
+        progress(.done)
         return outcome
     }
 
-    private func syncAlbums(_ albumAssets: [String: [String]], into outcome: inout ImmichLibrarySyncOutcome) async {
-        guard !albumAssets.isEmpty else { return }
+    /// The `<year>/<event folder>` folders the files sit in; a subevent's
+    /// folder is inside its parent's, so it is covered too.
+    static func eventFolders(of files: [ImmichCatalogFile]) -> [String] {
+        let folders = Set(files.compactMap { file -> String? in
+            let parts = file.relativePath.split(separator: "/", omittingEmptySubsequences: true)
+            guard parts.count > 2 else { return nil }
+            return parts.prefix(2).joined(separator: "/")
+        })
+        return folders.sorted()
+    }
+
+    private func syncAlbums(
+        _ report: ImmichReconcileReport,
+        into outcome: inout ImmichLibrarySyncOutcome,
+        progress: @Sendable (ImmichSyncStep) -> Void
+    ) async {
+        guard !report.albumAssets.isEmpty else { return }
+        let account: [ImmichAlbum]
         do {
-            var albums = Dictionary(try await client.albums().map { ($0.name, $0) }) { first, _ in first }
-            for name in albumAssets.keys.sorted() {
-                do {
-                    let album: ImmichAlbum
-                    if let existing = albums[name] {
+            account = try await client.albums()
+        } catch {
+            outcome.problems.append("albums: \(error.localizedDescription)")
+            return
+        }
+        let byID = Dictionary(account.map { ($0.id, $0) }) { first, _ in first }
+        var byName = Dictionary(account.map { ($0.name, $0) }) { first, _ in first }
+        for target in report.albumAssets.keys.sorted(by: { $0.displayName < $1.displayName }) {
+            let wanted = report.albumAssets[target] ?? []
+            let eventIDs = report.albumEvents[target] ?? []
+            do {
+                let album: ImmichAlbum
+                switch target {
+                case .existing(let id, _):
+                    guard let current = byID[id] else {
+                        outcome.missingAlbumIDs.insert(id)
+                        outcome.problems.append("album “\(target.displayName)” is no longer in Immich; pair the event again")
+                        continue
+                    }
+                    // Its current name, in case it was renamed in Immich.
+                    album = current
+                case .named(let name):
+                    if let existing = byName[name] {
                         album = existing
                     } else {
                         album = try await client.createAlbum(named: name)
-                        albums[name] = album
+                        byName[name] = album
                         outcome.albumsCreated += 1
                     }
-                    let ids = albumAssets[name] ?? []
-                    for start in stride(from: 0, to: ids.count, by: Self.albumBatchSize) {
-                        let batch = Array(ids[start..<min(start + Self.albumBatchSize, ids.count)])
-                        let result = try await client.addAssets(batch, toAlbum: album.id)
-                        outcome.addedToAlbums += result.added
-                        if !result.failed.isEmpty {
-                            outcome.problems.append("\(result.failed.count) not added to album “\(name)”")
-                        }
-                    }
-                } catch {
-                    outcome.problems.append("album “\(name)”: \(error.localizedDescription)")
                 }
+                for eventID in eventIDs { outcome.resolvedAlbums[eventID] = album }
+                // Only what is missing is sent, so the count is what was added.
+                var members = Set(try await client.albumAssets(albumID: album.id).map(\.id))
+                let missing = Array(Set(wanted).subtracting(members))
+                var failed = Set<String>()
+                if !missing.isEmpty { progress(.adding(count: missing.count, album: album.name)) }
+                for start in stride(from: 0, to: missing.count, by: Self.albumBatchSize) {
+                    let batch = Array(missing[start..<min(start + Self.albumBatchSize, missing.count)])
+                    let result = try await client.addAssets(batch, toAlbum: album.id)
+                    outcome.addedToAlbums += result.added
+                    failed.formUnion(result.failed.keys)
+                    members.formUnion(batch.filter { !result.failed.keys.contains($0) })
+                }
+                if !failed.isEmpty {
+                    outcome.problems.append("\(failed.count) not added to album “\(album.name)”")
+                }
+                for eventID in eventIDs {
+                    let mine = report.eventAlbumAssets[eventID] ?? []
+                    outcome.albumStates[eventID] = ImmichEventAlbumState(
+                        albumID: album.id,
+                        albumName: album.name,
+                        albumCount: members.count,
+                        inAlbum: mine.count { members.contains($0) },
+                        failedToAdd: mine.count { failed.contains($0) }
+                    )
+                }
+            } catch {
+                outcome.problems.append("album “\(target.displayName)”: \(error.localizedDescription)")
             }
-        } catch {
-            outcome.problems.append("albums: \(error.localizedDescription)")
         }
     }
 

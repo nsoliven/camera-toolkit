@@ -502,6 +502,7 @@ private struct EventBoardHeader: View {
         VStack(alignment: .leading, spacing: 8) {
             EventStorageStrip(model: model, workspace: workspace, eventID: eventID)
                 .guideHighlight(.storageStrip, in: workspace)
+            ImmichEventAlbumBar(model: model, workspace: workspace, eventID: eventID)
             // The strip stays put; the notices and chips under it scroll
             // once they would take more than their share of the board.
             BoardBarScrollRegion(maxHeight: OrganizeChromeSizing.boardAccessoryHeightLimit(boardHeight: boardHeight)) {
@@ -1012,7 +1013,7 @@ struct EventStorageSlots {
         let summary = ImmichEventSummary(statuses: (workspace.eventImmichStatuses[event.id] ?? [:]).values)
         let isConfigured = workspace.immichIsConfigured
         let isPrivate = workspace.locations.resolvedPolicy(for: event) == .archiveOnly
-        let album = workspace.immichAlbumTitles[event.id]
+        let album = model.immichAlbumStates[event.id]?.albumName ?? workspace.immichAlbumTargets[event.id]?.displayName
         let detail: String = if !isConfigured {
             "Choose your Immich library in Settings"
         } else if let outstanding = summary.outstandingText {
@@ -1020,7 +1021,7 @@ struct EventStorageSlots {
         } else if isPrivate, !summary.isEmpty, album == nil {
             "Private here, but Immich reads the whole NAS"
         } else if let album {
-            "Album “\(album)” · \(summary.inImmich.formatted()) photo\(summary.inImmich == 1 ? "" : "s")"
+            "Album “\(album)”"
         } else if summary.isEmpty {
             "Not checked yet"
         } else {
@@ -1035,27 +1036,12 @@ struct EventStorageSlots {
             state: !isConfigured || summary.isEmpty ? .unknown : (summary.needsAttention ? .partial : .complete)
         ) {
             if isConfigured {
-                Button(workspace.immichIsChecking ? "Checking…" : "Check") { workspace.checkImmichNow() }
-                    .disabled(workspace.immichIsChecking)
-                    .help("Asks Immich to scan the NAS library again and compares what it has. Nothing is uploaded.")
-                if isPrivate {
-                    Toggle("Allow album", isOn: Binding(
-                        get: { event.sendsToImmich },
-                        set: { model.setEventImmichUploadEnabled(event.id, enabled: $0) }
-                    ))
-                    .help("Private events never get an Immich album unless you allow it here.")
+                Button("Send to Immich…") { workspace.requestImmichSend([event.id]) }
+                    .help("Scan now and add this event's photos to its album. Nothing is uploaded.")
+                Menu("Album") {
+                    ImmichAlbumMenuItems(model: model, event: event, isPrivate: isPrivate)
                 }
-                if !isPrivate || event.sendsToImmich {
-                    Menu("Album") {
-                        Button(model.configuration.immichAlbumsForEveryEvent ? "Automatic (Event album)" : "Automatic (No album)") {
-                            model.setEventImmichAlbumPolicy(event.id, policy: nil)
-                        }
-                        ForEach(ImmichAlbumPolicy.allCases) { policy in
-                            Button(policy.displayName) { model.setEventImmichAlbumPolicy(event.id, policy: policy) }
-                        }
-                    }
-                    .fixedSize()
-                }
+                .fixedSize()
             }
         }
     }

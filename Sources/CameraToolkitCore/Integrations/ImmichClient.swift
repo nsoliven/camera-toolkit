@@ -58,7 +58,7 @@ public struct ImmichClient: Sendable {
 
     public func albums() async throws -> [ImmichAlbum] {
         let response: [AlbumResponse] = try await get("/albums", authenticated: true)
-        return response.map { ImmichAlbum(id: $0.id, name: $0.albumName) }
+        return response.map { ImmichAlbum(id: $0.id, name: $0.albumName, assetCount: $0.assetCount) }
     }
 
     /// The albums one asset is in.
@@ -110,21 +110,41 @@ public struct ImmichClient: Sendable {
     /// at a time. Uses the search fields that work on every server version
     /// this app targets; Immich marks them deprecated from v3.2 and plans to
     /// drop them in v4.
-    public func libraryAssets(libraryID: String, pageSize: Int = 1_000) async throws -> [ImmichLibraryAsset] {
+    ///
+    /// `pathContains` narrows it to paths containing that text (the server
+    /// matches it anywhere in the path, ignoring case and accents), so one
+    /// event folder is a request or two instead of the whole library.
+    public func libraryAssets(libraryID: String, pathContains: String? = nil, pageSize: Int = 1_000) async throws -> [ImmichLibraryAsset] {
         try Self.validate(id: libraryID, kind: "library")
+        return try await searchAll(MetadataSearchRequest(libraryId: libraryID, albumIds: nil, originalPath: pathContains, withDeleted: true, page: 1, size: pageSize))
+    }
+
+    /// Every asset in one album, as the album search returns them.
+    public func albumAssets(albumID: String, pageSize: Int = 1_000) async throws -> [ImmichLibraryAsset] {
+        try Self.validate(id: albumID, kind: "album")
+        return try await searchAll(MetadataSearchRequest(libraryId: nil, albumIds: [albumID], originalPath: nil, withDeleted: false, page: 1, size: pageSize))
+    }
+
+    private func searchAll(_ first: MetadataSearchRequest) async throws -> [ImmichLibraryAsset] {
+        var request = first
         var assets: [ImmichLibraryAsset] = []
-        var page = 1
         // The bound only stops a server that never says "last page".
         for _ in 0..<Self.maximumAssetPages {
-            let response: MetadataSearchResponse = try await post(
-                "/search/metadata",
-                body: MetadataSearchRequest(libraryId: libraryID, withDeleted: true, page: page, size: pageSize)
-            )
+            let response: MetadataSearchResponse = try await post("/search/metadata", body: request)
             assets += response.assets.items
             guard let next = response.assets.nextPage.flatMap(Int.init) else { return assets }
-            page = next
+            request.page = next
         }
-        throw ToolkitError.commandFailed("Immich kept returning more pages of this library; stopped after \(Self.maximumAssetPages).")
+        throw ToolkitError.commandFailed("Immich kept returning more pages; stopped after \(Self.maximumAssetPages).")
+    }
+
+    /// The album's page in the Immich web app.
+    public static func webURL(serverURL: String, albumID: String) -> URL? {
+        guard (try? validate(id: albumID, kind: "album")) != nil,
+              var components = normalizedAPIBaseURL(serverURL).flatMap({ URLComponents(url: $0, resolvingAgainstBaseURL: false) })
+        else { return nil }
+        components.path = String(components.path.dropLast("/api".count)) + "/albums/\(albumID)"
+        return components.url
     }
 
     private static let maximumAssetPages = 10_000
@@ -282,7 +302,9 @@ private struct ServerMediaTypesResponse: Decodable {
 }
 
 private struct MetadataSearchRequest: Encodable {
-    var libraryId: String
+    var libraryId: String?
+    var albumIds: [String]?
+    var originalPath: String?
     var withDeleted: Bool
     var page: Int
     var size: Int
@@ -300,6 +322,7 @@ private struct MetadataSearchResponse: Decodable {
 private struct AlbumResponse: Decodable {
     var id: String
     var albumName: String
+    var assetCount: Int?
 }
 
 private struct CreateAlbumRequest: Encodable {
@@ -350,13 +373,15 @@ public struct ImmichLibraryAsset: Codable, Equatable, Sendable {
     }
 }
 
-public struct ImmichAlbum: Equatable, Sendable {
+public struct ImmichAlbum: Codable, Equatable, Hashable, Identifiable, Sendable {
     public var id: String
     public var name: String
+    public var assetCount: Int?
 
-    public init(id: String, name: String) {
+    public init(id: String, name: String, assetCount: Int? = nil) {
         self.id = id
         self.name = name
+        self.assetCount = assetCount
     }
 }
 

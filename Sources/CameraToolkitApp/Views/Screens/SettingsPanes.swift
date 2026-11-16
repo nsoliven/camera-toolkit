@@ -468,7 +468,7 @@ struct ServicesSettingsPane: View {
             albumsForEveryEvent: true
         ).count
         let lead = model.configuration.immichAlbumsForEveryEvent ? "" : "With this on, "
-        return "\(lead)\(withSwitchOn) of \(events.count) events \(model.configuration.immichAlbumsForEveryEvent ? "get" : "would get") an album, made on the next check. Events set to No album or Custom keep their choice; private events need Allow album."
+        return "\(lead)\(withSwitchOn) of \(events.count) events \(model.configuration.immichAlbumsForEveryEvent ? "get" : "would get") an album, made on the next check. Off, events get an album only when you pair one or choose one. Events set to No album keep their choice; private events need Allow album."
     }
 
     var body: some View {
@@ -509,6 +509,16 @@ struct ServicesSettingsPane: View {
                     }
                 }
                 .disabled(model.immichLibraries.isEmpty && model.configuration.immichLibraryID.isEmpty)
+                HStack {
+                    Button(model.immichIsPairing ? "Pairing…" : "Pair Albums") { model.pairImmichAlbums() }
+                        .disabled(model.immichIsPairing || model.configuration.immichLibraryID.isEmpty)
+                        .help("Reads every album on your Immich account and pairs each with its event when the match is clear. Nothing is changed in Immich.")
+                    if !model.immichPairingNote.isEmpty {
+                        Text(model.immichPairingNote)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
                 Toggle("Make an album for every event", isOn: Binding(
                     get: { model.configuration.immichAlbumsForEveryEvent },
                     set: { model.setImmichAlbumsForEveryEvent($0) }
@@ -524,6 +534,17 @@ struct ServicesSettingsPane: View {
                 Text("Immich reads the NAS itself: pick the external library whose folder is your NAS library. The app asks it to scan after Sync to NAS and renames, and shows what it found on each event. It never uploads.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+            }
+
+            if !model.configuration.immichLibraryID.isEmpty {
+                Section("Immich Albums") {
+                    ImmichPairsListView(
+                        pairs: model.immichPairRows,
+                        unpaired: model.immichUnpairedRows,
+                        onUnpair: { model.unpairImmichAlbum(for: $0) }
+                    )
+                    .onAppear { model.loadImmichAlbumStates() }
+                }
             }
 
             Section {

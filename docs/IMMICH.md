@@ -25,11 +25,24 @@ Checks run outside the job gate, so a slow or absent server never holds up a fil
 
 ## Albums
 
-**Make an album for every event** (Settings, on by default; nothing happens until a library is chosen) gives every event whose album choice is still the default an Event album, new events included. An event set to **No album** or **Custom album** keeps its choice; **Automatic** in the event's Album menu puts it back on the default. Settings says how many events will get one before it is turned on.
+Events get an album only when asked: by pairing an existing album, or by choosing one in the event's **Album** menu (**Existing Album**, **New Album Named After the Event**, or **No Album**). **Make an album for every event** in Settings is off by default; turned on, every event left at the default gets an album named after it.
 
-An album named after its event takes the event's date as well when another event has the same name, because albums are found by name. A custom name is used exactly as typed, so it can join an album that already exists.
+**Pairing existing albums.** Choosing a library, or **Pair Albums** in Settings › Services, reads every album on the account (read-only) and pairs it with an event when the match is clear:
 
-Albums are created and filled on the next check, which runs after any copy to the NAS. Each check adds every online, untrashed asset of the event and never removes one, so a photo taken out of such an album comes back on the next check; set the event to **No album** to stop that.
+- its name equals the event's name or its dated album title, ignoring case and Unicode spelling; or
+- at least 80% of its photos, and at least 5, are one event's files, matched by library path.
+
+Nothing ambiguous is paired: two events tying for a name, an album that mixes events, a name and contents that disagree, or an event that matches two albums. Private events need **Allow album**, events set to **No album** keep it, and an event that already has an album keeps that one. Each unpaired album is listed with its reason. Pairing writes nothing to Immich.
+
+A pairing is stored by album ID, so renaming the album in Immich does not break it. The event also keeps the album's name with a custom policy, so an older build still fills the same album by name. An album made by name on a check is paired by ID from then on.
+
+**Filling.** Each check adds the event's online, untrashed photos that are missing from its album. It never removes any, so a photo taken out of such an album comes back on the next check; choose **No Album** to stop that. A paired album that is no longer in Immich is reported, not made again.
+
+**Where it shows.** The event header has an Immich album chip with the album's name, its photo count, "N to add" when some are missing, and buttons for Send to Immich and Open in Immich. Paired events have an album mark in the sidebar. Settings › Services lists every pair with **Unpair**, and every unpaired album with its reason.
+
+## Send to Immich
+
+**Send to Immich…** on the event's chip, its storage capsule, or its sidebar menu opens a list of events, with that event checked. Sending asks Immich to scan now and waits up to 90 seconds for the chosen events' files to appear. Only those events' folders are read, so it is a few requests. It then fills their albums and shows each step: scanning, adding photos to an album, done. Each event lists photos that are not on the NAS yet ("sync first") and photos Immich has not listed yet, which are added on the next check.
 
 A private event never gets an album unless **Allow album** is on for that event. That only governs albums: Immich reads the whole NAS root, so a private event's files are visible in Immich unless the library's exclusion patterns cover them. The event says so when it happens.
 

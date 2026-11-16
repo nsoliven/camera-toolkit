@@ -18,9 +18,9 @@ extension EventsWorkspace {
             && !model.configuration.immichServerURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
-    /// Every event's Immich album title, for the storage strip.
-    var immichAlbumTitles: [UUID: String] {
-        ImmichAlbumNaming.titles(
+    /// Every event's Immich album, for the storage strip and the header chip.
+    var immichAlbumTargets: [UUID: ImmichAlbumTarget] {
+        ImmichAlbumNaming.targets(
             events: model.configuration.savedEvents,
             locations: locations,
             albumsForEveryEvent: model.configuration.immichAlbumsForEveryEvent
@@ -96,41 +96,13 @@ extension EventsWorkspace {
     }
 
     private func makeImmichSync() throws -> ImmichLibrarySync {
-        let configuration = model.configuration
-        var apiKey = model.immichAPIKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
-        if apiKey.isEmpty {
-            apiKey = (try model.secretStore.read(account: DashboardModel.immichAPIKeyAccount))?
-                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        }
-        guard !apiKey.isEmpty else {
-            throw ToolkitError.commandFailed("Save an Immich API key in Settings first.")
-        }
-        return ImmichLibrarySync(
-            client: try ImmichClient(serverURL: configuration.immichServerURL, apiKey: apiKey),
-            libraryID: configuration.immichLibraryID,
-            catalogURL: URL(fileURLWithPath: DashboardModel.expandedPath(configuration.catalogDatabasePath)),
-            carriesAlbumsAcrossRenames: configuration.immichCarriesAlbumsAcrossRenames
-        )
+        try model.makeImmichSync()
     }
 
     private func checkImmichOnce(_ sync: ImmichLibrarySync) async throws -> ImmichLibrarySyncOutcome {
-        let assignments = model.configuration.photoEventAssignments
-        let events = model.configuration.savedEvents
-        let albumsForEveryEvent = model.configuration.immichAlbumsForEveryEvent
-        let locations = self.locations
-        let catalogURL = sync.catalogURL
-        let files = await Task.detached(priority: .utility) { () -> [ImmichCatalogFile] in
-            let verified = NASSyncStore.existingRecords(catalogURL: catalogURL, nasRoot: locations.nasRoot.path)
-                .filter { $0.value.state == .verified }
-            return ImmichCatalogFile.build(
-                assignments: assignments,
-                events: events,
-                locations: locations,
-                verifiedPathKeys: Set(verified.keys),
-                albumsForEveryEvent: albumsForEveryEvent
-            )
-        }.value
-        return try await sync.check(files: files)
+        let outcome = try await sync.check(files: await model.immichCatalogFiles())
+        model.applyImmichAlbumOutcome(outcome)
+        return outcome
     }
 
     /// Boards already open read the new answer without a full refresh.

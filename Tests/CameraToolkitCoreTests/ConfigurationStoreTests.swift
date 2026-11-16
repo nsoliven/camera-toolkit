@@ -72,10 +72,10 @@ final class ConfigurationStoreTests: XCTestCase {
             // Configs written before manual burst splits decode with none.
             XCTAssertEqual(loaded.burstSplits, [])
             // Configs written before external-library mode: Immich stays
-            // off (no library), with every-event albums ready for when one is chosen.
+            // off (no library), and events get albums only when asked.
             XCTAssertEqual(loaded.immichLibraryID, "")
             XCTAssertFalse(loaded.immichCarriesAlbumsAcrossRenames)
-            XCTAssertTrue(loaded.immichAlbumsForEveryEvent)
+            XCTAssertFalse(loaded.immichAlbumsForEveryEvent)
         }
     }
 

@@ -108,6 +108,14 @@ final class DashboardModel {
     var immichConnectionReport: ImmichConnectionReport?
     var immichIsTestingConnection: Bool = false
     var immichLibraries: [ImmichLibrary] = []
+    /// The account's albums, for the event Album menus. Filled by pairing.
+    var immichAlbums: [ImmichAlbum] = []
+    /// The last pairing run: what paired and what did not, with reasons.
+    var immichPairing: ImmichPairingResult?
+    var immichPairingNote = ""
+    var immichIsPairing = false
+    /// Each event's album as the last check left it.
+    var immichAlbumStates: [UUID: ImmichEventAlbumState] = [:]
     var trueNASAPIKeyDraft: String = ""
     var trueNASConnectionStatus: String = "Not configured. Add the TrueNAS server in Settings."
     var trueNASConnectionReport: TrueNASCapacityReport?
@@ -533,6 +541,8 @@ extension DashboardModel {
         updateConfiguration { configuration in
             guard let index = configuration.savedEvents.firstIndex(where: { $0.id == eventID }) else { return }
             configuration.savedEvents[index].immichAlbumPolicy = policy
+            // A policy chosen here replaces a pairing.
+            configuration.savedEvents[index].immichAlbumID = nil
         }
         statusMessage = switch policy {
         case .none?: "This event will not get an Immich album."
@@ -790,7 +800,10 @@ extension DashboardModel {
     }
 
     func setImmichLibraryID(_ value: String) {
+        let changed = value != configuration.immichLibraryID
         updateConfiguration { $0.immichLibraryID = value }
+        // Choosing a library pairs the account's existing albums at once.
+        if changed, !value.isEmpty { pairImmichAlbums() }
     }
 
     func setImmichAlbumsForEveryEvent(_ value: Bool) {
