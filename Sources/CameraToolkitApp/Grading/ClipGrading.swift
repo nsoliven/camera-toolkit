@@ -130,20 +130,17 @@ final class ClipGrading {
         detected[Self.fileKey(item.primary)] ?? nil
     }
 
-    /// The clip's own grade, else the default look for its profile.
+    /// Defaults and the present LUTs' roles, as the resolver sees them.
+    var resolver: GradeResolver {
+        GradeResolver(defaults: model.gradeDefaultsSnapshot, lutRoles: Dictionary(luts.map { ($0.id, $0.role) }, uniquingKeysWith: { first, _ in first }))
+    }
+
+    /// The clip's own grade, with its profile's default look when it chose
+    /// none. Nil for a clip that is not gradable.
     func effectiveGrade(for item: OrganizeItem) -> ClipGrade? {
-        if let grade = explicitGrade(for: item) {
-            // A grade that only labels the profile still gets the default.
-            if grade.look == .none, grade.hasNeutralControls, let profile = profile(for: item),
-               let look = model.gradeDefaultsSnapshot.look(for: profile) {
-                var withDefault = grade
-                withDefault.look = look
-                return withDefault
-            }
-            return grade
-        }
-        guard let profile = profile(for: item), let look = model.gradeDefaultsSnapshot.look(for: profile) else { return nil }
-        return ClipGrade(look: look)
+        guard Self.isGradable(item) else { return nil }
+        let explicit = explicitGrade(for: item)
+        return resolver.effectiveGrade(explicit: explicit, profile: profile(for: item))
     }
 
     func signalRange(for item: OrganizeItem, profile: LogProfile?) -> VideoSignalRange {
@@ -156,30 +153,79 @@ final class ClipGrading {
         }
     }
 
+    /// What the clip is drawn with: (a) its adjustments, (b) the
+    /// conversion its profile gets, (c) its look on top. Nil when that
+    /// changes nothing. `grade` stands in for the stored one (the panel's
+    /// draft).
     func recipe(for item: OrganizeItem, grade: ClipGrade? = nil) -> GradeRecipe? {
-        guard Self.isGradable(item), let grade = grade ?? effectiveGrade(for: item) else { return nil }
-        let profile = grade.profileMark.resolve(detected: detectedProfile(for: item))
-        let recipe = GradeRecipe(grade: grade, profile: profile, range: signalRange(for: item, profile: profile))
-        return recipe.grade.isIdentity ? nil : recipe
+        guard Self.isGradable(item) else { return nil }
+        let resolver = self.resolver
+        let profile = profile(for: item)
+        let explicit = grade ?? explicitGrade(for: item)
+        let detectedProfile = detectedProfile(for: item)
+        let range = signalRange(for: item, profile: profile)
+        return resolver.recipe(explicit: explicit, detected: detectedProfile, range: range)
     }
 
     func tileMark(for stack: OrganizeStack) -> TileGradeMark? {
         let item = stack.coverItem
         guard Self.isGradable(item) else { return nil }
-        if let recipe = recipe(for: item), isLookAvailable(recipe) {
+        let profile = profile(for: item)
+        if let recipe = recipe(for: item), isAvailable(recipe), recipe.conversion.converts || profile == nil {
             return .graded(recipe)
         }
-        if let profile = profile(for: item) { return .flatLog(profile) }
+        if let profile { return .flatLog(profile) }
         return nil
     }
 
     /// Without reading a LUT file: a tile asks this while it draws.
-    func isLookAvailable(_ recipe: GradeRecipe) -> Bool {
-        switch recipe.grade.look {
-        case .none: true
-        case .rec709: recipe.profile?.hasBuiltInConversion == true
-        case .lut(let id): luts.contains { $0.id == id }
+    func isAvailable(_ recipe: GradeRecipe) -> Bool {
+        if case .lut(let id) = recipe.conversion, !luts.contains(where: { $0.id == id }) { return false }
+        if case .lut(let id) = recipe.grade.look, !luts.contains(where: { $0.id == id && $0.role == .look }) { return false }
+        return true
+    }
+
+    /// "Sony S-Log3 → Rec.709 · s709" — what stage (b) is for this recipe.
+    func conversionTitle(_ conversion: ResolvedConversion, profile: LogProfile?) -> String {
+        guard let profile else { return "None — already Rec.709 video" }
+        switch conversion {
+        case .none:
+            return profile.hasBuiltInConversion || conversionLUTs(for: profile).isEmpty == false
+                ? "Off — shown as recorded (\(profile.shortName))"
+                : "None yet — import \(profile == .djiDLogM ? "DJI’s D-Log M" : "a") conversion LUT in Settings › Color"
+        case .builtIn:
+            return "\(profile.vendorName) \(profile.shortName) → Rec.709 · Built-in (Sony math)"
+        case .lut(let id):
+            return "\(profile.vendorName) \(profile.shortName) → Rec.709 · \(luts.first { $0.id == id }?.name ?? "LUT")"
         }
+    }
+
+    func conversionLUTs(for profile: LogProfile) -> [ImportedLUT] {
+        luts.filter { $0.role == .conversion(profile) }
+    }
+
+    func conversionName(_ conversion: GradeConversion, profile: LogProfile) -> String {
+        switch conversion {
+        case .auto:
+            let resolved = GradeResolver(defaults: model.gradeDefaultsSnapshot, lutRoles: resolver.lutRoles).conversion(for: ClipGrade(), profile: profile)
+            switch resolved {
+            case .lut(let id): return "Default (\(luts.first { $0.id == id }?.name ?? "LUT"))"
+            case .builtIn: return "Default (Built-in, Sony math)"
+            case .none: return "Default (none available)"
+            }
+        case .builtIn: return "Built-in (Sony math)"
+        case .lut(let id): return luts.first { $0.id == id }?.name ?? "Missing LUT"
+        case .off: return "Don’t convert"
+        }
+    }
+
+    /// The conversions a clip of `profile` can use.
+    func conversionChoices(for profile: LogProfile) -> [GradeConversion] {
+        var choices: [GradeConversion] = [.auto]
+        if profile.hasBuiltInConversion { choices.append(.builtIn) }
+        choices.append(contentsOf: conversionLUTs(for: profile).map { .lut($0.id) })
+        choices.append(.off)
+        return choices
     }
 
     // MARK: Detection
@@ -285,7 +331,7 @@ final class ClipGrading {
         let pairs: [(OrganizeItem, ClipGrade?)] = targets.map { item in
             var grade = explicitGrade(for: item) ?? ClipGrade()
             grade.look = look
-            grade.intensity = intensity
+            grade.intensity = look == .none ? 1 : intensity
             return (item, grade)
         }
         setGrades(pairs, undoTitle: "Apply \(lookName(look))", detail: "\(targets.count) log clip\(targets.count == 1 ? "" : "s")")
@@ -319,7 +365,7 @@ final class ClipGrading {
         let pairs: [(OrganizeItem, ClipGrade?)] = items.filter(Self.isGradable).map { item in
             var grade = explicitGrade(for: item) ?? ClipGrade()
             grade.profileMark = mark
-            return (item, grade.isIdentity && mark == .detected ? nil : grade)
+            return (item, grade.isDefault && mark == .detected ? nil : grade)
         }
         let title: String = switch mark {
         case .detected: "Use Detected Profile"
@@ -330,6 +376,10 @@ final class ClipGrading {
     }
 
     // MARK: Defaults and LUTs (Settings — outside Undo)
+
+    func setDefaultConversion(_ conversion: GradeConversion, for profile: LogProfile) {
+        model.updateConfiguration { $0.gradeDefaults.setConversion(conversion, for: profile) }
+    }
 
     func setDefaultLook(_ look: GradeLook?, for profile: LogProfile) {
         model.updateConfiguration { $0.gradeDefaults.setLook(look, for: profile) }
@@ -373,18 +423,16 @@ final class ClipGrading {
 
     func lookName(_ look: GradeLook) -> String {
         switch look {
-        case .none: "Original"
-        case .rec709: "Rec.709"
+        case .none: "No Look"
+        case .builtIn(let look): look.displayName
         case .lut(let id): luts.first { $0.id == id }?.name ?? "Missing LUT"
         }
     }
 
-    /// Looks to offer for a clip: Rec.709 when the profile has a built-in
-    /// conversion, then every imported LUT.
+    /// Looks for the strip: none, the built-in looks, then imported look
+    /// LUTs. Conversion LUTs never appear here, so a log-in LUT can never be
+    /// put on top of a converted picture.
     func availableLooks(for profile: LogProfile?) -> [GradeLook] {
-        var looks: [GradeLook] = [.none]
-        if profile?.hasBuiltInConversion == true { looks.append(.rec709) }
-        looks.append(contentsOf: luts.map { .lut($0.id) })
-        return looks
+        [.none] + BuiltInLook.allCases.map { .builtIn($0) } + luts.filter { $0.role == .look }.map { .lut($0.id) }
     }
 }

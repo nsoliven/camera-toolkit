@@ -147,7 +147,7 @@ final class CubeLUTTests: XCTestCase {
     /// The built-in conversion, written out and parsed back, gives the same
     /// answers through the parser's interpolation.
     func testBuiltInConversionSurvivesAsACubeFile() throws {
-        let pipeline = GradePipeline(recipe: GradeRecipe(grade: .rec709, profile: .sLog3SGamut3Cine))
+        let pipeline = GradePipeline(recipe: GradeRecipe(grade: .converted, profile: .sLog3SGamut3Cine))
         let size = 33
         var values: [SIMD3<Double>] = []
         for b in 0..<size { for g in 0..<size { for r in 0..<size {

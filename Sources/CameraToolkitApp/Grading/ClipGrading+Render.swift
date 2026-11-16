@@ -37,7 +37,7 @@ extension ClipGrading {
                     plan.refusals.append("\(item.primary.name) has no grade.")
                     continue
                 }
-                guard renderer.pipeline(for: recipe).isLookAvailable else {
+                guard isAvailable(recipe) else {
                     plan.refusals.append("\(item.primary.name): its look is not available (\(lookName(recipe.grade.look))).")
                     continue
                 }
@@ -126,8 +126,7 @@ extension ClipGrading {
             locations: workspace.locations,
             policy: { resolved[$0.id] ?? .buffer },
             grades: model.colorGradesSnapshot,
-            defaults: model.gradeDefaultsSnapshot,
-            availableLUTs: Set(luts.map(\.id))
+            resolver: resolver
         )
         let renderer = self.renderer
         model.statusMessage = "Looking for graded log clips to render before the sync…"

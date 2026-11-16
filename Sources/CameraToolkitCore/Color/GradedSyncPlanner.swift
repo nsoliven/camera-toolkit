@@ -3,8 +3,8 @@ import Foundation
 /// Which graded copies to render before a Sync to NAS, when "Send graded
 /// versions of log videos to Immich" is on. Works from the catalog — no
 /// board needs to be open: every assigned clip of the synced events that is
-/// on the drive, is log footage, and has a grade (its own, or its
-/// profile's default) gets a request for `Edited/Rec709` on the drive, so
+/// on the drive and is log footage the app converts (with its look, if it
+/// has one) gets a request for `Edited/Rec709` on the drive, so
 /// Sync carries the copy to the NAS at its final name.
 public enum GradedSyncPlanner {
     public static let gradableExtensions: Set<String> = ["mp4", "mov", "m4v", "mxf"]
@@ -15,8 +15,7 @@ public enum GradedSyncPlanner {
         public var locations: EventStorageLocations
         public var policy: @Sendable (SavedCameraEvent) -> EventStoragePolicy
         public var grades: [String: ClipGrade]
-        public var defaults: GradeDefaults
-        public var availableLUTs: Set<String>
+        public var resolver: GradeResolver
 
         public init(
             events: [SavedCameraEvent],
@@ -24,16 +23,14 @@ public enum GradedSyncPlanner {
             locations: EventStorageLocations,
             policy: @escaping @Sendable (SavedCameraEvent) -> EventStoragePolicy,
             grades: [String: ClipGrade],
-            defaults: GradeDefaults,
-            availableLUTs: Set<String>
+            resolver: GradeResolver
         ) {
             self.events = events
             self.assignments = assignments
             self.locations = locations
             self.policy = policy
             self.grades = grades
-            self.defaults = defaults
-            self.availableLUTs = availableLUTs
+            self.resolver = resolver
         }
     }
 
@@ -62,23 +59,11 @@ public enum GradedSyncPlanner {
             let mark = explicit?.profileMark ?? .detected
             guard mark != .notLog, fileExists(url) else { continue }
             let detected: LogProfile? = if case .marked = mark { nil } else { detect(url) }
-            guard let profile = mark.resolve(detected: detected) else { continue }
-            var grade: ClipGrade
-            if let explicit, !(explicit.look == .none && explicit.hasNeutralControls) {
-                grade = explicit
-            } else if let look = inputs.defaults.look(for: profile) {
-                grade = explicit ?? ClipGrade()
-                grade.look = look
-            } else {
-                continue
-            }
-            let recipe = GradeRecipe(grade: grade, profile: profile, range: range(url))
-            guard !recipe.grade.isIdentity else { continue }
-            switch grade.look {
-            case .rec709: guard profile.hasBuiltInConversion else { continue }
-            case .lut(let id): guard inputs.availableLUTs.contains(id) else { continue }
-            case .none: break
-            }
+            // Log footage only: a converted (and maybe looked) copy is what
+            // Immich should show.
+            guard mark.resolve(detected: detected) != nil,
+                  let recipe = inputs.resolver.recipe(explicit: explicit, detected: detected, range: range(url)),
+                  recipe.conversion.converts else { continue }
             let edited = inputs.locations.editedRoot(for: event, policy: policy)
             let output = GradedRenderNaming.outputFolder(editedRoot: edited)
             requests.append(GradedRenderRequest(

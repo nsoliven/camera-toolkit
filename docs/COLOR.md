@@ -2,23 +2,40 @@
 
 Log footage (Sony S-Log3, DJI D-Log M) looks flat until it is converted for a normal display. Camera Toolkit grades it **non-destructively**: a grade is a few numbers stored in the catalog, applied while tiles decode, while the preview plays and while a copy renders. The original clip is only ever read.
 
+## How a picture is built
+
+Always in this order, never mixed:
+
+1. **Camera adjustments** — exposure and white balance, in scene-linear light through the clip's own log curve.
+2. **Conversion** — log → Rec.709. For Sony S-Log3 this is Sony's conversion: Sony's own s709 LUT once it is imported (Settings › Color › Get Sony's Official Conversion LUTs…), and until then the built-in conversion computed from Sony's published math, labelled "Built-in (Sony math)". D-Log M uses DJI's LUT once imported; there is no built-in D-Log M conversion.
+3. **Look** — optional creative colour on top of the Rec.709 picture, mixed by its own intensity.
+4. **Contrast and saturation.**
+
+So a LUT is applied *after* the conversion when it is a look, and *instead of* the conversion when it expects log footage. Every imported LUT says which it is (guessed from its name — `SLog3`, `SGamut3`, `D-Log M`… mean a conversion — and editable in Settings). A creative LUT that takes log in ("S-Log3 to film") counts as a conversion. Conversion LUTs never appear among the looks, and a look never goes on log footage that is not converted, so a log-in LUT can never be stacked on a converted picture.
+
+The panel shows the two stages as **1 Conversion** (with its source, e.g. "Sony S-Log3 → Rec.709 · Built-in (Sony math)") and **2 Look**, under one line that says the order. "Original (log)" is the before/after reference, not a look.
+
 ## What a grade is
 
 `ClipGrade` (`Sources/CameraToolkitCore/Color/ClipGrade.swift`):
 
-| Field | Range | Applied |
+| Field | Range | Stage |
 |---|---|---|
-| look | none · built-in Rec.709 · an imported LUT | after exposure and white balance |
-| intensity | 0–100 % | mixes the look over the adjusted picture |
-| exposure | −4…+4 stops | scene-linear, through the clip's own log curve |
-| temperature, tint | −100…+100 | scene-linear channel gains, luminance kept |
-| contrast | −100…+100 | S-curve around mid grey, after the look |
-| saturation | −100…+100 | after the look |
+| exposure | −4…+4 stops | 1 |
+| temperature, tint | −100…+100 | 1 |
+| conversion | default · built-in · a conversion LUT · off | 2 |
+| look | none · a built-in look · a look LUT | 3 |
+| intensity | 0–100 % | 3 (how much of the look) |
+| contrast, saturation | −100…+100 | 4 |
 | profile mark | camera metadata · marked profile · not log | which conversion applies |
 
-Grades are keyed by file identity (`DisplayRotation.fileKey`: name, bytes, modification second), exactly like saved rotations, so a grade follows the clip from card to Buffer to NAS. They live in the catalog's `color_grades` table (`file_key`, the grade as JSON, `updated_at`). The schema change only adds that table. Every grade change is one Undo step (`UndoConfigChange.colorGrades`); a slider drag is saved once it settles, so a drag is one step too.
+Grades are keyed by file identity (`DisplayRotation.fileKey`: name, bytes, modification second), exactly like saved rotations, so a grade follows the clip from card to Buffer to NAS. They live in the catalog's `color_grades` table (`file_key`, the grade as JSON, `updated_at`). The schema change only adds that table, and every later field is an optional JSON key (a grade saved before the conversion stage existed reads as default conversion, no look). Every grade change is one Undo step (`UndoConfigChange.colorGrades`); a slider drag is saved once it settles.
 
-The **default look per log profile** (Settings › Color) is a setting in `config.json`. A log clip with no grade of its own is shown, played and rendered with its profile's default, so new clips get it as soon as they appear without anything being written per clip.
+Settings › Color holds, per log profile, the **default conversion** and the **default look** (`config.json`). A log clip with no grade of its own is drawn with them, so S-Log3 clips show converted the moment they appear. `GradeResolver` turns a stored grade into what is drawn; the app and the before-sync renderer both use it.
+
+## Built-in looks
+
+Six looks designed in code (`BuiltInLooks.swift`), each Rec.709 in → Rec.709 out, tuned on real S-Log3 clips: **Soft Film** (lifted warm blacks, gentle S, restrained colour), **Bright & Airy** (open mids, soft contrast, light colour), **Teal & Orange** (teal shadows and blues, warm highlights), **Moody Matte** (darker, matte blacks, muted), **Rich & Vivid** (deeper contrast, vibrance) and **Black & White** (red-filtered mono, faint warm tone). Hue shifts are weighted away from the skin band and saturation pushes are vibrance, so skin stays natural; each starts at 70–75 % (black and white at 100 %).
 
 ## Finding log footage
 
@@ -27,9 +44,9 @@ The **default look per log profile** (Settings › Color) is a setting in `confi
 
 Detection reads the sidecar (a couple of kilobytes) off the main actor, a screenful at a time. A log clip without a look wears a quiet `S-Log3` tag on its tile; a graded clip draws graded with a small filter glyph.
 
-## The colour math
+## The built-in conversion
 
-All maths is in `GradePipeline.swift` and `ColorMath.swift`, from published references; no vendor LUT files are in the repository.
+The fallback until Sony's own LUT is imported. All maths is in `GradePipeline.swift` and `ColorMath.swift`, from published references; no vendor LUT files are in the repository.
 
 1. **Decode S-Log3** to scene-linear reflectance with Sony's formula ("Technical Summary for S-Gamut3.Cine/S-Log3 and S-Gamut3/S-Log3"): 18 % grey ↔ 10-bit code 420, 0 % ↔ 95, 90 % ↔ 598, linear toe below code 171.21. Sony's log clips are full-range; for a video-range clip the decoded value is mapped back to the full code value first (`VideoSignalRange`).
 2. **Gamut**: S-Gamut3.Cine (or S-Gamut3) → Rec.709 through XYZ, from the published primaries and D65 (the normalized primary matrices match Sony's to 1e-7; tests check them).
@@ -37,6 +54,10 @@ All maths is in `GradePipeline.swift` and `ColorMath.swift`, from published refe
 4. Exposure and white balance run before step 1's conversion, in linear light. Contrast and saturation run on the result.
 
 The whole grade is per pixel, so it is baked into one 3D cube (33³ for tiles and preview, 64³ for renders) and applied by Core Image (`CIColorCube`) on the GPU. Colour management is off for that pass: a log curve is defined on code values, and the decoded frame's values are fed in untouched. The output is tagged the way AVFoundation tags Rec.709 video, so a graded still and graded playback match (the opt-in sample test checks the two paths agree to within 0.1 %).
+
+## Sony's conversion LUTs
+
+Sony lists its LUTs on its cinematography site (`https://sony-cinematography.com/resources/luts/`); the "Sony Collection" there offers `Slog3-S-Gamut3.Cine To s709 V200`. s709 is the Rec.709 look Sony's current cameras use, and it is the LUT an A7V's own clip metadata names (`SL3SG3Ctos709.cube`), so it is the default once imported. Settings › Color › **Get Sony's Official Conversion LUTs…** shows the address and, when asked, downloads the archive (about 230 KB) over HTTPS from the host that page links, checks it is a zip of `.cube` files, imports them as S-Log3 conversion LUTs and makes s709 the default. Sony's page asks for a few details before its own download button; **Open Sony's LUT Page** goes there instead, and the downloaded file can be imported by hand.
 
 ## Imported LUTs
 

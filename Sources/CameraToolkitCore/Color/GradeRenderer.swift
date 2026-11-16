@@ -42,9 +42,11 @@ public final class GradeRenderer: @unchecked Sendable {
     // MARK: Cubes
 
     public func pipeline(for recipe: GradeRecipe) -> GradePipeline {
-        var lut: CubeLUT?
-        if case .lut(let id) = recipe.grade.look { lut = lutProvider(id) }
-        return GradePipeline(recipe: recipe, lut: lut)
+        var conversion: CubeLUT?
+        var look: CubeLUT?
+        if case .lut(let id) = recipe.conversion { conversion = lutProvider(id) }
+        if case .lut(let id) = recipe.grade.look { look = lutProvider(id) }
+        return GradePipeline(recipe: recipe, conversionLUT: conversion, lookLUT: look)
     }
 
     /// The baked cube for a recipe, computed once and kept (a few dozen).
@@ -73,8 +75,10 @@ public final class GradeRenderer: @unchecked Sendable {
     /// A missing LUT draws as no look; the stamp keeps a cube baked while
     /// it was missing from being reused once it is imported again.
     private func lutStamp(_ recipe: GradeRecipe) -> String {
-        if case .lut(let id) = recipe.grade.look { return lutProvider(id) == nil ? "missing" : "ok" }
-        return ""
+        var stamp = ""
+        if case .lut(let id) = recipe.conversion { stamp += lutProvider(id) == nil ? "c-missing" : "c-ok" }
+        if case .lut(let id) = recipe.grade.look { stamp += lutProvider(id) == nil ? "l-missing" : "l-ok" }
+        return stamp
     }
 
     public func forgetCubes() {
@@ -93,7 +97,7 @@ public final class GradeRenderer: @unchecked Sendable {
 
     /// The image with the recipe's cube applied (no colour management).
     public func apply(_ recipe: GradeRecipe, to image: CIImage, cubeSize: Int = GradeRenderer.previewCubeSize) -> CIImage {
-        guard !recipe.grade.isIdentity, let filter = Self.colorCube(cube(for: recipe, size: cubeSize), size: cubeSize) else { return image }
+        guard !recipe.isIdentity, let filter = Self.colorCube(cube(for: recipe, size: cubeSize), size: cubeSize) else { return image }
         filter.setValue(image, forKey: kCIInputImageKey)
         return filter.outputImage ?? image
     }
@@ -261,7 +265,7 @@ extension GradeRenderer {
                 return
             }
             let state = live.snapshot
-            guard let recipe = state.recipe, !state.bypass, !recipe.grade.isIdentity else {
+            guard let recipe = state.recipe, !state.bypass, !recipe.isIdentity else {
                 request.finish(with: source, context: context)
                 return
             }

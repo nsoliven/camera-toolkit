@@ -536,7 +536,7 @@ final class TileImageLoader: @unchecked Sendable {
     /// A graded tile from memory, or nil. Like `cachedImage`, never touches
     /// the filesystem.
     func cachedImage(for url: URL, maximumPixelSize: Int, orientation: Int?, grade: GradeRecipe?) -> CGImage? {
-        guard let grade, !grade.grade.isIdentity else {
+        guard let grade, !grade.isIdentity else {
             return cachedImage(for: url, maximumPixelSize: maximumPixelSize, orientation: orientation)
         }
         let bucket = Self.bucket(for: maximumPixelSize)
@@ -555,7 +555,7 @@ final class TileImageLoader: @unchecked Sendable {
         priority: Operation.QueuePriority = .normal,
         fileIdentity: String? = nil
     ) async -> CGImage? {
-        guard let grade, !grade.grade.isIdentity else {
+        guard let grade, !grade.isIdentity else {
             return await image(for: url, maximumPixelSize: maximumPixelSize, orientation: orientation, priority: priority, fileIdentity: fileIdentity)
         }
         let bucket = Self.bucket(for: maximumPixelSize)

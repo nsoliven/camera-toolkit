@@ -6,21 +6,28 @@ import Foundation
 /// whole grade bakes into one 3D cube that the GPU applies in one pass —
 /// for tiles, live playback and rendered copies alike.
 ///
-/// Order: basic exposure and white balance in scene-linear light (through
-/// the clip's own log curve when it has one) → the look (built-in Rec.709
-/// conversion or an imported LUT), mixed by intensity → contrast and
-/// saturation on the result.
+/// The stages, always in this order and never mixed:
+/// (a) exposure and white balance in scene-linear light, through the
+///     clip's own log curve;
+/// (b) the conversion, log → Rec.709 (built-in, or a conversion LUT that
+///     expects log in);
+/// (c) the look on the Rec.709 picture (built-in, or a look LUT that
+///     expects Rec.709 in), mixed by intensity;
+/// (d) contrast and saturation.
 public struct GradePipeline: Sendable {
     public let recipe: GradeRecipe
-    /// The imported LUT for a `.lut` look; nil when it is missing.
-    public let lut: CubeLUT?
+    /// For a `.lut` conversion; nil when it is missing.
+    public let conversionLUT: CubeLUT?
+    /// For a `.lut` look; nil when it is missing.
+    public let lookLUT: CubeLUT?
 
     private let toRec709: ColorMatrix3?
     private let gains: SIMD3<Double>
 
-    public init(recipe: GradeRecipe, lut: CubeLUT? = nil) {
+    public init(recipe: GradeRecipe, conversionLUT: CubeLUT? = nil, lookLUT: CubeLUT? = nil) {
         self.recipe = recipe
-        self.lut = lut
+        self.conversionLUT = conversionLUT
+        self.lookLUT = lookLUT
         toRec709 = recipe.profile?.primaries?.conversion(to: .rec709)
         let g = recipe.grade
         let exposure = pow(2.0, g.exposure)
@@ -33,24 +40,31 @@ public struct GradePipeline: Sendable {
         gains = wb * exposure
     }
 
-    /// Whether the look can be drawn for this clip — the built-in
-    /// conversion needs a profile it knows, an imported LUT needs its file.
+    /// Whether the conversion can be drawn (its LUT is there, the built-in
+    /// knows the profile).
+    public var isConversionAvailable: Bool {
+        switch recipe.conversion {
+        case .none: true
+        case .builtIn: recipe.profile?.hasBuiltInConversion == true
+        case .lut: conversionLUT != nil
+        }
+    }
+
+    /// Whether the look can be drawn. Never on log footage left
+    /// unconverted (`GradeRecipe.lookApplies`).
     public var isLookAvailable: Bool {
         switch recipe.grade.look {
         case .none: true
-        case .rec709: recipe.profile?.hasBuiltInConversion == true
-        case .lut: lut != nil
+        case .builtIn: recipe.lookApplies || recipe.grade.intensity == 0
+        case .lut: lookLUT != nil && (recipe.lookApplies || recipe.grade.intensity == 0)
         }
     }
 
     public func apply(_ input: SIMD3<Double>) -> SIMD3<Double> {
         let g = recipe.grade
-        let adjusted = adjustInput(input)
-        var out: SIMD3<Double>
-        if g.intensity > 0, let looked = look(adjusted) {
-            out = g.intensity >= 1 ? looked : adjusted + (looked - adjusted) * g.intensity
-        } else {
-            out = adjusted
+        var out = convert(adjustInput(input))
+        if recipe.lookApplies, isConversionAvailable, let looked = look(out) {
+            out = g.intensity >= 1 ? looked : out + (looked - out) * g.intensity
         }
         if g.contrast != 0 { out = Self.contrast(out, amount: g.contrast / 100) }
         if g.saturation != 0 {
@@ -89,15 +103,16 @@ public struct GradePipeline: Sendable {
         }
     }
 
-    /// The look's output for already-adjusted input, or nil for no look.
-    func look(_ v: SIMD3<Double>) -> SIMD3<Double>? {
-        switch recipe.grade.look {
+    /// Stage (b): log → Rec.709, or the input as it is when there is no
+    /// conversion (or it is unavailable).
+    func convert(_ v: SIMD3<Double>) -> SIMD3<Double> {
+        switch recipe.conversion {
         case .none:
-            return nil
+            return v
         case .lut:
-            return lut.map { simd_clamp01($0.apply(v)) }
-        case .rec709:
-            guard let toRec709, recipe.profile?.hasBuiltInConversion == true else { return nil }
+            return conversionLUT.map { simd_clamp01($0.apply(v)) } ?? v
+        case .builtIn:
+            guard let toRec709, recipe.profile?.hasBuiltInConversion == true else { return v }
             let range = recipe.range
             let linear = SIMD3(
                 SLog3.decode(codeValue: range.codeValue(fromDecoded: v.x)),
@@ -105,6 +120,15 @@ public struct GradePipeline: Sendable {
                 SLog3.decode(codeValue: range.codeValue(fromDecoded: v.z))
             )
             return DisplayRendering.rec709(sceneLinear709: toRec709.apply(linear))
+        }
+    }
+
+    /// Stage (c): the look on a Rec.709 picture, or nil for none.
+    func look(_ v: SIMD3<Double>) -> SIMD3<Double>? {
+        switch recipe.grade.look {
+        case .none: nil
+        case .builtIn(let look): look.apply(v)
+        case .lut: lookLUT.map { simd_clamp01($0.apply(v)) }
         }
     }
 

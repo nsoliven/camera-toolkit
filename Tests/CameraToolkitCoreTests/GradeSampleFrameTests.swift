@@ -38,19 +38,26 @@ final class GradeSampleFrameTests: XCTestCase {
         let time = CMTime(seconds: seconds, preferredTimescale: 600)
         let frame = try await generator.image(at: time).image
         let name = clip.deletingPathExtension().lastPathComponent
-        let recipe = GradeRecipe(grade: .rec709, profile: profile, range: range)
-        try writePNG(frame, to: out.appendingPathComponent("\(name)-before.png"))
+        // Stage (b) only: the conversion.
+        let recipe = GradeRecipe(grade: .converted, profile: profile, conversion: .builtIn, range: range)
+        try writePNG(frame, to: out.appendingPathComponent("\(name)-0-log.png"))
         let graded = try XCTUnwrap(renderer.grade(frame, recipe: recipe))
-        try writePNG(graded, to: out.appendingPathComponent("\(name)-after-rec709.png"))
-        var warm = ClipGrade.rec709
-        warm.exposure = 0.3
-        warm.temperature = 18
-        warm.contrast = 15
-        warm.saturation = 10
-        let warmGraded = try XCTUnwrap(renderer.grade(frame, recipe: GradeRecipe(grade: warm, profile: profile, range: range)))
-        try writePNG(warmGraded, to: out.appendingPathComponent("\(name)-after-rec709-warm.png"))
+        try writePNG(graded, to: out.appendingPathComponent("\(name)-1-sony-conversion.png"))
         let split = try XCTUnwrap(sideBySide(frame, graded, renderer: renderer))
-        try writePNG(split, to: out.appendingPathComponent("\(name)-wipe.png"))
+        try writePNG(split, to: out.appendingPathComponent("\(name)-wipe-log-vs-conversion.png"))
+        // Stage (c): each built-in look on top, at its default intensity.
+        var tiles: [CGImage] = [frame, graded]
+        for look in BuiltInLook.allCases {
+            var grade = ClipGrade.converted
+            grade.look = .builtIn(look)
+            grade.intensity = look.defaultIntensity
+            let looked = try XCTUnwrap(renderer.grade(frame, recipe: GradeRecipe(grade: grade, profile: profile, conversion: .builtIn, range: range)))
+            try writePNG(looked, to: out.appendingPathComponent("\(name)-2-look-\(look.rawValue).png"))
+            tiles.append(looked)
+        }
+        if let sheet = contactSheet(tiles, columns: 4, renderer: renderer) {
+            try writePNG(sheet, to: out.appendingPathComponent("\(name)-contact-sheet.png"))
+        }
 
         // The playback path must agree with the still path.
         let live = GradeLiveState(recipe: recipe)
@@ -102,6 +109,22 @@ final class GradeSampleFrameTests: XCTestCase {
         let right = b.cropped(to: CGRect(x: split, y: 0, width: a.extent.width - split, height: a.extent.height))
         let line = CIImage(color: CIColor(red: 1, green: 1, blue: 1)).cropped(to: CGRect(x: split - 1, y: 0, width: 2, height: a.extent.height))
         return renderer.render(line.composited(over: right.composited(over: left)), extent: a.extent)
+    }
+
+    /// Log, conversion, then each look, in a grid.
+    private func contactSheet(_ images: [CGImage], columns: Int, renderer: GradeRenderer) -> CGImage? {
+        guard let first = images.first else { return nil }
+        let w = CGFloat(first.width) / 2, h = CGFloat(first.height) / 2
+        let rows = (images.count + columns - 1) / columns
+        var canvas = CIImage(color: CIColor(red: 0, green: 0, blue: 0)).cropped(to: CGRect(x: 0, y: 0, width: w * CGFloat(columns), height: h * CGFloat(rows)))
+        for (index, image) in images.enumerated() {
+            let col = index % columns, row = rows - 1 - index / columns
+            let tile = CIImage(cgImage: image, options: [.colorSpace: NSNull()])
+                .transformed(by: CGAffineTransform(scaleX: w / CGFloat(image.width), y: h / CGFloat(image.height)))
+                .transformed(by: CGAffineTransform(translationX: CGFloat(col) * w, y: CGFloat(row) * h))
+            canvas = tile.composited(over: canvas)
+        }
+        return renderer.render(canvas, extent: canvas.extent)
     }
 
     private func meanDifference(_ a: CGImage, _ b: CGImage) -> Double {

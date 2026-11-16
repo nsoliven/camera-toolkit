@@ -10,6 +10,8 @@ final class BlanketGradeModel {
         let id: String
         let name: String
         let profile: LogProfile
+        /// Stage (b) for this clip (the looks go on top of it).
+        let conversion: ResolvedConversion
         let range: VideoSignalRange
         let existing: ClipGrade?
         var before: CGImage?
@@ -20,10 +22,14 @@ final class BlanketGradeModel {
     private(set) var isLoading = true
     private(set) var rows: [Row] = []
     private(set) var notLogCount = 0
-    private(set) var looks: [GradeLook] = [.rec709]
+    private(set) var looks: [GradeLook] = [.none]
     private(set) var lookThumbnails: [GradeLook: CGImage] = [:]
-    var look: GradeLook = .rec709 {
-        didSet { if look != oldValue { refreshAfters() } }
+    var look: GradeLook = .builtIn(.softFilm) {
+        didSet {
+            guard look != oldValue else { return }
+            intensity = look.defaultIntensity
+            refreshAfters()
+        }
     }
     var intensity: Double = 1 {
         didSet { if intensity != oldValue { refreshAfters() } }
@@ -39,7 +45,10 @@ final class BlanketGradeModel {
         self.renderer = renderer
     }
 
-    var alreadyGradedCount: Int { rows.count { $0.existing.map { !$0.isIdentity } ?? false } }
+    var alreadyGradedCount: Int { rows.count { $0.existing.map { !$0.isDefault } ?? false } }
+    /// "Sony S-Log3 → Rec.709 · Built-in (Sony math)" — what every row is
+    /// converted with first; set by whoever fills the model.
+    var conversionTitle = ""
     /// Profiles among the rows; the default toggle needs exactly one.
     var profiles: Set<LogProfile> { Set(rows.map(\.profile)) }
 
@@ -48,6 +57,7 @@ final class BlanketGradeModel {
         self.notLogCount = notLogCount
         self.looks = looks
         if !looks.contains(look) { look = looks.first { $0 != .none } ?? .none }
+        intensity = look.defaultIntensity
         isLoading = false
         refreshAfters()
     }
@@ -61,8 +71,8 @@ final class BlanketGradeModel {
     private func grade(for row: Row, look: GradeLook) -> GradeRecipe {
         var grade = row.existing ?? ClipGrade()
         grade.look = look
-        grade.intensity = intensity
-        return GradeRecipe(grade: grade, profile: row.profile, range: row.range)
+        grade.intensity = look == .none ? 1 : intensity
+        return GradeRecipe(grade: grade, profile: row.profile, conversion: row.conversion, range: row.range)
     }
 
     private func refreshAfters() {
@@ -82,7 +92,7 @@ final class BlanketGradeModel {
                 }
                 var thumbs: [GradeLook: CGImage] = [:]
                 for (look, before, recipe) in thumbJobs {
-                    thumbs[look] = recipe.grade.isIdentity ? before : renderer.grade(before, recipe: recipe)
+                    thumbs[look] = recipe.isIdentity ? before : renderer.grade(before, recipe: recipe)
                 }
                 return (afters, thumbs)
             }.value
@@ -112,6 +122,11 @@ struct BlanketGradeSheet: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
+                if !model.conversionTitle.isEmpty {
+                    Label("Converted with \(model.conversionTitle), then the look below on top.", systemImage: "arrow.right.circle")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
             .padding(.horizontal, 20)
             .padding(.top, 18)
@@ -208,7 +223,9 @@ struct BlanketGradeSheet: View {
         guard !model.isLoading else { return "Counting…" }
         var parts: [String] = []
         let n = model.rows.count
-        parts.append("\(n) log clip\(n == 1 ? "" : "s") will show \(model.lookName(model.look))")
+        parts.append(model.look == .none
+            ? "\(n) log clip\(n == 1 ? "" : "s") will show the conversion only"
+            : "\(n) log clip\(n == 1 ? "" : "s") will get \(model.lookName(model.look)) on top of the conversion")
         if model.alreadyGradedCount > 0 {
             parts.append("\(model.alreadyGradedCount) already graded keep their own sliders")
         }
@@ -257,10 +274,10 @@ struct BlanketGradeCell: View {
             .aspectRatio(16 / 9, contentMode: .fit)
             .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
             .overlay(alignment: .bottomLeading) {
-                Text("Before").cellLabel().padding(5)
+                Text("Log").cellLabel().padding(5)
             }
             .overlay(alignment: .bottomTrailing) {
-                Text("After").cellLabel().padding(5)
+                Text("Converted + look").cellLabel().padding(5)
             }
             HStack(spacing: 6) {
                 Text(row.name)
@@ -269,7 +286,7 @@ struct BlanketGradeCell: View {
                 Spacer(minLength: 4)
                 Text(row.profile.shortName)
                     .foregroundStyle(.secondary)
-                if row.existing.map({ !$0.isIdentity }) ?? false {
+                if row.existing.map({ !$0.isDefault }) ?? false {
                     Image(systemName: "camera.filters")
                         .foregroundStyle(.secondary)
                         .help("Already graded — its own sliders are kept, only the look changes.")
@@ -307,20 +324,21 @@ extension ClipGrading {
                     notLog += 1
                     continue
                 }
+                let existing = explicitGrade(for: item)
                 rows.append(.init(
                     id: item.id,
                     name: item.primary.name,
                     profile: profile,
+                    conversion: resolver.conversion(for: existing ?? ClipGrade(), profile: profile),
                     range: signalRange(for: item, profile: profile),
-                    existing: explicitGrade(for: item)
+                    existing: existing
                 ))
             }
-            let profiles = Set(rows.map(\.profile))
-            var looks: [GradeLook] = []
-            if profiles.contains(where: \.hasBuiltInConversion) { looks.append(.rec709) }
-            looks.append(contentsOf: luts.map { .lut($0.id) })
-            looks.append(.none)
-            model.load(rows: rows, notLogCount: notLog, looks: looks)
+            // Clips with no conversion (D-Log M without its LUT) cannot take
+            // a look: they are left out rather than stacked on log.
+            let convertible = rows.filter { $0.conversion.converts }
+            model.conversionTitle = convertible.first.map { conversionTitle($0.conversion, profile: $0.profile) } ?? ""
+            model.load(rows: convertible, notLogCount: notLog + rows.count - convertible.count, looks: availableLooks(for: convertible.first?.profile))
             // Posters: tiles have usually decoded them already.
             for item in request.items where rows.contains(where: { $0.id == item.id }) {
                 let image = await TileImageLoader.shared.image(

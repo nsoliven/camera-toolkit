@@ -56,70 +56,86 @@ final class GradeScreenshotTests: XCTestCase {
     // MARK: Screens
 
     func testDrawGradingScreens() async throws {
-        let hero = clips[min(clips.count - 1, Int(ProcessInfo.processInfo.environment["CT_GRADE_SCREENSHOT_HERO"] ?? "") ?? 0)]
-        let frame = try await self.frame(of: hero.url, at: 4, width: 1_600)
-        let looks: [GradeLook] = [.none, .rec709, .lut("aaaaaaaaaaaaaaaa"), .lut("bbbbbbbbbbbbbbbb")]
-        let lutA = Self.creativeLUT(warmth: 0.06, teal: 0.05, lift: 0.02)
-        let lutB = Self.creativeLUT(warmth: -0.03, teal: 0.0, lift: 0.05, desaturate: 0.35)
-        GradeRenderer.shared.lutProvider = { id in
-            id == "aaaaaaaaaaaaaaaa" ? lutA : id == "bbbbbbbbbbbbbbbb" ? lutB : nil
+        let env = ProcessInfo.processInfo.environment
+        let hero = clips[min(clips.count - 1, Int(env["CT_GRADE_SCREENSHOT_HERO"] ?? "") ?? 0)]
+        let frame = try await self.frame(of: hero.url, at: Double(env["CT_GRADE_SCREENSHOT_AT"] ?? "") ?? 4, width: 1_600)
+        let looks: [GradeLook] = [.none] + BuiltInLook.allCases.map { .builtIn($0) }
+        let name: (GradeLook) -> String = { look in
+            switch look {
+            case .none: "No Look"
+            case .builtIn(let look): look.displayName
+            case .lut: "LUT"
+            }
         }
-        GradeRenderer.shared.forgetCubes()
-        let names: [GradeLook: String] = [.none: "Original", .rec709: "Rec.709", .lut("aaaaaaaaaaaaaaaa"): "Teal & Orange", .lut("bbbbbbbbbbbbbbbb"): "Soft Matte"]
-
-        var grade = ClipGrade.rec709
-        grade.exposure = 0.2
-        grade.temperature = 8
-        grade.contrast = 10
+        let conversionName: (GradeConversion) -> String = { choice in
+            switch choice {
+            case .auto: "Default (Built-in, Sony math)"
+            case .builtIn: "Built-in (Sony math)"
+            case .lut: "LUT"
+            case .off: "Don’t convert"
+            }
+        }
+        let title: (GradeRecipe) -> String = { recipe in
+            recipe.conversion.converts ? "Sony S-Log3 → Rec.709 · Built-in (Sony math)" : "Off — shown as recorded (S-Log3)"
+        }
+        let lookName = env["CT_GRADE_SCREENSHOT_LOOK"].flatMap(BuiltInLook.init(rawValue:)) ?? .softFilm
+        var grade = ClipGrade(look: .builtIn(lookName), intensity: lookName.defaultIntensity)
+        grade.exposure = 0.1
         let session = GradeSession(
             itemID: hero.item.id, clipName: hero.item.primary.name, grade: grade,
             profile: hero.profile, detectedProfile: hero.profile, range: hero.range,
-            looks: looks, lookName: { names[$0] ?? "" }
+            looks: looks, lookName: name,
+            conversionChoices: [.auto, .builtIn, .off], conversionName: conversionName, conversionTitle: title
         )
         session.setFrame(try XCTUnwrap(GradeSession.downscaled(frame, maxWidth: 960)))
         try await waitUntil { session.histogram != nil && session.lookThumbnails.count == looks.count }
 
-        let recipe = session.recipe
-        let graded = try XCTUnwrap(GradeRenderer.shared.grade(frame, recipe: recipe))
-        try save(GradeScreenMock(session: session, picture: graded, clipName: hero.item.primary.name, showWipe: false), size: CGSize(width: 1_500, height: 900), name: "1-grade-panel", appearance: .darkAqua)
+        let graded = try XCTUnwrap(GradeRenderer.shared.grade(frame, recipe: session.recipe))
+        try save(GradeScreenMock(session: session, picture: graded, clipName: hero.item.primary.name, showWipe: false), size: CGSize(width: 1_560, height: 960), name: "1-grade-panel", appearance: .darkAqua)
 
         session.viewMode = .split
         session.wipe = 0.46
         let split = try XCTUnwrap(Self.split(before: frame, after: graded, at: session.wipe))
-        try save(GradeScreenMock(session: session, picture: split, clipName: hero.item.primary.name, showWipe: true), size: CGSize(width: 1_500, height: 900), name: "2-before-after-wipe", appearance: .darkAqua)
+        try save(GradeScreenMock(session: session, picture: split, clipName: hero.item.primary.name, showWipe: true), size: CGSize(width: 1_560, height: 960), name: "2-before-after-wipe", appearance: .darkAqua)
 
         try save(
-            GradeLookStrip(looks: looks, selected: session.draft.look, thumbnails: session.lookThumbnails, name: { names[$0] ?? "" }, onChoose: { _ in })
+            GradeLookStrip(looks: looks, selected: session.draft.look, thumbnails: session.lookThumbnails, name: name, onChoose: { _ in })
                 .padding(8)
                 .background(Color(white: 0.12), in: RoundedRectangle(cornerRadius: 16))
                 .padding(16)
                 .background(Color.black)
                 .environment(\.colorScheme, .dark),
-            size: CGSize(width: 640, height: 170), name: "3-look-strip", appearance: .darkAqua
+            size: CGSize(width: 1_060, height: 170), name: "3-look-strip", appearance: .darkAqua
         )
 
         // Blanket preview over several real clips.
-        let blanket = BlanketGradeModel(scopeTitle: "Trip 2026", lookName: { names[$0] ?? "" })
+        let blanket = BlanketGradeModel(scopeTitle: "Trip 2026", lookName: name)
+        blanket.conversionTitle = "Sony S-Log3 → Rec.709 · Built-in (Sony math)"
         var rows: [BlanketGradeModel.Row] = []
         for clip in clips.prefix(6) {
-            rows.append(.init(id: clip.item.id, name: clip.item.primary.name, profile: clip.profile ?? .sLog3SGamut3Cine, range: clip.range, existing: nil))
+            rows.append(.init(id: clip.item.id, name: clip.item.primary.name, profile: clip.profile ?? .sLog3SGamut3Cine, conversion: .builtIn, range: clip.range, existing: nil))
         }
-        blanket.load(rows: rows, notLogCount: 2, looks: [.rec709, .lut("aaaaaaaaaaaaaaaa"), .lut("bbbbbbbbbbbbbbbb"), .none])
+        blanket.load(rows: rows, notLogCount: 2, looks: looks)
         for clip in clips.prefix(6) {
             blanket.setBefore(try await self.frame(of: clip.url, at: 3, width: 480), for: clip.item.id)
         }
         blanket.alsoMakeDefault = true
-        try await waitUntil { blanket.rows.allSatisfy { $0.after != nil } && blanket.lookThumbnails.count == 4 }
+        try await waitUntil { blanket.rows.allSatisfy { $0.after != nil } && blanket.lookThumbnails.count == looks.count }
         for (appearance, suffix) in [(NSAppearance.Name.darkAqua, "dark"), (.aqua, "light")] {
             try save(BlanketGradeSheet(model: blanket, onCancel: {}, onApply: {}).background(Color(nsColor: .windowBackgroundColor)), size: CGSize(width: 760, height: 640), name: "4-blanket-preview-\(suffix)", appearance: appearance)
         }
 
-        // Tiles: graded clips draw graded, flat log clips wear the marker.
+        // Tiles: converted clips (some with a look) draw graded; clips with
+        // the conversion turned off stay flat and wear the marker.
         let loader = TileImageLoader.shared
         var tiles: [(OrganizeStack, TileGradeMark)] = []
+        let tileLooks: [GradeLook] = [.none, .builtIn(.softFilm), .none, .builtIn(.brightAiry), .none, .builtIn(.tealOrange), .none, .none]
         for (index, clip) in clips.prefix(8).enumerated() {
             let profile = clip.profile ?? .sLog3SGamut3Cine
-            let mark: TileGradeMark = index % 3 == 2 ? .flatLog(profile) : .graded(GradeRecipe(grade: .rec709, profile: profile, range: clip.range))
+            let look = tileLooks[index % tileLooks.count]
+            let mark: TileGradeMark = index % 4 == 2
+                ? .flatLog(profile)
+                : .graded(GradeRecipe(grade: ClipGrade(look: look, intensity: look.defaultIntensity), profile: profile, conversion: .builtIn, range: clip.range))
             for size in [384, 512, 768] {
                 _ = await loader.image(for: clip.url, maximumPixelSize: size, orientation: nil, grade: mark.recipe)
             }
@@ -129,14 +145,15 @@ final class GradeScreenshotTests: XCTestCase {
             try save(TileGridMock(tiles: tiles), size: CGSize(width: 980, height: 430), name: "5-tiles-\(suffix)", appearance: appearance)
         }
 
-        // Settings › Color with two imported LUTs.
+        // Settings › Color with a conversion LUT and a look LUT imported.
         let lutFolder = FileManager.default.temporaryDirectory.appendingPathComponent("GradeShots-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: lutFolder) }
         try FileManager.default.createDirectory(at: lutFolder, withIntermediateDirectories: true)
         let library = LUTLibrary(folder: lutFolder.appendingPathComponent("LUTs"))
-        for (name, lut) in [("Teal & Orange", lutA), ("D-Log M to Rec.709", lutB)] {
+        let identity = (0..<8).map { i in SIMD3(Double(i & 1), Double((i >> 1) & 1), Double((i >> 2) & 1)) }
+        for name in ["D-Log M to Rec.709", "Film Print Look"] {
             let file = lutFolder.appendingPathComponent("\(name).cube")
-            try Data(CubeLUT.write3D(title: name, size: lut.cube!.size, values: lut.cube!.values).utf8).write(to: file)
+            try Data(CubeLUT.write3D(title: name, size: 2, values: identity).utf8).write(to: file)
             try library.importLUT(from: file)
         }
         let root = lutFolder
@@ -146,7 +163,7 @@ final class GradeScreenshotTests: XCTestCase {
             activityLogPath: root.appendingPathComponent("activity.jsonl").path
         )
         let model = DashboardModel(jobs: [], configuration: configuration, configurationStore: ConfigurationStore(url: root.appendingPathComponent("config.json")))
-        model.updateConfiguration { $0.gradeDefaults.setLook(.rec709, for: .sLog3SGamut3Cine) }
+        model.updateConfiguration { $0.gradeDefaults.setLook(.builtIn(.softFilm), for: .sLog3SGamut3Cine) }
         for (appearance, suffix) in [(NSAppearance.Name.darkAqua, "dark"), (.aqua, "light")] {
             try save(
                 ColorSettingsPane(model: model, library: library).formStyle(.grouped),
@@ -174,24 +191,6 @@ final class GradeScreenshotTests: XCTestCase {
         return GradeRenderer.shared.render(right.composited(over: left), extent: a.extent)
     }
 
-    /// A synthetic creative look on top of the built-in S-Log3 conversion,
-    /// standing in for an imported LUT (no vendor LUT ships here).
-    private static func creativeLUT(warmth: Double, teal: Double, lift: Double, desaturate: Double = 0) -> CubeLUT {
-        let base = GradePipeline(recipe: GradeRecipe(grade: .rec709, profile: .sLog3SGamut3Cine, range: .full))
-        let size = 17
-        var values: [SIMD3<Double>] = []
-        for b in 0..<size { for g in 0..<size { for r in 0..<size {
-            var v = base.apply(SIMD3(Double(r), Double(g), Double(b)) / Double(size - 1))
-            let luma = 0.2126 * v.x + 0.7152 * v.y + 0.0722 * v.z
-            v = SIMD3(repeating: luma) + (v - SIMD3(repeating: luma)) * (1 - desaturate)
-            v.x += warmth * luma - teal * (1 - luma) * 0.5
-            v.z += -warmth * luma + teal * (1 - luma)
-            v = v * (1 - lift) + SIMD3(repeating: lift)
-            values.append(SIMD3(min(max(v.x, 0), 1), min(max(v.y, 0), 1), min(max(v.z, 0), 1)))
-        } } }
-        return try! CubeLUT.parse(CubeLUT.write3D(title: nil, size: size, values: values))
-    }
-
     private func waitUntil(timeout: Duration = .seconds(30), _ condition: () -> Bool) async throws {
         let deadline = ContinuousClock.now + timeout
         while !condition() {
@@ -210,8 +209,12 @@ final class GradeScreenshotTests: XCTestCase {
         window.contentView = host
         window.layoutIfNeeded()
         host.layoutSubtreeIfNeeded()
-        RunLoop.main.run(until: Date().addingTimeInterval(0.4))
-        host.display()
+        // Grouped forms lay their rows out over a few passes.
+        for _ in 0..<4 {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+            host.layoutSubtreeIfNeeded()
+            host.display()
+        }
         let rep = try XCTUnwrap(NSBitmapImageRep(
             bitmapDataPlanes: nil, pixelsWide: Int(size.width * 2), pixelsHigh: Int(size.height * 2),
             bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,

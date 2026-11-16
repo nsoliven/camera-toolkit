@@ -117,7 +117,7 @@ final class ColorGradingMathTests: XCTestCase {
     // MARK: Pipeline
 
     func testRec709LookMapsSLog3GreyToRec709GreyAndStaysNeutral() {
-        let pipeline = GradePipeline(recipe: GradeRecipe(grade: .rec709, profile: .sLog3SGamut3Cine, range: .full))
+        let pipeline = GradePipeline(recipe: GradeRecipe(grade: .converted, profile: .sLog3SGamut3Cine, range: .full))
         let grey = pipeline.apply(SIMD3(repeating: 420.0 / 1023))
         XCTAssertEqual(grey.x, DisplayRendering.midGreyEncoded, accuracy: 1e-6)
         XCTAssertEqual(grey.x, grey.y, accuracy: 1e-9)
@@ -131,15 +131,15 @@ final class ColorGradingMathTests: XCTestCase {
     }
 
     func testVideoRangeInputReadsTheSameCodeValues() {
-        let full = GradePipeline(recipe: GradeRecipe(grade: .rec709, profile: .sLog3SGamut3Cine, range: .full))
-        let video = GradePipeline(recipe: GradeRecipe(grade: .rec709, profile: .sLog3SGamut3Cine, range: .video))
+        let full = GradePipeline(recipe: GradeRecipe(grade: .converted, profile: .sLog3SGamut3Cine, range: .full))
+        let video = GradePipeline(recipe: GradeRecipe(grade: .converted, profile: .sLog3SGamut3Cine, range: .video))
         let cv = 420.0 / 1023
         let decodedVideo = VideoSignalRange.video.decoded(fromCodeValue: cv)
         XCTAssertEqual(full.apply(SIMD3(repeating: cv)).x, video.apply(SIMD3(repeating: decodedVideo)).x, accuracy: 1e-9)
     }
 
     func testExposureIsOneStopInSceneLinear() {
-        var grade = ClipGrade.rec709
+        var grade = ClipGrade.converted
         grade.exposure = 1
         let brighter = GradePipeline(recipe: GradeRecipe(grade: grade, profile: .sLog3SGamut3Cine))
         // 9% grey pushed one stop reads as 18% grey.
@@ -148,7 +148,7 @@ final class ColorGradingMathTests: XCTestCase {
     }
 
     func testWhiteBalanceWarmsAndKeepsLuminance() {
-        var grade = ClipGrade.rec709
+        var grade = ClipGrade.converted
         grade.temperature = 50
         let warm = GradePipeline(recipe: GradeRecipe(grade: grade, profile: .sLog3SGamut3Cine)).apply(SIMD3(repeating: 420.0 / 1023))
         XCTAssertGreaterThan(warm.x, warm.z)
@@ -158,16 +158,32 @@ final class ColorGradingMathTests: XCTestCase {
         XCTAssertLessThan(magenta.y, magenta.x)
     }
 
-    func testIntensityBlendsBetweenFlatAndLook() {
+    func testLookIntensityBlendsOverTheConvertedPicture() {
         let input = SIMD3<Double>(0.45, 0.40, 0.35)
         func out(_ intensity: Double) -> SIMD3<Double> {
-            var grade = ClipGrade.rec709
+            var grade = ClipGrade.converted
+            grade.look = .builtIn(.blackWhite)
             grade.intensity = intensity
             return GradePipeline(recipe: GradeRecipe(grade: grade, profile: .sLog3SGamut3Cine)).apply(input)
         }
-        XCTAssertEqual(out(0), input)
+        let converted = GradePipeline(recipe: GradeRecipe(grade: .converted, profile: .sLog3SGamut3Cine)).apply(input)
+        XCTAssertEqual(out(0), converted, "no look: the conversion alone")
         let half = out(0.5), full = out(1)
-        for c in 0..<3 { XCTAssertEqual(half[c], (input[c] + full[c]) / 2, accuracy: 1e-9) }
+        for c in 0..<3 { XCTAssertEqual(half[c], (converted[c] + full[c]) / 2, accuracy: 1e-9) }
+        XCTAssertEqual(full.x, full.z, accuracy: 0.012, "black and white: neutral but for a faint warm tone")
+    }
+
+    func testALookNeverGoesOnUnconvertedLog() {
+        let input = SIMD3<Double>(0.45, 0.40, 0.35)
+        var grade = ClipGrade(conversion: .off, look: .builtIn(.richVivid))
+        let off = GradeRecipe(grade: grade, profile: .sLog3SGamut3Cine)
+        XCTAssertEqual(off.conversion, ResolvedConversion.none)
+        XCTAssertFalse(off.lookApplies)
+        XCTAssertEqual(GradePipeline(recipe: off).apply(input), input, "flat log stays flat — no look on top of log")
+        grade.conversion = .auto
+        XCTAssertTrue(GradeRecipe(grade: grade, profile: .sLog3SGamut3Cine).lookApplies)
+        XCTAssertTrue(GradeRecipe(grade: grade, profile: nil).lookApplies, "plain Rec.709 video takes a look directly")
+        XCTAssertFalse(GradeRecipe(grade: grade, profile: .djiDLogM).lookApplies, "D-Log M has no conversion until its LUT is imported")
     }
 
     func testContrastAndSaturationAreNeutralAtZeroAndPivotOnGrey() {
@@ -183,11 +199,34 @@ final class ColorGradingMathTests: XCTestCase {
         XCTAssertEqual(mono.y, mono.z, accuracy: 1e-9)
     }
 
-    func testBuiltInLookIsUnavailableWithoutAKnownProfile() {
-        XCTAssertFalse(GradePipeline(recipe: GradeRecipe(grade: .rec709, profile: nil)).isLookAvailable)
-        XCTAssertFalse(GradePipeline(recipe: GradeRecipe(grade: .rec709, profile: .djiDLogM)).isLookAvailable)
-        XCTAssertTrue(GradePipeline(recipe: GradeRecipe(grade: .rec709, profile: .sLog3SGamut3)).isLookAvailable)
-        XCTAssertFalse(GradePipeline(recipe: GradeRecipe(grade: ClipGrade(look: .lut("abc")), profile: nil), lut: nil).isLookAvailable)
+    func testConversionResolvesFromTheProfile() {
+        XCTAssertEqual(GradeRecipe(grade: .converted, profile: nil).conversion, ResolvedConversion.none)
+        XCTAssertEqual(GradeRecipe(grade: .converted, profile: .djiDLogM).conversion, ResolvedConversion.none)
+        XCTAssertEqual(GradeRecipe(grade: .converted, profile: .sLog3SGamut3).conversion, .builtIn)
+        XCTAssertTrue(GradeRecipe(grade: .converted, profile: nil).isIdentity)
+        XCTAssertFalse(GradeRecipe(grade: .converted, profile: .sLog3SGamut3Cine).isIdentity, "log footage is converted")
+        let missing = GradePipeline(recipe: GradeRecipe(grade: ClipGrade(look: .lut("abc")), profile: nil), lookLUT: nil)
+        XCTAssertFalse(missing.isLookAvailable)
+        let conversionMissing = GradePipeline(recipe: GradeRecipe(grade: ClipGrade(conversion: .lut("abc")), profile: .sLog3SGamut3Cine), conversionLUT: nil)
+        XCTAssertFalse(conversionMissing.isConversionAvailable)
+    }
+
+    func testBuiltInLooksStayInRangeKeepGreyNeutralAndSkinNatural() {
+        let skin = SIMD3<Double>(0.78, 0.58, 0.47)   // a typical Rec.709 skin tone
+        for look in BuiltInLook.allCases {
+            for v in [SIMD3<Double>(0, 0, 0), SIMD3(1, 1, 1), SIMD3(0.2, 0.7, 0.9), skin] {
+                let out = look.apply(v)
+                for c in 0..<3 { XCTAssertTrue((0...1).contains(out[c]), "\(look) out of range") }
+            }
+            let grey = look.apply(SIMD3(repeating: 0.42))
+            XCTAssertLessThan(abs(grey.x - grey.z), 0.06, "\(look) keeps mid grey near neutral")
+            if look != .blackWhite {
+                let (inHue, _) = LookMath.hueChroma(skin)
+                let (outHue, _) = LookMath.hueChroma(look.apply(skin))
+                XCTAssertLessThan(abs(outHue - inHue), 8, "\(look) keeps skin hue")
+            }
+            XCTAssertTrue((0.6...1.0).contains(look.defaultIntensity))
+        }
     }
 
     func testImportedLUTLookUsesTheTable() throws {
@@ -203,7 +242,7 @@ final class ColorGradingMathTests: XCTestCase {
         1 0 0
         0 0 0
         """)
-        let pipeline = GradePipeline(recipe: GradeRecipe(grade: ClipGrade(look: .lut("x")), profile: nil), lut: lut)
+        let pipeline = GradePipeline(recipe: GradeRecipe(grade: ClipGrade(look: .lut("x")), profile: nil), lookLUT: lut)
         let out = pipeline.apply(SIMD3(0.2, 0.5, 0.9))
         XCTAssertEqual(out.x, 0.8, accuracy: 1e-9)
         XCTAssertEqual(out.y, 0.5, accuracy: 1e-9)
@@ -224,9 +263,9 @@ final class ColorGradingMathTests: XCTestCase {
     }
 
     func testFingerprintChangesWithEveryPart() {
-        let base = GradeRecipe(grade: .rec709, profile: .sLog3SGamut3Cine, range: .full)
+        let base = GradeRecipe(grade: .converted, profile: .sLog3SGamut3Cine, range: .full)
         var variants: [GradeRecipe] = []
-        for change in 0..<9 {
+        for change in 0..<11 {
             var recipe = base
             switch change {
             case 0: recipe.grade.intensity = 0.5
@@ -237,13 +276,15 @@ final class ColorGradingMathTests: XCTestCase {
             case 5: recipe.grade.saturation = 5
             case 6: recipe.profile = .sLog3SGamut3
             case 7: recipe.range = .video
-            default: recipe.grade.look = .lut("abc")
+            case 8: recipe.grade.look = .lut("abc")
+            case 9: recipe.grade.look = .builtIn(.softFilm)
+            default: recipe.conversion = .lut("sony")
             }
             variants.append(recipe)
         }
         let prints = Set(([base] + variants).map(\.fingerprint))
-        XCTAssertEqual(prints.count, 10)
-        XCTAssertEqual(base.fingerprint, GradeRecipe(grade: .rec709, profile: .sLog3SGamut3Cine, range: .full).fingerprint)
+        XCTAssertEqual(prints.count, 12)
+        XCTAssertEqual(base.fingerprint, GradeRecipe(grade: .converted, profile: .sLog3SGamut3Cine, range: .full).fingerprint)
         XCTAssertEqual(base.shortFingerprint.count, 16)
     }
 

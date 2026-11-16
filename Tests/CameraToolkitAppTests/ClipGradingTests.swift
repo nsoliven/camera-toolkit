@@ -70,24 +70,34 @@ final class ClipGradingTests: XCTestCase {
             let items = try makeItems(in: root, log: 3, flat: 2)
             await grading.ensureDetected(items)
             XCTAssertEqual(items.filter { grading.profile(for: $0) != nil }.count, 3)
-            XCTAssertEqual(grading.tileMark(for: OrganizeStack(items: [items[0]])), .flatLog(.sLog3SGamut3Cine), "log and flat: the quiet marker")
+            // S-Log3 is converted out of the box (the Sony conversion).
+            guard case .graded(let converted) = grading.tileMark(for: OrganizeStack(items: [items[0]])) else {
+                return XCTFail("a log clip is drawn converted")
+            }
+            XCTAssertEqual(converted.conversion, .builtIn)
+            XCTAssertEqual(converted.grade.look, GradeLook.none)
             XCTAssertNil(grading.tileMark(for: OrganizeStack(items: [items[3]])), "not log: no marker")
+            // With the conversion off, a log clip is flat and wears the marker.
+            grading.setDefaultConversion(.off, for: .sLog3SGamut3Cine)
+            XCTAssertEqual(grading.tileMark(for: OrganizeStack(items: [items[0]])), .flatLog(.sLog3SGamut3Cine), "log and flat: the quiet marker")
+            grading.setDefaultConversion(.auto, for: .sLog3SGamut3Cine)
 
             // One clip already has its own exposure; it keeps it.
             grading.setGrade(ClipGrade(look: .none, exposure: 0.5), for: [items[1]], undoTitle: "Adjust Grade")
-            let applied = grading.applyLook(.rec709, intensity: 0.8, toLogClipsIn: items)
+            let applied = grading.applyLook(.builtIn(.softFilm), intensity: 0.8, toLogClipsIn: items)
             XCTAssertEqual(applied, 3)
             let grades = model.configuration.colorGrades
             XCTAssertEqual(grades.count, 3, "the flat clips and the photo are left alone")
-            XCTAssertEqual(grades[ClipGrading.fileKey(items[0].primary)], ClipGrade(look: .rec709, intensity: 0.8))
+            XCTAssertEqual(grades[ClipGrading.fileKey(items[0].primary)], ClipGrade(look: .builtIn(.softFilm), intensity: 0.8))
             XCTAssertEqual(grades[ClipGrading.fileKey(items[1].primary)]?.exposure, 0.5)
-            XCTAssertEqual(grades[ClipGrading.fileKey(items[1].primary)]?.look, .rec709)
+            XCTAssertEqual(grades[ClipGrading.fileKey(items[1].primary)]?.look, .builtIn(.softFilm))
             guard case .graded(let recipe) = grading.tileMark(for: OrganizeStack(items: [items[0]])) else {
                 return XCTFail("a graded tile draws the graded picture")
             }
             XCTAssertEqual(recipe.profile, .sLog3SGamut3Cine)
             XCTAssertEqual(recipe.range, .full)
-            XCTAssertTrue(workspace.undoMenuTitle?.contains("Apply Rec.709") == true, workspace.undoMenuTitle ?? "nil")
+            XCTAssertEqual(recipe.conversion, .builtIn, "the look sits on the conversion")
+            XCTAssertTrue(workspace.undoMenuTitle?.contains("Apply Soft Film") == true, workspace.undoMenuTitle ?? "nil")
 
             // ⌘Z takes the whole blanket back; the earlier own grade remains.
             workspace.undo()
@@ -104,7 +114,7 @@ final class ClipGradingTests: XCTestCase {
             let grading = workspace.grading
             let items = try makeItems(in: root, log: 2, flat: 1)
             await grading.ensureDetected(items)
-            var warm = ClipGrade.rec709
+            var warm = ClipGrade(look: .builtIn(.tealOrange), intensity: 0.7)
             warm.temperature = 25
             grading.setGrade(warm, for: [items[0]], undoTitle: "Adjust Grade")
             grading.copyGrade(from: items[0])
@@ -125,10 +135,11 @@ final class ClipGradingTests: XCTestCase {
             let grading = workspace.grading
             let items = try makeItems(in: root, log: 1, flat: 1)
             await grading.ensureDetected(items)
-            XCTAssertNil(grading.effectiveGrade(for: items[0]))
-            grading.setDefaultLook(.rec709, for: .sLog3SGamut3Cine)
-            XCTAssertEqual(grading.effectiveGrade(for: items[0])?.look, .rec709, "new log clips get the default")
-            XCTAssertNil(grading.effectiveGrade(for: items[1]), "not log: no default")
+            XCTAssertEqual(grading.effectiveGrade(for: items[0])?.look, GradeLook.none)
+            grading.setDefaultLook(.builtIn(.brightAiry), for: .sLog3SGamut3Cine)
+            XCTAssertEqual(grading.effectiveGrade(for: items[0])?.look, .builtIn(.brightAiry), "new log clips get the default look")
+            XCTAssertEqual(grading.effectiveGrade(for: items[0])?.intensity, BuiltInLook.brightAiry.defaultIntensity)
+            XCTAssertEqual(grading.effectiveGrade(for: items[1])?.look, GradeLook.none, "not log: no default look")
             XCTAssertTrue(model.configuration.colorGrades.isEmpty, "nothing is written per clip")
             // A clip's own choice of no look wins over the default.
             grading.setGrade(ClipGrade(look: .none, exposure: 0.3), for: [items[0]], undoTitle: "Adjust Grade")
@@ -150,7 +161,7 @@ final class ClipGradingTests: XCTestCase {
                     sourceRootPath: root.appendingPathComponent("Card").path, relativePath: "C0001.MP4",
                     fileSize: 64, modifiedAt: date, eventID: event.id, deviceID: "sony-a7v"
                 )]
-                configuration.gradeDefaults.setLook(.rec709, for: .sLog3SGamut3Cine)
+                configuration.gradeDefaults.setLook(.builtIn(.softFilm), for: .sLog3SGamut3Cine)
                 configuration.renderGradedCopiesBeforeSync = true
             }
             let assignment = model.configuration.photoEventAssignments[0]
@@ -199,7 +210,7 @@ final class ClipGradingTests: XCTestCase {
         let requests = (1...3).map { index in
             GradedRenderRequest(
                 source: folder.appendingPathComponent("C000\(index).MP4"),
-                recipe: GradeRecipe(grade: .rec709, profile: .sLog3SGamut3Cine),
+                recipe: GradeRecipe(grade: .converted, profile: .sLog3SGamut3Cine),
                 sourceKey: "C000\(index)|1|1", sourceModifiedAt: Date(),
                 outputFolder: folder.appendingPathComponent("Edited/Rec709", isDirectory: true)
             )

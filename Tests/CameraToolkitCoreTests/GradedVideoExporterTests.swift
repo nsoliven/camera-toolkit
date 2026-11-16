@@ -93,7 +93,7 @@ final class GradedVideoExporterTests: XCTestCase {
             let edited = root.appendingPathComponent("Buffer/2026/2026-06-01 Trip/Edited", isDirectory: true)
             let request = GradedRenderRequest(
                 source: source,
-                recipe: GradeRecipe(grade: .rec709, profile: .sLog3SGamut3Cine, range: .full),
+                recipe: GradeRecipe(grade: .converted, profile: .sLog3SGamut3Cine, range: .full),
                 sourceKey: "C0001.MOV|1|1",
                 sourceModifiedAt: stamp,
                 outputFolder: GradedRenderNaming.outputFolder(editedRoot: edited),
@@ -196,7 +196,7 @@ final class GradedVideoExporterTests: XCTestCase {
             let exporter = GradedVideoExporter()
             exporter.requireHardwareEncoder = false
             var request = GradedRenderRequest(
-                source: source, recipe: GradeRecipe(grade: .rec709, profile: .sLog3SGamut3Cine, range: .full),
+                source: source, recipe: GradeRecipe(grade: .converted, profile: .sLog3SGamut3Cine, range: .full),
                 sourceKey: "C0002.MOV|1|1", sourceModifiedAt: Date(timeIntervalSince1970: 1_780_000_000),
                 outputFolder: output, mirrorFolder: mirror
             )

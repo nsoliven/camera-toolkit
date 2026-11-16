@@ -143,7 +143,7 @@ struct GradeLookStrip: View {
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
-                    .help(look == .rec709 ? "Built-in S-Log3 → Rec.709 conversion" : "Use \(name(look))")
+                    .help(look == .none ? "The converted picture with no look on top" : "Put \(name(look)) on top of the converted picture")
                     .accessibilityAddTraits(look == selected ? .isSelected : [])
                 }
             }
@@ -258,29 +258,74 @@ struct GradePanel: View {
                     .frame(height: 76)
                 Picker("View", selection: $session.viewMode) {
                     ForEach(GradeViewMode.allCases) { mode in
-                        Text(mode.title).tag(mode)
+                        Text(mode == .before && session.isLog ? "Original (log)" : mode.title).tag(mode)
                     }
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
                 .help("Graded, split (drag the line on the picture), or the untouched original (B toggles)")
 
-                section("Look", icon: "camera.filters") {
+                Text(session.orderLine)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                stage(1, "Conversion", icon: "arrow.right.circle") {
+                    HStack(alignment: .firstTextBaseline) {
+                        Text(session.conversionTitle(session.recipe))
+                            .font(.callout.weight(.medium))
+                            .fixedSize(horizontal: false, vertical: true)
+                        Spacer(minLength: 4)
+                        if !session.conversionChoices.isEmpty {
+                            Menu {
+                                ForEach(session.conversionChoices, id: \.self) { choice in
+                                    Button {
+                                        session.setConversion(choice)
+                                    } label: {
+                                        if choice == session.draft.conversion {
+                                            Label(session.conversionName(choice), systemImage: "checkmark")
+                                        } else {
+                                            Text(session.conversionName(choice))
+                                        }
+                                    }
+                                }
+                            } label: {
+                                Image(systemName: "chevron.up.chevron.down")
+                            }
+                            .menuStyle(.button)
+                            .buttonStyle(.borderless)
+                            .menuIndicator(.hidden)
+                            .fixedSize()
+                            .help("Log → Rec.709 for this clip. The default for every clip is set in Settings › Color.")
+                        }
+                    }
+                    if !session.isConversionAvailable {
+                        Label("The conversion LUT is missing — import it again in Settings › Color.", systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    }
+                }
+
+                stage(2, "Look", icon: "camera.filters") {
                     HStack {
                         Text(session.lookName(session.draft.look))
                             .font(.callout.weight(.medium))
                         Spacer()
-                        if !session.isLookAvailable {
+                        if !session.canTakeLook {
+                            Text("Needs the conversion")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        } else if !session.isLookAvailable {
                             Label("Unavailable", systemImage: "exclamationmark.triangle.fill")
                                 .font(.caption)
                                 .foregroundStyle(.orange)
-                                .help(unavailableHelp)
+                                .help("This look LUT is not in Settings › Color any more. Import it again to use it.")
                         }
                     }
-                    control("Intensity", value: $session.draft.intensity, range: ClipGrade.ranges.intensity, reset: 1) {
+                    control("Intensity", value: $session.draft.intensity, range: ClipGrade.ranges.intensity, reset: session.draft.look.defaultIntensity) {
                         "\(Int(($0 * 100).rounded()))%"
                     }
-                    .disabled(session.draft.look == .none)
+                    .disabled(session.draft.look == .none || !session.canTakeLook)
                 }
 
                 section("Light", icon: "sun.max") {
@@ -325,7 +370,7 @@ struct GradePanel: View {
                         }
                         .buttonStyle(.borderedProminent)
                         .controlSize(.regular)
-                        .disabled(session.recipe.grade.isIdentity || !session.isLookAvailable)
+                        .disabled(session.recipe.isIdentity || !session.isConversionAvailable)
                         if let renderNote {
                             Text(renderNote)
                                 .font(.caption2)
@@ -380,15 +425,23 @@ struct GradePanel: View {
         }
     }
 
-    private var unavailableHelp: String {
-        switch session.draft.look {
-        case .rec709:
-            "The built-in Rec.709 conversion is for Sony S-Log3. For D-Log M, import DJI's LUT in Settings › Color."
-        case .lut:
-            "This LUT is not in Settings › Color any more. Import it again to use it."
-        case .none:
-            ""
+    /// A numbered stage heading: 1 Conversion, 2 Look.
+    private func stage<Content: View>(_ number: Int, _ title: String, icon: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Text("\(number)")
+                    .font(.caption2.weight(.bold).monospacedDigit())
+                    .frame(width: 16, height: 16)
+                    .background(.secondary.opacity(0.25), in: Circle())
+                Label(title, systemImage: icon)
+                    .font(.caption.weight(.semibold))
+            }
+            .foregroundStyle(.secondary)
+            content()
         }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
 
     private func signed(_ value: Double) -> String {

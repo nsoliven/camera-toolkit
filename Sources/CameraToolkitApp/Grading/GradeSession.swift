@@ -35,6 +35,13 @@ final class GradeSession {
     let range: VideoSignalRange
     let looks: [GradeLook]
     let lookName: (GradeLook) -> String
+    /// The conversions this clip can use (empty for non-log video).
+    let conversionChoices: [GradeConversion]
+    let conversionName: (GradeConversion) -> String
+    /// "Sony S-Log3 → Rec.709 · Built-in (Sony math)".
+    let conversionTitle: (GradeRecipe) -> String
+    /// The draft as drawn: profile, resolved conversion, range.
+    @ObservationIgnored let resolve: (ClipGrade) -> GradeRecipe
 
     var draft: ClipGrade {
         didSet {
@@ -80,6 +87,10 @@ final class GradeSession {
         range: VideoSignalRange,
         looks: [GradeLook],
         lookName: @escaping (GradeLook) -> String,
+        conversionChoices: [GradeConversion] = [],
+        conversionName: @escaping (GradeConversion) -> String = { _ in "" },
+        conversionTitle: @escaping (GradeRecipe) -> String = { _ in "" },
+        resolve: ((ClipGrade) -> GradeRecipe)? = nil,
         live: GradeLiveState = GradeLiveState(),
         renderer: GradeRenderer = .shared
     ) {
@@ -91,25 +102,53 @@ final class GradeSession {
         self.range = range
         self.looks = looks
         self.lookName = lookName
+        self.conversionChoices = conversionChoices
+        self.conversionName = conversionName
+        self.conversionTitle = conversionTitle
+        self.resolve = resolve ?? { grade in
+            GradeRecipe(grade: grade, profile: grade.profileMark.resolve(detected: detectedProfile), range: range)
+        }
         self.live = live
         self.renderer = renderer
         pushLive()
     }
 
-    func recipe(for grade: ClipGrade) -> GradeRecipe {
-        GradeRecipe(grade: grade, profile: grade.profileMark.resolve(detected: detectedProfile), range: range)
-    }
+    func recipe(for grade: ClipGrade) -> GradeRecipe { resolve(grade) }
 
     var recipe: GradeRecipe { recipe(for: draft) }
 
+    var isConversionAvailable: Bool { renderer.pipeline(for: recipe).isConversionAvailable }
     var isLookAvailable: Bool { renderer.pipeline(for: recipe).isLookAvailable }
+    /// A look can only go on a Rec.709 picture: log footage needs its
+    /// conversion first.
+    var canTakeLook: Bool { recipe.profile == nil || recipe.conversion.converts }
+    var isLog: Bool { recipe.profile != nil }
+
+    /// The one-line order of operations the panel shows.
+    var orderLine: String {
+        let r = recipe
+        guard let profile = r.profile else { return "Rec.709 video: your look and adjustments go straight on top." }
+        guard r.conversion.converts else { return "Shown as recorded (\(profile.shortName)). Looks need the conversion first." }
+        let source: String = switch r.conversion {
+        case .builtIn: "the built-in Sony math"
+        case .lut: "\(profile.vendorName)’s conversion"
+        case .none: ""
+        }
+        return "Converted from \(profile.shortName) with \(source), then your look on top."
+    }
+
+    func setConversion(_ conversion: GradeConversion) {
+        var next = draft
+        next.conversion = conversion
+        draft = next
+    }
 
     private func pushLive() {
         let recipe = recipe
         let mode = viewMode
         let wipe = wipe
         live.update { state in
-            state.recipe = recipe.grade.isIdentity ? nil : recipe
+            state.recipe = recipe.isIdentity ? nil : recipe
             state.bypass = mode == .before
             state.wipe = mode == .split ? wipe : nil
         }
@@ -144,9 +183,10 @@ final class GradeSession {
     }
 
     func choose(_ look: GradeLook) {
+        guard canTakeLook || look == .none else { return }
         var next = draft
+        if next.look != look { next.intensity = look.defaultIntensity }
         next.look = look
-        if look != .none, next.intensity == 0 { next.intensity = 1 }
         draft = next
     }
 
@@ -157,7 +197,7 @@ final class GradeSession {
         next.tint = 0
         next.contrast = 0
         next.saturation = 0
-        next.intensity = 1
+        next.intensity = next.look.defaultIntensity
         draft = next
     }
 
@@ -178,8 +218,8 @@ final class GradeSession {
         let recipe = recipe(for: draft)
         let lookRecipes = looks.map { look -> (GradeLook, GradeRecipe) in
             var grade = draft
+            if grade.look != look { grade.intensity = look.defaultIntensity }
             grade.look = look
-            if look != .none, grade.intensity == 0 { grade.intensity = 1 }
             return (look, self.recipe(for: grade))
         }
         // Thumbnails follow the draft's controls, so each look is shown
@@ -190,13 +230,13 @@ final class GradeSession {
             try? await Task.sleep(for: .milliseconds(40))
             guard !Task.isCancelled else { return }
             let result = await Task.detached(priority: .userInitiated) { () -> (CGImage?, GradeHistogram?, [GradeLook: CGImage]) in
-                let graded = recipe.grade.isIdentity ? frame : renderer.grade(frame, recipe: recipe)
+                let graded = recipe.isIdentity ? frame : renderer.grade(frame, recipe: recipe)
                 let histogram = graded.map { GradeRenderer.histogram(of: $0) }
                 var thumbs: [GradeLook: CGImage] = [:]
                 if wantsThumbnails {
                     let small = Self.downscaled(frame, maxWidth: 360) ?? frame
                     for (look, lookRecipe) in lookRecipes {
-                        thumbs[look] = lookRecipe.grade.isIdentity ? small : renderer.grade(small, recipe: lookRecipe)
+                        thumbs[look] = lookRecipe.isIdentity ? small : renderer.grade(small, recipe: lookRecipe)
                     }
                 }
                 return (graded, histogram, thumbs)

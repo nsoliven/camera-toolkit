@@ -12,13 +12,38 @@ public struct ImportedLUT: Codable, Hashable, Identifiable, Sendable {
     public var importedAt: Date
     /// 3D table size, or nil for a 1D-only LUT.
     public var cubeSize: Int?
+    /// What it expects in: log (a conversion) or Rec.709 (a look).
+    public var role: LUTRole
 
-    public init(id: String, name: String, fileName: String, importedAt: Date, cubeSize: Int?) {
+    public init(id: String, name: String, fileName: String, importedAt: Date, cubeSize: Int?, role: LUTRole? = nil) {
         self.id = id
         self.name = name
         self.fileName = fileName
         self.importedAt = importedAt
         self.cubeSize = cubeSize
+        self.role = role ?? LUTRole.inferred(fromName: name + " " + fileName)
+    }
+
+    private enum CodingKeys: String, CodingKey { case id, name, fileName, importedAt, cubeSize, role, sourceName }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(String.self, forKey: .id)
+        name = try values.decode(String.self, forKey: .name)
+        fileName = try values.decode(String.self, forKey: .fileName)
+        importedAt = try values.decode(Date.self, forKey: .importedAt)
+        cubeSize = try values.decodeIfPresent(Int.self, forKey: .cubeSize)
+        role = try values.decodeIfPresent(LUTRole.self, forKey: .role) ?? LUTRole.inferred(fromName: name)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(id, forKey: .id)
+        try values.encode(name, forKey: .name)
+        try values.encode(fileName, forKey: .fileName)
+        try values.encode(importedAt, forKey: .importedAt)
+        try values.encodeIfPresent(cubeSize, forKey: .cubeSize)
+        try values.encode(role, forKey: .role)
     }
 }
 
@@ -55,7 +80,7 @@ public final class LUTLibrary: @unchecked Sendable {
     /// Parses `url`, then copies it in. Returns the existing entry when the
     /// same file was imported before.
     @discardableResult
-    public func importLUT(from url: URL, now: Date = Date()) throws -> ImportedLUT {
+    public func importLUT(from url: URL, role: LUTRole? = nil, now: Date = Date()) throws -> ImportedLUT {
         let data = try Data(contentsOf: url)
         guard data.count <= CubeLUT.maximumFileBytes else { throw CubeLUTError.tooLarge }
         let lut = try CubeLUT.parse(data)
@@ -74,7 +99,12 @@ public final class LUTLibrary: @unchecked Sendable {
         let name = (lut.title?.isEmpty == false ? lut.title! : baseName)
         // Whole seconds: the index stores ISO 8601 without fractions.
         let stamp = Date(timeIntervalSince1970: now.timeIntervalSince1970.rounded(.down))
-        let entry = ImportedLUT(id: id, name: name, fileName: fileName, importedAt: stamp, cubeSize: lut.cube?.size)
+        // The role: as asked, else guessed from the file's own name (Sony's
+        // and DJI's conversion LUTs name their log input).
+        let entry = ImportedLUT(
+            id: id, name: name, fileName: fileName, importedAt: stamp, cubeSize: lut.cube?.size,
+            role: role ?? LUTRole.inferred(fromName: url.lastPathComponent + " " + (lut.title ?? ""))
+        )
         index.append(entry)
         try writeIndex(index)
         parsed[id] = lut
@@ -90,6 +120,20 @@ public final class LUTLibrary: @unchecked Sendable {
         guard !trimmed.isEmpty else { return }
         index[position].name = trimmed
         try writeIndex(index)
+    }
+
+    public func setRole(id: String, to role: LUTRole) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        var index = readIndex()
+        guard let position = index.firstIndex(where: { $0.id == id }) else { return }
+        index[position].role = role
+        try writeIndex(index)
+    }
+
+    /// Present LUTs and what each expects, for `GradeResolver`.
+    public func roles() -> [String: LUTRole] {
+        Dictionary(list().map { ($0.id, $0.role) }, uniquingKeysWith: { first, _ in first })
     }
 
     /// Takes the LUT off the list and moves its copy to the Trash. Grades

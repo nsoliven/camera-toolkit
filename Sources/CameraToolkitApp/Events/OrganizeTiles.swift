@@ -1976,7 +1976,7 @@ struct StackPreviewOverlay: View {
         .onChange(of: gradeFingerprint) { _, _ in
             // Undo, Paste or another window changed the clip's grade.
             if let item, let gradeSession {
-                gradeSession.adopt(workspace.grading.explicitGrade(for: item) ?? workspace.grading.effectiveGrade(for: item) ?? ClipGrade())
+                gradeSession.adopt(workspace.grading.effectiveGrade(for: item) ?? ClipGrade())
             } else {
                 syncLiveGrade()
             }
@@ -2207,6 +2207,9 @@ struct StackPreviewOverlay: View {
                             name: gradeSession.lookName,
                             onChoose: { gradeSession.choose($0); isFocused = true }
                         )
+                        .disabled(!gradeSession.canTakeLook)
+                        .opacity(gradeSession.canTakeLook ? 1 : 0.45)
+                        .help(gradeSession.canTakeLook ? "Looks go on top of the converted Rec.709 picture" : "Looks go on a Rec.709 picture: this clip has no conversion yet")
                         .frame(maxWidth: CGFloat(gradeSession.looks.count) * 142 + 20)
                         .glassEffect(.regular, in: .rect(cornerRadius: 16))
                     }
@@ -2948,16 +2951,28 @@ extension StackPreviewOverlay {
         }
         let grading = workspace.grading
         let profile = grading.profile(for: item)
-        let grade = grading.explicitGrade(for: item) ?? grading.effectiveGrade(for: item) ?? ClipGrade()
+        let detected = grading.detectedProfile(for: item)
+        let range = grading.signalRange(for: item, profile: profile)
+        let grade = grading.effectiveGrade(for: item) ?? ClipGrade()
         let session = GradeSession(
             itemID: item.id,
             clipName: item.primary.name,
             grade: grade,
             profile: profile,
-            detectedProfile: grading.detectedProfile(for: item),
-            range: grading.signalRange(for: item, profile: profile),
-            looks: grading.availableLooks(for: profile ?? grade.profileMark.resolve(detected: grading.detectedProfile(for: item))),
+            detectedProfile: detected,
+            range: range,
+            looks: grading.availableLooks(for: profile),
             lookName: { grading.lookName($0) },
+            conversionChoices: profile.map { grading.conversionChoices(for: $0) } ?? [],
+            conversionName: { choice in profile.map { grading.conversionName(choice, profile: $0) } ?? "" },
+            conversionTitle: { recipe in grading.conversionTitle(recipe.conversion, profile: recipe.profile) },
+            resolve: { draft in
+                let resolver = grading.resolver
+                let resolvedProfile = resolver.profile(explicit: draft, detected: detected)
+                var drawn = draft
+                if !resolver.isLook(drawn.look) { drawn.look = .none }
+                return GradeRecipe(grade: drawn, profile: resolvedProfile, conversion: resolver.conversion(for: drawn, profile: resolvedProfile), range: range)
+            },
             live: liveGrade
         )
         session.commit = { [weak grading] draft in
