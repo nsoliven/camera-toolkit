@@ -493,7 +493,7 @@ struct ServicesSettingsPane: View {
                         }
                     }
                 }
-                Text("Use a key from the account that owns the library, with: library read and scan, asset read and update, album read, create and add, stack read, create, update and delete (only the app's own stacks are ever removed).")
+                Text("Use a key from the account that owns the library, with: user read, library read and scan, asset read and update, album read, create and add, stack read, create, update and delete (only the app's own stacks are ever removed).")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .onAppear { model.refreshImmichKeyStatus() }

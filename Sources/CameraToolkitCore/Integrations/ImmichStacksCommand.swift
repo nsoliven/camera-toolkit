@@ -179,7 +179,7 @@ public enum ImmichStacksCommand {
         let plan = report.plan
         var lines: [String] = []
         let byKind = Dictionary(grouping: plan.creates, by: \.group.kind).mapValues(\.count)
-        lines.append("\(dryRun ? "Would make" : "Stacks to make"): \(plan.creates.count) (bursts \(byKind[.burst] ?? 0), RAW+JPEG \(byKind[.rawPair] ?? 0), with edits \(byKind[.edit] ?? 0)); \(plan.creates.count { $0.replacing != nil }) of them replace the app's own earlier stack")
+        lines.append("\(dryRun ? "Would make" : "Stacks to make"): \(plan.creates.count) (bursts \(byKind[.burst] ?? 0), RAW+JPEG \(byKind[.rawPair] ?? 0), with edits \(byKind[.edit] ?? 0)); \(plan.creates.count { !$0.replacing.isEmpty }) of them replace the app's own earlier stacks")
         lines.append("Already stacked by the app, unchanged: \(plan.unchanged)")
         lines.append("Left alone, already in a stack the app did not make: \(plan.skippedForeign)")
         lines.append("Unstacked in Immich since the app made them, not made again: \(plan.skippedRemoved)")

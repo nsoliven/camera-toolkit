@@ -855,18 +855,18 @@ public struct ImmichLibrarySync: Sendable {
     ) async {
         guard !report.albumAssets.isEmpty else { return }
         let account: [ImmichAlbum]
-        let me: String?
         do {
             account = try await client.albums()
-            me = try? await client.currentUserID()
         } catch {
             outcome.problems.append("albums: \(error.localizedDescription)")
             return
         }
+        // Fails closed: albums are found by name only when the key's user is known.
+        let me = try? await client.currentUserID()
         let byID = Dictionary(account.map { ($0.id, $0) }) { first, _ in first }
         // By name, only the user's own albums that no other event is paired with.
         var byName = Dictionary(account.filter { album in
-            !reservedAlbumIDs.contains(album.id) && (me == nil || album.ownerID == nil || album.ownerID == me)
+            !reservedAlbumIDs.contains(album.id) && (album.ownerID == nil || album.ownerID == me)
         }.map { ($0.name, $0) }) { first, _ in first }
         let additionsLog = logFolder?.appendingPathComponent("album-additions.jsonl")
         for target in report.albumAssets.keys.sorted(by: { $0.displayName < $1.displayName }) {
@@ -884,6 +884,10 @@ public struct ImmichLibrarySync: Sendable {
                     // Its current name, in case it was renamed in Immich.
                     album = current
                 case .named(let name):
+                    guard me != nil else {
+                        outcome.problems.append("could not confirm which albums are yours (the key needs user.read); “\(name)” was not made or filled")
+                        continue
+                    }
                     if let existing = byName[name] {
                         album = existing
                     } else {

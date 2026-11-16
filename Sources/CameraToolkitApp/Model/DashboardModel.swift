@@ -120,6 +120,11 @@ final class DashboardModel {
     var immichStackCounts: [UUID: Int] = [:]
     /// Group keys of the app's Immich stacks, for the burst tiles' mark.
     var immichStackedKeys: Set<String> = []
+    /// Group keys of app stacks someone unstacked in Immich; the app does not
+    /// make them again unless asked.
+    var immichUnstackedKeys: Set<String> = []
+    /// The key's user, once read: albums owned by anyone else are shared.
+    var immichCurrentUserID: String?
     /// The chosen library as the last check or pairing read it.
     var immichLibrary: ImmichLibrary?
     /// Whether a key is saved, and where an earlier build left one. Read
@@ -813,8 +818,9 @@ extension DashboardModel {
     func setImmichLibraryID(_ value: String) {
         let changed = value != configuration.immichLibraryID
         updateConfiguration { $0.immichLibraryID = value }
-        // Choosing a library pairs the account's existing albums at once.
-        if changed, !value.isEmpty { pairImmichAlbums() }
+        // Choosing a library pairs the account's existing albums at once, as
+        // links only: nothing is filled until an album is switched to fill.
+        if changed, !value.isEmpty { pairImmichAlbums(allowsFilling: false) }
     }
 
     func setImmichStacksBurstsAndEdits(_ value: Bool) {

@@ -136,9 +136,11 @@ struct ImmichAlbumMenuItems: View {
         if !isPrivate || event.sendsToImmich {
             if event.immichAlbumID != nil {
                 Toggle("Keep This Album Filled with the Whole Event", isOn: Binding(
-                    get: { event.fillsImmichAlbum && event.immichAlbumAutomatic != true },
+                    get: { event.isFillingImmichAlbum(albumsForEveryEvent: model.configuration.immichAlbumsForEveryEvent) },
                     set: { model.setImmichAlbumFill(for: event.id, fills: $0) }
                 ))
+                .disabled(event.immichAlbumShared == true)
+                .help(event.immichAlbumShared == true ? "Shared with you: the app never adds to someone else's album" : "Add every photo of this event to the album on each check")
                 Divider()
             }
             Button("New Album Named After the Event") { model.useNewImmichAlbum(for: event.id) }
@@ -152,10 +154,11 @@ struct ImmichAlbumMenuItems: View {
                     Button {
                         model.pairEvent(event.id, withImmichAlbum: album)
                     } label: {
+                        let shared = model.immichAlbumIsShared(album) ? " · shared with you" : ""
                         if album.id == event.immichAlbumID {
-                            Label(album.name, systemImage: "checkmark")
+                            Label(album.name + shared, systemImage: "checkmark")
                         } else {
-                            Text(album.assetCount.map { "\(album.name) (\($0.formatted()))" } ?? album.name)
+                            Text(album.assetCount.map { "\(album.name) (\($0.formatted()))\(shared)" } ?? album.name + shared)
                         }
                     }
                 }

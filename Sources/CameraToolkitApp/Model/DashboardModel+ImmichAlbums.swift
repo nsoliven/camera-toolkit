@@ -71,7 +71,9 @@ extension DashboardModel {
 
     /// Reads every album on the account and pairs each with an event when the
     /// match is clear. Writes nothing to Immich.
-    func pairImmichAlbums() {
+    /// - Parameter allowsFilling: false links every pair without filling it
+    ///   (choosing a library); Pair Albums keeps event albums filled.
+    func pairImmichAlbums(allowsFilling: Bool = true) {
         guard immichLibraryIsChosen else {
             immichPairingNote = "Choose your Immich library first."
             return
@@ -93,7 +95,9 @@ extension DashboardModel {
                 let files = await immichCatalogFiles()
                 let events = configuration.savedEvents
                 let locations = EventStorageLocations(configuration: configuration)
+                // Fails closed: without the key's user, nothing with an owner pairs.
                 let me = try? await client.currentUserID()
+                immichCurrentUserID = me
                 let result = ImmichAlbumPairing.pair(albums: contents, events: events, files: files, library: library, locations: locations, currentUserID: me)
                 let pairs = Dictionary(result.pairs.map { ($0.eventID, $0) }) { first, _ in first }
                 if !pairs.isEmpty {
@@ -101,13 +105,13 @@ extension DashboardModel {
                     updateConfiguration { configuration in
                         for index in configuration.savedEvents.indices {
                             if let pair = pairs[configuration.savedEvents[index].id] {
-                                configuration.savedEvents[index].pairImmichAlbum(pair.album, fills: pair.fills)
+                                configuration.savedEvents[index].pairImmichAlbum(pair.album, fills: allowsFilling && pair.fills)
                             }
                         }
                     }
                 }
                 immichPairing = result
-                let picks = result.pairs.count { !$0.fills }
+                let picks = result.pairs.count { !(allowsFilling && $0.fills) }
                 immichPairingNote = "Paired \(result.pairs.count) album\(result.pairs.count == 1 ? "" : "s") (\(picks) picks, linked only); \(result.unpaired.count) not paired. Nothing was changed in Immich."
                 loadImmichAlbumStates()
             } catch {
@@ -120,9 +124,16 @@ extension DashboardModel {
     func loadImmichAlbumsIfNeeded() {
         guard immichLibraryIsChosen, immichAlbums.isEmpty else { return }
         Task { @MainActor [weak self] in
-            guard let self, let albums = try? await makeImmichClient().albums() else { return }
+            guard let self, let client = try? makeImmichClient(), let albums = try? await client.albums() else { return }
             immichAlbums = albums.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+            if immichCurrentUserID == nil { immichCurrentUserID = try? await client.currentUserID() }
         }
+    }
+
+    /// Someone else's album, or one whose owner cannot be confirmed.
+    func immichAlbumIsShared(_ album: ImmichAlbum) -> Bool {
+        guard let owner = album.ownerID else { return false }
+        return owner != immichCurrentUserID
     }
 
     func loadImmichAlbumStates() {
@@ -132,8 +143,11 @@ extension DashboardModel {
                 ((try? ImmichEventAlbumStore(catalogURL: catalogURL).all()) ?? [:],
                  (try? ImmichStackStore(catalogURL: catalogURL).records()) ?? [:])
             }.value
-            let counts = records.values.reduce(into: [UUID: Int]()) { $0[$1.eventID, default: 0] += 1 }
-            let keys = Set(records.keys)
+            let live = records.values.filter { !$0.stackID.isEmpty && $0.removedInImmich != true }
+            let counts = live.reduce(into: [UUID: Int]()) { $0[$1.eventID, default: 0] += 1 }
+            let keys = Set(live.map(\.key))
+            let unstacked = Set(records.values.filter { $0.removedInImmich == true }.map(\.key))
+            if self?.immichUnstackedKeys != unstacked { self?.immichUnstackedKeys = unstacked }
             if self?.immichAlbumStates != states { self?.immichAlbumStates = states }
             if self?.immichStackCounts != counts { self?.immichStackCounts = counts }
             if self?.immichStackedKeys != keys { self?.immichStackedKeys = keys }
@@ -198,21 +212,75 @@ extension DashboardModel {
 
     // MARK: - One event's album
 
+    /// Links an album the user picked. It is filled only when it already
+    /// holds most of the event (checked right after), or when the user turns
+    /// filling on; someone else's album is never filled.
     func pairEvent(_ eventID: UUID, withImmichAlbum album: ImmichAlbum) {
+        let shared = immichAlbumIsShared(album)
         updateConfiguration { configuration in
-            // One album fills one event: a previous holder lets go.
+            // One album belongs to one event: a previous holder lets go.
             for index in configuration.savedEvents.indices where configuration.savedEvents[index].immichAlbumID == album.id {
                 configuration.savedEvents[index].unpairImmichAlbum()
             }
             guard let index = configuration.savedEvents.firstIndex(where: { $0.id == eventID }) else { return }
-            configuration.savedEvents[index].pairImmichAlbum(album)
+            configuration.savedEvents[index].pairImmichAlbum(album, fills: false, shared: shared)
         }
         immichAlbumStates[eventID] = nil
-        statusMessage = "Paired with “\(album.name)”. New photos are added on the next check; nothing is removed from it."
+        statusMessage = shared
+            ? "Linked to “\(album.name)”, which is shared with you. The app never adds to someone else's album."
+            : "Linked to “\(album.name)” as a picks album. Checking whether it already holds this event…"
+        guard !shared else { return }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let client = try makeImmichClient()
+                let library: ImmichLibrary
+                if let known = immichLibrary { library = known } else { library = try await client.library(id: configuration.immichLibraryID) }
+                let inAlbum = try await client.albumAssets(albumID: album.id)
+                let files = await immichCatalogFiles().filter { $0.eventID == eventID }
+                let paths = ImmichLibraryPaths(importPaths: library.importPaths)
+                let mine = Set(files.map { NASSyncStore.pathKey($0.relativePath) })
+                let matched = inAlbum.count { asset in
+                    paths.relativePath(forOriginalPath: asset.originalPath).map { mine.contains(NASSyncStore.pathKey($0)) } ?? false
+                }
+                let media = OrganizeFileClassifier.rawExtensions.union(OrganizeFileClassifier.photoExtensions).union(OrganizeFileClassifier.videoExtensions)
+                let eventMedia = files.count { media.contains(($0.relativePath as NSString).pathExtension.lowercased()) }
+                guard event(eventID)?.immichAlbumID == album.id else { return }
+                if SavedCameraEvent.immichAlbumHoldsWholeEvent(matched: matched, eventMediaCount: eventMedia) {
+                    setImmichAlbumFill(for: eventID, fills: true)
+                } else {
+                    statusMessage = "Linked to “\(album.name)” as a picks album (\(matched) of \(eventMedia) photos). Turn on Keep This Album Filled to add the whole event."
+                }
+            } catch {
+                statusMessage = "Linked to “\(album.name)” as a picks album; could not check it: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func event(_ id: UUID) -> SavedCameraEvent? {
+        configuration.savedEvents.first { $0.id == id }
+    }
+
+    /// Clears the app's memory that these stacks were unstacked in Immich,
+    /// so the next check makes them again.
+    func stackAgainInImmich(groupKeys: Set<String>) {
+        guard !groupKeys.isEmpty else { return }
+        let catalogURL = catalogURLForImmich
+        Task { @MainActor [weak self] in
+            await Task.detached(priority: .utility) { try? ImmichStackStore(catalogURL: catalogURL).remove(keys: groupKeys) }.value
+            self?.loadImmichAlbumStates()
+            self?.statusMessage = groupKeys.count == 1
+                ? "This burst is stacked again on the next Immich check."
+                : "\(groupKeys.count) bursts are stacked again on the next Immich check."
+        }
     }
 
     /// Whether checks keep a paired album filled with the whole event.
     func setImmichAlbumFill(for eventID: UUID, fills: Bool) {
+        if fills, event(eventID)?.immichAlbumShared == true {
+            statusMessage = "This album is shared with you; the app never adds to someone else's album."
+            return
+        }
         updateConfiguration { configuration in
             guard let index = configuration.savedEvents.firstIndex(where: { $0.id == eventID }) else { return }
             configuration.savedEvents[index].immichAlbumFill = fills

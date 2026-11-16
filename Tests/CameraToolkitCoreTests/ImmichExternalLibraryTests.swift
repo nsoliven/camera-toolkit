@@ -339,6 +339,7 @@ final class ImmichLibrarySyncTests: XCTestCase {
         transport.respond("GET", "/api/libraries/\(libraryID)", body: encode(library()))
         transport.respond("GET", "/api/server/media-types", body: #"{"image":[".jpg"],"video":[".mp4"],"sidecar":[".xmp"]}"#)
         transport.respond("POST", "/api/search/metadata", bodies: [searchPage(assets, nextPage: nil)])
+        transport.respond("GET", "/api/users/me", body: #"{"id":"me","email":"user@example.com","name":"Example User","isAdmin":false}"#)
         return transport
     }
 
@@ -420,6 +421,19 @@ final class ImmichLibrarySyncTests: XCTestCase {
 
         XCTAssertEqual(outcome.resolvedAlbums[trip]?.id, "fresh")
         XCTAssertFalse(transport.requests.contains { $0.url?.path == "/api/albums/taken/assets" })
+    }
+
+    func testWithoutTheKeysUserNoAlbumIsMadeOrFilledByName() async throws {
+        let files = try prepareCatalog(count: 1, album: .named("Trip 2026"))
+        let transport = transport(assets: [asset("a1", "2026/T/1.jpg")])
+        transport.respond("GET", "/api/albums", body: #"[{"id":"x","albumName":"Trip 2026","ownerId":"someone"}]"#)
+        transport.respond("GET", "/api/users/me", status: 403, body: "")
+
+        let outcome = try await sync(transport).check(files: files)
+
+        XCTAssertTrue(outcome.problems.contains { $0.contains("user.read") })
+        XCTAssertFalse(transport.requests.contains { $0.httpMethod == "POST" && $0.url?.path == "/api/albums" })
+        XCTAssertFalse(transport.requests.contains { $0.httpMethod == "PUT" })
     }
 
     func testEveryAlbumAdditionIsLogged() async throws {
@@ -768,6 +782,39 @@ final class ImmichAlbumPairingTests: XCTestCase {
         XCTAssertNil(ImmichAlbumNaming.targets(events: [event], locations: locations, albumsForEveryEvent: false)[event.id])
     }
 
+    // MARK: R3, R4, R5
+
+    func testASharedAlbumIsNeverFilled() {
+        var event = SavedCameraEvent(name: "Trip 2026", eventDate: date)
+        event.pairImmichAlbum(ImmichAlbum(id: "theirs", name: "Their Trip", ownerID: "friend"), fills: true, shared: true)
+        XCTAssertFalse(event.fillsImmichAlbum)
+        event.immichAlbumFill = true
+        XCTAssertFalse(event.fillsImmichAlbum, "shared wins over the switch")
+        XCTAssertNil(ImmichAlbumNaming.targets(events: [event], locations: locations, albumsForEveryEvent: true)[event.id])
+    }
+
+    func testTheWholeEventRuleForAPickedAlbum() {
+        XCTAssertTrue(SavedCameraEvent.immichAlbumHoldsWholeEvent(matched: 80, eventMediaCount: 100))
+        XCTAssertFalse(SavedCameraEvent.immichAlbumHoldsWholeEvent(matched: 79, eventMediaCount: 100))
+        XCTAssertFalse(SavedCameraEvent.immichAlbumHoldsWholeEvent(matched: 0, eventMediaCount: 0))
+    }
+
+    func testWithoutTheKeysUserNoAlbumWithAnOwnerPairs() {
+        let event = SavedCameraEvent(name: "Beach Day", eventDate: date)
+        var owned = album("x", "Beach Day")
+        owned.album.ownerID = "someone"
+        let result = pair([owned], [event], [], currentUserID: nil)
+        XCTAssertTrue(result.pairs.isEmpty)
+        XCTAssertEqual(result.unpaired.first?.reason, .ownerUnknown)
+    }
+
+    func testTheFillSwitchShowsWhetherAnAutomaticAlbumIsFillingNow() {
+        var event = SavedCameraEvent(name: "Trip 2026", eventDate: date)
+        event.pairImmichAlbum(ImmichAlbum(id: "auto", name: "Trip 2026"), fills: true, automatic: true)
+        XCTAssertTrue(event.isFillingImmichAlbum(albumsForEveryEvent: true))
+        XCTAssertFalse(event.isFillingImmichAlbum(albumsForEveryEvent: false))
+    }
+
     func testPairingIsByIDAndSurvivesARename() {
         var event = SavedCameraEvent(name: "Trip 2026", eventDate: date)
         event.pairImmichAlbum(ImmichAlbum(id: "album-1", name: "Trip 2026"))
@@ -929,7 +976,7 @@ final class ImmichStackTests: XCTestCase {
         let account = ImmichAccountStack(id: "ours", primaryAssetID: oldIDs[0], assetIDs: oldIDs)
         let plan = ImmichStackPlanner.plan(groups: groups, assets: newAssets, library: library(), accountStacks: [account], records: [key: record])
         XCTAssertEqual(plan.creates.count, 1)
-        XCTAssertEqual(plan.creates.first?.replacing, "ours")
+        XCTAssertEqual(plan.creates.first?.replacing, ["ours"])
         XCTAssertEqual(plan.creates.first?.assetIDs.first, "new-DSC00002.ARW")
     }
 
@@ -1044,6 +1091,68 @@ final class ImmichStackTests: XCTestCase {
         XCTAssertEqual(report.created.map(\.stackID), ["made"])
         XCTAssertEqual(try store.records()[groups[0].key]?.stackID, "made")
         XCTAssertEqual(logged.all.map(\.action), [.adopted])
+    }
+
+    // MARK: R2, R5
+
+    func testWhenTheFirstFrameLeavesNoStackEverCrossesEvents() async throws {
+        // The app stacked a, b, c for the trip; a was then moved to the party,
+        // whose burst is now a, d.
+        let (a, b, c, d) = ("a", "b", "c", "d")
+        let tripGroup = ImmichStackGroup(key: "trip-burst", eventID: trip, kind: .burst, relativePaths: ["2026/T/b.arw", "2026/T/c.arw"])
+        let partyGroup = ImmichStackGroup(key: "party-burst", eventID: party, kind: .burst, relativePaths: ["2026/P/a.arw", "2026/P/d.arw"])
+        let assets = [asset(a, "2026/P/a.arw"), asset(b, "2026/T/b.arw"), asset(c, "2026/T/c.arw"), asset(d, "2026/P/d.arw")]
+        let store = try ImmichStackStore(catalogURL: catalogURL)
+        try store.save(ImmichStackRecord(key: "trip-burst", stackID: "ours", eventID: trip, kind: .burst, assetIDs: [a, b, c]))
+        let transport = ScriptedTransport()
+        transport.respond("GET", "/api/stacks", body: "[\(stackJSON("ours", primary: a, [a, b, c]))]")
+        transport.respond("DELETE", "/api/stacks/ours", status: 204, body: "")
+        transport.respond("POST", "/api/stacks", bodies: [stackJSON("party-new", primary: a, [a, d]), stackJSON("trip-new", primary: b, [b, c])])
+        let client = try ImmichClient(serverURL: "https://photos.example.com", apiKey: "secret-key", transport: transport)
+
+        let report = try await ImmichStackRunner.run(client: client, groups: [partyGroup, tripGroup], assets: assets, library: library(), store: store, dryRun: false)
+
+        let calls = transport.writes.map { "\($0.httpMethod ?? "") \($0.url?.path ?? "")" }
+        XCTAssertEqual(calls.first, "DELETE /api/stacks/ours", "the trip's stack goes before a joins the party's")
+        XCTAssertEqual(calls.filter { $0.hasPrefix("DELETE") }.count, 1)
+        for post in transport.writes where post.httpMethod == "POST" {
+            let ids = Set((try JSONSerialization.jsonObject(with: XCTUnwrap(post.httpBody)) as? [String: [String]])?["assetIds"] ?? [])
+            XCTAssertTrue(ids.isSubset(of: [a, d]) || ids.isSubset(of: [b, c]), "one event per stack: \(ids)")
+        }
+        XCTAssertTrue(report.problems.isEmpty, "\(report.problems)")
+        let records = try store.records()
+        XCTAssertEqual(records["trip-burst"]?.stackID, "trip-new")
+        XCTAssertEqual(records["party-burst"]?.stackID, "party-new")
+        XCTAssertNil(records["trip-burst"]?.removedInImmich)
+    }
+
+    func testAStackTheAppRemovedItselfIsForgottenNotTombstoned() async throws {
+        // Another group's app stack holds d, which now belongs to this group.
+        let group = ImmichStackGroup(key: "g1", eventID: trip, kind: .burst, relativePaths: ["2026/T/c.arw", "2026/T/d.arw"])
+        let assets = [asset("c", "2026/T/c.arw"), asset("d", "2026/T/d.arw")]
+        let store = try ImmichStackStore(catalogURL: catalogURL)
+        try store.save(ImmichStackRecord(key: "g2", stackID: "s2", eventID: trip, kind: .burst, assetIDs: ["d", "e"]))
+        let transport = ScriptedTransport()
+        transport.respond("GET", "/api/stacks", body: "[\(stackJSON("s2", primary: "d", ["d", "e"]))]")
+        transport.respond("DELETE", "/api/stacks/s2", status: 204, body: "")
+        transport.respond("POST", "/api/stacks", body: stackJSON("s1", primary: "c", ["c", "d"]))
+        let client = try ImmichClient(serverURL: "https://photos.example.com", apiKey: "secret-key", transport: transport)
+
+        _ = try await ImmichStackRunner.run(client: client, groups: [group], assets: assets, library: library(), store: store, dryRun: false)
+
+        let records = try store.records()
+        XCTAssertEqual(records["g1"]?.stackID, "s1")
+        XCTAssertNil(records["g2"], "removed by the app, so made fresh next time rather than tombstoned")
+    }
+
+    func testStackingAgainClearsTheTombstone() throws {
+        let files = burst(trip, folder: "2026/T/Originals/A", first: 1, count: 3, at: start)
+        let groups = ImmichStackGrouping.groups(files: files)
+        let store = try ImmichStackStore(catalogURL: catalogURL)
+        try store.save(ImmichStackRecord(key: groups[0].key, stackID: "gone", eventID: trip, kind: .burst, assetIDs: [], removedInImmich: true))
+        XCTAssertEqual(ImmichStackPlanner.plan(groups: groups, assets: assets(for: files), library: library(), accountStacks: [], records: try store.records()).skippedRemoved, 1)
+        try store.remove(keys: [groups[0].key])
+        XCTAssertEqual(ImmichStackPlanner.plan(groups: groups, assets: assets(for: files), library: library(), accountStacks: [], records: try store.records()).creates.count, 1)
     }
 
     // MARK: P5, P6
