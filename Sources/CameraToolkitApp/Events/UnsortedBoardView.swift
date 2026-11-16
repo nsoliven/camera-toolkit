@@ -20,6 +20,7 @@ struct UnsortedBoardView: View {
     @AppStorage(OrganizeBoardSortDefaults.unsortedKey) private var sortKey: OrganizeSortKey = .captureTime
     @AppStorage(OrganizeBoardSortDefaults.unsortedAscending) private var sortAscending = OrganizeBoardSortDefaults.legacyAscending()
     @State private var previewStackID: String?
+    @State private var blanketRequest: BlanketGradeRequest?
     @State private var previewFrameIndex = 0
     /// The filter popover — owned here, outside the bottom bar's
     /// renderings, so a width change cannot re-present it mid-layout.
@@ -163,6 +164,7 @@ struct UnsortedBoardView: View {
                 )
             }
         }
+        .blanketGradeSheet(workspace: workspace, request: $blanketRequest)
         .navigationTitle(location.name)
         .toolbar(removing: .title)
         .toolbar {
@@ -370,6 +372,7 @@ struct UnsortedBoardView: View {
             isDimmed: { workspace.isSorted($0) && !workspace.selectedStackIDs.contains($0.id) },
             badge: { _ in nil },
             orientationForFile: { workspace.savedTurns(for: $0) },
+            gradeForStack: { workspace.grading.tileMark(for: $0) },
             onOpen: { stack, frame in
                 workspace.focus(stackID: stack.id)
                 previewFrameIndex = frame
@@ -414,6 +417,17 @@ struct UnsortedBoardView: View {
         }
         .disabled(!menu.canRotate)
         .optionalHelp(menu.rotateHelp)
+        let targetStacks = workspace.stacks(matching: targets, inLocation: location.id)
+        if targetStacks.contains(where: { $0.items.contains(where: ClipGrading.isGradable) }) {
+            GradeMenuItems(
+                workspace: workspace,
+                targets: targetStacks,
+                boardStacks: { orderedStacks(in: groups) },
+                boardTitle: location.name,
+                boardEventID: nil,
+                onBlanket: { blanketRequest = $0 }
+            )
+        }
         Divider()
         Button("Preview") { openPreview(stack.id) }
         // A 360 clip's own editor leads when it's installed; Photomator

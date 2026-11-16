@@ -375,6 +375,16 @@ public struct CatalogStore {
             updated_at TEXT NOT NULL
         );
         """, database: database)
+        // Colour grades (`ClipGrade`) by file identity, added after the
+        // catalog first owned rotations: a new table only, nothing altered.
+        // `grade` is the grade's JSON so new fields round-trip.
+        try execute("""
+        CREATE TABLE IF NOT EXISTS color_grades (
+            file_key TEXT PRIMARY KEY,
+            grade TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        """, database: database)
         try execute(NASSyncStore.schema, database: database)
     }
 

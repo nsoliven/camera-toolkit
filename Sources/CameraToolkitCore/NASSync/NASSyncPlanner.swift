@@ -90,8 +90,12 @@ public enum NASSyncPlanner {
     /// Our own in-flight temporary files, never source material.
     public static let temporaryMarker = ".ctsync-"
 
+    /// macOS's own temporary folder name, also where graded renders keep
+    /// their partials (`GradedRenderNaming`) until they are verified.
+    public static let temporaryItemsFolder = ".TemporaryItems"
+
     public static func isJunk(_ name: String) -> Bool {
-        name.hasPrefix("._") || name == ".DS_Store" || name.contains(temporaryMarker)
+        name.hasPrefix("._") || name == ".DS_Store" || name.contains(temporaryMarker) || name == temporaryItemsFolder
     }
 
     /// `checkLegacyLayout` lists the legacy archive folders of each event

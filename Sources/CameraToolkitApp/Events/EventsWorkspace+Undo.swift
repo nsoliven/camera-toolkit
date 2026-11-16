@@ -1557,6 +1557,9 @@ extension EventsWorkspace {
                 }
             }
             invalidateTiles(forOrientationKeys: Set(changes.map(\.key)))
+        case .colorGrades(let changes):
+            // Data only: tiles re-read their grade by key; no file is touched.
+            grading.apply(changes, undo: direction == .undo)
         case .events(let events):
             if let refusal = applyEventsChange(events, direction) {
                 refuseUndo(entry, direction, refusal)
