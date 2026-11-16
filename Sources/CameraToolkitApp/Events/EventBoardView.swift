@@ -226,7 +226,7 @@ struct EventBoardView: View {
             badge: { workspace.badge(for: $0, in: eventID) },
             orientationForFile: { workspace.savedTurns(for: $0) },
             gradeForStack: { workspace.grading.tileMark(for: $0) },
-            immichStackedForStack: { stack in workspace.isStackedInImmich(stack, eventID: workspace.assignedEvent(for: stack).event?.id ?? eventID) },
+            immichStackedForStack: { stack, assignedEventID in workspace.isStackedInImmich(stack, eventID: assignedEventID ?? eventID) },
             onOpen: { stack, frame in
                 workspace.focus(stackID: stack.id)
                 previewFrameIndex = frame

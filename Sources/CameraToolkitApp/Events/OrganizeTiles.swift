@@ -1180,8 +1180,9 @@ struct OrganizeGrid<MenuContent: View>: View {
     var orientationForFile: (OrganizeFile) -> Int? = { _ in nil }
     /// A tile's colour: graded picture, or a quiet flat-log marker.
     var gradeForStack: (OrganizeStack) -> TileGradeMark? = { _ in nil }
-    /// Whether the app made this burst an Immich stack.
-    var immichStackedForStack: (OrganizeStack) -> Bool = { _ in false }
+    /// Whether the app made this burst an Immich stack, given the event the
+    /// tile is already drawn for (no other assignment read per tile).
+    var immichStackedForStack: (OrganizeStack, UUID?) -> Bool = { _, _ in false }
     /// Opens the full preview at a specific frame of the stack (0 for the
     /// usual double-click/Space path).
     let onOpen: (OrganizeStack, Int) -> Void
@@ -1438,7 +1439,7 @@ struct OrganizeGrid<MenuContent: View>: View {
                 ),
                 orientation: orientationForFile(stack.coverItem.primary),
                 gradeMark: gradeForStack(stack),
-                isStackedInImmich: stack.isBurst && immichStackedForStack(stack),
+                isStackedInImmich: stack.isBurst && immichStackedForStack(stack, assigned.event?.id),
                 onExpand: { workspace.setExpanded(stack.id, expanded: true) },
                 onPlay: { onOpen(stack, 0) },
                 onOpen: { onOpen(stack, 0) },
