@@ -10,17 +10,21 @@ public struct CatalogOwnedState: Codable, Equatable, Sendable {
     public var photoEventAssignments: [PhotoEventAssignment]
     public var displayOrientations: [String: Int]
     public var burstSplits: [BurstSplit]
+    /// Colour grades by file identity key (`DisplayRotation.fileKey`).
+    public var colorGrades: [String: ClipGrade]
 
     public init(
         savedEvents: [SavedCameraEvent] = [],
         photoEventAssignments: [PhotoEventAssignment] = [],
         displayOrientations: [String: Int] = [:],
-        burstSplits: [BurstSplit] = []
+        burstSplits: [BurstSplit] = [],
+        colorGrades: [String: ClipGrade] = [:]
     ) {
         self.savedEvents = savedEvents
         self.photoEventAssignments = photoEventAssignments
         self.displayOrientations = displayOrientations
         self.burstSplits = burstSplits
+        self.colorGrades = colorGrades
     }
 
     public init(configuration: AppConfiguration) {
@@ -28,7 +32,8 @@ public struct CatalogOwnedState: Codable, Equatable, Sendable {
             savedEvents: configuration.savedEvents,
             photoEventAssignments: configuration.photoEventAssignments,
             displayOrientations: configuration.displayOrientations,
-            burstSplits: configuration.burstSplits
+            burstSplits: configuration.burstSplits,
+            colorGrades: configuration.colorGrades
         )
     }
 
@@ -39,11 +44,13 @@ public struct CatalogOwnedState: Codable, Equatable, Sendable {
         configuration.photoEventAssignments = photoEventAssignments
         configuration.displayOrientations = displayOrientations
         configuration.burstSplits = burstSplits
+        configuration.colorGrades = colorGrades
         configuration.normalizeEventSelection()
     }
 
     public var isEmpty: Bool {
         savedEvents.isEmpty && photoEventAssignments.isEmpty && displayOrientations.isEmpty && burstSplits.isEmpty
+            && colorGrades.isEmpty
     }
 
     /// What the catalog can hold for this state, and what did not fit:
@@ -85,7 +92,8 @@ public struct CatalogOwnedState: Codable, Equatable, Sendable {
                 savedEvents: events,
                 photoEventAssignments: assignments,
                 displayOrientations: displayOrientations,
-                burstSplits: splits
+                burstSplits: splits,
+                colorGrades: colorGrades
             ),
             duplicateEventsDropped: savedEvents.count - events.count,
             duplicateAssignmentsDropped: duplicates,
@@ -105,6 +113,8 @@ public struct CatalogStateChangeSummary: Equatable, Sendable {
     public var orientationsDeleted = 0
     public var burstSplitsWritten = 0
     public var burstSplitsDeleted = 0
+    public var colorGradesWritten = 0
+    public var colorGradesDeleted = 0
 
     public init() {}
 
@@ -259,11 +269,23 @@ public struct CatalogStateStore: Sendable {
             )
         }
 
+        var grades: [String: ClipGrade] = [:]
+        if try database.tableExists("color_grades") {
+            for row in try Row.fetchAll(database, sql: "SELECT file_key, grade FROM color_grades") {
+                // A row this build cannot read is skipped, not fatal: the
+                // clip simply shows ungraded.
+                if let grade = ClipGrade.fromCatalogJSON(row["grade"]) {
+                    grades[row["file_key"]] = grade
+                }
+            }
+        }
+
         return CatalogOwnedState(
             savedEvents: events,
             photoEventAssignments: assignments,
             displayOrientations: orientations,
-            burstSplits: splits
+            burstSplits: splits,
+            colorGrades: grades
         )
     }
 
@@ -359,6 +381,23 @@ public struct CatalogStateStore: Sendable {
         for key in before.displayOrientations.keys where after.displayOrientations[key] == nil {
             try database.execute(sql: "DELETE FROM display_orientations WHERE file_key = ?", arguments: [key])
             summary.orientationsDeleted += 1
+        }
+
+        if before.colorGrades != after.colorGrades {
+            for (key, grade) in after.colorGrades where before.colorGrades[key] != grade {
+                try database.execute(
+                    sql: """
+                    INSERT INTO color_grades(file_key, grade, updated_at) VALUES (?, ?, ?)
+                    ON CONFLICT(file_key) DO UPDATE SET grade = excluded.grade, updated_at = excluded.updated_at
+                    """,
+                    arguments: [key, grade.catalogJSON(), now]
+                )
+                summary.colorGradesWritten += 1
+            }
+            for key in before.colorGrades.keys where after.colorGrades[key] == nil {
+                try database.execute(sql: "DELETE FROM color_grades WHERE file_key = ?", arguments: [key])
+                summary.colorGradesDeleted += 1
+            }
         }
 
         let oldSplits = Dictionary(before.burstSplits.enumerated().map { ($1.id, ($0, $1)) }, uniquingKeysWith: { first, _ in first })
@@ -508,6 +547,13 @@ public struct CatalogStateStore: Sendable {
         try database.execute(sql: "DELETE FROM burst_splits")
         for (index, split) in state.burstSplits.enumerated() {
             try upsertSplit(split, ordinal: index, now: now, database: database)
+        }
+        try database.execute(sql: "DELETE FROM color_grades")
+        for (key, grade) in state.colorGrades {
+            try database.execute(
+                sql: "INSERT INTO color_grades(file_key, grade, updated_at) VALUES (?, ?, ?)",
+                arguments: [key, grade.catalogJSON(), now]
+            )
         }
     }
 

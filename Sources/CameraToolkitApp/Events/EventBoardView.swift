@@ -15,6 +15,7 @@ struct EventBoardView: View {
     @AppStorage(OrganizeBoardSortDefaults.eventKey) private var sortKey: OrganizeSortKey = .captureTime
     @AppStorage(OrganizeBoardSortDefaults.eventAscending) private var sortAscending = OrganizeBoardSortDefaults.legacyAscending()
     @State private var previewStackID: String?
+    @State private var blanketRequest: BlanketGradeRequest?
     @State private var previewFrameIndex = 0
     /// The board's measured height, which limits how tall its top bar's
     /// notices and chips may grow before they scroll.
@@ -127,10 +128,12 @@ struct EventBoardView: View {
                         onRotate: { stack, delta in
                             workspace.rotateStack(stack, quarterTurnsCW: delta)
                         },
-                        initialFrameIndex: previewFrameIndex
+                        initialFrameIndex: previewFrameIndex,
+                        boardEventID: eventID
                     )
                 }
             }
+            .blanketGradeSheet(workspace: workspace, request: $blanketRequest)
             .navigationTitle(title)
             .toolbar(removing: .title)
             .toolbar {
@@ -221,6 +224,7 @@ struct EventBoardView: View {
             isDimmed: { _ in false },
             badge: { workspace.badge(for: $0, in: eventID) },
             orientationForFile: { workspace.savedTurns(for: $0) },
+            gradeForStack: { workspace.grading.tileMark(for: $0) },
             onOpen: { stack, frame in
                 workspace.focus(stackID: stack.id)
                 previewFrameIndex = frame
@@ -265,6 +269,17 @@ struct EventBoardView: View {
         }
         .disabled(!menu.canRotate)
         .optionalHelp(menu.rotateHelp)
+        let targetStacks = stacks(for: targets)
+        if targetStacks.contains(where: { $0.items.contains(where: ClipGrading.isGradable) }) {
+            GradeMenuItems(
+                workspace: workspace,
+                targets: targetStacks,
+                boardStacks: { workspace.eventStacks[eventID] ?? [] },
+                boardTitle: workspace.event(eventID).map { workspace.eventTitle($0) } ?? "This Event",
+                boardEventID: eventID,
+                onBlanket: { blanketRequest = $0 }
+            )
+        }
         Divider()
         Button("Preview") { openPreview(stack.id) }
         // A 360 clip's own editor leads when it's installed; Photomator

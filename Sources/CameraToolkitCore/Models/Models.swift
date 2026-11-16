@@ -173,6 +173,8 @@ public enum JobAction: String, Codable, CaseIterable, Sendable {
     case nasRename
     /// One Sync to NAS conflict resolved (or its resolution undone).
     case resolveConflict
+    /// Graded Rec.709 copies of clips rendered into `Edited/Rec709`.
+    case gradeRender
 }
 
 public struct JobSnapshot: Identifiable, Codable, Hashable, Sendable {

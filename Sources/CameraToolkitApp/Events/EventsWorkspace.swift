@@ -7220,12 +7220,25 @@ final class EventsWorkspace {
     /// One-way Buffer → NAS copy of the event and its subevents.
     func syncToNAS(_ eventID: UUID) {
         guard let event = event(eventID) else { return }
-        nasConnection.prepareForNASJob { [weak self] in
-            guard let self else { return }
-            // One event's sync renames what moved into place instead of
-            // copying it; the stale-duplicate sweep is Sync All's.
-            startNASSync(events: eventFamily(eventID), title: eventTitle(event), refresh: [eventID], catchUp: true, reconcile: false)
-        }
+        grading.renderBeforeSyncIfWanted(
+            events: eventFamily(eventID),
+            syncTitle: eventTitle(event),
+            syncNow: { [weak self] in
+                self?.nasConnection.prepareForNASJob { [weak self] in
+                    self?.startSyncToNAS(eventID, jobID: nil)
+                }
+            },
+            // Queued behind the render: the queue's job boundary already
+            // gives a pending NAS link switch its turn.
+            queueSync: { [weak self] id in self?.startSyncToNAS(eventID, jobID: id) }
+        )
+    }
+
+    private func startSyncToNAS(_ eventID: UUID, jobID: UUID?) {
+        guard let event = event(eventID) else { return }
+        // One event's sync renames what moved into place instead of
+        // copying it; the stale-duplicate sweep is Sync All's.
+        startNASSync(events: eventFamily(eventID), title: eventTitle(event), refresh: [eventID], catchUp: true, reconcile: false, jobID: jobID)
     }
 
     /// Sync All to NAS: the confirmation first, listing each event's files
@@ -7340,21 +7353,32 @@ final class EventsWorkspace {
             model.statusMessage = "There are no events to sync."
             return
         }
-        nasConnection.prepareForNASJob { [weak self] in
-            // With the drive away nothing can be proven stale, so nothing is
-            // set aside whatever the switch says; the renames that only put
-            // a moved copy where the catalog looks still run.
-            guard let self else { return }
-            let driveMounted = NASCatchUp.driveIsMounted(locations)
-            let reconcile = driveMounted && syncAllReconcile
-            startNASSync(
-                events: events,
-                title: "all events",
-                refresh: events.filter { $0.parentEventID == nil }.map(\.id),
-                catchUp: reconcile || !driveMounted,
-                reconcile: reconcile
-            )
-        }
+        grading.renderBeforeSyncIfWanted(
+            events: events,
+            syncTitle: "all events",
+            syncNow: { [weak self] in
+                self?.nasConnection.prepareForNASJob { [weak self] in
+                    self?.startSyncAllToNAS(events, jobID: nil)
+                }
+            },
+            queueSync: { [weak self] id in self?.startSyncAllToNAS(events, jobID: id) }
+        )
+    }
+
+    private func startSyncAllToNAS(_ events: [SavedCameraEvent], jobID: UUID?) {
+        // With the drive away nothing can be proven stale, so nothing is
+        // set aside whatever the switch says; the renames that only put
+        // a moved copy where the catalog looks still run.
+        let driveMounted = NASCatchUp.driveIsMounted(locations)
+        let reconcile = driveMounted && syncAllReconcile
+        startNASSync(
+            events: events,
+            title: "all events",
+            refresh: events.filter { $0.parentEventID == nil }.map(\.id),
+            catchUp: reconcile || !driveMounted,
+            reconcile: reconcile,
+            jobID: jobID
+        )
     }
 
     /// `catchUp`: NAS copies of files moved before the NAS followed them
@@ -7362,7 +7386,8 @@ final class EventsWorkspace {
     /// after the copy, stale NAS duplicates of files already at their right
     /// path are set aside (never deleted). Renames queued by moves are
     /// always applied first.
-    private func startNASSync(events: [SavedCameraEvent], title: String, refresh: [UUID], catchUp: Bool, reconcile: Bool) {
+    /// `jobID`: the queued row this sync starts (`enqueueFileJob`), or nil.
+    private func startNASSync(events: [SavedCameraEvent], title: String, refresh: [UUID], catchUp: Bool, reconcile: Bool, jobID: UUID? = nil) {
         let locations = self.locations
         // A live check: the user just asked, so the cached answer may be old.
         guard VolumeInfo.isAvailable(locations.nasRoot), FileManager.default.fileExists(atPath: locations.nasRoot.path) else {
@@ -7376,7 +7401,7 @@ final class EventsWorkspace {
         let options = NASSyncOptions.from(configuration: model.configuration, nasRoot: nasRoot)
         // Sync to NAS feeds its own recorder: per-second speed from the
         // engine, and a row per file.
-        let recorder = model.makeHistoryRecorder(action: .syncBuffer, title: "Synced \(title) to the NAS")
+        let recorder = model.makeHistoryRecorder(action: .syncBuffer, title: "Synced \(title) to the NAS", id: jobID ?? UUID())
         let nasPresence = self.nasPresence
         let renameQueue = nasRenameQueue
         let assignments = model.configuration.photoEventAssignments
@@ -7394,6 +7419,7 @@ final class EventsWorkspace {
             // Settled either way (done, failed, stopped): list the synced
             // folders again — unthrottled, and only those.
             onSettled: { nasPresence.refresh(.syncFinished, scope: events) },
+            jobID: jobID,
             operation: { progress in
                 progress(BackgroundJobUpdate(progress: 0.02, note: "Sync to NAS: renaming NAS copies of moved files"))
                 let store = try? NASSyncStore(catalogURL: catalogURL)
@@ -8282,6 +8308,8 @@ final class EventsWorkspace {
     /// The pets side of the People window and of a face scan — its own
     /// index beside the catalog (`PetIndexDatabase`).
     @ObservationIgnored lazy var petGallery = PetGallery(model: model)
+    /// Colour grades, log detection, imported LUTs and graded renders.
+    @ObservationIgnored lazy var grading = ClipGrading(workspace: self)
     /// Test seam: supplies the pet engine so a pet pass can run without
     /// the pet sidecar installed. Nil in production.
     @ObservationIgnored var petAnalyzerProvider: (@Sendable () async throws -> FaceAnalyzing?)?

@@ -299,6 +299,16 @@ private struct JobDetailContainer: View {
 
     private var pane: some View {
         ScrollView {
+            if let live, live.state == .running, model.stoppableJobIDs.contains(live.id) {
+                HStack {
+                    Spacer()
+                    Button("Stop", systemImage: "stop.fill", role: .cancel) {
+                        model.stopJob(id: live.id)
+                    }
+                    .help("Stop after the frame being written. The copy in progress is discarded; finished copies stay. Originals are never touched.")
+                }
+                .padding([.top, .horizontal], 20)
+            }
             JobActivityDetail(
                 live: live, detail: detail, monitor: monitor, zoom: $zoom, hover: hover,
                 showIssues: transfer == nil && !(detail?.items.isEmpty ?? true) ? { fileFilter = .issues } : nil,
@@ -668,6 +678,7 @@ struct JobListRow: View {
     static func runningSymbol(_ action: JobAction) -> String {
         switch action {
         case .faceScan: "person.crop.rectangle.stack"
+        case .gradeRender: "camera.filters"
         case .organize: "rectangle.3.group"
         case .nasRename: "arrow.left.arrow.right"
         case .ingestCard: "arrow.down.circle"
@@ -1213,6 +1224,7 @@ extension JobAction {
         case .faceScan: "Face Scan"
         case .nasRename: "NAS Rename"
         case .resolveConflict: "Resolve Conflict"
+        case .gradeRender: "Render Graded Copies"
         }
     }
 }

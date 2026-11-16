@@ -72,6 +72,9 @@ public enum EditTagLinker {
                 guard !JunkPolicy.isJunkFile(entry.name) else { continue }
                 let relative = String(entry.path.dropFirst(edited.count + 1))
                 let components = relative.split(separator: "/")
+                // A render still being written (or one a crash left) is not
+                // an edit; neither is anything under a temporary folder.
+                guard !components.contains(where: { NASSyncPlanner.isJunk(String($0)) }) else { continue }
                 let tag = components.count > 1 ? String(components[0]) : EventStorageLocations.editedFolderName
                 result.append(EditedFile(path: entry.path, tag: tag))
             }
@@ -81,7 +84,7 @@ public enum EditTagLinker {
 
     /// The name an edit and its original share: lowercased, without
     /// extensions, burst prefix (`B0012_`), a Keep Both `(N)`, or an edit
-    /// suffix (`-edit`, `_Edited`, ` copy`, `-Edit-2`). `DSC06778.ARW`,
+    /// suffix (`-edit`, `_Edited`, ` copy`, `-Edit-2`, a graded `_709`). `DSC06778.ARW`,
     /// `DSC06778.jpg` and `DSC06778-edit.jpg` all give `dsc06778`.
     public static func stem(of name: String) -> String {
         var stem = name.lowercased()
@@ -91,6 +94,8 @@ public enum EditTagLinker {
         let patterns = [
             #"\s*\(\d+\)$"#,
             #"[-_ ](edit|edited|copy|final)([-_ ]?\d+)?$"#,
+            // A graded copy this app rendered (`GradedRenderNaming`).
+            #"_709$"#,
         ]
         var changed = true
         while changed {
