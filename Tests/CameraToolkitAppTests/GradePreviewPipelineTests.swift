@@ -33,11 +33,11 @@ final class GradePreviewPipelineTests: XCTestCase {
         let ready = await VideoPreviewSupport.readyPlayer(for: clip)
         let player = try XCTUnwrap(ready)
         let item = try XCTUnwrap(player.currentItem)
-        let live = GradeLiveState(recipe: SyntheticSLog3Clip.recipe)
+        let live = GradeLiveState(recipe: SyntheticSLog3Clip.recipe(range: .video))
         let composition = try await GradeRenderer.shared.videoComposition(for: item.asset, live: live)
         // The same composition the player gets, drawn offscreen.
         let graded = try await Self.firstFrame(of: item.asset, composition: composition)
-        let expected = SyntheticSLog3Clip.expectedGraded
+        let expected = SyntheticSLog3Clip.expectedGraded(range: .video)
         for (index, patch) in SyntheticSLog3Clip.patches.enumerated() {
             assertClose(Self.sample(graded, patch: index), expected[index], accuracy: 0.03, "graded \(patch.name)")
         }
@@ -58,10 +58,16 @@ final class GradePreviewPipelineTests: XCTestCase {
     /// the log gamut a second time: the red patch lost nearly all its green
     /// (a magenta cast) in the thumbnails and in playback.
     func testStillThumbnailAndPlaybackMatchThePipelineForEachTag() async throws {
-        for primaries in [SyntheticSLog3Clip.Primaries.rec709, .rec2020] {
-            let clip = try await SyntheticSLog3Clip.write(to: folder.appendingPathComponent("C-\(primaries).MP4"), primaries: primaries)
-            let expected = SyntheticSLog3Clip.expectedGraded
-            let recipe = SyntheticSLog3Clip.recipe
+        // Video range tagged both ways, and what a Sony A7V body writes:
+        // full range with no colour tags at all.
+        let cases: [(SyntheticSLog3Clip.Primaries, VideoSignalRange)] = [(.rec709, .video), (.rec2020, .video), (.untagged, .full)]
+        for (primaries, range) in cases {
+            let clip = try await SyntheticSLog3Clip.write(to: folder.appendingPathComponent("C-\(primaries)-\(range).MP4"), primaries: primaries, range: range)
+            // The range is read from the file, as the app does.
+            let read = await GradeRenderer().signalRange(of: clip)
+            XCTAssertEqual(read, range, "\(primaries): signal range read from the file")
+            let expected = SyntheticSLog3Clip.expectedGraded(range: range)
+            let recipe = SyntheticSLog3Clip.recipe(range: range)
 
             let grabbed = await GradeFrameGrabber(url: clip).frame(at: .zero)
             let frame = try XCTUnwrap(grabbed, "\(primaries)")
@@ -114,11 +120,12 @@ final class GradePreviewPipelineTests: XCTestCase {
     }
 }
 
-/// A two-frame 10-bit HEVC clip of flat S-Log3 / S-Gamut3.Cine patches in
-/// video range, the way a Sony body records, tagged Rec.709 or BT.2020.
+/// A two-frame 10-bit HEVC clip of flat S-Log3 / S-Gamut3.Cine patches,
+/// full or video range, tagged Rec.709, BT.2020 or not at all (a Sony A7V
+/// writes full range with no colour tags; its sidecar says Rec.709 coding).
 enum SyntheticSLog3Clip {
     enum Primaries: String, CustomStringConvertible {
-        case rec709, rec2020
+        case rec709, rec2020, untagged
         var description: String { rawValue }
     }
 
@@ -137,11 +144,12 @@ enum SyntheticSLog3Clip {
         Patch(name: "sky", linear709: SIMD3(0.11, 0.18, 0.30)),
     ]
 
-    static let range = VideoSignalRange.video
-    static let recipe = GradeRecipe(grade: .converted, profile: .sLog3SGamut3Cine, conversion: .builtIn, range: range)
+    static func recipe(range: VideoSignalRange) -> GradeRecipe {
+        GradeRecipe(grade: .converted, profile: .sLog3SGamut3Cine, conversion: .builtIn, range: range)
+    }
 
     /// Each patch's decoded value (0…1 R′G′B′ as the decoder hands it over).
-    static var decoded: [SIMD3<Double>] {
+    static func decoded(range: VideoSignalRange) -> [SIMD3<Double>] {
         let toCine = RGBPrimaries.rec709.conversion(to: .sGamut3Cine)
         return patches.map { patch in
             let cine = toCine.apply(patch.linear709)
@@ -153,34 +161,44 @@ enum SyntheticSLog3Clip {
         }
     }
 
-    static var expectedGraded: [SIMD3<Double>] {
-        let pipeline = GradePipeline(recipe: recipe)
-        return decoded.map { pipeline.apply($0) }
+    static func expectedGraded(range: VideoSignalRange) -> [SIMD3<Double>] {
+        let pipeline = GradePipeline(recipe: recipe(range: range))
+        return decoded(range: range).map { pipeline.apply($0) }
     }
 
-    static func write(to url: URL, primaries: Primaries) async throws -> URL {
-        let width = 64 * patches.count, height = 128
+    static func write(to url: URL, primaries: Primaries, range: VideoSignalRange = .video) async throws -> URL {
+        // HD, as the camera records: for a clip with no colour tags
+        // VideoToolbox guesses the YCbCr matrix from the frame size (BT.601
+        // below HD, BT.709 at HD and up), and Sony's untagged clips are
+        // coded BT.709.
+        let width = 1_920, height = 1_080
         let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
-        let (primariesKey, matrixKey, kr, kb): (String, String, Double, Double) = switch primaries {
+        // An untagged clip is still coded with the Rec.709 matrix.
+        let (primariesKey, matrixKey, kr, kb): (String?, String?, Double, Double) = switch primaries {
         case .rec709: (AVVideoColorPrimaries_ITU_R_709_2, AVVideoYCbCrMatrix_ITU_R_709_2, 0.2126, 0.0722)
         case .rec2020: (AVVideoColorPrimaries_ITU_R_2020, AVVideoYCbCrMatrix_ITU_R_2020, 0.2627, 0.0593)
+        case .untagged: (nil, nil, 0.2126, 0.0722)
         }
-        let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
+        var settings: [String: Any] = [
             AVVideoCodecKey: AVVideoCodecType.hevc,
             AVVideoWidthKey: width,
             AVVideoHeightKey: height,
-            AVVideoColorPropertiesKey: [
-                AVVideoColorPrimariesKey: primariesKey,
-                AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
-                AVVideoYCbCrMatrixKey: matrixKey,
-            ],
             AVVideoCompressionPropertiesKey: [
                 AVVideoProfileLevelKey: kVTProfileLevel_HEVC_Main10_AutoLevel as String,
                 AVVideoAverageBitRateKey: 20_000_000,
             ],
-        ])
+        ]
+        if let primariesKey, let matrixKey {
+            settings[AVVideoColorPropertiesKey] = [
+                AVVideoColorPrimariesKey: primariesKey,
+                AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
+                AVVideoYCbCrMatrixKey: matrixKey,
+            ]
+        }
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
         input.expectsMediaDataInRealTime = false
-        let format = kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+        let full = range == .full
+        let format = full ? kCVPixelFormatType_420YpCbCr10BiPlanarFullRange : kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
         let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input, sourcePixelBufferAttributes: [
             kCVPixelBufferPixelFormatTypeKey as String: format,
             kCVPixelBufferWidthKey as String: width,
@@ -189,15 +207,17 @@ enum SyntheticSLog3Clip {
         writer.add(input)
         guard writer.startWriting() else { throw writer.error ?? CocoaError(.fileWriteUnknown) }
         writer.startSession(atSourceTime: .zero)
-        let values = decoded
+        let values = decoded(range: range)
         for frame in 0..<2 {
             while !input.isReadyForMoreMediaData { try await Task.sleep(for: .milliseconds(5)) }
             var buffer: CVPixelBuffer?
             CVPixelBufferCreate(nil, width, height, format, [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary, &buffer)
             let pixels = try XCTUnwrap(buffer)
-            CVBufferSetAttachment(pixels, kCVImageBufferColorPrimariesKey, primariesKey as CFString, .shouldPropagate)
-            CVBufferSetAttachment(pixels, kCVImageBufferYCbCrMatrixKey, matrixKey as CFString, .shouldPropagate)
-            CVBufferSetAttachment(pixels, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2, .shouldPropagate)
+            if let primariesKey, let matrixKey {
+                CVBufferSetAttachment(pixels, kCVImageBufferColorPrimariesKey, primariesKey as CFString, .shouldPropagate)
+                CVBufferSetAttachment(pixels, kCVImageBufferYCbCrMatrixKey, matrixKey as CFString, .shouldPropagate)
+                CVBufferSetAttachment(pixels, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2, .shouldPropagate)
+            }
             CVPixelBufferLockBaseAddress(pixels, [])
             let luma = CVPixelBufferGetBaseAddressOfPlane(pixels, 0)!.assumingMemoryBound(to: UInt16.self)
             let chroma = CVPixelBufferGetBaseAddressOfPlane(pixels, 1)!.assumingMemoryBound(to: UInt16.self)
@@ -206,9 +226,11 @@ enum SyntheticSLog3Clip {
             func ycbcr(_ v: SIMD3<Double>) -> (UInt16, UInt16, UInt16) {
                 let y = kr * v.x + (1 - kr - kb) * v.y + kb * v.z
                 let cb = (v.z - y) / (2 * (1 - kb)), cr = (v.x - y) / (2 * (1 - kr))
-                // 10-bit video range, MSB-aligned in 16 bits.
+                // 10-bit, MSB-aligned in 16 bits.
                 func q(_ x: Double) -> UInt16 { UInt16(min(max(x.rounded(), 0), 1023)) << 6 }
-                return (q(64 + 876 * y), q(512 + 896 * cb), q(512 + 896 * cr))
+                return full
+                    ? (q(1023 * y), q(512 + 1023 * cb), q(512 + 1023 * cr))
+                    : (q(64 + 876 * y), q(512 + 896 * cb), q(512 + 896 * cr))
             }
             for row in 0..<height {
                 for column in 0..<width {
