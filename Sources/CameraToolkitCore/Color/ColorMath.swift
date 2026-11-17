@@ -74,6 +74,8 @@ public struct RGBPrimaries: Equatable, Sendable {
     public static let sGamut3Cine = RGBPrimaries(red: [0.766, 0.275], green: [0.225, 0.800], blue: [0.089, -0.087], white: d65)
     /// Sony S-Gamut3 (same document).
     public static let sGamut3 = RGBPrimaries(red: [0.730, 0.280], green: [0.140, 0.855], blue: [0.100, -0.050], white: d65)
+    /// ITU-R BT.2020.
+    public static let rec2020 = RGBPrimaries(red: [0.708, 0.292], green: [0.170, 0.797], blue: [0.131, 0.046], white: d65)
 
     private static func xyz(_ xy: SIMD2<Double>) -> SIMD3<Double> {
         SIMD3(xy.x / xy.y, 1, (1 - xy.x - xy.y) / xy.y)

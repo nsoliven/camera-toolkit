@@ -281,6 +281,7 @@ final class GradeFrameGrabber: @unchecked Sendable {
         }
         guard start else { return nil }
         defer { lock.withLock { busy = false } }
-        return try? await generator.image(at: time).image
+        // The grade reads code values: never let a BT.2020 tag colour-match them.
+        return (try? await generator.image(at: time).image).map(GradeRenderer.codeValues(ofDecodedFrame:))
     }
 }

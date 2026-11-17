@@ -1,4 +1,5 @@
 @testable import CameraToolkitCore
+import CoreMedia
 import XCTest
 
 /// The colour math against Sony's published S-Log3 / S-Gamut3 figures
@@ -83,6 +84,66 @@ final class ColorGradingMathTests: XCTestCase {
         let m = RGBPrimaries.sGamut3Cine.toXYZ
         let product = m * m.inverse
         assertMatrix(product, [[1, 0, 0], [0, 1, 0], [0, 0, 1]], accuracy: 1e-12)
+    }
+
+    func testRec2020MatrixMatchesTheStandard() {
+        assertMatrix(RGBPrimaries.rec2020.toXYZ, [
+            [0.6369580, 0.1446169, 0.1688810],
+            [0.2627002, 0.6779981, 0.0593017],
+            [0.0000000, 0.0280727, 1.0609851],
+        ], accuracy: 1e-6)
+    }
+
+    /// A synthetic S-Log3 grey ramp through the built-in conversion, against
+    /// Sony's published curve and the Rec.709 OETF computed by hand: every
+    /// step lands where the formulas put it and stays neutral, in both
+    /// signal ranges.
+    func testSLog3GreyRampMatchesThePublishedFormulasAndStaysNeutral() {
+        for range in [VideoSignalRange.full, .video] {
+            let pipeline = GradePipeline(recipe: GradeRecipe(grade: .converted, profile: .sLog3SGamut3Cine, range: range))
+            var last = -1.0
+            for reflection in [0.0, 0.01, 0.02, 0.045, 0.09, 0.18, 0.36, 0.72, 0.9, 1.5, 2.5, 5.0] {
+                // Sony: CV = 420 + 261.5·log10((x + 0.01) / 0.19) above the toe.
+                let cv = reflection >= 0.01125
+                    ? (420 + log10((reflection + 0.01) / 0.19) * 261.5) / 1023
+                    : (reflection * (171.2102946929 - 95) / 0.01125 + 95) / 1023
+                let out = pipeline.apply(SIMD3(repeating: range.decoded(fromCodeValue: cv)))
+                let expected = Rec709Transfer.encode(DisplayRendering.toneCurve(reflection))
+                XCTAssertEqual(out.x, expected, accuracy: 1e-6, "\(range) \(reflection)")
+                XCTAssertEqual(out.x, out.y, accuracy: 1e-9, "neutral \(range) \(reflection)")
+                XCTAssertEqual(out.y, out.z, accuracy: 1e-9, "neutral \(range) \(reflection)")
+                XCTAssertGreaterThanOrEqual(out.x, last)
+                last = out.x
+            }
+        }
+    }
+
+    /// AVFoundation draws a BT.2020-tagged track into a Rec.709
+    /// composition by a gamut conversion in linear light; the undo cube
+    /// takes that rendition back to the track's code values.
+    func testSourceGamutUndoInvertsTheRec2020ToRec709Rendition() throws {
+        XCTAssertNil(GradeRenderer.sourceGamutUndo(primaries: kCMFormatDescriptionColorPrimaries_ITU_R_709_2 as String))
+        XCTAssertNil(GradeRenderer.sourceGamutUndo(primaries: nil))
+        let data = try XCTUnwrap(GradeRenderer.sourceGamutUndo(primaries: kCMFormatDescriptionColorPrimaries_ITU_R_2020 as String))
+        let size = GradeRenderer.previewCubeSize
+        let floats = data.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
+        XCTAssertEqual(floats.count, size * size * size * 4)
+        let to709 = RGBPrimaries.rec2020.conversion(to: .rec709)
+        func rendition(_ v: SIMD3<Double>) -> SIMD3<Double> {
+            let l = to709.apply(SIMD3(Rec709Transfer.decode(v.x), Rec709Transfer.decode(v.y), Rec709Transfer.decode(v.z)))
+            return SIMD3(Rec709Transfer.encode(l.x), Rec709Transfer.encode(l.y), Rec709Transfer.encode(l.z))
+        }
+        // Log code values: low saturation, the rendition stays in range.
+        for code in [SIMD3(0.41, 0.41, 0.41), SIMD3(0.49, 0.36, 0.37), SIMD3(0.43, 0.51, 0.50), SIMD3(0.38, 0.42, 0.46)] {
+            let shown = rendition(code)
+            // Nearest texel is enough to show the cube points the right way.
+            let idx = SIMD3<Int>(Int((shown.x * Double(size - 1)).rounded()), Int((shown.y * Double(size - 1)).rounded()), Int((shown.z * Double(size - 1)).rounded()))
+            let i = ((idx.z * size + idx.y) * size + idx.x) * 4
+            let back = SIMD3(Double(floats[i]), Double(floats[i + 1]), Double(floats[i + 2]))
+            XCTAssertEqual(back.x, code.x, accuracy: 0.03)
+            XCTAssertEqual(back.y, code.y, accuracy: 0.03)
+            XCTAssertEqual(back.z, code.z, accuracy: 0.03)
+        }
     }
 
     // MARK: Display rendering

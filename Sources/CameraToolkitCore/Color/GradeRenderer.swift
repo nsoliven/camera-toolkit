@@ -123,6 +123,18 @@ public final class GradeRenderer: @unchecked Sendable {
         return managedContext.createCGImage(managed, from: managed.extent, format: .RGBA16, colorSpace: Self.outputColorSpace)
     }
 
+    /// A frame straight from the decoder (`AVAssetImageGenerator`) is
+    /// code values whatever it is tagged — `CoreMedia709`, or an unnamed
+    /// "QuickTime 'nclc' Video (9,1,9)" space for a clip tagged BT.2020.
+    /// Retagging (never colour matching) keeps those values: matching a
+    /// BT.2020-tagged log frame into Rec.709 expanded its gamut a second
+    /// time on top of the S-Gamut3.Cine conversion, pushing reds and skin
+    /// toward magenta.
+    public static func codeValues(ofDecodedFrame image: CGImage) -> CGImage {
+        guard image.colorSpace?.name != CGColorSpace.coreMedia709, image.colorSpace?.model == .rgb else { return image }
+        return image.copy(colorSpace: outputColorSpace) ?? image
+    }
+
     public func render(_ image: CIImage, extent: CGRect) -> CGImage? {
         guard let rendered = context.createCGImage(image, from: extent, format: .RGBA16, colorSpace: nil) else { return nil }
         return rendered.copy(colorSpace: Self.outputColorSpace) ?? rendered
@@ -258,6 +270,11 @@ extension GradeRenderer {
     /// Rec.709. Used by the preview player and by the renderer.
     public func videoComposition(for asset: AVAsset, live: GradeLiveState, cubeSize: Int = GradeRenderer.previewCubeSize) async throws -> AVVideoComposition {
         let context = self.context
+        // AVFoundation hands the handler frames already converted into the
+        // composition's Rec.709. For a track tagged BT.2020 that conversion
+        // moved the log code values; undo it before the grade reads them
+        // (the original side of a split keeps AVFoundation's picture).
+        let undo = try await Self.sourceGamutUndo(for: asset)
         let composition = try await AVMutableVideoComposition.videoComposition(with: asset) { [weak self] request in
             let source = request.sourceImage
             guard let self else {
@@ -269,7 +286,12 @@ extension GradeRenderer {
                 request.finish(with: source, context: context)
                 return
             }
-            let graded = self.apply(recipe, to: source, cubeSize: cubeSize)
+            var codeValues = source
+            if let undo, let filter = Self.colorCube(undo, size: Self.previewCubeSize) {
+                filter.setValue(source, forKey: kCIInputImageKey)
+                codeValues = filter.outputImage ?? source
+            }
+            let graded = self.apply(recipe, to: codeValues, cubeSize: cubeSize)
             if let wipe = state.wipe {
                 let extent = source.extent
                 let split = extent.minX + extent.width * min(max(wipe, 0), 1)
@@ -284,5 +306,35 @@ extension GradeRenderer {
         composition.colorTransferFunction = AVVideoTransferFunction_ITU_R_709_2
         composition.colorYCbCrMatrix = AVVideoYCbCrMatrix_ITU_R_709_2
         return composition
+    }
+
+    /// The cube that takes AVFoundation's Rec.709 rendition of a BT.2020
+    /// tagged track back to the track's own code values, or nil when the
+    /// track is Rec.709 (or untagged) and nothing moved.
+    static func sourceGamutUndo(for asset: AVAsset) async throws -> Data? {
+        guard let track = try await asset.loadTracks(withMediaType: .video).first,
+              let description = try await track.load(.formatDescriptions).first else { return nil }
+        return sourceGamutUndo(primaries: CMFormatDescriptionGetExtension(description, extensionKey: kCMFormatDescriptionExtension_ColorPrimaries) as? String)
+    }
+
+    static func sourceGamutUndo(primaries: String?) -> Data? {
+        guard primaries == (kCMFormatDescriptionColorPrimaries_ITU_R_2020 as String) else { return nil }
+        let toSource = RGBPrimaries.rec709.conversion(to: .rec2020)
+        let size = previewCubeSize
+        let scale = 1 / Double(size - 1)
+        var floats = [Float](repeating: 1, count: size * size * size * 4)
+        for b in 0..<size {
+            for g in 0..<size {
+                for r in 0..<size {
+                    let shown = SIMD3(Double(r) * scale, Double(g) * scale, Double(b) * scale)
+                    let linear = toSource.apply(SIMD3(Rec709Transfer.decode(shown.x), Rec709Transfer.decode(shown.y), Rec709Transfer.decode(shown.z)))
+                    let index = ((b * size + g) * size + r) * 4
+                    floats[index] = Float(min(max(Rec709Transfer.encode(linear.x), 0), 1))
+                    floats[index + 1] = Float(min(max(Rec709Transfer.encode(linear.y), 0), 1))
+                    floats[index + 2] = Float(min(max(Rec709Transfer.encode(linear.z), 0), 1))
+                }
+            }
+        }
+        return floats.withUnsafeBufferPointer { Data(buffer: $0) }
     }
 }
