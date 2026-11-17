@@ -275,7 +275,35 @@ public final class GradedVideoExporter: @unchecked Sendable {
     public static func identity(at url: URL, of request: GradedRenderRequest, timeout: TimeInterval = 20) -> GradedRenderIdentity {
         guard let tags = readTags(url, timeout: timeout) else { return .unknown }
         guard tags.source == request.sourceKey else { return .other }
-        return tags.grade == request.recipe.fingerprint ? .same : .olderGrade
+        guard let fingerprint = renderFingerprint(of: request, timeout: timeout) else { return .unknown }
+        return tags.grade == fingerprint ? .same : .olderGrade
+    }
+
+    /// The grade tag a copy of `request` carries
+    /// (`GradeRecipe.renderFingerprint`), or nil when the original's colour
+    /// tags could not be read within `timeout`.
+    public static func renderFingerprint(of request: GradedRenderRequest, timeout: TimeInterval = 20) -> String? {
+        guard let colour = sourceColourTags(request.source, timeout: timeout) else { return nil }
+        return request.recipe.renderFingerprint(sourcePrimaries: colour.primaries, sourceTransfer: colour.transfer)
+    }
+
+    /// The original's video colour primaries and transfer tags (nil inside
+    /// when untagged or unreadable); nil when nothing answered in time.
+    static func sourceColourTags(_ url: URL, timeout: TimeInterval) -> (primaries: String?, transfer: String?)? {
+        let asset = CameraVideoAsset.asset(for: url)
+        let semaphore = DispatchSemaphore(value: 0)
+        final class Box: @unchecked Sendable { var primaries: String?; var transfer: String? }
+        let box = Box()
+        Task.detached {
+            if let track = try? await asset.loadTracks(withMediaType: .video).first,
+               let description = try? await track.load(.formatDescriptions).first {
+                box.primaries = CMFormatDescriptionGetExtension(description, extensionKey: kCMFormatDescriptionExtension_ColorPrimaries) as? String
+                box.transfer = CMFormatDescriptionGetExtension(description, extensionKey: kCMFormatDescriptionExtension_TransferFunction) as? String
+            }
+            semaphore.signal()
+        }
+        guard semaphore.wait(timeout: .now() + timeout) == .success else { return nil }
+        return (box.primaries, box.transfer)
     }
 
     /// The copy's grade and source tags; nil when they could not be read
@@ -560,7 +588,7 @@ public final class GradedVideoExporter: @unchecked Sendable {
         if let make = request.make { add(.quickTimeMetadataMake, make) }
         if let model = request.model { add(.quickTimeMetadataModel, model) }
         add(.quickTimeMetadataSoftware, "Camera Toolkit")
-        addCustom(Self.metadataGradeKey, request.recipe.fingerprint)
+        addCustom(Self.metadataGradeKey, Self.renderFingerprint(of: request) ?? request.recipe.fingerprint)
         addCustom(Self.metadataSourceKey, request.sourceKey)
         return items
     }

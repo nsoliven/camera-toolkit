@@ -355,6 +355,30 @@ final class ColorGradingMathTests: XCTestCase {
         XCTAssertEqual(base.shortFingerprint.count, 16)
     }
 
+    /// Copies rendered before the BT.2020 undo must count as an older grade,
+    /// but only those: every other source keeps its fingerprint byte for
+    /// byte, so existing Rec.709 and untagged copies are not rendered again.
+    func testRenderFingerprintChangesOnlyForLogFromSDRBT2020Sources() {
+        let log = GradeRecipe(grade: .converted, profile: .sLog3SGamut3Cine, range: .full)
+        let rec709 = GradeRecipe(grade: ClipGrade(look: .builtIn(.softFilm), intensity: 1), profile: nil, conversion: .none, range: .video)
+        let p709 = kCMFormatDescriptionColorPrimaries_ITU_R_709_2 as String
+        let p2020 = kCMFormatDescriptionColorPrimaries_ITU_R_2020 as String
+        let t709 = kCMFormatDescriptionTransferFunction_ITU_R_709_2 as String
+        let t2020 = kCMFormatDescriptionTransferFunction_ITU_R_2020 as String
+        let hlg = kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG as String
+        let pq = kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ as String
+        // Unchanged: untagged, Rec.709, HLG/PQ, and anything not log.
+        for (primaries, transfer) in [(nil, nil), (p709, t709), (p709, nil), (nil, t709), (p2020, hlg), (p2020, pq)] as [(String?, String?)] {
+            XCTAssertEqual(log.renderFingerprint(sourcePrimaries: primaries, sourceTransfer: transfer), log.fingerprint, "\(String(describing: primaries)) \(String(describing: transfer))")
+        }
+        XCTAssertEqual(rec709.renderFingerprint(sourcePrimaries: p2020, sourceTransfer: t709), rec709.fingerprint)
+        // Changed: log from BT.2020 with a 709, 2020 or absent transfer.
+        for transfer in [t709, t2020, nil] as [String?] {
+            XCTAssertEqual(log.renderFingerprint(sourcePrimaries: p2020, sourceTransfer: transfer), log.fingerprint + "|src2020v3")
+        }
+        XCTAssertEqual(GradeRecipe.pipelineVersion, 2, "a global bump would re-render every existing copy")
+    }
+
     // MARK: Helpers
 
     private func assertMatrix(_ m: ColorMatrix3, _ expected: [[Double]], accuracy: Double, file: StaticString = #filePath, line: UInt = #line) {

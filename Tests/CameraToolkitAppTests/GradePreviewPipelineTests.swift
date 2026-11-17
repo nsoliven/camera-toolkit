@@ -169,6 +169,32 @@ final class GradePreviewPipelineTests: XCTestCase {
         }
     }
 
+    /// A copy rendered before this fix from a BT.2020-tagged log clip
+    /// carried the plain fingerprint; it must read as an older grade so it is
+    /// rendered again. Rec.709 and untagged sources keep their fingerprint,
+    /// so their existing copies still count as rendered.
+    func testRenderedCopiesOfBT2020LogClipsAreNotReusedFromBeforeTheFix() async throws {
+        let recipe = SyntheticSLog3Clip.recipe(range: .video)
+        func request(_ clip: URL, output: URL) -> GradedRenderRequest {
+            GradedRenderRequest(source: clip, recipe: recipe, sourceKey: clip.lastPathComponent, sourceModifiedAt: Date(), outputFolder: output)
+        }
+        for (primaries, range) in [(SyntheticSLog3Clip.Primaries.rec709, VideoSignalRange.video), (.untagged, .full)] {
+            let clip = try await SyntheticSLog3Clip.write(to: folder.appendingPathComponent("F-\(primaries).MP4"), primaries: primaries, range: range)
+            XCTAssertEqual(GradedVideoExporter.renderFingerprint(of: request(clip, output: folder)), recipe.fingerprint, "\(primaries)")
+        }
+        let clip = try await SyntheticSLog3Clip.write(to: folder.appendingPathComponent("F-2020.MP4"), primaries: .rec2020)
+        let output = folder.appendingPathComponent("Edited/Rec709", isDirectory: true)
+        let renderRequest = request(clip, output: output)
+        let fingerprint = try XCTUnwrap(GradedVideoExporter.renderFingerprint(of: renderRequest))
+        XCTAssertEqual(fingerprint, recipe.fingerprint + "|src2020v3")
+        XCTAssertNotEqual(fingerprint, recipe.fingerprint, "a copy tagged before the fix reads as an older grade")
+        // A copy rendered now carries the new tag and is recognised as this render.
+        let outcome = try GradedVideoExporter(renderer: GradeRenderer()).render(renderRequest)
+        let tags = try XCTUnwrap(GradedVideoExporter.readTags(outcome.url))
+        XCTAssertEqual(tags.grade, fingerprint)
+        XCTAssertEqual(GradedVideoExporter.identity(at: outcome.url, of: renderRequest), .same)
+    }
+
     // MARK: Helpers
 
     /// The first frame through `composition`, as a player would draw it.

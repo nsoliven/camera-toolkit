@@ -409,10 +409,17 @@ extension GradeRenderer {
         )
     }
 
-    static func sourceGamutUndo(primaries: String?, transfer: String?) -> Data? {
-        guard primaries == (kCMFormatDescriptionColorPrimaries_ITU_R_2020 as String) else { return nil }
+    /// Whether AVFoundation converts this track BT.2020 → Rec.709 before the
+    /// composition handler, which the composition then undoes for log:
+    /// BT.2020 primaries with a 709, 2020 or absent transfer.
+    public static func undoesSourceGamut(primaries: String?, transfer: String?) -> Bool {
+        guard primaries == (kCMFormatDescriptionColorPrimaries_ITU_R_2020 as String) else { return false }
         let sdrTransfers: Set<String> = [kCMFormatDescriptionTransferFunction_ITU_R_709_2 as String, kCMFormatDescriptionTransferFunction_ITU_R_2020 as String]
-        guard transfer.map(sdrTransfers.contains) ?? true else { return nil }
+        return transfer.map(sdrTransfers.contains) ?? true
+    }
+
+    static func sourceGamutUndo(primaries: String?, transfer: String?) -> Data? {
+        guard undoesSourceGamut(primaries: primaries, transfer: transfer) else { return nil }
         let toSource = RGBPrimaries.rec709.conversion(to: .rec2020)
         let size = previewCubeSize
         let scale = 1 / Double(size - 1)
