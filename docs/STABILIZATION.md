@@ -62,11 +62,13 @@ No `-f`: Gyroflow never overwrites. If it ever wrote its default
 after the run, but only when the run made it.
 
 Runs never outlive the app. Each Gyroflow runs under a small `/bin/sh`
-guard. The guard ends it when the app's process is gone (crash, force quit),
+guard. The guard ends it when its own parent is no longer the app (crash,
+force quit; a reused pid can't fool it),
 and passes on Stop as SIGTERM, then SIGKILL. Quitting, including Quit
 Anyway with a render running, ends every run first. At launch, Gyroflow
-processes an earlier session left (only ones carrying `-t _ctk-stabilizing`)
-are ended. Then stabilizer partials written before this launch are swept
+processes an earlier session left are ended: only ones carrying
+`-t _ctk-stabilizing` whose app is gone (parent, or its guard's parent, is
+launchd). A run another open copy of the app is driving is left alone. Then stabilizer partials written before this launch are swept
 from the events' `Edited/Stabilized` and `Edited/Rec709` folders and the
 preview cache.
 
@@ -75,6 +77,10 @@ rate and length (Apple's ProRes target rates, about 13 GB a minute at UHD
 60p in HQ). A stabilized graded render needs room for the intermediate and
 the HEVC copy together, plus the 5 GB kept free. Otherwise the batch stops
 before that clip and says why.
+
+The Gyroflow search starts at launch. A render asked for while it is still
+running waits for it, so a clip set to Stabilize is never planned as graded
+only by accident.
 
 Without a Gyroflow that can render, clips set to Stabilize are graded
 alone, and the job says so. A graded copy is never skipped for it.

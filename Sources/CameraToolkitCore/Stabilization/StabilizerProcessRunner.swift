@@ -42,25 +42,19 @@ public struct FoundationProcessRunner: StabilizerProcessRunning {
     public init() {}
 
     /// `sh -c guardScript ctk-guard <parent pid> <tool> <args…>`: starts the
-    /// tool, prints its pid, ends it on TERM/INT/HUP and when the parent
-    /// pid is gone, and exits with the tool's status.
-    static let guardScript = """
-    parent=$1; shift
-    "$@" &
-    child=$!
-    echo "CTK_CHILD_PID=$child"
-    stop() {
-      kill -TERM $child 2>/dev/null
-      for i in 1 2 3 4 5 6 7 8 9 10; do kill -0 $child 2>/dev/null || break; sleep 0.2; done
-      kill -KILL $child 2>/dev/null
-    }
-    trap 'stop; exit 143' TERM INT HUP
-    while kill -0 $child 2>/dev/null; do
-      if ! kill -0 $parent 2>/dev/null; then stop; exit 1; fi
-      sleep 1
-    done
-    wait $child
-    """
+    /// tool, prints its pid, ends it on TERM/INT/HUP and when the guard's
+    /// own parent is no longer the app (its ppid changes when the app goes,
+    /// which a reused pid cannot fake), and exits with the tool's status.
+    /// One line, so a process listing shows it on one line.
+    static let guardScript = [
+        "parent=$1; shift",
+        "\"$@\" & child=$!",
+        "echo \"CTK_CHILD_PID=$child\"",
+        "stop() { kill -TERM $child 2>/dev/null; for i in 1 2 3 4 5 6 7 8 9 10; do kill -0 $child 2>/dev/null || break; sleep 0.2; done; kill -KILL $child 2>/dev/null; }",
+        "trap 'stop; exit 143' TERM INT HUP",
+        "while kill -0 $child 2>/dev/null; do if [ \"$(ps -o ppid= -p $$ | tr -d ' ')\" != \"$parent\" ]; then stop; exit 1; fi; sleep 1; done",
+        "wait $child",
+    ].joined(separator: "; ")
 
     public static let childPIDPrefix = "CTK_CHILD_PID="
 
@@ -156,21 +150,41 @@ public enum StabilizerProcesses {
         lock.withLock { live.subtract(pids) }
     }
 
-    /// Process ids, from a `ps -axo pid=,command=` listing, of runs this
-    /// app started: a Gyroflow executable (`…/Contents/MacOS/gyroflow`)
-    /// given this app's scratch suffix (`-t _ctk-stabilizing`), which
-    /// nothing else uses. The person's own Gyroflow, a shell that merely
-    /// mentions the suffix, and this process are never matched. (A guard
-    /// shell ends by itself once its Gyroflow is gone.)
+    /// Process ids, from a `ps -axo pid=,ppid=,command=` listing, of
+    /// orphaned runs: a Gyroflow executable (`…/Contents/MacOS/gyroflow`)
+    /// given this app's scratch suffix (`-t _ctk-stabilizing`) whose app is
+    /// gone — the Gyroflow's own parent is launchd (pid 1), or its parent
+    /// is a `ctk-guard` shell whose parent is launchd. A run another live
+    /// instance of the app is driving (its guard's parent is that app) is
+    /// never matched; nor is the person's own Gyroflow, a shell that only
+    /// mentions the suffix, or this process.
     public static func leftoverPIDs(inListing listing: String, own: pid_t = getpid()) -> [pid_t] {
-        listing.split(separator: "\n").compactMap { line in
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            guard let pid = pid_t(trimmed.prefix { $0.isNumber }), pid != own else { return nil }
-            let command = trimmed.drop { $0.isNumber }.trimmingCharacters(in: .whitespaces)
-            guard let marker = command.range(of: "/Contents/MacOS/gyroflow ") else { return nil }
-            guard command[marker.upperBound...].contains("-t \(GyroflowCommand.scratchSuffix) ") || command.hasSuffix("-t \(GyroflowCommand.scratchSuffix)") else { return nil }
-            return pid
+        struct Entry { let pid: pid_t; let ppid: pid_t; let command: Substring }
+        var entries: [pid_t: Entry] = [:]
+        var order: [pid_t] = []
+        for line in listing.split(separator: "\n") {
+            let fields = line.split(separator: " ", maxSplits: 2, omittingEmptySubsequences: true)
+            guard fields.count == 3, let pid = pid_t(fields[0]), let ppid = pid_t(fields[1]) else { continue }
+            entries[pid] = Entry(pid: pid, ppid: ppid, command: fields[2])
+            order.append(pid)
         }
+        var result: [pid_t] = []
+        for pid in order {
+            guard pid != own, let entry = entries[pid] else { continue }
+            let command = entry.command
+            // The guard's own line names Gyroflow too; it is matched through
+            // its Gyroflow below.
+            guard !command.contains("ctk-guard"), let marker = command.range(of: "/Contents/MacOS/gyroflow ") else { continue }
+            let rest = command[marker.upperBound...]
+            guard rest.contains("-t \(GyroflowCommand.scratchSuffix) ") || rest.hasSuffix("-t \(GyroflowCommand.scratchSuffix)") else { continue }
+            if entry.ppid == 1 {
+                result.append(pid)
+            } else if let parent = entries[entry.ppid], parent.command.contains("ctk-guard"), parent.ppid == 1 {
+                result.append(parent.pid)
+                result.append(pid)
+            }
+        }
+        return result
     }
 
     /// Ends stabilizer runs a crashed or force-quit session left behind,
@@ -179,7 +193,7 @@ public enum StabilizerProcesses {
     public static func killLeftovers(grace: TimeInterval = 2) -> Int {
         let ps = Process()
         ps.executableURL = URL(fileURLWithPath: "/bin/ps")
-        ps.arguments = ["-axo", "pid=,command="]
+        ps.arguments = ["-axo", "pid=,ppid=,command="]
         let pipe = Pipe()
         ps.standardOutput = pipe
         ps.standardError = FileHandle.nullDevice

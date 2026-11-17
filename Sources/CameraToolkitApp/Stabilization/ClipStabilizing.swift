@@ -28,8 +28,18 @@ final class ClipStabilizing {
     @ObservationIgnored private var probing: Set<String> = []
     /// Builds the engine; tests hand in one with a fake runner.
     @ObservationIgnored var makeStabilizer: @MainActor () -> Stabilizer?
+    /// Finds Gyroflow (reads code signatures; run off the main actor).
+    @ObservationIgnored private let locator: @Sendable () -> GyroflowInstallation?
+    /// The search under way, for planners to wait on (`ensureAvailability`).
+    @ObservationIgnored private var search: Task<Void, Never>?
 
-    init(grading: ClipGrading, store: StabilizationStore? = nil, installation: GyroflowInstallation?? = nil) {
+    init(
+        grading: ClipGrading,
+        store: StabilizationStore? = nil,
+        installation: GyroflowInstallation?? = nil,
+        locator: (@Sendable () -> GyroflowInstallation?)? = nil
+    ) {
+        self.locator = locator ?? { GyroflowInstallation.locate() }
         self.grading = grading
         let catalog = URL(fileURLWithPath: DashboardModel.expandedPath(grading.model.configuration.catalogDatabasePath))
         let store = store ?? (grading.model.configuration.catalogDatabasePath.isEmpty ? nil : StabilizationStore(catalogURL: catalog))
@@ -39,10 +49,22 @@ final class ClipStabilizing {
             availability = StabilizerAvailability(installation)
             makeStabilizer = { StabilizerAvailability(installation).installation.map { Stabilizer(installation: $0) } }
         } else {
-            // The search checks code signatures: off the main actor.
+            // The search checks code signatures: off the main actor. Made
+            // at launch (`StabilizeLifecycle`), so it is done long before a
+            // render asks; a planner that does ask while it runs waits.
             availability = .checking
             makeStabilizer = { nil }
             refreshAvailability()
+        }
+    }
+
+    /// Returns once Gyroflow's availability is known. Planners call it
+    /// before deciding which clips are stabilized: `.checking` is a wait,
+    /// never "unavailable" (that would plan stabilized clips as graded
+    /// only, and their stabilized copies would read as older grades).
+    func ensureAvailability() async {
+        while availability == .checking, let search {
+            await search.value
         }
     }
 
@@ -51,8 +73,10 @@ final class ClipStabilizing {
 
     /// Looks for Gyroflow again (after the person installed it).
     func refreshAvailability() {
-        Task { @MainActor [weak self] in
-            let found = await Task.detached(priority: .utility) { GyroflowInstallation.locate() }.value
+        availability = .checking
+        let locate = locator
+        search = Task { @MainActor [weak self] in
+            let found = await Task.detached(priority: .userInitiated) { locate() }.value
             guard let self else { return }
             availability = StabilizerAvailability(found)
             makeStabilizer = { StabilizerAvailability(found).installation.map { Stabilizer(installation: $0) } }
@@ -243,6 +267,13 @@ final class ClipStabilizing {
 
     /// Queues one job that makes the stabilized-only copies of `items`.
     func renderStabilizedCopies(of items: [OrganizeItem], in stacks: [OrganizeStack], boardEventID: UUID?) {
+        if availability == .checking {
+            Task { @MainActor [weak self] in
+                await self?.ensureAvailability()
+                self?.renderStabilizedCopies(of: items, in: stacks, boardEventID: boardEventID)
+            }
+            return
+        }
         guard let stabilizer = makeStabilizer() else {
             model.statusMessage = availability.problem ?? "Gyroflow is needed to stabilize."
             return

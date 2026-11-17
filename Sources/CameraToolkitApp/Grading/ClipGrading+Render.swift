@@ -83,6 +83,14 @@ extension ClipGrading {
 
     /// Queues one job that renders every graded clip among `stacks`.
     func renderGradedCopies(of stacks: [OrganizeStack], boardEventID: UUID?, includeStabilizeOnly: Bool = true) {
+        // Which clips are stabilized depends on Gyroflow: wait for the search.
+        if stabilizing.availability == .checking {
+            Task { @MainActor [weak self] in
+                await self?.stabilizing.ensureAvailability()
+                self?.renderGradedCopies(of: stacks, boardEventID: boardEventID, includeStabilizeOnly: includeStabilizeOnly)
+            }
+            return
+        }
         let plan = renderPlan(for: stacks, boardEventID: boardEventID)
         // Stabilized clips without a grade get their stabilized-only copy.
         let stabilizeOnly = includeStabilizeOnly ? stabilizing.stabilizeOnlyItems(in: stacks) : []
@@ -157,9 +165,12 @@ extension ClipGrading {
         )
         let renderer = self.renderer
         let model = self.model
-        let stabilization = stabilizing.renderStabilizationMap()
+        let stabilizing = self.stabilizing
         model.statusMessage = "Looking for graded log clips to render before the sync…"
         Task { @MainActor [weak self] in
+            // Which clips are stabilized depends on Gyroflow: wait for the search.
+            await stabilizing.ensureAvailability()
+            let stabilization = stabilizing.renderStabilizationMap()
             let survey = await Task.detached(priority: .userInitiated) {
                 Self.surveyBeforeSync(inputs, renderer: renderer, stabilization: stabilization, progress: { done, total in
                     Task { @MainActor in

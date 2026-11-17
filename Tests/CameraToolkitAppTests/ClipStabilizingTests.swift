@@ -340,4 +340,74 @@ final class ClipStabilizingTests: XCTestCase {
         let left = (try? FileManager.default.subpathsOfDirectory(atPath: plain.outputFolder.path)) ?? []
         XCTAssertEqual(left, [url.lastPathComponent], "the intermediate is gone")
     }
+
+    /// Right after launch the Gyroflow search may still run. Render before
+    /// Sync and a manual render wait for it — never planning clips set to
+    /// Stabilize as graded only (their stabilized copies would read as
+    /// older grades and get plain "(2)" duplicates).
+    func testPlannersWaitForTheGyroflowSearch() async throws {
+        try await withSandbox { root, model, workspace, _ in
+            let grading = workspace.grading
+            let found = Self.gyroflow
+            let slow = ClipStabilizing(grading: grading, installation: nil, locator: {
+                Thread.sleep(forTimeInterval: 0.8)
+                return found
+            })
+            grading.stabilizingStorage = slow
+            XCTAssertEqual(slow.availability, .checking)
+
+            let event = SavedCameraEvent(name: "Beach Day", eventDate: Date(timeIntervalSince1970: 1_780_000_000))
+            let date = Date(timeIntervalSince1970: 1_780_000_100)
+            model.updateConfiguration { configuration in
+                configuration.savedEvents = [event]
+                configuration.photoEventAssignments = [PhotoEventAssignment(
+                    sourceRootPath: root.appendingPathComponent("Card").path, relativePath: "C0001.MP4",
+                    fileSize: 64, modifiedAt: date, eventID: event.id, deviceID: "sony-a7v"
+                )]
+                configuration.gradeDefaults.setLook(.builtIn(.softFilm), for: .sLog3SGamut3Cine)
+                configuration.renderGradedCopiesBeforeSync = true
+            }
+            let assignment = model.configuration.photoEventAssignments[0]
+            let clip = try XCTUnwrap(workspace.locations.driveURL(for: assignment, event: event, policy: .buffer))
+            try FileManager.default.createDirectory(at: clip.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data(repeating: 1, count: 64).write(to: clip)
+            try Data(sidecar.utf8).write(to: clip.deletingLastPathComponent().appendingPathComponent("C0001M01.XML"))
+            let key = FaceIndexStore.fileKey(fileName: "C0001.MP4", byteCount: 64, modifiedAt: date)
+            slow.setStabilization(byKey: [(key, StabilizationSettings())], undoTitle: "Stabilize")
+
+            var asked: [ClipGrading.RenderBeforeSyncSummary] = []
+            grading.confirmRenderBeforeSync = { summary in
+                asked.append(summary)
+                return .cancel
+            }
+            UserDefaults.standard.removeObject(forKey: ClipGrading.renderBeforeSyncConfirmedKey)
+            defer { UserDefaults.standard.removeObject(forKey: ClipGrading.renderBeforeSyncConfirmedKey) }
+            grading.renderBeforeSyncIfWanted(events: [event], syncTitle: "Beach Day", syncNow: {}, queueSync: { _ in })
+            let deadline = ContinuousClock.now + .seconds(20)
+            while asked.isEmpty, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(20)) }
+            XCTAssertEqual(asked.first?.count, 1)
+            XCTAssertEqual(asked.first?.stabilized, 1, "the plan waited for the search and stabilizes the clip")
+            XCTAssertTrue(slow.availability.isReady)
+
+            // A manual render asked while the search runs also waits.
+            slow.refreshAvailability()
+            XCTAssertEqual(slow.availability, .checking)
+            model.isBusy = true
+            let xml = clip.deletingLastPathComponent().appendingPathComponent("C0001M01.XML")
+            let item = OrganizeItem(
+                primary: OrganizeFile(path: clip.path, size: 64, modifiedAt: date),
+                companions: [OrganizeFile(path: xml.path, size: Int64(sidecar.utf8.count), modifiedAt: date)],
+                kind: .video, captureDate: date, hasCameraDate: true
+            )
+            await grading.ensureDetected([item])
+            grading.renderGradedCopies(of: [OrganizeStack(items: [item])], boardEventID: event.id)
+            while !model.queuedFileJobs.contains(where: { $0.action == .gradeRender }), ContinuousClock.now < deadline + .seconds(20) {
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            let job = try XCTUnwrap(model.jobs.first { $0.action == .gradeRender && $0.state == .queued }, "\(model.statusMessage) \(model.jobs.map { "\($0.action) \($0.state)" })")
+            XCTAssertTrue(job.detail.contains("1 stabilized first"), job.detail)
+            model.cancelQueuedFileJob(id: job.id)
+            model.isBusy = false
+        }
+    }
 }

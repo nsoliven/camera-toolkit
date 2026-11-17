@@ -43,53 +43,55 @@ final class StabilizerHardeningTests: XCTestCase {
     func testTheGuardEndsTheToolWhenItsParentIsGone() throws {
         try withTemporaryDirectory { root in
             let tool = try fakeTool(in: root)
-            // A stand-in parent the test can kill, as a crash would.
-            let parent = Process()
-            parent.executableURL = URL(fileURLWithPath: "/bin/sleep")
-            parent.arguments = ["30"]
-            try parent.run()
-            let guardProcess = Process()
-            guardProcess.executableURL = URL(fileURLWithPath: "/bin/sh")
-            guardProcess.arguments = ["-c", FoundationProcessRunner.guardScript, "ctk-guard", String(parent.processIdentifier), tool.path, "-t", GyroflowCommand.scratchSuffix]
-            let pipe = Pipe()
-            guardProcess.standardOutput = pipe
-            try guardProcess.run()
+            let pids = root.appendingPathComponent("guard.out")
+            // A stand-in app the test can kill, as a crash would: it starts
+            // the guard (its child, with its own pid as the parent) and waits.
+            let app = Process()
+            app.executableURL = URL(fileURLWithPath: "/bin/sh")
+            app.arguments = ["-c", "/bin/sh -c \"$1\" ctk-guard $$ \"$2\" -t \(GyroflowCommand.scratchSuffix) > \"$3\" & wait", "app", FoundationProcessRunner.guardScript, tool.path, pids.path]
+            try app.run()
             var childPID: pid_t?
             let deadline = Date().addingTimeInterval(5)
-            var buffer = ""
             while childPID == nil, Date() < deadline {
-                buffer += String(decoding: pipe.fileHandleForReading.availableData, as: UTF8.self)
-                if let line = buffer.split(separator: "\n").first(where: { $0.hasPrefix(FoundationProcessRunner.childPIDPrefix) }) {
+                let text = (try? String(contentsOf: pids, encoding: .utf8)) ?? ""
+                if let line = text.split(separator: "\n").first(where: { $0.hasPrefix(FoundationProcessRunner.childPIDPrefix) }) {
                     childPID = pid_t(line.dropFirst(FoundationProcessRunner.childPIDPrefix.count))
                 }
+                Thread.sleep(forTimeInterval: 0.05)
             }
             let child = try XCTUnwrap(childPID)
-            XCTAssertTrue(isAlive(child))
-            parent.terminate()
-            parent.waitUntilExit()
+            Thread.sleep(forTimeInterval: 2.5)
+            XCTAssertTrue(isAlive(child), "the tool runs while its app is there")
+            kill(app.processIdentifier, SIGKILL)
+            app.waitUntilExit()
             let gone = Date().addingTimeInterval(6)
             while isAlive(child), Date() < gone { Thread.sleep(forTimeInterval: 0.1) }
-            XCTAssertFalse(isAlive(child), "the tool ended with its parent")
-            guardProcess.waitUntilExit()
+            XCTAssertFalse(isAlive(child), "the tool ended with its app")
         }
     }
 
-    func testLeftoversAreOnlyOurRuns() {
+    func testLeftoversAreOnlyOrphanedRunsOfThisApp() {
         let listing = """
-          101 /Applications/Gyroflow.app/Contents/MacOS/gyroflow /Volumes/Buffer/C0001.MP4 -t _ctk-stabilizing --stdout-progress --preset /tmp/x.gyroflow
-          102 /bin/zsh -c grep -E 'MacOS/gyroflow .* -t _ctk-stabilizing' log
-          103 /Applications/Gyroflow.app/Contents/MacOS/gyroflow /Volumes/Buffer/C0002.MP4 -f
-          104 /usr/bin/vim notes_ctk.txt
-          105 /Applications/Gyroflow.app/Contents/MacOS/gyroflow /Volumes/Buffer/C0003.MP4 -t _ctk-stabilizing
-          555 /Applications/Gyroflow.app/Contents/MacOS/gyroflow x -t _ctk-stabilizing
+          101     1 /Applications/Gyroflow.app/Contents/MacOS/gyroflow /Volumes/Buffer/C0001.MP4 -t _ctk-stabilizing --stdout-progress --preset /tmp/x.gyroflow
+          201     1 /bin/sh -c parent=$1; shift; ctk-guard 77 /Applications/Gyroflow.app/Contents/MacOS/gyroflow /Volumes/Buffer/C0002.MP4 -t _ctk-stabilizing
+          202   201 /Applications/Gyroflow.app/Contents/MacOS/gyroflow /Volumes/Buffer/C0002.MP4 -t _ctk-stabilizing --stdout-progress
+          300   900 /bin/sh -c parent=$1; shift; ctk-guard 900 /Applications/Gyroflow.app/Contents/MacOS/gyroflow /Volumes/Buffer/C0003.MP4 -t _ctk-stabilizing
+          301   300 /Applications/Gyroflow.app/Contents/MacOS/gyroflow /Volumes/Buffer/C0003.MP4 -t _ctk-stabilizing --stdout-progress
+          102   700 /bin/zsh -c grep -E 'MacOS/gyroflow .* -t _ctk-stabilizing' log
+          103     1 /Applications/Gyroflow.app/Contents/MacOS/gyroflow /Volumes/Buffer/C0004.MP4 -f
+          104   700 /usr/bin/vim notes_ctk.txt
+          555     1 /Applications/Gyroflow.app/Contents/MacOS/gyroflow x -t _ctk-stabilizing
         """
-        XCTAssertEqual(StabilizerProcesses.leftoverPIDs(inListing: listing, own: 555), [101, 105], "the person's own Gyroflow, shells that mention the suffix, and this process are left alone")
+        XCTAssertEqual(
+            StabilizerProcesses.leftoverPIDs(inListing: listing, own: 555), [101, 201, 202],
+            "orphans only: a run another live instance drives (300/301), the person's own Gyroflow, shells, and this process are left alone"
+        )
     }
 
     private func psListing() throws -> String {
         let ps = Process()
         ps.executableURL = URL(fileURLWithPath: "/bin/ps")
-        ps.arguments = ["-axo", "pid=,command="]
+        ps.arguments = ["-axo", "pid=,ppid=,command="]
         let pipe = Pipe()
         ps.standardOutput = pipe
         try ps.run()

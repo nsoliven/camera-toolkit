@@ -34,6 +34,8 @@ enum StabilizeLifecycle {
     /// exist are read; an offline drive or NAS is skipped.
     @MainActor
     static func cleanUpAtLaunch(workspace: EventsWorkspace) {
+        // Made now, so its Gyroflow search is done before any render asks.
+        _ = workspace.grading.stabilizing
         let folders = partialFolders(workspace: workspace)
         let launched = Date()
         Task.detached(priority: .utility) {
