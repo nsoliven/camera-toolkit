@@ -123,6 +123,32 @@ public struct ImmichClient: Sendable {
         }
     }
 
+    /// Asks Immich to read these assets' files again for their dates and
+    /// tags (the "refresh metadata" job; the key needs `job.create`). A
+    /// rewritten graded copy keeps its modification time, so a library scan
+    /// alone would not notice it changed.
+    public func refreshMetadata(assetIDs: [String]) async throws {
+        guard !assetIDs.isEmpty else { return }
+        for id in assetIDs { try Self.validate(id: id, kind: "asset") }
+        let path = "/assets/jobs"
+        guard let url = endpointURL(path) else {
+            throw ToolkitError.commandFailed("Immich endpoint URL is not valid")
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+        request.httpBody = try JSONEncoder().encode(AssetJobRequest(assetIds: assetIDs, name: "refresh-metadata"))
+        let (_, response) = try await transport.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw ToolkitError.commandFailed("Immich response was not HTTP")
+        }
+        guard (200..<300).contains(httpResponse.statusCode) else {
+            throw ToolkitError.commandFailed("Immich \(path) failed with HTTP \(httpResponse.statusCode)")
+        }
+    }
+
     /// File extensions the server imports (`.arw`, `.mp4`, …), lower-cased.
     public func supportedMediaExtensions() async throws -> Set<String> {
         let response: ServerMediaTypesResponse = try await get("/server/media-types", authenticated: false)
@@ -410,6 +436,11 @@ private struct StackResponse: Decodable {
     var id: String
     var primaryAssetId: String
     var assets: [Member]
+}
+
+private struct AssetJobRequest: Encodable {
+    var assetIds: [String]
+    var name: String
 }
 
 private struct StackCreateRequest: Encodable {

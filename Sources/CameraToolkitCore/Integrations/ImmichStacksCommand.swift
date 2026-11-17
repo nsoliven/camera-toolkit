@@ -13,7 +13,9 @@ import Foundation
 /// several. The API key comes from the Keychain inside this one process and
 /// is never printed. `--dry-run` only reads. A real run writes one line per
 /// stack it made to the log (its stack ID and assets), which is the list to
-/// undo from; it never deletes or changes a stack it did not make.
+/// undo from; it never deletes or changes a stack it did not make. A real
+/// run with `--event` also marks those events as stacked one at a time
+/// (`ImmichStackEventStore`), so the app's checks keep them stacked.
 public enum ImmichStacksCommand {
     public static let flag = "--immich-stacks"
 
@@ -102,6 +104,12 @@ public enum ImmichStacksCommand {
                 let wanted = Set(parsed.eventNames.map { NASSyncStore.pathKey($0) })
                 events = events.filter { wanted.contains(NASSyncStore.pathKey($0.name)) }
                 guard !events.isEmpty else { throw ToolkitError.commandFailed("No event has that name.") }
+                // A real run marks the events it stacks, so a name must say
+                // which one.
+                let shared = Dictionary(grouping: events, by: { NASSyncStore.pathKey($0.name) }).filter { $0.value.count > 1 }
+                if !parsed.dryRun, let name = shared.values.first?.first?.name {
+                    throw ToolkitError.commandFailed("\(shared.values.first!.count) events are named “\(name)”; rename one first, or use Stack This Event in Immich in the app.")
+                }
             }
             let eventIDs = Set(events.map(\.id))
 
@@ -165,6 +173,12 @@ public enum ImmichStacksCommand {
                 dryRun: parsed.dryRun
             ) { entry in
                 if let log { ImmichChangeLog.append(entry, to: log) }
+            }
+            // Events stacked by name are kept stacked by the app's checks
+            // from now on, even with the global switch off.
+            if !parsed.dryRun, !parsed.eventNames.isEmpty {
+                try ImmichStackEventStore(catalogURL: context.catalogURL).add(eventIDs)
+                output("From now on the app's Immich checks keep \(events.count == 1 ? "this event's" : "these events'") stacks up to date.")
             }
             output(summaryText(result, dryRun: parsed.dryRun))
             if let logURL, FileManager.default.fileExists(atPath: logURL.path) { output("Log of stack changes (to undo from): \(logURL.path)") }

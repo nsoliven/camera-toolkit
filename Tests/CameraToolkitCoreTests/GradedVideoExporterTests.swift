@@ -24,8 +24,9 @@ final class GradedVideoExporterTests: XCTestCase {
 
     /// A 256×144, 12-frame, 24 fps HEVC clip with 16-bit stereo LPCM, a grey
     /// ramp standing in for a log picture.
-    static func makeClip(at url: URL, frames: Int = 12) throws {
+    static func makeClip(at url: URL, frames: Int = 12, metadata: [AVMetadataItem] = []) throws {
         let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
+        writer.metadata = metadata
         let width = 256, height = 144
         let video = AVAssetWriterInput(mediaType: .video, outputSettings: [
             AVVideoCodecKey: AVVideoCodecType.hevc,
@@ -178,6 +179,215 @@ final class GradedVideoExporterTests: XCTestCase {
             let flatFrame = try await AVAssetImageGenerator(asset: AVURLAsset(url: source)).image(at: CMTime(value: 6, timescale: 24)).image
             XCTAssertNotEqual(meanLuma(gradedFrame), meanLuma(flatFrame), accuracy: 0.01)
         }
+    }
+
+    static func textItem(_ identifier: AVMetadataIdentifier, _ value: String) -> AVMetadataItem {
+        let item = AVMutableMetadataItem()
+        item.identifier = identifier
+        item.value = value as NSString
+        item.dataType = kCMMetadataBaseDataType_UTF8 as String
+        return item
+    }
+
+    private func creationDateTag(_ url: URL) async throws -> String? {
+        for item in try await AVURLAsset(url: url).loadMetadata(for: .quickTimeMetadata) where item.identifier == .quickTimeMetadataCreationDate {
+            return try await item.load(.stringValue)
+        }
+        return nil
+    }
+
+    private func render(_ source: URL, in root: URL, modifiedAt: Date) throws -> URL {
+        let request = GradedRenderRequest(
+            source: source,
+            recipe: GradeRecipe(grade: .converted, profile: .sLog3SGamut3Cine, range: .full),
+            sourceKey: "\(source.lastPathComponent)|1|1",
+            sourceModifiedAt: modifiedAt,
+            outputFolder: GradedRenderNaming.outputFolder(editedRoot: root.appendingPathComponent("Buffer/2026/2026-06-01 Trip/Edited", isDirectory: true))
+        )
+        let exporter = GradedVideoExporter()
+        exporter.requireHardwareEncoder = false
+        return try exporter.render(request).url
+    }
+
+    /// A phone-style original (its `creationdate` tag has the UTC offset and
+    /// a location): the copy's movie, track and media headers carry the
+    /// capture instant, not the render time, and its tags keep the offset
+    /// and the location, so viewers show the original's local time.
+    func testTheCopysHeadersAndTagsCarryTheOriginalsCaptureTime() async throws {
+        try await withTemporaryDirectoryAsync { root in
+            let originals = root.appendingPathComponent("Buffer/2026/2026-06-01 Trip/Originals/Phone", isDirectory: true)
+            try FileManager.default.createDirectory(at: originals, withIntermediateDirectories: true)
+            let source = originals.appendingPathComponent("C0001.MOV")
+            try Self.makeClip(at: source, frames: 6, metadata: [
+                Self.textItem(.quickTimeMetadataCreationDate, "2026-06-01T10:20:30-0700"),
+                Self.textItem(.quickTimeMetadataLocationISO6709, "+37.7749-122.4194+010.000/"),
+            ])
+            let captured = Date(timeIntervalSince1970: 1_780_334_430) // 2026-06-01 17:20:30 UTC
+            let mtime = Date(timeIntervalSince1970: 1_780_000_000)
+            try FileManager.default.setAttributes([.modificationDate: mtime], ofItemAtPath: source.path)
+            let before = try QuickTimeHeaderDates.read(source)
+
+            let copy = try render(source, in: root, modifiedAt: mtime)
+
+            let headers = try QuickTimeHeaderDates.read(copy)
+            XCTAssertGreaterThanOrEqual(headers.count, 6, "movie header, and track and media header of video and audio")
+            for date in headers { XCTAssertEqual(date.timeIntervalSince1970, captured.timeIntervalSince1970, accuracy: 0.5) }
+            let creation = try await creationDateTag(copy)
+            XCTAssertEqual(creation, "2026-06-01T10:20:30-07:00")
+            var location: String?
+            for item in try await AVURLAsset(url: copy).loadMetadata(for: .quickTimeMetadata) where item.identifier == .quickTimeMetadataLocationISO6709 {
+                location = try await item.load(.stringValue)
+            }
+            XCTAssertEqual(location, "+37.7749-122.4194+010.000/")
+            let attributes = try FileManager.default.attributesOfItem(atPath: copy.path)
+            XCTAssertEqual((attributes[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0, mtime.timeIntervalSince1970, accuracy: 1)
+            XCTAssertEqual(try QuickTimeHeaderDates.read(source), before, "the original is only read")
+        }
+    }
+
+    /// A Sony-style original: no `creationdate` tag, the capture time in its
+    /// headers, and the camera's offset only in its `M01.XML` sidecar.
+    func testASonyCopyTakesTheOffsetFromTheSidecar() async throws {
+        try await withTemporaryDirectoryAsync { root in
+            let originals = root.appendingPathComponent("Buffer/2026/2026-06-01 Trip/Originals/A7V", isDirectory: true)
+            try FileManager.default.createDirectory(at: originals, withIntermediateDirectories: true)
+            let source = originals.appendingPathComponent("C0002.MP4")
+            try Self.makeClip(at: source, frames: 6)
+            let captured = Date(timeIntervalSince1970: 1_780_334_430)
+            try QuickTimeHeaderDates.stamp(source, date: captured)
+            try #"<?xml version="1.0"?><NonRealTimeMeta><CreationDate value="2026-06-01T10:20:30-07:00"/><Device manufacturer="Sony" modelName="ILCE-7M5"/></NonRealTimeMeta>"#
+                .write(to: originals.appendingPathComponent("C0002M01.XML"), atomically: true, encoding: .utf8)
+
+            let copy = try render(source, in: root, modifiedAt: captured)
+
+            for date in try QuickTimeHeaderDates.read(copy) { XCTAssertEqual(date.timeIntervalSince1970, captured.timeIntervalSince1970, accuracy: 0.5) }
+            let creation = try await creationDateTag(copy)
+            XCTAssertEqual(creation, "2026-06-01T10:20:30-07:00")
+        }
+    }
+
+    /// A copy an earlier build made (render time in its headers, a UTC tag)
+    /// is rewritten through a partial, sample for sample: its headers and
+    /// tag carry the capture time with the camera's offset, its own tags and
+    /// modification time stay, and the original is only read.
+    func testAnEarlierCopysDatesAreRepairedInPlaceThroughAPartial() throws {
+        try withTemporaryDirectory { root in
+            let originals = root.appendingPathComponent("Library/2026/2026-06-01 Trip/Originals/A7V", isDirectory: true)
+            let rec709 = root.appendingPathComponent("Library/2026/2026-06-01 Trip/Edited/Rec709", isDirectory: true)
+            try FileManager.default.createDirectory(at: originals, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: rec709, withIntermediateDirectories: true)
+            let original = originals.appendingPathComponent("C0003.MP4")
+            try Self.makeClip(at: original, frames: 6)
+            let captured = Date(timeIntervalSince1970: 1_780_334_430)
+            try QuickTimeHeaderDates.stamp(original, date: captured)
+            let originalBytes = try Data(contentsOf: original)
+
+            let sourceTag = AVMutableMetadataItem()
+            sourceTag.keySpace = .quickTimeMetadata
+            sourceTag.key = GradedVideoExporter.metadataSourceKey as NSString
+            sourceTag.value = "C0003.MP4|1|1" as NSString
+            sourceTag.dataType = kCMMetadataBaseDataType_UTF8 as String
+            let copy = rec709.appendingPathComponent("C0003_709.mov")
+            try Self.makeClip(at: copy, frames: 6, metadata: [Self.textItem(.quickTimeMetadataCreationDate, "2026-06-01T17:20:30Z"), sourceTag])
+            try FileManager.default.setAttributes([.modificationDate: captured], ofItemAtPath: copy.path)
+            let moment = GradedVideoExporter.CaptureMoment(date: captured, offsetSeconds: -25_200, dateIsFromFile: true)
+            XCTAssertTrue(GradedCopyDateRepair.needsRepair(copy, moment: moment))
+
+            try GradedCopyDateRepair.repair(GradedCopyDateRepair.Found(
+                copy: copy, eventID: UUID(), original: original,
+                originalRelativePath: "2026/2026-06-01 Trip/Originals/A7V/C0003.MP4",
+                gradedRelativePath: "2026/2026-06-01 Trip/Edited/Rec709/C0003_709.mov",
+                sourceKey: "C0003.MP4|1|1", moment: moment, isOnNAS: true, needsRepair: true
+            ))
+
+            XCTAssertFalse(GradedCopyDateRepair.needsRepair(copy, moment: moment))
+            for date in try QuickTimeHeaderDates.read(copy) { XCTAssertEqual(date.timeIntervalSince1970, captured.timeIntervalSince1970, accuracy: 0.5) }
+            XCTAssertEqual(GradedCopyDateRepair.creationTag(copy), "2026-06-01T10:20:30-07:00")
+            XCTAssertEqual(GradedVideoExporter.readTags(copy)?.source, "C0003.MP4|1|1", "the app's own tags stay")
+            let attributes = try FileManager.default.attributesOfItem(atPath: copy.path)
+            XCTAssertEqual((attributes[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0, captured.timeIntervalSince1970, accuracy: 1)
+            XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: rec709.path), ["C0003_709.mov"], "no partial left")
+            XCTAssertEqual(try Data(contentsOf: original), originalBytes, "the original is only read")
+        }
+    }
+
+    private func sourceTagged(_ key: String, creationDate: String) -> [AVMetadataItem] {
+        let tag = AVMutableMetadataItem()
+        tag.keySpace = .quickTimeMetadata
+        tag.key = GradedVideoExporter.metadataSourceKey as NSString
+        tag.value = key as NSString
+        tag.dataType = kCMMetadataBaseDataType_UTF8 as String
+        return [Self.textItem(.quickTimeMetadataCreationDate, creationDate), tag]
+    }
+
+    /// When the original cannot be read, its capture time is a fallback:
+    /// the survey skips the copy as "original unreadable" and the repair
+    /// refuses, so a fallback time is never written over an existing copy.
+    /// A copy whose clip is in two events belongs to the event whose
+    /// Edited folder holds it.
+    func testAnUnreadableOriginalIsNeverUsedAndTheCopysOwnEventWins() throws {
+        try withTemporaryDirectory { root in
+            let configuration = AppConfiguration.testConfiguration(root: root, catalog: root.appendingPathComponent("catalog.sqlite"))
+            let locations = EventStorageLocations(configuration: configuration)
+            let first = SavedCameraEvent(name: "Trip", eventDate: Date(timeIntervalSince1970: 1_780_000_000))
+            let second = SavedCameraEvent(name: "Beach", eventDate: Date(timeIntervalSince1970: 1_780_100_000))
+            let stamp = Date(timeIntervalSince1970: 1_780_334_000)
+            func assignment(_ event: SavedCameraEvent) -> PhotoEventAssignment {
+                PhotoEventAssignment(sourceRootPath: root.appendingPathComponent("Card").path, relativePath: "C0004.MP4", fileSize: 99, modifiedAt: stamp, eventID: event.id)
+            }
+            let key = FaceIndexStore.fileKey(fileName: "C0004.MP4", byteCount: 99, modifiedAt: stamp)
+            let inSecond = assignment(second)
+            let original = try XCTUnwrap(locations.archiveURL(for: inSecond, event: second))
+            try FileManager.default.createDirectory(at: original.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Self.makeClip(at: original, frames: 6)
+            let folder = GradedRenderNaming.outputFolder(editedRoot: locations.nasEditedRoot(for: second))
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            let copy = folder.appendingPathComponent("C0004_709.mov")
+            try Self.makeClip(at: copy, frames: 6, metadata: sourceTagged(key, creationDate: "2026-06-01T17:20:30Z"))
+
+            let found = GradedCopyDateRepair.survey(
+                events: [second], allEvents: [first, second],
+                assignments: [assignment(first), inSecond], locations: locations
+            )
+            XCTAssertEqual(found.map(\.eventID), [second.id], "the event whose Edited folder holds the copy")
+            XCTAssertEqual(found.first?.originalUnreadable, false)
+
+            // The original stops answering: a fallback time, never written.
+            XCTAssertFalse(GradedVideoExporter.captureMoment(of: root.appendingPathComponent("gone.MP4"), fallback: stamp).dateIsFromFile)
+            var unreadable = try XCTUnwrap(found.first)
+            unreadable.moment = GradedVideoExporter.CaptureMoment(date: stamp, dateIsFromFile: false)
+            unreadable.originalUnreadable = true
+            let before = try Data(contentsOf: copy)
+            XCTAssertThrowsError(try GradedCopyDateRepair.repair(unreadable))
+            XCTAssertEqual(try Data(contentsOf: copy), before, "the copy is left as it was")
+            try FileManager.default.removeItem(at: original)
+            let skipped = GradedCopyDateRepair.survey(events: [second], allEvents: [first, second], assignments: [inSecond], locations: locations)
+            XCTAssertTrue(skipped.allSatisfy { !$0.needsRepair }, "no original, nothing to repair from")
+        }
+    }
+
+    /// A corrupt 64-bit atom size stops the walk; it never traps.
+    func testACorruptAtomSizeNeverTraps() throws {
+        try withTemporaryDirectory { root in
+            let url = root.appendingPathComponent("bad.mov")
+            var bytes = Data([0, 0, 0, 1]) + Data("moov".utf8)
+            bytes += Data(repeating: 0xFF, count: 8)
+            bytes += Data(repeating: 0, count: 32)
+            try bytes.write(to: url)
+            XCTAssertEqual(try QuickTimeHeaderDates.read(url), [])
+            XCTAssertThrowsError(try QuickTimeHeaderDates.stamp(url, date: Date()))
+        }
+    }
+
+    func testOffsetsAreReadFromISO8601Text() {
+        XCTAssertEqual(GradedVideoExporter.offsetSeconds(inISO8601: "2026-06-01T10:20:30-07:00"), -25_200)
+        XCTAssertEqual(GradedVideoExporter.offsetSeconds(inISO8601: "2026-06-01T10:20:30+0530"), 19_800)
+        XCTAssertEqual(GradedVideoExporter.offsetSeconds(inISO8601: "2026-06-01T17:20:30Z"), 0)
+        XCTAssertNil(GradedVideoExporter.offsetSeconds(inISO8601: "2026-06-01T17:20:30"))
+        XCTAssertNil(GradedVideoExporter.offsetSeconds(inISO8601: "2026-06-01"))
+        let moment = GradedVideoExporter.CaptureMoment(date: Date(timeIntervalSince1970: 1_780_334_430), offsetSeconds: -28_800)
+        XCTAssertEqual(GradedVideoExporter.creationDateString(moment), "2026-06-01T09:20:30-08:00")
+        XCTAssertEqual(GradedVideoExporter.creationDateString(.init(date: moment.date)), "2026-06-01T17:20:30Z")
     }
 
     func testStalePartialsAreClearedAndAMirroredRenderCounts() async throws {

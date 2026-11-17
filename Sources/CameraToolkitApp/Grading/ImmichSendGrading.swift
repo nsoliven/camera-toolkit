@@ -535,6 +535,10 @@ extension ClipGrading {
                 },
                 completion: { [weak self] (result: ImmichSendRenderResult) in
                     for eventID in eventIDs { self?.workspace.refreshEditTags(for: eventID) }
+                    // The send scans and checks itself; the job keeps its copies.
+                    if let self {
+                        model.noteRenderedCopies(Self.jobCopies(outcome: result.outcome, requests: requests, placed: items, locations: locations), jobID: jobID)
+                    }
                     var summary = Self.summary(result.outcome, refusals: [])
                     if !result.recordProblems.isEmpty {
                         summary += " \(result.recordProblems.count) NAS cop\(result.recordProblems.count == 1 ? "y" : "ies") could not be checked (\(result.recordProblems[0]))."

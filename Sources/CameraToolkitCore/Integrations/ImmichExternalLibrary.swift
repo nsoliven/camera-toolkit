@@ -939,7 +939,11 @@ public struct ImmichLibrarySync: Sendable {
             await syncAlbums(report, into: &outcome, progress: progress)
             await ImmichGradedAlbumSwap.removeReplacedOriginals(client: client, into: &outcome, logFolder: logFolder)
             try? ImmichEventAlbumStore(catalogURL: catalogURL).save(outcome.albumStates)
-            if stacksBurstsAndEdits {
+            // With the global switch off, only events stacked one at a time
+            // (`ImmichStackEventStore`) are kept stacked; no other event is.
+            let stackedOneByOne = stacksBurstsAndEdits ? [] : ImmichStackEventStore.existing(catalogURL: catalogURL)
+            let stackEvents: Set<UUID>? = stacksBurstsAndEdits ? nil : stackedOneByOne
+            if stacksBurstsAndEdits || files.contains(where: { $0.eventID.map(stackedOneByOne.contains) ?? false }) {
                 progress(.stacking)
                 do {
                     let editPaths = assets.compactMap { asset -> String? in
@@ -947,7 +951,8 @@ public struct ImmichLibrarySync: Sendable {
                               relative.localizedCaseInsensitiveContains("/Edited/") else { return nil }
                         return relative
                     }
-                    let stackable = stackableEventIDs.map { allowed in files.filter { $0.eventID.map(allowed.contains) ?? false } } ?? files
+                    var stackable = stackableEventIDs.map { allowed in files.filter { $0.eventID.map(allowed.contains) ?? false } } ?? files
+                    if let stackEvents { stackable = stackable.filter { $0.eventID.map(stackEvents.contains) ?? false } }
                     let stackLog = logFolder?.appendingPathComponent("stacks.jsonl")
                     outcome.stacks = try await ImmichStackRunner.run(
                         client: client,
@@ -964,6 +969,9 @@ public struct ImmichLibrarySync: Sendable {
                     outcome.problems.append("stacks: \(error.localizedDescription)")
                 }
             }
+        }
+        if !outcome.graded.assetIDs.isEmpty, let records = try? ImmichStackStore(catalogURL: catalogURL).records() {
+            outcome.graded.markStacked(Array(records.values))
         }
         if events == nil {
             try await carryOverAlbums(assets: assets, library: library, into: &outcome)

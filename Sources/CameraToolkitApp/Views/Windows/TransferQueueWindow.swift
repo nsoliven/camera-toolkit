@@ -297,6 +297,22 @@ private struct JobDetailContainer: View {
         }
     }
 
+    /// A finished render job's copies, with each one's Immich state now.
+    private var gradedCopyRows: [JobGradedCopyRow] {
+        guard live.map({ $0.state != .running && $0.state != .queued }) ?? true else { return [] }
+        let id = live?.id ?? detail?.job.id
+        let copies = id.flatMap { model.renderedCopiesByJob[$0] } ?? detail?.job.summary?.gradedCopies ?? []
+        guard !copies.isEmpty else { return [] }
+        let configuration = model.configuration
+        let stackedEvents = model.immichStackedEventIDs
+        return JobDetailFacts.gradedCopyRows(
+            copies,
+            states: model.immichGradedCopyStates,
+            immichConfigured: !configuration.immichLibraryID.isEmpty && !configuration.immichServerURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+            stacksOn: { eventID in configuration.immichStacksBurstsAndEdits || eventID.map(stackedEvents.contains) == true }
+        )
+    }
+
     private var pane: some View {
         ScrollView {
             if let live, live.state == .running, model.stoppableJobIDs.contains(live.id) {
@@ -312,7 +328,8 @@ private struct JobDetailContainer: View {
             JobActivityDetail(
                 live: live, detail: detail, monitor: monitor, zoom: $zoom, hover: hover,
                 showIssues: transfer == nil && !(detail?.items.isEmpty ?? true) ? { fileFilter = .issues } : nil,
-                compare: compare
+                compare: compare,
+                gradedCopies: gradedCopyRows
             )
         }
     }

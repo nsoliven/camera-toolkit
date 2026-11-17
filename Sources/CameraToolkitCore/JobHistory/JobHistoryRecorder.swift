@@ -356,6 +356,17 @@ public final class JobHistoryRecorder: @unchecked Sendable {
         }
     }
 
+    /// A render job's graded copies, kept in the job's summary so the
+    /// finished job can say where each went.
+    public func noteGradedCopies(_ copies: [JobGradedCopy]) {
+        lock.withLock {
+            var summary = job.summary ?? JobHistorySummary()
+            summary.gradedCopies = copies
+            job.summary = summary
+            jobChanged = true
+        }
+    }
+
     /// The job ended. `totals` are the job's final counters for jobs that
     /// did not pin their own. Everything buffered is written.
     public func finish(outcome: JobHistoryOutcome, note: String?, totals: Observation? = nil, endedAt: Date = Date()) {

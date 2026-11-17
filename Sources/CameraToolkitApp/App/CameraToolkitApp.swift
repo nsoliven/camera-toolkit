@@ -59,6 +59,25 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate, NSMenuIte
             DebugLog.shared.flush()
             exit(result.value)
         }
+        if CommandLine.arguments.contains(GradedCopyDatesCommand.flag) {
+            let support = DashboardModel.defaultApplicationSupportURL.appendingPathComponent("CameraToolkit", isDirectory: true)
+            let arguments = CommandLine.arguments
+            let result = CommandStatusBox()
+            let semaphore = DispatchSemaphore(value: 0)
+            Task.detached {
+                let status = await GradedCopyDatesCommand.run(
+                    arguments: arguments,
+                    defaultSupportFolder: support,
+                    apiKey: { try KeychainSecretStore(service: DashboardModel.keychainService).read(account: DashboardModel.immichAPIKeyAccount) },
+                    isAppRunning: { LayoutMigrationAppGuard.otherInstanceIsRunning() }
+                )
+                result.set(status)
+                semaphore.signal()
+            }
+            semaphore.wait()
+            DebugLog.shared.flush()
+            exit(result.value)
+        }
         if CommandLine.arguments.contains(ImmichStacksCommand.flag) {
             let support = DashboardModel.defaultApplicationSupportURL.appendingPathComponent("CameraToolkit", isDirectory: true)
             let arguments = CommandLine.arguments

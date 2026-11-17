@@ -1171,6 +1171,21 @@ private struct EventSidebarMenu: View {
             Button("Send to Immich…") { workspace.requestImmichSend([event.id]) }
                 .help("Choose events, then scan now and fill their albums")
         }
+        if workspace.immichIsConfigured, !workspace.model.configuration.immichStacksBurstsAndEdits {
+            let stacked = workspace.model.immichStackedEventIDs.contains(event.id)
+            Button(stacked ? "Update This Event's Immich Stacks" : "Stack This Event in Immich") {
+                workspace.stackEventInImmich(event.id)
+            }
+            .help(stacked
+                ? "Checks keep this event stacked. This checks now: new bursts, RAW+JPEG pairs and edits are stacked."
+                : "Stacks this event's bursts, RAW+JPEG pairs and originals with their edits (edit on top) in Immich, and keeps them stacked. No other event is touched.")
+            if stacked {
+                Button("Stop Stacking This Event in Immich") {
+                    workspace.stopStackingEventInImmich(event.id)
+                }
+                .help("Later checks leave this event's stacks alone. The stacks already in Immich stay; unstack them there if you do not want them.")
+            }
+        }
         let unstacked = workspace.model.immichUnstackedKeys.filter { $0.hasPrefix(event.id.uuidString + "|") }
         if !unstacked.isEmpty {
             Button("Stack \(unstacked.count) Burst\(unstacked.count == 1 ? "" : "s") Unstacked in Immich Again") {

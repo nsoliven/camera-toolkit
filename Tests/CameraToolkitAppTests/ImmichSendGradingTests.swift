@@ -203,6 +203,71 @@ final class ImmichSendGradingTests: XCTestCase {
             XCTAssertEqual(records.first?.isOnNAS, true, "a NAS copy with no Sync record is read and recorded as verified")
         }
     }
+
+    /// A manual render of a clip that is only on the NAS: the copy is
+    /// written down for Immich and recorded as verified on the NAS, Immich
+    /// is asked to scan (the same follow-up Sync uses), and the finished job
+    /// says where the copy went, with a Show in Finder target.
+    func testAFinishedNASRenderIsWrittenDownAndAsksImmichToScan() async throws {
+        try await withSandbox { root, model, workspace in
+            let clip = try addClip(root, model, workspace, onNAS: true)
+            let output = GradedRenderNaming.outputFolder(editedRoot: workspace.locations.nasEditedRoot(for: event))
+            let copy = output.appendingPathComponent("C0001_709.mov")
+            try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
+            try Data(repeating: 3, count: 128).write(to: copy)
+            let key = "C0001.MP4|64|1780000100"
+            let request = GradedRenderRequest(
+                source: clip, recipe: GradeRecipe(grade: .converted, profile: .sLog3SGamut3Cine, range: .full),
+                sourceKey: key, sourceModifiedAt: Date(timeIntervalSince1970: 1_780_000_100), outputFolder: output
+            )
+            let placed = ClipGrading.placedForRecording([request], events: [key: event.id], locations: workspace.locations)
+            XCTAssertEqual(placed.count, 1)
+            XCTAssertEqual(placed.first?.placement, .nas)
+            XCTAssertEqual(placed.first?.originalRelativePath, workspace.locations.nasRelativePath(clip.path))
+            var outcome = ClipGrading.RenderOutcome()
+            outcome.rendered = [copy]
+            outcome.copies = [0: copy]
+
+            let problems = ClipGrading.recordRenderedCopies(placed, outcome: outcome, requests: [request], locations: workspace.locations, catalogURL: model.catalogURLForImmich)
+            XCTAssertEqual(problems, [])
+            let records = try GradedCopyStore(catalogURL: model.catalogURLForImmich).records(eventIDs: [event.id])
+            XCTAssertEqual(records.map(\.gradedRelativePath), [workspace.locations.nasRelativePath(copy.path)].compactMap { $0 })
+            XCTAssertEqual(records.first?.isOnNAS, true, "recorded as verified on the NAS, so checks wait for its scan")
+
+            var followUps = 0
+            workspace.nasChangeFollowObserver = { _ in followUps += 1 }
+            let jobID = UUID()
+            workspace.grading.finishedRender(jobID: jobID, outcome: outcome, placed: placed, requests: [request])
+            XCTAssertEqual(followUps, 1, "a copy on the NAS asks Immich to scan")
+            let copies = try XCTUnwrap(model.renderedCopiesByJob[jobID])
+            XCTAssertEqual(copies.map(\.path), [copy.standardizedFileURL.path])
+            XCTAssertEqual(copies.first?.libraryRelativePath, workspace.locations.nasRelativePath(copy.path))
+            XCTAssertTrue(copies.first?.libraryRelativePath.hasSuffix("/Edited/Rec709/C0001_709.mov") == true)
+            XCTAssertEqual(copies.first?.eventID, event.id)
+
+            // The Jobs window's rows: where it is, and its Immich state.
+            let waiting = JobDetailFacts.gradedCopyRows(copies, states: [:], immichConfigured: true, stacksOn: { _ in false })
+            XCTAssertEqual(waiting.first?.place, "On the NAS")
+            XCTAssertEqual(waiting.first?.immich, "Waiting for Immich scan: added on the next check")
+            XCTAssertEqual(waiting.first?.path, copy.standardizedFileURL.path, "Show in Finder selects the copy itself")
+            let pathKey = NASSyncStore.pathKey(copies[0].libraryRelativePath)
+            let stacked = JobDetailFacts.gradedCopyRows(copies, states: [pathKey: .stacked], immichConfigured: true, stacksOn: { _ in true })
+            XCTAssertEqual(stacked.first?.immich, "In Immich, stacked on its original")
+            XCTAssertEqual(stacked.first?.isStacked, true)
+            let listed = JobDetailFacts.gradedCopyRows(copies, states: [pathKey: .inImmich], immichConfigured: true, stacksOn: { $0 == self.event.id })
+            XCTAssertEqual(listed.first?.immich, "In Immich; stacked on its original on the next check")
+
+            // A drive copy waits for Sync: no scan is asked for.
+            followUps = 0
+            var onDrive = copies[0]
+            onDrive.isOnNAS = false
+            XCTAssertEqual(JobDetailFacts.gradedCopyRows([onDrive], states: [:], immichConfigured: true, stacksOn: { _ in false }).first?.immich, "Sync to NAS carries it, then Immich adds it")
+            // Show in Finder checks on the click; a missing copy is said.
+            XCTAssertNil(JobDetailFacts.revealMessage(found: 2, of: 2))
+            XCTAssertEqual(JobDetailFacts.revealMessage(found: 0, of: 1), "The copy is not there now: it was moved, or its drive or NAS is not connected.")
+            XCTAssertEqual(JobDetailFacts.revealMessage(found: 1, of: 3), "2 of 3 copies are not there now; Finder shows the others.")
+        }
+    }
 }
 
 /// Renders the question off-screen with made-up clips, light and dark. Runs

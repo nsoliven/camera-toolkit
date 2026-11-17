@@ -274,8 +274,12 @@ public final class GradedVideoExporter: @unchecked Sendable {
             _ = rmdir(temporaryFolder.path)
         }
 
-        try write(request, to: partial, progress: progress, isCancelled: isCancelled)
+        let moment = Self.captureMoment(of: request.source, fallback: request.sourceModifiedAt)
+        try write(request, moment: moment, to: partial, progress: progress, isCancelled: isCancelled)
         if isCancelled() { throw CancellationError() }
+        // The movie, track and media headers carry the capture time too,
+        // not the render's.
+        try QuickTimeHeaderDates.stamp(partial, date: moment.date)
         try verify(partial, against: request.decodeSource ?? request.source)
         try? fileManager.setAttributes(
             [.modificationDate: request.sourceModifiedAt, .creationDate: request.sourceModifiedAt],
@@ -431,6 +435,7 @@ public final class GradedVideoExporter: @unchecked Sendable {
 
     private func write(
         _ request: GradedRenderRequest,
+        moment: CaptureMoment,
         to url: URL,
         progress: @escaping @Sendable (Progress) -> Void,
         isCancelled: @escaping @Sendable () -> Bool
@@ -464,7 +469,7 @@ public final class GradedVideoExporter: @unchecked Sendable {
 
         let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
         writer.shouldOptimizeForNetworkUse = true
-        writer.metadata = metadata(for: request)
+        writer.metadata = metadata(for: request, moment: moment)
         let size = loaded.composition.renderSize
         let bitRate = Self.bitRate(sourceDataRate: Double(loaded.dataRate))
         var videoSettings: [String: Any] = [
@@ -603,7 +608,7 @@ public final class GradedVideoExporter: @unchecked Sendable {
         return Int(min(max(target, 8_000_000), 150_000_000))
     }
 
-    private func metadata(for request: GradedRenderRequest) -> [AVMetadataItem] {
+    private func metadata(for request: GradedRenderRequest, moment: CaptureMoment) -> [AVMetadataItem] {
         var items: [AVMetadataItem] = []
         func add(_ identifier: AVMetadataIdentifier, _ value: String) {
             let item = AVMutableMetadataItem()
@@ -620,15 +625,19 @@ public final class GradedVideoExporter: @unchecked Sendable {
             item.dataType = kCMMetadataBaseDataType_UTF8 as String
             items.append(item)
         }
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime]
-        let created = Self.blockingCreationDate(of: request.source) ?? request.sourceModifiedAt
-        add(.quickTimeMetadataCreationDate, formatter.string(from: created))
+        // The capture time with the camera's own UTC offset when it is
+        // known, so viewers show the same local time as the original. Immich
+        // takes `CreationDate` before the headers' `CreateDate`.
+        let created = Self.creationDateString(moment)
+        add(.quickTimeMetadataCreationDate, created)
         // `©day` too: some readers look only at the user-data atom. The
-        // movie header's own time is the render time; AVAssetWriter has no
-        // way to set it, so these tags and the file's date carry the
-        // capture time.
-        add(.quickTimeUserDataCreationDate, formatter.string(from: created))
+        // movie, track and media headers are stamped after writing
+        // (`QuickTimeHeaderDates`).
+        add(.quickTimeUserDataCreationDate, created)
+        if let location = moment.location {
+            add(.quickTimeMetadataLocationISO6709, location)
+            add(.quickTimeUserDataLocationISO6709, location)
+        }
         if let make = request.make { add(.quickTimeMetadataMake, make) }
         if let model = request.model { add(.quickTimeMetadataModel, model) }
         add(.quickTimeMetadataSoftware, "Camera Toolkit")
@@ -637,11 +646,100 @@ public final class GradedVideoExporter: @unchecked Sendable {
         return items
     }
 
-    static func blockingCreationDate(of url: URL) -> Date? {
-        try? blocking {
-            let asset = CameraVideoAsset.asset(for: url)
-            return try await asset.load(.creationDate)?.load(.dateValue)
+    // MARK: Capture time
+
+    /// When and where the original was shot, as the copy should say it.
+    public struct CaptureMoment: Equatable, Sendable {
+        public var date: Date
+        /// The camera's offset from UTC in seconds, when the original says.
+        public var offsetSeconds: Int?
+        /// ISO 6709 location (`+37.7749-122.4194/`), when the original has one.
+        public var location: String?
+        /// True when `date` was read from the original (its tag, its movie
+        /// header or its Sony sidecar); false when the original could not
+        /// be read and `date` is the fallback. A new render may use the
+        /// fallback; the repair never writes it over an existing copy.
+        public var dateIsFromFile: Bool
+
+        public init(date: Date, offsetSeconds: Int? = nil, location: String? = nil, dateIsFromFile: Bool = true) {
+            self.date = date
+            self.offsetSeconds = offsetSeconds
+            self.location = location
+            self.dateIsFromFile = dateIsFromFile
         }
+    }
+
+    /// The original's capture time: its own creation date (the QuickTime
+    /// `creationdate` tag, else the movie header), else `fallback`. The UTC
+    /// offset comes from that tag when it has one (phones write it), else
+    /// from a Sony sidecar's `<CreationDate value=…>`. Only reads.
+    public static func captureMoment(of source: URL, fallback: Date) -> CaptureMoment {
+        struct Found: Sendable {
+            var date: Date?
+            var tagText: String?
+            var location: String?
+        }
+        let found = (try? blocking { () -> Found in
+            let asset = CameraVideoAsset.asset(for: source)
+            var result = Found()
+            result.date = try? await asset.load(.creationDate)?.load(.dateValue)
+            for format in [AVMetadataFormat.quickTimeMetadata, .quickTimeUserData] {
+                for item in (try? await asset.loadMetadata(for: format)) ?? [] {
+                    switch item.identifier {
+                    case .quickTimeMetadataCreationDate?, .quickTimeUserDataCreationDate?:
+                        if result.tagText == nil { result.tagText = try? await item.load(.stringValue) }
+                    case .quickTimeMetadataLocationISO6709?, .quickTimeUserDataLocationISO6709?:
+                        if result.location == nil { result.location = try? await item.load(.stringValue) }
+                    default:
+                        continue
+                    }
+                }
+            }
+            return result
+        }) ?? Found()
+        let location = found.location?.trimmingCharacters(in: .whitespaces)
+        var moment = CaptureMoment(date: found.date ?? fallback, location: location?.isEmpty == false ? location : nil, dateIsFromFile: found.date != nil)
+        if let text = found.tagText, let offset = offsetSeconds(inISO8601: text) {
+            moment.offsetSeconds = offset
+        } else if let text = LogProfileDetector.sonySidecarCreationDate(forClip: source), let offset = offsetSeconds(inISO8601: text) {
+            moment.offsetSeconds = offset
+            if found.date == nil, let date = parsedISO8601(text) {
+                moment.date = date
+                moment.dateIsFromFile = true
+            }
+        }
+        return moment
+    }
+
+    /// `2026-06-01T10:20:30-07:00` with an offset, else `…Z`.
+    public static func creationDateString(_ moment: CaptureMoment) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        if let offset = moment.offsetSeconds, let zone = TimeZone(secondsFromGMT: offset) {
+            formatter.timeZone = zone
+        }
+        return formatter.string(from: moment.date)
+    }
+
+    /// The UTC offset an ISO 8601 date-time states (`Z` is 0); nil when it
+    /// states none.
+    public static func offsetSeconds(inISO8601 text: String) -> Int? {
+        let trimmed = text.trimmingCharacters(in: .whitespaces)
+        guard trimmed.count > 10, let tIndex = trimmed.firstIndex(where: { $0 == "T" || $0 == " " }) else { return nil }
+        let time = trimmed[trimmed.index(after: tIndex)...]
+        if time.hasSuffix("Z") || time.hasSuffix("z") { return 0 }
+        guard let sign = time.lastIndex(where: { $0 == "+" || $0 == "-" }) else { return nil }
+        let digits = time[time.index(after: sign)...].filter(\.isNumber)
+        guard digits.count == 4 || digits.count == 2, let hours = Int(digits.prefix(2)) else { return nil }
+        let minutes = digits.count == 4 ? Int(digits.suffix(2)) ?? 0 : 0
+        guard hours <= 14, minutes < 60 else { return nil }
+        return (time[sign] == "-" ? -1 : 1) * (hours * 3_600 + minutes * 60)
+    }
+
+    static func parsedISO8601(_ text: String) -> Date? {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter.date(from: text.trimmingCharacters(in: .whitespaces))
     }
 
     // MARK: Verification
