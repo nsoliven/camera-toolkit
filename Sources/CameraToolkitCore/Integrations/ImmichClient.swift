@@ -255,6 +255,7 @@ public struct ImmichClient: Sendable {
         for item in response {
             if item.success {
                 result.added += 1
+                result.addedIDs.append(item.id)
             } else if item.error == "duplicate" {
                 result.alreadyInAlbum += 1
             } else {
@@ -491,6 +492,8 @@ public struct ImmichAlbum: Codable, Equatable, Hashable, Identifiable, Sendable 
 
 public struct ImmichAlbumAddResult: Equatable, Sendable {
     public var added = 0
+    /// The assets this call put in the album (not ones already there).
+    public var addedIDs: [String] = []
     public var alreadyInAlbum = 0
     public var failed: [String: String] = [:]
 

@@ -116,6 +116,9 @@ struct ImmichSendGradeAskView: View {
         if ask.estimatedBytes > 0 {
             lines.append("About \(formatter.string(fromByteCount: ask.estimatedBytes)) in all. The render shows in Jobs, where Stop removes any partial copy.")
         }
+        if ask.driveAwayCount > 0 {
+            lines.append("The drive is not connected, so a copy of \(ask.driveAwayCount == 1 ? "this clip" : "these clips") made there and not synced yet can't be checked. If there is one, Sync keeps both and reports a conflict; nothing is overwritten.")
+        }
         if ask.unchecked > 0 {
             lines.append("\(ask.unchecked) could not be checked in time (the NAS may be asleep); their render looks again first and never makes a second copy.")
         }
@@ -137,6 +140,11 @@ struct ImmichSendGradedLines: View {
             Label("\(result.gradedWaiting.formatted()) graded cop\(result.gradedWaiting == 1 ? "y" : "ies") waiting for Immich scan: added on the next check", systemImage: "clock")
                 .font(.callout)
                 .foregroundStyle(.secondary)
+        }
+        if result.gradedMissing > 0 {
+            Label("\(result.gradedMissing.formatted()) graded cop\(result.gradedMissing == 1 ? "y isn't" : "ies aren't") in Immich (gone from the NAS, offline, trashed or excluded by the library): the flat original stays in the album", systemImage: "exclamationmark.circle")
+                .font(.callout)
+                .foregroundStyle(Color.orange)
         }
         if result.gradedOnDrive > 0 {
             Label("\(result.gradedOnDrive.formatted()) graded cop\(result.gradedOnDrive == 1 ? "y is" : "ies are") on the drive: Sync to NAS carries \(result.gradedOnDrive == 1 ? "it" : "them") to Immich", systemImage: "externaldrive")

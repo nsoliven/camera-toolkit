@@ -24,6 +24,9 @@ struct ImmichSendResult: Equatable, Identifiable {
     var gradedInAlbum = 0
     var gradedWaiting = 0
     var gradedOnDrive = 0
+    /// Gone from the NAS, offline or trashed in Immich, or excluded by the
+    /// library: the flat original keeps its album place.
+    var gradedMissing = 0
 }
 
 struct ImmichSendState: Equatable {
@@ -172,7 +175,8 @@ extension EventsWorkspace {
                 waiting: summary.pendingScan,
                 gradedInAlbum: graded.swapsByEvent[id] ?? 0,
                 gradedWaiting: graded.waitingByEvent[id] ?? 0,
-                gradedOnDrive: graded.notOnNASByEvent[id] ?? 0
+                gradedOnDrive: graded.notOnNASByEvent[id] ?? 0,
+                gradedMissing: (graded.unavailableByEvent[id] ?? 0) + (graded.excludedByEvent[id] ?? 0)
             )
         }
         .sorted { $0.eventName.localizedStandardCompare($1.eventName) == .orderedAscending }

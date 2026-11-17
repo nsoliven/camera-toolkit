@@ -54,14 +54,19 @@ extension ClipGrading {
                 // On the drive, the NAS copy of the folder is checked too:
                 // a copy Sync already carried counts, and its name is never
                 // reused for another render.
+                // On the NAS, the drive's folder is checked the same way: a
+                // drive copy not synced yet keeps its name.
                 let onNAS = output.path.hasPrefix(workspace.locations.nasRoot.standardizedFileURL.path + "/")
+                let policy = workspace.resolvedPolicy(for: event)
                 plan.requests.append(GradedRenderRequest(
                     source: item.primary.url,
                     recipe: recipe,
                     sourceKey: Self.fileKey(item.primary),
                     sourceModifiedAt: item.primary.modifiedAt,
                     outputFolder: output,
-                    mirrorFolder: onNAS ? nil : workspace.locations.nasMirrorURL(forDrivePath: output.path)
+                    mirrorFolder: onNAS
+                        ? GradedRenderNaming.outputFolder(editedRoot: workspace.locations.editedRoot(for: event, policy: policy))
+                        : workspace.locations.nasMirrorURL(forDrivePath: output.path)
                 ))
             }
         }

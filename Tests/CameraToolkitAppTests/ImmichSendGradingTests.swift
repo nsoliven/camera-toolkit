@@ -163,6 +163,18 @@ final class ImmichSendGradingTests: XCTestCase {
         }
     }
 
+    func testANASRenderChecksTheDriveFolderAndSaysWhenTheDriveIsAway() async throws {
+        try await withSandbox { root, model, workspace in
+            try addClip(root, model, workspace, onNAS: true)
+            let inputs = workspace.grading.sendPlanInputs([event.id])
+            let away = ClipGrading.planImmichSend(inputs, readsNAS: true, renderer: GradeRenderer(), check: { _, _ in .none }, driveIsAvailable: { _ in false })
+            XCTAssertEqual(away.pending.first?.request.mirrorFolder, GradedRenderNaming.outputFolder(editedRoot: workspace.locations.editedRoot(for: event, policy: .buffer)))
+            XCTAssertEqual(away.driveAwayCount, 1)
+            let here = ClipGrading.planImmichSend(inputs, readsNAS: true, renderer: GradeRenderer(), check: { _, _ in .none }, driveIsAvailable: { _ in true })
+            XCTAssertEqual(here.driveAwayCount, 0)
+        }
+    }
+
     func testACopyAlreadyMadeIsWrittenDownAndNotAskedFor() async throws {
         try await withSandbox { root, model, workspace in
             try addClip(root, model, workspace, onNAS: true)

@@ -26,6 +26,11 @@ public struct ImmichGradedSwapReport: Equatable, Sendable {
     public var waitingByEvent: [UUID: Int] = [:]
     /// Copies still only on the drive: Sync to NAS carries them first.
     public var notOnNASByEvent: [UUID: Int] = [:]
+    /// Copies gone from the NAS, or that Immich shows offline or in its
+    /// trash: not waited for, and the original keeps its album place.
+    public var unavailableByEvent: [UUID: Int] = [:]
+    /// Copies the library's exclusion patterns keep out of Immich.
+    public var excludedByEvent: [UUID: Int] = [:]
     /// Originals taken out of their album (the app had put them there).
     public var removedOriginals = 0
 
@@ -79,10 +84,20 @@ public enum ImmichGradedAlbumSwap {
         var result = ImmichGradedSwapReport()
         guard !records.isEmpty else { return result }
         let paths = ImmichLibraryPaths(importPaths: library.importPaths)
+        let exclusions = ImmichExclusionMatcher(patterns: library.exclusionPatterns)
         var assetByKey: [String: String] = [:]
-        for asset in assets where !asset.isOffline && !asset.isTrashed {
+        // Assets Immich has at a path but cannot show (offline or trashed):
+        // a copy there is not coming, so it is not waited for.
+        var unavailable: Set<String> = []
+        for asset in assets {
             guard let relative = paths.relativePath(forOriginalPath: asset.originalPath) else { continue }
-            assetByKey[NASSyncStore.pathKey(relative)] = asset.id
+            let key = NASSyncStore.pathKey(relative)
+            if asset.isOffline || asset.isTrashed {
+                if assetByKey[key] == nil { unavailable.insert(key) }
+            } else {
+                assetByKey[key] = asset.id
+                unavailable.remove(key)
+            }
         }
         let fileByKey = Dictionary(files.map { (NASSyncStore.pathKey($0.relativePath), $0) }) { first, _ in first }
         // The newest copy of each original speaks for it.
@@ -94,11 +109,15 @@ public enum ImmichGradedAlbumSwap {
         for key in newest.keys.sorted() {
             guard let record = newest[key], let file = fileByKey[key], let eventID = file.eventID else { continue }
             guard let gradedID = assetByKey[record.gradedKey] else {
-                if record.isOnNAS {
+                if !record.wasOnNAS {
+                    result.notOnNASByEvent[eventID, default: 0] += 1
+                } else if !record.isOnNAS || unavailable.contains(record.gradedKey) {
+                    result.unavailableByEvent[eventID, default: 0] += 1
+                } else if let server = paths.originalPath(forRelativePath: record.gradedRelativePath), exclusions.isExcluded(server) {
+                    result.excludedByEvent[eventID, default: 0] += 1
+                } else {
                     result.waitingForScan.append(record.gradedRelativePath)
                     result.waitingByEvent[eventID, default: 0] += 1
-                } else {
-                    result.notOnNASByEvent[eventID, default: 0] += 1
                 }
                 continue
             }

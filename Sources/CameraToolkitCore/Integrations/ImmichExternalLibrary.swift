@@ -916,8 +916,10 @@ public struct ImmichLibrarySync: Sendable {
                     let result = try await client.addAssets(batch, toAlbum: album.id)
                     outcome.addedToAlbums += result.added
                     failed.formUnion(result.failed.keys)
-                    let added = batch.filter { !result.failed.keys.contains($0) }
-                    members.formUnion(added)
+                    members.formUnion(batch.filter { !result.failed.keys.contains($0) })
+                    // Only what this call put there: an asset that was already
+                    // in the album ("duplicate") is not the app's addition.
+                    let added = result.addedIDs
                     if let additionsLog, !added.isEmpty {
                         ImmichChangeLog.append(ImmichAlbumAdditionEntry(albumID: album.id, albumName: album.name, assetIDs: added), to: additionsLog)
                     }

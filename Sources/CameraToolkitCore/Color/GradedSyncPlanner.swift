@@ -142,14 +142,19 @@ public enum GradedSyncPlanner {
                     mirrorFolder: inputs.locations.nasMirrorURL(forDrivePath: output.path)
                 )
             case .nas:
-                // Written on the NAS at its final name: there is no other
-                // copy of the folder to check.
+                // Written on the NAS at its final name. The drive's copy of
+                // the folder is checked too: a copy rendered there and not
+                // synced yet keeps its name (Sync would meet a different
+                // file there and record a conflict), and the same render
+                // there counts as made. With the drive away it cannot be
+                // checked; the send says so.
                 request = GradedRenderRequest(
                     source: url,
                     recipe: recipe,
                     sourceKey: key,
                     sourceModifiedAt: assignment.modifiedAt,
-                    outputFolder: GradedRenderNaming.outputFolder(editedRoot: inputs.locations.nasEditedRoot(for: event))
+                    outputFolder: GradedRenderNaming.outputFolder(editedRoot: inputs.locations.nasEditedRoot(for: event)),
+                    mirrorFolder: GradedRenderNaming.outputFolder(editedRoot: inputs.locations.editedRoot(for: event, policy: policy))
                 )
             }
             placed.append(PlacedRequest(

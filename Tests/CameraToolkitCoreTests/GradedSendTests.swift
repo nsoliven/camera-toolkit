@@ -51,7 +51,8 @@ final class GradedSendPlannerTests: XCTestCase {
             let nas = placed[1].request
             XCTAssertEqual(nas.source, locations.archiveURL(for: assignments[1], event: event), "read from the NAS copy")
             XCTAssertEqual(nas.outputFolder, GradedRenderNaming.outputFolder(editedRoot: locations.nasEditedRoot(for: event)))
-            XCTAssertNil(nas.mirrorFolder, "written at its final name on the NAS")
+            let driveFolder = GradedRenderNaming.outputFolder(editedRoot: locations.editedRoot(for: event, policy: .buffer))
+            XCTAssertEqual(nas.mirrorFolder, driveFolder, "the drive's folder is checked too")
             XCTAssertNil(nas.stabilization, "no second render step unless one is asked for")
             XCTAssertEqual(placed[1].originalRelativePath, locations.archiveRelativePath(for: assignments[1], event: event))
             XCTAssertEqual(placed[1].eventAssetID, CatalogStore.eventAssetID(assignments[1]))
@@ -60,6 +61,19 @@ final class GradedSendPlannerTests: XCTestCase {
             XCTAssertEqual(placed[1].gradedRelativePath(forCopyAt: copy, locations: locations), locations.nasRelativePath(copy.path))
             let driveCopy = drive.outputFolder.appendingPathComponent("C0001_709.mov")
             XCTAssertEqual(placed[0].gradedRelativePath(forCopyAt: driveCopy, locations: locations), locations.mirrorRelativePath(forDrivePath: driveCopy.path), "a drive copy is known by the path Sync gives it")
+
+            // A drive copy not synced yet keeps its name: the NAS render
+            // takes the next one, so Sync never meets a different file there.
+            let driveTaken = driveFolder.appendingPathComponent("C0002_709.mov")
+            XCTAssertEqual(
+                GradedRenderNaming.resolve(source: nas.source, folder: nas.outputFolder, mirror: nas.mirrorFolder, exists: { $0 == driveTaken }, identity: { _ in .other }),
+                .free(nas.outputFolder.appendingPathComponent("C0002_709 (2).mov"), beside: [])
+            )
+            // The same render on the drive counts as made.
+            XCTAssertEqual(
+                GradedRenderNaming.resolve(source: nas.source, folder: nas.outputFolder, mirror: nas.mirrorFolder, exists: { $0 == driveTaken }, identity: { _ in .same }),
+                .alreadyRendered(driveTaken)
+            )
 
             // Without NAS reading (Sync's plan), only the drive clip.
             XCTAssertEqual(GradedSyncPlanner.requests(inputs, fileExists: exists, detect: { _ in .sLog3SGamut3Cine }, range: { _ in .full }).map(\.source.lastPathComponent), ["C0001.MP4"])
@@ -136,12 +150,24 @@ final class GradedCopyStoreTests: XCTestCase {
                 GradedCopyRecord(eventID: trip, originalRelativePath: "2026/Trip/Originals/A7V/C0002.MP4", gradedRelativePath: "2026/Trip/Edited/Rec709/C0002_709.mov", sourceKey: "k2"),
                 GradedCopyRecord(eventID: other, originalRelativePath: "2026/Other/Originals/A7V/C0001.MP4", gradedRelativePath: "2026/Other/Edited/Rec709/C0001_709.mov", sourceKey: "k3"),
             ])
-            try NASSyncStore(catalogURL: catalog).upsert([NASSyncRecord(
-                nasRoot: root.path, relativePath: "2026/Trip/Edited/Rec709/C0001_709.mov", byteCount: 10, sha256: "ab", state: .verified, checkedAt: Date(), verifiedAt: Date()
-            )])
-            let trips = try store.records(eventIDs: [trip]).sorted { $0.sourceKey < $1.sourceKey }
+            try NASSyncStore(catalogURL: catalog).upsert([
+                NASSyncRecord(nasRoot: root.path, relativePath: "2026/Trip/Edited/Rec709/C0001_709.mov", byteCount: 10, sha256: "ab", state: .verified, checkedAt: Date(), verifiedAt: Date()),
+                // Sync met a different drive file at the copy's path: the NAS copy stays, as a conflict.
+                NASSyncRecord(nasRoot: root.path, relativePath: "2026/Other/Edited/Rec709/C0001_709.mov", byteCount: 10, sha256: "cd", nasSHA256: "ef", state: .conflict, checkedAt: Date()),
+            ])
+            let present: Set<String> = [root.path + "/2026/Trip/Edited/Rec709/C0001_709.mov", root.path + "/2026/Other/Edited/Rec709/C0001_709.mov"]
+            let trips = try store.records(eventIDs: [trip], exists: { present.contains($0) }).sorted { $0.sourceKey < $1.sourceKey }
             XCTAssertEqual(trips.map(\.sourceKey), ["k1", "k2"])
             XCTAssertEqual(trips.map(\.isOnNAS), [true, false], "a copy still on the drive is not waited for")
+            XCTAssertEqual(trips.map(\.wasOnNAS), [true, false])
+            XCTAssertEqual(try store.records(eventIDs: [other], exists: { present.contains($0) }).first?.isOnNAS, true, "a conflict keeps the NAS copy, so it is still there")
+            // Gone from the NAS: written down once, not there now.
+            let gone = try XCTUnwrap(store.records(eventIDs: [trip], exists: { _ in false }).first { $0.sourceKey == "k1" })
+            XCTAssertEqual(gone.wasOnNAS, true)
+            XCTAssertEqual(gone.isOnNAS, false)
+            // The flags are never stored.
+            let raw = try CatalogDatabase.writer(for: catalog).read { try String.fetchAll($0, sql: "SELECT record FROM graded_copies") }
+            XCTAssertFalse(raw.contains { $0.contains("OnNAS") })
             XCTAssertEqual(try store.records().count, 3)
             XCTAssertTrue(GradedCopyStore.existingRecords(catalogURL: root.appendingPathComponent("missing.sqlite"), eventIDs: nil).isEmpty)
         }
@@ -194,6 +220,28 @@ final class ImmichGradedAlbumSwapTests: XCTestCase {
         XCTAssertTrue(outcome.waitsForScan, "the next check looks again for the copy on the NAS")
     }
 
+    func testACopyImmichWillNeverListIsNotWaitedFor() {
+        let files = (1...4).map { ImmichCatalogFile(eventAssetID: "e\($0)", relativePath: "2026/T/Originals/A7V/C000\($0).MP4", isOnNAS: true, album: album, eventID: trip) }
+        let excludingLibrary = ImmichLibrary(id: "lib", name: "Archive", importPaths: [serverRoot + "/"], exclusionPatterns: ["**/Edited/Rec709/C0002_*"])
+        let assets = (1...4).map { asset("o\($0)", "2026/T/Originals/A7V/C000\($0).MP4") } + [
+            asset("g1", "2026/T/Edited/Rec709/C0001_709.mov", offline: true), // offline or trashed in Immich
+        ]
+        var report = ImmichReconciler.reconcile(files: files, assets: assets, library: excludingLibrary, mediaExtensions: [".mp4", ".mov"])
+        var gone = record(3)
+        gone.isOnNAS = false // written down once, deleted from the NAS since
+        let swap = ImmichGradedAlbumSwap.prepare(&report, files: files, assets: assets, library: excludingLibrary, records: [
+            record(1), record(2), gone, record(4),
+        ])
+        XCTAssertEqual(swap.waitingForScan, ["2026/T/Edited/Rec709/C0004_709.mov"], "only the copy Immich can still list")
+        XCTAssertEqual(swap.unavailableByEvent[trip], 2, "offline, and gone from the NAS")
+        XCTAssertEqual(swap.excludedByEvent[trip], 1)
+        XCTAssertEqual(Set(report.albumAssets[album] ?? []), ["o1", "o2", "o3", "o4"], "their originals keep their album places")
+
+        var outcome = ImmichLibrarySyncOutcome(report: report)
+        outcome.graded = ImmichGradedAlbumSwap.prepare(&report, files: files, assets: assets, library: excludingLibrary, records: [record(1), record(2), gone])
+        XCTAssertFalse(outcome.waitsForScan, "nothing to wait for: a send does not sit out its 90 seconds")
+    }
+
     func testTheNewestCopyOfAnOriginalSpeaksForIt() {
         let files = [ImmichCatalogFile(eventAssetID: "e1", relativePath: "2026/T/Originals/A7V/C0001.MP4", isOnNAS: true, album: album, eventID: trip)]
         let assets = [asset("o1", "2026/T/Originals/A7V/C0001.MP4"), asset("g1", "2026/T/Edited/Rec709/C0001_709.mov"), asset("g2", "2026/T/Edited/Rec709/C0001_709 (2).mov")]
@@ -203,6 +251,16 @@ final class ImmichGradedAlbumSwapTests: XCTestCase {
         let swap = ImmichGradedAlbumSwap.prepare(&report, files: files, assets: assets, library: library, records: [record(1), newer])
         XCTAssertEqual(report.albumAssets[album], ["g2"])
         XCTAssertEqual(swap.swaps.map(\.gradedAssetID), ["g2"])
+    }
+
+    func testAddAssetsReportsOnlyWhatItAdded() async throws {
+        let transport = SwapTransport()
+        transport.respond("PUT", "/api/albums/album-9/assets", body: #"[{"id":"a1","success":true},{"id":"a2","success":false,"error":"duplicate"},{"id":"a3","success":false,"error":"no_permission"}]"#)
+        let client = try ImmichClient(serverURL: "https://photos.example.com", apiKey: "secret-key", transport: transport)
+        let result = try await client.addAssets(["a1", "a2", "a3"], toAlbum: "album-9")
+        XCTAssertEqual(result.addedIDs, ["a1"])
+        XCTAssertEqual(result.alreadyInAlbum, 1)
+        XCTAssertEqual(result.failed.keys.sorted(), ["a3"])
     }
 
     func testOnlyOriginalsTheAppAddedLeaveTheAlbumAndOnlyOnce() {
@@ -249,8 +307,8 @@ final class ImmichGradedAlbumSwapTests: XCTestCase {
         return [ImmichCatalogFile(eventAssetID: CatalogStore.eventAssetID(assignment), relativePath: "2026/T/Originals/A7V/C0001.MP4", isOnNAS: true, album: album, eventID: trip)]
     }
 
-    private func transport(members: [[ImmichLibraryAsset]]) -> SwapTransport {
-        let assets = [asset("o1", "2026/T/Originals/A7V/C0001.MP4"), asset("g1", "2026/T/Edited/Rec709/C0001_709.mov")]
+    private func transport(members: [[ImmichLibraryAsset]], listed: [ImmichLibraryAsset]? = nil) -> SwapTransport {
+        let assets = listed ?? [asset("o1", "2026/T/Originals/A7V/C0001.MP4"), asset("g1", "2026/T/Edited/Rec709/C0001_709.mov")]
         let transport = SwapTransport()
         transport.respond("GET", "/api/libraries/lib", body: Self.encode(library))
         transport.respond("GET", "/api/server/media-types", body: #"{"image":[".jpg"],"video":[".mp4",".mov"],"sidecar":[".xmp"]}"#)
@@ -298,6 +356,25 @@ final class ImmichGradedAlbumSwapTests: XCTestCase {
         XCTAssertFalse(second.requests.contains { $0.httpMethod == "PUT" })
         XCTAssertFalse(second.requests.contains { $0.httpMethod == "DELETE" })
         XCTAssertEqual(again.graded.removedOriginals, 0)
+    }
+
+    func testAnOriginalAlreadyInTheAlbumIsNotLoggedAsTheAppsAddition() async throws {
+        let files = try prepare()
+        let original = asset("o1", "2026/T/Originals/A7V/C0001.MP4")
+        let graded = asset("g1", "2026/T/Edited/Rec709/C0001_709.mov")
+        // The copy is not listed yet, so the original is wanted; the user
+        // added it by hand meanwhile, and Immich answers "duplicate".
+        let first = transport(members: [[]], listed: [original])
+        first.respond("PUT", "/api/albums/album-9/assets", body: #"[{"id":"o1","success":false,"error":"duplicate"}]"#)
+        let outcome = try await sync(first).check(files: files)
+        XCTAssertEqual(outcome.addedToAlbums, 0)
+        XCTAssertNil(ImmichGradedAlbumSwap.loggedAssets(in: logs.appendingPathComponent(ImmichGradedAlbumSwap.additionsLogName))["album-9"], "not the app's addition")
+
+        // Once the copy is listed it joins, and the hand-added original stays.
+        let second = transport(members: [[original], [original, graded]])
+        _ = try await sync(second).check(files: files)
+        XCTAssertEqual(ImmichGradedAlbumSwap.loggedAssets(in: logs.appendingPathComponent(ImmichGradedAlbumSwap.additionsLogName))["album-9"], ["g1"])
+        XCTAssertFalse(second.requests.contains { $0.httpMethod == "DELETE" })
     }
 
     func testAnOriginalAddedByHandStaysInTheAlbum() async throws {

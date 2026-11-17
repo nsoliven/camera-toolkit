@@ -67,6 +67,9 @@ final class ImmichSendGradeAsk: Identifiable {
     /// Copies already there that the check could not read in time: their
     /// render looks again first and never makes a second copy.
     var unchecked = 0
+    /// NAS copies whose drive (and its `Edited/Rec709`) is not connected,
+    /// so a copy made there and not synced yet cannot be checked.
+    var driveAwayCount = 0
     /// Before/after frames of the first few clips.
     var previews: [BlanketGradeModel.Row] = []
     var blanket: BlanketGradeModel?
@@ -139,6 +142,7 @@ extension ClipGrading {
         var pending: [GradedSyncPlanner.PlacedRequest] = []
         var estimatedBytes: Int64 = 0
         var unchecked = 0
+        var driveAwayCount = 0
     }
 
     func sendPlanInputs(_ eventIDs: Set<UUID>) -> GradedSyncPlanner.Inputs {
@@ -164,7 +168,8 @@ extension ClipGrading {
         renderer: GradeRenderer,
         check: (@Sendable (GradedRenderRequest, TimeInterval) -> GradedVideoExporter.ExistingRenderCheck)? = nil,
         progress: @escaping @Sendable (Int, Int) -> Void = { _, _ in },
-        record: ([GradedSyncPlanner.PlacedRequest], [String: URL]) -> Void = { _, _ in }
+        record: ([GradedSyncPlanner.PlacedRequest], [String: URL]) -> Void = { _, _ in },
+        driveIsAvailable: (URL) -> Bool = { VolumeInfo.isAvailable($0) }
     ) -> ImmichSendPlan {
         let placed = GradedSyncPlanner.placedRequests(
             inputs,
@@ -183,7 +188,24 @@ extension ClipGrading {
             item.request = request
             plan.pending.append(item)
         }
+        var available: [String: Bool] = [:]
+        plan.driveAwayCount = plan.pending.count { item in
+            guard item.placement == .nas, let drive = item.request.mirrorFolder else { return false }
+            let root = driveRoot(of: drive, inputs.locations)
+            if let known = available[root.path] { return !known }
+            let isThere = driveIsAvailable(root)
+            available[root.path] = isThere
+            return !isThere
+        }
         return plan
+    }
+
+    /// The Buffer or private staging root a drive path is under.
+    nonisolated static func driveRoot(of url: URL, _ locations: EventStorageLocations) -> URL {
+        let path = url.standardizedFileURL.path
+        return [locations.bufferRoot, locations.privateStagingRoot]
+            .sorted { $0.path.count > $1.path.count }
+            .first { path.hasPrefix($0.path + "/") } ?? locations.bufferRoot
     }
 
     private func settlePlan(_ plan: ImmichSendPlan, for ask: ImmichSendGradeAsk) {
@@ -195,6 +217,7 @@ extension ClipGrading {
         ask.pending = plan.pending
         ask.estimatedBytes = plan.estimatedBytes
         ask.unchecked = plan.unchecked
+        ask.driveAwayCount = plan.driveAwayCount
         let pendingEvents = Set(plan.pending.map(\.eventID))
         ask.eventNames = model.configuration.savedEvents
             .filter { pendingEvents.contains($0.id) }

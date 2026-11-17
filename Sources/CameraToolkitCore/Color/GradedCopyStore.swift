@@ -12,18 +12,29 @@ public struct GradedCopyRecord: Codable, Equatable, Sendable {
     /// The original's identity (`FaceIndexStore.fileKey`), as tagged in the copy.
     public var sourceKey: String
     public var recordedAt: Date
-    /// Filled when read: Sync to NAS (or the NAS render itself) verified a
-    /// file at `gradedRelativePath`. A copy still only on the drive is not
-    /// waited for.
-    public var isOnNAS: Bool
+    /// Filled when read: Sync to NAS (or the NAS render itself) put a file
+    /// at `gradedRelativePath` — verified, or kept beside a drive copy Sync
+    /// called a conflict — and it is there now. A copy still only on the
+    /// drive, or one gone from the NAS, is not waited for.
+    public var isOnNAS: Bool = false
+    /// Filled when read: Sync (or the NAS render) wrote a file down at
+    /// `gradedRelativePath` at some point. True with `isOnNAS` false means
+    /// the copy is gone from the NAS; both false, it is still on the drive.
+    public var wasOnNAS: Bool = false
 
-    public init(eventID: UUID, originalRelativePath: String, gradedRelativePath: String, sourceKey: String, recordedAt: Date = Date(), isOnNAS: Bool = false) {
+    public init(eventID: UUID, originalRelativePath: String, gradedRelativePath: String, sourceKey: String, recordedAt: Date = Date(), isOnNAS: Bool = false, wasOnNAS: Bool? = nil) {
+        self.wasOnNAS = wasOnNAS ?? isOnNAS
         self.eventID = eventID
         self.originalRelativePath = originalRelativePath
         self.gradedRelativePath = gradedRelativePath
         self.sourceKey = sourceKey
         self.recordedAt = recordedAt
         self.isOnNAS = isOnNAS
+    }
+
+    /// The NAS flags are worked out when read, never stored.
+    private enum CodingKeys: String, CodingKey {
+        case eventID, originalRelativePath, gradedRelativePath, sourceKey, recordedAt
     }
 
     public var originalKey: String { NASSyncStore.pathKey(originalRelativePath) }
@@ -58,25 +69,28 @@ public final class GradedCopyStore: @unchecked Sendable {
         encoder.dateEncodingStrategy = .iso8601
         try CatalogDatabase.writer(for: catalogURL).write { database in
             for record in records {
-                var stored = record
-                stored.isOnNAS = false
                 try database.execute(
                     sql: """
                     INSERT INTO graded_copies(graded_key, original_key, event_id, record) VALUES (?, ?, ?, ?)
                     ON CONFLICT(graded_key) DO UPDATE SET original_key = excluded.original_key, event_id = excluded.event_id, record = excluded.record
                     """,
-                    arguments: [record.gradedKey, record.originalKey, record.eventID.uuidString, String(decoding: try encoder.encode(stored), as: UTF8.self)]
+                    arguments: [record.gradedKey, record.originalKey, record.eventID.uuidString, String(decoding: try encoder.encode(record), as: UTF8.self)]
                 )
             }
         }
     }
 
     /// The records of these events (all with nil), each marked with whether
-    /// a verified NAS file is at its copy's path.
-    public func records(eventIDs: Set<UUID>? = nil) throws -> [GradedCopyRecord] {
+    /// its copy is on the NAS: a verified (or conflict) Sync record at its
+    /// path, and the file there now (`exists`, one stat per record).
+    public func records(
+        eventIDs: Set<UUID>? = nil,
+        exists: ((String) -> Bool)? = nil
+    ) throws -> [GradedCopyRecord] {
+        let exists = exists ?? { LayoutMigrationDisk.lstatEntry($0)?.kind == .file }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        return try CatalogDatabase.writer(for: catalogURL).read { database in
+        let (records, onNASPaths) = try CatalogDatabase.writer(for: catalogURL).read { database -> ([GradedCopyRecord], [String: [String]]) in
             var records: [GradedCopyRecord] = []
             for row in try Row.fetchAll(database, sql: "SELECT event_id, record FROM graded_copies") {
                 if let eventIDs {
@@ -86,25 +100,32 @@ public final class GradedCopyStore: @unchecked Sendable {
                     records.append(record)
                 }
             }
-            guard !records.isEmpty, try database.tableExists(NASSyncStore.tableName) else { return records }
-            var verified: Set<String> = []
+            guard !records.isEmpty, try database.tableExists(NASSyncStore.tableName) else { return (records, [:]) }
+            // Path key → the NAS paths Sync wrote it down at.
+            var onNAS: [String: [String]] = [:]
             let keys = records.map(\.gradedKey)
             for start in stride(from: 0, to: keys.count, by: 500) {
                 let batch = Array(keys[start..<min(start + 500, keys.count)])
                 let marks = Array(repeating: "?", count: batch.count).joined(separator: ",")
                 for row in try Row.fetchAll(
                     database,
-                    sql: "SELECT path_key FROM \(NASSyncStore.tableName) WHERE state = 'verified' AND path_key IN (\(marks))",
+                    sql: "SELECT path_key, nas_root, relative_path FROM \(NASSyncStore.tableName) WHERE state IN ('verified', 'conflict') AND path_key IN (\(marks))",
                     arguments: StatementArguments(batch)
                 ) {
-                    verified.insert(row["path_key"])
+                    let root: String = row["nas_root"]
+                    let relative: String = row["relative_path"]
+                    onNAS[row["path_key"], default: []].append(root + "/" + relative)
                 }
             }
-            return records.map { record in
-                var marked = record
-                marked.isOnNAS = verified.contains(record.gradedKey)
-                return marked
-            }
+            return (records, onNAS)
+        }
+        // The NAS is asked after the catalog read, never inside it.
+        return records.map { record in
+            var marked = record
+            let paths = onNASPaths[record.gradedKey] ?? []
+            marked.wasOnNAS = !paths.isEmpty
+            marked.isOnNAS = paths.contains(where: exists)
+            return marked
         }
     }
 
