@@ -418,7 +418,7 @@ struct BlanketGradeSheetHost: ViewModifier {
                     )
                 }
             }
-            .modifier(StabilizeAllSheetHost(workspace: workspace))
+            .modifier(StabilizeSheetHost(workspace: workspace))
     }
 }
 
