@@ -969,6 +969,8 @@ struct PhaseBreakdown: View {
         case "Rename": .purple
         case "Remove": .orange
         case "Check": .gray
+        case "Stabilize": .indigo
+        case "Grade": .pink
         default: .gray
         }
     }

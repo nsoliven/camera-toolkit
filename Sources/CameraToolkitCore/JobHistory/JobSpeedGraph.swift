@@ -5,7 +5,8 @@ import Foundation
 /// still running and one that ended long ago.
 ///
 /// One rate is plotted, chosen by what the job did: MB/s for a job that
-/// moved bytes, files/s for one that only counted files (a face scan, a
+/// moved bytes, frames/s for one that makes video frames (a graded
+/// render), files/s for one that only counted files (a face scan, a
 /// check). Seconds without a sample are gaps, never a line drawn across
 /// them. The phases the samples record (Check, Hash, Copy, Verify) become
 /// spans the graph marks under the line. A job too short to chart, or one
@@ -14,11 +15,13 @@ public struct JobSpeedGraph: Equatable, Sendable {
     public enum Metric: String, Equatable, Sendable {
         case megabytesPerSecond
         case filesPerSecond
+        case framesPerSecond
 
         public var unit: String {
             switch self {
             case .megabytesPerSecond: "MB/s"
             case .filesPerSecond: "files/s"
+            case .framesPerSecond: "frames/s"
             }
         }
     }
@@ -33,6 +36,10 @@ public struct JobSpeedGraph: Equatable, Sendable {
         case copy
         /// Re-reading the NAS copy, or hashing it on the NAS.
         case verify
+        /// Gyroflow making a clip's stabilized intermediate.
+        case stabilize
+        /// Rendering a clip's graded copy.
+        case grade
 
         public var label: String {
             switch self {
@@ -40,6 +47,8 @@ public struct JobSpeedGraph: Equatable, Sendable {
             case .hash: "Hash"
             case .copy: "Copy"
             case .verify: "Verify"
+            case .stabilize: "Stabilize"
+            case .grade: "Grade"
             }
         }
     }
@@ -138,6 +147,8 @@ public struct JobSpeedGraph: Equatable, Sendable {
     /// Stretches of a scan spent matching and grouping, when no photo was
     /// being read.
     public var scanFinishing: [ClosedRange<Double>] = []
+    /// Video frames the job finished, for a job that makes frames.
+    public var framesDone: Int = 0
 
     /// True when the graph marks more than one kind of phase — a single
     /// phase over the whole job tells nothing a lane could add.
@@ -168,9 +179,14 @@ public struct JobSpeedGraph: Equatable, Sendable {
         let filesDone = positiveDeltaSum(samples.map { Int64($0.doneFiles) })
         let hasByteRates = samples.contains { ($0.combined ?? 0) > 0 }
         let hasFileRates = samples.contains { ($0.filesPerSecond ?? 0) > 0 }
+        // A render's honest unit is frames: it finishes one file an hour.
+        let hasFrameRates = samples.contains { $0.framesPerSecond != nil }
+        let framesDone = positiveDeltaSum(samples.map { Int64($0.doneFrames ?? 0) })
 
         let metric: Metric?
-        if fileRateKinds.contains(kind), hasFileRates {
+        if hasFrameRates {
+            metric = .framesPerSecond
+        } else if fileRateKinds.contains(kind), hasFileRates {
             metric = .filesPerSecond
         } else if hasByteRates, bytesMoved > 0 {
             metric = .megabytesPerSecond
@@ -194,6 +210,7 @@ public struct JobSpeedGraph: Equatable, Sendable {
             switch metric {
             case .megabytesPerSecond: return duration >= 1 && bytesMoved > 0 ? Double(bytesMoved) / duration / 1_000_000 : nil
             case .filesPerSecond: return filesRate
+            case .framesPerSecond: return duration >= 1 && framesDone > 0 ? Double(framesDone) / duration : nil
             }
         }
         let peak = points.max { $0.value < $1.value }.flatMap { $0.value > 0 ? $0 : nil }
@@ -221,7 +238,8 @@ public struct JobSpeedGraph: Equatable, Sendable {
             averageFilesPerSecond: filesRate,
             yUpper: yUpper,
             gapThreshold: gap,
-            summary: summary
+            summary: summary,
+            framesDone: Int(framesDone)
         )
     }
 
@@ -452,6 +470,7 @@ public struct JobSpeedGraph: Equatable, Sendable {
         switch metric {
         case .megabytesPerSecond: sample.combined
         case .filesPerSecond: sample.filesPerSecond
+        case .framesPerSecond: sample.framesPerSecond
         }
     }
 
@@ -463,6 +482,11 @@ public struct JobSpeedGraph: Equatable, Sendable {
         if sample.copy != nil { phases.insert(.copy) }
         if sample.verify != nil || sample.remoteVerify != nil { phases.insert(.verify) }
         if sample.hash != nil { phases.insert(.hash) }
+        switch sample.frameStep {
+        case "Stabilize": phases.insert(.stabilize)
+        case "Grade": phases.insert(.grade)
+        default: break
+        }
         if phases.isEmpty, (sample.combined ?? 0) == 0, (sample.filesPerSecond ?? 0) > 0 {
             phases.insert(.check)
         }

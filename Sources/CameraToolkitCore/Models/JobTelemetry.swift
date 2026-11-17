@@ -312,6 +312,71 @@ public struct JobPhaseLedger: Sendable {
     }
 }
 
+/// Where a video job is in its frames: the clip, the step working on it
+/// ("Stabilize", then "Grade"), that step's frame count, and every frame
+/// the job has finished so far — the counter its speed is measured from.
+public struct JobFrameProgress: Codable, Equatable, Hashable, Sendable {
+    /// The step running now — one of `steps`.
+    public var step: String
+    /// This clip's steps, in order: ["Stabilize", "Grade"] or ["Grade"].
+    public var steps: [String]
+    /// Frames this step has finished on this clip.
+    public var frame: Int
+    /// Frames this step will make of this clip; nil while unknown.
+    public var totalFrames: Int?
+    /// Every frame every step has finished in this job; never goes down.
+    public var framesDone: Int
+    /// The clip's own frame rate, so a speed reads as × realtime; nil
+    /// when the clip did not say.
+    public var videoFrameRate: Double?
+    /// 1-based clip in hand, of `clipCount`.
+    public var clipIndex: Int
+    public var clipCount: Int
+
+    public init(
+        step: String,
+        steps: [String],
+        frame: Int,
+        totalFrames: Int?,
+        framesDone: Int,
+        videoFrameRate: Double? = nil,
+        clipIndex: Int = 1,
+        clipCount: Int = 1
+    ) {
+        self.step = step
+        self.steps = steps
+        self.frame = frame
+        self.totalFrames = totalFrames
+        self.framesDone = framesDone
+        self.videoFrameRate = videoFrameRate
+        self.clipIndex = clipIndex
+        self.clipCount = clipCount
+    }
+
+    /// True when a later step still runs on this clip.
+    public var stepsFollow: Bool {
+        guard let index = steps.firstIndex(of: step) else { return false }
+        return index < steps.count - 1
+    }
+
+    /// True when more clips follow this one.
+    public var clipsFollow: Bool { clipIndex < clipCount }
+
+    /// Frames this step still has to make; nil while the total is unknown.
+    public var framesLeftInStep: Int? {
+        totalFrames.map { max($0 - frame, 0) }
+    }
+
+    /// "Stabilizing", "Grading".
+    public static func presentTense(_ step: String) -> String {
+        switch step {
+        case "Stabilize": "Stabilizing"
+        case "Grade": "Grading"
+        default: step
+        }
+    }
+}
+
 /// Which pass of a scan is running. A scan with "Look for dogs" on is one
 /// job with two passes over the same files, and each pass counts its own
 /// files from zero, so anything that shows the counters needs to know which
@@ -411,6 +476,9 @@ public struct JobTelemetry: Codable, Equatable, Hashable, Sendable {
     /// The pass a scan is in; nil for every other job and in older
     /// snapshots.
     public var scanPass: JobScanPass?
+    /// Frame progress of a video job (a graded render, with its stabilize
+    /// step); nil for every other job and in older snapshots.
+    public var frames: JobFrameProgress?
 
     public init(
         step: String? = nil,
@@ -422,7 +490,8 @@ public struct JobTelemetry: Codable, Equatable, Hashable, Sendable {
         phases: [JobPhaseTotal] = [],
         configuration: String? = nil,
         transferBytes: Int64? = nil,
-        scanPass: JobScanPass? = nil
+        scanPass: JobScanPass? = nil,
+        frames: JobFrameProgress? = nil
     ) {
         self.step = step
         self.activeItems = activeItems
@@ -434,6 +503,7 @@ public struct JobTelemetry: Codable, Equatable, Hashable, Sendable {
         self.configuration = configuration
         self.transferBytes = transferBytes
         self.scanPass = scanPass
+        self.frames = frames
     }
 
     public init(from decoder: Decoder) throws {
@@ -448,6 +518,7 @@ public struct JobTelemetry: Codable, Equatable, Hashable, Sendable {
         configuration = try container.decodeIfPresent(String.self, forKey: .configuration)
         transferBytes = try container.decodeIfPresent(Int64.self, forKey: .transferBytes)
         scanPass = try container.decodeIfPresent(JobScanPass.self, forKey: .scanPass)
+        frames = try container.decodeIfPresent(JobFrameProgress.self, forKey: .frames)
     }
 
     /// Each measured phase's share of the time, in the job's order. The

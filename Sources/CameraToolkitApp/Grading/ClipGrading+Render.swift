@@ -435,11 +435,13 @@ extension ClipGrading {
         availableBytes: (URL) -> Int64? = { GradedVideoExporter.availableBytes(near: $0) },
         estimatedBytes: (URL) -> Int64? = { GradedVideoExporter.estimatedBytes(of: $0) },
         stabilizedBytes: (URL) -> Int64? = { Stabilizer.estimatedBytes(of: $0) },
+        frameRate: (URL) -> Double? = { GradedVideoExporter.nominalFrameRate(of: $0) },
         progress: @escaping @Sendable (BackgroundJobUpdate) -> Void
     ) throws -> RenderOutcome {
         let exporter = exporter ?? GradedVideoExporter(renderer: renderer)
         var outcome = RenderOutcome()
         let total = requests.count
+        let tally = RenderFrameTally()
         // A crash or a Stop can leave partials: clear them first, in every
         // folder this job touches, whatever it goes on to render.
         for folder in Set(requests.map(\.outputFolder)) {
@@ -458,6 +460,8 @@ extension ClipGrading {
             prepared.model = sidecar?.model
             let request = prepared
             let name = request.source.lastPathComponent
+            let steps = request.stabilization == nil ? [RenderFrameTally.grade] : [RenderFrameTally.stabilize, RenderFrameTally.grade]
+            let clip = index + 1
             progress(BackgroundJobUpdate(
                 progress: Double(index) / Double(total),
                 note: "Rendering \(index + 1) of \(total) · \(name)",
@@ -466,7 +470,8 @@ extension ClipGrading {
                 destinationPath: request.outputFolder.path,
                 currentPath: request.source.path,
                 processedFiles: index,
-                totalFiles: total
+                totalFiles: total,
+                telemetry: tally.telemetry(step: steps[0], steps: steps, frame: 0, totalFrames: nil, videoFrameRate: nil, clip: clip, of: total)
             ))
             if let existing = GradedVideoExporter.existingRender(of: request) {
                 outcome.alreadyThere.append(existing)
@@ -494,7 +499,11 @@ extension ClipGrading {
             let share = request.stabilization == nil ? 0.0 : 0.5
             do {
                 var graded = request
+                var stabilizedFrames: Int?
                 if request.stabilization != nil {
+                    let clipRate = frameRate(request.source)
+                    tally.beginStep()
+                    defer { stabilizedFrames = tally.endStep() }
                     chain = try StabilizedGradeChain.prepare(
                         request, stabilizer: stabilizer,
                         rangeOf: { probedRange($0, renderer: renderer) },
@@ -505,13 +514,23 @@ extension ClipGrading {
                                 phase: "Stabilize",
                                 currentPath: request.source.path,
                                 processedFiles: index,
-                                totalFiles: total
+                                totalFiles: total,
+                                telemetry: tally.telemetry(
+                                    step: RenderFrameTally.stabilize, steps: steps, frame: step.frame,
+                                    totalFrames: step.totalFrames > 0 ? step.totalFrames : nil,
+                                    videoFrameRate: clipRate, clip: clip, of: total
+                                )
                             ))
                         },
                         isCancelled: isStopped
                     )
                     graded = chain!.request
                 }
+                tally.beginStep()
+                defer { _ = tally.endStep() }
+                // The stabilized intermediate has exactly the frames Gyroflow
+                // counted; a plain clip's are length × frame rate.
+                let gradeFrames = stabilizedFrames.flatMap { $0 > 0 ? $0 : nil }
                 let result = try exporter.render(graded, progress: { step in
                     progress(BackgroundJobUpdate(
                         progress: (Double(index) + share + step.fraction * (1 - share)) / Double(total),
@@ -519,7 +538,12 @@ extension ClipGrading {
                         phase: "Render",
                         currentPath: request.source.path,
                         processedFiles: index,
-                        totalFiles: total
+                        totalFiles: total,
+                        telemetry: tally.telemetry(
+                            step: RenderFrameTally.grade, steps: steps, frame: step.framesWritten,
+                            totalFrames: gradeFrames ?? step.totalFrames, videoFrameRate: step.frameRate,
+                            clip: clip, of: total
+                        )
                     ))
                 }, isCancelled: isStopped)
                 switch result {
@@ -562,6 +586,70 @@ extension ClipGrading {
             parts.append("\(refusals.count) skipped (\(refusals[0]))")
         }
         return parts.joined(separator: "; ") + ". Originals untouched; Sync to NAS carries the copies."
+    }
+}
+
+/// Counts a render job's frames across its steps and clips, so the Jobs
+/// window measures the job's speed from one counter that only goes up.
+/// Its reports arrive from Gyroflow's reader and the encoder's queue.
+final class RenderFrameTally: @unchecked Sendable {
+    static let stabilize = "Stabilize"
+    static let grade = "Grade"
+
+    private let lock = NSLock()
+    /// Frames of steps already over.
+    private var finished = 0
+    /// Frames the running step has made, of the total it last reported.
+    private var current = 0
+    private var currentTotal: Int?
+
+    /// A step starts counting from zero.
+    func beginStep() {
+        lock.withLock {
+            finished += current
+            current = 0
+            currentTotal = nil
+        }
+    }
+
+    /// The step is over (made, failed or stopped); returns the frames it
+    /// said it would make, or those it made when it never said.
+    @discardableResult
+    func endStep() -> Int {
+        lock.withLock {
+            let made = currentTotal ?? current
+            finished += current
+            current = 0
+            currentTotal = nil
+            return made
+        }
+    }
+
+    /// The running step reached `frame`; the telemetry the update carries.
+    func telemetry(
+        step: String,
+        steps: [String],
+        frame: Int,
+        totalFrames: Int?,
+        videoFrameRate: Double?,
+        clip: Int,
+        of clipCount: Int
+    ) -> JobTelemetry {
+        let done: Int = lock.withLock {
+            current = max(current, frame)
+            if let totalFrames { currentTotal = totalFrames }
+            return finished + current
+        }
+        return JobTelemetry(frames: JobFrameProgress(
+            step: step,
+            steps: steps,
+            frame: max(frame, 0),
+            totalFrames: totalFrames,
+            framesDone: done,
+            videoFrameRate: videoFrameRate,
+            clipIndex: clip,
+            clipCount: clipCount
+        ))
     }
 }
 

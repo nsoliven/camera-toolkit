@@ -36,6 +36,7 @@ final class JobHistoryTests: XCTestCase {
             let samples = [
                 JobHistorySample(t: 1, combined: nil, activeTransfers: 4, doneBytes: 10, doneFiles: 0),
                 JobHistorySample(t: 2, combined: 112.5, copy: 60, verify: 58, hash: nil, remoteVerify: nil, filesPerSecond: 1.5, activeTransfers: 3, cpu: 0.2, gpu: nil, transferBytes: 1_000, doneBytes: 900, doneFiles: 1, secondsRemaining: 600),
+                JobHistorySample(t: 3, framesPerSecond: 24.5, doneFrames: 120, frameStep: "Stabilize"),
             ]
             let items = [
                 JobHistoryItem(relativePath: "2026/Event/Originals/Cam/A.ARW", byteCount: 1_000, start: 0.5, end: 1.5, slot: 0, outcome: .copied, verifyMethod: "smb", copySeconds: 0.6, verifySeconds: 0.3),
@@ -87,7 +88,7 @@ final class JobHistoryTests: XCTestCase {
             }
             XCTAssertTrue(Set(indexes).isSuperset(of: ["job_samples_job_id", "job_items_job_id", "jobs_started_at"]), "\(indexes)")
             let migrations = try writer.read { db in try String.fetchAll(db, sql: "SELECT identifier FROM grdb_migrations") }
-            XCTAssertEqual(migrations, ["v1", "v2-estimates"])
+            XCTAssertEqual(migrations, ["v1", "v2-estimates", "v3-frames"])
             let journal = try writer.read { db in try String.fetchOne(db, sql: "PRAGMA journal_mode") }
             XCTAssertEqual(journal, "wal")
         }
@@ -192,6 +193,41 @@ final class JobHistoryTests: XCTestCase {
             for _ in 0..<8 { tick() }
             XCTAssertEqual(recorder.samples().count, 6)
         }
+    }
+
+    /// A render reports frames, not files: the recorder turns its frame
+    /// counter into frames/s and keeps the step, through a report that
+    /// carries no frames.
+    func testTheRecorderMeasuresFramesPerSecondForARender() throws {
+        let clock = ManualClock()
+        let recorder = JobHistoryRecorder(store: nil, kind: "gradeRender", title: "Render 1 graded copy", clock: { clock.read() })
+        func report(_ done: Int, step: String, frames: Bool = true) {
+            clock.advance(1)
+            let telemetry = frames
+                ? JobTelemetry(frames: JobFrameProgress(step: step, steps: ["Stabilize", "Grade"], frame: done % 300, totalFrames: 300, framesDone: done))
+                : nil
+            recorder.observe(.init(processedFiles: 0, totalFiles: 1, processedBytes: 0, totalBytes: 0, telemetry: telemetry))
+        }
+        // No frames for two seconds (the clip is opened), then 30 frames a
+        // second while stabilizing, 60 while grading.
+        report(0, step: "Stabilize", frames: false)
+        report(0, step: "Stabilize", frames: false)
+        for second in 1...10 { report(second * 30, step: "Stabilize") }
+        for second in 1...10 { report(300 + second * 60, step: "Grade") }
+        report(0, step: "Grade", frames: false)
+        recorder.flush()
+        let samples = recorder.samples()
+        XCTAssertNil(samples[0].framesPerSecond, "before the first frame report there is no frame rate")
+        XCTAssertNil(samples[2].framesPerSecond, "one frame report is no span yet")
+        XCTAssertEqual(try XCTUnwrap(samples[3].framesPerSecond), 30, accuracy: 0.001, "measured from the first report with frames, not watered down")
+        XCTAssertEqual(try XCTUnwrap(samples[8].framesPerSecond), 30, accuracy: 0.001)
+        XCTAssertEqual(samples[8].frameStep, "Stabilize")
+        XCTAssertEqual(try XCTUnwrap(samples[21].framesPerSecond), 60, accuracy: 0.001)
+        XCTAssertEqual(samples[21].frameStep, "Grade")
+        XCTAssertEqual(samples[21].doneFrames, 900)
+        XCTAssertEqual(samples.last?.doneFrames, 900, "a closing report without frames keeps the count")
+        XCTAssertEqual(samples.last?.frameStep, "Grade")
+        XCTAssertNil(samples[21].filesPerSecond.flatMap { $0 > 0 ? $0 : nil }, "no file finished")
     }
 
     func testPhaseRatesAreOverTheTimeEachPhaseRan() throws {

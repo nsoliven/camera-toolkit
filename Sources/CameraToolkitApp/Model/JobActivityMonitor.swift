@@ -97,6 +97,9 @@ struct JobThroughputReadout: Equatable {
     var filesPerSecond: Double?
     /// Video frames per second, for face scans that decode clips.
     var framesPerSecond: Double?
+    /// A frame job's current speed against its clip's frame rate (1 is
+    /// realtime); nil when the clip's rate is unknown.
+    var realtime: Double?
     var points: [ThroughputPoint] = []
     /// Series in legend order — "Copy (write)", "Verify (re-read)".
     var series: [String] = []
@@ -161,6 +164,14 @@ struct JobThroughputTrack {
     private(set) var series: [String] = []
     private(set) var scale = StableScale()
     private(set) var pace: JobPassPace
+    /// A frame job's running step — clip and step — and its own frame
+    /// rate, so the time left is the step's, not a blend with the last one.
+    private var stepKey: String?
+    private var stepStarted: TimeInterval
+    private(set) var stepRate = HeldRate()
+
+    /// A step younger than this has not shown its pace yet.
+    static let stepWarmup: TimeInterval = 5
 
     init(unit: ThroughputUnit, job: JobSnapshot, now: TimeInterval, wallNow: Date) {
         self.unit = unit
@@ -171,6 +182,7 @@ struct JobThroughputTrack {
         lastPrimaryCount = count
         movedTotal = count
         pace = JobPassPace(files: job.processedFiles, bytes: job.processedBytes, at: now)
+        stepStarted = now
     }
 
     func elapsed(at now: TimeInterval) -> TimeInterval {
@@ -180,10 +192,13 @@ struct JobThroughputTrack {
     /// The headline counter: for a job with parallel transfers, the bytes
     /// all of them together moved over the link (the combined speed);
     /// otherwise the job's own byte or file counter.
-    static func primaryCount(_ job: JobSnapshot, unit: ThroughputUnit) -> Double {
+    /// A frame job's report without frames (a closing check) leaves the
+    /// count at `fallback`, the last one heard.
+    static func primaryCount(_ job: JobSnapshot, unit: ThroughputUnit, fallback: Double = 0) -> Double {
         switch unit {
         case .megabytesPerSecond: Double(max(job.telemetry?.transferBytes ?? job.processedBytes, 0))
         case .filesPerSecond: Double(max(job.processedFiles, 0))
+        case .framesPerSecond: job.telemetry?.frames.map { Double(max($0.framesDone, 0)) } ?? fallback
         }
     }
 
@@ -191,11 +206,13 @@ struct JobThroughputTrack {
     /// times its phases (Sync to NAS) — each byte-moving phase's speed while
     /// it runs, so copy and verify can each be read against the link
     /// ceiling however short a file's copy → flush → verify cycle is.
-    static func seriesCounts(_ job: JobSnapshot, unit: ThroughputUnit) -> [SeriesCount] {
-        let overall = SeriesCount(
-            name: unit == .megabytesPerSecond ? "Throughput" : "Files",
-            count: primaryCount(job, unit: unit)
-        )
+    static func seriesCounts(_ job: JobSnapshot, unit: ThroughputUnit, primary: Double? = nil) -> [SeriesCount] {
+        let name: String = switch unit {
+        case .megabytesPerSecond: "Throughput"
+        case .filesPerSecond: "Files"
+        case .framesPerSecond: "Frames"
+        }
+        let overall = SeriesCount(name: name, count: primary ?? primaryCount(job, unit: unit))
         guard unit == .megabytesPerSecond, let telemetry = job.telemetry,
               !telemetry.phases.isEmpty || telemetry.transferBytes != nil else {
             return [overall]
@@ -224,7 +241,7 @@ struct JobThroughputTrack {
 
     mutating func record(_ job: JobSnapshot, at now: TimeInterval, ceiling: JobLinkCeiling?) {
         lastTick = now
-        let count = Self.primaryCount(job, unit: unit)
+        let count = Self.primaryCount(job, unit: unit, fallback: lastPrimaryCount)
         if count >= lastPrimaryCount {
             movedTotal += count - lastPrimaryCount
         }
@@ -236,8 +253,17 @@ struct JobThroughputTrack {
             hasFrames = true
             frames.observe(Double(frameCount), at: now)
         }
+        if let step = job.telemetry?.frames {
+            let key = "\(step.clipIndex)-\(step.step)"
+            if key != stepKey {
+                stepKey = key
+                stepRate = HeldRate()
+                stepStarted = now
+            }
+            stepRate.observe(Double(step.frame), at: now)
+        }
 
-        let counts = Self.seriesCounts(job, unit: unit)
+        let counts = Self.seriesCounts(job, unit: unit, primary: count)
         for entry in counts where !series.contains(entry.name) {
             series.append(entry.name)
         }
@@ -279,6 +305,15 @@ struct JobThroughputTrack {
         scale.update(visibleMax: visibleMax, floor: (ceiling?.megabytesPerSecond ?? 0) * 1.1)
     }
 
+    /// Seconds left in a frame job's running step at that step's own
+    /// smoothed pace; nil until the step has run `stepWarmup` and made
+    /// frames, or while its frame total is unknown.
+    func stepSecondsRemaining(_ step: JobFrameProgress) -> TimeInterval? {
+        guard stepKey == "\(step.clipIndex)-\(step.step)", lastTick - stepStarted >= Self.stepWarmup,
+              let rate = stepRate.value, rate > 0, let left = step.framesLeftInStep else { return nil }
+        return Double(left) / rate
+    }
+
     func xDomain(at now: TimeInterval) -> ClosedRange<Double> {
         let end = max(elapsed(at: now), 60)
         return max(end - Self.chartWindow, 0)...end
@@ -297,13 +332,18 @@ struct JobThroughputTrack {
             ? primary.value.map { $0 / divisor } ?? (pastWarmup ? 0 : nil)
             : nil
         let average: Double? = seconds >= 1 && (movedTotal > 0 || pastWarmup) ? movedTotal / seconds / divisor : nil
+        let clipRate = job.telemetry?.frames?.videoFrameRate
+        let realtime: Double? = unit == .framesPerSecond && live
+            ? clipRate.flatMap { rate in rate > 0 ? current.map { $0 / rate } : nil }
+            : nil
         return JobThroughputReadout(
             unit: unit,
             current: current,
             average: average,
             heldFor: live && primary.value != nil ? held : nil,
-            filesPerSecond: unit == .filesPerSecond ? nil : (live ? files.value : nil),
+            filesPerSecond: unit != .megabytesPerSecond ? nil : (live ? files.value : nil),
             framesPerSecond: hasFrames && live ? frames.value : nil,
+            realtime: realtime,
             points: points,
             series: series,
             yUpper: scale.upper,
@@ -383,6 +423,9 @@ final class JobActivityMonitor {
     static func throughputUnit(_ job: JobSnapshot) -> ThroughputUnit? {
         let counts = job.totalFiles > 0 || job.processedFiles > 0
         if job.action == .faceScan { return counts ? .filesPerSecond : nil }
+        // A render is frames from its first report: it finishes a file in
+        // minutes, and its bytes are an estimate, not a counter.
+        if job.action == .gradeRender { return .framesPerSecond }
         return job.totalBytes > 0 || job.processedBytes > 0 ? .megabytesPerSecond : (counts ? .filesPerSecond : nil)
     }
 
@@ -392,13 +435,16 @@ final class JobActivityMonitor {
         if let track = tracks[job.id] {
             return track.readout(for: job, at: now, ceiling: ceilings[job.id])
         }
-        let bytes = job.action != .faceScan && (job.totalBytes > 0 || job.processedBytes > 0)
+        let frames = job.action == .gradeRender
+        let bytes = !frames && job.action != .faceScan && (job.totalBytes > 0 || job.processedBytes > 0)
         let end = job.finishedAt ?? Date()
         let seconds = end.timeIntervalSince(job.createdAt)
-        let moved = bytes ? Double(job.telemetry?.transferBytes ?? job.processedBytes) / 1_000_000 : Double(job.processedFiles)
+        let moved = frames
+            ? Double(job.telemetry?.frames?.framesDone ?? 0)
+            : bytes ? Double(job.telemetry?.transferBytes ?? job.processedBytes) / 1_000_000 : Double(job.processedFiles)
         let live = job.state == .running || job.state == .queued
         return JobThroughputReadout(
-            unit: bytes ? .megabytesPerSecond : .filesPerSecond,
+            unit: frames ? .framesPerSecond : bytes ? .megabytesPerSecond : .filesPerSecond,
             current: live && seconds >= JobThroughputTrack.placeholderWindow ? 0 : nil,
             average: seconds >= JobThroughputTrack.placeholderWindow || (seconds >= 1 && moved > 0) ? moved / max(seconds, 1) : nil,
             ceiling: ceilings[job.id]
@@ -434,6 +480,11 @@ final class JobActivityMonitor {
                 return .seconds(seconds)
             }
             return .estimating
+        }
+        if let step = job.telemetry?.frames {
+            guard let track = tracks[job.id], track.unit == .framesPerSecond,
+                  let seconds = track.stepSecondsRemaining(step) else { return .estimating }
+            return .seconds(seconds)
         }
         return estimatedRemaining(for: job).map { .seconds($0) }
     }

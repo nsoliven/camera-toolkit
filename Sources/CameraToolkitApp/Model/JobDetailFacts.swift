@@ -37,8 +37,9 @@ enum JobDetailFacts {
     /// "now" and average, the files rate, and the recorded peak.
     static func liveReadouts(_ readout: JobThroughputReadout, graph: JobSpeedGraph, job: JobSnapshot) -> [JobReadout] {
         let bytes = readout.unit == .megabytesPerSecond
+        let frames = readout.unit == .framesPerSecond
         let format: (Double) -> String = { bytes ? JobThroughputFormat.rate($0) : JobThroughputFormat.itemRate($0) }
-        let unit = bytes ? readout.unit.axisLabel : filesUnit(job.action.rawValue)
+        let unit = bytes || frames ? readout.unit.axisLabel : filesUnit(job.action.rawValue)
         let scan = job.action == .faceScan
         let combined = job.telemetry?.transferBytes != nil
         let nowCaption = combined ? "now · combined" : "now"
@@ -54,8 +55,15 @@ enum JobDetailFacts {
                 faded: readout.isHeld,
                 help: (readout.isHeld
                     ? "No progress reported for a few seconds — the last smoothed speed is held, not blanked."
-                    : "Smoothed over about the last 5 seconds") + (combined ? " All parallel transfers together." : "")
+                    : (frames ? "Video frames made per second, smoothed over about the last 5 seconds" : "Smoothed over about the last 5 seconds"))
+                    + (combined ? " All parallel transfers together." : "")
             ))
+            if let realtime = readout.realtime {
+                result.append(JobReadout(
+                    caption: "speed", value: JobThroughputFormat.realtime(realtime), unit: "× realtime",
+                    faded: readout.isHeld, help: "The speed now against the clip's own frame rate: 1 × is as fast as the clip plays"
+                ))
+            }
         }
         // A scan's average is over the time it spent reading photos, which
         // the graph knows: it leaves out matching and the gaps between passes.
@@ -67,11 +75,13 @@ enum JobDetailFacts {
             prominent: !running,
             help: scan
                 ? "Photos finished over the time spent reading them, across every pass"
-                : "Everything this job has moved, over its elapsed time" + (combined ? ", all parallel transfers together" : "")
+                : frames
+                    ? "Every frame this job has made, stabilizing and grading, over its elapsed time"
+                    : "Everything this job has moved, over its elapsed time" + (combined ? ", all parallel transfers together" : "")
         ))
         // "Now" is smoothed differently from the recorded samples, so it can
         // run ahead of them; a peak below the current speed makes no sense.
-        let nowMatchesGraph = bytes == (graph.metric == .megabytesPerSecond)
+        let nowMatchesGraph = graph.metric == metric(of: readout.unit)
         if let peak = peakReadout(graph, kind: job.action.rawValue, atLeast: running && nowMatchesGraph ? readout.current : nil) {
             result.append(peak)
         }
@@ -91,6 +101,16 @@ enum JobDetailFacts {
     /// samples: average, peak, and the files rate.
     static func finishedReadouts(job: JobHistoryJob, graph: JobSpeedGraph) -> [JobReadout] {
         var result: [JobReadout] = []
+        if graph.metric == .framesPerSecond {
+            if let average = graph.average {
+                result.append(JobReadout(
+                    caption: "average", value: JobThroughputFormat.itemRate(average), unit: "frames/s", prominent: true,
+                    help: "\(graph.framesDone.formatted()) frames made over the job's whole time"
+                ))
+            }
+            if let peak = peakReadout(graph, kind: job.kind) { result.append(peak) }
+            return result
+        }
         let combined = job.transferBytes != nil
         // A scan reads in photos, whatever bytes it passed over.
         let scan = job.kind == JobAction.faceScan.rawValue
@@ -125,13 +145,22 @@ enum JobDetailFacts {
         return JobReadout(
             caption: "peak",
             value: metric == .megabytesPerSecond ? JobThroughputFormat.rate(value) : JobThroughputFormat.itemRate(value),
-            unit: metric == .megabytesPerSecond ? metric.unit : filesUnit(kind),
+            unit: metric == .filesPerSecond ? filesUnit(kind) : metric.unit,
             help: "The fastest stretch, at \(JobActivityDetail.durationText(peak.t)) — each sample spans about five seconds"
         )
     }
 
     static func filesUnit(_ kind: String) -> String {
         kind == JobAction.faceScan.rawValue ? "photos/s" : "files/s"
+    }
+
+    /// The recorded graph's metric that a live readout's unit matches.
+    static func metric(of unit: ThroughputUnit) -> JobSpeedGraph.Metric {
+        switch unit {
+        case .megabytesPerSecond: .megabytesPerSecond
+        case .filesPerSecond: .filesPerSecond
+        case .framesPerSecond: .framesPerSecond
+        }
     }
 
     // MARK: The answer at the top
@@ -147,6 +176,13 @@ enum JobDetailFacts {
     /// "Pass 2 of 2 · Dogs · ~12 m left in this pass", or just the time
     /// left; nil when there is nothing true to say yet.
     static func liveSubline(_ job: JobSnapshot, remaining: String?) -> String? {
+        if let frames = job.telemetry?.frames {
+            // The time left is the running step's: say which, when more
+            // work follows it.
+            guard let remaining else { return nil }
+            if frames.stepsFollow { return "\(remaining) to \(frames.step.lowercased())" }
+            return frames.clipsFollow ? "\(remaining) on this clip" : remaining
+        }
         let pass = job.telemetry?.scanPass
         var parts: [String] = []
         if let label = pass?.label { parts.append(label) }
@@ -162,6 +198,7 @@ enum JobDetailFacts {
     /// scan shows the count of the pass it is in, the percent that goes
     /// with it, and what the pass found.
     static func liveCounts(_ job: JobSnapshot) -> String {
+        if let frames = job.telemetry?.frames { return frameCounts(frames) }
         var parts: [String] = []
         let pass = job.telemetry?.scanPass
         let scan = job.action == .faceScan
@@ -194,6 +231,28 @@ enum JobDetailFacts {
             parts.append(contentsOf: counters.map { "\($0.value.formatted()) \($0.label.lowercased())" })
         }
         return parts.isEmpty ? "Waiting for the job to report" : parts.joined(separator: " · ")
+    }
+
+    /// "Clip 2 of 3 · Stabilized · Grading 1,200 of 3,390 frames": the
+    /// clip, then each of its steps — done, running with its frames, or
+    /// next.
+    static func frameCounts(_ frames: JobFrameProgress) -> String {
+        var parts: [String] = []
+        if frames.clipCount > 1 {
+            parts.append("Clip \(frames.clipIndex.formatted()) of \(frames.clipCount.formatted())")
+        }
+        let current = frames.steps.firstIndex(of: frames.step) ?? 0
+        for (index, step) in frames.steps.enumerated() {
+            if index < current {
+                parts.append(step == "Stabilize" ? "Stabilized" : "\(step) done")
+            } else if index == current {
+                let count = frames.totalFrames.map { "\(frames.frame.formatted()) of \($0.formatted())" } ?? frames.frame.formatted()
+                parts.append("\(JobFrameProgress.presentTense(step)) \(count) frames")
+            } else {
+                parts.append("\(step) next")
+            }
+        }
+        return parts.joined(separator: " · ")
     }
 
     /// The result of a finished job, in one line.
@@ -236,6 +295,9 @@ enum JobDetailFacts {
         if scan {
             if graph.filesDone > 0 { value = "\(graph.filesDone.formatted()) photos" }
             subline = graph.average.map { "\(JobThroughputFormat.itemRate($0)) \(unit) on average" }
+        } else if graph.metric == .framesPerSecond {
+            if graph.framesDone > 0 { value = "\(graph.framesDone.formatted()) frames" }
+            subline = graph.average.map { "\(JobThroughputFormat.itemRate($0)) frames/s on average" }
         } else if let job {
             if job.bytesDone > 0 {
                 value = job.bytesDone.formattedBytes
@@ -361,7 +423,13 @@ enum JobDetailFacts {
         case .tooShort(let duration):
             if isLive { return "Measuring speed…" }
             let average = graph.average.flatMap { value in
-                graph.metric.map { $0 == .megabytesPerSecond ? "\(JobThroughputFormat.rate(value)) MB/s" : "\(JobThroughputFormat.itemRate(value)) \(unit)" }
+                graph.metric.map { metric in
+                    switch metric {
+                    case .megabytesPerSecond: "\(JobThroughputFormat.rate(value)) MB/s"
+                    case .framesPerSecond: "\(JobThroughputFormat.itemRate(value)) frames/s"
+                    case .filesPerSecond: "\(JobThroughputFormat.itemRate(value)) \(unit)"
+                    }
+                }
             }
             return "Done in \(JobActivityDetail.durationText(duration)) — too quick to chart" + (average.map { ". Averaged \($0)." } ?? ".")
         case .noSamples:
@@ -381,14 +449,20 @@ enum JobDetailFacts {
         guard let sample else { return (title, [("", "No samples — nothing reported")]) }
         var rows: [(String, String)] = []
         let unit = filesUnit(kind)
-        if graph.metric == .filesPerSecond {
+        if graph.metric == .framesPerSecond {
+            rows.append(("Speed", sample.framesPerSecond.map { "\(JobThroughputFormat.itemRate($0)) frames/s" } ?? JobThroughputFormat.placeholder))
+        } else if graph.metric == .filesPerSecond {
             rows.append(("Speed", sample.filesPerSecond.map { "\(JobThroughputFormat.itemRate($0)) \(unit)" } ?? JobThroughputFormat.placeholder))
             if kind != JobAction.faceScan.rawValue, let bytes = sample.combined, bytes > 0 { rows.append(("Read", "\(JobThroughputFormat.rate(bytes)) MB/s")) }
         } else {
             rows.append(("Speed", sample.combined.map { "\(JobThroughputFormat.rate($0)) MB/s" } ?? JobThroughputFormat.placeholder))
             if let files = sample.filesPerSecond, files > 0 { rows.append(("Files", "\(JobThroughputFormat.itemRate(files)) \(unit)")) }
         }
-        rows.append(("Done", "\(sample.doneFiles.formatted()) files" + (sample.doneBytes > 0 ? " · \(sample.doneBytes.formattedBytes)" : "")))
+        if graph.metric == .framesPerSecond, let frames = sample.doneFrames {
+            rows.append(("Done", "\(frames.formatted()) frames" + (sample.frameStep.map { " · \(JobFrameProgress.presentTense($0).lowercased())" } ?? "")))
+        } else {
+            rows.append(("Done", "\(sample.doneFiles.formatted()) files" + (sample.doneBytes > 0 ? " · \(sample.doneBytes.formattedBytes)" : "")))
+        }
         let phaseRates: [(String, Double?)] = [
             ("Copy", sample.copy), ("Verify", sample.verify), ("Verify on NAS", sample.remoteVerify), ("Hash", sample.hash),
         ]

@@ -220,6 +220,11 @@ public final class GradedVideoExporter: @unchecked Sendable {
     public struct Progress: Sendable {
         public var fraction: Double
         public var framesWritten: Int
+        /// About how many frames the copy will have (length × frame rate);
+        /// nil when the clip did not say.
+        public var totalFrames: Int? = nil
+        /// The clip's nominal frame rate; nil when unknown.
+        public var frameRate: Double? = nil
     }
 
     public func render(
@@ -379,6 +384,15 @@ public final class GradedVideoExporter: @unchecked Sendable {
         return values?.volumeAvailableCapacity.map(Int64.init)
     }
 
+    /// The clip's nominal video frame rate, nil when it has none to read.
+    public static func nominalFrameRate(of source: URL) -> Double? {
+        let rate: Float?? = try? blocking {
+            try await CameraVideoAsset.asset(for: source).loadTracks(withMediaType: .video).first?.load(.nominalFrameRate)
+        }
+        guard let rate = rate ?? nil, rate.isFinite, rate > 0 else { return nil }
+        return Double(rate)
+    }
+
     /// About how many bytes the copy will take: the target video bit rate
     /// plus the original's audio, over the clip's length.
     public static func estimatedBytes(of source: URL) -> Int64? {
@@ -494,6 +508,8 @@ public final class GradedVideoExporter: @unchecked Sendable {
         let parts = Sendables(reader: reader, writer: writer, videoOutput: videoOutput, videoInput: videoInput, audio: audio)
         let group = DispatchGroup()
         let durationSeconds = max(loaded.duration.seconds, 0.001)
+        let frameRate: Double? = loaded.fps.isFinite && loaded.fps > 0 ? Double(loaded.fps) : nil
+        let plannedFrames = frameRate.map { Int((durationSeconds * $0).rounded()) }
         final class Counter: @unchecked Sendable { var frames = 0; var cancelled = false }
         let counter = Counter()
 
@@ -520,7 +536,7 @@ public final class GradedVideoExporter: @unchecked Sendable {
                 counter.frames += 1
                 if counter.frames % 15 == 0 {
                     let time = CMSampleBufferGetPresentationTimeStamp(sample).seconds
-                    progress(Progress(fraction: min(1, max(0, time / durationSeconds)), framesWritten: counter.frames))
+                    progress(Progress(fraction: min(1, max(0, time / durationSeconds)), framesWritten: counter.frames, totalFrames: plannedFrames, frameRate: frameRate))
                 }
             }
         }
@@ -554,7 +570,7 @@ public final class GradedVideoExporter: @unchecked Sendable {
         guard writer.status == .completed else {
             throw ToolkitError.commandFailed("Writing the graded copy failed: \(writer.error?.localizedDescription ?? "unknown error").")
         }
-        progress(Progress(fraction: 1, framesWritten: counter.frames))
+        progress(Progress(fraction: 1, framesWritten: counter.frames, totalFrames: counter.frames, frameRate: frameRate))
     }
 
     private struct LoadedSource: @unchecked Sendable {

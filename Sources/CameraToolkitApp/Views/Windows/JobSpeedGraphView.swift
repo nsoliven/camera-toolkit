@@ -252,6 +252,7 @@ private struct JobSpeedPlot: View {
         switch metric {
         case .filesPerSecond: JobDetailFacts.filesUnit(kind)
         case .megabytesPerSecond: "MB/s"
+        case .framesPerSecond: "frames/s"
         case nil: ""
         }
     }
@@ -350,6 +351,8 @@ extension JobSpeedGraph.Phase {
         case .hash: "Hash"
         case .copy: "Copy"
         case .verify: "Verify"
+        case .stabilize: "Stabilize"
+        case .grade: "Grade"
         }
     }
 }
