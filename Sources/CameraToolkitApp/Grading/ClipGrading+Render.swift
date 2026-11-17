@@ -8,6 +8,8 @@ extension ClipGrading {
         var eventIDs: Set<UUID> = []
         /// Why some clips were left out, one line each.
         var refusals: [String] = []
+        /// Said with the job (clips set to Stabilize rendered graded only).
+        var notes: [String] = []
     }
 
     /// Which `Edited` folder a clip's copy goes to: the drive's when the
@@ -60,6 +62,9 @@ extension ClipGrading {
                 // drive copy not synced yet keeps its name.
                 let onNAS = output.path.hasPrefix(workspace.locations.nasRoot.standardizedFileURL.path + "/")
                 let policy = workspace.resolvedPolicy(for: event)
+                if let note = stabilizing.unavailableNote(forKeys: [Self.fileKey(item.primary)]), plan.notes.isEmpty {
+                    plan.notes.append(note)
+                }
                 plan.requests.append(GradedRenderRequest(
                     source: item.primary.url,
                     recipe: recipe,
@@ -192,6 +197,7 @@ extension ClipGrading {
                     return request
                 }
                 plan.eventIDs = Set(events.map(\.id))
+                if let note = stabilizing.unavailableNote(forKeys: survey.pending.map(\.sourceKey)) { plan.notes.append(note) }
                 enqueueRender(plan, reason: "Before Sync to NAS: Rec.709 copies of graded log clips into Edited/\(GradedRenderNaming.folderName), so they reach the NAS and Immich.")
                 model.enqueueFileJob(
                     action: .syncBuffer,
@@ -344,6 +350,7 @@ extension ClipGrading {
         let stabilized = requests.count { $0.stabilization != nil }
         let detail = (reason ?? "Rec.709 HEVC copies into Edited/\(GradedRenderNaming.folderName). Originals are only read.")
             + (stabilized > 0 ? " \(stabilized) stabilized first with Gyroflow." : "")
+            + plan.notes.map { " " + $0 }.joined()
         let renderer = self.renderer
         let stabilizer = stabilizing.stabilizerForRender(requests)
         model.enqueueFileJob(
@@ -398,6 +405,7 @@ extension ClipGrading {
         isStopped: @escaping @Sendable () -> Bool = { false },
         availableBytes: (URL) -> Int64? = { GradedVideoExporter.availableBytes(near: $0) },
         estimatedBytes: (URL) -> Int64? = { GradedVideoExporter.estimatedBytes(of: $0) },
+        stabilizedBytes: (URL) -> Int64? = { Stabilizer.estimatedBytes(of: $0) },
         progress: @escaping @Sendable (BackgroundJobUpdate) -> Void
     ) throws -> RenderOutcome {
         let exporter = exporter ?? GradedVideoExporter(renderer: renderer)
@@ -436,11 +444,19 @@ extension ClipGrading {
                 outcome.copies[index] = existing
                 continue
             }
-            if let need = estimatedBytes(request.source), let free = availableBytes(request.outputFolder),
-               free < need + freeSpaceMargin {
-                let formatter = ByteCountFormatter()
-                outcome.stoppedReason = "Stopped before \(name): \(formatter.string(fromByteCount: max(free, 0))) free where the copy goes; it needs about \(formatter.string(fromByteCount: need)) plus \(formatter.string(fromByteCount: freeSpaceMargin)) kept free."
-                break
+            // A stabilized render also holds its ProRes intermediate (several
+            // GB a minute at UHD) beside the copy until the copy is made.
+            let intermediate = request.stabilization == nil ? nil : stabilizedBytes(request.source)
+            let copy = estimatedBytes(request.source)
+            if copy != nil || intermediate != nil, let free = availableBytes(request.outputFolder) {
+                let need = (copy ?? 0) + (intermediate ?? 0)
+                if free < need + freeSpaceMargin {
+                    let formatter = ByteCountFormatter()
+                    let what = intermediate.map { "about \(formatter.string(fromByteCount: need)) (\(formatter.string(fromByteCount: $0)) of it the stabilized intermediate, deleted after)" }
+                        ?? "about \(formatter.string(fromByteCount: need))"
+                    outcome.stoppedReason = "Stopped before \(name): \(formatter.string(fromByteCount: max(free, 0))) free where the copy goes; it needs \(what) plus \(formatter.string(fromByteCount: freeSpaceMargin)) kept free."
+                    break
+                }
             }
             // Stabilize first (the first half of this clip's progress), then
             // grade from the stabilized intermediate, which is deleted after.

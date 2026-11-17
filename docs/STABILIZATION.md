@@ -46,8 +46,38 @@ old. A stabilized-only copy carries the same identity in its comment
 ## The Gyroflow run
 
 ```
-gyroflow <clip> -f -t _ctk-stabilizing --stdout-progress --preset <file>.gyroflow
+gyroflow <clip> -t _ctk-stabilizing --stdout-progress --preset <file>.gyroflow
 ```
+
+Which copy runs: the app looks in `/Applications`, `~/Applications`, and
+every copy LaunchServices knows for `xyz.gyroflow`. It never runs a copy in
+the Trash, on a mounted volume or disk image, translocated, in Downloads or
+in a build folder, a version older than 1.6, or a bundle that fails the code
+signature check pinned to Gyroflow's Developer ID (team `RR3ZC2L4DF`,
+identifier `xyz.gyroflow`). The App Store copy is only used to explain why
+it can't render.
+
+No `-f`: Gyroflow never overwrites. If it ever wrote its default
+`<name>_ctk-stabilizing.*` beside the source, that exact file is removed
+after the run, but only when the run made it.
+
+Runs never outlive the app. Each Gyroflow runs under a small `/bin/sh`
+guard. The guard ends it when the app's process is gone (crash, force quit),
+and passes on Stop as SIGTERM, then SIGKILL. Quitting, including Quit
+Anyway with a render running, ends every run first. At launch, Gyroflow
+processes an earlier session left (only ones carrying `-t _ctk-stabilizing`)
+are ended. Then stabilizer partials written before this launch are swept
+from the events' `Edited/Stabilized` and `Edited/Rec709` folders and the
+preview cache.
+
+Space: before each run the ProRes size is estimated from resolution, frame
+rate and length (Apple's ProRes target rates, about 13 GB a minute at UHD
+60p in HQ). A stabilized graded render needs room for the intermediate and
+the HEVC copy together, plus the 5 GB kept free. Otherwise the batch stops
+before that clip and says why.
+
+Without a Gyroflow that can render, clips set to Stabilize are graded
+alone, and the job says so. A graded copy is never skipped for it.
 
 Everything that decides the render is in the preset file (Gyroflow rewrites
 `'` to `"` in inline JSON, which would break paths with apostrophes):
@@ -57,7 +87,8 @@ data, the clip's own size and frame rate, ProRes 422 HQ through
 VideoToolbox, PCM audio. The preview uses ProRes Proxy and a 3-second
 `trim_ranges_ms`.
 
-Gyroflow writes to a partial name in the destination's temporary folder.
+Gyroflow writes to a partial name in the destination's temporary folder
+(as `<partial>.tmp` while it renders).
 Progress comes from its `Rendering progress: n/N frames` lines. Gyroflow's
 command line does not quit after an error, so an `[ERROR]` line with no
 render under way ends the run after a few seconds. Stop ends the process

@@ -20,6 +20,8 @@ final class StabilizerTests: XCTestCase {
         var exitCode: Int32 = 0
         /// Called after each line (the test flips a stop flag here).
         var afterLine: (Int) -> Void = { _ in }
+        /// Where the bytes go: Gyroflow renders into `<output>.tmp`.
+        var writesTo: (String) -> String = { $0 }
         private(set) var calls: [(URL, [String])] = []
         private(set) var presets: [[String: Any]] = []
         private(set) var ended = false
@@ -43,7 +45,7 @@ final class StabilizerTests: XCTestCase {
             }
             let output = ((preset["output"] as? [String: Any])?["output_path"]) as! String
             for (index, line) in lines.enumerated() {
-                if index == 1, let bytes = writesOutput { try bytes.write(to: URL(fileURLWithPath: output)) }
+                if index == 1, let bytes = writesOutput { try bytes.write(to: URL(fileURLWithPath: writesTo(output))) }
                 onLine(line)
                 afterLine(index)
                 if !keepRunning() {
@@ -142,7 +144,7 @@ final class StabilizerTests: XCTestCase {
         let preset = URL(fileURLWithPath: "/tmp/p.gyroflow")
         XCTAssertEqual(
             GyroflowCommand.arguments(input: job.input, presetFile: preset),
-            ["/Volumes/Buffer/Trip 2026/C0001.MP4", "-f", "-t", "_ctk-stabilizing", "--stdout-progress", "--preset", "/tmp/p.gyroflow"]
+            ["/Volumes/Buffer/Trip 2026/C0001.MP4", "-t", "_ctk-stabilizing", "--stdout-progress", "--preset", "/tmp/p.gyroflow"]
         )
         let object = try XCTUnwrap(JSONSerialization.jsonObject(with: GyroflowCommand.presetData(for: job)) as? [String: Any])
         let stabilization = try XCTUnwrap(object["stabilization"] as? [String: Any])
@@ -245,6 +247,7 @@ final class StabilizerTests: XCTestCase {
         try withTemporaryDirectory { root in
             let source = try makeSource(root)
             let runner = FakeRunner(lines: Self.gyroflowOutput)
+            runner.writesTo = { $0 + ".tmp" } // mid-render, as Gyroflow names it
             let stop = Flag()
             runner.afterLine = { index in if index == 3 { stop.set() } }
             let request = request(source, root: root)
@@ -314,36 +317,55 @@ final class StabilizerTests: XCTestCase {
 
     func testFindsGyroflowAndTellsTheAppStoreBuildApart() throws {
         try withTemporaryDirectory { root in
-            func makeApp(_ folder: String, appStore: Bool) throws -> URL {
+            func makeApp(_ folder: String, appStore: Bool, version: String = "1.6.3", bundleID: String = "xyz.gyroflow") throws -> URL {
                 let app = root.appendingPathComponent("\(folder)/Gyroflow.app", isDirectory: true)
                 let macOS = app.appendingPathComponent("Contents/MacOS", isDirectory: true)
                 try FileManager.default.createDirectory(at: macOS, withIntermediateDirectories: true)
                 let binary = macOS.appendingPathComponent("gyroflow")
                 try Data("#!/bin/sh\n".utf8).write(to: binary)
                 try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: binary.path)
-                try (["CFBundleShortVersionString": "1.6.3"] as NSDictionary).write(to: app.appendingPathComponent("Contents/Info.plist"))
+                try (["CFBundleShortVersionString": version, "CFBundleIdentifier": bundleID] as NSDictionary).write(to: app.appendingPathComponent("Contents/Info.plist"))
                 if appStore {
                     try FileManager.default.createDirectory(at: app.appendingPathComponent("Contents/_MASReceipt"), withIntermediateDirectories: true)
                 }
                 return app
             }
-            XCTAssertNil(GyroflowInstallation.locate(roots: [root], registered: []))
+            XCTAssertNil(GyroflowInstallation.locate(roots: [root], registered: [], isTrusted: { _ in true }))
             XCTAssertEqual(StabilizerAvailability(nil), .notInstalled)
             _ = try makeApp("A", appStore: true)
-            let store = try XCTUnwrap(GyroflowInstallation.locate(roots: [root.appendingPathComponent("A")], registered: []))
+            let store = try XCTUnwrap(GyroflowInstallation.locate(roots: [root.appendingPathComponent("A")], registered: [], isTrusted: { _ in true }))
             XCTAssertTrue(store.isAppStoreBuild)
             XCTAssertEqual(store.version, "1.6.3")
             XCTAssertEqual(StabilizerAvailability(store), .appStoreBuild(store))
             XCTAssertNotNil(StabilizerAvailability(store).problem)
             _ = try makeApp("B", appStore: false)
-            let both = try XCTUnwrap(GyroflowInstallation.locate(roots: [root.appendingPathComponent("A"), root.appendingPathComponent("B")], registered: []))
+            let both = try XCTUnwrap(GyroflowInstallation.locate(roots: [root.appendingPathComponent("A"), root.appendingPathComponent("B")], registered: [], isTrusted: { _ in true }))
             XCTAssertFalse(both.isAppStoreBuild, "the download is preferred when both are installed")
             // Found through LaunchServices only (installed somewhere else),
             // still preferred over the App Store copy in the folders.
             let elsewhere = try makeApp("Elsewhere", appStore: false)
-            let viaRegistry = try XCTUnwrap(GyroflowInstallation.locate(roots: [root.appendingPathComponent("A")], registered: [root.appendingPathComponent("A/Gyroflow.app"), elsewhere]))
+            let viaRegistry = try XCTUnwrap(GyroflowInstallation.locate(roots: [root.appendingPathComponent("A")], registered: [root.appendingPathComponent("A/Gyroflow.app"), elsewhere], isTrusted: { _ in true }))
             XCTAssertEqual(viaRegistry.appURL.standardizedFileURL, elsewhere.standardizedFileURL)
             XCTAssertFalse(viaRegistry.isAppStoreBuild)
+
+            // Never run: an untrusted signature, an old version, a look-alike
+            // bundle id, or a copy in the Trash, on a volume, in Downloads.
+            XCTAssertTrue(try XCTUnwrap(GyroflowInstallation.locate(roots: [root.appendingPathComponent("A"), root.appendingPathComponent("B")], registered: [], isTrusted: { _ in false })).isAppStoreBuild, "an unsigned download is passed over")
+            let old = try makeApp("Old", appStore: false, version: "1.5.4")
+            XCTAssertNil(GyroflowInstallation.locate(roots: [], registered: [old], isTrusted: { _ in true }))
+            let fake = try makeApp("Fake", appStore: false, bundleID: "com.example.gyroflow")
+            XCTAssertNil(GyroflowInstallation.locate(roots: [], registered: [fake], isTrusted: { _ in true }))
+            XCTAssertNil(GyroflowInstallation.inspect(appURL: fake))
+            let home = FileManager.default.homeDirectoryForCurrentUser
+            for excluded in [home.appendingPathComponent(".Trash/Gyroflow.app").path, "/Volumes/Gyroflow/Gyroflow.app", home.appendingPathComponent("Downloads/Gyroflow.app").path,
+                             "/private/var/folders/ab/T/AppTranslocation/1234/d/Gyroflow.app", home.appendingPathComponent("Library/Developer/Xcode/DerivedData/G/Gyroflow.app").path] {
+                XCTAssertTrue(GyroflowInstallation.isExcludedLocation(URL(fileURLWithPath: excluded)), excluded)
+            }
+            XCTAssertFalse(GyroflowInstallation.isExcludedLocation(URL(fileURLWithPath: "/Applications/Gyroflow.app")))
+            XCTAssertTrue(GyroflowInstallation.isSupportedVersion("1.6.3"))
+            XCTAssertTrue(GyroflowInstallation.isSupportedVersion("2.0"))
+            XCTAssertFalse(GyroflowInstallation.isSupportedVersion("1.5.4"))
+            XCTAssertFalse(GyroflowInstallation.isSupportedVersion(nil))
             XCTAssertTrue(StabilizerAvailability(both).isReady)
         }
     }
@@ -361,6 +383,8 @@ final class StabilizerTests: XCTestCase {
         let partial = StabilizedRenderNaming.partialName()
         XCTAssertTrue(StabilizedRenderNaming.isPartialName(partial))
         XCTAssertFalse(StabilizedRenderNaming.isPartialName("C0001.mov"))
+        XCTAssertTrue(StabilizedRenderNaming.isPartialName(partial + ".tmp"), "Gyroflow's in-progress name")
+        XCTAssertFalse(StabilizedRenderNaming.isPartialName("C0001.mov.tmp"))
         XCTAssertFalse(GradedRenderNaming.isPartialName(partial), "the graded exporter never deletes a stabilizer partial")
         XCTAssertTrue(NASSyncPlanner.isJunk(partial), "Sync skips it")
         let settings = StabilizationSettings(smoothing: .low)

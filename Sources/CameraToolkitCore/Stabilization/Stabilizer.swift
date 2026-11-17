@@ -23,9 +23,15 @@ public enum StabilizedRenderNaming {
 
     public static func partialName() -> String { UUID().uuidString + partialSuffix }
 
+    /// Gyroflow writes `<partial>.tmp` while it renders and renames it to
+    /// the partial when done: both are this stabilizer's.
+    public static let inProgressSuffix = ".tmp"
+
     public static func isPartialName(_ name: String) -> Bool {
-        guard name.hasSuffix(partialSuffix) else { return false }
-        return UUID(uuidString: String(name.dropLast(partialSuffix.count))) != nil
+        var base = name
+        if base.hasSuffix(partialSuffix + inProgressSuffix) { base = String(base.dropLast(inProgressSuffix.count)) }
+        guard base.hasSuffix(partialSuffix) else { return false }
+        return UUID(uuidString: String(base.dropLast(partialSuffix.count))) != nil
     }
 
     public static func outputFolder(editedRoot: URL) -> URL {
@@ -100,14 +106,19 @@ public enum StabilizedRenderNaming {
     /// Deletes stabilizer partials (and its preset files) a crashed or
     /// stopped run left in `folder`'s temporary folder — only this
     /// stabilizer's exact names — then the folder if that emptied it.
+    /// With `olderThan`, a partial written to since then is left alone (a
+    /// run of this session may be writing it).
     @discardableResult
-    public static func removeStalePartials(in folder: URL) -> Int {
+    public static func removeStalePartials(in folder: URL, olderThan: Date? = nil) -> Int {
         let temporary = temporaryFolder(in: folder).path
         guard LayoutMigrationDisk.lstatEntry(temporary)?.kind == .directory,
               let entries = try? DirectoryListing.list(temporary) else { return 0 }
         var removed = 0
         for entry in entries where entry.kind == .file && isPartialName(entry.name) {
-            if unlink((temporary as NSString).appendingPathComponent(entry.name)) == 0 { removed += 1 }
+            let path = (temporary as NSString).appendingPathComponent(entry.name)
+            if let olderThan, let modified = (try? FileManager.default.attributesOfItem(atPath: path))?[.modificationDate] as? Date,
+               modified >= olderThan { continue }
+            if unlink(path) == 0 { removed += 1 }
         }
         _ = rmdir(temporary)
         return removed
@@ -282,9 +293,16 @@ public final class Stabilizer: @unchecked Sendable {
         let job = GyroflowJob(input: source, output: partial, settings: settings, trim: trim, codec: codec, comment: comment)
         try GyroflowCommand.presetData(for: job).write(to: presetFile, options: .atomic)
         var keep = false
+        // Gyroflow should never write beside the source (the preset moves
+        // the output); if it did, only the exact stray name a run made goes.
+        let strays = GyroflowCommand.strayOutputs(beside: source)
+        let strayBefore = Set(strays.filter { DriveMoveService.exists($0.path) }.map(\.path))
         defer {
             _ = unlink(presetFile.path)
             if !keep { Self.removePartial(partial) }
+            for stray in strays where !strayBefore.contains(stray.path) && DriveMoveService.exists(stray.path) {
+                _ = unlink(stray.path)
+            }
         }
 
         final class RunState: @unchecked Sendable {
@@ -359,6 +377,8 @@ public final class Stabilizer: @unchecked Sendable {
     public static func removePartial(_ partial: URL) {
         guard StabilizedRenderNaming.isPartialName(partial.lastPathComponent) else { return }
         if DriveMoveService.exists(partial.path) { _ = unlink(partial.path) }
+        let inProgress = partial.path + StabilizedRenderNaming.inProgressSuffix
+        if DriveMoveService.exists(inProgress) { _ = unlink(inProgress) }
         _ = rmdir(partial.deletingLastPathComponent().path)
     }
 
@@ -395,6 +415,28 @@ public final class Stabilizer: @unchecked Sendable {
     }
 
     // MARK: Checks
+
+    /// About how many bytes Gyroflow writes for `source` in `codec`
+    /// (Apple's ProRes target rates, scaled from 1080p30 by pixels and
+    /// frame rate), plus PCM audio and a little container overhead.
+    public static func estimatedBytes(of source: URL, codec: StabilizedOutputCodec = .proResHQ, trim: ClosedRange<Double>? = nil) -> Int64? {
+        let facts: (CGSize, Float, Double)? = try? GradedVideoExporter.blocking {
+            let asset = AVURLAsset(url: source)
+            guard let video = try await asset.loadTracks(withMediaType: .video).first else { return nil }
+            return (try await video.load(.naturalSize), try await video.load(.nominalFrameRate), try await asset.load(.duration).seconds)
+        } ?? nil
+        guard let (size, fps, duration) = facts else { return nil }
+        let seconds = trim.map { $0.upperBound - $0.lowerBound } ?? duration
+        return estimatedBytes(width: Double(size.width), height: Double(size.height), fps: Double(fps), seconds: seconds, codec: codec)
+    }
+
+    public static func estimatedBytes(width: Double, height: Double, fps: Double, seconds: Double, codec: StabilizedOutputCodec) -> Int64? {
+        guard width > 0, height > 0, seconds.isFinite, seconds > 0 else { return nil }
+        let rate = fps.isFinite && fps > 0 ? fps : 30
+        let video = codec.megabitsAt1080p30 * 1_000_000 * (abs(width * height) / (1920 * 1080)) * (rate / 29.97)
+        let audio = 1_536_000.0
+        return Int64((video + audio) * seconds / 8 * 1.05)
+    }
 
     public static func duration(of url: URL) -> Double? {
         try? GradedVideoExporter.blocking {

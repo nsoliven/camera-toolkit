@@ -26,14 +26,43 @@ public protocol StabilizerProcessRunning: Sendable {
     ) throws -> StabilizerProcessOutcome
 }
 
-/// The real runner: `Process` with both pipes read as they fill. Ending a
-/// run sends SIGTERM, then SIGKILL if the tool has not gone within two
-/// seconds. No window is opened: Gyroflow's command line mode is a console
-/// application.
+/// The real runner: `Process` with both pipes read as they fill. The
+/// tool runs under a small `/bin/sh` guard that ends it when this app goes
+/// away — a crash, a force quit, Quit Anyway — so a render never outlives
+/// the app writing a multi-GB partial. Ending a run sends SIGTERM (the
+/// guard passes it on), then SIGKILL to both if they have not gone. Every
+/// live run is in `StabilizerProcesses`, which quitting ends. No window is
+/// opened: Gyroflow's command line mode is a console application.
 public struct FoundationProcessRunner: StabilizerProcessRunning {
     public var pollInterval: TimeInterval = 0.2
+    /// Run under the parent-watching guard (off only in tests of the bare
+    /// runner).
+    public var guardsParent = true
 
     public init() {}
+
+    /// `sh -c guardScript ctk-guard <parent pid> <tool> <args…>`: starts the
+    /// tool, prints its pid, ends it on TERM/INT/HUP and when the parent
+    /// pid is gone, and exits with the tool's status.
+    static let guardScript = """
+    parent=$1; shift
+    "$@" &
+    child=$!
+    echo "CTK_CHILD_PID=$child"
+    stop() {
+      kill -TERM $child 2>/dev/null
+      for i in 1 2 3 4 5 6 7 8 9 10; do kill -0 $child 2>/dev/null || break; sleep 0.2; done
+      kill -KILL $child 2>/dev/null
+    }
+    trap 'stop; exit 143' TERM INT HUP
+    while kill -0 $child 2>/dev/null; do
+      if ! kill -0 $parent 2>/dev/null; then stop; exit 1; fi
+      sleep 1
+    done
+    wait $child
+    """
+
+    public static let childPIDPrefix = "CTK_CHILD_PID="
 
     public func run(
         executable: URL,
@@ -42,26 +71,48 @@ public struct FoundationProcessRunner: StabilizerProcessRunning {
         keepRunning: @escaping @Sendable () -> Bool
     ) throws -> StabilizerProcessOutcome {
         let process = Process()
-        process.executableURL = executable
-        process.arguments = arguments
+        if guardsParent {
+            process.executableURL = URL(fileURLWithPath: "/bin/sh")
+            process.arguments = ["-c", Self.guardScript, "ctk-guard", String(getpid()), executable.path] + arguments
+        } else {
+            process.executableURL = executable
+            process.arguments = arguments
+        }
         process.standardInput = FileHandle.nullDevice
         let output = Pipe()
         let errors = Pipe()
         process.standardOutput = output
         process.standardError = errors
-        let splitters = [LineSplitter(onLine), LineSplitter(onLine)]
+        final class Child: @unchecked Sendable { let lock = NSLock(); var pid: pid_t? }
+        let child = Child()
+        let forward: @Sendable (String) -> Void = { line in
+            if line.hasPrefix(Self.childPIDPrefix), let pid = pid_t(line.dropFirst(Self.childPIDPrefix.count)) {
+                child.lock.withLock { child.pid = pid }
+                StabilizerProcesses.register(pid)
+                return
+            }
+            onLine(line)
+        }
+        let splitters = [LineSplitter(forward), LineSplitter(forward)]
         output.fileHandleForReading.readabilityHandler = { handle in splitters[0].feed(handle.availableData) }
         errors.fileHandleForReading.readabilityHandler = { handle in splitters[1].feed(handle.availableData) }
         try process.run()
+        let pid = process.processIdentifier
+        StabilizerProcesses.register(pid)
+        defer {
+            StabilizerProcesses.unregister(pid)
+            if let childPID = child.lock.withLock({ child.pid }) { StabilizerProcesses.unregister(childPID) }
+        }
 
         var terminated = false
         while process.isRunning {
             if !keepRunning() {
                 terminated = true
                 process.terminate()
-                let deadline = Date().addingTimeInterval(2)
+                let deadline = Date().addingTimeInterval(4)
                 while process.isRunning, Date() < deadline { Thread.sleep(forTimeInterval: 0.05) }
-                if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+                if process.isRunning { kill(pid, SIGKILL) }
+                if let childPID = child.lock.withLock({ child.pid }) { StabilizerProcesses.end([childPID], grace: 1) }
                 break
             }
             Thread.sleep(forTimeInterval: pollInterval)
@@ -73,6 +124,72 @@ public struct FoundationProcessRunner: StabilizerProcessRunning {
         splitters[1].feed(errors.fileHandleForReading.readDataToEndOfFile())
         splitters.forEach { $0.flush() }
         return StabilizerProcessOutcome(exitCode: process.terminationStatus, terminated: terminated)
+    }
+}
+
+/// Every stabilizer process this app has running (guards and Gyroflow
+/// itself), so quitting can end them, and a sweep for ones a crashed run
+/// left behind.
+public enum StabilizerProcesses {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var live: Set<pid_t> = []
+
+    public static func register(_ pid: pid_t) { _ = lock.withLock { live.insert(pid) } }
+    public static func unregister(_ pid: pid_t) { _ = lock.withLock { live.remove(pid) } }
+    public static var running: Set<pid_t> { lock.withLock { live } }
+
+    /// SIGTERM, then SIGKILL after `grace` for any still there.
+    public static func end(_ pids: [pid_t], grace: TimeInterval = 2) {
+        let alive = pids.filter { kill($0, 0) == 0 }
+        guard !alive.isEmpty else { return }
+        for pid in alive { kill(pid, SIGTERM) }
+        let deadline = Date().addingTimeInterval(grace)
+        while Date() < deadline, alive.contains(where: { kill($0, 0) == 0 }) { Thread.sleep(forTimeInterval: 0.05) }
+        for pid in alive where kill(pid, 0) == 0 { kill(pid, SIGKILL) }
+    }
+
+    /// Ends every run this app has going. Called on quit (also Quit
+    /// Anyway) before the app goes.
+    public static func terminateAll(grace: TimeInterval = 2) {
+        let pids = Array(running)
+        end(pids, grace: grace)
+        lock.withLock { live.subtract(pids) }
+    }
+
+    /// Process ids, from a `ps -axo pid=,command=` listing, of runs this
+    /// app started: a Gyroflow executable (`…/Contents/MacOS/gyroflow`)
+    /// given this app's scratch suffix (`-t _ctk-stabilizing`), which
+    /// nothing else uses. The person's own Gyroflow, a shell that merely
+    /// mentions the suffix, and this process are never matched. (A guard
+    /// shell ends by itself once its Gyroflow is gone.)
+    public static func leftoverPIDs(inListing listing: String, own: pid_t = getpid()) -> [pid_t] {
+        listing.split(separator: "\n").compactMap { line in
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard let pid = pid_t(trimmed.prefix { $0.isNumber }), pid != own else { return nil }
+            let command = trimmed.drop { $0.isNumber }.trimmingCharacters(in: .whitespaces)
+            guard let marker = command.range(of: "/Contents/MacOS/gyroflow ") else { return nil }
+            guard command[marker.upperBound...].contains("-t \(GyroflowCommand.scratchSuffix) ") || command.hasSuffix("-t \(GyroflowCommand.scratchSuffix)") else { return nil }
+            return pid
+        }
+    }
+
+    /// Ends stabilizer runs a crashed or force-quit session left behind,
+    /// before anything sweeps their partials. Returns how many there were.
+    @discardableResult
+    public static func killLeftovers(grace: TimeInterval = 2) -> Int {
+        let ps = Process()
+        ps.executableURL = URL(fileURLWithPath: "/bin/ps")
+        ps.arguments = ["-axo", "pid=,command="]
+        let pipe = Pipe()
+        ps.standardOutput = pipe
+        ps.standardError = FileHandle.nullDevice
+        guard (try? ps.run()) != nil else { return 0 }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        ps.waitUntilExit()
+        let mine = running
+        let pids = leftoverPIDs(inListing: String(decoding: data, as: UTF8.self)).filter { !mine.contains($0) }
+        end(pids, grace: grace)
+        return pids.count
     }
 }
 

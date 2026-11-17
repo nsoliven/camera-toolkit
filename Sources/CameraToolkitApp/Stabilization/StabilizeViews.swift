@@ -323,9 +323,12 @@ struct StabilizeComparePlayers: View {
         left.forwardPlaybackEndTime = end
         let right = AVPlayerItem(asset: AVURLAsset(url: stabilized))
         if let recipe {
-            let live = GradeLiveState(recipe: recipe)
-            left.videoComposition = try? await GradeRenderer.shared.videoComposition(for: left.asset, live: live)
-            right.videoComposition = try? await GradeRenderer.shared.videoComposition(for: right.asset, live: live)
+            left.videoComposition = try? await GradeRenderer.shared.videoComposition(for: left.asset, live: GradeLiveState(recipe: recipe))
+            // Gyroflow writes video range, whatever the original's range:
+            // the stabilized side is drawn with its own.
+            var stabilizedRecipe = recipe
+            stabilizedRecipe.range = await GradeRenderer.shared.signalRange(of: stabilized) ?? .video
+            right.videoComposition = try? await GradeRenderer.shared.videoComposition(for: right.asset, live: GradeLiveState(recipe: stabilizedRecipe))
         }
         let a = AVPlayer(playerItem: left)
         let b = AVPlayer(playerItem: right)

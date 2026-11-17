@@ -46,7 +46,9 @@ public enum StabilizedGradeChain {
         chained.decodeSource = intermediate
         // The copy's tags keep the original's recipe; the picture is drawn
         // with the range the intermediate was written in.
-        chained.decodeRange = rangeOf(intermediate)
+        // Gyroflow writes video range; when the intermediate does not say,
+        // that is what it is — never the original's (often full) range.
+        chained.decodeRange = rangeOf(intermediate) ?? .video
         return Prepared(request: chained, intermediate: intermediate)
     }
 

@@ -69,78 +69,95 @@ public enum MotionDataProbe {
         guard let moov = readTopLevelBox("moov", from: handle) else {
             return .unknown("Not an MP4 or MOV movie this app can look inside")
         }
-        let types = sampleEntryTypes(inMovie: moov)
+        guard let types = sampleEntryTypes(inMovie: moov) else {
+            return .unknown("This movie's header is damaged")
+        }
         for type in ["rtmd", "djmd", "dbgi", "gpmd", "camm"] where types.contains(type) {
             return .present(sampleEntryTypes[type]!)
         }
         return .absent
     }
 
-    /// The four-character sample entry types of every track in `moov`.
-    public static func sampleEntryTypes(inMovie moov: Data) -> Set<String> {
+    /// The four-character sample entry types of every track in `moov`, or
+    /// nil when a box size does not fit (a damaged or crafted header).
+    public static func sampleEntryTypes(inMovie moov: Data) -> Set<String>? {
         var found: Set<String> = []
-        walk(moov, path: []) { path, type, payload in
-            guard type == "stsd", payload.count >= 8 else { return }
+        var malformed = false
+        walk(moov, malformed: &malformed) { type, payload in
+            guard type == "stsd" else { return true }
+            guard payload.count >= 8 else { return false }
             var offset = payload.startIndex + 8 // version/flags, entry count
-            while offset + 8 <= payload.endIndex {
+            while payload.endIndex - offset >= 8 {
                 let size = Int(readUInt32(payload, at: offset))
-                let entryType = fourCC(payload, at: offset + 4)
-                found.insert(entryType)
-                guard size >= 8 else { break }
+                found.insert(fourCC(payload, at: offset + 4))
+                guard size >= 8, size <= payload.endIndex - offset else { return false }
                 offset += size
             }
+            return true
         }
-        return found
+        return malformed ? nil : found
     }
 
     private static let containers: Set<String> = ["moov", "trak", "mdia", "minf", "stbl", "edts", "dinf"]
 
-    private static func walk(_ data: Data, path: [String], visit: ([String], String, Data) -> Void) {
+    /// Visits every box, descending into containers. Sizes are checked
+    /// before any arithmetic: a size that does not fit what is left marks
+    /// the header malformed and stops. `visit` answers false for a payload
+    /// it could not read.
+    private static func walk(_ data: Data, depth: Int = 0, malformed: inout Bool, visit: (String, Data) -> Bool) {
+        guard depth < 16 else { malformed = true; return }
         var offset = data.startIndex
-        while offset + 8 <= data.endIndex {
+        while data.endIndex - offset >= 8 {
+            let remaining = UInt64(data.endIndex - offset)
             var size = UInt64(readUInt32(data, at: offset))
             let type = fourCC(data, at: offset + 4)
-            var header = 8
-            if size == 1, offset + 16 <= data.endIndex {
+            var header: UInt64 = 8
+            if size == 1 {
+                guard remaining >= 16 else { malformed = true; return }
                 size = readUInt64(data, at: offset + 8)
                 header = 16
             } else if size == 0 {
-                size = UInt64(data.endIndex - offset)
+                size = remaining
             }
-            guard size >= UInt64(header), offset + Int(size) <= data.endIndex else { break }
-            let payload = data[(offset + header)..<(offset + Int(size))]
-            visit(path, type, payload)
+            guard size >= header, size <= remaining else { malformed = true; return }
+            let payload = data[(offset + Int(header))..<(offset + Int(size))]
+            if !visit(type, payload) { malformed = true; return }
             if containers.contains(type) {
-                walk(Data(payload), path: path + [type], visit: visit)
+                walk(Data(payload), depth: depth + 1, malformed: &malformed, visit: visit)
+                if malformed { return }
             }
             offset += Int(size)
         }
     }
 
     /// Seeks box by box through the top level until `type`, then reads it.
+    /// Nil when it is not there, too big, or a size does not add up.
     static func readTopLevelBox(_ type: String, from handle: FileHandle) -> Data? {
         var offset: UInt64 = 0
         let end = (try? handle.seekToEnd()) ?? 0
         for _ in 0..<64 {
-            guard offset + 8 <= end else { return nil }
+            guard end >= 8, offset <= end - 8 else { return nil }
             try? handle.seek(toOffset: offset)
             guard let header = try? handle.read(upToCount: 16), header.count >= 8 else { return nil }
             var size = UInt64(readUInt32(header, at: header.startIndex))
             let boxType = fourCC(header, at: header.startIndex + 4)
             var headerSize: UInt64 = 8
-            if size == 1, header.count >= 16 {
+            if size == 1 {
+                guard header.count >= 16 else { return nil }
                 size = readUInt64(header, at: header.startIndex + 8)
                 headerSize = 16
             } else if size == 0 {
                 size = end - offset
             }
-            guard size >= headerSize else { return nil }
+            guard size >= headerSize, size <= end - offset else { return nil }
             if boxType == type {
                 guard size - headerSize <= maximumHeaderBytes else { return nil }
                 try? handle.seek(toOffset: offset + headerSize)
                 return try? handle.read(upToCount: Int(size - headerSize))
             }
-            offset += size
+            let (next, overflow) = offset.addingReportingOverflow(size)
+            guard !overflow else { return nil }
+            offset = next
         }
         return nil
     }

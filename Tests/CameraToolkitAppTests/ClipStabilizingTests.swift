@@ -240,4 +240,76 @@ final class ClipStabilizingTests: XCTestCase {
         XCTAssertEqual(ClipStabilizing.previewRange(around: 11.9, duration: 12), 9...12)
         XCTAssertEqual(ClipStabilizing.previewRange(around: 1, duration: 2), 0...2)
     }
+
+    func testStabilizeStopsBeforeRunningOutOfSpace() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("StabilizeSpace-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let requests = (1...2).map { index in
+            StabilizeRequest(
+                source: folder.appendingPathComponent("C000\(index).MP4"), settings: StabilizationSettings(),
+                sourceKey: "C000\(index)|1|1", sourceModifiedAt: Date(),
+                outputFolder: folder.appendingPathComponent("Edited/Stabilized", isDirectory: true)
+            )
+        }
+        final class Counting: StabilizerProcessRunning, @unchecked Sendable {
+            var runs = 0
+            func run(executable: URL, arguments: [String], onLine: @escaping @Sendable (String) -> Void, keepRunning: @escaping @Sendable () -> Bool) throws -> StabilizerProcessOutcome {
+                runs += 1
+                return StabilizerProcessOutcome(exitCode: 0, terminated: false)
+            }
+        }
+        let runner = Counting()
+        let stabilizer = Stabilizer(installation: Self.gyroflow, runner: runner, verifier: { _, _ in }, probe: { _ in .present(.sony) })
+        let outcome = try ClipStabilizing.runStabilize(
+            requests, stabilizer: stabilizer,
+            availableBytes: { _ in 20 * 1_024 * 1_024 * 1_024 },
+            estimatedBytes: { _ in 30 * 1_024 * 1_024 * 1_024 },
+            progress: { _ in }
+        )
+        XCTAssertEqual(runner.runs, 0, "Gyroflow is never started without room for its ProRes copy")
+        XCTAssertTrue(outcome.stoppedReason?.hasPrefix("Stopped before C0001.MP4") == true, outcome.stoppedReason ?? "nil")
+        XCTAssertTrue(outcome.stoppedReason?.contains("ProRes") == true)
+
+        // A graded render that stabilizes counts its intermediate too.
+        var graded = GradedRenderRequest(
+            source: folder.appendingPathComponent("C0001.MP4"), recipe: GradeRecipe(grade: .converted, profile: .sLog3SGamut3Cine),
+            sourceKey: "C0001|1|1", sourceModifiedAt: Date(), outputFolder: folder.appendingPathComponent("Edited/Rec709", isDirectory: true)
+        )
+        graded.stabilization = RenderStabilization()
+        let gb: Int64 = 1_024 * 1_024 * 1_024
+        let full = try ClipGrading.runRender(
+            [graded], stabilizer: stabilizer,
+            availableBytes: { _ in 12 * gb }, estimatedBytes: { _ in 2 * gb }, stabilizedBytes: { _ in 8 * gb },
+            progress: { _ in }
+        )
+        XCTAssertEqual(runner.runs, 0)
+        XCTAssertTrue(full.stoppedReason?.contains("intermediate") == true, full.stoppedReason ?? "nil")
+        // Without stabilization the same space is enough for the copy alone.
+        graded.stabilization = nil
+        let plain = try? ClipGrading.runRender([graded], availableBytes: { _ in 12 * gb }, estimatedBytes: { _ in 2 * gb }, stabilizedBytes: { _ in 8 * gb }, progress: { _ in })
+        XCTAssertNil(plain?.stoppedReason, "the intermediate is only counted when there is one")
+    }
+
+    func testWithoutAUsableGyroflowClipsAreGradedAloneWithANote() async throws {
+        try await withSandbox { root, model, workspace, _ in
+            let grading = workspace.grading
+            let missing = ClipStabilizing(grading: grading, installation: .some(nil))
+            grading.stabilizingStorage = missing
+            XCTAssertEqual(missing.availability, .notInstalled)
+            let event = SavedCameraEvent(name: "Beach Day", eventDate: Date(timeIntervalSince1970: 1_780_000_000))
+            model.updateConfiguration { $0.savedEvents = [event] }
+            let folder = workspace.locations.eventFolder(for: event, policy: .buffer).appendingPathComponent("Originals/A7V", isDirectory: true)
+            let items = try makeClips(in: folder, names: ["C0001"], log: ["C0001"])
+            await grading.ensureDetected(items)
+            grading.setGrade(ClipGrade(look: .builtIn(.softFilm)), for: items, undoTitle: "Apply Soft Film")
+            missing.setStabilization(byKey: [(ClipStabilizing.fileKey(items[0]), StabilizationSettings())], undoTitle: "Stabilize")
+            missing.setMotion(.present(.sony), forKey: ClipStabilizing.fileKey(items[0]))
+            XCTAssertNil(missing.renderStabilization(forKey: ClipStabilizing.fileKey(items[0])))
+            XCTAssertTrue(missing.renderStabilizationMap().isEmpty, "render before Sync shows no Stabilize box")
+            let plan = grading.renderPlan(for: [OrganizeStack(items: items)], boardEventID: event.id)
+            XCTAssertEqual(plan.requests.count, 1, "the graded copy is still made")
+            XCTAssertNil(plan.requests[0].stabilization)
+            XCTAssertTrue(plan.notes.first?.contains("graded only") == true, plan.notes.first ?? "nil")
+        }
+    }
 }

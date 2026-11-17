@@ -34,10 +34,16 @@ final class ClipStabilizing {
         let catalog = URL(fileURLWithPath: DashboardModel.expandedPath(grading.model.configuration.catalogDatabasePath))
         let store = store ?? (grading.model.configuration.catalogDatabasePath.isEmpty ? nil : StabilizationStore(catalogURL: catalog))
         self.store = store
-        let found = installation ?? GyroflowInstallation.locate()
-        availability = StabilizerAvailability(found)
-        makeStabilizer = { StabilizerAvailability(found).installation.map { Stabilizer(installation: $0) } }
         settingsByKey = (try? store?.load()) ?? [:]
+        if let installation {
+            availability = StabilizerAvailability(installation)
+            makeStabilizer = { StabilizerAvailability(installation).installation.map { Stabilizer(installation: $0) } }
+        } else {
+            // The search checks code signatures: off the main actor.
+            availability = .checking
+            makeStabilizer = { nil }
+            refreshAvailability()
+        }
     }
 
     var workspace: EventsWorkspace { grading.workspace }
@@ -45,9 +51,12 @@ final class ClipStabilizing {
 
     /// Looks for Gyroflow again (after the person installed it).
     func refreshAvailability() {
-        let found = GyroflowInstallation.locate()
-        availability = StabilizerAvailability(found)
-        makeStabilizer = { StabilizerAvailability(found).installation.map { Stabilizer(installation: $0) } }
+        Task { @MainActor [weak self] in
+            let found = await Task.detached(priority: .utility) { GyroflowInstallation.locate() }.value
+            guard let self else { return }
+            availability = StabilizerAvailability(found)
+            makeStabilizer = { StabilizerAvailability(found).installation.map { Stabilizer(installation: $0) } }
+        }
     }
 
     // MARK: Questions
@@ -148,7 +157,9 @@ final class ClipStabilizing {
     /// The stabilization a graded copy of `key` gets: the clip's own, when
     /// it is on and the clip has motion data (or has not been probed).
     func renderStabilization(forKey key: String) -> RenderStabilization? {
-        guard let settings = settingsByKey[key] else { return nil }
+        // Without a Gyroflow that can render, the clip is graded alone
+        // (with a note), never left without its graded copy.
+        guard availability.isReady, let settings = settingsByKey[key] else { return nil }
         if motion[key] == .absent { return nil }
         return RenderStabilization(settings: settings)
     }
@@ -160,6 +171,15 @@ final class ClipStabilizing {
             request.stabilization = renderStabilization(forKey: request.sourceKey)
             return request
         }
+    }
+
+    /// Said when clips set to Stabilize are rendered without it because
+    /// Gyroflow can't run here; nil otherwise.
+    func unavailableNote(forKeys keys: [String]) -> String? {
+        guard !availability.isReady else { return nil }
+        let count = keys.count { settingsByKey[$0] != nil }
+        guard count > 0 else { return nil }
+        return "\(count) clip\(count == 1 ? " is" : "s are") set to Stabilize but rendered graded only: \(availability.problem ?? "Gyroflow can’t run here.")"
     }
 
     /// True when some of `requests` would be stabilized.
@@ -274,6 +294,8 @@ final class ClipStabilizing {
         _ requests: [StabilizeRequest],
         stabilizer: Stabilizer,
         isStopped: @escaping @Sendable () -> Bool = { false },
+        availableBytes: (URL) -> Int64? = { GradedVideoExporter.availableBytes(near: $0) },
+        estimatedBytes: (URL) -> Int64? = { Stabilizer.estimatedBytes(of: $0) },
         progress: @escaping @Sendable (BackgroundJobUpdate) -> Void
     ) throws -> ClipGrading.RenderOutcome {
         var outcome = ClipGrading.RenderOutcome()
@@ -294,6 +316,12 @@ final class ClipStabilizing {
                 processedFiles: index,
                 totalFiles: total
             ))
+            if let need = estimatedBytes(request.source), let free = availableBytes(request.outputFolder),
+               free < need + ClipGrading.freeSpaceMargin {
+                let formatter = ByteCountFormatter()
+                outcome.stoppedReason = "Stopped before \(name): \(formatter.string(fromByteCount: max(free, 0))) free where the copy goes; its ProRes copy needs about \(formatter.string(fromByteCount: need)) plus \(formatter.string(fromByteCount: ClipGrading.freeSpaceMargin)) kept free."
+                break
+            }
             do {
                 let result = try stabilizer.render(request, progress: { step in
                     progress(BackgroundJobUpdate(

@@ -81,4 +81,39 @@ final class StabilizerRealClipTests: XCTestCase {
         print("Graded from the stabilized intermediate in \(Date().timeIntervalSince(started)) s → \(result.url.path)")
         XCTAssertEqual(GradedVideoExporter.readTags(result.url)?.grade, request.renderFingerprint)
     }
+
+    /// With `CT_GYROFLOW_SIGNATURE=1`: the downloaded Gyroflow in
+    /// ~/Applications or /Applications passes the Developer ID check, and
+    /// `locate` picks it. Reads signatures only; runs nothing.
+    func testInstalledGyroflowSignature() throws {
+        guard ProcessInfo.processInfo.environment["CT_GYROFLOW_SIGNATURE"] == "1" else { throw XCTSkip("Set CT_GYROFLOW_SIGNATURE=1.") }
+        for root in GyroflowInstallation.defaultSearchRoots() {
+            let app = root.appendingPathComponent("Gyroflow.app")
+            guard let installation = GyroflowInstallation.inspect(appURL: app) else { continue }
+            print("\(app.path): App Store \(installation.isAppStoreBuild), version \(installation.version ?? "?"), Developer ID check \(GyroflowSignature.isGenuineDownload(app))")
+        }
+        let chosen = try XCTUnwrap(GyroflowInstallation.locate())
+        print("Chosen: \(chosen.appURL.path)")
+        XCTAssertFalse(chosen.isAppStoreBuild)
+        XCTAssertTrue(GyroflowSignature.isGenuineDownload(chosen.appURL))
+    }
+
+    /// With `CT_STABILIZE_CLIP` and `CT_STABILIZE_GYROFLOW=1`: Stop three
+    /// seconds into a real render ends Gyroflow and leaves no file behind.
+    func testRealStopLeavesNothing() throws {
+        guard let clip, ProcessInfo.processInfo.environment["CT_STABILIZE_GYROFLOW"] == "1" else { throw XCTSkip("Set CT_STABILIZE_CLIP and CT_STABILIZE_GYROFLOW=1.") }
+        guard let installation = StabilizerAvailability(GyroflowInstallation.locate()).installation else { throw XCTSkip("No Gyroflow that can render here.") }
+        let base = ProcessInfo.processInfo.environment["CT_STABILIZE_OUT"].map { URL(fileURLWithPath: $0, isDirectory: true) } ?? FileManager.default.temporaryDirectory
+        let out = base.appendingPathComponent("CT-Stop-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: out) }
+        let folder = out.appendingPathComponent("Edited/Stabilized", isDirectory: true)
+        let started = Date()
+        XCTAssertThrowsError(try Stabilizer(installation: installation).stabilize(
+            source: clip, settings: StabilizationSettings(), into: folder, isCancelled: { Date().timeIntervalSince(started) > 3 }
+        )) { XCTAssertTrue($0 is CancellationError, "\($0)") }
+        let left = (try? FileManager.default.subpathsOfDirectory(atPath: out.path)) ?? []
+        print("Stopped after \(Date().timeIntervalSince(started)) s; left: \(left)")
+        XCTAssertTrue(left.allSatisfy { !$0.contains(".mov") }, "\(left)")
+        XCTAssertTrue(StabilizerProcesses.running.isEmpty)
+    }
 }
