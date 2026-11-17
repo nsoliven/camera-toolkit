@@ -101,14 +101,11 @@ struct StabilizePanel: View {
         }
         .padding(10)
         .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .sheet(isPresented: Binding(
-            get: { stabilizing.preview?.itemID == item.id },
-            set: { if !$0 { stabilizing.closePreview() } }
-        )) {
-            if let preview = stabilizing.preview {
-                StabilizePreviewSheet(model: preview, onClose: { stabilizing.closePreview() })
-            }
-        }
+        // No sheet here: this panel sits in the grade card, which forces
+        // the dark colour scheme and white text. A sheet attached here
+        // inherits both while its window follows the system, so in Light
+        // mode it drew white on white. `StabilizeSheetHost` presents the
+        // preview from the board instead.
     }
 }
 
@@ -470,15 +467,24 @@ extension ClipStabilizing {
     }
 }
 
-/// Presents the "Stabilize all clips" sheet for a board.
-struct StabilizeAllSheetHost: ViewModifier {
+/// Presents a board's stabilize sheets: "Stabilize all clips" and the
+/// viewer's Preview 3 s. Both hang off the board, outside the viewer's
+/// forced-dark glass, so they take the window's own appearance.
+struct StabilizeSheetHost: ViewModifier {
     let workspace: EventsWorkspace
 
     func body(content: Content) -> some View {
         let stabilizing = workspace.grading.stabilizing
-        content.sheet(item: Binding(get: { stabilizing.allRequest }, set: { stabilizing.allRequest = $0 })) { request in
-            StabilizeAllSheet(stabilizing: stabilizing, request: request, onDone: { stabilizing.allRequest = nil })
-        }
+        content
+            .sheet(item: Binding(get: { stabilizing.allRequest }, set: { stabilizing.allRequest = $0 })) { request in
+                StabilizeAllSheet(stabilizing: stabilizing, request: request, onDone: { stabilizing.allRequest = nil })
+            }
+            .sheet(item: Binding(
+                get: { stabilizing.preview },
+                set: { if $0 == nil { stabilizing.closePreview() } }
+            )) { preview in
+                StabilizePreviewSheet(model: preview, onClose: { stabilizing.closePreview() })
+            }
     }
 }
 
