@@ -70,6 +70,47 @@ final class StabilizerHardeningTests: XCTestCase {
         }
     }
 
+    /// A `ps` that fails (empty answer) is not "the app is gone": the
+    /// render keeps going until it is really stopped.
+    func testAFailingPsNeverStopsAHealthyRun() throws {
+        try withTemporaryDirectory { root in
+            let tool = try fakeTool(in: root)
+            let bin = root.appendingPathComponent("bin", isDirectory: true)
+            try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+            for (name, target) in [("sleep", "/bin/sleep"), ("tr", "/usr/bin/tr")] {
+                try FileManager.default.createSymbolicLink(atPath: bin.appendingPathComponent(name).path, withDestinationPath: target)
+            }
+            let ps = bin.appendingPathComponent("ps")
+            try Data("#!/bin/sh\nexit 1\n".utf8).write(to: ps)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: ps.path)
+            let guardProcess = Process()
+            guardProcess.executableURL = URL(fileURLWithPath: "/bin/sh")
+            guardProcess.arguments = ["-c", FoundationProcessRunner.guardScript, "ctk-guard", String(getpid()), tool.path, "-t", GyroflowCommand.scratchSuffix]
+            guardProcess.environment = ["PATH": bin.path]
+            let pipe = Pipe()
+            guardProcess.standardOutput = pipe
+            try guardProcess.run()
+            var childPID: pid_t?
+            var buffer = ""
+            let deadline = Date().addingTimeInterval(5)
+            while childPID == nil, Date() < deadline {
+                buffer += String(decoding: pipe.fileHandleForReading.availableData, as: UTF8.self)
+                if let line = buffer.split(separator: "\n").first(where: { $0.hasPrefix(FoundationProcessRunner.childPIDPrefix) }) {
+                    childPID = pid_t(line.dropFirst(FoundationProcessRunner.childPIDPrefix.count))
+                }
+            }
+            let child = try XCTUnwrap(childPID)
+            Thread.sleep(forTimeInterval: 3)
+            XCTAssertTrue(isAlive(child), "a failed parent check did not stop the run")
+            XCTAssertTrue(guardProcess.isRunning)
+            guardProcess.terminate()
+            guardProcess.waitUntilExit()
+            let gone = Date().addingTimeInterval(5)
+            while isAlive(child), Date() < gone { Thread.sleep(forTimeInterval: 0.1) }
+            XCTAssertFalse(isAlive(child), "Stop still ends it")
+        }
+    }
+
     func testLeftoversAreOnlyOrphanedRunsOfThisApp() {
         let listing = """
           101     1 /Applications/Gyroflow.app/Contents/MacOS/gyroflow /Volumes/Buffer/C0001.MP4 -t _ctk-stabilizing --stdout-progress --preset /tmp/x.gyroflow

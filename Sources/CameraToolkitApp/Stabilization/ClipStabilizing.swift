@@ -58,14 +58,31 @@ final class ClipStabilizing {
         }
     }
 
-    /// Returns once Gyroflow's availability is known. Planners call it
-    /// before deciding which clips are stabilized: `.checking` is a wait,
-    /// never "unavailable" (that would plan stabilized clips as graded
-    /// only, and their stabilized copies would read as older grades).
-    func ensureAvailability() async {
-        while availability == .checking, let search {
-            await search.value
+    /// How long a planner waits for the Gyroflow search before rendering
+    /// the clips set to Stabilize graded only (with a note).
+    @ObservationIgnored var availabilityWaitLimit: TimeInterval = 15
+
+    /// Planners call this before deciding which clips are stabilized. It
+    /// returns at once when none of `keys` is set to Stabilize (a Sync of
+    /// clips nobody stabilizes never waits on Gyroflow) or the search is
+    /// done; otherwise it waits for the search — `.checking` is a wait, not
+    /// "unavailable", which would make plain duplicates of stabilized
+    /// copies — but at most `availabilityWaitLimit`. Returns false when it
+    /// gave up waiting; those clips are then rendered graded only.
+    @discardableResult
+    func ensureAvailability<Keys: Sequence>(forKeys keys: Keys) async -> Bool where Keys.Element == String {
+        guard availability == .checking, search != nil else { return true }
+        guard keys.contains(where: { settingsByKey[$0] != nil }) else { return true }
+        let deadline = ContinuousClock.now + .seconds(availabilityWaitLimit)
+        while availability == .checking, ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(50))
         }
+        return availability != .checking
+    }
+
+    /// True when a planner for `keys` would have to wait for the search.
+    func needsAvailabilityWait<Keys: Sequence>(forKeys keys: Keys) -> Bool where Keys.Element == String {
+        availability == .checking && search != nil && keys.contains { settingsByKey[$0] != nil }
     }
 
     var workspace: EventsWorkspace { grading.workspace }
@@ -203,6 +220,9 @@ final class ClipStabilizing {
         guard !availability.isReady else { return nil }
         let count = keys.count { settingsByKey[$0] != nil }
         guard count > 0 else { return nil }
+        if availability == .checking {
+            return "\(count) clip\(count == 1 ? " is" : "s are") set to Stabilize: the Gyroflow check didn't finish, so rendered graded only."
+        }
         return "\(count) clip\(count == 1 ? " is" : "s are") set to Stabilize but rendered graded only: \(availability.problem ?? "Gyroflow can’t run here.")"
     }
 
@@ -267,13 +287,17 @@ final class ClipStabilizing {
 
     /// Queues one job that makes the stabilized-only copies of `items`.
     func renderStabilizedCopies(of items: [OrganizeItem], in stacks: [OrganizeStack], boardEventID: UUID?) {
-        if availability == .checking {
+        if needsAvailabilityWait(forKeys: items.map(Self.fileKey)) {
             Task { @MainActor [weak self] in
-                await self?.ensureAvailability()
-                self?.renderStabilizedCopies(of: items, in: stacks, boardEventID: boardEventID)
+                await self?.ensureAvailability(forKeys: items.map(Self.fileKey))
+                self?.renderStabilizedCopiesNow(of: items, in: stacks, boardEventID: boardEventID)
             }
             return
         }
+        renderStabilizedCopiesNow(of: items, in: stacks, boardEventID: boardEventID)
+    }
+
+    private func renderStabilizedCopiesNow(of items: [OrganizeItem], in stacks: [OrganizeStack], boardEventID: UUID?) {
         guard let stabilizer = makeStabilizer() else {
             model.statusMessage = availability.problem ?? "Gyroflow is needed to stabilize."
             return

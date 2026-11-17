@@ -83,14 +83,20 @@ extension ClipGrading {
 
     /// Queues one job that renders every graded clip among `stacks`.
     func renderGradedCopies(of stacks: [OrganizeStack], boardEventID: UUID?, includeStabilizeOnly: Bool = true) {
-        // Which clips are stabilized depends on Gyroflow: wait for the search.
-        if stabilizing.availability == .checking {
+        // Which clips are stabilized depends on Gyroflow: wait for the search
+        // (only when a clip here is set to Stabilize, and not forever).
+        let keys = stacks.flatMap(\.items).map { Self.fileKey($0.primary) }
+        if stabilizing.needsAvailabilityWait(forKeys: keys) {
             Task { @MainActor [weak self] in
-                await self?.stabilizing.ensureAvailability()
-                self?.renderGradedCopies(of: stacks, boardEventID: boardEventID, includeStabilizeOnly: includeStabilizeOnly)
+                await self?.stabilizing.ensureAvailability(forKeys: keys)
+                self?.renderGradedCopiesNow(of: stacks, boardEventID: boardEventID, includeStabilizeOnly: includeStabilizeOnly)
             }
             return
         }
+        renderGradedCopiesNow(of: stacks, boardEventID: boardEventID, includeStabilizeOnly: includeStabilizeOnly)
+    }
+
+    private func renderGradedCopiesNow(of stacks: [OrganizeStack], boardEventID: UUID?, includeStabilizeOnly: Bool) {
         let plan = renderPlan(for: stacks, boardEventID: boardEventID)
         // Stabilized clips without a grade get their stabilized-only copy.
         let stabilizeOnly = includeStabilizeOnly ? stabilizing.stabilizeOnlyItems(in: stacks) : []
@@ -167,9 +173,12 @@ extension ClipGrading {
         let model = self.model
         let stabilizing = self.stabilizing
         model.statusMessage = "Looking for graded log clips to render before the sync…"
+        let plannedKeys = Self.plannedKeys(inputs)
         Task { @MainActor [weak self] in
-            // Which clips are stabilized depends on Gyroflow: wait for the search.
-            await stabilizing.ensureAvailability()
+            // Which clips are stabilized depends on Gyroflow: wait for the
+            // search, only when a clip here is set to Stabilize, at most
+            // `availabilityWaitLimit` (then those render graded only).
+            await stabilizing.ensureAvailability(forKeys: plannedKeys)
             let stabilization = stabilizing.renderStabilizationMap()
             let survey = await Task.detached(priority: .userInitiated) {
                 Self.surveyBeforeSync(inputs, renderer: renderer, stabilization: stabilization, progress: { done, total in
@@ -219,6 +228,15 @@ extension ClipGrading {
                 )
             }
         }
+    }
+
+    /// The file keys of every clip a before-sync or send plan could take,
+    /// from the catalog alone (no file or Gyroflow access).
+    static func plannedKeys(_ inputs: GradedSyncPlanner.Inputs) -> Set<String> {
+        let events = Set(inputs.events.map(\.id))
+        return Set(inputs.assignments.filter { events.contains($0.eventID) }.map { assignment in
+            FaceIndexStore.fileKey(fileName: (assignment.relativePath as NSString).lastPathComponent, byteCount: assignment.fileSize, modifiedAt: assignment.modifiedAt)
+        })
     }
 
     struct BeforeSyncSurvey: Sendable {

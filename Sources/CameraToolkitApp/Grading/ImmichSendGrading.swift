@@ -123,9 +123,11 @@ extension ClipGrading {
         let locations = workspace.locations
         let catalogURL = model.catalogURLForImmich
         let stabilizing = self.stabilizing
+        let plannedKeys = Self.plannedKeys(inputs)
         Task { @MainActor [weak self] in
-            // Which clips are stabilized depends on Gyroflow: wait for the search.
-            await stabilizing.ensureAvailability()
+            // Which clips are stabilized depends on Gyroflow: wait for the
+            // search, only when a clip here is set to Stabilize, and not forever.
+            await stabilizing.ensureAvailability(forKeys: plannedKeys)
             let stabilization = stabilizing.renderStabilizationMap()
             let found = await Task.detached(priority: .userInitiated) {
                 Self.planImmichSend(inputs, readsNAS: readsNAS, renderer: renderer, stabilization: stabilization, progress: { done, total in

@@ -44,7 +44,8 @@ public struct FoundationProcessRunner: StabilizerProcessRunning {
     /// `sh -c guardScript ctk-guard <parent pid> <tool> <args…>`: starts the
     /// tool, prints its pid, ends it on TERM/INT/HUP and when the guard's
     /// own parent is no longer the app (its ppid changes when the app goes,
-    /// which a reused pid cannot fake), and exits with the tool's status.
+    /// which a reused pid cannot fake; an unreadable ppid is not a change),
+    /// and exits with the tool's status.
     /// One line, so a process listing shows it on one line.
     static let guardScript = [
         "parent=$1; shift",
@@ -52,7 +53,9 @@ public struct FoundationProcessRunner: StabilizerProcessRunning {
         "echo \"CTK_CHILD_PID=$child\"",
         "stop() { kill -TERM $child 2>/dev/null; for i in 1 2 3 4 5 6 7 8 9 10; do kill -0 $child 2>/dev/null || break; sleep 0.2; done; kill -KILL $child 2>/dev/null; }",
         "trap 'stop; exit 143' TERM INT HUP",
-        "while kill -0 $child 2>/dev/null; do if [ \"$(ps -o ppid= -p $$ | tr -d ' ')\" != \"$parent\" ]; then stop; exit 1; fi; sleep 1; done",
+        // Only a parent pid that was read and differs ends the run: a failed
+        // `ps` (empty answer) never stops a healthy render.
+        "while kill -0 $child 2>/dev/null; do p=$(ps -o ppid= -p $$ 2>/dev/null | tr -d ' '); if [ -n \"$p\" ] && [ \"$p\" != \"$parent\" ]; then stop; exit 1; fi; sleep 1; done",
         "wait $child",
     ].joined(separator: "; ")
 

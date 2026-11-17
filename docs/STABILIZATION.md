@@ -63,7 +63,8 @@ after the run, but only when the run made it.
 
 Runs never outlive the app. Each Gyroflow runs under a small `/bin/sh`
 guard. The guard ends it when its own parent is no longer the app (crash,
-force quit; a reused pid can't fool it),
+force quit; a reused pid can't fool it, and a `ps` that fails to answer is
+not taken as the app being gone),
 and passes on Stop as SIGTERM, then SIGKILL. Quitting, including Quit
 Anyway with a render running, ends every run first. At launch, Gyroflow
 processes an earlier session left are ended: only ones carrying
@@ -78,9 +79,12 @@ rate and length (Apple's ProRes target rates, about 13 GB a minute at UHD
 the HEVC copy together, plus the 5 GB kept free. Otherwise the batch stops
 before that clip and says why.
 
-The Gyroflow search starts at launch. A render asked for while it is still
-running waits for it, so a clip set to Stabilize is never planned as graded
-only by accident.
+The Gyroflow search starts at launch. A render asked for while the search
+is still running waits for it, so a clip set to Stabilize is never planned
+as graded only by accident. The wait happens only when a clip in the plan is
+set to Stabilize, so a Sync of other clips never waits on Gyroflow. It lasts
+at most 15 s; after that, those clips are rendered graded only, and the job
+says "the Gyroflow check didn't finish".
 
 Without a Gyroflow that can render, clips set to Stabilize are graded
 alone, and the job says so. A graded copy is never skipped for it.

@@ -410,4 +410,88 @@ final class ClipStabilizingTests: XCTestCase {
             model.isBusy = false
         }
     }
+
+    /// One assigned S-Log3 clip on the drive, with render before Sync on;
+    /// returns the event and the clip's catalog file key.
+    private func syncFixture(root: URL, model: DashboardModel, workspace: EventsWorkspace) throws -> (SavedCameraEvent, String) {
+        let event = SavedCameraEvent(name: "Beach Day", eventDate: Date(timeIntervalSince1970: 1_780_000_000))
+        let date = Date(timeIntervalSince1970: 1_780_000_100)
+        model.updateConfiguration { configuration in
+            configuration.savedEvents = [event]
+            configuration.photoEventAssignments = [PhotoEventAssignment(
+                sourceRootPath: root.appendingPathComponent("Card").path, relativePath: "C0001.MP4",
+                fileSize: 64, modifiedAt: date, eventID: event.id, deviceID: "sony-a7v"
+            )]
+            configuration.gradeDefaults.setLook(.builtIn(.softFilm), for: .sLog3SGamut3Cine)
+            configuration.renderGradedCopiesBeforeSync = true
+        }
+        let clip = try XCTUnwrap(workspace.locations.driveURL(for: model.configuration.photoEventAssignments[0], event: event, policy: .buffer))
+        try FileManager.default.createDirectory(at: clip.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data(repeating: 1, count: 64).write(to: clip)
+        try Data(sidecar.utf8).write(to: clip.deletingLastPathComponent().appendingPathComponent("C0001M01.XML"))
+        return (event, FaceIndexStore.fileKey(fileName: "C0001.MP4", byteCount: 64, modifiedAt: date))
+    }
+
+    /// A Sync of clips nobody set to Stabilize never waits on Gyroflow,
+    /// even when the search never finishes.
+    func testAPlanWithoutStabilizedClipsNeverWaitsForTheSearch() async throws {
+        try await withSandbox { root, model, workspace, _ in
+            let grading = workspace.grading
+            let stuck = ClipStabilizing(grading: grading, installation: nil, locator: {
+                Thread.sleep(forTimeInterval: 30)
+                return nil
+            })
+            grading.stabilizingStorage = stuck
+            let (event, _) = try syncFixture(root: root, model: model, workspace: workspace)
+            var asked: [ClipGrading.RenderBeforeSyncSummary] = []
+            grading.confirmRenderBeforeSync = { summary in
+                asked.append(summary)
+                return .cancel
+            }
+            UserDefaults.standard.removeObject(forKey: ClipGrading.renderBeforeSyncConfirmedKey)
+            defer { UserDefaults.standard.removeObject(forKey: ClipGrading.renderBeforeSyncConfirmedKey) }
+            let started = ContinuousClock.now
+            grading.renderBeforeSyncIfWanted(events: [event], syncTitle: "Beach Day", syncNow: {}, queueSync: { _ in })
+            while asked.isEmpty, ContinuousClock.now < started + .seconds(20) { try await Task.sleep(for: .milliseconds(20)) }
+            XCTAssertEqual(asked.first?.count, 1)
+            XCTAssertEqual(asked.first?.stabilized, 0)
+            XCTAssertLessThan(ContinuousClock.now - started, .seconds(stuck.availabilityWaitLimit), "did not wait on the search")
+            XCTAssertEqual(stuck.availability, .checking, "the search is still running")
+        }
+    }
+
+    /// A stuck search is waited on only up to the limit; then the clips set
+    /// to Stabilize are rendered graded only and the job says why.
+    func testAStuckSearchIsWaitedOnOnlyUpToTheLimit() async throws {
+        try await withSandbox { root, model, workspace, _ in
+            let grading = workspace.grading
+            let stuck = ClipStabilizing(grading: grading, installation: nil, locator: {
+                Thread.sleep(forTimeInterval: 30)
+                return nil
+            })
+            stuck.availabilityWaitLimit = 0.6
+            grading.stabilizingStorage = stuck
+            let (event, key) = try syncFixture(root: root, model: model, workspace: workspace)
+            stuck.setStabilization(byKey: [(key, StabilizationSettings())], undoTitle: "Stabilize")
+            var asked: [ClipGrading.RenderBeforeSyncSummary] = []
+            grading.confirmRenderBeforeSync = { summary in
+                asked.append(summary)
+                return .renderThenSync
+            }
+            UserDefaults.standard.removeObject(forKey: ClipGrading.renderBeforeSyncConfirmedKey)
+            defer { UserDefaults.standard.removeObject(forKey: ClipGrading.renderBeforeSyncConfirmedKey) }
+            model.isBusy = true
+            let started = ContinuousClock.now
+            grading.renderBeforeSyncIfWanted(events: [event], syncTitle: "Beach Day", syncNow: {}, queueSync: { _ in })
+            while model.queuedFileJobs.count < 2, ContinuousClock.now < started + .seconds(20) { try await Task.sleep(for: .milliseconds(20)) }
+            let waited = ContinuousClock.now - started
+            XCTAssertGreaterThanOrEqual(waited, .seconds(0.5), "it did wait for the search")
+            XCTAssertLessThan(waited, .seconds(10), "but not past the limit")
+            XCTAssertEqual(asked.first?.stabilized, 0, "graded only")
+            let job = try XCTUnwrap(model.jobs.first { $0.action == .gradeRender && $0.state == .queued })
+            XCTAssertTrue(job.detail.contains("Gyroflow check didn't finish"), job.detail)
+            for queued in model.queuedFileJobs { model.cancelQueuedFileJob(id: queued.id) }
+            model.isBusy = false
+        }
+    }
 }
