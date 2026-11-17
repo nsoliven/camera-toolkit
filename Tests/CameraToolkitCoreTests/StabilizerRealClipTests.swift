@@ -56,4 +56,29 @@ final class StabilizerRealClipTests: XCTestCase {
         print("Stabilized in \(Date().timeIntervalSince(started)) s → \(result.url.path)")
         XCTAssertEqual(Stabilizer.identity(at: result.url, sourceKey: "real|0|0", settings: request.settings), .same, "the comment tag reads back")
     }
+
+    /// With `CT_STABILIZE_INTERMEDIATE` (a stabilized ProRes of the clip,
+    /// e.g. from the test above with `CT_STABILIZE_KEEP=1`): grades it the
+    /// way a stabilize-then-grade render does, as S-Log3, into
+    /// `CT_STABILIZE_OUT`, and checks the copy.
+    func testRealStabilizedIntermediateGrades() throws {
+        guard let clip, let intermediate = ProcessInfo.processInfo.environment["CT_STABILIZE_INTERMEDIATE"].map({ URL(fileURLWithPath: $0) }) else {
+            throw XCTSkip("Set CT_STABILIZE_CLIP and CT_STABILIZE_INTERMEDIATE.")
+        }
+        let base = ProcessInfo.processInfo.environment["CT_STABILIZE_OUT"].map { URL(fileURLWithPath: $0, isDirectory: true) } ?? FileManager.default.temporaryDirectory
+        let out = base.appendingPathComponent("CT-Grade-\(UUID().uuidString)/Edited/Rec709", isDirectory: true)
+        var request = GradedRenderRequest(
+            source: clip,
+            recipe: GradeRecipe(grade: .converted, profile: .sLog3SGamut3Cine, range: .full),
+            sourceKey: "real|0|0", sourceModifiedAt: Date(), outputFolder: out
+        )
+        request.stabilization = RenderStabilization(settings: StabilizationSettings(smoothing: .medium))
+        request.decodeSource = intermediate
+        request.decodeRange = try GradedVideoExporter.blocking { await GradeRenderer.shared.signalRange(of: intermediate) }
+        let started = Date()
+        let result = try GradedVideoExporter().render(request)
+        print("Decode range of the intermediate: \(String(describing: request.decodeRange))")
+        print("Graded from the stabilized intermediate in \(Date().timeIntervalSince(started)) s → \(result.url.path)")
+        XCTAssertEqual(GradedVideoExporter.readTags(result.url)?.grade, request.renderFingerprint)
+    }
 }
