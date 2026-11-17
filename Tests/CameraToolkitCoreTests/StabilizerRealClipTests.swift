@@ -79,7 +79,7 @@ final class StabilizerRealClipTests: XCTestCase {
         let result = try GradedVideoExporter().render(request)
         print("Decode range of the intermediate: \(String(describing: request.decodeRange))")
         print("Graded from the stabilized intermediate in \(Date().timeIntervalSince(started)) s → \(result.url.path)")
-        XCTAssertEqual(GradedVideoExporter.readTags(result.url)?.grade, request.renderFingerprint)
+        XCTAssertEqual(GradedVideoExporter.readTags(result.url)?.grade, GradedVideoExporter.renderFingerprint(of: request))
     }
 
     /// With `CT_GYROFLOW_SIGNATURE=1`: the downloaded Gyroflow in

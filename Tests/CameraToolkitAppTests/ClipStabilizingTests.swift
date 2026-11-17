@@ -312,4 +312,32 @@ final class ClipStabilizingTests: XCTestCase {
             XCTAssertTrue(plan.notes.first?.contains("graded only") == true, plan.notes.first ?? "nil")
         }
     }
+
+    /// A BT.2020-tagged log clip that is also stabilized: its copy's tag
+    /// names both (`|src2020v3` then the stabilization), it is found again
+    /// as the same render, and a plain graded copy is never taken for it.
+    func testBT2020AndStabilizationComposeInTheGradeTag() async throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("Stabilize2020-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let clip = try await SyntheticSLog3Clip.write(to: folder.appendingPathComponent("C0001.MP4"), primaries: .rec2020)
+        let recipe = SyntheticSLog3Clip.recipe(range: .video)
+        let plain = GradedRenderRequest(source: clip, recipe: recipe, sourceKey: "C0001|1|1", sourceModifiedAt: Date(), outputFolder: folder.appendingPathComponent("Edited/Rec709", isDirectory: true))
+        var stabilized = plain
+        stabilized.stabilization = RenderStabilization(settings: StabilizationSettings(smoothing: .high))
+        let tag = try XCTUnwrap(GradedVideoExporter.renderFingerprint(of: stabilized))
+        XCTAssertEqual(tag, recipe.fingerprint + "|src2020v3|" + StabilizationSettings(smoothing: .high).fingerprint)
+        XCTAssertEqual(GradedVideoExporter.renderFingerprint(of: plain), recipe.fingerprint + "|src2020v3")
+
+        // The fake Gyroflow "stabilizes" by writing the clip itself.
+        let stabilizer = Stabilizer(installation: Self.gyroflow, runner: FakeRunner(bytes: try Data(contentsOf: clip)), verifier: { _, _ in }, probe: { _ in .present(.sony) }, scratchFolder: folder.appendingPathComponent("Scratch"))
+        stabilizer.finishGrace = 0.1
+        let outcome = try ClipGrading.runRender([stabilized], renderer: GradeRenderer(), stabilizer: stabilizer, availableBytes: { _ in nil }, estimatedBytes: { _ in nil }, progress: { _ in })
+        let url = try XCTUnwrap(outcome.rendered.first, "\(outcome)")
+        XCTAssertEqual(GradedVideoExporter.readTags(url)?.grade, tag)
+        XCTAssertEqual(GradedVideoExporter.identity(at: url, of: stabilized), .same)
+        XCTAssertEqual(GradedVideoExporter.identity(at: url, of: plain), .olderGrade, "never taken for an unstabilized copy")
+        let left = (try? FileManager.default.subpathsOfDirectory(atPath: plain.outputFolder.path)) ?? []
+        XCTAssertEqual(left, [url.lastPathComponent], "the intermediate is gone")
+    }
 }
