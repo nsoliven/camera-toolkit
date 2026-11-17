@@ -329,4 +329,23 @@ final class ClipGradingTests: XCTestCase {
     private func XCTUnwrapAsync<T>(_ value: T?, file: StaticString = #filePath, line: UInt = #line) async throws -> T {
         try XCTUnwrap(value, file: file, line: line)
     }
+
+    /// A Gyroflow line that arrives after the grade began is stale: it
+    /// moves neither the job's frame counter nor the step shown.
+    func testALateStabilizeReportAfterTheGradeBeganIsDropped() throws {
+        let tally = RenderFrameTally()
+        let steps = [RenderFrameTally.stabilize, RenderFrameTally.grade]
+        XCTAssertEqual(tally.idleTelemetry(step: RenderFrameTally.stabilize, steps: steps, clip: 1, of: 1).frames?.framesDone, 0)
+        tally.beginStep(RenderFrameTally.stabilize)
+        XCTAssertEqual(tally.telemetry(step: RenderFrameTally.stabilize, steps: steps, frame: 290, totalFrames: 300, videoFrameRate: 30, clip: 1, of: 1)?.frames?.framesDone, 290)
+        XCTAssertEqual(tally.endStep(), 300, "the step's own total is the grade's frame count")
+        tally.beginStep(RenderFrameTally.grade)
+        XCTAssertNotNil(tally.telemetry(step: RenderFrameTally.grade, steps: steps, frame: 30, totalFrames: 300, videoFrameRate: 30, clip: 1, of: 1))
+        XCTAssertNil(tally.telemetry(step: RenderFrameTally.stabilize, steps: steps, frame: 300, totalFrames: 300, videoFrameRate: 30, clip: 1, of: 1), "dropped")
+        let next = try XCTUnwrap(tally.telemetry(step: RenderFrameTally.grade, steps: steps, frame: 60, totalFrames: 300, videoFrameRate: 30, clip: 1, of: 1)?.frames)
+        XCTAssertEqual(next.step, RenderFrameTally.grade)
+        XCTAssertEqual(next.framesDone, 350, "290 stabilized + 60 graded; the late line added nothing")
+        tally.endStep()
+        XCTAssertNil(tally.telemetry(step: RenderFrameTally.grade, steps: steps, frame: 300, totalFrames: 300, videoFrameRate: 30, clip: 1, of: 1), "nothing counts between steps")
+    }
 }

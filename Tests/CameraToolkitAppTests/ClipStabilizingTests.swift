@@ -332,8 +332,27 @@ final class ClipStabilizingTests: XCTestCase {
         // The fake Gyroflow "stabilizes" by writing the clip itself.
         let stabilizer = Stabilizer(installation: Self.gyroflow, runner: FakeRunner(bytes: try Data(contentsOf: clip)), verifier: { _, _ in }, probe: { _ in .present(.sony) }, scratchFolder: folder.appendingPathComponent("Scratch"))
         stabilizer.finishGrace = 0.1
-        let outcome = try ClipGrading.runRender([stabilized], renderer: GradeRenderer(), stabilizer: stabilizer, availableBytes: { _ in nil }, estimatedBytes: { _ in nil }, progress: { _ in })
+        final class Updates: @unchecked Sendable {
+            let lock = NSLock()
+            var frames: [JobFrameProgress] = []
+        }
+        let updates = Updates()
+        let outcome = try ClipGrading.runRender([stabilized], renderer: GradeRenderer(), stabilizer: stabilizer, availableBytes: { _ in nil }, estimatedBytes: { _ in nil }, progress: { update in
+            if let frames = update.telemetry?.frames { updates.lock.withLock { updates.frames.append(frames) } }
+        })
         let url = try XCTUnwrap(outcome.rendered.first, "\(outcome)")
+        // Every report carries frame progress for the Jobs window: the
+        // clip's steps, the step running, and a job counter that only rises.
+        let frames = updates.lock.withLock { updates.frames }
+        XCTAssertEqual(frames.first?.steps, ["Stabilize", "Grade"])
+        XCTAssertEqual(frames.first?.step, "Stabilize")
+        XCTAssertEqual(frames.last?.step, "Grade")
+        XCTAssertTrue(frames.contains { $0.step == "Stabilize" } && frames.contains { $0.step == "Grade" })
+        XCTAssertEqual(frames.map(\.framesDone), frames.map(\.framesDone).sorted(), "the job's frame counter never goes down")
+        let graded = try XCTUnwrap(frames.last)
+        XCTAssertGreaterThan(graded.frame, 0, "the grade step counts the frames it writes")
+        XCTAssertGreaterThan(try XCTUnwrap(graded.videoFrameRate), 0, "the clip's own frame rate, for × realtime")
+        XCTAssertEqual(graded.frame, graded.totalFrames, "the last report is the whole clip")
         XCTAssertEqual(GradedVideoExporter.readTags(url)?.grade, tag)
         XCTAssertEqual(GradedVideoExporter.identity(at: url, of: stabilized), .same)
         XCTAssertEqual(GradedVideoExporter.identity(at: url, of: plain), .olderGrade, "never taken for an unstabilized copy")

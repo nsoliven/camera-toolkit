@@ -36,6 +36,29 @@ final class JobSpeedGraphTests: XCTestCase {
         XCTAssertNil(graph.summary)
     }
 
+    /// A graded render finishes one file in many minutes: it plots the
+    /// frames it makes, with its stabilize and grade steps as lanes.
+    func testARenderPlotsFramesPerSecondWithItsSteps() {
+        let stabilize = (1...20).map { second in
+            JobHistorySample(t: Double(second), filesPerSecond: 0, doneFiles: 0, framesPerSecond: 30, doneFrames: second * 30, frameStep: "Stabilize")
+        }
+        let grade = (21...40).map { second in
+            JobHistorySample(t: Double(second), filesPerSecond: 0, doneFiles: 0, framesPerSecond: 60, doneFrames: 600 + (second - 20) * 60, frameStep: "Grade")
+        }
+        let graph = JobSpeedGraph.build(samples: stabilize + grade, kind: "gradeRender", duration: 40)
+        XCTAssertEqual(graph.metric, .framesPerSecond)
+        XCTAssertEqual(graph.metric?.unit, "frames/s")
+        XCTAssertNil(graph.summary, "a chart, not \"waiting for the job to report\"")
+        XCTAssertEqual(graph.pointCount, 40)
+        XCTAssertEqual(graph.framesDone, 1_800)
+        XCTAssertEqual(graph.average ?? 0, 45, accuracy: 0.001, "1,800 frames over 40 s")
+        XCTAssertEqual(graph.peak?.value, 60)
+        XCTAssertTrue(graph.showsPhases)
+        XCTAssertEqual(graph.phases.map(\.phase), [.stabilize, .grade])
+        XCTAssertEqual(graph.phases(at: 10), [.stabilize])
+        XCTAssertEqual(graph.phases(at: 30), [.grade])
+    }
+
     // MARK: Summaries instead of empty charts
 
     /// The case that drew one floating fragment on a files/s axis: a sync

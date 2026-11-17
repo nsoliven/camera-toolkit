@@ -70,6 +70,8 @@ public final class JobHistoryRecorder: @unchecked Sendable {
         var t: Double
         var transfer: Double
         var files: Double
+        /// Frames finished, for a job that makes frames.
+        var frames: Double?
         /// Phase label → (bytes, seconds the phase was running).
         var phases: [String: (bytes: Double, running: Double)]
     }
@@ -96,6 +98,9 @@ public final class JobHistoryRecorder: @unchecked Sendable {
     private var jobChanged = true
     private var lastSample: TimeInterval = -.infinity
     private var lastObservation: Observation?
+    /// The last frame progress heard: a report without one (a closing
+    /// check) does not take a render's frames back to nothing.
+    private var lastFrames: JobFrameProgress?
     private var window: [Cumulative] = []
     private var finished = false
 
@@ -180,6 +185,7 @@ public final class JobHistoryRecorder: @unchecked Sendable {
             guard !finished else { return nil }
             lastObservation = observation
             let phases = observation.telemetry?.phases ?? []
+            if let frames = observation.telemetry?.frames { lastFrames = frames }
             if !reportNoted {
                 if !totalsPinned {
                     job.totalFiles = observation.totalFiles
@@ -196,6 +202,7 @@ public final class JobHistoryRecorder: @unchecked Sendable {
                 t: t,
                 transfer: Double(max(observation.telemetry?.transferBytes ?? observation.processedBytes, 0)),
                 files: Double(max(observation.processedFiles, 0)),
+                frames: lastFrames.map { Double(max($0.framesDone, 0)) },
                 phases: Dictionary(phases.map { ($0.label, (Double($0.bytes), $0.runningSeconds)) }, uniquingKeysWith: { a, _ in a })
             ))
             if let keep = window.lastIndex(where: { $0.t <= t - Self.batchedWindow - 2 }), keep > 0 {
@@ -231,6 +238,14 @@ public final class JobHistoryRecorder: @unchecked Sendable {
         let wall = reference(Self.trailingWindow)
         let combined = wall.map { max(newest.transfer - $0.transfer, 0) / (t - $0.t) / 1_000_000 }
         let files = wall.map { max(newest.files - $0.files, 0) / (t - $0.t) }
+        // Measured from the oldest report in the window that had frames,
+        // so the seconds before the first frame do not water the rate down.
+        let frames: Double? = newest.frames.flatMap { now in
+            guard let reference = window.last(where: { $0.t <= t - Self.trailingWindow && $0.frames != nil })
+                ?? window.first(where: { $0.frames != nil }),
+                  let then = reference.frames, t - reference.t >= 1 else { return nil }
+            return max(now - then, 0) / (t - reference.t)
+        }
         func phaseRate(_ label: String, span: TimeInterval) -> Double? {
             guard let now = newest.phases[label], let reference = reference(span) else { return nil }
             let before = reference.phases[label] ?? (0, 0)
@@ -253,7 +268,10 @@ public final class JobHistoryRecorder: @unchecked Sendable {
             transferBytes: observation.telemetry?.transferBytes,
             doneBytes: observation.processedBytes,
             doneFiles: observation.processedFiles,
-            secondsRemaining: observation.telemetry?.work?.secondsRemaining
+            secondsRemaining: observation.telemetry?.work?.secondsRemaining,
+            framesPerSecond: frames,
+            doneFrames: lastFrames?.framesDone,
+            frameStep: lastFrames?.step
         )
     }
 

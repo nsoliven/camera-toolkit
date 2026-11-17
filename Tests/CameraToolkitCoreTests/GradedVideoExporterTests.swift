@@ -8,6 +8,20 @@ import XCTest
 /// and length, audio passed through, capture time and grade written into
 /// it, the original untouched, never a file replaced.
 final class GradedVideoExporterTests: XCTestCase {
+    /// A clip's planned frames for the Jobs window: length × frame rate, and
+    /// nil — never a trap — for a length that is not a number.
+    func testPlannedFramesNeverTrapOnAnUnusableLength() {
+        XCTAssertEqual(GradedVideoExporter.plannedFrames(duration: CMTime(value: 10, timescale: 1), frameRate: 29.97), 300)
+        XCTAssertNil(GradedVideoExporter.plannedFrames(duration: .indefinite, frameRate: 30))
+        XCTAssertNil(GradedVideoExporter.plannedFrames(duration: .invalid, frameRate: 30))
+        XCTAssertNil(GradedVideoExporter.plannedFrames(duration: .positiveInfinity, frameRate: 30))
+        // CoreMedia turns a NaN length into a zero time; it plans nothing.
+        XCTAssertEqual(GradedVideoExporter.plannedFrames(duration: CMTime(seconds: .nan, preferredTimescale: 600), frameRate: 30) ?? 0, 0)
+        XCTAssertNil(GradedVideoExporter.plannedFrames(duration: CMTime(value: 10, timescale: 1), frameRate: .nan))
+        XCTAssertNil(GradedVideoExporter.plannedFrames(duration: CMTime(value: 10, timescale: 1), frameRate: nil))
+        XCTAssertNil(GradedVideoExporter.plannedFrames(duration: CMTime(value: Int64.max / 2, timescale: 1), frameRate: 240), "an absurd length is no plan")
+    }
+
     /// A 256×144, 12-frame, 24 fps HEVC clip with 16-bit stereo LPCM, a grey
     /// ramp standing in for a log picture.
     static func makeClip(at url: URL, frames: Int = 12) throws {

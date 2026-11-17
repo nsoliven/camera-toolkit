@@ -143,11 +143,15 @@ struct ThroughputPoint: Identifiable, Equatable, Sendable {
 enum ThroughputUnit: Equatable, Sendable {
     case megabytesPerSecond
     case filesPerSecond
+    /// Video frames made per second — a graded render and its stabilize
+    /// step, which finish one file in many minutes.
+    case framesPerSecond
 
     var axisLabel: String {
         switch self {
         case .megabytesPerSecond: "MB/s"
         case .filesPerSecond: "files/s"
+        case .framesPerSecond: "frames/s"
         }
     }
 }
@@ -272,6 +276,15 @@ enum JobThroughputFormat {
         let divisor = gigabytes ? 1_000_000_000.0 : 1_000_000.0
         let unit = gigabytes ? "GB" : "MB"
         return String(format: "%.1f / %.1f %@", Double(max(done, 0)) / divisor, Double(max(total, 0)) / divisor, unit)
+    }
+
+    /// A speed against the clip's own frame rate: "0.42", "1.8", "12".
+    static func realtime(_ factor: Double) -> String {
+        let value = max(factor, 0)
+        guard value.isFinite else { return placeholder }
+        if value < 1 { return String(format: "%.2f", value) }
+        if value < 10 { return String(format: "%.1f", value) }
+        return Int(value.rounded()).formatted()
     }
 
     static func megabytes(_ bytesPerSecond: Double) -> Double {

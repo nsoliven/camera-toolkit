@@ -183,6 +183,13 @@ public struct JobHistorySample: Codable, Equatable, Hashable, Sendable {
     /// What the Jobs window said was left at this second ("~10 m left"),
     /// so a finished job shows how far off each estimate was.
     public var secondsRemaining: Double?
+    /// Video frames finished per second, for jobs that make frames (a
+    /// graded render); nil for every other job.
+    public var framesPerSecond: Double?
+    /// Every frame the job had finished by this second.
+    public var doneFrames: Int?
+    /// The frame step running at this second — "Stabilize", "Grade".
+    public var frameStep: String?
 
     public init(
         t: Double,
@@ -198,7 +205,10 @@ public struct JobHistorySample: Codable, Equatable, Hashable, Sendable {
         transferBytes: Int64? = nil,
         doneBytes: Int64 = 0,
         doneFiles: Int = 0,
-        secondsRemaining: Double? = nil
+        secondsRemaining: Double? = nil,
+        framesPerSecond: Double? = nil,
+        doneFrames: Int? = nil,
+        frameStep: String? = nil
     ) {
         self.t = t
         self.combined = combined
@@ -214,6 +224,9 @@ public struct JobHistorySample: Codable, Equatable, Hashable, Sendable {
         self.doneBytes = doneBytes
         self.doneFiles = doneFiles
         self.secondsRemaining = secondsRemaining
+        self.framesPerSecond = framesPerSecond
+        self.doneFrames = doneFrames
+        self.frameStep = frameStep
     }
 
     /// When this second's estimate said the job would end, minus when it
@@ -233,6 +246,7 @@ public struct JobHistorySample: Codable, Equatable, Hashable, Sendable {
         case "Verify (on NAS)": remoteVerify
         case "Hash (drive read)": hash
         case "Files": filesPerSecond
+        case "Frames": framesPerSecond
         default: nil
         }
     }

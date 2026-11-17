@@ -139,6 +139,13 @@ public final class JobHistoryStore: @unchecked Sendable {
         migrator.registerMigration("v2-estimates") { db in
             try db.execute(sql: "ALTER TABLE job_samples ADD COLUMN seconds_remaining REAL")
         }
+        migrator.registerMigration("v3-frames") { db in
+            try db.execute(sql: """
+            ALTER TABLE job_samples ADD COLUMN frames_per_second REAL;
+            ALTER TABLE job_samples ADD COLUMN done_frames INTEGER;
+            ALTER TABLE job_samples ADD COLUMN frame_step TEXT;
+            """)
+        }
         return migrator
     }
 
@@ -185,14 +192,16 @@ public final class JobHistoryStore: @unchecked Sendable {
             let sampleStatement = try db.cachedStatement(sql: """
             INSERT INTO job_samples(
                 job_id, t, combined_mbps, copy_mbps, verify_mbps, hash_mbps, remote_verify_mbps, files_per_second,
-                active_transfers, cpu, gpu, transfer_bytes, done_bytes, done_files, seconds_remaining
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                active_transfers, cpu, gpu, transfer_bytes, done_bytes, done_files, seconds_remaining,
+                frames_per_second, done_frames, frame_step
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """)
             for sample in samples {
                 try sampleStatement.execute(arguments: [
                     id, sample.t, sample.combined, sample.copy, sample.verify, sample.hash, sample.remoteVerify,
                     sample.filesPerSecond, sample.activeTransfers, sample.cpu, sample.gpu, sample.transferBytes,
                     sample.doneBytes, sample.doneFiles, sample.secondsRemaining,
+                    sample.framesPerSecond, sample.doneFrames, sample.frameStep,
                 ])
             }
             let itemStatement = try db.cachedStatement(sql: """
@@ -276,7 +285,10 @@ public final class JobHistoryStore: @unchecked Sendable {
                     transferBytes: row["transfer_bytes"],
                     doneBytes: row["done_bytes"],
                     doneFiles: row["done_files"],
-                    secondsRemaining: row["seconds_remaining"]
+                    secondsRemaining: row["seconds_remaining"],
+                    framesPerSecond: row["frames_per_second"],
+                    doneFrames: row["done_frames"],
+                    frameStep: row["frame_step"]
                 )
             }
         }
