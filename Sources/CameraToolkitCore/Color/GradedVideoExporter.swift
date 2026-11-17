@@ -21,9 +21,14 @@ public struct GradedRenderRequest: Sendable {
     /// drive: a copy Sync already carried there counts as rendered, and its
     /// name is never reused for a different render (Sync would conflict).
     public var mirrorFolder: URL?
+    /// A second render step after the grade (post stabilization). Nil — the
+    /// default — renders the grade alone, as before; this exporter does not
+    /// read it yet.
+    public var stabilization: RenderStabilization?
 
-    public init(source: URL, recipe: GradeRecipe, sourceKey: String, sourceModifiedAt: Date, outputFolder: URL, make: String? = nil, model: String? = nil, mirrorFolder: URL? = nil) {
+    public init(source: URL, recipe: GradeRecipe, sourceKey: String, sourceModifiedAt: Date, outputFolder: URL, make: String? = nil, model: String? = nil, mirrorFolder: URL? = nil, stabilization: RenderStabilization? = nil) {
         self.mirrorFolder = mirrorFolder
+        self.stabilization = stabilization
         self.source = source
         self.recipe = recipe
         self.sourceKey = sourceKey
@@ -31,6 +36,18 @@ public struct GradedRenderRequest: Sendable {
         self.outputFolder = outputFolder
         self.make = make
         self.model = model
+    }
+}
+
+/// The settings of an optional post-stabilization step in a render. A
+/// placeholder the stabilizer fills in: requests carry it, nothing reads it
+/// yet.
+public struct RenderStabilization: Codable, Hashable, Sendable {
+    /// The stabilizer's preset or profile name.
+    public var preset: String
+
+    public init(preset: String = "default") {
+        self.preset = preset
     }
 }
 

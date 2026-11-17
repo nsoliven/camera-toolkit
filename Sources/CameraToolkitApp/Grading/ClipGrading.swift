@@ -34,6 +34,11 @@ final class ClipGrading {
     private(set) var luts: [ImportedLUT] = []
     /// Copy Grade / Paste Grade.
     var clipboard: ClipGrade?
+    /// The grading question Send to Immich is asking (`ImmichSendGrading`).
+    var immichSendAsk: ImmichSendGradeAsk?
+    /// What sending means once grading is settled; tests answer it
+    /// themselves. Nil sends through the workspace.
+    @ObservationIgnored var startImmichSend: (@MainActor (Set<UUID>) -> Void)?
 
     /// Detected profile by file key: present once the sidecar was read
     /// (nil value = read, not log).

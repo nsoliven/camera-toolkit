@@ -413,6 +413,7 @@ struct ImmichSendProgressView: View {
                                     .font(.callout)
                                     .foregroundStyle(.secondary)
                             }
+                            ImmichSendGradedLines(result: result)
                         }
                     }
                 }
@@ -445,6 +446,14 @@ struct ImmichSendSheet: View {
     }
 
     var body: some View {
+        if let ask = workspace.grading.immichSendAsk {
+            ImmichSendGradeAskView(grading: workspace.grading, ask: ask)
+        } else {
+            sendBody
+        }
+    }
+
+    private var sendBody: some View {
         VStack(alignment: .leading, spacing: 14) {
             Text("Send to Immich").font(.title2.weight(.semibold))
             if let state = workspace.immichSend {
@@ -489,7 +498,7 @@ struct ImmichSendSheet: View {
                     Button("Cancel") { workspace.cancelImmichSend(); dismiss() }
                         .keyboardShortcut(.cancelAction)
                     Button("Send \(selected.count) Event\(selected.count == 1 ? "" : "s")") {
-                        workspace.sendToImmich(selected)
+                        workspace.grading.beginImmichSend(selected)
                     }
                     .keyboardShortcut(.defaultAction)
                     .disabled(selected.isEmpty)

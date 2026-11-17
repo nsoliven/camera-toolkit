@@ -640,6 +640,8 @@ public struct ImmichLibrarySyncOutcome: Equatable, Sendable {
     public var stacks: ImmichStackRunReport?
     /// The library as Immich has it now.
     public var library: ImmichLibrary?
+    /// Graded copies put in their originals' places (`ImmichGradedAlbumSwap`).
+    public var graded = ImmichGradedSwapReport()
 
     public var summary: String {
         var parts = ["\(report.count(.present).formatted()) in Immich"]
@@ -798,11 +800,18 @@ public struct ImmichLibrarySync: Sendable {
         }
         try inspector.saveImmichStatuses(report.statuses)
         report.statuses = []
+        // Graded copies take their log original's place in the albums.
+        let graded = ImmichGradedAlbumSwap.prepare(
+            &report, files: files, assets: assets, library: library,
+            records: GradedCopyStore.existingRecords(catalogURL: catalogURL, eventIDs: events)
+        )
 
         var outcome = ImmichLibrarySyncOutcome(report: report)
+        outcome.graded = graded
         outcome.library = library
         if fillsAlbums {
             await syncAlbums(report, into: &outcome, progress: progress)
+            await ImmichGradedAlbumSwap.removeReplacedOriginals(client: client, into: &outcome, logFolder: logFolder)
             try? ImmichEventAlbumStore(catalogURL: catalogURL).save(outcome.albumStates)
             if stacksBurstsAndEdits {
                 progress(.stacking)
@@ -907,8 +916,10 @@ public struct ImmichLibrarySync: Sendable {
                     let result = try await client.addAssets(batch, toAlbum: album.id)
                     outcome.addedToAlbums += result.added
                     failed.formUnion(result.failed.keys)
-                    let added = batch.filter { !result.failed.keys.contains($0) }
-                    members.formUnion(added)
+                    members.formUnion(batch.filter { !result.failed.keys.contains($0) })
+                    // Only what this call put there: an asset that was already
+                    // in the album ("duplicate") is not the app's addition.
+                    let added = result.addedIDs
                     if let additionsLog, !added.isEmpty {
                         ImmichChangeLog.append(ImmichAlbumAdditionEntry(albumID: album.id, albumName: album.name, assetIDs: added), to: additionsLog)
                     }
