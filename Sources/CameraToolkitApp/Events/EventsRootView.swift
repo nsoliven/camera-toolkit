@@ -1181,7 +1181,14 @@ private struct EventSidebarMenu: View {
             if let url = workspace.model.immichWebURL(for: event) { NSWorkspace.shared.open(url) }
         }
         .disabled(!workspace.model.immichServerIsSet)
-        .help(workspace.model.immichServerIsSet ? "Open this event in Immich in your browser" : "Add your Immich server in Settings › Services first")
+        .help(workspace.model.immichServerIsSet ? "Open this event's folder in Immich in your browser" : "Add your Immich server in Settings › Services first")
+        let albums = workspace.model.immichAlbumChoices(for: event)
+        if albums.count == 1, let only = albums.first {
+            Button("Show Album in Immich") { NSWorkspace.shared.open(only.url) }
+                .help("Open the album “\(only.name)” in Immich in your browser")
+        } else if albums.count > 1 {
+            Menu("Show Album in Immich") { ImmichAlbumChoiceItems(choices: albums) }
+        }
         Button("Scan for Faces…") { workspace.requestFaceScan(event) }
             .disabled(workspace.faceScanBlocker(for: event) != nil)
             .help(workspace.faceScanBlocker(for: event)

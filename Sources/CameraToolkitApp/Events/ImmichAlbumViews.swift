@@ -21,11 +21,14 @@ struct ImmichAlbumChipInfo: Equatable {
     /// A linked album checks do not fill (a picks album, or an automatic one
     /// with "Make an album for every event" off).
     var isNotFilled = false
+    /// The other albums the event is in ("also in" links), by name.
+    var alsoIn: [String] = []
 
     /// From an event's own statuses (not its subevents') and its album state.
-    init(albumName: String?, state: ImmichEventAlbumState?, summary: ImmichEventSummary, isPrivateWithoutAlbum: Bool, stackCount: Int = 0, isNotFilled: Bool = false) {
+    init(albumName: String?, state: ImmichEventAlbumState?, summary: ImmichEventSummary, isPrivateWithoutAlbum: Bool, stackCount: Int = 0, isNotFilled: Bool = false, alsoIn: [String] = []) {
         self.stackCount = stackCount
         self.isNotFilled = isNotFilled
+        self.alsoIn = alsoIn
         self.albumName = albumName
         inAlbum = state?.inAlbum
         let notAdded = state.map { max(0, summary.inImmich - $0.inAlbum) } ?? 0
@@ -34,14 +37,25 @@ struct ImmichAlbumChipInfo: Equatable {
         self.isPrivateWithoutAlbum = isPrivateWithoutAlbum
     }
 
-    init(albumName: String?, inAlbum: Int?, toAdd: Int, notOnNAS: Int, isPrivateWithoutAlbum: Bool = false, stackCount: Int = 0, isNotFilled: Bool = false) {
+    init(albumName: String?, inAlbum: Int?, toAdd: Int, notOnNAS: Int, isPrivateWithoutAlbum: Bool = false, stackCount: Int = 0, isNotFilled: Bool = false, alsoIn: [String] = []) {
         self.stackCount = stackCount
         self.isNotFilled = isNotFilled
+        self.alsoIn = alsoIn
         self.albumName = albumName
         self.inAlbum = inAlbum
         self.toAdd = toAdd
         self.notOnNAS = notOnNAS
         self.isPrivateWithoutAlbum = isPrivateWithoutAlbum
+    }
+
+    /// "Also in A", "Also in A, B", "Also in A +2"; nil without links.
+    var alsoInText: String? {
+        guard let first = alsoIn.first else { return nil }
+        switch alsoIn.count {
+        case 1: return "Also in \(first)"
+        case 2: return "Also in \(first), \(alsoIn[1])"
+        default: return "Also in \(first) +\(alsoIn.count - 1)"
+        }
     }
 }
 
@@ -96,6 +110,16 @@ struct ImmichAlbumChip<AlbumMenu: View>: View {
                     .monospacedDigit()
                     .help("Bursts, RAW+JPEG pairs and edits the app stacked in Immich")
             }
+            if let alsoIn = info.alsoInText {
+                Label(alsoIn, systemImage: "link")
+                    .font(.caption.weight(.semibold))
+                    .lineLimit(1)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 2)
+                    .background(Capsule().fill(Color.teal.opacity(0.18)))
+                    .foregroundStyle(Color.teal)
+                    .help("Also linked to: \(info.alsoIn.joined(separator: ", ")). Linked albums are never filled by the app; Show Album opens them.")
+            }
             Divider().frame(height: 14)
             Menu {
                 albumMenu()
@@ -143,6 +167,15 @@ struct ImmichAlbumMenuItems: View {
                 .help(event.immichAlbumShared == true ? "Shared with you: the app never adds to someone else's album" : "Add every photo of this event to the album on each check")
                 Divider()
             }
+            let links = model.immichAlbumLinks[event.id] ?? []
+            if !links.isEmpty {
+                Section("Also In (Linked, Not Filled)") {
+                    ForEach(links, id: \.albumID) { link in
+                        Button("Remove Link to “\(link.albumName)”") { model.removeImmichAlbumLink(eventID: event.id, albumID: link.albumID) }
+                    }
+                }
+                Divider()
+            }
             Button("New Album Named After the Event") { model.useNewImmichAlbum(for: event.id) }
             Button("No Album") { model.unpairImmichAlbum(for: event.id) }
             Divider()
@@ -167,9 +200,9 @@ struct ImmichAlbumMenuItems: View {
     }
 }
 
-/// "View in Immich": a clear button that opens the event's album, else its
-/// folder, else the server, in the browser. Disabled with a hint when no
-/// server is set.
+/// "View in Immich": a clear button that opens the event's folder in
+/// Immich's folder view (else the server) in the browser. Disabled with a
+/// hint when no server is set. Show Album opens the albums.
 struct ViewInImmichButton: View {
     let url: URL?
 
@@ -182,7 +215,50 @@ struct ViewInImmichButton: View {
         .buttonStyle(.bordered)
         .controlSize(.small)
         .disabled(url == nil)
-        .help(url == nil ? "Add your Immich server in Settings › Services first" : "Open this event in Immich in your browser")
+        .help(url == nil ? "Add your Immich server in Settings › Services first" : "Open this event's folder in Immich in your browser")
+    }
+}
+
+/// "Show Album": opens the event's album in the browser; a menu of every
+/// album (its own first, then the ones it is also in) when there are
+/// several. Hidden when the event has no album.
+struct ShowImmichAlbumButton: View {
+    let choices: [ImmichAlbumChoice]
+
+    var body: some View {
+        if choices.count == 1, let only = choices.first {
+            Button {
+                NSWorkspace.shared.open(only.url)
+            } label: {
+                Label("Show Album", systemImage: "rectangle.stack")
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .help("Open the album “\(only.name)” in Immich in your browser")
+        } else if choices.count > 1 {
+            Menu {
+                ImmichAlbumChoiceItems(choices: choices)
+            } label: {
+                Label("Show Album", systemImage: "rectangle.stack")
+            }
+            .menuStyle(.button)
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .fixedSize()
+            .help("Open one of this event's \(choices.count) albums in Immich in your browser")
+        }
+    }
+}
+
+/// One menu item per album: "Name" for the event's own, "Name · also in" for
+/// the rest.
+struct ImmichAlbumChoiceItems: View {
+    let choices: [ImmichAlbumChoice]
+
+    var body: some View {
+        ForEach(choices) { choice in
+            Button(choice.isMain ? choice.name : "\(choice.name) · also in") { NSWorkspace.shared.open(choice.url) }
+        }
     }
 }
 
@@ -200,6 +276,7 @@ struct ImmichEventAlbumBar: View {
                     chip(event)
                 }
                 ViewInImmichButton(url: model.immichWebURL(for: event))
+                ShowImmichAlbumButton(choices: model.immichAlbumChoices(for: event))
             }
             .task {
                 guard workspace.immichIsConfigured else { return }
@@ -227,7 +304,8 @@ struct ImmichEventAlbumBar: View {
                 summary: ImmichEventSummary(statuses: own),
                 isPrivateWithoutAlbum: isPrivate && !event.sendsToImmich,
                 stackCount: model.immichStackCounts[eventID] ?? 0,
-                isNotFilled: isNotFilled
+                isNotFilled: isNotFilled,
+                alsoIn: model.immichAlbumChoices(for: event).filter { !$0.isMain }.map(\.name)
             ),
             onSend: { workspace.requestImmichSend([eventID]) },
             albumMenu: { ImmichAlbumMenuItems(model: model, event: event, isPrivate: isPrivate) }
@@ -275,6 +353,17 @@ struct ImmichPairRow: Identifiable, Equatable {
     var isPicks = false
 }
 
+/// An "also in" link: an album the event is in besides its own.
+struct ImmichLinkRow: Identifiable, Equatable {
+    var id: String { "\(eventID.uuidString)|\(albumID)" }
+    var eventID: UUID
+    var eventName: String
+    var albumID: String
+    var albumName: String
+    /// Why it was linked: "several events", "dates", …
+    var basis: String
+}
+
 struct ImmichUnpairedRow: Identifiable, Equatable {
     var id: String { albumID }
     var albumID: String
@@ -283,12 +372,15 @@ struct ImmichUnpairedRow: Identifiable, Equatable {
     var reason: String
 }
 
-/// Settings › Services: every event paired with an album, with Unpair, and
-/// every album left unpaired with the reason.
+/// Settings › Services: every event paired with its own album, with Unpair;
+/// every "also in" link, with Unlink; and every album left unpaired with the
+/// reason.
 struct ImmichPairsListView: View {
     let pairs: [ImmichPairRow]
+    var links: [ImmichLinkRow] = []
     let unpaired: [ImmichUnpairedRow]
     let onUnpair: (UUID) -> Void
+    var onUnlink: (UUID, String) -> Void = { _, _ in }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -321,6 +413,32 @@ struct ImmichPairsListView: View {
                     }
                     Button("Unpair") { onUnpair(pair.eventID) }
                         .controlSize(.small)
+                }
+            }
+            if !links.isEmpty {
+                Divider()
+                Text("Also in (\(links.count))")
+                    .font(.headline)
+                Text("Albums an event is in besides its own: albums of several events, and phone albums of an event that has its own album. Linked only; the app never adds photos to them.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                ForEach(links) { link in
+                    HStack(spacing: 8) {
+                        Image(systemName: "link").foregroundStyle(Color.teal)
+                        Text(link.eventName).lineLimit(1)
+                        Image(systemName: "arrow.left.and.right").foregroundStyle(.secondary).font(.caption)
+                        Text(link.albumName).fontWeight(.semibold).lineLimit(1)
+                        Text("Also in · \(link.basis)")
+                            .font(.caption)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 1)
+                            .background(Capsule().fill(Color.teal.opacity(0.16)))
+                            .foregroundStyle(Color.teal)
+                        Spacer(minLength: 8)
+                        Button("Unlink") { onUnlink(link.eventID, link.albumID) }
+                            .controlSize(.small)
+                    }
                 }
             }
             if !unpaired.isEmpty {
@@ -363,11 +481,52 @@ extension DashboardModel {
             .sorted { $0.eventName.localizedStandardCompare($1.eventName) == .orderedAscending }
     }
 
+    var immichLinkRows: [ImmichLinkRow] {
+        let events = Dictionary(configuration.savedEvents.map { ($0.id, $0) }) { first, _ in first }
+        let currentNames = Dictionary(immichAlbums.map { ($0.id, $0.name) }) { first, _ in first }
+        return immichAlbumLinks.flatMap { eventID, links -> [ImmichLinkRow] in
+            guard let event = events[eventID] else { return [] }
+            return links.filter { $0.albumID != event.immichAlbumID }.map { link in
+                ImmichLinkRow(eventID: eventID, eventName: event.name, albumID: link.albumID, albumName: currentNames[link.albumID] ?? link.albumName, basis: link.basisText)
+            }
+        }
+        .sorted {
+            let order = $0.eventName.localizedStandardCompare($1.eventName)
+            return order == .orderedSame ? $0.albumName.localizedStandardCompare($1.albumName) == .orderedAscending : order == .orderedAscending
+        }
+    }
+
     var immichUnpairedRows: [ImmichUnpairedRow] {
-        let paired = Set(configuration.savedEvents.compactMap(\.immichAlbumID))
+        let paired = Set(configuration.savedEvents.compactMap(\.immichAlbumID)).union(immichAlbumLinks.values.flatMap { $0.map(\.albumID) })
         return (immichPairing?.unpaired ?? [])
             .filter { !paired.contains($0.album.id) }
             .map { ImmichUnpairedRow(albumID: $0.album.id, albumName: $0.album.name, assetCount: $0.album.assetCount, reason: $0.reason.text) }
+    }
+}
+
+/// Pair Albums found albums of private events: one line saying how many,
+/// and one button that allows an album for exactly those events and pairs.
+struct ImmichPrivateAlbumsBanner: View {
+    let albumCount: Int
+    let eventNames: [String]
+    let onAllow: () -> Void
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "lock.fill").foregroundStyle(Color.orange)
+            Text("\(albumCount) album\(albumCount == 1 ? "" : "s") belong\(albumCount == 1 ? "s" : "") to private events")
+                .help(eventNames.joined(separator: ", "))
+            Spacer(minLength: 8)
+            Button("Allow Album and Pair", action: onAllow)
+                .help("Turns on Allow album for exactly these private events (\(eventNames.joined(separator: ", "))) and pairs their albums. Nothing is changed in Immich.")
+        }
+    }
+}
+
+extension DashboardModel {
+    var immichPrivateEventNames: [String] {
+        let ids = immichPairing?.privateEventIDs ?? []
+        return configuration.savedEvents.filter { ids.contains($0.id) }.map(\.name).sorted { $0.localizedStandardCompare($1) == .orderedAscending }
     }
 }
 

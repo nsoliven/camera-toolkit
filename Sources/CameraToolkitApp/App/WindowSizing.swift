@@ -56,17 +56,19 @@ enum CameraToolkitWindowFactory {
         title: String,
         initialContentSize: NSSize,
         toolbarStyle: NSWindow.ToolbarStyle = .unified,
-        rootView: Root
+        rootView: Root,
+        // Tests pass a window that stays off every display.
+        makeWindow: (NSRect, NSWindow.StyleMask) -> NSWindow = { rect, style in
+            NSWindow(contentRect: rect, styleMask: style, backing: .buffered, defer: false)
+        }
     ) -> NSWindow {
         let host = NSHostingController(rootView: rootView)
         // Must be set before the window installs the controller's view, or
         // the SwiftUI toolbar never reaches the window.
         host.sceneBridgingOptions = [.title, .toolbars]
-        let window = NSWindow(
-            contentRect: NSRect(origin: .zero, size: initialContentSize),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
-            backing: .buffered,
-            defer: false
+        let window = makeWindow(
+            NSRect(origin: .zero, size: initialContentSize),
+            [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView]
         )
         // An empty toolbar gives the bridged SwiftUI items somewhere to land
         // and keeps the unified title bar height stable while they load.

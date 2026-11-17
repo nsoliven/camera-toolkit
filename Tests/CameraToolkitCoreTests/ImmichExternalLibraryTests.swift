@@ -631,9 +631,28 @@ final class ImmichAlbumPairingTests: XCTestCase {
         activityLogPath: "/tmp/a.jsonl"
     ))
 
-    private func album(_ id: String, _ name: String, paths: [String] = []) -> ImmichAlbumContents {
-        ImmichAlbumContents(album: ImmichAlbum(id: id, name: name, assetCount: paths.count), originalPaths: paths.map { "\(root)/\($0)" })
+    /// An album of camera-library `paths` plus `uploads` phone uploads
+    /// (outside the library). With neither, one upload, so it is not empty.
+    private func album(_ id: String, _ name: String, paths: [String] = [], uploads: Int? = nil, dates: [Date] = []) -> ImmichAlbumContents {
+        let uploadCount = uploads ?? (paths.isEmpty ? max(1, dates.count) : 0)
+        let all = paths.map { "\(root)/\($0)" } + (0..<uploadCount).map { "/upload/\(id)/IMG_\($0).HEIC" }
+        return ImmichAlbumContents(album: ImmichAlbum(id: id, name: name, assetCount: all.count), originalPaths: all, captureDates: dates)
     }
+
+    /// One file per date for `event`, at `<folder>/<n>.jpg`, with that date
+    /// as its file time.
+    private func datedFiles(_ event: SavedCameraEvent, folder: String, dates: [Date]) -> [ImmichCatalogFile] {
+        dates.enumerated().map { index, date in
+            ImmichCatalogFile(eventAssetID: "\(event.id)|\(index)", relativePath: "\(folder)/\(index).jpg", isOnNAS: true, eventID: event.id, modifiedAt: date)
+        }
+    }
+
+    /// `count` dates from `start`, `hours` apart.
+    private func days(from start: Date, count: Int, hours: Double = 6) -> [Date] {
+        (0..<count).map { start.addingTimeInterval(Double($0) * hours * 3_600) }
+    }
+
+    private let dayLength: TimeInterval = 86_400
 
     /// `count` files of `event` at `<folder>/<n>.jpg`.
     private func files(_ event: SavedCameraEvent, folder: String, count: Int) -> [ImmichCatalogFile] {
@@ -683,7 +702,19 @@ final class ImmichAlbumPairingTests: XCTestCase {
         let result = pair([few, mixed], [trip, other], allFiles)
         XCTAssertTrue(result.pairs.isEmpty)
         XCTAssertEqual(result.unpaired.first { $0.album.id == "few" }?.reason, .noMatch)
-        XCTAssertEqual(result.unpaired.first { $0.album.id == "mixed" }?.reason, .mixed(topShare: 0.6))
+        // Not one event's album, but six of the trip's photos: linked to the
+        // trip only (four of the party's are under the link minimum).
+        XCTAssertNil(result.unpaired.first { $0.album.id == "mixed" })
+        XCTAssertEqual(result.links.map(\.eventID), [trip.id])
+        XCTAssertEqual(result.links.first?.basis, .severalEvents)
+        XCTAssertEqual(result.links.first?.matchedAssets, 6)
+
+        // Spread thin over many events with too few each, it stays mixed.
+        let many = (0..<25).map { SavedCameraEvent(name: "Event \($0)", eventDate: date) }
+        let manyFiles = many.enumerated().flatMap { index, event in files(event, folder: "2026/E\(index)", count: 40) }
+        let thin = album("thin", "Thin", paths: many.indices.flatMap { index in (1...5).map { "2026/E\(index)/\($0).jpg" } }.prefix(24 * 5 + 4).map { $0 })
+        let spread = pair([thin], many, manyFiles)
+        XCTAssertTrue(spread.links.allSatisfy { $0.matchedAssets >= ImmichAlbumPairing.linkMinimumAssets })
     }
 
     func testTwoEventsWithTheAlbumsNameTieUnlessPhotosSettleIt() {
@@ -702,11 +733,13 @@ final class ImmichAlbumPairingTests: XCTestCase {
         XCTAssertEqual(result.unpaired.first?.reason, .nameAndContentsDisagree)
     }
 
-    func testAnEventMatchingTwoAlbumsPairsWithNeither() {
+    func testAnEventMatchingTwoAlbumsPairsWithNeitherButLinksBoth() {
         let trip = SavedCameraEvent(name: "Trip 2026", eventDate: date)
-        let result = pair([album("a", "Trip 2026"), album("b", "trip 2026")], [trip])
-        XCTAssertTrue(result.pairs.isEmpty)
-        XCTAssertEqual(result.unpaired.map(\.reason), [.eventMatchesSeveralAlbums, .eventMatchesSeveralAlbums])
+        let result = pair([album("a", "Trip 2026", paths: ["2026/T/1.jpg"]), album("b", "trip 2026", paths: ["2026/T/2.jpg"])], [trip])
+        XCTAssertTrue(result.pairs.isEmpty, "neither is clearly its own album")
+        XCTAssertEqual(Set(result.links.map(\.album.id)), ["a", "b"])
+        XCTAssertTrue(result.links.allSatisfy { $0.eventID == trip.id })
+        XCTAssertTrue(result.unpaired.isEmpty)
     }
 
     func testPrivateOptedOutAndAlreadyPairedEventsAreLeftAlone() {
@@ -715,14 +748,20 @@ final class ImmichAlbumPairingTests: XCTestCase {
         let optedOut = SavedCameraEvent(name: "Family Party", eventDate: date, immichAlbumPolicy: ImmichAlbumPolicy.none)
         var paired = SavedCameraEvent(name: "Trip 2026", eventDate: date)
         paired.pairImmichAlbum(ImmichAlbum(id: "kept", name: "Kept"))
+        let one = ["2026/X/1.jpg"]
         let result = pair(
-            [album("s", "Secret"), album("al", "Allowed"), album("o", "Family Party"), album("t", "Trip 2026"), album("kept", "Kept")],
+            [album("s", "Secret", paths: one), album("al", "Allowed", paths: one), album("o", "Family Party", paths: one), album("t", "Trip 2026", paths: one), album("kept", "Kept", paths: one)],
             [secret, allowed, optedOut, paired]
         )
         XCTAssertEqual(result.pairs.map(\.eventID), [allowed.id])
         XCTAssertEqual(result.unpaired.first { $0.album.id == "s" }?.reason, .privateEvent)
+        XCTAssertEqual(result.privatePairs.map(\.album.id), ["s"], "waits for Allow album and pair")
+        XCTAssertEqual(result.privateEventIDs, [secret.id])
         XCTAssertEqual(result.unpaired.first { $0.album.id == "o" }?.reason, .eventOptedOut)
-        XCTAssertEqual(result.unpaired.first { $0.album.id == "t" }?.reason, .eventAlreadyPaired)
+        // A second album for an event that has its own is an "also in" link.
+        XCTAssertNil(result.unpaired.first { $0.album.id == "t" })
+        XCTAssertEqual(result.links.map(\.album.id), ["t"])
+        XCTAssertEqual(result.links.first?.eventID, paired.id)
         XCTAssertEqual(result.alreadyPaired, 1)
     }
 
@@ -730,7 +769,7 @@ final class ImmichAlbumPairingTests: XCTestCase {
 
     func testSharedAlbumsAreNeverPaired() {
         let event = SavedCameraEvent(name: "Beach Day", eventDate: date)
-        var shared = album("x", "Beach Day")
+        var shared = album("x", "Beach Day", paths: ["2026/B/1.jpg"])
         shared.album.ownerID = "friend"
         let result = pair([shared], [event], [], currentUserID: "me")
         XCTAssertTrue(result.pairs.isEmpty)
@@ -743,8 +782,8 @@ final class ImmichAlbumPairingTests: XCTestCase {
         var big = album("x", "Shared Trip", paths: (1...10).map { "2026/T/\($0).jpg" })
         big.album.assetCount = 500
         let result = pair([big], [trip], files(trip, folder: "2026/T", count: 10))
-        XCTAssertTrue(result.pairs.isEmpty)
-        XCTAssertEqual(result.unpaired.first?.reason, .mixed(topShare: 0.02))
+        XCTAssertTrue(result.pairs.isEmpty, "not the trip's own album")
+        XCTAssertEqual(result.links.map(\.eventID), [trip.id], "but the trip is in it")
     }
 
     func testAPicksAlbumIsLinkedButNotFilled() {
@@ -791,6 +830,281 @@ final class ImmichAlbumPairingTests: XCTestCase {
         event.immichAlbumFill = true
         XCTAssertFalse(event.fillsImmichAlbum, "shared wins over the switch")
         XCTAssertNil(ImmichAlbumNaming.targets(events: [event], locations: locations, albumsForEveryEvent: true)[event.id])
+    }
+
+    // MARK: Phone albums, several events, private, idempotence
+
+    func testNameWordsIgnoreCaseAccentsDigitsEmojiAndStopWords() {
+        XCTAssertEqual(ImmichAlbumPairing.nameWords("24' Island"), ["island"])
+        XCTAssertEqual(ImmichAlbumPairing.nameWords("Blue Cliff w Sam and Seaside"), ["blue", "cliff", "sam", "seaside"])
+        XCTAssertEqual(ImmichAlbumPairing.nameWords("SEASIDE \u{1F30A}"), ["seaside"])
+        XCTAssertEqual(ImmichAlbumPairing.nameWords("Caf\u{E9} Trip 2021!"), ["cafe"])
+        XCTAssertEqual(ImmichAlbumPairing.nameWords("Favorites"), [])
+    }
+
+    func testAPhoneAlbumPairsByItsDatesAndANameWord() {
+        let start = date
+        // The album starts the day after the event's photos end: within a day.
+        let island = SavedCameraEvent(name: "Island", eventDate: start)
+        let coast = SavedCameraEvent(name: "Blue Cliff w Sam and Seaside", eventDate: start.addingTimeInterval(40 * dayLength))
+        let other = SavedCameraEvent(name: "Beach Day", eventDate: start.addingTimeInterval(41 * dayLength))
+        let eventFiles = datedFiles(island, folder: "2026/I", dates: days(from: start, count: 5))
+            + datedFiles(coast, folder: "2026/C", dates: days(from: coast.eventDate, count: 12))
+            + datedFiles(other, folder: "2026/B", dates: days(from: other.eventDate, count: 4))
+        let islandAlbum = album("ia", "Island 2026", dates: days(from: start.addingTimeInterval(1.25 * dayLength), count: 24))
+        let coastAlbum = album("ca", "Seaside \u{1F30A}", dates: days(from: coast.eventDate.addingTimeInterval(dayLength), count: 6))
+        let result = pair([islandAlbum, coastAlbum], [island, coast, other], eventFiles)
+        XCTAssertTrue(result.pairs.isEmpty, "dates alone never take an event's own album")
+        XCTAssertEqual(result.links.first { $0.album.id == "ia" }?.eventID, island.id)
+        XCTAssertEqual(result.links.first { $0.album.id == "ia" }?.basis, .dates)
+        XCTAssertEqual(result.links.first { $0.album.id == "ia" }?.fills, false, "never filled")
+        XCTAssertEqual(result.links.first { $0.album.id == "ca" }?.eventID, coast.id, "the beach day overlaps too, but shares no word")
+        XCTAssertNotNil(result.links.first?.dateSpan)
+    }
+
+    func testAPhoneAlbumForAnEventWithItsOwnAlbumIsAlsoIn() {
+        var island = SavedCameraEvent(name: "Island", eventDate: date)
+        island.pairImmichAlbum(ImmichAlbum(id: "own", name: "Island (2026)"))
+        let result = pair([album("ph", "Island phone", dates: days(from: date, count: 8))], [island], datedFiles(island, folder: "2026/I", dates: days(from: date, count: 8)))
+        XCTAssertTrue(result.pairs.isEmpty)
+        XCTAssertEqual(result.links.map(\.eventID), [island.id])
+        XCTAssertEqual(result.links.first?.basis, .dates)
+    }
+
+    func testOutliersAreTrimmedFromTheSpan() throws {
+        let span = ImmichAlbumPairing.robustSpan(days(from: date, count: 20) + [date.addingTimeInterval(-4 * 365 * dayLength)])
+        XCTAssertGreaterThanOrEqual(try XCTUnwrap(span).lowerBound, date, "the one import-day photo years earlier drops out")
+        XCTAssertNil(ImmichAlbumPairing.robustSpan([]))
+        // Exports nine months later do not stretch a three-day shoot.
+        let shoot = days(from: date, count: 20, hours: 3.5)
+        let exports = (0..<4).map { date.addingTimeInterval(270 * dayLength + Double($0) * 3_600) }
+        let robust = try XCTUnwrap(ImmichAlbumPairing.robustSpan(shoot + exports))
+        XCTAssertLessThanOrEqual(robust.upperBound.timeIntervalSince(robust.lowerBound), 3 * dayLength)
+
+        let trip = SavedCameraEvent(name: "Lakes", eventDate: date)
+        let dates = days(from: date, count: 20) + [date.addingTimeInterval(-4 * 365 * dayLength)]
+        let result = pair([album("l", "Lakes 2026", dates: dates)], [trip], datedFiles(trip, folder: "2026/L", dates: days(from: date, count: 10)))
+        XCTAssertEqual(result.links.map(\.eventID), [trip.id])
+    }
+
+    func testLongSpanSystemAlbumsNeverPair() {
+        let trip = SavedCameraEvent(name: "Lakes", eventDate: date)
+        let tripFiles = datedFiles(trip, folder: "2026/L", dates: days(from: date, count: 10))
+        let years = (0..<40).map { date.addingTimeInterval(Double($0) * 30 * dayLength) }
+        let favorites = album("f", "Favorites", dates: years)
+        let lakesForever = album("lf", "Lakes Forever", dates: years)
+        let recents = album("r", "Recents", dates: days(from: date, count: 10))
+        let result = pair([favorites, lakesForever, recents], [trip], tripFiles)
+        XCTAssertTrue(result.pairs.isEmpty)
+        XCTAssertTrue(result.links.isEmpty)
+        XCTAssertEqual(result.unpaired.first { $0.album.id == "f" }?.reason, .longSpan(days: 930))
+        if case .longSpan? = result.unpaired.first(where: { $0.album.id == "lf" })?.reason {} else { XCTFail("a name word is not enough over years") }
+        XCTAssertEqual(result.unpaired.first { $0.album.id == "r" }?.reason, .noDateMatch, "a system word never matches a name")
+    }
+
+    func testAnAmbiguousNameIsSettledByDates() {
+        let earlier = SavedCameraEvent(name: "Harbor City", eventDate: date)
+        let later = SavedCameraEvent(name: "Harbor City", eventDate: date.addingTimeInterval(365 * dayLength))
+        let files = datedFiles(earlier, folder: "2026/H1", dates: days(from: earlier.eventDate, count: 8))
+            + datedFiles(later, folder: "2027/H2", dates: days(from: later.eventDate, count: 8))
+        let result = pair([album("h", "Harbor City", dates: days(from: date.addingTimeInterval(dayLength), count: 5))], [earlier, later], files)
+        XCTAssertEqual(result.pairs.map(\.eventID), [earlier.id])
+        XCTAssertEqual(result.pairs.first?.basis, .nameAndDates)
+
+        // Without dates it stays a tie, as before.
+        XCTAssertEqual(pair([album("h", "Harbor City")], [earlier, later], files).unpaired.first?.reason, .tie)
+
+        // Two events with the word on the same days: left alone.
+        let twin = SavedCameraEvent(name: "Harbor Walk", eventDate: date)
+        let twinFiles = files + datedFiles(twin, folder: "2026/HW", dates: days(from: date, count: 8))
+        let tied = pair([album("p", "Harbor pics", dates: days(from: date.addingTimeInterval(dayLength), count: 5))], [earlier, twin], twinFiles)
+        XCTAssertTrue(tied.pairs.isEmpty)
+        XCTAssertEqual(tied.unpaired.first?.reason, .datesFitSeveralEvents)
+    }
+
+    func testSeveralEventsLinkThresholds() {
+        let names = ["A", "B", "C", "D", "E", "F"]
+        let events = names.map { SavedCameraEvent(name: "Event \($0)", eventDate: date) }
+        let inAlbum = [60, 30, 6, 4, 5, 5]
+        let eventSizes = [100, 100, 10, 10, 10, 100]
+        var allFiles: [ImmichCatalogFile] = []
+        var paths: [String] = []
+        for (index, event) in events.enumerated() {
+            allFiles += files(event, folder: "2026/\(names[index])", count: eventSizes[index])
+            paths += (1...inAlbum[index]).map { "2026/\(names[index])/\($0).jpg" }
+        }
+        let result = pair([album("u", "Year in Review", paths: paths)], events, allFiles)
+        XCTAssertTrue(result.pairs.isEmpty, "no event holds 80% of it")
+        // A 55%, B 27%, C 5.5% of the album; D has 4 (< 5); E 4.5% of the album
+        // but half its own event; F 4.5% of the album and 5% of its event.
+        XCTAssertEqual(Set(result.links.map(\.eventID)), Set([events[0], events[1], events[2], events[4]].map(\.id)))
+        XCTAssertTrue(result.links.allSatisfy { $0.basis == .severalEvents && !$0.fills })
+
+        // One event dominates: today's pairing for it, a link for the parent trip.
+        let parent = SavedCameraEvent(name: "Trip", eventDate: date)
+        var child = SavedCameraEvent(name: "Day One", eventDate: date)
+        child.parentEventID = parent.id
+        let dominated = album("d", "Highlights", paths: (1...90).map { "2026/T/D/\($0).jpg" } + (1...10).map { "2026/T/\($0).jpg" })
+        let both = pair([dominated], [parent, child], files(child, folder: "2026/T/D", count: 100) + files(parent, folder: "2026/T", count: 200))
+        XCTAssertEqual(both.pairs.map(\.eventID), [child.id])
+        XCTAssertEqual(both.pairs.first?.basis, .contents)
+        XCTAssertEqual(both.pairs.first?.fills, true, "90 of the child's 100: kept filled, as before")
+        XCTAssertEqual(both.links.map(\.eventID), [parent.id])
+    }
+
+    func testPrivateEventsWaitForAllowAlbum() {
+        let secret = SavedCameraEvent(name: "Hidden Cove", eventDate: date, storagePolicy: .archiveOnly)
+        let allowed = SavedCameraEvent(name: "Open Cove", eventDate: date.addingTimeInterval(60 * dayLength), immichUploadEnabled: true, storagePolicy: .archiveOnly)
+        let files = datedFiles(secret, folder: "2026/S", dates: days(from: secret.eventDate, count: 5))
+            + datedFiles(allowed, folder: "2026/O", dates: days(from: allowed.eventDate, count: 5))
+        let result = pair(
+            [album("s", "Cove pics", dates: days(from: secret.eventDate, count: 5)), album("o", "More cove pics", dates: days(from: allowed.eventDate, count: 5))],
+            [secret, allowed], files
+        )
+        XCTAssertEqual(result.links.map(\.eventID), [allowed.id])
+        XCTAssertEqual(result.privateLinks.map(\.eventID), [secret.id])
+        XCTAssertEqual(result.privateAlbumIDs, ["s"])
+        XCTAssertEqual(result.unpaired.map(\.reason), [.privateEvent])
+    }
+
+    func testPairingTwiceChangesNothingAndLeavesManualPairingsAlone() {
+        let island = SavedCameraEvent(name: "Island", eventDate: date)
+        var manual = SavedCameraEvent(name: "Concert", eventDate: date.addingTimeInterval(90 * dayLength))
+        manual.pairImmichAlbum(ImmichAlbum(id: "m", name: "My Picks"), fills: false)
+        let parent = SavedCameraEvent(name: "Trip", eventDate: date.addingTimeInterval(200 * dayLength))
+        let child = SavedCameraEvent(name: "Day One", eventDate: parent.eventDate, parentEventID: parent.id)
+        let files = datedFiles(island, folder: "2026/I", dates: days(from: date, count: 6))
+            + self.files(parent, folder: "2026/T", count: 50) + self.files(child, folder: "2026/T/D", count: 50)
+        let albums = [
+            album("ia", "Island phone", dates: days(from: date, count: 6)),
+            album("m", "My Picks", paths: (1...10).map { "2026/T/\($0).jpg" }),
+            album("x", "Mixed", paths: (1...30).map { "2026/T/\($0).jpg" } + (1...20).map { "2026/T/D/\($0).jpg" })
+        ]
+        let first = pair(albums, [island, manual, parent, child], files)
+        XCTAssertTrue(first.pairs.isEmpty)
+        XCTAssertEqual(Set(first.links.map(\.eventID)), [island.id, parent.id, child.id])
+        XCTAssertEqual(first.alreadyPaired, 1, "the manual pairing is left alone")
+
+        var events = [island, manual, parent, child]
+        for pair in first.pairs {
+            if let index = events.firstIndex(where: { $0.id == pair.eventID }) { events[index].pairImmichAlbum(pair.album, fills: pair.fills) }
+        }
+        var configuration = AppConfiguration(
+            demoRootPath: "/tmp/demo", importSourcePath: "/tmp/card", archivePath: "/tmp/lib/Originals",
+            bufferPath: "/tmp/buffer", cameraLibraryRootPath: "/tmp/lib", catalogDatabasePath: "/tmp/c.sqlite",
+            activityLogPath: "/tmp/a.jsonl"
+        )
+        configuration.savedEvents = events
+        let second = ImmichAlbumPairing.pair(
+            albums: albums, events: events, files: files, library: library(),
+            locations: EventStorageLocations(configuration: configuration),
+            linkedAlbumIDs: Set(first.links.map(\.album.id))
+        )
+        XCTAssertTrue(second.pairs.isEmpty)
+        XCTAssertTrue(second.links.isEmpty)
+        XCTAssertTrue(second.unpaired.isEmpty)
+        XCTAssertEqual(second.alreadyPaired, 3)
+        XCTAssertEqual(events.first { $0.id == manual.id }?.immichAlbumID, "m")
+    }
+
+    func testSomeoneElsesAlbumIsNeverPairedOrLinked() {
+        let island = SavedCameraEvent(name: "Island", eventDate: date)
+        let trip = SavedCameraEvent(name: "Trip", eventDate: date)
+        let other = SavedCameraEvent(name: "Other", eventDate: date)
+        let files = datedFiles(island, folder: "2026/I", dates: days(from: date, count: 6))
+            + self.files(trip, folder: "2026/T", count: 20) + self.files(other, folder: "2026/O", count: 20)
+        var phone = album("p", "Island phone", dates: days(from: date, count: 6))
+        phone.album.ownerID = "friend"
+        var several = album("s", "Shared mix", paths: (1...10).map { "2026/T/\($0).jpg" } + (1...10).map { "2026/O/\($0).jpg" })
+        several.album.ownerID = "friend"
+        let result = pair([phone, several], [island, trip, other], files, currentUserID: "me")
+        XCTAssertTrue(result.pairs.isEmpty)
+        XCTAssertTrue(result.links.isEmpty)
+        XCTAssertEqual(result.unpaired.map(\.reason), [.sharedWithYou, .sharedWithYou])
+    }
+
+    func testAnEmptyAlbumNeverPairs() {
+        let event = SavedCameraEvent(name: "Beach Day", eventDate: date)
+        let empty = ImmichAlbumContents(album: ImmichAlbum(id: "e", name: "Beach Day", assetCount: 0), originalPaths: [])
+        let result = pair([empty], [event])
+        XCTAssertTrue(result.pairs.isEmpty)
+        XCTAssertEqual(result.unpaired.first?.reason, .empty)
+    }
+
+    func testAlbumAssetsCarryTheirCaptureDates() {
+        let local = ImmichLibraryAsset(id: "a", originalPath: "/x", localDateTime: "2026-05-04T10:00:00.000Z", fileCreatedAt: "2026-05-04T17:00:00.000Z")
+        XCTAssertEqual(local.captureDate, ImmichLibraryAsset.parseDate("2026-05-04T10:00:00Z"))
+        XCTAssertEqual(ImmichLibraryAsset(id: "b", originalPath: "/x", fileCreatedAt: "2026-05-04T17:00:00Z").captureDate, ImmichLibraryAsset.parseDate("2026-05-04T17:00:00.000Z"))
+        XCTAssertNil(ImmichLibraryAsset(id: "c", originalPath: "/x").captureDate)
+    }
+
+    func testAPhoneAlbumIsNeverFilledEvenWithAllOfASmallEventsPhotos() {
+        // Two camera photos of a two-photo event among forty phone photos.
+        let pond = SavedCameraEvent(name: "Pond Walk", eventDate: date)
+        let phone = album("p", "Pond Walk", paths: ["2026/P/1.jpg", "2026/P/2.jpg"], uploads: 40, dates: days(from: date, count: 42, hours: 1))
+        let result = pair([phone], [pond], files(pond, folder: "2026/P", count: 2))
+        XCTAssertEqual(result.pairs.map(\.eventID), [pond.id], "its name is the event's")
+        XCTAssertEqual(result.pairs.first?.fills, false, "but a phone album is never filled")
+    }
+
+    func testAnAlbumTheUserMovedAnEventOffIsNotPairedAgain() {
+        // The event was paired with "a", then set to a new album by name.
+        var event = SavedCameraEvent(name: "Pond Walk", eventDate: date)
+        event.pairImmichAlbum(ImmichAlbum(id: "a", name: "Pond Walk"))
+        event.useNewImmichAlbumNamedAfterEvent()
+        let albums = [album("a", "Pond Walk", dates: days(from: date, count: 5))]
+        XCTAssertEqual(pair(albums, [event]).pairs.map(\.album.id), ["a"], "without the record it would pair again")
+        var configuration = AppConfiguration(
+            demoRootPath: "/tmp/demo", importSourcePath: "/tmp/card", archivePath: "/tmp/lib/Originals",
+            bufferPath: "/tmp/buffer", cameraLibraryRootPath: "/tmp/lib", catalogDatabasePath: "/tmp/c.sqlite",
+            activityLogPath: "/tmp/a.jsonl"
+        )
+        configuration.savedEvents = [event]
+        let again = ImmichAlbumPairing.pair(albums: albums, events: [event], files: [], library: library(), locations: EventStorageLocations(configuration: configuration), linkedAlbumIDs: ["a"])
+        XCTAssertTrue(again.pairs.isEmpty)
+        XCTAssertTrue(again.links.isEmpty)
+        XCTAssertEqual(again.alreadyPaired, 1)
+    }
+
+    func testEventDatesComeFromImmichThenTheCaptureCacheThenFileTimes() {
+        // File times run twelve days after the shoot (copied later).
+        let shoot = date
+        let event = SavedCameraEvent(name: "Pond Walk", eventDate: shoot)
+        let late = datedFiles(event, folder: "2026/P", dates: days(from: shoot.addingTimeInterval(12 * dayLength), count: 6))
+        let phone = album("ph", "Pond phone", dates: days(from: shoot, count: 6))
+        XCTAssertEqual(pair([phone], [event], late).unpaired.first?.reason, .noDateMatch, "file times alone miss it")
+
+        var configuration = AppConfiguration(
+            demoRootPath: "/tmp/demo", importSourcePath: "/tmp/card", archivePath: "/tmp/lib/Originals",
+            bufferPath: "/tmp/buffer", cameraLibraryRootPath: "/tmp/lib", catalogDatabasePath: "/tmp/c.sqlite",
+            activityLogPath: "/tmp/a.jsonl"
+        )
+        configuration.savedEvents = [event]
+        let locations = EventStorageLocations(configuration: configuration)
+        let assets = late.enumerated().map { index, file in
+            ImmichLibraryAsset(id: "a\(index)", originalPath: "\(root)/\(file.relativePath)", localDateTime: ISO8601DateFormatter().string(from: shoot.addingTimeInterval(Double(index) * 3_600)))
+        }
+        let assetDates = ImmichAlbumPairing.assetDates(assets: assets, library: library())
+        XCTAssertEqual(assetDates.count, 6)
+        let byImmich = ImmichAlbumPairing.pair(albums: [phone], events: [event], files: late, library: library(), locations: locations, assetDates: assetDates)
+        XCTAssertEqual(byImmich.links.map(\.eventID), [event.id])
+
+        let byCache = ImmichAlbumPairing.pair(
+            albums: [phone], events: [event], files: late, library: library(), locations: locations,
+            captureDates: Dictionary(uniqueKeysWithValues: late.map { ($0.eventAssetID, shoot) })
+        )
+        XCTAssertEqual(byCache.links.map(\.eventID), [event.id])
+    }
+
+    func testCaptureDatesAreReadFromTheCacheByAssignment() throws {
+        let event = SavedCameraEvent(name: "Pond Walk", eventDate: date)
+        let assignment = PhotoEventAssignment(sourceRootPath: "/tmp/card", relativePath: "DCIM/DSC00001.ARW", fileSize: 42, modifiedAt: date, eventID: event.id)
+        let missing = PhotoEventAssignment(sourceRootPath: "/tmp/card", relativePath: "DCIM/DSC00002.ARW", fileSize: 42, modifiedAt: date, eventID: event.id)
+        let cache = CaptureDateCache(url: nil)
+        let stamp = CaptureTimestamp(original: "2026:05:04 10:00:00")
+        cache.store(path: "/tmp/card/DCIM/DSC00001.ARW", size: 42, modifiedAt: date, timestamp: stamp)
+        let dates = ImmichAlbumPairing.captureDates(assignments: [assignment, missing], cache: cache)
+        XCTAssertEqual(dates, [CatalogStore.eventAssetID(assignment): try XCTUnwrap(stamp.date)])
     }
 
     func testTheWholeEventRuleForAPickedAlbum() {
@@ -1212,6 +1526,25 @@ final class ImmichStackTests: XCTestCase {
         XCTAssertTrue(counts.contains("Photos from several events: 2"))
         XCTAssertFalse(counts.contains("Screenshots"), "names only with --list")
         XCTAssertTrue(ImmichPairCommand.summaryText(result, albums: 4, events: [event], list: true).contains("pair  Beach Day  ↔  Beach Day"))
+
+        let a = SavedCameraEvent(name: "Trip A", eventDate: start)
+        let b = SavedCameraEvent(name: "Trip B", eventDate: start)
+        let secret = SavedCameraEvent(name: "Family Party", eventDate: start)
+        var more = ImmichPairingResult()
+        more.links = [
+            ImmichAlbumPair(album: ImmichAlbum(id: "p", name: "Island phone"), eventID: a.id, basis: .dates, matchedAssets: 0, dateSpan: start...start.addingTimeInterval(86_400)),
+            ImmichAlbumPair(album: ImmichAlbum(id: "u", name: "Year in Review"), eventID: a.id, basis: .severalEvents, matchedAssets: 40),
+            ImmichAlbumPair(album: ImmichAlbum(id: "u", name: "Year in Review"), eventID: b.id, basis: .severalEvents, matchedAssets: 30)
+        ]
+        more.privatePairs = [ImmichAlbumPair(album: ImmichAlbum(id: "s", name: "Party"), eventID: secret.id, basis: .name, matchedAssets: 0)]
+        more.unpaired = [ImmichUnpairedAlbum(album: ImmichAlbum(id: "s", name: "Party"), eventID: secret.id, reason: .privateEvent)]
+        let listed = ImmichPairCommand.summaryText(more, albums: 3, events: [a, b, secret], list: true)
+        XCTAssertTrue(listed.contains("link (dates: Trip A)  Island phone  [dates, photos"))
+        XCTAssertTrue(listed.contains("link (several events: Trip A, Trip B)  Year in Review  [40 / 30]"))
+        XCTAssertTrue(listed.contains("Would link as also in: 3 link(s) on 2 album(s)"))
+        XCTAssertTrue(listed.contains("Albums of private events: 1"))
+        XCTAssertTrue(listed.contains("private  Party  ↔  Family Party"))
+        XCTAssertTrue(listed.contains("skip  Party"), "still listed as before")
     }
 
     func testWebLinksForAnAssetAFolderAndHome() {

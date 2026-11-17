@@ -125,6 +125,7 @@ struct EventBoardView: View {
                             workspace.splitItems(items)
                         },
                         onViewInImmich: model.immichServerIsSet ? { item in workspace.viewInImmich(item, boardEventID: eventID) } : nil,
+                        immichAlbumChoices: model.immichAlbumChoices(for: event),
                         orientationForFile: { workspace.savedTurns(for: $0) },
                         onRotate: { stack, delta in
                             workspace.rotateStack(stack, quarterTurnsCW: delta)

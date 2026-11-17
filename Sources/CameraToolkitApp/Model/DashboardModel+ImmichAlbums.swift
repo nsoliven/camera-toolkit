@@ -35,13 +35,21 @@ extension DashboardModel {
             catalogURL: catalogURLForImmich,
             carriesAlbumsAcrossRenames: configuration.immichCarriesAlbumsAcrossRenames,
             stacksBurstsAndEdits: configuration.immichStacksBurstsAndEdits,
-            reservedAlbumIDs: Set(configuration.savedEvents.compactMap(\.immichAlbumID)),
+            reservedAlbumIDs: immichReservedAlbumIDs,
             stackableEventIDs: ImmichStackGrouping.stackableEventIDs(
                 events: configuration.savedEvents,
                 locations: EventStorageLocations(configuration: configuration)
             ),
             logFolder: immichLogFolder
         )
+    }
+
+    /// Albums an album found by name may not resolve to: other events' own
+    /// albums. "Also in" albums are not reserved: they are never filled as
+    /// links, and an event whose name matches one should use it rather than
+    /// get a duplicate made in Immich.
+    var immichReservedAlbumIDs: Set<String> {
+        Set(configuration.savedEvents.compactMap(\.immichAlbumID))
     }
 
     /// Every album addition and stack change, as JSON lines to undo from.
@@ -70,7 +78,8 @@ extension DashboardModel {
     }
 
     /// Reads every album on the account and pairs each with an event when the
-    /// match is clear. Writes nothing to Immich.
+    /// match is clear, and links albums of several events (and phone albums
+    /// of an event that has its own) as "also in". Writes nothing to Immich.
     /// - Parameter allowsFilling: false links every pair without filling it
     ///   (choosing a library); Pair Albums keeps event albums filled.
     func pairImmichAlbums(allowsFilling: Bool = true) {
@@ -98,25 +107,147 @@ extension DashboardModel {
                 // Fails closed: without the key's user, nothing with an owner pairs.
                 let me = try? await client.currentUserID()
                 immichCurrentUserID = me
-                let result = ImmichAlbumPairing.pair(albums: contents, events: events, files: files, library: library, locations: locations, currentUserID: me)
-                let pairs = Dictionary(result.pairs.map { ($0.eventID, $0) }) { first, _ in first }
-                if !pairs.isEmpty {
-                    // Event albums are kept filled; picks albums are only linked.
-                    updateConfiguration { configuration in
-                        for index in configuration.savedEvents.indices {
-                            if let pair = pairs[configuration.savedEvents[index].id] {
-                                configuration.savedEvents[index].pairImmichAlbum(pair.album, fills: allowsFilling && pair.fills)
-                            }
-                        }
-                    }
+                // Links to albums Immich no longer has go; the rest (and the
+                // ones the user removed) are left alone.
+                let catalogURL = catalogURLForImmich
+                let accountIDs = Set(contents.map(\.album.id))
+                let linked = await Task.detached(priority: .utility) { () -> Set<String> in
+                    try? ImmichEventAlbumStore(catalogURL: catalogURL).removeLinks(toAlbumsNotIn: accountIDs)
+                    return ImmichEventAlbumStore.handledAlbumIDs(catalogURL: catalogURL)
+                }.value
+                // Event dates: Immich's own capture dates, else the capture-date cache.
+                immichPairingNote = "Reading the library's photo dates…"
+                let assetDates = ImmichAlbumPairing.assetDates(assets: (try? await client.libraryAssets(libraryID: library.id)) ?? [], library: library)
+                let assignments = configuration.photoEventAssignments
+                let cacheURL = LayoutMigrationPlanner.captureDateCacheURL(supportFolder: configurationStore.url.deletingLastPathComponent())
+                let captureDates = await Task.detached(priority: .utility) {
+                    ImmichAlbumPairing.captureDates(assignments: assignments, cache: CaptureDateCache(url: cacheURL))
+                }.value
+                var result = ImmichAlbumPairing.pair(
+                    albums: contents, events: events, files: files, library: library, locations: locations,
+                    currentUserID: me, linkedAlbumIDs: linked, assetDates: assetDates, captureDates: captureDates
+                )
+                if !allowsFilling {
+                    for index in result.privatePairs.indices { result.privatePairs[index].fills = false }
                 }
+                await applyImmichPairs(result.pairs, links: result.links, allowsFilling: allowsFilling)
                 immichPairing = result
                 let picks = result.pairs.count { !(allowsFilling && $0.fills) }
-                immichPairingNote = "Paired \(result.pairs.count) album\(result.pairs.count == 1 ? "" : "s") (\(picks) picks, linked only); \(result.unpaired.count) not paired. Nothing was changed in Immich."
+                immichPairingNote = Self.immichPairingSummary(result, picks: picks)
                 loadImmichAlbumStates()
             } catch {
                 immichPairingNote = "Pairing failed: \(error.localizedDescription)"
             }
+        }
+    }
+
+    static func immichPairingSummary(_ result: ImmichPairingResult, picks: Int) -> String {
+        var parts = ["Paired \(result.pairs.count) album\(result.pairs.count == 1 ? "" : "s") (\(picks) picks, linked only)"]
+        let linkedAlbums = Set(result.links.map(\.album.id)).count
+        if linkedAlbums > 0 {
+            parts.append("linked \(linkedAlbums) more as also in (\(result.links.count) event link\(result.links.count == 1 ? "" : "s"))")
+        }
+        parts.append("\(result.unpaired.count) not paired")
+        return parts.joined(separator: "; ") + ". Nothing was changed in Immich."
+    }
+
+    /// Writes pairs to the events and links to the catalog. A pair whose
+    /// event got an album in the meantime becomes a link.
+    /// Returns once the links are in the catalog, so a reload right after
+    /// reads them.
+    private func applyImmichPairs(_ pairs: [ImmichAlbumPair], links: [ImmichAlbumPair], allowsFilling: Bool, allowingEvents allowed: Set<UUID> = []) async {
+        let byEvent = Dictionary(pairs.map { ($0.eventID, $0) }) { first, _ in first }
+        var demoted: [ImmichAlbumPair] = []
+        if !byEvent.isEmpty || !allowed.isEmpty {
+            let current = Dictionary(configuration.savedEvents.map { ($0.id, $0) }) { first, _ in first }
+            demoted = pairs.filter { current[$0.eventID]?.immichAlbumID != nil }
+            // Event albums are kept filled; picks albums are only linked.
+            updateConfiguration { configuration in
+                for index in configuration.savedEvents.indices {
+                    let id = configuration.savedEvents[index].id
+                    if allowed.contains(id) { configuration.savedEvents[index].immichUploadEnabled = true }
+                    if let pair = byEvent[id], configuration.savedEvents[index].immichAlbumID == nil {
+                        configuration.savedEvents[index].pairImmichAlbum(pair.album, fills: allowsFilling && pair.fills)
+                    }
+                }
+            }
+        }
+        let rows = (links + demoted).map(ImmichEventAlbumLink.init)
+        guard !rows.isEmpty else { return }
+        for row in rows where !(immichAlbumLinks[row.eventID] ?? []).contains(where: { $0.albumID == row.albumID }) {
+            immichAlbumLinks[row.eventID, default: []].append(row)
+        }
+        let catalogURL = catalogURLForImmich
+        await Task.detached(priority: .utility) { try? ImmichEventAlbumStore(catalogURL: catalogURL).addLinks(rows) }.value
+    }
+
+    /// Albums of private events the last pairing found, by album.
+    var immichPrivateAlbumCount: Int { immichPairing?.privateAlbumIDs.count ?? 0 }
+
+    /// "Allow album and pair": turns on Allow album for exactly the private
+    /// events the last pairing found albums for, and pairs those albums.
+    @discardableResult
+    func allowAlbumAndPairPrivateEvents() -> Task<Void, Never>? {
+        guard var result = immichPairing, !result.privateAlbumIDs.isEmpty else { return nil }
+        let eventIDs = result.privateEventIDs
+        let albumIDs = result.privateAlbumIDs
+        let pairs = result.privatePairs
+        let links = result.privateLinks
+        // The events change now; the links reach the catalog right after.
+        let write = Task { @MainActor [weak self] () -> Void in
+            guard let self else { return }
+            await applyImmichPairs(pairs, links: links, allowsFilling: true, allowingEvents: eventIDs)
+        }
+        result.pairs += pairs
+        result.links += links
+        result.privatePairs = []
+        result.privateLinks = []
+        result.unpaired.removeAll { albumIDs.contains($0.album.id) && $0.reason == .privateEvent }
+        immichPairing = result
+        immichPairingNote = "Allowed an album for \(eventIDs.count) private event\(eventIDs.count == 1 ? "" : "s") and paired \(albumIDs.count) album\(albumIDs.count == 1 ? "" : "s"). Nothing was changed in Immich."
+        statusMessage = immichPairingNote
+        return write
+    }
+
+    /// Removes one "also in" link; pairing never makes it again. The album
+    /// stays in Immich as it is.
+    @discardableResult
+    func removeImmichAlbumLink(eventID: UUID, albumID: String) -> Task<Void, Never> {
+        let removed = immichAlbumLinks[eventID]?.first { $0.albumID == albumID }
+        let name = removed?.albumName ?? ""
+        immichAlbumLinks[eventID]?.removeAll { $0.albumID == albumID }
+        if immichAlbumLinks[eventID]?.isEmpty == true { immichAlbumLinks[eventID] = nil }
+        statusMessage = "Removed the link to “\(name)”. The album stays in Immich as it is."
+        let catalogURL = catalogURLForImmich
+        return Task { @MainActor [weak self] () -> Void in
+            let failure = await Task.detached(priority: .utility) { () -> String? in
+                do {
+                    try ImmichEventAlbumStore(catalogURL: catalogURL).dismissLink(eventID: eventID, albumID: albumID, albumName: name)
+                    return nil
+                } catch {
+                    return error.localizedDescription
+                }
+            }.value
+            guard let self, let failure else { return }
+            // Not saved: show the link again and say so.
+            if let removed, !(immichAlbumLinks[eventID] ?? []).contains(where: { $0.albumID == albumID }) {
+                immichAlbumLinks[eventID, default: []].append(removed)
+            }
+            statusMessage = "Could not remove the link to “\(name)”: \(failure)"
+        }
+    }
+
+    /// The event no longer uses `albumID` as its own album (another album
+    /// was picked, a new one asked for, or none): the catalog forgets the
+    /// album's last state and remembers the move, so Pair Albums does not
+    /// pair the album with the event again.
+    @discardableResult
+    func forgetImmichAlbum(_ albumID: String?, name: String?, for eventID: UUID) -> Task<Void, Never> {
+        let catalogURL = catalogURLForImmich
+        return Task.detached(priority: .utility) {
+            guard let store = try? ImmichEventAlbumStore(catalogURL: catalogURL) else { return }
+            try? store.remove(eventIDs: [eventID])
+            if let albumID { try? store.dismissLink(eventID: eventID, albumID: albumID, albumName: name ?? "") }
         }
     }
 
@@ -139,10 +270,13 @@ extension DashboardModel {
     func loadImmichAlbumStates() {
         let catalogURL = catalogURLForImmich
         Task { @MainActor [weak self] in
-            let (states, records) = await Task.detached(priority: .utility) {
+            let (states, records, links) = await Task.detached(priority: .utility) {
                 ((try? ImmichEventAlbumStore(catalogURL: catalogURL).all()) ?? [:],
-                 (try? ImmichStackStore(catalogURL: catalogURL).records()) ?? [:])
+                 (try? ImmichStackStore(catalogURL: catalogURL).records()) ?? [:],
+                 ImmichEventAlbumStore.existingLinks(catalogURL: catalogURL))
             }.value
+            let linksByEvent = Dictionary(grouping: links, by: \.eventID)
+            if self?.immichAlbumLinks != linksByEvent { self?.immichAlbumLinks = linksByEvent }
             let live = records.values.filter { !$0.stackID.isEmpty && $0.removedInImmich != true }
             let counts = live.reduce(into: [UUID: Int]()) { $0[$1.eventID, default: 0] += 1 }
             let keys = Set(live.map(\.key))
@@ -187,23 +321,63 @@ extension DashboardModel {
 
     // MARK: - View in Immich
 
-    /// Where View in Immich goes for an event: its paired album, else its
-    /// folder in Immich's folder view, else the server's home page. Nil when
-    /// no server is set.
+    /// Where View in Immich goes for an event: always its folder in Immich's
+    /// folder view (Show Album opens its albums), else the server's home
+    /// page when the library's folder is not known yet. Nil when no server
+    /// is set.
     func immichWebURL(for event: SavedCameraEvent) -> URL? {
-        let server = configuration.immichServerURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !server.isEmpty else { return nil }
-        if let albumID = immichAlbumStates[event.id]?.albumID ?? event.immichAlbumID,
-           let url = ImmichClient.webURL(serverURL: server, albumID: albumID) {
-            return url
-        }
         let library = immichLibrary ?? immichLibraries.first { $0.id == configuration.immichLibraryID }
-        if let root = library?.importPaths.first {
-            let folder = EventStorageLocations(configuration: configuration).nasEventFolderRelativePath(for: event)
+        return Self.immichFolderURL(
+            server: configuration.immichServerURL,
+            importRoot: library?.importPaths.first,
+            eventFolder: EventStorageLocations(configuration: configuration).nasEventFolderRelativePath(for: event)
+        )
+    }
+
+    /// An event folder's page in Immich's folder view, else the server's home.
+    static func immichFolderURL(server: String, importRoot: String?, eventFolder: String) -> URL? {
+        let server = server.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !server.isEmpty else { return nil }
+        if let root = importRoot, !root.isEmpty {
             let trimmed = root.hasSuffix("/") ? String(root.dropLast()) : root
-            if let url = ImmichClient.webURL(serverURL: server, folder: "\(trimmed)/\(folder)") { return url }
+            if let url = ImmichClient.webURL(serverURL: server, folder: "\(trimmed)/\(eventFolder)") { return url }
         }
         return ImmichClient.webURL(serverURL: server)
+    }
+
+    /// The albums Show Album lists for an event: its own album first, then
+    /// its "also in" albums by name. Empty when it has none, or no server.
+    func immichAlbumChoices(for event: SavedCameraEvent) -> [ImmichAlbumChoice] {
+        let state = immichAlbumStates[event.id]
+        let mainID = state?.albumID ?? event.immichAlbumID
+        let mainName = state?.albumName ?? event.immichAlbumName ?? event.name
+        let currentNames = Dictionary(immichAlbums.map { ($0.id, $0.name) }) { first, _ in first }
+        return Self.immichAlbumChoices(
+            server: configuration.immichServerURL,
+            main: mainID.map { ($0, mainName) },
+            links: immichAlbumLinks[event.id] ?? [],
+            currentNames: currentNames
+        )
+    }
+
+    static func immichAlbumChoices(
+        server: String,
+        main: (id: String, name: String)?,
+        links: [ImmichEventAlbumLink],
+        currentNames: [String: String] = [:]
+    ) -> [ImmichAlbumChoice] {
+        let server = server.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !server.isEmpty else { return [] }
+        var choices: [ImmichAlbumChoice] = []
+        if let main, let url = ImmichClient.webURL(serverURL: server, albumID: main.id) {
+            choices.append(ImmichAlbumChoice(albumID: main.id, name: currentNames[main.id] ?? main.name, isMain: true, url: url))
+        }
+        var seen = Set(choices.map(\.albumID))
+        let also = links.compactMap { link -> ImmichAlbumChoice? in
+            guard seen.insert(link.albumID).inserted, let url = ImmichClient.webURL(serverURL: server, albumID: link.albumID) else { return nil }
+            return ImmichAlbumChoice(albumID: link.albumID, name: currentNames[link.albumID] ?? link.albumName, isMain: false, url: url)
+        }
+        return choices + also.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
     }
 
     var immichServerIsSet: Bool {
@@ -217,6 +391,9 @@ extension DashboardModel {
     /// filling on; someone else's album is never filled.
     func pairEvent(_ eventID: UUID, withImmichAlbum album: ImmichAlbum) {
         let shared = immichAlbumIsShared(album)
+        if let previous = event(eventID), let old = previous.immichAlbumID, old != album.id {
+            forgetImmichAlbum(old, name: previous.immichAlbumName, for: eventID)
+        }
         updateConfiguration { configuration in
             // One album belongs to one event: a previous holder lets go.
             for index in configuration.savedEvents.indices where configuration.savedEvents[index].immichAlbumID == album.id {
@@ -291,23 +468,27 @@ extension DashboardModel {
             : "The album stays linked; checks no longer add photos to it."
     }
 
-    func useNewImmichAlbum(for eventID: UUID) {
+    @discardableResult
+    func useNewImmichAlbum(for eventID: UUID) -> Task<Void, Never> {
+        let previous = event(eventID)
         updateConfiguration { configuration in
             guard let index = configuration.savedEvents.firstIndex(where: { $0.id == eventID }) else { return }
             configuration.savedEvents[index].useNewImmichAlbumNamedAfterEvent()
         }
         immichAlbumStates[eventID] = nil
         statusMessage = "A new album named after the event is made on the next check."
+        // The stored state would still offer the old album in Show Album.
+        return forgetImmichAlbum(previous?.immichAlbumID, name: previous?.immichAlbumName, for: eventID)
     }
 
     func unpairImmichAlbum(for eventID: UUID) {
+        let previous = event(eventID)
         updateConfiguration { configuration in
             guard let index = configuration.savedEvents.firstIndex(where: { $0.id == eventID }) else { return }
             configuration.savedEvents[index].unpairImmichAlbum()
         }
         immichAlbumStates[eventID] = nil
-        let catalogURL = catalogURLForImmich
-        Task.detached(priority: .utility) { try? ImmichEventAlbumStore(catalogURL: catalogURL).remove(eventIDs: [eventID]) }
+        forgetImmichAlbum(previous?.immichAlbumID, name: previous?.immichAlbumName, for: eventID)
         statusMessage = "No album for this event. The album stays in Immich as it is."
     }
 
@@ -342,4 +523,14 @@ extension DashboardModel {
         if let library = outcome.library { immichLibrary = library }
         if let created = outcome.stacks?.created, !created.isEmpty { loadImmichAlbumStates() }
     }
+}
+
+/// One album Show Album can open: the event's own album or an "also in" one.
+struct ImmichAlbumChoice: Identifiable, Equatable {
+    var id: String { albumID }
+    var albumID: String
+    var name: String
+    /// The event's own album (the one that may be kept filled).
+    var isMain: Bool
+    var url: URL
 }
