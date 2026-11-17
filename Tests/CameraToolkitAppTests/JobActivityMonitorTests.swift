@@ -237,6 +237,30 @@ final class JobActivityMonitorTests: XCTestCase {
         XCTAssertGreaterThan(readout.current ?? 0, 0, "the speed is held, not dropped to zero")
     }
 
+    /// A queued render starts no track: its speed and average are timed
+    /// from its first frame report while running, not from the queue.
+    func testAQueuedRenderIsNotTimedUntilItRunsWithFrames() {
+        let monitor = JobActivityMonitor(ceilingResolver: nil)
+        var queued = renderJob(step: "Stabilize", frame: 0, total: nil, done: 0)
+        queued.state = .queued
+        XCTAssertNil(JobActivityMonitor.throughputUnit(queued))
+        monitor.tick(job: queued, now: 0, wallNow: renderStart)
+        XCTAssertNil(monitor.tracks[renderID], "no track while queued")
+
+        var running = JobSnapshot(id: renderID, action: .gradeRender, state: .running, totalFiles: 1, createdAt: renderStart.addingTimeInterval(60))
+        XCTAssertNil(JobActivityMonitor.throughputUnit(running), "no frames reported yet")
+        monitor.tick(job: running, now: 60, wallNow: running.createdAt)
+        XCTAssertNil(monitor.tracks[renderID])
+
+        for second in 0...10 {
+            running.telemetry = renderJob(step: "Grade", frame: second * 30, total: 900, done: second * 30).telemetry
+            monitor.tick(job: running, now: 60 + Double(second), wallNow: running.createdAt.addingTimeInterval(Double(second)))
+        }
+        let readout = monitor.readout(for: running, now: 70)
+        XCTAssertEqual(readout.unit, .framesPerSecond)
+        XCTAssertEqual(try XCTUnwrap(readout.average), 30, accuracy: 0.01, "the minute in the queue is not averaged in")
+    }
+
     /// File jobs keep their files/s.
     func testFileJobsStillReadInFiles() {
         let job = JobSnapshot(action: .organize, state: .running, processedFiles: 3, totalFiles: 10)

@@ -94,6 +94,37 @@ final class JobHistoryTests: XCTestCase {
         }
     }
 
+    /// A history written before frames were recorded migrates in place:
+    /// its jobs and samples stay, and they read back with no frames.
+    func testAVersionTwoHistoryMigratesToFramesKeepingItsRows() throws {
+        try withTemporaryDirectory { root in
+            let url = root.appendingPathComponent(JobHistoryStore.fileName)
+            defer { CatalogDatabase.checkpointAndClose(url: url) }
+            let id = UUID()
+            let writer = try CatalogDatabase.writer(for: url)
+            try JobHistoryStore.migrator.migrate(writer, upTo: "v2-estimates")
+            try writer.write { db in
+                try db.execute(sql: """
+                INSERT INTO jobs(id, kind, title, started_at, outcome) VALUES (?, 'syncBuffer', 'Synced a test event', ?, 'succeeded')
+                """, arguments: [id.uuidString, JobHistoryStore.timestamp(Date(timeIntervalSince1970: 1_790_000_000))])
+                try db.execute(sql: """
+                INSERT INTO job_samples(job_id, t, combined_mbps, done_bytes, done_files, seconds_remaining) VALUES (?, 1, 110, 100, 1, 30)
+                """, arguments: [id.uuidString])
+            }
+            let store = try JobHistoryStore(url: url)
+            XCTAssertEqual(try store.jobs().map(\.id), [id])
+            let samples = try store.samples(jobID: id)
+            XCTAssertEqual(samples.count, 1)
+            XCTAssertEqual(samples.first?.combined, 110)
+            XCTAssertEqual(samples.first?.secondsRemaining, 30)
+            XCTAssertNil(samples.first?.framesPerSecond)
+            XCTAssertNil(samples.first?.doneFrames)
+            XCTAssertNil(samples.first?.frameStep)
+            let migrations = try writer.read { db in try String.fetchAll(db, sql: "SELECT identifier FROM grdb_migrations") }
+            XCTAssertEqual(migrations, ["v1", "v2-estimates", "v3-frames"])
+        }
+    }
+
     func testJobsStillRunningAtLaunchBecomeInterruptedAtTheirLastRecordedSecond() throws {
         try withStore { url, store in
             let started = Date(timeIntervalSince1970: 1_790_000_000)

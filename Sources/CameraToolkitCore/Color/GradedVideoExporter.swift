@@ -384,6 +384,16 @@ public final class GradedVideoExporter: @unchecked Sendable {
         return values?.volumeAvailableCapacity.map(Int64.init)
     }
 
+    /// About how many frames a clip of `duration` has at `frameRate`; nil
+    /// for an indefinite, invalid or absurd length — never a trap on NaN.
+    static func plannedFrames(duration: CMTime, frameRate: Double?) -> Int? {
+        guard duration.isNumeric, let frameRate, frameRate.isFinite, frameRate > 0 else { return nil }
+        let frames = (duration.seconds * frameRate).rounded()
+        // Over a day of video at 240 fps is not a clip this app renders.
+        guard frames.isFinite, frames >= 0, frames <= 24 * 3_600 * 240 else { return nil }
+        return Int(frames)
+    }
+
     /// The clip's nominal video frame rate, nil when it has none to read.
     public static func nominalFrameRate(of source: URL) -> Double? {
         let rate: Float?? = try? blocking {
@@ -507,9 +517,12 @@ public final class GradedVideoExporter: @unchecked Sendable {
 
         let parts = Sendables(reader: reader, writer: writer, videoOutput: videoOutput, videoInput: videoInput, audio: audio)
         let group = DispatchGroup()
-        let durationSeconds = max(loaded.duration.seconds, 0.001)
+        // An indefinite or NaN length gives no fraction (0), never a NaN
+        // that a caller's Int(…) would trap on.
+        let seconds = loaded.duration.isNumeric ? loaded.duration.seconds : .nan
+        let durationSeconds: Double? = seconds.isFinite && seconds > 0 ? seconds : nil
         let frameRate: Double? = loaded.fps.isFinite && loaded.fps > 0 ? Double(loaded.fps) : nil
-        let plannedFrames = frameRate.map { Int((durationSeconds * $0).rounded()) }
+        let plannedFrames = Self.plannedFrames(duration: loaded.duration, frameRate: frameRate)
         final class Counter: @unchecked Sendable { var frames = 0; var cancelled = false }
         let counter = Counter()
 
@@ -536,7 +549,7 @@ public final class GradedVideoExporter: @unchecked Sendable {
                 counter.frames += 1
                 if counter.frames % 15 == 0 {
                     let time = CMSampleBufferGetPresentationTimeStamp(sample).seconds
-                    progress(Progress(fraction: min(1, max(0, time / durationSeconds)), framesWritten: counter.frames, totalFrames: plannedFrames, frameRate: frameRate))
+                    progress(Progress(fraction: durationSeconds.map { time.isFinite ? min(1, max(0, time / $0)) : 0 } ?? 0, framesWritten: counter.frames, totalFrames: plannedFrames, frameRate: frameRate))
                 }
             }
         }

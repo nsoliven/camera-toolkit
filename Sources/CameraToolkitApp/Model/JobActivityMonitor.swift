@@ -405,7 +405,10 @@ final class JobActivityMonitor {
         sampleHardware(now: now)
         guard let job, job.state == .running || job.state == .queued else { return }
 
-        guard let unit = Self.throughputUnit(job) else { return }
+        // A render whose snapshot lost its frames (it never should) keeps
+        // the frame track it has rather than starting a files one.
+        let kept = job.action == .gradeRender ? tracks[job.id]?.unit : nil
+        guard let unit = Self.throughputUnit(job) ?? kept else { return }
         if tracks[job.id]?.unit != unit {
             tracks[job.id] = JobThroughputTrack(unit: unit, job: job, now: now, wallNow: wallNow)
             pruneTracks()
@@ -423,9 +426,13 @@ final class JobActivityMonitor {
     static func throughputUnit(_ job: JobSnapshot) -> ThroughputUnit? {
         let counts = job.totalFiles > 0 || job.processedFiles > 0
         if job.action == .faceScan { return counts ? .filesPerSecond : nil }
-        // A render is frames from its first report: it finishes a file in
-        // minutes, and its bytes are an estimate, not a counter.
-        if job.action == .gradeRender { return .framesPerSecond }
+        // A render is measured in frames: it finishes a file in minutes,
+        // and its bytes are an estimate, not a counter. Its track starts
+        // with its first frame report while running — never while queued,
+        // or the wait would be averaged in.
+        if job.action == .gradeRender {
+            return job.state == .running && job.telemetry?.frames != nil ? .framesPerSecond : nil
+        }
         return job.totalBytes > 0 || job.processedBytes > 0 ? .megabytesPerSecond : (counts ? .filesPerSecond : nil)
     }
 
