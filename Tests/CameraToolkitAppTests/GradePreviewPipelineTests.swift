@@ -2,6 +2,7 @@ import AVFoundation
 @testable import CameraToolkitApp
 @testable import CameraToolkitCore
 import CoreImage
+import ImageIO
 import VideoToolbox
 import XCTest
 
@@ -87,6 +88,87 @@ final class GradePreviewPipelineTests: XCTestCase {
         }
     }
 
+    /// HLG and PQ tracks reach the composition handler unconverted, so a
+    /// log grade on a BT.2020 HLG track reads its code values directly —
+    /// undoing a 2020 → 709 conversion that never happened shifted it.
+    func testPlaybackOfALogClipTaggedHLGReadsItsCodeValues() async throws {
+        let clip = try await SyntheticSLog3Clip.write(to: folder.appendingPathComponent("C-hlg.MOV"), primaries: .rec2020, hlg: true)
+        let recipe = SyntheticSLog3Clip.recipe(range: .video)
+        let asset = AVURLAsset(url: clip)
+        let composition = try await GradeRenderer.shared.videoComposition(for: asset, live: GradeLiveState(recipe: recipe))
+        let played = try await Self.firstFrame(of: asset, composition: composition)
+        let expected = SyntheticSLog3Clip.expectedGraded(range: .video)
+        for (index, patch) in SyntheticSLog3Clip.patches.enumerated() {
+            assertClose(Self.sample(played, patch: index), expected[index], accuracy: 0.035, "HLG playback \(patch.name)")
+        }
+        // The still path never reads an HLG frame as code values: the
+        // generator re-encodes it, yet tags it like an SDR BT.2020 frame.
+        // The grabber (and the tile loader) colour match it as before.
+        let raw = try await AVAssetImageGenerator(asset: AVURLAsset(url: clip)).image(at: .zero).image
+        XCTAssertTrue(GradeRenderer.isSDRVideoSpace(raw.colorSpace), "the tag alone cannot tell HLG apart")
+        let grabbed = await GradeFrameGrabber(url: clip).frame(at: .zero)
+        let still = try XCTUnwrap(GradeRenderer.shared.grade(try XCTUnwrap(grabbed), recipe: recipe))
+        let matched = try XCTUnwrap(GradeRenderer.shared.codeValueImage(raw))
+        let before = try XCTUnwrap(GradeRenderer.shared.grade(matched, recipe: recipe))
+        let tile = GradeRenderer.shared.settledFrameBlocking(raw, source: clip)
+        let tileGraded = try XCTUnwrap(GradeRenderer.shared.grade(tile, recipe: recipe))
+        for (index, patch) in SyntheticSLog3Clip.patches.enumerated() {
+            assertClose(Self.sample(still, patch: index), Self.sample(before, patch: index), accuracy: 0.005, "HLG still keeps the old conversion \(patch.name)")
+            assertClose(Self.sample(tileGraded, patch: index), Self.sample(before, patch: index), accuracy: 0.005, "HLG tile keeps the old conversion \(patch.name)")
+        }
+    }
+
+    /// A Rec.709 picture (no log profile) on a BT.2020 track takes its look
+    /// on AVFoundation's Rec.709 rendition, in playback and in the still
+    /// alike — the code-value handling is for log only.
+    func testALookOnANonLogBT2020ClipGoesOnItsRec709Rendition() async throws {
+        let clip = try await SyntheticSLog3Clip.write(to: folder.appendingPathComponent("C-2020-nonlog.MP4"), primaries: .rec2020)
+        let recipe = GradeRecipe(grade: ClipGrade(look: .builtIn(.tealOrange), intensity: 1), profile: nil, conversion: .none, range: .video)
+        XCTAssertFalse(recipe.isIdentity)
+        let asset = AVURLAsset(url: clip)
+        let composition = try await GradeRenderer.shared.videoComposition(for: asset, live: GradeLiveState(recipe: recipe))
+        let played = try await Self.firstFrame(of: asset, composition: composition)
+        let grabbed = await GradeFrameGrabber(url: clip).frame(at: .zero)
+        let still = try XCTUnwrap(GradeRenderer.shared.grade(try XCTUnwrap(grabbed), recipe: recipe))
+        // Expected: the look on the 2020 → 709 rendition of the decoded values.
+        let to709 = RGBPrimaries.rec2020.conversion(to: .rec709)
+        let pipeline = GradePipeline(recipe: recipe)
+        for (index, decoded) in SyntheticSLog3Clip.decoded(range: .video).enumerated() {
+            let linear = to709.apply(SIMD3(Rec709Transfer.decode(decoded.x), Rec709Transfer.decode(decoded.y), Rec709Transfer.decode(decoded.z)))
+            let shown = SIMD3(Rec709Transfer.encode(linear.x), Rec709Transfer.encode(linear.y), Rec709Transfer.encode(linear.z))
+            let expected = pipeline.apply(SIMD3(min(max(shown.x, 0), 1), min(max(shown.y, 0), 1), min(max(shown.z, 0), 1)))
+            let name = SyntheticSLog3Clip.patches[index].name
+            assertClose(Self.sample(played, patch: index), expected, accuracy: 0.04, "non-log playback \(name)")
+            assertClose(Self.sample(still, patch: index), expected, accuracy: 0.04, "non-log still \(name)")
+        }
+    }
+
+    /// Board tiles and the blanket sheet grade posters from
+    /// `TileImageLoader`: a decoder frame, or the same frame back from the
+    /// JPEG thumbnail cache. Both must match the panel and playback on a
+    /// BT.2020-tagged log clip.
+    func testTilePostersOfABT2020LogClipGradeLikeThePanel() async throws {
+        let clip = try await SyntheticSLog3Clip.write(to: folder.appendingPathComponent("C-2020-tile.MP4"), primaries: .rec2020)
+        let recipe = SyntheticSLog3Clip.recipe(range: .video)
+        let expected = SyntheticSLog3Clip.expectedGraded(range: .video)
+        let generator = AVAssetImageGenerator(asset: AVURLAsset(url: clip))
+        generator.maximumSize = CGSize(width: 768, height: 768)
+        let poster = try await generator.image(at: .zero).image
+        // The disk cache's own encoding: JPEG at 0.82, the frame's profile embedded.
+        let data = NSMutableData()
+        let destination = try XCTUnwrap(CGImageDestinationCreateWithData(data, "public.jpeg" as CFString, 1, nil))
+        CGImageDestinationAddImage(destination, poster, [kCGImageDestinationLossyCompressionQuality: 0.82] as CFDictionary)
+        XCTAssertTrue(CGImageDestinationFinalize(destination))
+        let source = try XCTUnwrap(CGImageSourceCreateWithData(data as CFData, nil))
+        let cached = try XCTUnwrap(CGImageSourceCreateImageAtIndex(source, 0, nil))
+        for (label, image, accuracy) in [("decoder poster", poster, 0.03), ("cached poster", cached, 0.05)] {
+            let graded = try XCTUnwrap(GradeRenderer.shared.grade(image, recipe: recipe))
+            for (index, patch) in SyntheticSLog3Clip.patches.enumerated() {
+                assertClose(Self.sample(graded, patch: index), expected[index], accuracy: accuracy, "\(label) \(patch.name)")
+            }
+        }
+    }
+
     // MARK: Helpers
 
     /// The first frame through `composition`, as a player would draw it.
@@ -166,7 +248,8 @@ enum SyntheticSLog3Clip {
         return decoded(range: range).map { pipeline.apply($0) }
     }
 
-    static func write(to url: URL, primaries: Primaries, range: VideoSignalRange = .video) async throws -> URL {
+    static func write(to url: URL, primaries: Primaries, range: VideoSignalRange = .video, hlg: Bool = false) async throws -> URL {
+        let transferKey = hlg ? AVVideoTransferFunction_ITU_R_2100_HLG : AVVideoTransferFunction_ITU_R_709_2
         // HD, as the camera records: for a clip with no colour tags
         // VideoToolbox guesses the YCbCr matrix from the frame size (BT.601
         // below HD, BT.709 at HD and up), and Sony's untagged clips are
@@ -191,7 +274,7 @@ enum SyntheticSLog3Clip {
         if let primariesKey, let matrixKey {
             settings[AVVideoColorPropertiesKey] = [
                 AVVideoColorPrimariesKey: primariesKey,
-                AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
+                AVVideoTransferFunctionKey: transferKey,
                 AVVideoYCbCrMatrixKey: matrixKey,
             ]
         }
@@ -216,7 +299,7 @@ enum SyntheticSLog3Clip {
             if let primariesKey, let matrixKey {
                 CVBufferSetAttachment(pixels, kCVImageBufferColorPrimariesKey, primariesKey as CFString, .shouldPropagate)
                 CVBufferSetAttachment(pixels, kCVImageBufferYCbCrMatrixKey, matrixKey as CFString, .shouldPropagate)
-                CVBufferSetAttachment(pixels, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2, .shouldPropagate)
+                CVBufferSetAttachment(pixels, kCVImageBufferTransferFunctionKey, transferKey as CFString, .shouldPropagate)
             }
             CVPixelBufferLockBaseAddress(pixels, [])
             let luma = CVPixelBufferGetBaseAddressOfPlane(pixels, 0)!.assumingMemoryBound(to: UInt16.self)

@@ -423,7 +423,7 @@ struct GradePanel: View {
             .padding(Self.contentInset)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .scrollIndicators(.never)
+        .scrollIndicators(.automatic)
         .coordinateSpace(.named(Self.cardSpace))
     }
 

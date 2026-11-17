@@ -264,7 +264,10 @@ final class GradeFrameGrabber: @unchecked Sendable {
     private let lock = NSLock()
     private var busy = false
 
+    private let url: URL
+
     init(url: URL, maximumWidth: CGFloat = 960) {
+        self.url = url
         generator = AVAssetImageGenerator(asset: CameraVideoAsset.asset(for: url))
         generator.appliesPreferredTrackTransform = true
         generator.maximumSize = CGSize(width: maximumWidth, height: maximumWidth)
@@ -281,7 +284,9 @@ final class GradeFrameGrabber: @unchecked Sendable {
         }
         guard start else { return nil }
         defer { lock.withLock { busy = false } }
-        // The grade reads code values: never let a BT.2020 tag colour-match them.
-        return (try? await generator.image(at: time).image).map(GradeRenderer.codeValues(ofDecodedFrame:))
+        guard let frame = try? await generator.image(at: time).image else { return nil }
+        // HLG/PQ frames are colour matched now; `GradeRenderer.grade` reads
+        // the rest (SDR video) as the clip's code values.
+        return await GradeRenderer.shared.settledFrame(frame, source: url)
     }
 }

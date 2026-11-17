@@ -25,6 +25,8 @@ public final class GradeRenderer: @unchecked Sendable {
     private var cubes: [String: Data] = [:]
     private var cubeOrder: [String] = []
     private var ranges: [String: VideoSignalRange] = [:]
+    /// Each clip's transfer function tag (nil inside: untagged), by path.
+    private var transfers: [String: String?] = [:]
     /// Imported LUTs by id; set by the app.
     public var lutProvider: @Sendable (String) -> CubeLUT? = { _ in nil }
 
@@ -106,8 +108,18 @@ public final class GradeRenderer: @unchecked Sendable {
 
     /// A decoded frame (raw code values in a CGImage, as
     /// `AVAssetImageGenerator` returns them) graded and tagged Rec.709.
+    ///
+    /// Log footage is graded from its code values. An SDR video frame is
+    /// exactly that whatever its tag says — `CoreMedia709`, or an unnamed
+    /// "QuickTime 'nclc' Video (9,1,9)" space for a clip tagged BT.2020 —
+    /// so it is read as is: colour matching a BT.2020 log frame into
+    /// Rec.709 expanded its gamut a second time on top of the S-Gamut3.Cine
+    /// conversion. Anything else (an HLG or PQ frame the generator already
+    /// re-encoded, a poster from an sRGB JPEG, Rec.709 video) is colour
+    /// matched into Rec.709 first, as before.
     public func grade(_ image: CGImage, recipe: GradeRecipe) -> CGImage? {
-        guard let source = codeValueImage(image) else { return nil }
+        let readAsCodeValues = recipe.profile != nil && Self.isSDRVideoSpace(image.colorSpace)
+        guard let source = readAsCodeValues ? (image.copy(colorSpace: Self.outputColorSpace) ?? image) : codeValueImage(image) else { return nil }
         let input = CIImage(cgImage: source, options: [.colorSpace: NSNull()])
         let output = apply(recipe, to: input)
         return render(output, extent: input.extent)
@@ -123,16 +135,34 @@ public final class GradeRenderer: @unchecked Sendable {
         return managedContext.createCGImage(managed, from: managed.extent, format: .RGBA16, colorSpace: Self.outputColorSpace)
     }
 
-    /// A frame straight from the decoder (`AVAssetImageGenerator`) is
-    /// code values whatever it is tagged — `CoreMedia709`, or an unnamed
-    /// "QuickTime 'nclc' Video (9,1,9)" space for a clip tagged BT.2020.
-    /// Retagging (never colour matching) keeps those values: matching a
-    /// BT.2020-tagged log frame into Rec.709 expanded its gamut a second
-    /// time on top of the S-Gamut3.Cine conversion, pushing reds and skin
-    /// toward magenta.
-    public static func codeValues(ofDecodedFrame image: CGImage) -> CGImage {
-        guard image.colorSpace?.name != CGColorSpace.coreMedia709, image.colorSpace?.model == .rgb else { return image }
-        return image.copy(colorSpace: outputColorSpace) ?? image
+    /// Whether a frame in this space holds an SDR video decode: Rec.709 or
+    /// BT.2020 primaries with an SDR transfer (or no space at all). HLG and
+    /// PQ never are: the generator re-encodes those.
+    public static func isSDRVideoSpace(_ space: CGColorSpace?) -> Bool {
+        guard let space else { return true }
+        guard space.model == .rgb, !CGColorSpaceUsesITUR_2100TF(space) else { return false }
+        if let name = space.name as String?,
+           [CGColorSpace.coreMedia709, CGColorSpace.itur_709, CGColorSpace.itur_2020].contains(where: { ($0 as String) == name }) {
+            return true
+        }
+        guard let codes = nclcCodes(of: space) else { return false }
+        // ISO/IEC 23091-2: primaries 1 = BT.709, 9 = BT.2020; transfer
+        // 1/6/14/15 are the BT.709/BT.2020 SDR curves, 2 unspecified.
+        return [1, 9].contains(codes.primaries) && [1, 2, 6, 14, 15].contains(codes.transfer)
+    }
+
+    /// The (primaries, transfer, matrix) codes of a profile AVFoundation
+    /// made for a video's colour tags ("QuickTime 'nclc' Video (9,1,9)"),
+    /// read from the profile's description; nil for any other profile.
+    static func nclcCodes(of space: CGColorSpace) -> (primaries: Int, transfer: Int, matrix: Int)? {
+        guard let icc = space.copyICCData() as Data? else { return nil }
+        let text = String(decoding: icc.map { $0 >= 0x20 && $0 < 0x7F ? $0 : 0x20 }, as: UTF8.self)
+        guard let marker = text.range(of: "'nclc' Video (") else { return nil }
+        let rest = text[marker.upperBound...]
+        guard let close = rest.firstIndex(of: ")") else { return nil }
+        let numbers = rest[..<close].split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+        guard numbers.count == 3 else { return nil }
+        return (numbers[0], numbers[1], numbers[2])
     }
 
     public func render(_ image: CIImage, extent: CGRect) -> CGImage? {
@@ -147,12 +177,63 @@ public final class GradeRenderer: @unchecked Sendable {
     /// video track. Sony log clips are full range.
     public func signalRange(of url: URL) async -> VideoSignalRange? {
         if let known = lock.withLock({ ranges[url.path] }) { return known }
+        guard await loadVideoFormat(of: url) else { return nil }
+        return lock.withLock { ranges[url.path] }
+    }
+
+    /// Reads a clip's video format description once and keeps its range
+    /// and transfer tag. False when the file has no readable video track.
+    private func loadVideoFormat(of url: URL) async -> Bool {
         let asset = CameraVideoAsset.asset(for: url)
         guard let track = try? await asset.loadTracks(withMediaType: .video).first,
-              let description = try? await track.load(.formatDescriptions).first else { return nil }
+              let description = try? await track.load(.formatDescriptions).first else { return false }
         let range = Self.signalRange(of: description)
-        lock.withLock { ranges[url.path] = range }
-        return range
+        let transfer = CMFormatDescriptionGetExtension(description, extensionKey: kCMFormatDescriptionExtension_TransferFunction) as? String
+        lock.withLock {
+            ranges[url.path] = range
+            transfers[url.path] = .some(transfer)
+        }
+        return true
+    }
+
+    // MARK: Decoded frames
+
+    /// Whether a clip is HLG or PQ: its decoded frames are the generator's
+    /// SDR re-encode, not code values, though they carry the same tag as
+    /// an SDR BT.2020 frame. False for an unreadable file.
+    public func isHDRSource(_ url: URL) async -> Bool {
+        if let known = lock.withLock({ transfers[url.path] }) { return Self.isHDRTransfer(known) }
+        guard await loadVideoFormat(of: url) else { return false }
+        return Self.isHDRTransfer(lock.withLock { transfers[url.path] ?? nil })
+    }
+
+    static func isHDRTransfer(_ transfer: String?) -> Bool {
+        transfer == (kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG as String)
+            || transfer == (kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ as String)
+    }
+
+    /// A frame `AVAssetImageGenerator` decoded from `source`, ready for
+    /// `grade`: an HLG or PQ frame is colour matched into Rec.709 now (as
+    /// every frame used to be), so it is never mistaken for code values;
+    /// any other frame is returned as it is.
+    public func settledFrame(_ image: CGImage, source: URL) async -> CGImage {
+        await isHDRSource(source) ? (codeValueImage(image) ?? image) : image
+    }
+
+    /// `settledFrame` for a decode queue that already blocks on the
+    /// decoder. Never call it from Swift concurrency's own threads.
+    public func settledFrameBlocking(_ image: CGImage, source: URL) -> CGImage {
+        if let known = lock.withLock({ transfers[source.path] }) {
+            return Self.isHDRTransfer(known) ? (codeValueImage(image) ?? image) : image
+        }
+        let done = DispatchSemaphore(value: 0)
+        let box = SettledBox(image)
+        Task.detached(priority: .userInitiated) { [self] in
+            box.image = await settledFrame(image, source: source)
+            done.signal()
+        }
+        done.wait()
+        return box.image
     }
 
     public func knownSignalRange(of url: URL) -> VideoSignalRange? {
@@ -215,6 +296,11 @@ public final class GradeRenderer: @unchecked Sendable {
         result.shadowClipFraction = total == 0 ? 0 : Double(clippedLow) / Double(total)
         return result
     }
+}
+
+private final class SettledBox: @unchecked Sendable {
+    var image: CGImage
+    init(_ image: CGImage) { self.image = image }
 }
 
 public struct GradeHistogram: Equatable, Sendable {
@@ -287,7 +373,9 @@ extension GradeRenderer {
                 return
             }
             var codeValues = source
-            if let undo, let filter = Self.colorCube(undo, size: Self.previewCubeSize) {
+            // Only log is graded from code values; a Rec.709 picture (no
+            // profile) takes its look on AVFoundation's Rec.709 rendition.
+            if recipe.profile != nil, let undo, let filter = Self.colorCube(undo, size: Self.previewCubeSize) {
                 filter.setValue(source, forKey: kCIInputImageKey)
                 codeValues = filter.outputImage ?? source
             }
@@ -309,16 +397,22 @@ extension GradeRenderer {
     }
 
     /// The cube that takes AVFoundation's Rec.709 rendition of a BT.2020
-    /// tagged track back to the track's own code values, or nil when the
-    /// track is Rec.709 (or untagged) and nothing moved.
+    /// tagged track back to the track's own code values, or nil when
+    /// nothing moved: a Rec.709 or untagged track, and HLG or PQ tracks,
+    /// whose values AVFoundation hands the handler unconverted.
     static func sourceGamutUndo(for asset: AVAsset) async throws -> Data? {
         guard let track = try await asset.loadTracks(withMediaType: .video).first,
               let description = try await track.load(.formatDescriptions).first else { return nil }
-        return sourceGamutUndo(primaries: CMFormatDescriptionGetExtension(description, extensionKey: kCMFormatDescriptionExtension_ColorPrimaries) as? String)
+        return sourceGamutUndo(
+            primaries: CMFormatDescriptionGetExtension(description, extensionKey: kCMFormatDescriptionExtension_ColorPrimaries) as? String,
+            transfer: CMFormatDescriptionGetExtension(description, extensionKey: kCMFormatDescriptionExtension_TransferFunction) as? String
+        )
     }
 
-    static func sourceGamutUndo(primaries: String?) -> Data? {
+    static func sourceGamutUndo(primaries: String?, transfer: String?) -> Data? {
         guard primaries == (kCMFormatDescriptionColorPrimaries_ITU_R_2020 as String) else { return nil }
+        let sdrTransfers: Set<String> = [kCMFormatDescriptionTransferFunction_ITU_R_709_2 as String, kCMFormatDescriptionTransferFunction_ITU_R_2020 as String]
+        guard transfer.map(sdrTransfers.contains) ?? true else { return nil }
         let toSource = RGBPrimaries.rec709.conversion(to: .rec2020)
         let size = previewCubeSize
         let scale = 1 / Double(size - 1)

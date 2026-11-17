@@ -122,9 +122,15 @@ final class ColorGradingMathTests: XCTestCase {
     /// composition by a gamut conversion in linear light; the undo cube
     /// takes that rendition back to the track's code values.
     func testSourceGamutUndoInvertsTheRec2020ToRec709Rendition() throws {
-        XCTAssertNil(GradeRenderer.sourceGamutUndo(primaries: kCMFormatDescriptionColorPrimaries_ITU_R_709_2 as String))
-        XCTAssertNil(GradeRenderer.sourceGamutUndo(primaries: nil))
-        let data = try XCTUnwrap(GradeRenderer.sourceGamutUndo(primaries: kCMFormatDescriptionColorPrimaries_ITU_R_2020 as String))
+        let bt2020 = kCMFormatDescriptionColorPrimaries_ITU_R_2020 as String
+        XCTAssertNil(GradeRenderer.sourceGamutUndo(primaries: kCMFormatDescriptionColorPrimaries_ITU_R_709_2 as String, transfer: nil))
+        XCTAssertNil(GradeRenderer.sourceGamutUndo(primaries: nil, transfer: nil))
+        // HLG and PQ reach the handler unconverted: nothing to undo.
+        XCTAssertNil(GradeRenderer.sourceGamutUndo(primaries: bt2020, transfer: kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG as String))
+        XCTAssertNil(GradeRenderer.sourceGamutUndo(primaries: bt2020, transfer: kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ as String))
+        XCTAssertNotNil(GradeRenderer.sourceGamutUndo(primaries: bt2020, transfer: kCMFormatDescriptionTransferFunction_ITU_R_2020 as String))
+        XCTAssertNotNil(GradeRenderer.sourceGamutUndo(primaries: bt2020, transfer: nil))
+        let data = try XCTUnwrap(GradeRenderer.sourceGamutUndo(primaries: bt2020, transfer: kCMFormatDescriptionTransferFunction_ITU_R_709_2 as String))
         let size = GradeRenderer.previewCubeSize
         let floats = data.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
         XCTAssertEqual(floats.count, size * size * size * 4)
