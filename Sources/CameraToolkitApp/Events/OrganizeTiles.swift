@@ -1813,6 +1813,9 @@ struct StackPreviewOverlay: View {
     /// "View in Immich" on the frame menu: the frame's Immich page when it is
     /// matched, else its event. Nil hides the item.
     var onViewInImmich: ((OrganizeItem) -> Void)? = nil
+    /// "Show Album in Immich" beside it: the board event's albums (its own
+    /// first, then the ones it is also in). Empty hides the item.
+    var immichAlbumChoices: [ImmichAlbumChoice] = []
     /// Saved rotation for a file, in quarter-turns clockwise, or nil.
     var orientationForFile: (OrganizeFile) -> Int? = { _ in nil }
     /// "Rotate Burst" — applies `delta` quarter-turns clockwise to every
@@ -2484,6 +2487,11 @@ struct StackPreviewOverlay: View {
         if let onViewInImmich {
             Divider()
             Button("View in Immich") { onViewInImmich(item) }
+            if immichAlbumChoices.count == 1, let only = immichAlbumChoices.first {
+                Button("Show Album in Immich") { NSWorkspace.shared.open(only.url) }
+            } else if immichAlbumChoices.count > 1 {
+                Menu("Show Album in Immich") { ImmichAlbumChoiceItems(choices: immichAlbumChoices) }
+            }
         }
     }
 

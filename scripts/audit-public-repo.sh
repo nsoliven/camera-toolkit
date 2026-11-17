@@ -4,11 +4,14 @@ set -euo pipefail
 # Fails when tracked files (or, with --history, any commit on any local
 # branch, and commit messages) contain personal or machine-specific data.
 #
-# Besides the built-in patterns, it reads the owner's private term list —
-# one case-insensitive extended regex per line, `#` comments allowed — from
-# $CAMERA_TOOLKIT_PRIVATE_TERMS or ~/.config/camera-toolkit/private-terms.txt.
-# That list names real people, events and volumes, so it lives outside the
-# repository and must never be committed.
+# Besides the built-in patterns, it reads the owner's private deny-list —
+# one case-insensitive term (an extended regex) per line, `#` comments
+# allowed — from $CT_PRIVATE_TERMS_FILE (or the older
+# $CAMERA_TOOLKIT_PRIVATE_TERMS), default
+# ~/.config/camera-toolkit/private-terms.txt, and fails on any match in the
+# tracked files or, with --history, in history. A missing list is skipped
+# silently. That list names real people, events and places, so it lives
+# outside the repository and must never be committed or printed.
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
@@ -65,14 +68,17 @@ check_pattern "Likely Supabase token" 'sbp_[0-9a-f]{20,}'
 check_pattern "Private network address" '(^|[^0-9.])(10\.[0-9]{1,3}|192\.168|172\.(1[6-9]|2[0-9]|3[01]))\.[0-9]{1,3}\.[0-9]{1,3}([^0-9]|$)'
 check_pattern "Email address" '[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+\.(com|net|org|io|dev|me|app|co)\b' 'i' '@example\.(com|org|net)|noreply@anthropic\.com'
 
-private_terms="${CAMERA_TOOLKIT_PRIVATE_TERMS:-$HOME/.config/camera-toolkit/private-terms.txt}"
+private_terms="${CT_PRIVATE_TERMS_FILE:-${CAMERA_TOOLKIT_PRIVATE_TERMS:-$HOME/.config/camera-toolkit/private-terms.txt}}"
 if [[ -f "$private_terms" ]]; then
+  term_number=0
   while IFS= read -r term || [[ -n "$term" ]]; do
-    [[ -z "$term" || "$term" == \#* ]] && continue
-    check_pattern "Private term /$term/" "$term" 'i'
+    term="${term%$'\r'}"
+    [[ -z "${term//[[:space:]]/}" || "$term" == \#* ]] && continue
+    term_number=$((term_number + 1))
+    # Named by its line number, so a failing run does not echo the term
+    # itself into a log (the matching lines still show where it is).
+    check_pattern "Private term #$term_number of the deny-list" "$term" 'i'
   done < "$private_terms"
-else
-  echo "Note: no private term list at $private_terms — only the built-in patterns were checked." >&2
 fi
 
 if $failed; then

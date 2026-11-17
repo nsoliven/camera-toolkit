@@ -116,6 +116,8 @@ final class DashboardModel {
     var immichIsPairing = false
     /// Each event's album as the last check left it.
     var immichAlbumStates: [UUID: ImmichEventAlbumState] = [:]
+    /// Each event's "also in" albums (besides its own), from the catalog.
+    var immichAlbumLinks: [UUID: [ImmichEventAlbumLink]] = [:]
     /// Stacks the app made in Immich, per event.
     var immichStackCounts: [UUID: Int] = [:]
     /// Group keys of the app's Immich stacks, for the burst tiles' mark.
@@ -554,6 +556,9 @@ extension DashboardModel {
     }
 
     func setEventImmichAlbumPolicy(_ eventID: UUID, policy: ImmichAlbumPolicy?) {
+        if let previous = configuration.savedEvents.first(where: { $0.id == eventID }), let old = previous.immichAlbumID {
+            forgetImmichAlbum(old, name: previous.immichAlbumName, for: eventID)
+        }
         updateConfiguration { configuration in
             guard let index = configuration.savedEvents.firstIndex(where: { $0.id == eventID }) else { return }
             configuration.savedEvents[index].immichAlbumPolicy = policy

@@ -80,7 +80,12 @@ final class JobNowPaneLayoutTests: XCTestCase {
             identifier: "CameraToolkitJobsLayout-\(UUID().uuidString)",
             title: "Jobs",
             initialContentSize: NSSize(width: 1_080, height: 720),
-            rootView: TransferQueueView(model: model)
+            rootView: TransferQueueView(model: model),
+            // Off every display: the owner never sees it, and AppKit cannot
+            // pull it back on screen when the size changes.
+            makeWindow: { rect, style in
+                OffscreenWindow(contentRect: NSRect(origin: SnapshotWindows.offscreen, size: rect.size), styleMask: style, backing: .buffered, defer: false)
+            }
         )
         SnapshotWindows.hide(window)
         window.orderFrontRegardless()

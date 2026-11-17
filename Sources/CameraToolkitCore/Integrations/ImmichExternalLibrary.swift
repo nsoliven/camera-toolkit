@@ -655,8 +655,43 @@ public struct ImmichLibrarySyncOutcome: Equatable, Sendable {
     }
 }
 
+/// An "also in" link: an album an event is in besides its own album
+/// (`SavedCameraEvent.immichAlbumID`). Pairing makes them for albums that
+/// span several events and for phone albums; the app never fills them.
+public struct ImmichEventAlbumLink: Codable, Equatable, Hashable, Sendable {
+    public var eventID: UUID
+    public var albumID: String
+    /// The album's name when it was linked.
+    public var albumName: String
+    /// Why it was linked (`ImmichAlbumPair.Basis.rawValue`).
+    public var basis: String
+
+    public init(eventID: UUID, albumID: String, albumName: String, basis: String = "") {
+        self.eventID = eventID
+        self.albumID = albumID
+        self.albumName = albumName
+        self.basis = basis
+    }
+
+    public init(_ pair: ImmichAlbumPair) {
+        self.init(eventID: pair.eventID, albumID: pair.album.id, albumName: pair.album.name, basis: pair.basis.rawValue)
+    }
+
+    /// Why it was linked, in words.
+    public var basisText: String {
+        ImmichAlbumPair.Basis(rawValue: basis)?.text ?? "linked"
+    }
+}
+
 /// The last known state of every event's album, kept in the catalog so the
-/// event page shows it before the next check.
+/// event page shows it before the next check, and every event's "also in"
+/// album links.
+///
+/// Schema history (each step only adds, so a catalog of any age opens and
+/// keeps its rows): `immich_event_albums`, one row per event; then
+/// `immich_event_album_links`, any number of albums per event and events
+/// per album. A link the user removed stays as a `dismissed` row, so
+/// pairing again does not bring it back.
 public final class ImmichEventAlbumStore: @unchecked Sendable {
     static let schema = """
     CREATE TABLE IF NOT EXISTS immich_event_albums (
@@ -665,12 +700,103 @@ public final class ImmichEventAlbumStore: @unchecked Sendable {
     );
     """
 
+    static let linksTable = "immich_event_album_links"
+    static let linksSchema = """
+    CREATE TABLE IF NOT EXISTS immich_event_album_links (
+        event_id TEXT NOT NULL,
+        album_id TEXT NOT NULL,
+        album_name TEXT NOT NULL,
+        basis TEXT NOT NULL DEFAULT '',
+        dismissed INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (event_id, album_id)
+    );
+    CREATE INDEX IF NOT EXISTS immich_event_album_links_album ON immich_event_album_links(album_id);
+    """
+
     public let catalogURL: URL
 
     public init(catalogURL: URL) throws {
         self.catalogURL = catalogURL
-        try CatalogDatabase.writer(for: catalogURL).write { try $0.execute(sql: Self.schema) }
+        try CatalogDatabase.writer(for: catalogURL).write { database in
+            try database.execute(sql: Self.schema)
+            try database.execute(sql: Self.linksSchema)
+        }
     }
+
+    // MARK: Links
+
+    /// Every live link (not removed by the user).
+    public func links() throws -> [ImmichEventAlbumLink] {
+        try CatalogDatabase.writer(for: catalogURL).read { try Self.links($0, includingDismissed: false) }
+    }
+
+    /// Adds links; one already there, or one the user removed, is left as it is.
+    public func addLinks(_ links: [ImmichEventAlbumLink], now: Date = Date()) throws {
+        guard !links.isEmpty else { return }
+        let stamp = ISO8601DateFormatter().string(from: now)
+        try CatalogDatabase.writer(for: catalogURL).write { database in
+            for link in links {
+                try database.execute(
+                    sql: "INSERT INTO immich_event_album_links(event_id, album_id, album_name, basis, dismissed, created_at) VALUES (?, ?, ?, ?, 0, ?) ON CONFLICT(event_id, album_id) DO NOTHING",
+                    arguments: [link.eventID.uuidString, link.albumID, link.albumName, link.basis, stamp]
+                )
+            }
+        }
+    }
+
+    /// Removes a link for good: pairing never makes it again.
+    public func dismissLink(eventID: UUID, albumID: String, albumName: String = "", now: Date = Date()) throws {
+        let stamp = ISO8601DateFormatter().string(from: now)
+        try CatalogDatabase.writer(for: catalogURL).write { database in
+            try database.execute(
+                sql: "INSERT INTO immich_event_album_links(event_id, album_id, album_name, basis, dismissed, created_at) VALUES (?, ?, ?, '', 1, ?) ON CONFLICT(event_id, album_id) DO UPDATE SET dismissed = 1",
+                arguments: [eventID.uuidString, albumID, albumName, stamp]
+            )
+        }
+    }
+
+    /// Forgets the live links to albums the account no longer lists. Rows
+    /// the user removed stay: an album missing from one listing (another
+    /// key, another server) must not bring a removed link back later.
+    public func removeLinks(toAlbumsNotIn albumIDs: Set<String>) throws {
+        try CatalogDatabase.writer(for: catalogURL).write { database in
+            let rows = try String.fetchAll(database, sql: "SELECT DISTINCT album_id FROM immich_event_album_links WHERE dismissed = 0")
+            for id in rows where !albumIDs.contains(id) {
+                try database.execute(sql: "DELETE FROM immich_event_album_links WHERE album_id = ? AND dismissed = 0", arguments: [id])
+            }
+        }
+    }
+
+    /// Albums with any link row, live or removed: pairing leaves them alone.
+    /// Reads only; a catalog without the table has none.
+    public static func handledAlbumIDs(catalogURL: URL) -> Set<String> {
+        Set(existingRows(catalogURL: catalogURL, includingDismissed: true).map(\.albumID))
+    }
+
+    /// Every live link, read only (nothing is created when the table is missing).
+    public static func existingLinks(catalogURL: URL) -> [ImmichEventAlbumLink] {
+        existingRows(catalogURL: catalogURL, includingDismissed: false)
+    }
+
+    private static func existingRows(catalogURL: URL, includingDismissed: Bool) -> [ImmichEventAlbumLink] {
+        guard FileManager.default.fileExists(atPath: catalogURL.path),
+              let writer = try? CatalogDatabase.writer(for: catalogURL) else { return [] }
+        return (try? writer.read { database -> [ImmichEventAlbumLink] in
+            guard try database.tableExists(linksTable) else { return [] }
+            return try links(database, includingDismissed: includingDismissed)
+        }) ?? []
+    }
+
+    private static func links(_ database: Database, includingDismissed: Bool) throws -> [ImmichEventAlbumLink] {
+        let filter = includingDismissed ? "" : " WHERE dismissed = 0"
+        return try Row.fetchAll(database, sql: "SELECT event_id, album_id, album_name, basis FROM immich_event_album_links\(filter) ORDER BY rowid").compactMap { row in
+            guard let id = UUID(uuidString: row["event_id"]) else { return nil }
+            return ImmichEventAlbumLink(eventID: id, albumID: row["album_id"], albumName: row["album_name"], basis: row["basis"])
+        }
+    }
+
+    // MARK: Album states
 
     public func save(_ states: [UUID: ImmichEventAlbumState]) throws {
         guard !states.isEmpty else { return }

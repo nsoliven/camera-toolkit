@@ -466,12 +466,34 @@ public struct ImmichLibraryAsset: Codable, Equatable, Sendable {
     public var originalPath: String
     public var isOffline: Bool
     public var isTrashed: Bool
+    /// When the photo was taken, as the camera's own clock read it
+    /// (Immich writes it as UTC). Nil from servers or fixtures without it.
+    public var localDateTime: String?
+    /// When the photo was taken, in UTC.
+    public var fileCreatedAt: String?
 
-    public init(id: String, originalPath: String, isOffline: Bool = false, isTrashed: Bool = false) {
+    public init(id: String, originalPath: String, isOffline: Bool = false, isTrashed: Bool = false, localDateTime: String? = nil, fileCreatedAt: String? = nil) {
         self.id = id
         self.originalPath = originalPath
         self.isOffline = isOffline
         self.isTrashed = isTrashed
+        self.localDateTime = localDateTime
+        self.fileCreatedAt = fileCreatedAt
+    }
+
+    /// The capture time Immich read: the camera clock's local time when it
+    /// has one, else the UTC time. Nil when neither parses.
+    public var captureDate: Date? {
+        (localDateTime.flatMap(Self.parseDate)) ?? (fileCreatedAt.flatMap(Self.parseDate))
+    }
+
+    static func parseDate(_ text: String) -> Date? {
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = fractional.date(from: text) { return date }
+        let plain = ISO8601DateFormatter()
+        plain.formatOptions = [.withInternetDateTime]
+        return plain.date(from: text)
     }
 }
 

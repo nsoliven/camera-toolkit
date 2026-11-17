@@ -534,6 +534,13 @@ struct ServicesSettingsPane: View {
                             .foregroundStyle(.secondary)
                     }
                 }
+                if model.immichPrivateAlbumCount > 0 {
+                    ImmichPrivateAlbumsBanner(
+                        albumCount: model.immichPrivateAlbumCount,
+                        eventNames: model.immichPrivateEventNames,
+                        onAllow: { model.allowAlbumAndPairPrivateEvents() }
+                    )
+                }
                 Toggle("Make an album for every event", isOn: Binding(
                     get: { model.configuration.immichAlbumsForEveryEvent },
                     set: { model.setImmichAlbumsForEveryEvent($0) }
@@ -560,8 +567,10 @@ struct ServicesSettingsPane: View {
                 Section("Immich Albums") {
                     ImmichPairsListView(
                         pairs: model.immichPairRows,
+                        links: model.immichLinkRows,
                         unpaired: model.immichUnpairedRows,
-                        onUnpair: { model.unpairImmichAlbum(for: $0) }
+                        onUnpair: { model.unpairImmichAlbum(for: $0) },
+                        onUnlink: { model.removeImmichAlbumLink(eventID: $0, albumID: $1) }
                     )
                     .onAppear { model.loadImmichAlbumStates() }
                 }

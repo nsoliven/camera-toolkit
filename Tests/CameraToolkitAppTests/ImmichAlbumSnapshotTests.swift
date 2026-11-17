@@ -18,10 +18,27 @@ final class ImmichAlbumSnapshotTests: XCTestCase {
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
 
         let server = URL(string: "https://photos.example.com/albums/sample")
+        let albumURL = URL(string: "https://photos.example.com/albums/aaaaaaaa-0000-4000-8000-000000000001")!
+        let oneAlbum = [ImmichAlbumChoice(albumID: "a", name: "Beach Day", isMain: true, url: albumURL)]
+        let threeAlbums = oneAlbum + [
+            ImmichAlbumChoice(albumID: "b", name: "Beach 2021", isMain: false, url: albumURL),
+            ImmichAlbumChoice(albumID: "c", name: "Year in Review", isMain: false, url: albumURL)
+        ]
         let chips = VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                ImmichAlbumChip(info: ImmichAlbumChipInfo(albumName: "Beach Day", inAlbum: 248, toAdd: 0, notOnNAS: 0, isNotFilled: true, alsoIn: ["Beach 2021", "Year in Review"]), onSend: {}) { Button("No Album") {} }
+                ViewInImmichButton(url: server)
+                ShowImmichAlbumButton(choices: threeAlbums)
+            }
+            HStack(spacing: 8) {
+                ImmichAlbumChip(info: ImmichAlbumChipInfo(albumName: nil, inAlbum: nil, toAdd: 0, notOnNAS: 0, alsoIn: ["Year in Review"]), onSend: {}) { Button("No Album") {} }
+                ViewInImmichButton(url: server)
+                ShowImmichAlbumButton(choices: [ImmichAlbumChoice(albumID: "c", name: "Year in Review", isMain: false, url: albumURL)])
+            }
             HStack(spacing: 8) {
                 ImmichAlbumChip(info: ImmichAlbumChipInfo(albumName: "Beach Day", inAlbum: 248, toAdd: 12, notOnNAS: 4, stackCount: 31), onSend: {}) { Button("New Album Named After the Event") {} }
                 ViewInImmichButton(url: server)
+                ShowImmichAlbumButton(choices: oneAlbum)
             }
             HStack(spacing: 8) {
                 ImmichAlbumChip(info: ImmichAlbumChipInfo(albumName: "Trip 2026", inAlbum: 1_310, toAdd: 0, notOnNAS: 0), onSend: {}) { Button("No Album") {} }
@@ -81,6 +98,19 @@ final class ImmichAlbumSnapshotTests: XCTestCase {
                     onUnpair: { _ in }
                 )
             }
+            Section("Pairing") {
+                ImmichPrivateAlbumsBanner(albumCount: 2, eventNames: ["Family Party", "Concert Night"], onAllow: {})
+                ImmichPairsListView(
+                    pairs: [ImmichPairRow(eventID: UUID(), eventName: "Beach Day", albumName: "Beach 2021", isPicks: true)],
+                    links: [
+                        ImmichLinkRow(eventID: UUID(), eventName: "Beach Day", albumID: "u", albumName: "Year in Review", basis: "several events"),
+                        ImmichLinkRow(eventID: UUID(), eventName: "Trip 2026", albumID: "u", albumName: "Year in Review", basis: "several events"),
+                        ImmichLinkRow(eventID: UUID(), eventName: "Trip 2026", albumID: "p", albumName: "Trip phone", basis: "dates")
+                    ],
+                    unpaired: [ImmichUnpairedRow(albumID: "f", albumName: "Favorites", assetCount: 900, reason: ImmichPairingReason.longSpan(days: 1_400).text)],
+                    onUnpair: { _ in }
+                )
+            }
         }
         .formStyle(.grouped)
 
@@ -103,9 +133,9 @@ final class ImmichAlbumSnapshotTests: XCTestCase {
 
         for appearance in [NSAppearance.Name.aqua, .darkAqua] {
             let suffix = appearance == .aqua ? "light" : "dark"
-            try render(AnyView(chips), size: NSSize(width: 980, height: 330), appearance: appearance, to: folder.appendingPathComponent("immich-chip-\(suffix).png"))
+            try render(AnyView(chips), size: NSSize(width: 1_180, height: 420), appearance: appearance, to: folder.appendingPathComponent("immich-chip-\(suffix).png"))
             try render(AnyView(sidebar), size: NSSize(width: 280, height: 260), appearance: appearance, to: folder.appendingPathComponent("immich-sidebar-\(suffix).png"))
-            try render(AnyView(pairs), size: NSSize(width: 620, height: 470), appearance: appearance, to: folder.appendingPathComponent("immich-pairs-\(suffix).png"))
+            try render(AnyView(pairs), size: NSSize(width: 720, height: 900), appearance: appearance, to: folder.appendingPathComponent("immich-pairs-\(suffix).png"))
             try render(AnyView(progress), size: NSSize(width: 520, height: 480), appearance: appearance, to: folder.appendingPathComponent("immich-send-\(suffix).png"))
         }
     }
