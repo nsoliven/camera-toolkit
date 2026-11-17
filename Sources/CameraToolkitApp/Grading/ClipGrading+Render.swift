@@ -186,6 +186,8 @@ extension ClipGrading {
         var unchecked = 0
         var estimatedBytes: Int64 = 0
         var freeBytes: Int64?
+        /// Where each copy already made is, by its original (`sourceKey`).
+        var existing: [String: URL] = [:]
     }
 
     /// How many clips are checked at once, and how long the whole check
@@ -222,7 +224,7 @@ extension ClipGrading {
         estimate: @escaping @Sendable (URL) -> Int64? = { GradedVideoExporter.estimatedBytes(of: $0) },
         progress: @escaping @Sendable (Int, Int) -> Void = { _, _ in }
     ) -> BeforeSyncSurvey {
-        enum Answer: Sendable { case pending(GradedRenderRequest, Int64), already, unchecked(GradedRenderRequest) }
+        enum Answer: Sendable { case pending(GradedRenderRequest, Int64), already(String, URL), unchecked(GradedRenderRequest) }
         final class Results: @unchecked Sendable {
             let lock = NSLock()
             var answers: [Int: Answer] = [:]
@@ -245,7 +247,7 @@ extension ClipGrading {
                 } else {
                     request.recipe.range = probedRange(request.source, renderer: renderer, timeout: min(remaining, 20)) ?? request.recipe.range
                     switch check(request, max(0.5, min(deadline.timeIntervalSinceNow, 20))) {
-                    case .found: answer = .already
+                    case .found(let url): answer = .already(request.sourceKey, url)
                     case .unknown: answer = .unchecked(request)
                     case .none: answer = .pending(request, estimate(request.source) ?? 0)
                     }
@@ -270,7 +272,9 @@ extension ClipGrading {
         let answers = results.lock.withLock { results.answers }
         for index in found.indices {
             switch answers[index] {
-            case .already?: survey.alreadyThere += 1
+            case .already(let key, let url)?:
+                survey.alreadyThere += 1
+                survey.existing[key] = url
             case .pending(let request, let bytes)?:
                 survey.pending.append(request)
                 survey.estimatedBytes += bytes
@@ -344,6 +348,9 @@ extension ClipGrading {
         var failures: [String] = []
         /// Why the job stopped before the end (Stop, or not enough space).
         var stoppedReason: String?
+        /// Where each request's copy is (made now or already there), by its
+        /// index in the requests.
+        var copies: [Int: URL] = [:]
     }
 
     /// Room kept free on the volume a copy is written to.
@@ -391,6 +398,7 @@ extension ClipGrading {
             ))
             if let existing = GradedVideoExporter.existingRender(of: request) {
                 outcome.alreadyThere.append(existing)
+                outcome.copies[index] = existing
                 continue
             }
             if let need = estimatedBytes(request.source), let free = availableBytes(request.outputFolder),
@@ -417,6 +425,7 @@ extension ClipGrading {
                 case .alreadyRendered(let url):
                     outcome.alreadyThere.append(url)
                 }
+                outcome.copies[index] = result.url
             } catch is CancellationError {
                 outcome.stoppedReason = "Stopped during \(name); its partial copy was removed."
                 break

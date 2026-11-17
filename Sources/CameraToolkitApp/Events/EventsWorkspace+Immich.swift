@@ -86,7 +86,7 @@ extension EventsWorkspace {
                 immichCheckLine = outcome.summary
                 await reloadShownImmichStatuses()
                 if reportsToStatusLine { model.statusMessage = "Immich: \(outcome.summary)." }
-                if outcome.report.count(.pendingScan) == 0 { break }
+                if !outcome.waitsForScan { break }
             }
         } catch {
             // A newer follow-up took over.

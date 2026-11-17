@@ -264,6 +264,20 @@ public struct ImmichClient: Sendable {
         return result
     }
 
+    /// Takes assets out of one album: album membership only, the assets
+    /// themselves stay in Immich. Returns the IDs that left the album.
+    public func removeAssets(_ assetIDs: [String], fromAlbum albumID: String) async throws -> [String] {
+        guard !assetIDs.isEmpty else { return [] }
+        try Self.validate(id: albumID, kind: "album")
+        for id in assetIDs { try Self.validate(id: id, kind: "asset") }
+        let response: [BulkIDResponse] = try await send(
+            method: "DELETE",
+            path: "/albums/\(albumID)/assets",
+            body: BulkIDsRequest(ids: assetIDs)
+        )
+        return response.filter(\.success).map(\.id)
+    }
+
     private func endpointURL(_ path: String) -> URL? {
         URL(string: "\(apiBaseURL.absoluteString)/\(path.trimmingCharacters(in: CharacterSet(charactersIn: "/")))")
     }
