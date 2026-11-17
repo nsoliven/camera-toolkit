@@ -92,9 +92,14 @@ enum VideoPreviewSupport {
             }
             let first = await group.next() ?? .timedOut
             group.cancelAll()
-            asset.cancelLoading()
             return first
         }
+        // Only a probe that ran out of time cancels the asset's loading.
+        // Cancelling after an answer marks the asset's other loads (its
+        // tracks, mid-flight) cancelled for good, and this asset goes on to
+        // the player: the grade's video composition, built from it, then
+        // failed with "Operation cancelled" and playback stayed ungraded.
+        if case .timedOut = result { asset.cancelLoading() }
         switch result {
         case .answered(let playable):
             DebugLog.shared.log(

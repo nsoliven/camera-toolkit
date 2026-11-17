@@ -748,7 +748,11 @@ final class TileImageLoader: @unchecked Sendable {
         DebugLog.shared.log("frame.start", subsystem: .video, url: url)
         let start = ContinuousClock.now
         do {
-            let frame = try generator.copyCGImage(at: CMTime(seconds: 1, preferredTimescale: 600), actualTime: nil)
+            // HLG/PQ posters are colour matched here, so grading a tile, the
+            // blanket sheet or a send preview never reads them as log code values.
+            let frame = GradeRenderer.shared.settledFrameBlocking(
+                try generator.copyCGImage(at: CMTime(seconds: 1, preferredTimescale: 600), actualTime: nil), source: url
+            )
             DebugLog.shared.log(
                 "frame.finish",
                 subsystem: .video,

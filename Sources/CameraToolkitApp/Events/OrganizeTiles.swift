@@ -1932,10 +1932,7 @@ struct StackPreviewOverlay: View {
                         previewPane(stack: stack, item: item)
                         if gradeMode, let gradeSession {
                             gradePanel(gradeSession, item: item, stack: stack)
-                                .frame(width: 290)
-                                .foregroundStyle(.white, .white.opacity(0.65), .white.opacity(0.45))
-                                .glassEffect(.regular, in: .rect(cornerRadius: 18))
-                                .environment(\.colorScheme, .dark)
+                                .gradeInspectorCard()
                                 .transition(.move(edge: .trailing).combined(with: .opacity))
                         } else if inspectorVisible {
                             FrameInspectorPanel(
@@ -2377,10 +2374,10 @@ struct StackPreviewOverlay: View {
             if gradeMode, let gradeSession, gradeSession.viewMode == .split, videoPlayer != nil {
                 GradeWipeOverlay(
                     wipe: Binding(get: { gradeSession.wipe }, set: { gradeSession.wipe = $0 }),
-                    videoSize: videoPlayer?.currentItem?.presentationSize ?? CGSize(width: 16, height: 9)
+                    videoSize: videoPlayer?.currentItem?.presentationSize ?? CGSize(width: 16, height: 9),
+                    // Leave the player's own controls at the bottom reachable.
+                    controlsInset: 64
                 )
-                // Leave the player's own controls at the bottom reachable.
-                .padding(.bottom, 64)
             }
         }
         .overlay(alignment: .top) {
@@ -3032,7 +3029,15 @@ extension StackPreviewOverlay {
 
     fileprivate func attachGradeComposition(to player: AVPlayer) async {
         guard let playerItem = player.currentItem, playerItem.videoComposition == nil else { return }
-        if let composition = try? await GradeRenderer.shared.videoComposition(for: playerItem.asset, live: liveGrade) {
+        do {
+            playerItem.videoComposition = try await GradeRenderer.shared.videoComposition(for: playerItem.asset, live: liveGrade)
+        } catch {
+            // Never leave playback silently ungraded: build it again from a
+            // fresh asset of the same file (same track IDs).
+            DebugLog.shared.log("grade.composition", subsystem: .video, level: .warning, outcome: .error, url: (playerItem.asset as? AVURLAsset)?.url, error: error.localizedDescription)
+            guard let url = (playerItem.asset as? AVURLAsset)?.url,
+                  let composition = try? await GradeRenderer.shared.videoComposition(for: CameraVideoAsset.asset(for: url), live: liveGrade),
+                  player.currentItem === playerItem else { return }
             playerItem.videoComposition = composition
         }
     }

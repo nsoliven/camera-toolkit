@@ -393,6 +393,17 @@ public struct GradeRecipe: Hashable, Sendable {
         ].joined(separator: "|")
     }
 
+    /// The fingerprint a rendered copy carries. It is `fingerprint`, except
+    /// for log footage from a source tagged BT.2020 with an SDR transfer:
+    /// renders of those changed when the composition began undoing
+    /// AVFoundation's BT.2020 → Rec.709 step, so copies made before carry an
+    /// older grade. Every other source keeps its fingerprint byte for byte
+    /// (bumping `pipelineVersion` would re-render every existing copy).
+    public func renderFingerprint(sourcePrimaries: String?, sourceTransfer: String?) -> String {
+        guard profile != nil, GradeRenderer.undoesSourceGamut(primaries: sourcePrimaries, transfer: sourceTransfer) else { return fingerprint }
+        return fingerprint + "|src2020v3"
+    }
+
     /// A short hash of the fingerprint for file names and cache keys.
     public var shortFingerprint: String {
         LayoutMigrationHash.sha256(fingerprint).prefix(16).lowercased()

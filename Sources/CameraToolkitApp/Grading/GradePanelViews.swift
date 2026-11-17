@@ -168,17 +168,22 @@ struct GradeWipeOverlay: View {
     @Binding var wipe: Double
     /// The video's pixel size, to find where the picture sits in the pane.
     let videoSize: CGSize
+    /// A strip at the bottom left to the player's own controls: drags
+    /// there go to the player. The picture is still measured in the whole
+    /// pane, so the line sits exactly where the frame is split.
+    var controlsInset: CGFloat = 0
 
     var body: some View {
         GeometryReader { geometry in
             let frame = Self.fittedRect(content: videoSize, in: geometry.size)
-            let x = frame.minX + frame.width * wipe
+            let x = Self.lineX(wipe: wipe, picture: frame)
             ZStack(alignment: .topLeading) {
                 Rectangle()
                     .fill(.white)
                     .frame(width: 2, height: frame.height)
                     .shadow(color: .black.opacity(0.5), radius: 2)
                     .position(x: x, y: frame.midY)
+                    .allowsHitTesting(false)
                 Circle()
                     .fill(.white)
                     .frame(width: 30, height: 30)
@@ -188,7 +193,7 @@ struct GradeWipeOverlay: View {
                             .foregroundStyle(.black.opacity(0.75))
                     }
                     .shadow(color: .black.opacity(0.4), radius: 3)
-                    .position(x: x, y: frame.midY)
+                    .position(x: x, y: min(frame.midY, geometry.size.height - controlsInset - 20))
                 wipeLabel("Original")
                     .position(x: max(frame.minX + 44, x - 52), y: frame.minY + 22)
                     .opacity(wipe > 0.12 ? 1 : 0)
@@ -196,7 +201,7 @@ struct GradeWipeOverlay: View {
                     .position(x: min(frame.maxX - 44, x + 50), y: frame.minY + 22)
                     .opacity(wipe < 0.88 ? 1 : 0)
             }
-            .contentShape(Rectangle())
+            .contentShape(Path(CGRect(x: 0, y: 0, width: geometry.size.width, height: max(0, geometry.size.height - controlsInset))))
             .gesture(
                 DragGesture(minimumDistance: 0)
                     .onChanged { value in
@@ -226,6 +231,12 @@ struct GradeWipeOverlay: View {
             .background(.black.opacity(0.55), in: Capsule())
     }
 
+    /// Where the divider is drawn for a wipe fraction: the same fraction
+    /// of the picture's width the composition splits the frame at.
+    static func lineX(wipe: Double, picture: CGRect) -> CGFloat {
+        picture.minX + picture.width * min(max(wipe, 0), 1)
+    }
+
     static func fittedRect(content: CGSize, in container: CGSize) -> CGRect {
         guard content.width > 0, content.height > 0, container.width > 0, container.height > 0 else {
             return CGRect(origin: .zero, size: container)
@@ -240,7 +251,20 @@ struct GradeWipeOverlay: View {
 
 /// The grade inspector beside the clip: scope, view mode, look, intensity,
 /// the basic controls, copy/paste and render.
+///
+/// Every row can shrink to the card: long text wraps or truncates, nothing
+/// is `fixedSize` horizontally. A row wider than the card made SwiftUI
+/// centre the whole column on it, so labels started left of the glass and
+/// values were cut off on the right.
 struct GradePanel: View {
+    /// The card's width beside the picture.
+    static let cardWidth: CGFloat = 290
+    /// Inset of the content from the card's edges.
+    static let contentInset: CGFloat = 14
+    static let cardCornerRadius: CGFloat = 18
+    /// The coordinate space `GradePanelContentFrameKey` is measured in.
+    static let cardSpace = "GradePanelCard"
+
     @Bindable var session: GradeSession
     var canPaste: Bool
     var onCopy: () -> Void
@@ -258,12 +282,15 @@ struct GradePanel: View {
                     .frame(height: 76)
                 Picker("View", selection: $session.viewMode) {
                     ForEach(GradeViewMode.allCases) { mode in
-                        Text(mode == .before && session.isLog ? "Original (log)" : mode.title).tag(mode)
+                        Text(mode.title).tag(mode)
                     }
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
-                .help("Graded, split (drag the line on the picture), or the untouched original (B toggles)")
+                .frame(maxWidth: .infinity)
+                .help(session.isLog
+                      ? "Graded, split (drag the line on the picture), or the untouched log original (B toggles)"
+                      : "Graded, split (drag the line on the picture), or the untouched original (B toggles)")
 
                 Text(session.orderLine)
                     .font(.caption)
@@ -275,7 +302,7 @@ struct GradePanel: View {
                         Text(session.conversionTitle(session.recipe))
                             .font(.callout.weight(.medium))
                             .fixedSize(horizontal: false, vertical: true)
-                        Spacer(minLength: 4)
+                            .frame(maxWidth: .infinity, alignment: .leading)
                         if !session.conversionChoices.isEmpty {
                             Menu {
                                 ForEach(session.conversionChoices, id: \.self) { choice in
@@ -307,14 +334,18 @@ struct GradePanel: View {
                 }
 
                 stage(2, "Look", icon: "camera.filters") {
-                    HStack {
+                    HStack(alignment: .firstTextBaseline) {
                         Text(session.lookName(session.draft.look))
                             .font(.callout.weight(.medium))
-                        Spacer()
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Spacer(minLength: 6)
                         if !session.canTakeLook {
                             Text("Needs the conversion")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
+                                .multilineTextAlignment(.trailing)
+                                .fixedSize(horizontal: false, vertical: true)
                         } else if !session.isLookAvailable {
                             Label("Unavailable", systemImage: "exclamationmark.triangle.fill")
                                 .font(.caption)
@@ -344,11 +375,13 @@ struct GradePanel: View {
 
                 HStack(spacing: 8) {
                     Button("Copy", systemImage: "doc.on.doc", action: onCopy)
+                        .lineLimit(1)
                         .help("Copy this grade (⌘⌥C)")
                     Button("Paste", systemImage: "doc.on.clipboard", action: onPaste)
+                        .lineLimit(1)
                         .disabled(!canPaste)
                         .help("Paste the copied grade onto this clip (⌘⌥V)")
-                    Spacer()
+                    Spacer(minLength: 0)
                     Button("Reset", systemImage: "arrow.counterclockwise") { session.resetControls() }
                         .labelStyle(.iconOnly)
                         .help("Reset the sliders (the look stays)")
@@ -366,6 +399,8 @@ struct GradePanel: View {
                     VStack(alignment: .leading, spacing: 6) {
                         Button(action: onRender) {
                             Label("Render Graded Copy", systemImage: "square.and.arrow.down.on.square")
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.8)
                                 .frame(maxWidth: .infinity)
                         }
                         .buttonStyle(.borderedProminent)
@@ -380,8 +415,16 @@ struct GradePanel: View {
                     }
                 }
             }
-            .padding(14)
+            .background {
+                GeometryReader { proxy in
+                    Color.clear.preference(key: GradePanelContentFrameKey.self, value: proxy.frame(in: .named(Self.cardSpace)))
+                }
+            }
+            .padding(Self.contentInset)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
+        .scrollIndicators(.automatic)
+        .coordinateSpace(.named(Self.cardSpace))
     }
 
     private var header: some View {
@@ -389,10 +432,11 @@ struct GradePanel: View {
             HStack(alignment: .firstTextBaseline) {
                 Text("Grade")
                     .font(.headline)
-                Spacer()
+                Spacer(minLength: 8)
                 Text(session.isSaved ? "Saved" : "Editing…")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
+                    .lineLimit(1)
             }
             Menu {
                 Button("Use Camera Metadata") { onMarkProfile(.detected) }
@@ -405,11 +449,13 @@ struct GradePanel: View {
                 Text(profileCaption)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
             }
             .menuStyle(.button)
             .buttonStyle(.plain)
             .menuIndicator(.visible)
-            .fixedSize()
+            .frame(maxWidth: .infinity, alignment: .leading)
             .help("What the clip was shot in. DJI D-Log M clips don't say so in their files — mark them here.")
         }
     }
@@ -467,13 +513,17 @@ struct GradePanel: View {
         format: @escaping (Double) -> String
     ) -> some View {
         VStack(spacing: 2) {
-            HStack {
+            HStack(spacing: 6) {
                 Text(title)
                     .font(.callout)
-                Spacer()
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Spacer(minLength: 4)
                 Text(format(value.wrappedValue))
                     .font(.callout.monospacedDigit())
                     .foregroundStyle(value.wrappedValue == reset ? .secondary : .primary)
+                    .lineLimit(1)
+                    .layoutPriority(1)
             }
             .contentShape(Rectangle())
             .onTapGesture(count: 2) { value.wrappedValue = reset }
@@ -488,5 +538,30 @@ struct GradePanel: View {
                 }
                 .accessibilityLabel(title)
         }
+    }
+}
+
+/// The panel content's frame in the card (`GradePanel.cardSpace`), so a
+/// test can prove nothing spills past the glass.
+struct GradePanelContentFrameKey: PreferenceKey {
+    static let defaultValue: CGRect = .zero
+    static func reduce(value: inout CGRect, nextValue: () -> CGRect) {
+        let next = nextValue()
+        if next != .zero { value = next }
+    }
+}
+
+extension View {
+    /// The grade panel's glass card beside the picture: a fixed width the
+    /// content is laid out in, clipped to the card so nothing can paint
+    /// over the video, on dark glass whatever the window's appearance.
+    func gradeInspectorCard() -> some View {
+        let shape = RoundedRectangle(cornerRadius: GradePanel.cardCornerRadius, style: .continuous)
+        return frame(width: GradePanel.cardWidth)
+            .frame(maxHeight: .infinity)
+            .foregroundStyle(.white, .white.opacity(0.65), .white.opacity(0.45))
+            .clipShape(shape)
+            .glassEffect(.regular, in: shape)
+            .environment(\.colorScheme, .dark)
     }
 }
