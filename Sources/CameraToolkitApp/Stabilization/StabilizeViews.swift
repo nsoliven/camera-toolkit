@@ -40,7 +40,7 @@ struct StabilizePanel: View {
                 .toggleStyle(.switch)
                 .labelsHidden()
                 .controlSize(.small)
-                .disabled(!canStabilize && settings == nil)
+                .disabled((!canStabilize || !available.isReady) && settings == nil)
                 .help(canStabilize ? "Stabilize this clip from its motion data when it is rendered" : (motion?.problem ?? "Looking for motion data…"))
             }
             Picker("Smoothing", selection: Binding(
@@ -424,7 +424,7 @@ struct StabilizeAllSheet: View {
                 Spacer()
                 Button("Cancel", role: .cancel, action: onDone).keyboardShortcut(.cancelAction)
                 Button("Turn On") { apply(render: false) }
-                    .disabled(!counted || withMotion.isEmpty)
+                    .disabled(!counted || withMotion.isEmpty || !stabilizing.availability.isReady)
                 Button("Turn On and Render") { apply(render: true) }
                     .keyboardShortcut(.defaultAction)
                     .buttonStyle(.borderedProminent)

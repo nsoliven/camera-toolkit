@@ -33,7 +33,7 @@ struct BlanketStabilizeControls: View {
                 }
                 .toggleStyle(.switch)
                 .controlSize(.small)
-                .disabled(choice.withMotion == 0 && !choice.initiallyOn)
+                .disabled((choice.withMotion == 0 || choice.problem != nil) && !choice.initiallyOn)
                 Picker("Smoothing", selection: $choice.smoothing) {
                     ForEach(StabilizationSmoothing.allCases) { Text($0.displayName).tag($0) }
                 }
@@ -53,7 +53,7 @@ struct BlanketStabilizeControls: View {
             }
             .font(.caption)
             .foregroundStyle(.secondary)
-            if let problem = choice.problem, choice.isOn {
+            if let problem = choice.problem {
                 Label(problem, systemImage: "exclamationmark.triangle.fill")
                     .font(.caption)
                     .foregroundStyle(.orange)
