@@ -273,6 +273,8 @@ struct GradePanel: View {
     var onMarkProfile: (ClipProfileMark) -> Void
     var onRender: (() -> Void)?
     var renderNote: String?
+    /// Shown above the render button (the Stabilize section).
+    var accessory: AnyView?
 
     var body: some View {
         ScrollView {
@@ -394,6 +396,8 @@ struct GradePanel: View {
                     .fixedSize()
                 }
                 .controlSize(.small)
+
+                if let accessory { accessory }
 
                 if let onRender {
                     VStack(alignment: .leading, spacing: 6) {

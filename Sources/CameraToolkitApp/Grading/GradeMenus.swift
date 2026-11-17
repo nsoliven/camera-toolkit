@@ -7,6 +7,8 @@ struct BlanketGradeRequest: Identifiable {
     /// "3 selected clips", "Beach Day", "Card".
     let scopeTitle: String
     let items: [OrganizeItem]
+    /// The board's event, for rendering clips not assigned to one.
+    var boardEventID: UUID?
 }
 
 /// The board menus' Color submenu: blanket apply, copy/paste, profile
@@ -28,14 +30,16 @@ struct GradeMenuItems: View {
             Button("Apply Look to Log Clips…") {
                 onBlanket(BlanketGradeRequest(
                     scopeTitle: items.count == 1 ? items[0].primary.name : "\(items.count) selected clips",
-                    items: items
+                    items: items,
+                    boardEventID: boardEventID
                 ))
             }
             .disabled(items.isEmpty)
             Button("Apply Look to All Log Clips in \(boardTitle)…") {
                 onBlanket(BlanketGradeRequest(
                     scopeTitle: boardTitle,
-                    items: boardStacks().flatMap(\.items).filter(ClipGrading.isGradable)
+                    items: boardStacks().flatMap(\.items).filter(ClipGrading.isGradable),
+                    boardEventID: boardEventID
                 ))
             }
             Divider()
@@ -63,6 +67,7 @@ struct GradeMenuItems: View {
             }
             .disabled(items.isEmpty)
             .help("Rec.709 HEVC copies into the event's Edited/\(GradedRenderNaming.folderName). Originals are only read.")
+            StabilizeMenuItems(workspace: workspace, targets: targets, boardStacks: boardStacks, boardTitle: boardTitle, boardEventID: boardEventID)
         }
     }
 }

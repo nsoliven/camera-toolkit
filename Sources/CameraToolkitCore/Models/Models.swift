@@ -175,6 +175,8 @@ public enum JobAction: String, Codable, CaseIterable, Sendable {
     case resolveConflict
     /// Graded Rec.709 copies of clips rendered into `Edited/Rec709`.
     case gradeRender
+    /// Stabilized copies of clips made with Gyroflow into `Edited/Stabilized`.
+    case stabilize
 }
 
 public struct JobSnapshot: Identifiable, Codable, Hashable, Sendable {

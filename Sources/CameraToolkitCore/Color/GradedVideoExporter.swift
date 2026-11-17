@@ -21,10 +21,23 @@ public struct GradedRenderRequest: Sendable {
     /// drive: a copy Sync already carried there counts as rendered, and its
     /// name is never reused for a different render (Sync would conflict).
     public var mirrorFolder: URL?
-    /// A second render step after the grade (post stabilization). Nil — the
-    /// default — renders the grade alone, as before; this exporter does not
-    /// read it yet.
+    /// Stabilize before grading. Nil — the default — renders the grade
+    /// alone, as before. It is part of the copy's name tag, so a stabilized
+    /// copy is never taken for an unstabilized one.
     public var stabilization: RenderStabilization?
+    /// Where the frames are read from when that is not `source`: the
+    /// stabilized intermediate. `source` stays the original's identity.
+    public var decodeSource: URL?
+    /// The signal range of `decodeSource` when it differs from the
+    /// recipe's (which stays the original's, for the tags).
+    public var decodeRange: VideoSignalRange?
+
+    /// What a stabilized copy adds to its grade tag (empty when it is not
+    /// stabilized): `GradedVideoExporter.renderFingerprint(of:)` is the
+    /// recipe's render fingerprint followed by this.
+    public var stabilizationTag: String {
+        stabilization.map { "|" + $0.fingerprint } ?? ""
+    }
 
     public init(source: URL, recipe: GradeRecipe, sourceKey: String, sourceModifiedAt: Date, outputFolder: URL, make: String? = nil, model: String? = nil, mirrorFolder: URL? = nil, stabilization: RenderStabilization? = nil) {
         self.mirrorFolder = mirrorFolder
@@ -39,16 +52,16 @@ public struct GradedRenderRequest: Sendable {
     }
 }
 
-/// The settings of an optional post-stabilization step in a render. A
-/// placeholder the stabilizer fills in: requests carry it, nothing reads it
-/// yet.
+/// The stabilization step of a render: the clip is stabilized first (its
+/// log signal untouched), then graded from that (`StabilizedGradeChain`).
 public struct RenderStabilization: Codable, Hashable, Sendable {
-    /// The stabilizer's preset or profile name.
-    public var preset: String
+    public var settings: StabilizationSettings
 
-    public init(preset: String = "default") {
-        self.preset = preset
+    public init(settings: StabilizationSettings = StabilizationSettings()) {
+        self.settings = settings
     }
+
+    public var fingerprint: String { settings.fingerprint }
 }
 
 public enum GradedRenderOutcome: Equatable, Sendable {
@@ -258,7 +271,7 @@ public final class GradedVideoExporter: @unchecked Sendable {
 
         try write(request, to: partial, progress: progress, isCancelled: isCancelled)
         if isCancelled() { throw CancellationError() }
-        try verify(partial, against: request.source)
+        try verify(partial, against: request.decodeSource ?? request.source)
         try? fileManager.setAttributes(
             [.modificationDate: request.sourceModifiedAt, .creationDate: request.sourceModifiedAt],
             ofItemAtPath: partial.path
@@ -284,7 +297,7 @@ public final class GradedVideoExporter: @unchecked Sendable {
     /// tags could not be read within `timeout`.
     public static func renderFingerprint(of request: GradedRenderRequest, timeout: TimeInterval = 20) -> String? {
         guard let colour = sourceColourTags(request.source, timeout: timeout) else { return nil }
-        return request.recipe.renderFingerprint(sourcePrimaries: colour.primaries, sourceTransfer: colour.transfer)
+        return request.recipe.renderFingerprint(sourcePrimaries: colour.primaries, sourceTransfer: colour.transfer) + request.stabilizationTag
     }
 
     /// The original's video colour primaries and transfer tags (nil inside
@@ -398,7 +411,7 @@ public final class GradedVideoExporter: @unchecked Sendable {
         progress: @escaping @Sendable (Progress) -> Void,
         isCancelled: @escaping @Sendable () -> Bool
     ) throws {
-        let asset = CameraVideoAsset.asset(for: request.source)
+        let asset = CameraVideoAsset.asset(for: request.decodeSource ?? request.source)
         let loaded = try Self.blocking {
             let videoTracks = try await asset.loadTracks(withMediaType: .video)
             guard let video = videoTracks.first else { throw ToolkitError.commandFailed("\(request.source.lastPathComponent) has no video track.") }
@@ -408,7 +421,9 @@ public final class GradedVideoExporter: @unchecked Sendable {
             let fps = try await video.load(.nominalFrameRate)
             var audioHints: [CMFormatDescription?] = []
             for track in audioTracks { audioHints.append(try await track.load(.formatDescriptions).first) }
-            let live = GradeLiveState(recipe: request.recipe)
+            var drawn = request.recipe
+            if let range = request.decodeRange { drawn.range = range }
+            let live = GradeLiveState(recipe: drawn)
             let composition = try await self.renderer.videoComposition(for: asset, live: live, cubeSize: GradeRenderer.renderCubeSize)
             return LoadedSource(video: video, audio: audioTracks, audioHints: audioHints, duration: duration, dataRate: rate, fps: fps, composition: composition)
         }
@@ -588,7 +603,7 @@ public final class GradedVideoExporter: @unchecked Sendable {
         if let make = request.make { add(.quickTimeMetadataMake, make) }
         if let model = request.model { add(.quickTimeMetadataModel, model) }
         add(.quickTimeMetadataSoftware, "Camera Toolkit")
-        addCustom(Self.metadataGradeKey, Self.renderFingerprint(of: request) ?? request.recipe.fingerprint)
+        addCustom(Self.metadataGradeKey, Self.renderFingerprint(of: request) ?? (request.recipe.fingerprint + request.stabilizationTag))
         addCustom(Self.metadataSourceKey, request.sourceKey)
         return items
     }

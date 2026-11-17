@@ -34,6 +34,8 @@ extension ClipGrading {
             let event = workspace.assignedEvent(for: stack).event ?? boardEvent
             for item in stack.items where Self.isGradable(item) {
                 guard let recipe = recipe(for: item) else {
+                    // Stabilized without a grade: a stabilized-only copy.
+                    if stabilizing.settings(for: item) != nil { continue }
                     plan.refusals.append("\(item.primary.name) has no grade.")
                     continue
                 }
@@ -66,7 +68,8 @@ extension ClipGrading {
                     outputFolder: output,
                     mirrorFolder: onNAS
                         ? GradedRenderNaming.outputFolder(editedRoot: workspace.locations.editedRoot(for: event, policy: policy))
-                        : workspace.locations.nasMirrorURL(forDrivePath: output.path)
+                        : workspace.locations.nasMirrorURL(forDrivePath: output.path),
+                    stabilization: stabilizing.renderStabilization(forKey: Self.fileKey(item.primary))
                 ))
             }
         }
@@ -74,8 +77,14 @@ extension ClipGrading {
     }
 
     /// Queues one job that renders every graded clip among `stacks`.
-    func renderGradedCopies(of stacks: [OrganizeStack], boardEventID: UUID?) {
+    func renderGradedCopies(of stacks: [OrganizeStack], boardEventID: UUID?, includeStabilizeOnly: Bool = true) {
         let plan = renderPlan(for: stacks, boardEventID: boardEventID)
+        // Stabilized clips without a grade get their stabilized-only copy.
+        let stabilizeOnly = includeStabilizeOnly ? stabilizing.stabilizeOnlyItems(in: stacks) : []
+        if !stabilizeOnly.isEmpty {
+            stabilizing.renderStabilizedCopies(of: stabilizeOnly, in: stacks, boardEventID: boardEventID)
+            if plan.requests.isEmpty { return }
+        }
         guard !plan.requests.isEmpty else {
             model.statusMessage = plan.refusals.first ?? "Nothing to render — none of these clips has a grade."
             return
@@ -96,10 +105,14 @@ extension ClipGrading {
         /// sleeping NAS); the render checks them again and never makes a
         /// duplicate.
         var unchecked: Int = 0
+        /// Copies that are stabilized first (clips set to Stabilize).
+        var stabilized: Int = 0
     }
 
     enum RenderBeforeSyncChoice: Equatable {
         case renderThenSync
+        /// Render, but grade only: the Stabilize box was unticked.
+        case renderThenSyncWithoutStabilizing
         case syncOnly
         case cancel
     }
@@ -139,10 +152,11 @@ extension ClipGrading {
         )
         let renderer = self.renderer
         let model = self.model
+        let stabilization = stabilizing.renderStabilizationMap()
         model.statusMessage = "Looking for graded log clips to render before the sync…"
         Task { @MainActor [weak self] in
             let survey = await Task.detached(priority: .userInitiated) {
-                Self.surveyBeforeSync(inputs, renderer: renderer, progress: { done, total in
+                Self.surveyBeforeSync(inputs, renderer: renderer, stabilization: stabilization, progress: { done, total in
                     Task { @MainActor in
                         model.statusMessage = "Checking which graded copies are already made: \(done) of \(total)…"
                     }
@@ -157,7 +171,8 @@ extension ClipGrading {
             let summary = RenderBeforeSyncSummary(
                 count: survey.pending.count, alreadyThere: survey.alreadyThere,
                 estimatedBytes: survey.estimatedBytes, freeBytes: survey.freeBytes, isFirstRun: firstRun,
-                unchecked: survey.unchecked
+                unchecked: survey.unchecked,
+                stabilized: survey.pending.count { $0.stabilization != nil }
             )
             var choice = RenderBeforeSyncChoice.renderThenSync
             if firstRun || summary.count > Self.renderBeforeSyncAskAbove {
@@ -168,10 +183,14 @@ extension ClipGrading {
                 model.statusMessage = "Nothing was rendered or synced."
             case .syncOnly:
                 syncNow()
-            case .renderThenSync:
+            case .renderThenSync, .renderThenSyncWithoutStabilizing:
                 UserDefaults.standard.set(true, forKey: Self.renderBeforeSyncConfirmedKey)
                 var plan = RenderPlan()
-                plan.requests = survey.pending
+                plan.requests = choice == .renderThenSync ? survey.pending : survey.pending.map { request in
+                    var request = request
+                    request.stabilization = nil
+                    return request
+                }
                 plan.eventIDs = Set(events.map(\.id))
                 enqueueRender(plan, reason: "Before Sync to NAS: Rec.709 copies of graded log clips into Edited/\(GradedRenderNaming.folderName), so they reach the NAS and Immich.")
                 model.enqueueFileJob(
@@ -209,6 +228,7 @@ extension ClipGrading {
     nonisolated static func surveyBeforeSync(
         _ inputs: GradedSyncPlanner.Inputs,
         renderer: GradeRenderer,
+        stabilization: [String: RenderStabilization] = [:],
         budget: TimeInterval = surveyBudget,
         check: (@Sendable (GradedRenderRequest, TimeInterval) -> GradedVideoExporter.ExistingRenderCheck)? = nil,
         progress: @escaping @Sendable (Int, Int) -> Void = { _, _ in }
@@ -217,7 +237,13 @@ extension ClipGrading {
             inputs,
             detect: { LogProfileDetector.profile(clipBesideSidecar: $0) },
             range: { _ in .full }
-        )
+        ).map { request in
+            // A clip set to Stabilize needs its stabilized copy, so a plain
+            // graded copy already there does not count as made.
+            var request = request
+            request.stabilization = stabilization[request.sourceKey]
+            return request
+        }
         return survey(found, renderer: renderer, budget: budget, check: check, progress: progress)
     }
 
@@ -315,8 +341,11 @@ extension ClipGrading {
         let refusals = plan.refusals
         let eventIDs = plan.eventIDs
         let title = "Render \(count) graded cop\(count == 1 ? "y" : "ies")"
-        let detail = reason ?? "Rec.709 HEVC copies into Edited/\(GradedRenderNaming.folderName). Originals are only read."
+        let stabilized = requests.count { $0.stabilization != nil }
+        let detail = (reason ?? "Rec.709 HEVC copies into Edited/\(GradedRenderNaming.folderName). Originals are only read.")
+            + (stabilized > 0 ? " \(stabilized) stabilized first with Gyroflow." : "")
         let renderer = self.renderer
+        let stabilizer = stabilizing.stabilizerForRender(requests)
         model.enqueueFileJob(
             action: .gradeRender,
             queuedNote: "\(title).",
@@ -335,7 +364,7 @@ extension ClipGrading {
                 onSettled: { @MainActor in model.unregisterStop(jobID: jobID) },
                 jobID: jobID,
                 operation: { progress in
-                    try Self.runRender(requests, renderer: renderer, isStopped: { stop.isStopped }, progress: progress)
+                    try Self.runRender(requests, renderer: renderer, stabilizer: stabilizer, isStopped: { stop.isStopped }, progress: progress)
                 },
                 completion: { [weak self] (outcome: RenderOutcome) in
                     for eventID in eventIDs { self?.workspace.refreshEditTags(for: eventID) }
@@ -365,6 +394,7 @@ extension ClipGrading {
         _ requests: [GradedRenderRequest],
         renderer: GradeRenderer = .shared,
         exporter: GradedVideoExporter? = nil,
+        stabilizer: Stabilizer? = nil,
         isStopped: @escaping @Sendable () -> Bool = { false },
         availableBytes: (URL) -> Int64? = { GradedVideoExporter.availableBytes(near: $0) },
         estimatedBytes: (URL) -> Int64? = { GradedVideoExporter.estimatedBytes(of: $0) },
@@ -412,10 +442,34 @@ extension ClipGrading {
                 outcome.stoppedReason = "Stopped before \(name): \(formatter.string(fromByteCount: max(free, 0))) free where the copy goes; it needs about \(formatter.string(fromByteCount: need)) plus \(formatter.string(fromByteCount: freeSpaceMargin)) kept free."
                 break
             }
+            // Stabilize first (the first half of this clip's progress), then
+            // grade from the stabilized intermediate, which is deleted after.
+            var chain: StabilizedGradeChain.Prepared?
+            defer { StabilizedGradeChain.cleanUp(chain) }
+            let share = request.stabilization == nil ? 0.0 : 0.5
             do {
-                let result = try exporter.render(request, progress: { step in
+                var graded = request
+                if request.stabilization != nil {
+                    chain = try StabilizedGradeChain.prepare(
+                        request, stabilizer: stabilizer,
+                        rangeOf: { probedRange($0, renderer: renderer) },
+                        progress: { step in
+                            progress(BackgroundJobUpdate(
+                                progress: (Double(index) + step.fraction * share) / Double(total),
+                                note: "Stabilizing \(index + 1) of \(total) · \(name) · \(StabilizeWording.phase(step))",
+                                phase: "Stabilize",
+                                currentPath: request.source.path,
+                                processedFiles: index,
+                                totalFiles: total
+                            ))
+                        },
+                        isCancelled: isStopped
+                    )
+                    graded = chain!.request
+                }
+                let result = try exporter.render(graded, progress: { step in
                     progress(BackgroundJobUpdate(
-                        progress: (Double(index) + step.fraction) / Double(total),
+                        progress: (Double(index) + share + step.fraction * (1 - share)) / Double(total),
                         note: "Rendering \(index + 1) of \(total) · \(name) · \(Int(step.fraction * 100))%",
                         phase: "Render",
                         currentPath: request.source.path,
