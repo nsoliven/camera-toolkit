@@ -390,6 +390,76 @@ final class ImmichGradedAlbumSwapTests: XCTestCase {
         XCTAssertEqual(outcome.graded.removedOriginals, 0)
     }
 
+    /// After a render the app asks Immich to scan; once the copy is listed,
+    /// a check with stacking on stacks it on its original, copy on top. The
+    /// clip's Sony sidecar is never an Immich asset and does not count.
+    func testAfterAScanTheCopyIsStackedOnItsOriginalWithTheCopyOnTop() async throws {
+        let files = try prepare() + [
+            ImmichCatalogFile(eventAssetID: "sidecar", relativePath: "2026/T/Originals/A7V/C0001M01.XML", isOnNAS: true, album: album, eventID: trip),
+        ]
+        let transport = self.transport(members: [[], []])
+        transport.respond("POST", "/api/libraries/lib/scan", status: 204, body: "")
+        transport.respond("GET", "/api/stacks", body: "[]")
+        transport.respond("POST", "/api/stacks", body: #"{"id":"stack-1","primaryAssetId":"g1","assets":[{"id":"g1"},{"id":"o1"}]}"#)
+        let sync = try self.sync(transport)
+        // The global switch stays off: only this event, stacked one at a time.
+        XCTAssertFalse(sync.stacksBurstsAndEdits)
+        try ImmichStackEventStore(catalogURL: catalogURL).add([trip])
+
+        try await sync.requestScan()
+        XCTAssertTrue(transport.requests.contains { $0.httpMethod == "POST" && $0.url?.path == "/api/libraries/lib/scan" })
+        let outcome = try await sync.check(files: files)
+
+        let create = try XCTUnwrap(transport.requests.first { $0.httpMethod == "POST" && $0.url?.path == "/api/stacks" })
+        let body = try XCTUnwrap(try JSONSerialization.jsonObject(with: try XCTUnwrap(create.httpBody)) as? [String: [String]])
+        XCTAssertEqual(body["assetIds"], ["g1", "o1"], "the graded copy on top of its original, the sidecar left out")
+        XCTAssertEqual(outcome.stacks?.created.first?.kind, .edit)
+        XCTAssertEqual(outcome.stacks?.plan.skippedNotInImmich, 0, "a clip with only its sidecar beside it is no group")
+        let key = NASSyncStore.pathKey("2026/T/Edited/Rec709/C0001_709.mov")
+        XCTAssertEqual(outcome.graded.states[key], .stacked)
+        XCTAssertEqual(outcome.graded.assetIDs[key], "g1")
+    }
+
+    /// With the global switch off and the event not stacked one at a time,
+    /// the scan, the match and the album swap still happen; no stack does.
+    func testWithoutStackingTheCopyStillJoinsTheAlbumButIsNotStacked() async throws {
+        let files = try prepare()
+        let transport = self.transport(members: [[], []])
+        let outcome = try await sync(transport).check(files: files)
+        XCTAssertFalse(transport.requests.contains { $0.url?.path.hasPrefix("/api/stacks") == true }, "no stack read or made")
+        XCTAssertNil(outcome.stacks)
+        XCTAssertEqual(outcome.graded.swaps.map(\.gradedAssetID), ["g1"])
+        XCTAssertEqual(outcome.graded.states[NASSyncStore.pathKey("2026/T/Edited/Rec709/C0001_709.mov")], .inImmich)
+        // Another event stacked one at a time does not stack this one.
+        try ImmichStackEventStore(catalogURL: catalogURL).add([UUID()])
+        let again = self.transport(members: [[], []])
+        _ = try await sync(again).check(files: files)
+        XCTAssertFalse(again.requests.contains { $0.url?.path.hasPrefix("/api/stacks") == true })
+    }
+
+    /// Each copy's state for the finished render job: listed, waiting for
+    /// the scan, or still only on the drive.
+    func testEachCopyHasAStateForTheRenderJob() {
+        let files = (1...3).map { ImmichCatalogFile(eventAssetID: "e\($0)", relativePath: "2026/T/Originals/A7V/C000\($0).MP4", isOnNAS: true, album: album, eventID: trip) }
+        var report = ImmichReconcileReport()
+        let graded = ImmichGradedAlbumSwap.prepare(
+            &report, files: files,
+            assets: [asset("o1", "2026/T/Originals/A7V/C0001.MP4"), asset("g1", "2026/T/Edited/Rec709/C0001_709.mov")],
+            library: library,
+            records: [record(1), record(2), record(3, onNAS: false)]
+        )
+        func state(_ n: Int) -> ImmichGradedCopyState? { graded.states[NASSyncStore.pathKey("2026/T/Edited/Rec709/C000\(n)_709.mov")] }
+        XCTAssertEqual(state(1), .inImmich)
+        XCTAssertEqual(state(2), .waitingForScan)
+        XCTAssertEqual(state(3), .notOnNAS)
+        var stacked = graded
+        stacked.markStacked([ImmichStackRecord(key: "k", stackID: "s1", eventID: trip, kind: .edit, assetIDs: ["g1", "o1"])])
+        XCTAssertEqual(stacked.states[NASSyncStore.pathKey("2026/T/Edited/Rec709/C0001_709.mov")], .stacked)
+        var unstacked = graded
+        unstacked.markStacked([ImmichStackRecord(key: "k", stackID: "s1", eventID: trip, kind: .edit, assetIDs: ["g1", "o1"], removedInImmich: true)])
+        XCTAssertEqual(unstacked.states[NASSyncStore.pathKey("2026/T/Edited/Rec709/C0001_709.mov")], .inImmich, "a stack unstacked in Immich is not claimed")
+    }
+
     private static func ids(_ request: URLRequest) throws -> [String] {
         let body = try XCTUnwrap(request.httpBody)
         return try XCTUnwrap((try JSONSerialization.jsonObject(with: body) as? [String: [String]])?["ids"])

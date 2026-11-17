@@ -82,7 +82,8 @@ public enum ImmichStackGrouping {
                     let ordered = [cover] + stack.items.filter { $0.id != cover.id }
                     groups.append(("\(eventID.uuidString)|burst|\(identity)", .burst, ordered.flatMap(paths(of:)), stack.items.map(\.primary.stem)))
                 } else if let item = stack.items.first {
-                    groups.append(("\(eventID.uuidString)|pair|\(identity)", item.companions.isEmpty ? .edit : .rawPair, paths(of: item), [item.primary.stem]))
+                    let files = paths(of: item)
+                    groups.append(("\(eventID.uuidString)|pair|\(identity)", files.count > 1 ? .rawPair : .edit, files, [item.primary.stem]))
                 }
             }
 
@@ -132,8 +133,15 @@ public enum ImmichStackGrouping {
         Set(events.filter { locations.resolvedPolicy(for: $0) != .archiveOnly || $0.sendsToImmich }.map(\.id))
     }
 
+    /// The item's files that Immich can hold: its primary and its partners
+    /// (a RAW's JPEG). Sidecars (a Sony clip's `M01.XML`, an `XMP`, a
+    /// `THM`) are never Immich assets, so they never count toward a stack.
     private static func paths(of item: OrganizeItem) -> [String] {
-        ([item.primary] + item.companions).map { String($0.path.dropFirst()) }
+        ([item.primary] + item.companions.filter { !isSidecar($0.name) }).map { String($0.path.dropFirst()) }
+    }
+
+    static func isSidecar(_ name: String) -> Bool {
+        OrganizeFileClassifier.companionExtensions.contains((name as NSString).pathExtension.lowercased())
     }
 
     /// `DSC00001_709` and `DSC00001-Edit` are edits of `DSC00001`;
@@ -380,6 +388,49 @@ public final class ImmichStackStore: @unchecked Sendable {
     /// Live stacks per event, for the event header.
     public func countsByEvent() throws -> [UUID: Int] {
         try records().values.filter { !$0.stackID.isEmpty && $0.removedInImmich != true }.reduce(into: [:]) { $0[$1.eventID, default: 0] += 1 }
+    }
+}
+
+/// Events stacked one at a time (Stack This Event in Immich, or the
+/// `--immich-stacks --event` command line): with the global "Stack bursts
+/// and edits" off, checks keep these events' stacks up to date, and only
+/// these. Rows are bookkeeping only; removing one never touches a stack.
+public final class ImmichStackEventStore: @unchecked Sendable {
+    static let schema = """
+    CREATE TABLE IF NOT EXISTS immich_stack_events (
+        event_id TEXT PRIMARY KEY,
+        added_at TEXT NOT NULL
+    );
+    """
+
+    public let catalogURL: URL
+
+    public init(catalogURL: URL) throws {
+        self.catalogURL = catalogURL
+        try CatalogDatabase.writer(for: catalogURL).write { try $0.execute(sql: Self.schema) }
+    }
+
+    public func add(_ eventIDs: Set<UUID>, now: Date = Date()) throws {
+        guard !eventIDs.isEmpty else { return }
+        let stamp = ISO8601DateFormatter().string(from: now)
+        try CatalogDatabase.writer(for: catalogURL).write { database in
+            for id in eventIDs.sorted(by: { $0.uuidString < $1.uuidString }) {
+                try database.execute(sql: "INSERT OR IGNORE INTO immich_stack_events(event_id, added_at) VALUES (?, ?)", arguments: [id.uuidString, stamp])
+            }
+        }
+    }
+
+    public func eventIDs() throws -> Set<UUID> {
+        try CatalogDatabase.writer(for: catalogURL).read { database in
+            guard try database.tableExists("immich_stack_events") else { return [] }
+            return Set(try String.fetchAll(database, sql: "SELECT event_id FROM immich_stack_events").compactMap(UUID.init(uuidString:)))
+        }
+    }
+
+    /// The events stacked one at a time, or none when the catalog cannot be read.
+    public static func existing(catalogURL: URL) -> Set<UUID> {
+        guard FileManager.default.fileExists(atPath: catalogURL.path) else { return [] }
+        return (try? ImmichStackEventStore(catalogURL: catalogURL).eventIDs()) ?? []
     }
 }
 

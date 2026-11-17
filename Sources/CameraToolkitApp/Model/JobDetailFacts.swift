@@ -632,3 +632,52 @@ extension JobDetailFacts {
         }
     }
 }
+
+/// One graded copy of a finished render job, as the Jobs window says it.
+struct JobGradedCopyRow: Equatable, Identifiable {
+    var id: String { path }
+    var path: String
+    /// `<year>/<event>/Edited/Rec709/<file>`.
+    var location: String
+    /// "On the NAS" or "On the drive".
+    var place: String
+    var immich: String
+    var isStacked: Bool
+}
+
+extension JobDetailFacts {
+    /// Where each copy went and where it stands with Immich: waiting for
+    /// the scan, in Immich, stacked on its original.
+    static func gradedCopyRows(
+        _ copies: [JobGradedCopy],
+        states: [String: ImmichGradedCopyState],
+        immichConfigured: Bool,
+        stacksOn: (UUID?) -> Bool
+    ) -> [JobGradedCopyRow] {
+        copies.map { copy in
+            let state = states[NASSyncStore.pathKey(copy.libraryRelativePath)]
+            let immich: String
+            if !immichConfigured {
+                immich = "Immich: no library chosen in Settings"
+            } else if !copy.isWrittenDown {
+                immich = "Immich: not tracked, the clip is not in an event"
+            } else {
+                switch state ?? (copy.isOnNAS ? .waitingForScan : .notOnNAS) {
+                case .stacked: immich = "In Immich, stacked on its original"
+                case .inImmich: immich = stacksOn(copy.eventID) ? "In Immich; stacked on its original on the next check" : "In Immich, beside its original (stacking is off for this event)"
+                case .waitingForScan: immich = "Waiting for Immich scan: added on the next check"
+                case .notOnNAS: immich = "Sync to NAS carries it, then Immich adds it"
+                case .unavailable: immich = "Not in Immich: gone from the NAS, or offline or trashed there"
+                case .excluded: immich = "Not in Immich: the library's exclusion patterns skip it"
+                }
+            }
+            return JobGradedCopyRow(
+                path: copy.path,
+                location: copy.libraryRelativePath,
+                place: (copy.isOnNAS ? "On the NAS" : "On the drive") + (copy.wasRendered ? "" : " · already there"),
+                immich: immich,
+                isStacked: state == .stacked
+            )
+        }
+    }
+}

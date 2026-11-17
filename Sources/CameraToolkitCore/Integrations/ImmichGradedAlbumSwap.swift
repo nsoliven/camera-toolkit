@@ -16,8 +16,30 @@ public struct ImmichGradedSwap: Equatable, Sendable {
     }
 }
 
+/// Where one graded copy stands with Immich, as the last check found it.
+public enum ImmichGradedCopyState: String, Codable, Equatable, Sendable {
+    /// Still only on the drive: Sync to NAS carries it first.
+    case notOnNAS
+    /// On the NAS; Immich has not listed it yet.
+    case waitingForScan
+    /// Immich lists it.
+    case inImmich
+    /// Immich lists it, stacked on its original by the app.
+    case stacked
+    /// Gone from the NAS, or offline or trashed in Immich.
+    case unavailable
+    /// The library's exclusion patterns keep it out.
+    case excluded
+}
+
 /// What a check did with the events' graded copies.
 public struct ImmichGradedSwapReport: Equatable, Sendable {
+    /// Each copy's state, by its path key under the NAS root
+    /// (`NASSyncStore.pathKey`).
+    public var states: [String: ImmichGradedCopyState] = [:]
+    /// Each listed copy's Immich asset, by path key.
+    public var assetIDs: [String: String] = [:]
+
     /// Copies listed by Immich, each put in its original's place in the album.
     public var swaps: [ImmichGradedSwap] = []
     /// Copies on the NAS that Immich does not list yet (paths under the NAS
@@ -111,16 +133,22 @@ public enum ImmichGradedAlbumSwap {
             guard let gradedID = assetByKey[record.gradedKey] else {
                 if !record.wasOnNAS {
                     result.notOnNASByEvent[eventID, default: 0] += 1
+                    result.states[record.gradedKey] = .notOnNAS
                 } else if !record.isOnNAS || unavailable.contains(record.gradedKey) {
                     result.unavailableByEvent[eventID, default: 0] += 1
+                    result.states[record.gradedKey] = .unavailable
                 } else if let server = paths.originalPath(forRelativePath: record.gradedRelativePath), exclusions.isExcluded(server) {
                     result.excludedByEvent[eventID, default: 0] += 1
+                    result.states[record.gradedKey] = .excluded
                 } else {
                     result.waitingForScan.append(record.gradedRelativePath)
                     result.waitingByEvent[eventID, default: 0] += 1
+                    result.states[record.gradedKey] = .waitingForScan
                 }
                 continue
             }
+            result.states[record.gradedKey] = .inImmich
+            result.assetIDs[record.gradedKey] = gradedID
             guard let album = file.album else { continue }
             let originalID = assetByKey[key]
             var wanted = report.albumAssets[album] ?? []
@@ -224,6 +252,17 @@ public enum ImmichGradedAlbumSwap {
             } catch {
                 outcome.problems.append("album \(names[albumID] ?? albumID): originals not taken out (\(error.localizedDescription))")
             }
+        }
+    }
+}
+
+extension ImmichGradedSwapReport {
+    /// Listed copies the app stacked (a live stack of its own holds the
+    /// copy's asset) are marked `stacked`.
+    public mutating func markStacked(_ records: [ImmichStackRecord]) {
+        let stacked = Set(records.filter { !$0.stackID.isEmpty && $0.removedInImmich != true }.flatMap(\.assetIDs))
+        for (key, assetID) in assetIDs where stacked.contains(assetID) {
+            states[key] = .stacked
         }
     }
 }

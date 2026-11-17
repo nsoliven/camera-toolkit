@@ -111,6 +111,8 @@ public struct JobHistorySummary: Codable, Equatable, Hashable, Sendable {
     public var note: String?
     /// Clear from Card's per-copy check results; nil for every other job.
     public var cardClearChecks: CardClearChecks?
+    /// A render job's graded copies; nil for every other job.
+    public var gradedCopies: [JobGradedCopy]?
 
     public init(
         phases: [JobPhaseTotal] = [],
@@ -145,6 +147,36 @@ public struct JobHistorySummary: Codable, Equatable, Hashable, Sendable {
         foldersCreated = try container.decodeIfPresent(Int.self, forKey: .foldersCreated)
         note = try container.decodeIfPresent(String.self, forKey: .note)
         cardClearChecks = try container.decodeIfPresent(CardClearChecks.self, forKey: .cardClearChecks)
+        gradedCopies = try container.decodeIfPresent([JobGradedCopy].self, forKey: .gradedCopies)
+    }
+}
+
+/// One graded copy a render job made or found, kept with the job so the
+/// Jobs window can say where it went and show it in Finder.
+public struct JobGradedCopy: Codable, Equatable, Hashable, Sendable {
+    /// Where the copy is on disk.
+    public var path: String
+    /// Its path under the library root (`<year>/<event>/Edited/Rec709/…`),
+    /// the path Immich lists it by.
+    public var libraryRelativePath: String
+    /// Written straight to the NAS; false while it is on the drive and
+    /// Sync to NAS still has to carry it.
+    public var isOnNAS: Bool
+    /// Made by this job; false when the same copy was already there.
+    public var wasRendered: Bool
+    /// Written down for Immich (`GradedCopyStore`): false for a clip with no
+    /// event, whose copy Immich checks cannot place.
+    public var isWrittenDown: Bool
+    /// The original's event.
+    public var eventID: UUID?
+
+    public init(path: String, libraryRelativePath: String, isOnNAS: Bool, wasRendered: Bool, isWrittenDown: Bool = true, eventID: UUID? = nil) {
+        self.eventID = eventID
+        self.path = path
+        self.libraryRelativePath = libraryRelativePath
+        self.isOnNAS = isOnNAS
+        self.wasRendered = wasRendered
+        self.isWrittenDown = isWrittenDown
     }
 }
 

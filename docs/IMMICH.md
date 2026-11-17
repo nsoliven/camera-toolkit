@@ -7,6 +7,7 @@ Immich reads the NAS library directly as a read-only **external library**. Camer
 | When | What |
 |---|---|
 | Sync to NAS copied something, or NAS renames ran | Asks Immich to scan the chosen library, then compares paths after 15 s, 1 min, 5 min and 15 min, stopping once nothing is waiting |
+| A render job wrote a graded copy to the NAS | The same: scan, then compare on the same schedule (see Send to Immich › graded copies) |
 | **Check** on an event's Immich slot | Scans and compares now |
 
 It matches each catalog file to an asset by its path under the library's import folder, which must be the NAS root the app syncs to (`<year>/<event>/Originals/<Camera>/…`). Case and Unicode spelling are ignored. The answer is stored in `immich_assets` and shown on the event:
@@ -59,17 +60,29 @@ A pairing is stored by album ID, so renaming the album in Immich does not break 
 - **Choose Looks First…** opens the blanket look sheet for those clips (one Undo step), then renders and sends.
 - **Send as They Are** sends exactly as before.
 
-Each copy is written down in the catalog (`graded_copies`). On every check, a copy Immich lists takes its original's place in the event's album. The original leaves the album only if the app's own `album-additions.jsonl` says the app put it there, and only once. Each removal is logged to `album-removals.jsonl`, and originals you added by hand stay. Only album membership changes: no asset or file is deleted. With **Stack bursts and edits** on, the copy is stacked on top of its original. A copy on the NAS that Immich has not listed yet shows as "waiting for Immich scan: added on the next check", and the follow-up checks keep looking. Some copies are never waited for: one gone from the NAS, one offline or trashed in Immich, and one excluded by the library's patterns. The send lists these, and their originals keep their album places. Album additions log only what each call put in the album, so a photo that was already there by hand is never counted as the app's. Re-sending an event that went out flat fixes it the same way.
+Each copy is written down in the catalog (`graded_copies`). A plain render job (Render Graded Copy, or the before-sync render) does the same, and asks Immich to scan when its copy is on the NAS, so its copy reaches the album the same way. On every check, a copy Immich lists takes its original's place in the event's album. The original leaves the album only if the app's own `album-additions.jsonl` says the app put it there, and only once. Each removal is logged to `album-removals.jsonl`, and originals you added by hand stay. Only album membership changes: no asset or file is deleted. Where stacking is on (the setting, or the event stacked on its own), the copy is stacked on top of its original. A copy on the NAS that Immich has not listed yet shows as "waiting for Immich scan: added on the next check", and the follow-up checks keep looking. Some copies are never waited for: one gone from the NAS, one offline or trashed in Immich, and one excluded by the library's patterns. The send lists these, and their originals keep their album places. Album additions log only what each call put in the album, so a photo that was already there by hand is never counted as the app's. Re-sending an event that went out flat fixes it the same way.
 
 A private event never gets an album unless **Allow album** is on for that event. That only governs albums: Immich reads the whole NAS root, so a private event's files are visible in Immich unless the library's exclusion patterns cover them. The event says so when it happens.
 
+## Graded copy dates
+
+Immich v3.3.1 takes a file's capture date from the first of these tags it finds: `SubSecDateTimeOriginal`, `SubSecCreateDate`, `DateTimeOriginal`, `CreationDate`, `CreateDate`, `MediaCreateDate`, then a few others, then the file's own time. Its zone comes from the file's time-zone tags or the date's own offset, else UTC. For a QuickTime copy `CreationDate` is `com.apple.quicktime.creationdate`, so it wins over the movie header's `CreateDate`.
+
+Copies from earlier builds have the right instant there but no offset, so Immich shows them in UTC: a clip shot at 19:00 at UTC−8 shows at 03:00 the next day. Copies made now carry the camera's offset and the capture time in their headers too. `CameraToolkit --graded-copy-dates` repairs older copies (see `COLOR.md` › Rendered copies).
+
 ## Stacks
 
-**Stack bursts and edits in Immich** (Settings, off by default; nothing happens until a library is chosen) makes, on each check and on Send to Immich:
+Stacking is on for an event when **Stack bursts and edits in Immich** is on (Settings, off by default; nothing happens until a library is chosen), or when the event was stacked on its own. **Stack This Event in Immich** in the event's sidebar menu (shown while the setting is off) stacks that event on a check now and marks it in the catalog (`immich_stack_events`). Later checks keep that event's stacks up to date, and only that event's: no other event is stacked. The menu then reads **Update This Event's Immich Stacks**.
+
+Scanning, matching and the graded-copy album swap never depend on stacking.
+
+Where stacking is on, each check and Send to Immich makes:
 
 - each burst the board groups into one stack, with its cover frame on top;
 - each RAW file and the JPEG of the same shot into one stack;
 - each original and its edit from the event's `Edited` folder (a Photomator export, or a graded copy such as `C0001_709.mp4`) into one stack, edit on top. An edit of a burst frame sits right under the burst's cover.
+
+Sidecars (a Sony clip's `M01.XML`, an `XMP`, a `THM`) are never Immich assets, so they never count toward a stack: a clip with only its sidecar beside it is no group.
 
 Groups never cross events, and an edit joins only an original in the same event folder, so edits never cross between an event and its subevents. A private event is stacked only with Allow album on. A file not matched to an asset in the chosen library is left out, and a group with fewer than two matched files is not made.
 
@@ -86,7 +99,7 @@ CameraToolkit --immich-stacks --dry-run [--event <name>]...
 CameraToolkit --immich-stacks [--event <name>]... [--log <file.jsonl>]
 ```
 
-The dry run only reads; a real run refuses while the app is running. It reports how many stacks it would make, how many are already the app's and unchanged, how many it would leave alone because they are already in someone else's stack, and how many groups are not matched in Immich. A real run writes one JSON line per stack it made to the log (default `<support folder>/Immich Logs/`); that list of stack IDs is what to undo from.
+The dry run only reads; a real run refuses while the app is running. A real run with `--event` stacks only those events, edits included once Immich lists them, and marks them as stacked on their own, so the app keeps them stacked. It reports how many stacks it would make, how many are already the app's and unchanged, how many it would leave alone because they are already in someone else's stack, and how many groups are not matched in Immich. A real run writes one JSON line per stack it made to the log (default `<support folder>/Immich Logs/`); that list of stack IDs is what to undo from.
 
 ## View in Immich
 

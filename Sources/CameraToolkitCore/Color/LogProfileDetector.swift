@@ -57,13 +57,30 @@ public enum LogProfileDetector {
 
     /// `C0001.MP4` → reads `C0001M01.XML` beside it, if there is one.
     public static func sonySidecarDevice(forClip clip: URL) -> (make: String?, model: String?)? {
+        sonySidecarText(forClip: clip).flatMap(sonyDevice(sidecarXML:))
+    }
+
+    /// The capture time a Sony sidecar states, with the camera's UTC offset
+    /// (`<CreationDate value="2026-06-01T10:20:30-07:00"/>`).
+    public static func sonyCreationDate(sidecarXML text: String) -> String? {
+        guard let open = text.range(of: "<CreationDate", options: .caseInsensitive),
+              let close = text.range(of: ">", range: open.upperBound..<text.endIndex) else { return nil }
+        return attribute("value", in: text[open.upperBound..<close.lowerBound])
+    }
+
+    /// `C0001.MP4` → the capture time in `C0001M01.XML` beside it.
+    public static func sonySidecarCreationDate(forClip clip: URL) -> String? {
+        sonySidecarText(forClip: clip).flatMap(sonyCreationDate(sidecarXML:))
+    }
+
+    static func sonySidecarText(forClip clip: URL) -> String? {
         let stem = clip.deletingPathExtension().lastPathComponent
         let folder = clip.deletingLastPathComponent()
         for name in ["\(stem)M01.XML", "\(stem)M01.xml"] {
             let url = folder.appendingPathComponent(name)
             guard let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize, size <= maximumSidecarBytes,
                   let text = try? String(contentsOf: url, encoding: .utf8) else { continue }
-            return sonyDevice(sidecarXML: text)
+            return text
         }
         return nil
     }

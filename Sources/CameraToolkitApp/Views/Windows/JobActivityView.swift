@@ -31,6 +31,8 @@ struct JobActivityDetail: View {
     /// Opens a file's two copies side by side; nil where there is nothing
     /// to compare (not a Sync to NAS job).
     var compare: ((JobHistoryItem, CompareRequest.Mode) -> Void)?
+    /// A finished render job's copies: where each went, its Immich state.
+    var gradedCopies: [JobGradedCopyRow] = []
 
     var isLive: Bool {
         guard let live else { return false }
@@ -124,6 +126,9 @@ struct JobActivityDetail: View {
         }
         if let job = detail?.job {
             JobIssueSection(job: job, items: detail?.items ?? [], showIssues: showIssues, compare: compare)
+        }
+        if !gradedCopies.isEmpty {
+            JobGradedCopiesSection(rows: gradedCopies)
         }
     }
 
@@ -755,6 +760,63 @@ private struct JobIssueSection: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
+    }
+}
+
+/// A finished render job's copies: each one's place under the library,
+/// its Immich state, and Show in Finder (only on a click).
+private struct JobGradedCopiesSection: View {
+    let rows: [JobGradedCopyRow]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(rows.count == 1 ? "Graded copy" : "Graded copies")
+                    .font(.callout.weight(.semibold))
+                Spacer()
+                if rows.count > 1 {
+                    Button("Show All in Finder", systemImage: "folder") { reveal(rows.map(\.path)) }
+                        .controlSize(.small)
+                        .disabled(existing(rows.map(\.path)).isEmpty)
+                        .help("Select every copy in Finder")
+                }
+            }
+            ForEach(rows) { row in
+                HStack(alignment: .top, spacing: 8) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(row.location)
+                            .font(.callout.monospaced())
+                            .lineLimit(2)
+                            .truncationMode(.middle)
+                            .help(row.path)
+                        Text("\(row.place) · \(row.immich)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer(minLength: 8)
+                    Button("Show in Finder", systemImage: "folder") { reveal([row.path]) }
+                        .labelStyle(.iconOnly)
+                        .controlSize(.small)
+                        .disabled(existing([row.path]).isEmpty)
+                        .help("Show this copy in Finder")
+                }
+            }
+        }
+        .textSelection(.enabled)
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private func existing(_ paths: [String]) -> [URL] {
+        paths.filter { FileManager.default.fileExists(atPath: $0) }.map { URL(fileURLWithPath: $0) }
+    }
+
+    private func reveal(_ paths: [String]) {
+        let urls = existing(paths)
+        guard !urls.isEmpty else { return }
+        NSWorkspace.shared.activateFileViewerSelecting(urls)
     }
 }
 

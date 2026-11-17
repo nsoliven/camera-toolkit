@@ -82,7 +82,27 @@ Settings › Color › Import LUTs… copies `.cube` files (after they parse) in
 - **Stop** in the Jobs window ends the job after the frame being written; the copy in progress is discarded, finished copies stay.
 - **Free space**: before each clip the job estimates the copy's size and stops, with a message, if that would leave less than 5 GB free where the copy goes.
 
-The copy carries the capture time (`com.apple.quicktime.creationdate`, `©day`) and camera, and the original's modification time. The original shows **Edited · Rec709** on its tile. Copies sync to the NAS with the normal Sync.
+**Dates.** The copy carries the original's capture time everywhere a viewer reads one:
+
+- the movie, track and media headers (`mvhd`, `tkhd`, `mdhd`), stamped on the partial before it is checked (`QuickTimeHeaderDates`; AVAssetWriter itself always writes the render time there);
+- `com.apple.quicktime.creationdate` and `©day`, with the camera's UTC offset (`2026-06-01T10:20:30-07:00`). The offset comes from the original's own `creationdate` tag (phones), else a Sony `M01.XML` sidecar's `CreationDate`. Without either it is written in UTC;
+- the original's location (ISO 6709), when it has one;
+- the original's modification time.
+
+It also carries the camera's make and model. The original shows **Edited · Rec709** on its tile. Copies sync to the NAS with the normal Sync.
+
+**After the render.** Every copy a render job makes or finds is written down in the catalog (`graded_copies`), the same way Send to Immich does. A copy written straight to the NAS is re-read whole and recorded as verified in `nas_sync_files`, and Immich is asked to scan. A copy on the drive waits for Sync to NAS, which asks for the scan. The checks that follow put the copy in its original's album place and, where stacking is on, stack it on top (see `IMMICH.md`).
+
+The finished job in the Jobs window lists each copy: its path under the library (`<year>/<event>/Edited/Rec709/<file>`), whether it is on the NAS or the drive, its Immich state (waiting for scan, in Immich, stacked on its original), and **Show in Finder**.
+
+**Copies made by earlier builds** have the render time in their headers and a UTC `creationdate`. Immich reads the right instant but shows it in UTC, so a clip shot in the evening can land on the next day. To fix them:
+
+```
+CameraToolkit --graded-copy-dates --dry-run [--event <name>]...
+CameraToolkit --graded-copy-dates [--event <name>]...
+```
+
+The dry run lists the copies it would repair. A real run refuses while the app runs. It touches only the app's own copies (a `_709` name in `Edited/Rec709` whose source tag names a catalog original). Each is copied sample for sample, with no re-encode, into a partial in the folder's temporary folder, with the corrected dates, then checked, given the copy's own modification time, and renamed over the copy only if the copy has not changed meanwhile. Originals are only read. It also writes every copy it finds down in `graded_copies`, re-reads each NAS copy it rewrote (or that Sync has no record of) and records it as verified. Then it asks Immich to scan, and to refresh the metadata of rewritten copies Immich already lists. That refresh needs the key's `job.create` permission; without it, use **Refresh metadata** on those assets in Immich.
 
 ## Immich
 
@@ -91,9 +111,9 @@ Immich reads the NAS library as an external library (see `IMMICH.md`), and each 
 - It works from the catalog, so no board needs to be open, and counts only copies not already made (on the drive or the NAS). Clips are checked eight at a time within a 30-second budget, with progress in the status line; a clip whose existing copy does not answer in time (a sleeping NAS) stays in the plan as unchecked, and its render looks again and never makes a second copy.
 - The first time, and whenever more than five copies are due, it shows the count, the estimated size and the free space, and asks: render and sync, sync without rendering, or cancel.
 - The render is queued, and the Sync is queued as its own job right behind it. The Sync keeps its place whatever happens to the render — finished, failed, stopped, or taken off the queue.
-- Copies are written at their final name on the drive, so Immich imports each once and never sees it renamed. Nothing is uploaded and no Immich API is called by this feature.
+- Copies are written at their final name on the drive, so Immich imports each once and never sees it renamed. Nothing is uploaded. The render itself calls no Immich API; the Sync after it asks Immich to scan.
 
-Send to Immich also checks for log clips without a copy, every time, and offers to render them first. Clips that are only on the NAS get their copy written straight into the NAS event's `Edited/Rec709`. The copies then take their originals' places in the event albums, and are stacked on top with **Stack bursts and edits** on. See `IMMICH.md` › Send to Immich.
+Send to Immich also checks for log clips without a copy, every time, and offers to render them first. Clips that are only on the NAS get their copy written straight into the NAS event's `Edited/Rec709`. The copies then take their originals' places in the event albums, and are stacked on top where stacking is on (see `IMMICH.md` › Stacks). See `IMMICH.md` › Send to Immich.
 
 ## Not covered
 

@@ -270,11 +270,13 @@ extension DashboardModel {
     func loadImmichAlbumStates() {
         let catalogURL = catalogURLForImmich
         Task { @MainActor [weak self] in
-            let (states, records, links) = await Task.detached(priority: .utility) {
+            let (states, records, links, stackedEvents) = await Task.detached(priority: .utility) {
                 ((try? ImmichEventAlbumStore(catalogURL: catalogURL).all()) ?? [:],
                  (try? ImmichStackStore(catalogURL: catalogURL).records()) ?? [:],
-                 ImmichEventAlbumStore.existingLinks(catalogURL: catalogURL))
+                 ImmichEventAlbumStore.existingLinks(catalogURL: catalogURL),
+                 ImmichStackEventStore.existing(catalogURL: catalogURL))
             }.value
+            if self?.immichStackedEventIDs != stackedEvents { self?.immichStackedEventIDs = stackedEvents }
             let linksByEvent = Dictionary(grouping: links, by: \.eventID)
             if self?.immichAlbumLinks != linksByEvent { self?.immichAlbumLinks = linksByEvent }
             let live = records.values.filter { !$0.stackID.isEmpty && $0.removedInImmich != true }
@@ -521,6 +523,9 @@ extension DashboardModel {
             immichAlbumStates[eventID] = state
         }
         if let library = outcome.library { immichLibrary = library }
+        for (key, state) in outcome.graded.states where immichGradedCopyStates[key] != state {
+            immichGradedCopyStates[key] = state
+        }
         if let created = outcome.stacks?.created, !created.isEmpty { loadImmichAlbumStates() }
     }
 }
@@ -533,4 +538,14 @@ struct ImmichAlbumChoice: Identifiable, Equatable {
     /// The event's own album (the one that may be kept filled).
     var isMain: Bool
     var url: URL
+}
+
+extension DashboardModel {
+    /// A render job's copies: kept for the Jobs window, and in the job's
+    /// history so a later session shows them too.
+    func noteRenderedCopies(_ copies: [JobGradedCopy], jobID: UUID) {
+        guard !copies.isEmpty else { return }
+        renderedCopiesByJob[jobID] = copies
+        jobHistoryRecorders[jobID]?.noteGradedCopies(copies)
+    }
 }

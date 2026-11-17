@@ -10,6 +10,9 @@ extension ClipGrading {
         var refusals: [String] = []
         /// Said with the job (clips set to Stabilize rendered graded only).
         var notes: [String] = []
+        /// Each clip's event, by its identity (`sourceKey`), so its copy is
+        /// written down for Immich (`GradedCopyStore`).
+        var eventBySourceKey: [String: UUID] = [:]
     }
 
     /// Which `Edited` folder a clip's copy goes to: the drive's when the
@@ -54,6 +57,7 @@ extension ClipGrading {
                     continue
                 }
                 plan.eventIDs.insert(event.id)
+                plan.eventBySourceKey[Self.fileKey(item.primary)] = event.id
                 let output = GradedRenderNaming.outputFolder(editedRoot: edited)
                 // On the drive, the NAS copy of the folder is checked too:
                 // a copy Sync already carried counts, and its name is never
@@ -217,6 +221,7 @@ extension ClipGrading {
                     return request
                 }
                 plan.eventIDs = Set(events.map(\.id))
+                plan.eventBySourceKey = Self.eventsBySourceKey(inputs)
                 if let note = stabilizing.unavailableNote(forKeys: survey.pending.map(\.sourceKey)) { plan.notes.append(note) }
                 enqueueRender(plan, reason: "Before Sync to NAS: Rec.709 copies of graded log clips into Edited/\(GradedRenderNaming.folderName), so they reach the NAS and Immich.")
                 model.enqueueFileJob(
@@ -233,10 +238,18 @@ extension ClipGrading {
     /// The file keys of every clip a before-sync or send plan could take,
     /// from the catalog alone (no file or Gyroflow access).
     static func plannedKeys(_ inputs: GradedSyncPlanner.Inputs) -> Set<String> {
+        Set(eventsBySourceKey(inputs).keys)
+    }
+
+    /// The same clips, each with its event.
+    static func eventsBySourceKey(_ inputs: GradedSyncPlanner.Inputs) -> [String: UUID] {
         let events = Set(inputs.events.map(\.id))
-        return Set(inputs.assignments.filter { events.contains($0.eventID) }.map { assignment in
-            FaceIndexStore.fileKey(fileName: (assignment.relativePath as NSString).lastPathComponent, byteCount: assignment.fileSize, modifiedAt: assignment.modifiedAt)
-        })
+        var result: [String: UUID] = [:]
+        for assignment in inputs.assignments where events.contains(assignment.eventID) {
+            let key = FaceIndexStore.fileKey(fileName: (assignment.relativePath as NSString).lastPathComponent, byteCount: assignment.fileSize, modifiedAt: assignment.modifiedAt)
+            if result[key] == nil { result[key] = assignment.eventID }
+        }
+        return result
     }
 
     struct BeforeSyncSurvey: Sendable {
@@ -382,6 +395,9 @@ extension ClipGrading {
             + plan.notes.map { " " + $0 }.joined()
         let renderer = self.renderer
         let stabilizer = stabilizing.stabilizerForRender(requests)
+        let locations = workspace.locations
+        let catalogURL = model.catalogURLForImmich
+        let placed = Self.placedForRecording(requests, events: plan.eventBySourceKey, locations: locations)
         model.enqueueFileJob(
             action: .gradeRender,
             queuedNote: "\(title).",
@@ -400,12 +416,98 @@ extension ClipGrading {
                 onSettled: { @MainActor in model.unregisterStop(jobID: jobID) },
                 jobID: jobID,
                 operation: { progress in
-                    try Self.runRender(requests, renderer: renderer, stabilizer: stabilizer, isStopped: { stop.isStopped }, progress: progress)
+                    let outcome = try Self.runRender(requests, renderer: renderer, stabilizer: stabilizer, isStopped: { stop.isStopped }, progress: progress)
+                    let problems = Self.recordRenderedCopies(placed, outcome: outcome, requests: requests, locations: locations, catalogURL: catalogURL, progress: progress)
+                    return ImmichSendRenderResult(outcome: outcome, recordProblems: problems)
                 },
-                completion: { [weak self] (outcome: RenderOutcome) in
+                completion: { [weak self] (result: ImmichSendRenderResult) in
                     for eventID in eventIDs { self?.workspace.refreshEditTags(for: eventID) }
-                    return Self.summary(outcome, refusals: refusals)
+                    self?.finishedRender(jobID: jobID, outcome: result.outcome, placed: placed, requests: requests)
+                    var summary = Self.summary(result.outcome, refusals: refusals)
+                    if !result.recordProblems.isEmpty {
+                        summary += " \(result.recordProblems.count) NAS cop\(result.recordProblems.count == 1 ? "y" : "ies") could not be checked (\(result.recordProblems[0]))."
+                    }
+                    return summary
                 }
+            )
+        }
+    }
+
+    /// Each request with its event and the original's path under the NAS
+    /// root, so its copy can be written down for Immich. A clip with no
+    /// event, or not in an event folder (still on a card), is left out.
+    nonisolated static func placedForRecording(
+        _ requests: [GradedRenderRequest],
+        events: [String: UUID],
+        locations: EventStorageLocations
+    ) -> [GradedSyncPlanner.PlacedRequest] {
+        requests.compactMap { request in
+            guard let eventID = events[request.sourceKey] else { return nil }
+            let source = request.source.standardizedFileURL.path
+            let original = locations.nasRelativePath(source) ?? locations.mirrorRelativePath(forDrivePath: source)
+            guard let original else { return nil }
+            let onNAS = locations.nasRelativePath(request.outputFolder.standardizedFileURL.path) != nil
+            return GradedSyncPlanner.PlacedRequest(request: request, placement: onNAS ? .nas : .drive, eventID: eventID, eventAssetID: "", originalRelativePath: original)
+        }
+    }
+
+    /// After a render: every copy made or found is written down
+    /// (`GradedCopyStore`), and one on the NAS is re-read whole and
+    /// recorded as verified there (`recordGradedCopies`), so Immich checks
+    /// find it, put it in its original's album place and stack it.
+    nonisolated static func recordRenderedCopies(
+        _ placed: [GradedSyncPlanner.PlacedRequest],
+        outcome: RenderOutcome,
+        requests: [GradedRenderRequest],
+        locations: EventStorageLocations,
+        catalogURL: URL,
+        progress: @Sendable (BackgroundJobUpdate) -> Void = { _ in }
+    ) -> [String] {
+        var copies: [String: URL] = [:]
+        for (index, url) in outcome.copies where requests.indices.contains(index) { copies[requests[index].sourceKey] = url }
+        guard !placed.isEmpty, !copies.isEmpty else { return [] }
+        if copies.values.contains(where: { locations.nasRelativePath($0.standardizedFileURL.path) != nil }) {
+            progress(BackgroundJobUpdate(progress: 0.99, note: "Checking the copies written to the NAS…", phase: "Verify"))
+        }
+        return recordGradedCopies(
+            placed, copies: copies, newlyRendered: Set(outcome.rendered.map(\.standardizedFileURL.path)),
+            locations: locations, catalogURL: catalogURL
+        )
+    }
+
+    /// A render job finished: its copies are kept with the job for the
+    /// Jobs window, and when one is on the NAS Immich is asked to scan
+    /// (the same follow-up Sync uses), so the next checks add it to the
+    /// album and stack it. A copy still on the drive waits for Sync.
+    func finishedRender(jobID: UUID, outcome: RenderOutcome, placed: [GradedSyncPlanner.PlacedRequest], requests: [GradedRenderRequest]) {
+        let copies = Self.jobCopies(outcome: outcome, requests: requests, placed: placed, locations: workspace.locations)
+        guard !copies.isEmpty else { return }
+        model.noteRenderedCopies(copies, jobID: jobID)
+        if copies.contains(where: \.isOnNAS) { workspace.followNASChangeInImmich() }
+    }
+
+    /// The finished job's copies: where each was written, under the
+    /// library, and where it is on disk.
+    nonisolated static func jobCopies(
+        outcome: RenderOutcome,
+        requests: [GradedRenderRequest],
+        placed: [GradedSyncPlanner.PlacedRequest],
+        locations: EventStorageLocations
+    ) -> [JobGradedCopy] {
+        let made = Set(outcome.rendered.map(\.standardizedFileURL.path))
+        let recorded = Dictionary(placed.map { ($0.request.sourceKey, $0.eventID) }) { first, _ in first }
+        return outcome.copies.keys.sorted().compactMap { index -> JobGradedCopy? in
+            guard let url = outcome.copies[index], requests.indices.contains(index) else { return nil }
+            let path = url.standardizedFileURL.path
+            let nas = locations.nasRelativePath(path)
+            let relative = nas ?? locations.mirrorRelativePath(forDrivePath: path) ?? url.lastPathComponent
+            return JobGradedCopy(
+                path: path,
+                libraryRelativePath: relative,
+                isOnNAS: nas != nil,
+                wasRendered: made.contains(path),
+                isWrittenDown: recorded[requests[index].sourceKey] != nil,
+                eventID: recorded[requests[index].sourceKey]
             )
         }
     }

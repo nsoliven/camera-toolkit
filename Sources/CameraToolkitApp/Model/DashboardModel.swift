@@ -125,6 +125,9 @@ final class DashboardModel {
     /// Group keys of app stacks someone unstacked in Immich; the app does not
     /// make them again unless asked.
     var immichUnstackedKeys: Set<String> = []
+    /// Events stacked one at a time (`ImmichStackEventStore`): kept stacked
+    /// while the global "Stack bursts and edits" switch is off.
+    var immichStackedEventIDs: Set<UUID> = []
     /// The key's user, once read: albums owned by anyone else are shared.
     var immichCurrentUserID: String?
     /// The chosen library as the last check or pairing read it.
@@ -380,6 +383,12 @@ final class DashboardModel {
     @ObservationIgnored var jobHistoryFinishedOrder: [UUID] = []
     /// Increments when a recorded job ends, so the History list reloads.
     var jobHistoryRevision: Int = 0
+    /// Graded copies each render job of this session made or found (the
+    /// job's history summary keeps them too).
+    var renderedCopiesByJob: [UUID: [JobGradedCopy]] = [:]
+    /// Each graded copy's Immich state as the last check found it, by its
+    /// path key under the NAS root.
+    var immichGradedCopyStates: [String: ImmichGradedCopyState] = [:]
 
     init(
         jobs: [JobSnapshot],
