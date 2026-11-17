@@ -39,6 +39,8 @@ final class ClipGrading {
     /// What sending means once grading is settled; tests answer it
     /// themselves. Nil sends through the workspace.
     @ObservationIgnored var startImmichSend: (@MainActor (Set<UUID>) -> Void)?
+    /// Backs `stabilizing` (ClipStabilizing.swift).
+    @ObservationIgnored var stabilizingStorage: ClipStabilizing?
 
     /// Detected profile by file key: present once the sidecar was read
     /// (nil value = read, not log).
@@ -81,11 +83,13 @@ final class ClipGrading {
         if summary.alreadyThere > 0 { lines.append("\(summary.alreadyThere) cop\(summary.alreadyThere == 1 ? "y is" : "ies are") already there and will not be made again.") }
         if summary.isFirstRun { lines.append("This is asked the first time, and again whenever more than \(renderBeforeSyncAskAbove) copies are due. Turn it off in Settings › Color.") }
         alert.informativeText = lines.joined(separator: "\n\n")
+        let stabilize = summary.stabilized > 0 ? StabilizeRenderAsk.checkbox(count: summary.stabilized) : nil
+        if let stabilize { alert.accessoryView = stabilize }
         alert.addButton(withTitle: "Render and Sync")
         alert.addButton(withTitle: "Sync Without Rendering")
         alert.addButton(withTitle: "Cancel")
         switch alert.runModal() {
-        case .alertFirstButtonReturn: return .renderThenSync
+        case .alertFirstButtonReturn: return (stabilize?.state ?? .on) == .on ? .renderThenSync : .renderThenSyncWithoutStabilizing
         case .alertSecondButtonReturn: return .syncOnly
         default: return .cancel
         }
@@ -103,7 +107,7 @@ final class ClipGrading {
         guard item.kind == .video else { return false }
         let ext = item.primary.fileExtension
         guard ["mp4", "mov", "m4v", "mxf"].contains(ext) else { return false }
-        return !GradedRenderNaming.isGradedCopy(item.primary.url)
+        return !GradedRenderNaming.isGradedCopy(item.primary.url) && !StabilizedRenderNaming.isStabilizedCopy(item.primary.url)
     }
 
     func explicitGrade(for item: OrganizeItem) -> ClipGrade? {

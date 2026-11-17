@@ -679,6 +679,7 @@ struct JobListRow: View {
         switch action {
         case .faceScan: "person.crop.rectangle.stack"
         case .gradeRender: "camera.filters"
+        case .stabilize: "gyroscope"
         case .organize: "rectangle.3.group"
         case .nasRename: "arrow.left.arrow.right"
         case .ingestCard: "arrow.down.circle"
@@ -1225,6 +1226,7 @@ extension JobAction {
         case .nasRename: "NAS Rename"
         case .resolveConflict: "Resolve Conflict"
         case .gradeRender: "Render Graded Copies"
+        case .stabilize: "Stabilize"
         }
     }
 }

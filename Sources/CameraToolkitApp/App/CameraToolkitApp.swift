@@ -142,9 +142,11 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate, NSMenuIte
             TransferQueueWindowController.shared.show(model: model)
         }
         CrashReporting.checkPreviousRunSoon()
+        StabilizeLifecycle.cleanUpAtLaunch(workspace: CameraToolkitRuntime.workspace)
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        StabilizeLifecycle.endAllRuns()
         NotificationCenter.default.removeObserver(self)
         model.flushConfigurationSave()
         model.flushJobHistory()
@@ -159,7 +161,10 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate, NSMenuIte
     /// mid-scan abandons it. Original camera files are never touched by a
     /// job, so warn rather than block: the user can still quit anyway.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard let job = model.activeJob else { return .terminateNow }
+        guard let job = model.activeJob else {
+            StabilizeLifecycle.endAllRuns()
+            return .terminateNow
+        }
 
         let alert = NSAlert()
         alert.alertStyle = .warning
@@ -169,7 +174,10 @@ final class CameraToolkitApplication: NSObject, NSApplicationDelegate, NSMenuIte
         quit.hasDestructiveAction = true
         let stay = alert.addButton(withTitle: "Don't Quit")
         stay.keyEquivalent = "\u{1b}"
-        return alert.runModal() == .alertFirstButtonReturn ? .terminateNow : .terminateCancel
+        guard alert.runModal() == .alertFirstButtonReturn else { return .terminateCancel }
+        // Quit Anyway: a stabilizer run must not outlive the app.
+        StabilizeLifecycle.endAllRuns()
+        return .terminateNow
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {

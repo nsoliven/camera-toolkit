@@ -385,6 +385,8 @@ public struct CatalogStore {
             updated_at TEXT NOT NULL
         );
         """, database: database)
+        // Per-clip stabilization (`StabilizationStore`): a new table only.
+        try execute(StabilizationStore.schema, database: database)
         try execute(NASSyncStore.schema, database: database)
     }
 

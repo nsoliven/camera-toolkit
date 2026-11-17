@@ -35,6 +35,8 @@ final class BlanketGradeModel {
         didSet { if intensity != oldValue { refreshAfters() } }
     }
     var alsoMakeDefault = false
+    /// Stabilization for the same clips (`BlanketStabilizeControls`).
+    var stabilize = BlanketStabilizeChoice()
     let lookName: (GradeLook) -> String
     @ObservationIgnored private let renderer: GradeRenderer
     @ObservationIgnored private var afterTask: Task<Void, Never>?
@@ -109,6 +111,8 @@ struct BlanketGradeSheet: View {
     @Bindable var model: BlanketGradeModel
     var onCancel: () -> Void
     var onApply: () -> Void
+    /// Offered beside Apply when the sheet can also render (a board).
+    var onApplyAndRender: (() -> Void)?
 
     private let columns = [GridItem(.adaptive(minimum: 196, maximum: 260), spacing: 14)]
 
@@ -189,6 +193,10 @@ struct BlanketGradeSheet: View {
             }
             .frame(minHeight: 280)
 
+            BlanketStabilizeControls(choice: $model.stabilize)
+                .padding(.horizontal, 20)
+                .padding(.bottom, 8)
+
             Divider()
 
             VStack(alignment: .leading, spacing: 10) {
@@ -207,10 +215,20 @@ struct BlanketGradeSheet: View {
                     Spacer()
                     Button("Cancel", role: .cancel, action: onCancel)
                         .keyboardShortcut(.cancelAction)
-                    Button(model.rows.isEmpty ? "Apply" : "Apply to \(model.rows.count) Clip\(model.rows.count == 1 ? "" : "s")", action: onApply)
-                        .keyboardShortcut(.defaultAction)
-                        .buttonStyle(.borderedProminent)
-                        .disabled(model.rows.isEmpty || model.isLoading)
+                    if let onApplyAndRender {
+                        Button(model.rows.isEmpty ? "Apply" : "Apply to \(model.rows.count) Clip\(model.rows.count == 1 ? "" : "s")", action: onApply)
+                            .disabled(model.rows.isEmpty || model.isLoading)
+                        Button("Apply and Render", action: onApplyAndRender)
+                            .keyboardShortcut(.defaultAction)
+                            .buttonStyle(.borderedProminent)
+                            .disabled(model.rows.isEmpty || model.isLoading)
+                            .help("Saves the look\(model.stabilize.isOn ? " and stabilization" : ""), then renders \(model.stabilize.isOn ? "stabilized, " : "")graded copies into Edited/\(GradedRenderNaming.folderName)")
+                    } else {
+                        Button(model.rows.isEmpty ? "Apply" : "Apply to \(model.rows.count) Clip\(model.rows.count == 1 ? "" : "s")", action: onApply)
+                            .keyboardShortcut(.defaultAction)
+                            .buttonStyle(.borderedProminent)
+                            .disabled(model.rows.isEmpty || model.isLoading)
+                    }
                 }
             }
             .padding(.horizontal, 20)
@@ -339,6 +357,8 @@ extension ClipGrading {
             let convertible = rows.filter { $0.conversion.converts }
             model.conversionTitle = convertible.first.map { conversionTitle($0.conversion, profile: $0.profile) } ?? ""
             model.load(rows: convertible, notLogCount: notLog + rows.count - convertible.count, looks: availableLooks(for: convertible.first?.profile))
+            let ids = Set(convertible.map(\.id))
+            await stabilizing.fillBlanketChoice(model, items: request.items.filter { ids.contains($0.id) })
             // Posters: tiles have usually decoded them already.
             for item in request.items where rows.contains(where: { $0.id == item.id }) {
                 let image = await TileImageLoader.shared.image(
@@ -361,7 +381,10 @@ extension ClipGrading {
         if model.alsoMakeDefault, model.profiles.count == 1, let profile = model.profiles.first {
             setDefaultLook(model.look, for: profile)
         }
-        self.model.statusMessage = "\(lookName(model.look)) on \(count) log clip\(count == 1 ? "" : "s"). Originals untouched — ⌘Z undoes it."
+        let stabilized = stabilizing.applyBlanketChoice(model.stabilize, items: targets)
+        self.model.statusMessage = "\(lookName(model.look)) on \(count) log clip\(count == 1 ? "" : "s")"
+            + (stabilized.map { $0 > 0 ? ", stabilize on for \($0)" : ", stabilize off" } ?? "")
+            + ". Originals untouched — ⌘Z undoes it."
     }
 }
 
@@ -384,10 +407,18 @@ struct BlanketGradeSheetHost: ViewModifier {
                         onApply: {
                             workspace.grading.applyBlanket(model, items: request.items)
                             self.request = nil
+                        },
+                        onApplyAndRender: {
+                            workspace.grading.applyBlanket(model, items: request.items)
+                            let ids = Set(model.rows.map(\.id))
+                            let targets = request.items.filter { ids.contains($0.id) }
+                            workspace.grading.renderGradedCopies(of: targets.map { OrganizeStack(items: [$0]) }, boardEventID: request.boardEventID)
+                            self.request = nil
                         }
                     )
                 }
             }
+            .modifier(StabilizeAllSheetHost(workspace: workspace))
     }
 }
 

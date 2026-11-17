@@ -31,6 +31,8 @@ final class ImmichSendGradeAsk: Identifiable {
     struct RenderOption: Identifiable, Equatable {
         enum Kind: String, Equatable {
             case grade
+            /// Stabilize first (`ClipStabilizing.stabilizeOption`).
+            case stabilize
         }
 
         var id: Kind
@@ -120,9 +122,15 @@ extension ClipGrading {
         let renderer = self.renderer
         let locations = workspace.locations
         let catalogURL = model.catalogURLForImmich
+        let stabilizing = self.stabilizing
+        let plannedKeys = Self.plannedKeys(inputs)
         Task { @MainActor [weak self] in
+            // Which clips are stabilized depends on Gyroflow: wait for the
+            // search, only when a clip here is set to Stabilize, and not forever.
+            await stabilizing.ensureAvailability(forKeys: plannedKeys)
+            let stabilization = stabilizing.renderStabilizationMap()
             let found = await Task.detached(priority: .userInitiated) {
-                Self.planImmichSend(inputs, readsNAS: readsNAS, renderer: renderer, progress: { done, total in
+                Self.planImmichSend(inputs, readsNAS: readsNAS, renderer: renderer, stabilization: stabilization, progress: { done, total in
                     Task { @MainActor in
                         if case .checking = ask.stage, total > 0 {
                             ask.stage = .checking("Checking which clips already have a Rec.709 copy: \(done) of \(total)…")
@@ -166,6 +174,7 @@ extension ClipGrading {
         _ inputs: GradedSyncPlanner.Inputs,
         readsNAS: Bool,
         renderer: GradeRenderer,
+        stabilization: [String: RenderStabilization] = [:],
         check: (@Sendable (GradedRenderRequest, TimeInterval) -> GradedVideoExporter.ExistingRenderCheck)? = nil,
         progress: @escaping @Sendable (Int, Int) -> Void = { _, _ in },
         record: ([GradedSyncPlanner.PlacedRequest], [String: URL]) -> Void = { _, _ in },
@@ -176,7 +185,12 @@ extension ClipGrading {
             readsNAS: readsNAS,
             detect: { LogProfileDetector.profile(clipBesideSidecar: $0) },
             range: { _ in .full }
-        )
+        ).map { item in
+            // A clip set to Stabilize needs its stabilized copy.
+            var item = item
+            item.request.stabilization = stabilization[item.request.sourceKey]
+            return item
+        }
         guard !placed.isEmpty else { return ImmichSendPlan() }
         let survey = survey(placed.map(\.request), renderer: renderer, check: check, progress: progress)
         if !survey.existing.isEmpty { record(placed, survey.existing) }
@@ -215,6 +229,7 @@ extension ClipGrading {
             return
         }
         ask.pending = plan.pending
+        ask.setStabilizeOption(stabilizing.stabilizeOption(for: plan.pending))
         ask.estimatedBytes = plan.estimatedBytes
         ask.unchecked = plan.unchecked
         ask.driveAwayCount = plan.driveAwayCount
@@ -274,6 +289,12 @@ extension ClipGrading {
         if blanket.alsoMakeDefault, blanket.profiles.count == 1, let profile = blanket.profiles.first {
             setDefaultLook(blanket.look, for: profile)
         }
+        // The quick sheet's Stabilize choice, then each copy's stabilization
+        // as it is now.
+        stabilizing.applyBlanketChoice(blanket.stabilize, keys: keys.sorted())
+        ask.pending = stabilizing.refreshStabilization(of: ask.pending)
+        let option = stabilizing.stabilizeOption(for: ask.pending)
+        ask.setStabilizeOption(option)
         // The copies are drawn with the grades as they are now.
         let resolver = self.resolver
         let grades = model.colorGradesSnapshot
@@ -333,6 +354,8 @@ extension ClipGrading {
         blanket.load(rows: rows, notLogCount: 0, looks: availableLooks(for: rows.first?.profile))
         ask.blanket = blanket
         ask.stage = .choosingLooks
+        let clips = ask.pending.map { (key: $0.request.sourceKey, url: $0.request.source) }
+        Task { @MainActor [weak self] in await self?.stabilizing.fillBlanketChoice(blanket, clips: clips) }
         let missing = ask.pending.filter { item in !rows.contains { $0.id == item.request.sourceKey && $0.before != nil } }
         Task { @MainActor in
             for item in missing {
@@ -400,7 +423,8 @@ extension ClipGrading {
     /// nil, a request renders exactly as before).
     func applyRenderOptions(_ options: [ImmichSendGradeAsk.RenderOption], to items: [GradedSyncPlanner.PlacedRequest]) -> [GradedSyncPlanner.PlacedRequest] {
         guard options.contains(where: { $0.id == .grade && $0.isOn && $0.isAvailable }) else { return [] }
-        return items
+        let stabilizes = options.contains { $0.id == .stabilize && $0.isOn && $0.isAvailable }
+        return stabilizes ? items : items.withoutStabilization()
     }
 
     private func gradeAndSend(_ ask: ImmichSendGradeAsk) {
@@ -478,6 +502,7 @@ extension ClipGrading {
         let locations = workspace.locations
         let catalogURL = model.catalogURLForImmich
         let eventIDs = Set(items.map(\.eventID))
+        let stabilizer = stabilizing.stabilizerForRender(requests)
         return model.enqueueFileJob(
             action: .gradeRender,
             queuedNote: "\(title).",
@@ -496,7 +521,7 @@ extension ClipGrading {
                 onSettled: { @MainActor in model.unregisterStop(jobID: jobID) },
                 jobID: jobID,
                 operation: { progress in
-                    let outcome = try Self.runRender(requests, renderer: renderer, isStopped: { stop.isStopped }, progress: progress)
+                    let outcome = try Self.runRender(requests, renderer: renderer, stabilizer: stabilizer, isStopped: { stop.isStopped }, progress: progress)
                     var copies: [String: URL] = [:]
                     for (index, url) in outcome.copies { copies[requests[index].sourceKey] = url }
                     progress(BackgroundJobUpdate(progress: 0.99, note: "Checking the copies written to the NAS…", phase: "Verify"))
