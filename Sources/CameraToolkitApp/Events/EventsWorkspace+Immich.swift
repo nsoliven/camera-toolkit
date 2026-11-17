@@ -74,6 +74,25 @@ extension EventsWorkspace {
         }
     }
 
+    /// Stop Stacking This Event in Immich: later checks leave this event's
+    /// stacks alone. The stacks already in Immich stay; unstack them there
+    /// if they are not wanted.
+    func stopStackingEventInImmich(_ eventID: UUID) {
+        let catalogURL = model.catalogURLForImmich
+        Task { @MainActor [weak self] in
+            do {
+                try await Task.detached(priority: .utility) {
+                    try ImmichStackEventStore(catalogURL: catalogURL).remove([eventID])
+                }.value
+            } catch {
+                self?.model.statusMessage = "Could not stop stacking the event: \(error.localizedDescription)"
+                return
+            }
+            self?.model.immichStackedEventIDs.remove(eventID)
+            self?.model.statusMessage = "This event is no longer stacked by the app. Its stacks in Immich stay as they are."
+        }
+    }
+
     /// The Check button: scan and compare now, and say how it went.
     func checkImmichNow() {
         guard immichIsConfigured else {

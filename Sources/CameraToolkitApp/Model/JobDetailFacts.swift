@@ -681,3 +681,15 @@ extension JobDetailFacts {
         }
     }
 }
+
+extension JobDetailFacts {
+    /// What Show in Finder says when some copies are not there (moved,
+    /// renamed, or the drive or NAS is away); nil when all are.
+    static func revealMessage(found: Int, of total: Int) -> String? {
+        guard found < total else { return nil }
+        if total == 1 { return "The copy is not there now: it was moved, or its drive or NAS is not connected." }
+        return found == 0
+            ? "None of the copies are there now: they were moved, or their drive or NAS is not connected."
+            : "\(total - found) of \(total) copies are not there now; Finder shows the others."
+    }
+}

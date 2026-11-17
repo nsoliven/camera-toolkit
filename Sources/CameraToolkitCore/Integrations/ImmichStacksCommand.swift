@@ -104,6 +104,12 @@ public enum ImmichStacksCommand {
                 let wanted = Set(parsed.eventNames.map { NASSyncStore.pathKey($0) })
                 events = events.filter { wanted.contains(NASSyncStore.pathKey($0.name)) }
                 guard !events.isEmpty else { throw ToolkitError.commandFailed("No event has that name.") }
+                // A real run marks the events it stacks, so a name must say
+                // which one.
+                let shared = Dictionary(grouping: events, by: { NASSyncStore.pathKey($0.name) }).filter { $0.value.count > 1 }
+                if !parsed.dryRun, let name = shared.values.first?.first?.name {
+                    throw ToolkitError.commandFailed("\(shared.values.first!.count) events are named “\(name)”; rename one first, or use Stack This Event in Immich in the app.")
+                }
             }
             let eventIDs = Set(events.map(\.id))
 

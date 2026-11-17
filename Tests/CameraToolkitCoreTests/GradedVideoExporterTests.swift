@@ -290,7 +290,7 @@ final class GradedVideoExporterTests: XCTestCase {
             let copy = rec709.appendingPathComponent("C0003_709.mov")
             try Self.makeClip(at: copy, frames: 6, metadata: [Self.textItem(.quickTimeMetadataCreationDate, "2026-06-01T17:20:30Z"), sourceTag])
             try FileManager.default.setAttributes([.modificationDate: captured], ofItemAtPath: copy.path)
-            let moment = GradedVideoExporter.CaptureMoment(date: captured, offsetSeconds: -25_200)
+            let moment = GradedVideoExporter.CaptureMoment(date: captured, offsetSeconds: -25_200, dateIsFromFile: true)
             XCTAssertTrue(GradedCopyDateRepair.needsRepair(copy, moment: moment))
 
             try GradedCopyDateRepair.repair(GradedCopyDateRepair.Found(
@@ -308,6 +308,74 @@ final class GradedVideoExporterTests: XCTestCase {
             XCTAssertEqual((attributes[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0, captured.timeIntervalSince1970, accuracy: 1)
             XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: rec709.path), ["C0003_709.mov"], "no partial left")
             XCTAssertEqual(try Data(contentsOf: original), originalBytes, "the original is only read")
+        }
+    }
+
+    private func sourceTagged(_ key: String, creationDate: String) -> [AVMetadataItem] {
+        let tag = AVMutableMetadataItem()
+        tag.keySpace = .quickTimeMetadata
+        tag.key = GradedVideoExporter.metadataSourceKey as NSString
+        tag.value = key as NSString
+        tag.dataType = kCMMetadataBaseDataType_UTF8 as String
+        return [Self.textItem(.quickTimeMetadataCreationDate, creationDate), tag]
+    }
+
+    /// When the original cannot be read, its capture time is a fallback:
+    /// the survey skips the copy as "original unreadable" and the repair
+    /// refuses, so a fallback time is never written over an existing copy.
+    /// A copy whose clip is in two events belongs to the event whose
+    /// Edited folder holds it.
+    func testAnUnreadableOriginalIsNeverUsedAndTheCopysOwnEventWins() throws {
+        try withTemporaryDirectory { root in
+            let configuration = AppConfiguration.testConfiguration(root: root, catalog: root.appendingPathComponent("catalog.sqlite"))
+            let locations = EventStorageLocations(configuration: configuration)
+            let first = SavedCameraEvent(name: "Trip", eventDate: Date(timeIntervalSince1970: 1_780_000_000))
+            let second = SavedCameraEvent(name: "Beach", eventDate: Date(timeIntervalSince1970: 1_780_100_000))
+            let stamp = Date(timeIntervalSince1970: 1_780_334_000)
+            func assignment(_ event: SavedCameraEvent) -> PhotoEventAssignment {
+                PhotoEventAssignment(sourceRootPath: root.appendingPathComponent("Card").path, relativePath: "C0004.MP4", fileSize: 99, modifiedAt: stamp, eventID: event.id)
+            }
+            let key = FaceIndexStore.fileKey(fileName: "C0004.MP4", byteCount: 99, modifiedAt: stamp)
+            let inSecond = assignment(second)
+            let original = try XCTUnwrap(locations.archiveURL(for: inSecond, event: second))
+            try FileManager.default.createDirectory(at: original.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Self.makeClip(at: original, frames: 6)
+            let folder = GradedRenderNaming.outputFolder(editedRoot: locations.nasEditedRoot(for: second))
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            let copy = folder.appendingPathComponent("C0004_709.mov")
+            try Self.makeClip(at: copy, frames: 6, metadata: sourceTagged(key, creationDate: "2026-06-01T17:20:30Z"))
+
+            let found = GradedCopyDateRepair.survey(
+                events: [second], allEvents: [first, second],
+                assignments: [assignment(first), inSecond], locations: locations
+            )
+            XCTAssertEqual(found.map(\.eventID), [second.id], "the event whose Edited folder holds the copy")
+            XCTAssertEqual(found.first?.originalUnreadable, false)
+
+            // The original stops answering: a fallback time, never written.
+            XCTAssertFalse(GradedVideoExporter.captureMoment(of: root.appendingPathComponent("gone.MP4"), fallback: stamp).dateIsFromFile)
+            var unreadable = try XCTUnwrap(found.first)
+            unreadable.moment = GradedVideoExporter.CaptureMoment(date: stamp, dateIsFromFile: false)
+            unreadable.originalUnreadable = true
+            let before = try Data(contentsOf: copy)
+            XCTAssertThrowsError(try GradedCopyDateRepair.repair(unreadable))
+            XCTAssertEqual(try Data(contentsOf: copy), before, "the copy is left as it was")
+            try FileManager.default.removeItem(at: original)
+            let skipped = GradedCopyDateRepair.survey(events: [second], allEvents: [first, second], assignments: [inSecond], locations: locations)
+            XCTAssertTrue(skipped.allSatisfy { !$0.needsRepair }, "no original, nothing to repair from")
+        }
+    }
+
+    /// A corrupt 64-bit atom size stops the walk; it never traps.
+    func testACorruptAtomSizeNeverTraps() throws {
+        try withTemporaryDirectory { root in
+            let url = root.appendingPathComponent("bad.mov")
+            var bytes = Data([0, 0, 0, 1]) + Data("moov".utf8)
+            bytes += Data(repeating: 0xFF, count: 8)
+            bytes += Data(repeating: 0, count: 32)
+            try bytes.write(to: url)
+            XCTAssertEqual(try QuickTimeHeaderDates.read(url), [])
+            XCTAssertThrowsError(try QuickTimeHeaderDates.stamp(url, date: Date()))
         }
     }
 

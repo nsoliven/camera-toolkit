@@ -26,6 +26,10 @@ public enum GradedCopyDateRepair {
         public var moment: GradedVideoExporter.CaptureMoment
         public var isOnNAS: Bool
         public var needsRepair: Bool
+        /// The original's capture time could not be read (a NAS that did
+        /// not answer): nothing is repaired, so a fallback time is never
+        /// written over the copy.
+        public var originalUnreadable: Bool = false
     }
 
     /// Every graded copy in these events' `Edited/Rec709` folders, on the
@@ -39,11 +43,13 @@ public enum GradedCopyDateRepair {
         exists: (URL) -> Bool = { FileManager.default.fileExists(atPath: $0.path) }
     ) -> [Found] {
         let byID = Dictionary(allEvents.map { ($0.id, $0) }) { first, _ in first }
-        var originals: [String: (PhotoEventAssignment, SavedCameraEvent)] = [:]
+        // The same clip can be in more than one event: each surveyed folder
+        // prefers its own event's assignment.
+        var originals: [String: [(PhotoEventAssignment, SavedCameraEvent)]] = [:]
         for assignment in assignments {
             guard let event = byID[assignment.eventID] else { continue }
             let key = FaceIndexStore.fileKey(fileName: (assignment.relativePath as NSString).lastPathComponent, byteCount: assignment.fileSize, modifiedAt: assignment.modifiedAt)
-            if originals[key] == nil { originals[key] = (assignment, event) }
+            originals[key, default: []].append((assignment, event))
         }
         var found: [Found] = []
         var seen = Set<String>()
@@ -58,7 +64,8 @@ public enum GradedCopyDateRepair {
                     guard GradedRenderNaming.isGradedCopy(copy), !GradedRenderNaming.isPartialName(entry.name),
                           seen.insert(copy.standardizedFileURL.path).inserted,
                           let source = GradedVideoExporter.readTags(copy)?.source,
-                          let (assignment, owner) = originals[source] else { continue }
+                          let candidates = originals[source],
+                          let (assignment, owner) = candidates.first(where: { $0.1.id == event.id }) ?? candidates.first else { continue }
                     let nasOriginal = locations.archiveURL(for: assignment, event: owner)
                     let driveOriginal = locations.driveURL(for: assignment, event: owner, policy: locations.resolvedPolicy(for: owner))
                     guard let original = [nasOriginal, driveOriginal].compactMap({ $0 }).first(where: exists),
@@ -71,7 +78,8 @@ public enum GradedCopyDateRepair {
                         copy: copy, eventID: owner.id, original: original,
                         originalRelativePath: originalRelative, gradedRelativePath: gradedRelative,
                         sourceKey: source, moment: moment, isOnNAS: nasRelative != nil,
-                        needsRepair: needsRepair(copy, moment: moment)
+                        needsRepair: moment.dateIsFromFile && needsRepair(copy, moment: moment),
+                        originalUnreadable: !moment.dateIsFromFile
                     ))
                 }
             }
@@ -101,6 +109,9 @@ public enum GradedCopyDateRepair {
     /// was, when anything does not check out.
     public static func repair(_ found: Found) throws {
         let copy = found.copy
+        guard found.moment.dateIsFromFile, !found.originalUnreadable else {
+            throw ToolkitError.commandFailed("The capture time of \(found.original.lastPathComponent) could not be read; \(copy.lastPathComponent) was left as it was.")
+        }
         guard let before = LayoutMigrationDisk.lstatEntry(copy.path), before.kind == .file else {
             throw ToolkitError.commandFailed("\(copy.lastPathComponent) is not there any more.")
         }
@@ -108,7 +119,14 @@ public enum GradedCopyDateRepair {
         let temporary = folder.appendingPathComponent(GradedRenderNaming.temporaryFolderName, isDirectory: true)
         try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
         let partial = temporary.appendingPathComponent(GradedRenderNaming.partialName())
+        // Set once the partial is checked: if the copy is gone by the time it
+        // should be replaced, the checked partial takes its name instead of
+        // being thrown away.
+        var checked = false
         defer {
+            if checked, DriveMoveService.exists(partial.path), !DriveMoveService.exists(copy.path) {
+                try? NASFileIO.renameExclusive(from: partial.path, to: copy.path)
+            }
             if DriveMoveService.exists(partial.path) { _ = unlink(partial.path) }
             if let entries = try? DirectoryListing.list(temporary.path) {
                 for entry in entries where entry.kind == .file && entry.name.hasPrefix(partial.lastPathComponent + ".sb-") {
@@ -124,6 +142,7 @@ public enum GradedCopyDateRepair {
             throw ToolkitError.commandFailed("The rewritten \(copy.lastPathComponent) lost its tags; the copy was left as it was.")
         }
         try FileManager.default.setAttributes([.modificationDate: before.modifiedDate, .creationDate: before.modifiedDate], ofItemAtPath: partial.path)
+        checked = true
         // Still the same file, and still the app's copy of that original.
         guard let now = LayoutMigrationDisk.lstatEntry(copy.path), now.kind == .file, now.size == before.size,
               abs(now.modifiedAt - before.modifiedAt) < 1,

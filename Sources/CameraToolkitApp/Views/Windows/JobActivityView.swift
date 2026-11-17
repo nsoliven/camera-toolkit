@@ -767,6 +767,8 @@ private struct JobIssueSection: View {
 /// its Immich state, and Show in Finder (only on a click).
 private struct JobGradedCopiesSection: View {
     let rows: [JobGradedCopyRow]
+    /// Said under the list when a copy to show is gone.
+    @State private var message: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -777,7 +779,6 @@ private struct JobGradedCopiesSection: View {
                 if rows.count > 1 {
                     Button("Show All in Finder", systemImage: "folder") { reveal(rows.map(\.path)) }
                         .controlSize(.small)
-                        .disabled(existing(rows.map(\.path)).isEmpty)
                         .help("Select every copy in Finder")
                 }
             }
@@ -798,9 +799,13 @@ private struct JobGradedCopiesSection: View {
                     Button("Show in Finder", systemImage: "folder") { reveal([row.path]) }
                         .labelStyle(.iconOnly)
                         .controlSize(.small)
-                        .disabled(existing([row.path]).isEmpty)
                         .help("Show this copy in Finder")
                 }
+            }
+            if let message {
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
             }
         }
         .textSelection(.enabled)
@@ -809,14 +814,17 @@ private struct JobGradedCopiesSection: View {
         .background(Color.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 8))
     }
 
-    private func existing(_ paths: [String]) -> [URL] {
-        paths.filter { FileManager.default.fileExists(atPath: $0) }.map { URL(fileURLWithPath: $0) }
-    }
-
+    /// Checked on the click, off the main thread: a sleeping NAS never
+    /// holds up drawing the window.
     private func reveal(_ paths: [String]) {
-        let urls = existing(paths)
-        guard !urls.isEmpty else { return }
-        NSWorkspace.shared.activateFileViewerSelecting(urls)
+        Task { @MainActor in
+            let urls = await Task.detached(priority: .userInitiated) {
+                paths.filter { FileManager.default.fileExists(atPath: $0) }.map { URL(fileURLWithPath: $0) }
+            }.value
+            message = JobDetailFacts.revealMessage(found: urls.count, of: paths.count)
+            guard !urls.isEmpty else { return }
+            NSWorkspace.shared.activateFileViewerSelecting(urls)
+        }
     }
 }
 

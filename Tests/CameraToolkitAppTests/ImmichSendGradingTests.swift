@@ -262,6 +262,10 @@ final class ImmichSendGradingTests: XCTestCase {
             var onDrive = copies[0]
             onDrive.isOnNAS = false
             XCTAssertEqual(JobDetailFacts.gradedCopyRows([onDrive], states: [:], immichConfigured: true, stacksOn: { _ in false }).first?.immich, "Sync to NAS carries it, then Immich adds it")
+            // Show in Finder checks on the click; a missing copy is said.
+            XCTAssertNil(JobDetailFacts.revealMessage(found: 2, of: 2))
+            XCTAssertEqual(JobDetailFacts.revealMessage(found: 0, of: 1), "The copy is not there now: it was moved, or its drive or NAS is not connected.")
+            XCTAssertEqual(JobDetailFacts.revealMessage(found: 1, of: 3), "2 of 3 copies are not there now; Finder shows the others.")
         }
     }
 }

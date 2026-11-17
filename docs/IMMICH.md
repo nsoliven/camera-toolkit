@@ -72,7 +72,7 @@ Copies from earlier builds have the right instant there but no offset, so Immich
 
 ## Stacks
 
-Stacking is on for an event when **Stack bursts and edits in Immich** is on (Settings, off by default; nothing happens until a library is chosen), or when the event was stacked on its own. **Stack This Event in Immich** in the event's sidebar menu (shown while the setting is off) stacks that event on a check now and marks it in the catalog (`immich_stack_events`). Later checks keep that event's stacks up to date, and only that event's: no other event is stacked. The menu then reads **Update This Event's Immich Stacks**.
+Stacking is on for an event when **Stack bursts and edits in Immich** is on (Settings, off by default; nothing happens until a library is chosen), or when the event was stacked on its own. **Stack This Event in Immich** in the event's sidebar menu (shown while the setting is off) stacks that event on a check now and marks it in the catalog (`immich_stack_events`). Later checks keep that event's stacks up to date, and only that event's: no other event is stacked. The menu then reads **Update This Event's Immich Stacks**, beside **Stop Stacking This Event in Immich**, which stops later checks from stacking the event. Its stacks in Immich stay as they are; unstack them there if they are not wanted.
 
 Scanning, matching and the graded-copy album swap never depend on stacking.
 
@@ -99,7 +99,7 @@ CameraToolkit --immich-stacks --dry-run [--event <name>]...
 CameraToolkit --immich-stacks [--event <name>]... [--log <file.jsonl>]
 ```
 
-The dry run only reads; a real run refuses while the app is running. A real run with `--event` stacks only those events, edits included once Immich lists them, and marks them as stacked on their own, so the app keeps them stacked. It reports how many stacks it would make, how many are already the app's and unchanged, how many it would leave alone because they are already in someone else's stack, and how many groups are not matched in Immich. A real run writes one JSON line per stack it made to the log (default `<support folder>/Immich Logs/`); that list of stack IDs is what to undo from.
+The dry run only reads; a real run refuses while the app is running. A real run with `--event` stacks only those events, edits included once Immich lists them, and marks them as stacked on their own, so the app keeps them stacked. It refuses a name that more than one event has. It reports how many stacks it would make, how many are already the app's and unchanged, how many it would leave alone because they are already in someone else's stack, and how many groups are not matched in Immich. A real run writes one JSON line per stack it made to the log (default `<support folder>/Immich Logs/`); that list of stack IDs is what to undo from.
 
 ## View in Immich
 

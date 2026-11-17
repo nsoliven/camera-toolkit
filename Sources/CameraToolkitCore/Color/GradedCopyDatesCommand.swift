@@ -87,13 +87,28 @@ public enum GradedCopyDatesCommand {
                 assignments: state.photoEventAssignments, locations: locations
             )
             let due = found.filter(\.needsRepair)
+            let unreadable = found.filter(\.originalUnreadable)
             output("Graded copies found: \(found.count) (\(found.count(where: \.isOnNAS)) on the NAS), with dates to repair: \(due.count)")
             for item in due { output("  \(parsed.dryRun ? "would repair" : "repair"): \(item.gradedRelativePath) → \(GradedVideoExporter.creationDateString(item.moment))") }
+            for item in unreadable { output("  skipped, original unreadable: \(item.gradedRelativePath) (its capture time could not be read; run again when it answers)") }
+            // A NAS copy that Sync carried from the drive has a twin there.
+            // Repairing only one makes them differ, and Sync reports a
+            // conflict until the other is repaired too.
+            let byID = Dictionary(state.savedEvents.map { ($0.id, $0) }) { first, _ in first }
+            var driveAway = Set<String>()
+            for item in due where item.isOnNAS {
+                guard let event = byID[item.eventID] else { continue }
+                let root = locations.driveRoot(for: locations.resolvedPolicy(for: event))
+                if !VolumeInfo.isAvailable(root) { driveAway.insert(event.name) }
+            }
+            if !driveAway.isEmpty {
+                output("Note: the drive for \(driveAway.sorted().joined(separator: ", ")) is not connected. If it holds copies of these files in Edited/Rec709, run this again with it connected, so those are repaired too; until then Sync to NAS reports them as conflicts.")
+            }
             guard !parsed.dryRun else { return 0 }
 
             var problems: [String] = []
             var repaired: [GradedCopyDateRepair.Found] = []
-            for item in due {
+            for item in due where !item.originalUnreadable {
                 do {
                     try repair(item)
                     repaired.append(item)
@@ -106,7 +121,7 @@ public enum GradedCopyDatesCommand {
             let syncStore = try NASSyncStore(catalogURL: context.catalogURL)
             let known = NASSyncStore.records(catalogURL: context.catalogURL, nasRoot: locations.nasRoot.path, pathKeys: found.filter(\.isOnNAS).map { NASSyncStore.pathKey($0.gradedRelativePath) })
             let rewritten = Set(repaired.map(\.copy))
-            for item in found where item.isOnNAS {
+            for item in found where item.isOnNAS && !item.originalUnreadable {
                 guard rewritten.contains(item.copy) || known[NASSyncStore.pathKey(item.gradedRelativePath)]?.state != .verified else { continue }
                 do {
                     _ = try GradedNASRecorder.record(copyAt: item.copy, eventID: item.eventID, locations: locations, store: syncStore, hasher: hasher)
@@ -114,14 +129,14 @@ public enum GradedCopyDatesCommand {
                     problems.append("\(item.copy.lastPathComponent): not recorded on the NAS (\(error.localizedDescription))")
                 }
             }
-            try GradedCopyStore(catalogURL: context.catalogURL).save(found.map {
+            try GradedCopyStore(catalogURL: context.catalogURL).save(found.filter { !$0.originalUnreadable }.map {
                 GradedCopyRecord(eventID: $0.eventID, originalRelativePath: $0.originalRelativePath, gradedRelativePath: $0.gradedRelativePath, sourceKey: $0.sourceKey)
             })
             output("Repaired: \(repaired.count); written down for Immich: \(found.count)")
 
             await askImmich(configuration: configuration, apiKey: apiKey, transport: transport, repaired: repaired, onNAS: found.contains(where: \.isOnNAS), output: output)
             if !problems.isEmpty { output("Problems: \(problems.count): \(problems.prefix(5).joined(separator: "; "))") }
-            return problems.isEmpty ? 0 : 1
+            return problems.isEmpty && unreadable.isEmpty ? 0 : 1
         } catch {
             output("error: \(error.localizedDescription)")
             return 2

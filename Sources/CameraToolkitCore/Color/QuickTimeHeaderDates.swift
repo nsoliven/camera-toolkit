@@ -124,7 +124,8 @@ public enum QuickTimeHeaderDates {
             } else if size == 0 {
                 size = end - cursor
             }
-            guard size >= body - cursor, cursor + size <= end else { break }
+            // A corrupt size never wraps the arithmetic.
+            guard size >= body - cursor, size <= end - cursor else { break }
             atoms.append(Atom(type: type, body: body, end: cursor + size))
             cursor += size
         }

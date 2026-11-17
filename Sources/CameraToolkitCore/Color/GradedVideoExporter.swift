@@ -655,11 +655,17 @@ public final class GradedVideoExporter: @unchecked Sendable {
         public var offsetSeconds: Int?
         /// ISO 6709 location (`+37.7749-122.4194/`), when the original has one.
         public var location: String?
+        /// True when `date` was read from the original (its tag, its movie
+        /// header or its Sony sidecar); false when the original could not
+        /// be read and `date` is the fallback. A new render may use the
+        /// fallback; the repair never writes it over an existing copy.
+        public var dateIsFromFile: Bool
 
-        public init(date: Date, offsetSeconds: Int? = nil, location: String? = nil) {
+        public init(date: Date, offsetSeconds: Int? = nil, location: String? = nil, dateIsFromFile: Bool = true) {
             self.date = date
             self.offsetSeconds = offsetSeconds
             self.location = location
+            self.dateIsFromFile = dateIsFromFile
         }
     }
 
@@ -692,12 +698,15 @@ public final class GradedVideoExporter: @unchecked Sendable {
             return result
         }) ?? Found()
         let location = found.location?.trimmingCharacters(in: .whitespaces)
-        var moment = CaptureMoment(date: found.date ?? fallback, location: location?.isEmpty == false ? location : nil)
+        var moment = CaptureMoment(date: found.date ?? fallback, location: location?.isEmpty == false ? location : nil, dateIsFromFile: found.date != nil)
         if let text = found.tagText, let offset = offsetSeconds(inISO8601: text) {
             moment.offsetSeconds = offset
         } else if let text = LogProfileDetector.sonySidecarCreationDate(forClip: source), let offset = offsetSeconds(inISO8601: text) {
             moment.offsetSeconds = offset
-            if found.date == nil, let date = parsedISO8601(text) { moment.date = date }
+            if found.date == nil, let date = parsedISO8601(text) {
+                moment.date = date
+                moment.dateIsFromFile = true
+            }
         }
         return moment
     }

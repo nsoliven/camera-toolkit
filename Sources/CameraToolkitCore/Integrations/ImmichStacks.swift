@@ -420,6 +420,16 @@ public final class ImmichStackEventStore: @unchecked Sendable {
         }
     }
 
+    /// Stops stacking these events. Their stacks in Immich stay as they are.
+    public func remove(_ eventIDs: Set<UUID>) throws {
+        guard !eventIDs.isEmpty else { return }
+        try CatalogDatabase.writer(for: catalogURL).write { database in
+            for id in eventIDs {
+                try database.execute(sql: "DELETE FROM immich_stack_events WHERE event_id = ?", arguments: [id.uuidString])
+            }
+        }
+    }
+
     public func eventIDs() throws -> Set<UUID> {
         try CatalogDatabase.writer(for: catalogURL).read { database in
             guard try database.tableExists("immich_stack_events") else { return [] }
