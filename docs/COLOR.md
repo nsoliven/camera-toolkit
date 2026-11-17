@@ -93,7 +93,7 @@ Immich reads the NAS library as an external library (see `IMMICH.md`), and each 
 - The render is queued, and the Sync is queued as its own job right behind it. The Sync keeps its place whatever happens to the render — finished, failed, stopped, or taken off the queue.
 - Copies are written at their final name on the drive, so Immich imports each once and never sees it renamed. Nothing is uploaded and no Immich API is called by this feature.
 
-Graded copies are not stacked with their originals in Immich. Stacking would need both assets' ids after Immich's scan, writes to Immich state the app otherwise never makes, and it would break whenever a rename makes Immich treat a file as new. The copy sits next to the original by capture time instead.
+Send to Immich also checks for log clips without a copy, every time, and offers to render them first. Clips that are only on the NAS get their copy written straight into the NAS event's `Edited/Rec709`. The copies then take their originals' places in the event albums, and are stacked on top with **Stack bursts and edits** on. See `IMMICH.md` › Send to Immich.
 
 ## Not covered
 
