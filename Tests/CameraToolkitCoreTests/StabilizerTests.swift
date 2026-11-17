@@ -327,17 +327,23 @@ final class StabilizerTests: XCTestCase {
                 }
                 return app
             }
-            XCTAssertNil(GyroflowInstallation.locate(roots: [root]))
+            XCTAssertNil(GyroflowInstallation.locate(roots: [root], registered: []))
             XCTAssertEqual(StabilizerAvailability(nil), .notInstalled)
             _ = try makeApp("A", appStore: true)
-            let store = try XCTUnwrap(GyroflowInstallation.locate(roots: [root.appendingPathComponent("A")]))
+            let store = try XCTUnwrap(GyroflowInstallation.locate(roots: [root.appendingPathComponent("A")], registered: []))
             XCTAssertTrue(store.isAppStoreBuild)
             XCTAssertEqual(store.version, "1.6.3")
             XCTAssertEqual(StabilizerAvailability(store), .appStoreBuild(store))
             XCTAssertNotNil(StabilizerAvailability(store).problem)
             _ = try makeApp("B", appStore: false)
-            let both = try XCTUnwrap(GyroflowInstallation.locate(roots: [root.appendingPathComponent("A"), root.appendingPathComponent("B")]))
+            let both = try XCTUnwrap(GyroflowInstallation.locate(roots: [root.appendingPathComponent("A"), root.appendingPathComponent("B")], registered: []))
             XCTAssertFalse(both.isAppStoreBuild, "the download is preferred when both are installed")
+            // Found through LaunchServices only (installed somewhere else),
+            // still preferred over the App Store copy in the folders.
+            let elsewhere = try makeApp("Elsewhere", appStore: false)
+            let viaRegistry = try XCTUnwrap(GyroflowInstallation.locate(roots: [root.appendingPathComponent("A")], registered: [root.appendingPathComponent("A/Gyroflow.app"), elsewhere]))
+            XCTAssertEqual(viaRegistry.appURL.standardizedFileURL, elsewhere.standardizedFileURL)
+            XCTAssertFalse(viaRegistry.isAppStoreBuild)
             XCTAssertTrue(StabilizerAvailability(both).isReady)
         }
     }

@@ -65,6 +65,22 @@ render under way ends the run after a few seconds. Stop ends the process
 open, have one video track, decode a frame and last as long as the clip
 before it is renamed in with an exclusive rename.
 
+## What Gyroflow writes (measured, Gyroflow 1.6.3, Sony A7V)
+
+- ProRes 422 HQ (`apch`), `yuv422p10le`, 10-bit, the clip's size and frame
+  rate, PCM audio, a timecode track, and the comment tag.
+- Gyroflow reads the A7V's `rtmd` data: the gyro and accelerometer, IBIS
+  (`camera_stab_data`), the per-frame focal length, and the lens distortion
+  ("Sony" distortion model, official profile from the camera), with
+  accurate timestamps, so no sync is needed.
+- The log curve is kept. A full-range S-Log3 clip comes out as video range
+  (a linear 64–940 mapping, tagged `tv`), and its transfer tag says
+  unknown, as the original's does. The graded copy reads the
+  intermediate's own range (`decodeRange`), while its tags keep the
+  original's recipe.
+- Gyroflow 1.6.3's command line runs as a console process. It never
+  registers with the window server (no Dock icon, no window).
+
 ## Settings
 
 Stabilization is saved per clip like a grade, in the catalog table

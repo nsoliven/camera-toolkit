@@ -203,6 +203,7 @@ final class ClipStabilizing {
             }
             let output = StabilizedRenderNaming.outputFolder(editedRoot: edited)
             let onNAS = output.path.hasPrefix(workspace.locations.nasRoot.standardizedFileURL.path + "/")
+            let policy = workspace.resolvedPolicy(for: event)
             plan.eventIDs.insert(event.id)
             plan.requests.append(StabilizeRequest(
                 source: item.primary.url,
@@ -210,7 +211,11 @@ final class ClipStabilizing {
                 sourceKey: Self.fileKey(item),
                 sourceModifiedAt: item.primary.modifiedAt,
                 outputFolder: output,
-                mirrorFolder: onNAS ? nil : workspace.locations.nasMirrorURL(forDrivePath: output.path)
+                // The other copy of the folder (NAS for a drive copy, drive
+                // for a NAS copy): a copy there keeps its name.
+                mirrorFolder: onNAS
+                    ? StabilizedRenderNaming.outputFolder(editedRoot: workspace.locations.editedRoot(for: event, policy: policy))
+                    : workspace.locations.nasMirrorURL(forDrivePath: output.path)
             ))
         }
         return plan

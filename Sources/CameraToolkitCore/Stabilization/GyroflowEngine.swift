@@ -1,3 +1,4 @@
+import CoreServices
 import Foundation
 
 /// An installed Gyroflow, the free (GPL) stabilizer this app drives from
@@ -31,16 +32,38 @@ public struct GyroflowInstallation: Equatable, Sendable {
         ]
     }
 
-    /// The first Gyroflow in `roots` (a headless-capable one preferred over
-    /// an App Store one), or nil.
-    public static func locate(roots: [URL] = defaultSearchRoots(), fileManager: FileManager = .default) -> GyroflowInstallation? {
-        var found: [GyroflowInstallation] = []
+    /// Gyroflow's bundle identifier, the same for the App Store build and
+    /// the download.
+    public static let bundleIdentifier = "xyz.gyroflow"
+
+    /// Every copy LaunchServices knows under Gyroflow's bundle identifier
+    /// (wherever it was installed). Read-only: nothing is opened.
+    public static func registeredAppURLs() -> [URL] {
+        guard let urls = LSCopyApplicationURLsForBundleIdentifier(bundleIdentifier as CFString, nil)?.takeRetainedValue() as? [URL] else {
+            return []
+        }
+        return urls
+    }
+
+    /// The Gyroflow to drive: among the copies in `roots` and `registered`
+    /// (LaunchServices), one that can run headless (not the App Store
+    /// build) is preferred, the first found wins; with only an App Store
+    /// copy, that one (so the app can say why it can't render); else nil.
+    public static func locate(
+        roots: [URL] = defaultSearchRoots(),
+        registered: [URL] = registeredAppURLs(),
+        fileManager: FileManager = .default
+    ) -> GyroflowInstallation? {
+        var candidates: [URL] = []
         for root in roots {
-            for name in ["Gyroflow.app", "Gyroflow/Gyroflow.app"] {
-                if let installation = inspect(appURL: root.appendingPathComponent(name, isDirectory: true), fileManager: fileManager) {
-                    found.append(installation)
-                }
-            }
+            candidates.append(root.appendingPathComponent("Gyroflow.app", isDirectory: true))
+            candidates.append(root.appendingPathComponent("Gyroflow/Gyroflow.app", isDirectory: true))
+        }
+        candidates.append(contentsOf: registered)
+        var seen: Set<String> = []
+        var found: [GyroflowInstallation] = []
+        for url in candidates where seen.insert(url.standardizedFileURL.resolvingSymlinksInPath().path).inserted {
+            if let installation = inspect(appURL: url, fileManager: fileManager) { found.append(installation) }
         }
         return found.first { $0.canRunHeadless } ?? found.first
     }
